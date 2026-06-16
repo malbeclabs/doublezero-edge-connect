@@ -36,3 +36,38 @@ pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
     }
     frames
 }
+
+use std::net::{Ipv4Addr, SocketAddrV4};
+
+use socket2::{Domain, Protocol, Socket, Type};
+
+/// The real Hyperliquid mainnet-beta multicast group. Multicast routing is by interface,
+/// not address class. The bridge joins this group on INADDR_ANY (the default interface,
+/// see `bridge.rs`), and the sender enables multicast loopback, so locally-sent datagrams
+/// reach the bridge in the same container/CI network namespace WITHOUT depending on the
+/// `lo` interface having the MULTICAST flag (it usually does not inside a container).
+pub const HYPERLIQUID_GROUP: Ipv4Addr = Ipv4Addr::new(233, 84, 178, 15);
+
+/// Sender configured exactly like the HL publisher's own loopback E2E test (which runs in
+/// their Linux CI): bound to UNSPECIFIED, multicast loopback on, TTL 1, and NO pinned
+/// outgoing interface — let the kernel route the multicast and loop it back locally. Do
+/// NOT `set_multicast_if_v4(LOCALHOST)`; pinning `lo` is the portability trap.
+fn multicast_sender() -> std::io::Result<Socket> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_multicast_loop_v4(true)?;
+    sock.set_multicast_ttl_v4(1)?;
+    sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
+    Ok(sock)
+}
+
+/// Send each frame as one UDP datagram to `(group, port)`, with a tiny inter-packet gap so
+/// the bridge's single-threaded decode keeps up.
+pub fn send_frames(group: Ipv4Addr, port: u16, frames: &[Vec<u8>]) -> std::io::Result<()> {
+    let sock = multicast_sender()?;
+    let dst: socket2::SockAddr = SocketAddrV4::new(group, port).into();
+    for f in frames {
+        sock.send_to(f, &dst)?;
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    Ok(())
+}
