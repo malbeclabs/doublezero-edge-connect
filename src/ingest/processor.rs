@@ -445,6 +445,7 @@ impl FrameProcessor for MboProcessor {
                 codec_mbo::Message::OrderAdd(o) => {
                     let op = DeltaOp {
                         seq: o.per_instrument_seq,
+                        mktdata_seq: header.sequence,
                         ts: o.enter_ts,
                         kind: DeltaKind::Add {
                             order_id: o.order_id,
@@ -460,6 +461,7 @@ impl FrameProcessor for MboProcessor {
                 codec_mbo::Message::OrderCancel(o) => {
                     let op = DeltaOp {
                         seq: o.per_instrument_seq,
+                        mktdata_seq: header.sequence,
                         ts: o.ts,
                         kind: DeltaKind::Cancel {
                             order_id: o.order_id,
@@ -472,6 +474,7 @@ impl FrameProcessor for MboProcessor {
                 codec_mbo::Message::OrderExecute(o) => {
                     let op = DeltaOp {
                         seq: o.per_instrument_seq,
+                        mktdata_seq: header.sequence,
                         ts: o.ts,
                         kind: DeltaKind::Execute {
                             order_id: o.order_id,
@@ -533,17 +536,25 @@ impl FrameProcessor for MboProcessor {
                     self.books
                         .entry(r.instrument_id)
                         .or_default()
-                        .on_instrument_reset();
+                        .on_instrument_reset(r.new_anchor_seq);
                 }
                 codec_mbo::Message::SnapshotBegin(s) => {
                     self.books
                         .entry(s.instrument_id)
                         .or_default()
-                        .on_snapshot_begin(s.snapshot_id, s.last_instrument_seq);
+                        .on_snapshot_begin(
+                            s.snapshot_id,
+                            s.anchor_seq,
+                            s.total_orders,
+                            s.last_instrument_seq,
+                        );
                 }
                 codec_mbo::Message::SnapshotOrder(s) => {
-                    // SnapshotOrder carries only the snapshot_id, not the instrument id; route it
-                    // to whichever book is currently assembling that snapshot.
+                    // SnapshotOrder carries only the snapshot_id, not the instrument id; route it to
+                    // whichever book is currently assembling that snapshot. snapshot_id is monotonic
+                    // per (channel, instrument) - not globally unique - but the spec forbids
+                    // interleaving snapshot groups across instruments, so at most one book is
+                    // `building` at a time and only it matches.
                     for book in self.books.values_mut() {
                         book.on_snapshot_order(
                             s.snapshot_id,
@@ -559,7 +570,7 @@ impl FrameProcessor for MboProcessor {
                         .books
                         .entry(s.instrument_id)
                         .or_default()
-                        .on_snapshot_end(s.snapshot_id)
+                        .on_snapshot_end(s.anchor_seq, s.snapshot_id)
                     {
                         changed.insert(s.instrument_id);
                     }
