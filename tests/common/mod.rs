@@ -2,3 +2,4 @@
 //! collect its WebSocket output, and assert the protocol contract.
 pub mod bridge;
 pub mod replay;
+pub mod ws_client;
