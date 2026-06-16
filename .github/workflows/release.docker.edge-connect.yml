@@ -1,0 +1,69 @@
+name: release.docker.edge-connect
+
+# Builds and publishes the three doublezero-edge-connect variants to GHCR.
+# See docs/superpowers/specs/2026-06-12-edge-connect-image-variants-design.md.
+#   push to main      -> moving tags (:testnet, :mainnet-beta, devnet :latest) + :sha-
+#   tag vX.Y.Z        -> pinned :<env>-X.Y.Z (+ :latest for mainnet-beta, devnet :X.Y.Z)
+#   workflow_dispatch -> moving tags (manual)
+#   pull_request      -> build-only smoke test (mainnet-beta, no push)
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker-entrypoint.sh
+      - .github/workflows/release.docker.edge-connect.build.yml
+      - .github/workflows/release.docker.edge-connect.yml
+      - .github/workflows/release.docker.edge-connect.poll.yml
+  workflow_dispatch: {}
+
+jobs:
+  # Resolve the release version once: the vX.Y.Z tag with leading v stripped, or
+  # empty for non-tag builds (which then publish moving tags only).
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          ref='${{ github.ref }}'
+          if [[ "$ref" == refs/tags/v* ]]; then
+            echo "version=${ref#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+
+  # main / tag / dispatch: build and push all three variants.
+  publish:
+    needs: version
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        env: [testnet, mainnet-beta, devnet]
+    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    with:
+      env: ${{ matrix.env }}
+      push: true
+      version: ${{ needs.version.outputs.version }}
+      ref: ${{ github.sha }}
+
+  # PR smoke test: build mainnet-beta only, no push. All variants share the same
+  # Rust source and differ only in base image, so one no-push build catches
+  # Dockerfile/layering regressions cheaply.
+  smoke:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    with:
+      env: mainnet-beta
+      push: false
+      ref: ${{ github.sha }}

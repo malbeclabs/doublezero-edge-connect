@@ -1,0 +1,47 @@
+name: rust
+
+# Build, lint, and test the Rust crate on every PR and on pushes to main/hotfix branches.
+# Mirrors the build-control jobs in malbeclabs/doublezero (.github/workflows/rust.yml),
+# adapted for this single-crate project: no Solana/agave tooling or validator job, and the
+# `make` targets are inlined as direct cargo commands.
+on:
+  push:
+    branches: [main, 'hotfix/**']
+  pull_request:
+
+jobs:
+  rust-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --verbose
+
+  rust-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # Nightly is only needed for rustfmt's imports_granularity option (matches the
+      # reference repo's `cargo +nightly fmt` formatting contract).
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo +nightly fmt --all -- --check --config imports_granularity=Crate
+      # The nightly toolchain above is now the default, but clippy is only installed on
+      # stable — pin clippy to stable so it doesn't resolve to the (clippy-less) nightly.
+      - name: clippy
+        run: cargo +stable clippy --all-targets -- -Dclippy::all -Dwarnings
+
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features --verbose

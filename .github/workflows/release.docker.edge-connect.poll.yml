@@ -1,0 +1,82 @@
+name: release.docker.edge-connect.poll
+
+# Self-contained poll: when a doublezero base image moves, rebuild the matching
+# edge-connect variant. No webhook/PAT in the doublezero repo — we compare the
+# current base digest against the digest recorded in the last published
+# edge-connect image (org.opencontainers.image.base.digest label).
+on:
+  schedule:
+    - cron: "23 5 * * *" # daily 05:23 UTC
+  workflow_dispatch: {}
+
+jobs:
+  # Inspect all three bases; emit a JSON array of the variants whose base digest
+  # no longer matches the digest baked into the published image.
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      stale: ${{ steps.scan.outputs.stale }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: scan
+        shell: bash
+        run: |
+          owner='${{ github.repository_owner }}'
+          stale=()
+          for envname in testnet mainnet-beta devnet; do
+            case "$envname" in
+              testnet)
+                image="ghcr.io/${owner}/doublezero-edge-connect"
+                base="ghcr.io/${owner}/doublezero:testnet"; moving="testnet" ;;
+              mainnet-beta)
+                image="ghcr.io/${owner}/doublezero-edge-connect"
+                base="ghcr.io/${owner}/doublezero:mainnet-beta"; moving="mainnet-beta" ;;
+              devnet)
+                image="ghcr.io/${owner}/doublezero-edge-connect-devnet"
+                base="ghcr.io/${owner}/doublezero-devnet:latest"; moving="latest" ;;
+            esac
+            current="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base" 2>/dev/null || true)"
+            if [ -z "$current" ]; then
+              echo "WARN: cannot inspect base $base; skipping $envname"
+              continue
+            fi
+            recorded="$(docker buildx imagetools inspect --format '{{ index .Image.Config.Labels "org.opencontainers.image.base.digest" }}' "${image}:${moving}" 2>/dev/null || true)"
+            echo "$envname: base=$current recorded=${recorded:-<none>}"
+            if [ "$current" != "$recorded" ]; then
+              stale+=("$envname")
+            fi
+          done
+          if [ "${#stale[@]}" -gt 0 ]; then
+            json="$(printf '%s\n' "${stale[@]}" | jq -R . | jq -cs .)"
+          else
+            json='[]'
+          fi
+          echo "stale=$json" >> "$GITHUB_OUTPUT"
+          echo "Stale variants: $json"
+
+  # Rebuild each stale variant with moving tags + :sha- only (a base move is not
+  # an edge-connect release, so no pinned version tag).
+  rebuild:
+    needs: check
+    if: needs.check.outputs.stale != '[]'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        env: ${{ fromJSON(needs.check.outputs.stale) }}
+    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    with:
+      env: ${{ matrix.env }}
+      push: true
+      ref: ${{ github.ref_name }}

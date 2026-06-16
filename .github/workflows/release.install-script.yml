@@ -1,0 +1,56 @@
+name: release.install-script
+
+# Publishes scripts/connect*.sh to the CDN behind https://get.doublezero.xyz/connect
+# (and /connect-testnet, /connect-devnet). Uploads to the SAME doublezero-install S3
+# bucket + CloudFront distribution that serves the doublezero installer (managed in
+# the doublezero infra repo), under the connect* keys. Auth is GitHub OIDC into the
+# main-only deploy role (no static keys).
+#
+# PREREQUISITE: the deploy role's OIDC trust policy must be extended to also trust
+# this repo (repo:malbeclabs/doublezero-edge-connect:*); until then the
+# configure-aws-credentials step fails. See the design doc / infra runbook.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/connect.sh"
+      - "scripts/connect-testnet.sh"
+      - "scripts/connect-devnet.sh"
+      - ".github/workflows/release.install-script.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # assume the AWS deploy role via OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DEPLOY_ROLE: arn:aws:iam::879381273509:role/github-doublezero-install-deploy
+  BUCKET: doublezero-install
+  DISTRIBUTION_ID: E393SM6O109RQ3
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload connect scripts
+        run: |
+          for variant in "connect:connect.sh" "connect-testnet:connect-testnet.sh" "connect-devnet:connect-devnet.sh"; do
+            key="${variant%%:*}"; file="scripts/${variant##*:}"
+            aws s3 cp "$file" "s3://${BUCKET}/${key}" \
+              --content-type text/x-shellscript \
+              --cache-control "public,max-age=120"
+          done
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths '/connect' '/connect-testnet' '/connect-devnet'

@@ -1,0 +1,140 @@
+name: release.docker.edge-connect.build
+
+# Reusable build of ONE doublezero-edge-connect environment variant. Called by
+# release.docker.edge-connect.yml (releases / main / dispatch) and
+# release.docker.edge-connect.poll.yml (base poll).
+# Each variant layers the same edge-connect binary on the matching doublezero base
+# image; only the base differs across testnet / mainnet-beta / devnet. Keeping the
+# base/tag logic here is what keeps publish and poll from drifting.
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: "Variant: testnet | mainnet-beta | devnet"
+        required: true
+        type: string
+      push:
+        description: "Push to GHCR (false = build-only smoke test)"
+        required: false
+        default: false
+        type: boolean
+      version:
+        description: "edge-connect release version (e.g. 0.1.0); blank = moving tags only"
+        required: false
+        default: ""
+        type: string
+      ref:
+        description: "Git ref/sha to build from"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The actually-built commit (inputs.ref may be a branch name); used for the
+      # :sha- tag and BUILD_COMMIT so they match what was compiled.
+      - name: Resolve build sha
+        id: sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Map the variant to target image, base image, moving tag, and whether it
+      # owns :latest. Single source of truth, shared with the poll workflow.
+      - name: Resolve variant config
+        id: cfg
+        shell: bash
+        run: |
+          owner='${{ github.repository_owner }}'
+          case '${{ inputs.env }}' in
+            testnet)
+              image="ghcr.io/${owner}/doublezero-edge-connect"
+              base="ghcr.io/${owner}/doublezero:testnet"
+              moving="testnet"; latest="false" ;;
+            mainnet-beta)
+              image="ghcr.io/${owner}/doublezero-edge-connect"
+              base="ghcr.io/${owner}/doublezero:mainnet-beta"
+              moving="mainnet-beta"; latest="true" ;;
+            devnet)
+              image="ghcr.io/${owner}/doublezero-edge-connect-devnet"
+              base="ghcr.io/${owner}/doublezero-devnet:latest"
+              moving="latest"; latest="false" ;;
+            *)
+              echo "unknown env '${{ inputs.env }}'"; exit 1 ;;
+          esac
+          {
+            echo "image=$image"
+            echo "base=$base"
+            echo "moving=$moving"
+            echo "latest=$latest"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Resolve the base to an immutable digest: reproducible builds + the digest
+      # we record in the image label for the poll to compare against.
+      - name: Resolve base digest
+        id: base
+        shell: bash
+        run: |
+          digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' '${{ steps.cfg.outputs.base }}')"
+          [ -n "$digest" ] || { echo "could not resolve digest for ${{ steps.cfg.outputs.base }}"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Base ${{ steps.cfg.outputs.base }} -> $digest"
+
+      # Tag list: always moving + sha-<short>. On a release (version set) add the
+      # pinned tag, and :latest for the variant that owns it. devnet uses a bare
+      # :<version> (its moving tag is already :latest).
+      - name: Compute tags
+        id: tags
+        shell: bash
+        run: |
+          image='${{ steps.cfg.outputs.image }}'
+          moving='${{ steps.cfg.outputs.moving }}'
+          sha='${{ steps.sha.outputs.sha }}'
+          short="${sha:0:12}"
+          tags="${image}:${moving}"$'\n'"${image}:sha-${short}"
+          ver='${{ inputs.version }}'
+          if [ -n "$ver" ]; then
+            safe="$(printf '%s' "$ver" | tr '~:' '--')"
+            if [ '${{ inputs.env }}' = 'devnet' ]; then
+              tags="${tags}"$'\n'"${image}:${safe}"
+            else
+              tags="${tags}"$'\n'"${image}:${moving}-${safe}"
+              if [ '${{ steps.cfg.outputs.latest }}' = 'true' ]; then
+                tags="${tags}"$'\n'"${image}:latest"
+              fi
+            fi
+          fi
+          {
+            echo 'tags<<EOF'
+            printf '%s\n' "$tags"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "Tags:"; printf '%s\n' "$tags"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ inputs.push }}
+          platforms: linux/amd64
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            DZ_BASE_IMAGE=${{ steps.cfg.outputs.base }}@${{ steps.base.outputs.digest }}
+            DZ_BASE_DIGEST=${{ steps.base.outputs.digest }}
+            BUILD_VERSION=${{ inputs.version != '' && inputs.version || steps.sha.outputs.sha }}
+            BUILD_COMMIT=${{ steps.sha.outputs.sha }}
