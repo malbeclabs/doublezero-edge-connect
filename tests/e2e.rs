@@ -1,6 +1,8 @@
 mod common;
 
+use common::bridge::Bridge;
 use common::replay;
+use serial_test::serial;
 
 #[test]
 fn tob_golden_splits_into_valid_frames() {
@@ -22,4 +24,11 @@ fn tob_refdata_golden_splits_into_valid_frames() {
         assert!(f.len() >= 24);
         assert_eq!(u16::from_le_bytes([f[0], f[1]]), replay::TOB_MAGIC);
     }
+}
+
+#[test]
+#[serial]
+fn bridge_starts_and_serves_ws() {
+    let bridge = Bridge::spawn("Hyperliquid", 18090);
+    assert!(std::net::TcpStream::connect(&bridge.ws_addr).is_ok());
 }
