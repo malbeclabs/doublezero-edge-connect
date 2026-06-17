@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per `(symbol, publisher)`), enabling a multi-symbol two-publisher fixture
   (`tob_multi_dual.combined.bin`: BTC busy / SOL medium / DOGE quiet) that exercises the dedup's
   per-`(venue, symbol)` independent windows.
+- Multi-publisher Top-of-Book deduplication: when several independent publishers mirror one feed
+  onto a multicast group, redundant copies of each update are collapsed so consumers see it once.
+  Datagrams are demultiplexed by source IP (`FrameCtx.publisher`); the frame-sequence tracker is
+  per-publisher so a slower publisher's frames aren't dropped before dedup; quotes dedup on a
+  windowed `(venue, symbol, source_ts, bid/ask/sizes)` identity and trades on `(venue, symbol,
+  trade_id)`. (Market-by-Order depth dedup is tracked separately.)
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry
