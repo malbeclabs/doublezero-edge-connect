@@ -18,8 +18,10 @@ fn ty(m: &Value) -> &str {
     s(m, "type")
 }
 
-/// Every quote/depth references a symbol that was already declared by an `instrument`
-/// message earlier in the stream (precision before price).
+/// Every quote/trade/depth references a symbol that was already declared by an
+/// `instrument` message earlier in the stream (precision before price). The bridge
+/// gates all price-carrying emissions on a known instrument definition, so trades
+/// must also be preceded by their instrument.
 pub fn instrument_before_price(msgs: &[Value]) {
     let mut known: HashSet<(String, String)> = HashSet::new();
     for m in msgs {
@@ -28,7 +30,7 @@ pub fn instrument_before_price(msgs: &[Value]) {
             "instrument" => {
                 known.insert(key);
             }
-            "quote" | "depth" => {
+            "quote" | "trade" | "depth" => {
                 assert!(
                     known.contains(&key),
                     "{} for {:?} arrived before its instrument definition",
@@ -41,9 +43,21 @@ pub fn instrument_before_price(msgs: &[Value]) {
     }
 }
 
-/// No two messages carry identical business content. Duplicate frames from competing
-/// publishers decode to byte-identical business fields (the live recv/ws timestamps
-/// differ and are excluded from the key), so this fails the moment dedup is missing.
+/// No two messages carry identical business content.
+///
+/// **Key design — business-content only, BY DESIGN.** Per-receipt timestamps
+/// (`recv_ts_ns`, `kernel_rx_ts_ns`, `ws_send_ts_ns`) are deliberately excluded.
+/// Duplicate frames from competing publishers carry identical business fields but
+/// different receipt timestamps; a business-content key collapses them so this
+/// assertion catches missing dedup. Do NOT add `recv_ts_ns` to any key arm — that
+/// gives each copy a distinct key and defeats the oracle.
+///
+/// **Known limitation — `source_ts_ns == 0` collisions.** Two genuinely distinct
+/// quotes that both have `source_ts_ns == 0` (the "unknown" sentinel) and identical
+/// bid/ask/sizes share the same key and produce a false-positive duplicate failure.
+/// This does not occur in the current single-publisher fixtures. Future multi-publisher
+/// dedup work must define duplicate identity precisely (e.g. by frame channel + sequence
+/// number at ingest) rather than relying on this heuristic.
 pub fn no_business_duplicates(msgs: &[Value]) {
     let mut seen: HashSet<String> = HashSet::new();
     for m in msgs {
