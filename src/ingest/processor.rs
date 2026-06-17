@@ -31,6 +31,30 @@ use crate::{
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
 
+/// Insert or replace an instrument definition in the shared snapshot, warning if an existing
+/// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
+/// multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same key; they are expected to
+/// agree on precision, so a disagreement is a publisher inconsistency worth surfacing rather than
+/// silently clobbering.
+fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
+    let key = (inst.venue.clone(), inst.symbol.clone());
+    let mut map = instruments.lock().unwrap();
+    if let Some(prev) = map.get(&key) {
+        if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
+            warn!(
+                venue = inst.venue,
+                symbol = inst.symbol,
+                prev_price_exp = prev.price_exponent,
+                new_price_exp = inst.price_exponent,
+                prev_qty_exp = prev.qty_exponent,
+                new_qty_exp = inst.qty_exponent,
+                "conflicting instrument definitions for the same (venue, symbol) across feeds; last writer wins"
+            );
+        }
+    }
+    map.insert(key, inst.clone());
+}
+
 /// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata stream
 /// and emits normalized quotes (gated per-instrument on a known definition) on the market-data
 /// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote frames.
@@ -143,10 +167,7 @@ impl FrameProcessor for TobProcessor {
                     };
                     // Update the shared snapshot so newly-connecting subscribers get this
                     // instrument before any quote.
-                    ctx.instruments
-                        .lock()
-                        .unwrap()
-                        .insert((inst.venue.clone(), inst.symbol.clone()), inst.clone());
+                    upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
                     let _ = ctx.tx.send(FeedMessage::Instrument(inst));
                 }
@@ -301,10 +322,7 @@ impl FrameProcessor for MidpointProcessor {
                         price_exponent: d.price_exponent,
                         qty_exponent: 0,
                     };
-                    ctx.instruments
-                        .lock()
-                        .unwrap()
-                        .insert((inst.venue.clone(), inst.symbol.clone()), inst.clone());
+                    upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
                     let _ = ctx.tx.send(FeedMessage::Instrument(inst));
                 }
@@ -443,10 +461,7 @@ impl FrameProcessor for MboProcessor {
                         price_exponent: d.price_exponent,
                         qty_exponent: d.qty_exponent,
                     };
-                    ctx.instruments
-                        .lock()
-                        .unwrap()
-                        .insert((inst.venue.clone(), inst.symbol.clone()), inst.clone());
+                    upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
                     let _ = ctx.tx.send(FeedMessage::Instrument(inst));
                 }
@@ -609,7 +624,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::MboProcessor;
+    use super::{upsert_instrument, MboProcessor};
     use crate::{
         ingest::{
             codec_mbo::{
@@ -619,7 +634,7 @@ mod tests {
             },
             receiver::{FrameCtx, FrameProcessor, PortRole},
         },
-        model::{DepthSnapshot, FeedMessage},
+        model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
     };
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
@@ -815,5 +830,56 @@ mod tests {
             vec![0, 1],
             "order must be stable across frames"
         );
+    }
+
+    /// `upsert_instrument` is idempotent for matching exponents and last-writer-wins for
+    /// conflicting ones (exercising the warn path; the warn itself is not asserted).
+    #[test]
+    fn upsert_instrument_idempotent_and_last_writer_wins() {
+        let instruments: crate::model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+
+        let base = NormalizedInstrument {
+            venue: "TestVenue".to_string(),
+            symbol: "BTC".to_string(),
+            price_exponent: -2,
+            qty_exponent: -4,
+        };
+
+        // First insert.
+        upsert_instrument(&instruments, &base);
+        {
+            let map = instruments.lock().unwrap();
+            assert_eq!(map.len(), 1);
+            let entry = map
+                .get(&("TestVenue".to_string(), "BTC".to_string()))
+                .unwrap();
+            assert_eq!(entry.price_exponent, -2);
+            assert_eq!(entry.qty_exponent, -4);
+        }
+
+        // Second insert with identical exponents — idempotent, still one entry.
+        upsert_instrument(&instruments, &base);
+        assert_eq!(instruments.lock().unwrap().len(), 1);
+
+        // Third insert with DIFFERENT exponents — exercises the divergence warn path.
+        // Last writer wins: the snapshot ends with the new exponents.
+        let conflicting = NormalizedInstrument {
+            price_exponent: -3,
+            qty_exponent: -5,
+            ..base.clone()
+        };
+        upsert_instrument(&instruments, &conflicting);
+        {
+            let map = instruments.lock().unwrap();
+            assert_eq!(map.len(), 1, "still one entry after conflicting write");
+            let entry = map
+                .get(&("TestVenue".to_string(), "BTC".to_string()))
+                .unwrap();
+            assert_eq!(
+                entry.price_exponent, -3,
+                "last writer's price_exponent wins"
+            );
+            assert_eq!(entry.qty_exponent, -5, "last writer's qty_exponent wins");
+        }
     }
 }
