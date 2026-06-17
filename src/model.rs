@@ -1,5 +1,5 @@
 //! Normalized feed messages re-served over WebSocket to any trading engine.
-//! Wire format is engine-agnostic JSON - see PROTOCOL.md. NautilusTrader is one consumer.
+//! Wire format is engine-agnostic JSON - see PROTOCOL.md.
 
 use std::{
     collections::HashMap,
