@@ -165,10 +165,7 @@ async fn mbo_single_publisher_depth_contract() {
     let ws_addr = bridge.ws_addr.clone();
 
     let collector = tokio::spawn(async move {
-        ws_client::collect(&ws_addr, Duration::from_secs(10), |m| {
-            !ws_client::by_type(m, "depth").is_empty()
-        })
-        .await
+        ws_client::collect(&ws_addr, Duration::from_secs(10), |_| false).await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -246,6 +243,17 @@ async fn mbo_single_publisher_depth_contract() {
             );
         }
     }
+
+    // The fixture is predominantly buy-side (wire side=0=Bid). At least one depth must carry bids;
+    // if none do, the MBO side constants are inverted (bids wrongly routed to asks).
+    assert!(
+        depths.iter().any(|d| d
+            .get("bids")
+            .and_then(|v| v.as_array())
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)),
+        "no depth message had a non-empty bid side — likely MBO side-constant inversion"
+    );
 
     // MBO is depth-only: no trades from this venue (TOB owns trades, idle here).
     assert!(
