@@ -49,12 +49,18 @@ real snapshot-port capture from the same run (the publisher's golden generator d
 one today). The empty-anchor snapshot is the honest, intractable-state-free substitute for an
 E2E depth-contract test.
 
-**Known bridge discrepancy (out of scope here, flagged):** the HL publisher encodes
-`SIDE_BID=0 / SIDE_ASK=1` (`server/src/protocol/mbo/constants.rs`), but the bridge's
-`codec_mbo.rs` uses `SIDE_BID=1 / SIDE_ASK=2`, so the bridge currently labels MBO bids/asks
-inverted. The depth test only asserts within-side ordering (a BTreeMap guarantees it regardless
-of the bid/ask label) and the ≤10-level bound, so it passes either way; the side-mapping fix
-belongs with the codec_mbo offset validation, not this fixture work.
+**Side-mapping inversion (found and fixed during this E2E work):** the HL publisher encodes
+`SIDE_BID=0 / SIDE_ASK=1` (`server/src/protocol/mbo/constants.rs`). The bridge's `codec_mbo.rs`
+previously used `SIDE_BID=1 / SIDE_ASK=2` (inverted). That bug was caught by these E2E tests and
+fixed: `codec_mbo.rs` now uses `0=Bid / 1=Ask`, matching the publisher.
+
+**Regenerating `mbo_snapshot.bin`:** the file is hand-crafted in the `[u32 LE length][frame bytes]`
+record format. Each frame is a complete codec_mbo datagram (24-byte frame header + 4-byte message
+header per message). The single frame carries two messages: `SnapshotBegin(instrument_id=0,
+anchor_seq=0, total_orders=0, snapshot_id=1, last_instrument_seq=0)` followed immediately by
+`SnapshotEnd(instrument_id=0, anchor_seq=0, snapshot_id=1)`. Together they assert an empty book
+anchored at mktdata_seq 0. Re-encode with `codec_mbo::encode_*` (or by hand from the spec layout)
+and prefix with a u32 LE length equal to the frame byte count.
 
 Regenerate the TOB/MBO mktdata+refdata by re-running the publisher's `hl_block_mode` golden
 generation (`server/tests/fixtures/hl_block_mode/generate_from_source.py`) and copying the

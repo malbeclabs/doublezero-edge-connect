@@ -107,16 +107,6 @@ pub const FEEDS: &[Feed] = &[
         },
         emit_trades: true,
     },
-    Feed {
-        venue: "Phoenix",
-        kind: FeedKind::TopOfBook,
-        group: Ipv4Addr::new(233, 84, 178, 18),
-        ports: FeedPorts::TwoPort {
-            mktdata: 9201,
-            refdata: 9202,
-        },
-        emit_trades: true,
-    },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, host2 ports (paired with
     // the TOB row above). Confirmed against edge-multicast-ref/docs/hyperliquid.md (mainnet-beta).
     // Depth-only: TOB owns this venue's trades.
@@ -130,6 +120,16 @@ pub const FEEDS: &[Feed] = &[
             snapshot: 10203,
         },
         emit_trades: false,
+    },
+    Feed {
+        venue: "Phoenix",
+        kind: FeedKind::TopOfBook,
+        group: Ipv4Addr::new(233, 84, 178, 18),
+        ports: FeedPorts::TwoPort {
+            mktdata: 9201,
+            refdata: 9202,
+        },
+        emit_trades: true,
     },
 ];
 

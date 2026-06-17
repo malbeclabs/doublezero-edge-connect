@@ -8,10 +8,9 @@ pub const MBO_MAGIC: u16 = 0x4444;
 /// Split a captured `.bin` (length-prefixed packet log) into individual frame byte-slices.
 ///
 /// The file format is a sequence of `[u32 LE length][frame bytes]` records, as produced
-/// by the publisher's `encode_packets` function. Each frame's first two bytes are the
-/// little-endian protocol magic; bytes 22-23 are the little-endian total frame length
-/// (equal to the outer length prefix). We assert both match, which doubles as a fixture
-/// format check.
+/// by the publisher's `encode_packets` function. The splitter walks by the 4-byte u32 LE
+/// length prefix to find each frame boundary, then checks that the frame's first two bytes
+/// match the expected protocol magic. Both checks double as fixture format validation.
 pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     let mut off = 0usize;

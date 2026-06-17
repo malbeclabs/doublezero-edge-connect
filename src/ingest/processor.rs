@@ -354,6 +354,7 @@ pub struct MboProcessor {
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
     warned_source_mismatch: bool,
+    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
 }
 
