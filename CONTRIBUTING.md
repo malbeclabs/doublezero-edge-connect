@@ -56,7 +56,7 @@ cargo deny check
 
 ## Reporting bugs and requesting features
 
-Use the [issue templates](.github/ISSUE_TEMPLATE). For security issues, **do not open a
+Open an issue on the tracker. For security issues, **do not open a
 public issue** — see [SECURITY.md](SECURITY.md).
 
 ## License
