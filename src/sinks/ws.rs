@@ -101,7 +101,7 @@ pub async fn run(
 }
 
 fn text(value: serde_json::Value) -> WsMessage {
-    WsMessage::Text(value.to_string())
+    WsMessage::Text(value.to_string().into())
 }
 
 async fn serve_client(
@@ -125,7 +125,7 @@ async fn serve_client(
     };
     for inst in snapshot {
         write
-            .send(WsMessage::Text(serde_json::to_string(&inst)?))
+            .send(WsMessage::Text(serde_json::to_string(&inst)?.into()))
             .await?;
     }
 
@@ -138,7 +138,7 @@ async fn serve_client(
     };
     for d in depth_snapshot {
         write
-            .send(WsMessage::Text(serde_json::to_string(&d)?))
+            .send(WsMessage::Text(serde_json::to_string(&d)?.into()))
             .await?;
     }
 
@@ -202,7 +202,7 @@ async fn serve_client(
                     let _ = write.send(WsMessage::Close(None)).await;
                     break;
                 }
-                write.send(WsMessage::Ping(Vec::new())).await?;
+                write.send(WsMessage::Ping(Vec::new().into())).await?;
             },
 
             // Forward broadcast feed messages this subscriber wants.
@@ -233,7 +233,7 @@ async fn serve_client(
                             FeedMessage::Depth(ref mut d) => d.ws_send_ts_ns = now_ns(),
                             _ => {}
                         }
-                        write.send(WsMessage::Text(serde_json::to_string(&m)?)).await?;
+                        write.send(WsMessage::Text(serde_json::to_string(&m)?.into())).await?;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => warn!("subscriber lagged, dropped {n}"),
