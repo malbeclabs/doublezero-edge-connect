@@ -47,6 +47,15 @@ Modules are grouped by role under `src/`:
   the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
+- **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
+  market-data pipeline — no `FeedMessage`, no WebSocket, no decode). Joins the DoubleZero
+  `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
+  UDP destinations. Pipeline: N receiver tasks → bounded `mpsc<ShredPacket>` → 1 forwarder task →
+  fan-out `send_to` → M destinations. The single forwarder is the deliberate seam where shared
+  dedup/sigverify will later live; receivers stay dumb (recv → push bytes). It reuses
+  `ingest::receiver::{bind_multicast, wait_for_interface_ip}` (now `pub`) rather than duplicating
+  socket plumbing. `shred/discovery.rs` shells out to `doublezero multicast group list` and
+  prefix-selects the source groups. Activate-on-discovery; off when no source is found.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
 - **`ingest/feeds.rs`** — the hardcoded feed registry: each `Feed` is one multicast group mapped to one

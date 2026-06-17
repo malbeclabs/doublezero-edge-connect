@@ -156,6 +156,29 @@ the env var shown.
 A sink is active when its key config value is non-empty/present; the WebSocket sink simply ships a
 non-empty default bind, so it is on unless you explicitly clear it.
 
+### Solana shred forwarding
+
+Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
+joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
+out to one or more local UDP destinations (e.g. a Jito shredstream-proxy listener). This step is the
+bare forwarder — no dedup, no signature verification, no decode.
+
+It **activates on discovery**: by default it shells out to `doublezero multicast group list`, selects
+the groups whose `code` starts with `--shred-code-prefix` (default `edge-solana-`), and binds each on
+`--shred-port` (default `7733`). If the CLI is missing or finds no matching group, the forwarder stays
+off. Pass `--shred-source GROUP:PORT` (repeatable) to override discovery entirely.
+
+| Flag | Env | Default |
+|------|-----|---------|
+| `--shred-code-prefix` | `DZ_SHRED_CODE_PREFIX` | `edge-solana-` |
+| `--shred-port` | `DZ_SHRED_PORT` | `7733` |
+| `--shred-forward` (repeatable) | `DZ_SHRED_FORWARD` | `127.0.0.1:20000` |
+| `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
+
+The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
+at startup. Shreds are loss-tolerant, so under forwarder backpressure datagrams are shed (with a
+periodic drop-count log) rather than blocking ingest.
+
 ## Learn more
 
 - **[PROTOCOL.md](PROTOCOL.md)**: the full WebSocket JSON contract (v1).

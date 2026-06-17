@@ -9,6 +9,7 @@
 
 mod ingest;
 mod model;
+mod shred;
 mod sinks;
 
 use std::{
@@ -71,6 +72,30 @@ struct Args {
     /// Broadcast buffer capacity (backpressure: a slow client drops the oldest beyond this).
     #[arg(long, env = "WS_BROADCAST_CAPACITY", default_value_t = 4096)]
     ws_broadcast_capacity: usize,
+
+    /// Shred forwarder: only join discovered multicast groups whose `code` starts with this
+    /// prefix (`doublezero multicast group list`). Excludes unrelated groups (e.g. jito-shredstream).
+    #[arg(long, env = "DZ_SHRED_CODE_PREFIX", default_value = "edge-solana-")]
+    shred_code_prefix: String,
+
+    /// Shred forwarder: UDP port the `edge-solana-*` groups publish on (all share one port).
+    #[arg(long, env = "DZ_SHRED_PORT", default_value_t = 7733)]
+    shred_port: u16,
+
+    /// Shred forwarder: local destination(s) every shred datagram is fanned out to, repeatable
+    /// (`host:port`). Defaults to the Jito shredstream-proxy local-listener convention.
+    #[arg(
+        long = "shred-forward",
+        env = "DZ_SHRED_FORWARD",
+        value_delimiter = ',',
+        default_value = "127.0.0.1:20000"
+    )]
+    shred_forward: Vec<String>,
+
+    /// Shred forwarder: explicit source group(s) `GROUP:PORT`, repeatable. Overrides discovery
+    /// entirely (for tests/edge cases). When set, the shred forwarder runs even without the CLI.
+    #[arg(long = "shred-source", env = "DZ_SHRED_SOURCES", value_delimiter = ',')]
+    shred_sources: Vec<String>,
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -132,6 +157,28 @@ async fn main() -> Result<()> {
         )))
     };
 
+    // Shred forwarder: activate-on-discovery. Runs iff an explicit `--shred-source` is given or
+    // discovery finds ≥1 `edge-solana-*` group; otherwise it stays off (no enable flag). Invalid
+    // source/destination addresses fail fast here, before anything is spawned.
+    let shred_sources = shred::resolve_sources(
+        &args.shred_sources,
+        &args.shred_code_prefix,
+        args.shred_port,
+    )?;
+    let shred = if shred_sources.is_empty() {
+        info!("shred forwarder disabled (no --shred-source and discovery found no groups)");
+        None
+    } else {
+        let shred_cfg = shred::ShredConfig {
+            iface: args.iface.clone(),
+            recv_buf: args.recv_buf,
+            sources: shred_sources,
+            forward: shred::parse_forwards(&args.shred_forward)?,
+        };
+        info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
+        Some(tokio::spawn(shred::run(shred_cfg)))
+    };
+
     // One receiver task per feed; all publish onto the shared broadcast tagged with the
     // feed's venue, and the WS server fans them out to consumers (who filter by venue).
     let mut receivers = JoinSet::new();
@@ -154,6 +201,10 @@ async fn main() -> Result<()> {
     // receivers alone.
     tokio::select! {
         r = async { match ws {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
+        r = async { match shred {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
