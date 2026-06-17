@@ -164,9 +164,13 @@ impl FeedMessage {
 /// Latest known instrument definitions, keyed by `(venue, symbol)`, shared between the
 /// receivers (which update it) and the WebSocket server (which replays it to each new
 /// subscriber so reference data arrives before quotes - otherwise a client that connects
-/// mid-stream sees a quote first and has to guess the price/qty precision). Keying by venue
-/// as well as symbol keeps two feeds that share a symbol (e.g. `SOL-PERP` on different
-/// venues) from clobbering each other.
+/// mid-stream sees a quote first and has to guess the price/qty precision).
+///
+/// The `(venue, symbol)` key disambiguates the same symbol across *different* venues (e.g.
+/// `SOL-PERP` on Hyperliquid vs. Phoenix). It does NOT distinguish by protocol/feed: when one
+/// venue is served by multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same entry
+/// (last-writer-wins). Those feeds are expected to agree on precision; `upsert_instrument` in
+/// `processor.rs` warns if their exponents diverge.
 pub type InstrumentSnapshot = Arc<Mutex<HashMap<(String, String), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
