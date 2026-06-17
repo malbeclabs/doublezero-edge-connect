@@ -160,8 +160,10 @@ non-empty default bind, so it is on unless you explicitly clear it.
 
 Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
 joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
-out to one or more local UDP destinations (e.g. a Jito shredstream-proxy listener). This step is the
-bare forwarder — no dedup, no signature verification, no decode.
+out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). This
+step is the bare forwarder — no dedup, no signature verification, no decode. `--shred-forward` targets
+should be local/fast sinks: sends are sequential per destination, so a slow or remote sink throttles
+the whole forwarder (and sheds load); the send socket pins no egress interface.
 
 It **activates on discovery**: by default it shells out to `doublezero multicast group list`, selects
 the groups whose `code` starts with `--shred-code-prefix` (default `edge-solana-`), and binds each on
@@ -176,8 +178,9 @@ off. Pass `--shred-source GROUP:PORT` (repeatable) to override discovery entirel
 | `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
 
 The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
-at startup. Shreds are loss-tolerant, so under forwarder backpressure datagrams are shed (with a
-periodic drop-count log) rather than blocking ingest.
+at startup. Shreds are loss-tolerant, so under forwarder backpressure the **newest** datagram is shed
+(with a periodic drop-count log) rather than blocking ingest. Discovery binds every matched group; a
+group this host isn't actually receiving on simply stays idle and periodically rejoins (harmless).
 
 ## Learn more
 

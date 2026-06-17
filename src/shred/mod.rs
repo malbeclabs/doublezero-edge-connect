@@ -197,9 +197,11 @@ async fn receiver_task(
                     match tx.try_send(buf[..n].to_vec()) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
-                            // Forwarder backpressure: shed this datagram and count it. mpsc sheds the
-                            // newest (a producer can't pop the queue head); for loss-tolerant shreds
-                            // this is equivalent load-shedding to the WS sink's slow-client drop.
+                            // Forwarder backpressure: shed the NEWEST datagram (this one) and count
+                            // it. `try_send` rejects the incoming datagram on a full queue; a
+                            // producer can't evict the queue head, so this is drop-newest, not
+                            // drop-oldest. For loss-tolerant shreds either is fine (the validator
+                            // recovers via Turbine/repair).
                             let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
                             if total.is_multiple_of(DROP_LOG_EVERY) {
                                 warn!(%group, dropped = total,
@@ -229,8 +231,9 @@ async fn receiver_task(
 ///
 /// Sends are sequential per destination, so effective forwarder throughput is ~`1/M` of a single
 /// send and a slow destination sheds load globally (the bounded channel fills and receivers drop).
-/// That is fine for the intended use — a few **local** destinations whose sends don't block — but
-/// don't point `--shred-forward` at a slow/remote sink.
+/// That is fine for the intended use — a few **local unicast** destinations whose sends don't block
+/// — but don't point `--shred-forward` at a slow/remote sink. The send socket binds `0.0.0.0:0` and
+/// pins no egress interface, so destinations should be loopback/local, not off-box.
 async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAddr>) -> Result<()> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .await
@@ -292,8 +295,7 @@ mod tests {
     // (`bind_multicast` binds to the group address, not INADDR_ANY). Sender mirrors the E2E
     // harness: multicast-loopback on, TTL 1, no pinned interface — locally-sent datagrams reach a
     // `--iface 0.0.0.0` receiver without `lo` needing the MULTICAST flag.
-
-    use tokio::{net::UdpSocket, time::timeout};
+    // (`UdpSocket`/`timeout` come from the module-scope `use` via `use super::*`.)
 
     async fn loopback_sender() -> UdpSocket {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
@@ -323,11 +325,14 @@ mod tests {
         {}
     }
 
-    /// Count how many datagrams arrive on `listener` within a short idle window.
+    /// Count how many datagrams arrive on `listener`, stopping after an idle gap with no datagram.
+    /// The idle window is generous (800ms) so a scheduled-out CI runner doesn't truncate the count
+    /// mid-batch; the call sites still assert the EXACT total (no dedup), so this can't relax to a
+    /// lower bound.
     async fn drain_count(listener: &UdpSocket) -> usize {
         let mut buf = [0u8; 2048];
         let mut n = 0;
-        while timeout(Duration::from_millis(300), listener.recv(&mut buf))
+        while timeout(Duration::from_millis(800), listener.recv(&mut buf))
             .await
             .is_ok()
         {
