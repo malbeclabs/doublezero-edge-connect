@@ -189,6 +189,11 @@ async fn main() -> Result<()> {
         info!("shred forwarder disabled (no --shred-source and discovery found no groups)");
         None
     } else {
+        // A zero window evicts everything immediately, defeating dedup; reject it up front rather
+        // than silently forwarding every duplicate.
+        if args.shred_rpc_url.is_some() && args.shred_dedup_window_slots == 0 {
+            bail!("--shred-dedup-window-slots must be > 0 when --shred-rpc-url is set");
+        }
         let shred_cfg = shred::ShredConfig {
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,

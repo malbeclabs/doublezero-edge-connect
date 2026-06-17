@@ -351,9 +351,11 @@ async fn forwarder_task(
     );
 
     let mut window = DedupWindow::new(dedup_window_slots);
-    // Tallies for the periodic misparse canary (see VERIFY_LOG_EVERY).
-    let (mut parsed, mut forwarded, mut dropped, mut verify_calls, mut verify_ok) =
-        (0u64, 0, 0, 0, 0);
+    // Tallies for the periodic misparse canary (see VERIFY_LOG_EVERY). `unparsed` is tracked too so
+    // a *total* misparse (every datagram rejected by `parse`) still trips the log — otherwise it
+    // would be silent, since `parsed` would never advance.
+    let (mut processed, mut parsed, mut unparsed, mut forwarded, mut dropped, mut verify_ok) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
 
     while let Some(pkt) = rx.recv().await {
         // Bare mode (no RPC): forward unconditionally.
@@ -361,11 +363,17 @@ async fn forwarder_task(
             fan_out(&socks, &pkt).await;
             continue;
         };
+        processed += 1;
 
         // Sigverify + dedup mode. An unparseable datagram can't be keyed, so forward it rather than
         // silently drop (loss-averse; it simply isn't deduped).
         let Some(meta) = parse::parse(&pkt) else {
+            unparsed += 1;
+            forwarded += 1;
             fan_out(&socks, &pkt).await;
+            log_tally(
+                processed, parsed, unparsed, forwarded, dropped, verify_ok, &window,
+            );
             continue;
         };
         parsed += 1;
@@ -373,7 +381,6 @@ async fn forwarder_task(
         let leader = schedule.leader(meta.slot).await;
         let action = {
             let mut verify_fn = || {
-                verify_calls += 1;
                 let ok = leader.as_ref().is_some_and(|pk| verify::verify(&meta, pk));
                 if ok {
                     verify_ok += 1;
@@ -396,17 +403,9 @@ async fn forwarder_task(
             Action::Drop => dropped += 1,
         }
 
-        if parsed.is_multiple_of(VERIFY_LOG_EVERY) {
-            info!(
-                parsed,
-                forwarded,
-                dropped,
-                verify_calls,
-                verify_ok,
-                tracked_slots = window.tracked_slots(),
-                "shred forwarder dedup/verify tally"
-            );
-        }
+        log_tally(
+            processed, parsed, unparsed, forwarded, dropped, verify_ok, &window,
+        );
     }
     info!("shred forwarder channel closed; exiting");
     Ok(())
@@ -418,6 +417,32 @@ async fn fan_out(socks: &[(SocketAddr, UdpSocket)], pkt: &[u8]) {
         if let Err(e) = sock.send(pkt).await {
             warn!(%dst, %e, "shred forward send failed; skipping this destination");
         }
+    }
+}
+
+/// Emit the dedup/verify tally every [`VERIFY_LOG_EVERY`] processed datagrams. The `verify_ok`
+/// share of `parsed` (and a high `unparsed`) is the canary for a systematic shred-parse misread.
+#[allow(clippy::too_many_arguments)]
+fn log_tally(
+    processed: u64,
+    parsed: u64,
+    unparsed: u64,
+    forwarded: u64,
+    dropped: u64,
+    verify_ok: u64,
+    window: &DedupWindow,
+) {
+    if processed.is_multiple_of(VERIFY_LOG_EVERY) {
+        info!(
+            processed,
+            parsed,
+            unparsed,
+            forwarded,
+            dropped,
+            verify_ok,
+            tracked_slots = window.tracked_slots(),
+            "shred forwarder dedup/verify tally"
+        );
     }
 }
 
@@ -600,5 +625,95 @@ mod tests {
             "the live destination must receive every datagram despite the dead one"
         );
         handle.abort();
+    }
+
+    // --- Sigverify + dedup forwarder tests ---
+    //
+    // These drive `forwarder_task` directly over the mpsc with a pre-seeded `LeaderSchedule` (no
+    // RPC), so the real parse → leader → verify → dedup path is exercised end-to-end. Shreds are
+    // built as legacy data shreds (the signature covers the post-signature payload), signed with a
+    // deterministic key whose pubkey is the seeded slot leader.
+
+    const TEST_SLOT: u64 = 100;
+    const TEST_INDEX: u32 = 5;
+
+    /// Build a legacy data shred for `(TEST_SLOT, TEST_INDEX)` signed by `signing`.
+    fn signed_legacy_shred(signing: &ed25519_dalek::SigningKey) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let mut shred = vec![0x42u8; 1228];
+        shred[64] = 0xa5; // legacy data variant
+        shred[65..73].copy_from_slice(&TEST_SLOT.to_le_bytes());
+        shred[73..77].copy_from_slice(&TEST_INDEX.to_le_bytes());
+        let sig = signing.sign(&shred[64..]).to_bytes();
+        shred[..64].copy_from_slice(&sig);
+        shred
+    }
+
+    /// A schedule whose leader for `TEST_SLOT` is `pubkey`.
+    fn seeded_schedule(pubkey: [u8; 32]) -> Arc<LeaderSchedule> {
+        let mut leaders = vec![None; TEST_SLOT as usize + 1];
+        leaders[TEST_SLOT as usize] = Some(pubkey);
+        Arc::new(LeaderSchedule::with_seeded_cache(0, 0, leaders))
+    }
+
+    async fn run_forwarder(schedule: Arc<LeaderSchedule>, pkts: Vec<Vec<u8>>) -> usize {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<ShredPacket>(64);
+        let handle = tokio::spawn(forwarder_task(rx, vec![dst], Some(schedule), 512));
+        for pkt in pkts {
+            tx.send(pkt).await.unwrap();
+        }
+        drop(tx); // close the channel so the forwarder drains and exits
+        handle.await.unwrap().unwrap();
+        drain_count(&listener).await
+    }
+
+    #[tokio::test]
+    async fn same_shred_from_two_sources_forwards_once() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let schedule = seeded_schedule(signing.verifying_key().to_bytes());
+        let shred = signed_legacy_shred(&signing);
+        // The identical valid shred arrives twice (leader copy + retransmit copy).
+        let got = run_forwarder(schedule, vec![shred.clone(), shred]).await;
+        assert_eq!(got, 1, "exactly one valid copy is forwarded");
+    }
+
+    #[tokio::test]
+    async fn bad_signature_dropped_good_forwarded() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let schedule = seeded_schedule(signing.verifying_key().to_bytes());
+        // A shred signed by the wrong key: leader is known, signature fails -> dropped.
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[99u8; 32]);
+        let got = run_forwarder(schedule, vec![signed_legacy_shred(&wrong)]).await;
+        assert_eq!(got, 0, "an invalid shred must not be forwarded");
+    }
+
+    #[tokio::test]
+    async fn prefer_valid_bad_copy_first_then_good_copy_forwards() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let schedule = seeded_schedule(signing.verifying_key().to_bytes());
+        let good = signed_legacy_shred(&signing);
+        // Forged copy (payload tampered after signing) of the SAME key arrives first.
+        let mut bad = good.clone();
+        bad[200] ^= 0xff;
+        let got = run_forwarder(schedule, vec![bad, good]).await;
+        assert_eq!(
+            got, 1,
+            "the later valid copy still wins and forwards exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_leader_fails_open() {
+        // Schedule has no leader for TEST_SLOT -> leader() is None -> forward (fail open), undeduped.
+        let schedule = Arc::new(LeaderSchedule::with_seeded_cache(0, 0, vec![None; 10]));
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let shred = signed_legacy_shred(&signing);
+        let got = run_forwarder(schedule, vec![shred.clone(), shred]).await;
+        assert_eq!(
+            got, 2,
+            "with no known leader both copies are forwarded, not deduped"
+        );
     }
 }

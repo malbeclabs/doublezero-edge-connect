@@ -56,7 +56,6 @@ impl DedupWindow {
         leader_known: bool,
         verify: &mut F,
     ) -> Action {
-        self.advance(slot);
         let key = (index, ty);
         if self.slots.get(&slot).is_some_and(|s| s.contains(&key)) {
             return Action::Drop; // duplicate of an already-forwarded winner: no sig check
@@ -65,24 +64,26 @@ impl DedupWindow {
             return Action::Forward; // can't judge -> fail open, don't record a winner
         }
         if verify() {
-            // Record the winner unless the slot is already past the eviction horizon (a very late
-            // shred for an evicted slot is forwarded but not tracked).
-            if slot >= self.horizon() {
-                self.slots.entry(slot).or_default().insert(key);
-            }
+            self.record_winner(slot, key);
             Action::Forward
         } else {
             Action::Drop // invalid copy: leave the key open for a later valid contender
         }
     }
 
-    /// Advance the tip to the newest slot seen and evict everything below the horizon.
-    fn advance(&mut self, slot: u64) {
+    /// Record a verified winner, advancing the tip and evicting old slots. The tip is advanced
+    /// **only here**, from verified shreds — never from the raw datagram slot — so a forged shred
+    /// carrying a far-future slot can't poison the eviction horizon and silently disable dedup. A
+    /// very late shred for an already-evicted slot is forwarded (it won the verify) but not tracked.
+    fn record_winner(&mut self, slot: u64, key: (u32, ShredType)) {
         if slot > self.tip {
             self.tip = slot;
             let horizon = self.horizon();
             // Drop every tracked slot strictly below the horizon (cheap range split off the front).
             self.slots = self.slots.split_off(&horizon);
+        }
+        if slot >= self.horizon() {
+            self.slots.entry(slot).or_default().insert(key);
         }
     }
 
@@ -221,5 +222,33 @@ mod tests {
             w.decide(0, 0, DATA, true, &mut again.closure()),
             Action::Forward
         );
+    }
+
+    #[test]
+    fn forged_far_future_slot_does_not_poison_the_eviction_horizon() {
+        // A real shred establishes a winner near slot 10.
+        let mut w = DedupWindow::new(100);
+        let mut good = Verifier::new(true);
+        assert_eq!(
+            w.decide(10, 0, DATA, true, &mut good.closure()),
+            Action::Forward
+        );
+
+        // An attacker injects a parseable shred claiming a far-future slot. Its signature is invalid
+        // (verify -> false), so it is dropped — and crucially it must NOT advance the eviction tip,
+        // which would otherwise evict slot 10's winner and let its duplicates through undeduped.
+        let mut forged = Verifier::new(false);
+        assert_eq!(
+            w.decide(u64::MAX, 0, DATA, true, &mut forged.closure()),
+            Action::Drop
+        );
+
+        // Slot 10's winner is still tracked: a duplicate is dropped without a signature check.
+        let mut dup = Verifier::new(true);
+        assert_eq!(
+            w.decide(10, 0, DATA, true, &mut dup.closure()),
+            Action::Drop
+        );
+        assert_eq!(dup.calls, 0, "dedup must still suppress the duplicate");
     }
 }
