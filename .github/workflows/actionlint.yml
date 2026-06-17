@@ -1,7 +1,11 @@
 name: actionlint
 
 # Lints the GitHub Actions workflow YAML itself (syntax, expression typos, shellcheck
-# of inline run: scripts). Runs only when a workflow file or its config changes.
+# of inline run: scripts). On push to main it runs only when a workflow file or its
+# config changes. On pull_request it runs unconditionally: actionlint is a required
+# status check, and a `paths`-filtered required check is skipped (never reported) on
+# PRs that don't touch workflows, which leaves the PR stuck on
+# "Expected — Waiting for status to be reported". actionlint is fast, so always run it.
 on:
   push:
     branches: [main]
@@ -9,9 +13,6 @@ on:
       - ".github/workflows/**"
       - ".github/actionlint.yaml"
   pull_request:
-    paths:
-      - ".github/workflows/**"
-      - ".github/actionlint.yaml"
 
 permissions:
   contents: read
