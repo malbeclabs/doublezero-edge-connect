@@ -7,7 +7,10 @@
 //! - [`MboProcessor`] - Market-by-Order (`codec_mbo`, magic `0x4444`): reconstructs the L3 book
 //!   in [`crate::ingest::book`] and re-serves it as full-state `depth` + `trade`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::IpAddr,
+};
 
 use tracing::{debug, info, warn};
 
@@ -65,8 +68,11 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 /// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote frames.
 pub struct TobProcessor {
     state: RefDataState<InstrumentDefinition>,
-    /// Per-channel frame sequence tracker, used to drop stale/out-of-order quote frames.
-    seq: SeqTracker,
+    /// Per-publisher, per-channel frame sequence tracker. Independent publishers mirror this feed
+    /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
+    /// frames stale and drop them before dedup; keying by source IP keeps each publisher's sequence
+    /// state separate.
+    seq: HashMap<IpAddr, SeqTracker>,
     /// Log the manifest `Valid=0` publisher workaround once, not on every (~1/s) manifest.
     warned_invalid_manifest: bool,
     /// Log an unregistered quote SourceID once, not on every quote.
@@ -84,7 +90,7 @@ impl TobProcessor {
     pub fn new(emit_trades: bool) -> Self {
         Self {
             state: RefDataState::new(),
-            seq: SeqTracker::default(),
+            seq: HashMap::new(),
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
@@ -131,10 +137,11 @@ impl FrameProcessor for TobProcessor {
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
         let quotes_fresh = if handle_quotes {
-            match self
-                .seq
-                .check(header.channel_id, header.reset_count, header.sequence)
-            {
+            match self.seq.entry(ctx.publisher).or_default().check(
+                header.channel_id,
+                header.reset_count,
+                header.sequence,
+            ) {
                 SeqCheck::Stale => {
                     debug!(
                         venue = ctx.venue,
@@ -765,6 +772,7 @@ mod tests {
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,
             role,
+            publisher: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         }
     }
 
