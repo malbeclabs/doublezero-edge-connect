@@ -1,9 +1,6 @@
 mod common;
 
-use common::assertions;
-use common::bridge::Bridge;
-use common::replay;
-use common::ws_client;
+use common::{assertions, bridge::Bridge, replay, ws_client};
 use serial_test::serial;
 use std::time::Duration;
 

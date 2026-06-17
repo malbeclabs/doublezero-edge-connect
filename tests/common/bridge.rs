@@ -1,8 +1,10 @@
 //! Spawn the real `doublezero-edge-connect` binary as a subprocess for E2E tests.
 
-use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::{
+    net::TcpStream,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
 
 /// A running bridge subprocess, joined to its feed's multicast group on loopback,
 /// serving WebSocket on `ws_addr`. Killed when dropped.

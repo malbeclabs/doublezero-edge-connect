@@ -3,6 +3,7 @@
 /// Top-of-Book & Trades frame magic (ASCII "ZD" little-endian).
 pub const TOB_MAGIC: u16 = 0x445A;
 /// Market-by-Order frame magic.
+#[allow(dead_code)] // used by the MBO tests added in a later task
 pub const MBO_MAGIC: u16 = 0x4444;
 
 /// Split a captured `.bin` (length-prefixed packet log) into individual frame byte-slices.

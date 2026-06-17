@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Connect to `ws://{ws_addr}` and collect parsed JSON text frames until `stop` is
 /// satisfied or `timeout` elapses. The empty subscription default (no subscribe sent)
