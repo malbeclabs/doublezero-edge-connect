@@ -1,8 +1,9 @@
 //! Two-publisher integration test: feed the combined dual-publisher TOB fixture through
-//! `TobProcessor` in capture order and assert the dedup contract (no business duplicates) holds
-//! across publishers. This is the cross-publisher counterpart to `tob_single_publisher_contract`
-//! in `e2e.rs`: the fixture carries two independent publishers mirroring the same Hyperliquid feed,
-//! so the windowed-identity quote deduper must collapse each logical update to one output.
+//! `TobProcessor` in capture order and assert the dedup contract holds across publishers. This is
+//! the cross-publisher counterpart to `tob_single_publisher_contract` in `e2e.rs`: the fixture
+//! carries two independent publishers mirroring the same Hyperliquid feed. Quotes dedup by a
+//! per-(venue, symbol) freshest-wins `source_ts` high-watermark, so a lagging publisher's stale BBO
+//! and any duplicate are dropped and the emitted stream is monotonic per symbol.
 
 mod common;
 
@@ -117,37 +118,60 @@ fn emitted_quotes_by_symbol(msgs: &[Value]) -> HashMap<String, usize> {
     counts
 }
 
+/// Assert that emitted quotes are strictly increasing in `source_ts_ns` per (venue, symbol). This is
+/// the freshest-wins contract: a lagging publisher's stale BBO must never appear out of order on the
+/// wire. Fails (proving the assertion bites) if the watermark is bypassed.
+fn assert_quote_source_ts_strictly_increasing(msgs: &[Value]) {
+    let mut last: HashMap<(String, String), u64> = HashMap::new();
+    for m in msgs.iter().filter(|m| m["type"] == "quote") {
+        let venue = m["venue"].as_str().unwrap_or_default().to_string();
+        let symbol = m["symbol"].as_str().unwrap_or_default().to_string();
+        let ts = m["source_ts_ns"].as_u64().expect("quote has source_ts_ns");
+        if let Some(prev) = last.insert((venue.clone(), symbol.clone()), ts) {
+            assert!(
+                ts > prev,
+                "{venue}/{symbol}: emitted source_ts_ns not strictly increasing ({prev} -> {ts})"
+            );
+        }
+    }
+}
+
 #[test]
-fn two_publishers_dedup_collapses_to_single() {
+fn two_publishers_freshest_wins_no_stale_or_dupes() {
     let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
     let msgs = replay(&recs);
-    // THE contract: a duplicate (content, source_ts) from the second publisher collapses, so no two
-    // emitted quotes share the oracle's business identity.
+    // No two emitted quotes share the oracle's business identity (duplicates dropped).
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
+    // Freshest-wins: per (venue, symbol) the emitted source_ts is strictly increasing — a lagging
+    // publisher's stale or duplicate BBO is never emitted.
+    assert_quote_source_ts_strictly_increasing(&msgs);
 
     let quotes = msgs.iter().filter(|m| m["type"] == "quote").count();
     // Sanity bound: the fixture carries 9330 raw mktdata frames split across two publishers
-    // mirroring the same feed. Dedup collapses each publisher's copy of a given (source_ts, content)
-    // update to one output, so the emitted count must sit well below 9330 (proving the second
-    // publisher's duplicates were dropped) while staying positive. Observed: 4470.
+    // mirroring the same feed. The freshest-wins watermark emits only strictly-newer samples per
+    // symbol. Because the two publishers interleave (each advances source_ts independently), the
+    // merged stream is far from monotonic, so the laggard's stale samples are dropped — the count
+    // falls well below the old windowed-identity count (4470), which kept every distinct-source_ts
+    // copy. Observed: 437.
     assert!(
-        quotes > 0 && quotes < 6000,
+        quotes > 0 && quotes < 1000,
         "two-pub quote count = {quotes}"
     );
 }
 
-/// Per-`(venue, symbol)` dedup independence. The dedup keys on `(venue, symbol)` with an
-/// **independent window per symbol** (see `arbiter::WindowedDedup`), so a busy symbol's volume must
-/// not perturb a quiet symbol's dedup. The single-symbol fixture above can't prove that; this uses a
+/// Per-`(venue, symbol)` dedup independence. The quote watermark keys on `(venue, symbol)` with an
+/// **independent high-watermark per symbol** (see `arbiter::Watermark`), so a busy symbol's volume
+/// must not perturb a quiet symbol's dedup. The single-symbol fixture above can't prove that; this uses a
 /// three-symbol fixture (BTC busy, SOL medium, DOGE quiet) from the same two publishers and asserts:
 ///   1. `no_business_duplicates` holds across ALL symbols at once (no cross-symbol key collision);
 ///   2. all three symbols emit quotes and each dedups (emitted < raw per symbol);
 ///   3. **independence**: the quiet symbol's emitted set is byte-for-byte what it produces when
 ///      replayed ALONE — i.e. stripping BTC/SOL from the input changes nothing for DOGE.
 ///
-/// Falsifiability: with quote dedup disabled, (1) fails (each publisher's duplicate copies re-emit)
-/// and (2) fails (emitted == raw), so this test pins the dedup, not just the fixture.
+/// Falsifiability: with the quote watermark bypassed (always-admit), `no_business_duplicates` and
+/// the strict-increase assertion both fail (stale/out-of-order copies re-emit) and emitted == raw,
+/// so this test pins the dedup, not just the fixture.
 #[test]
 fn per_symbol_dedup_is_independent() {
     let recs = read_combined("tests/fixtures/tob_multi_dual.combined.bin");
@@ -156,9 +180,13 @@ fn per_symbol_dedup_is_independent() {
     // (1) the dedup contract holds across the whole multi-symbol stream.
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
+    // Freshest-wins monotonicity holds per (venue, symbol) across all symbols at once.
+    assert_quote_source_ts_strictly_increasing(&msgs);
 
     let raw = raw_quotes_by_symbol(&recs);
     let emitted = emitted_quotes_by_symbol(&msgs);
+    // Observed freshest-wins emitted vs raw: BTC 405/8788, SOL 279/3010, DOGE 69/527 (was, under
+    // windowed-identity, a far smaller drop since same-content distinct-source_ts copies were kept).
 
     // The fixture's three tiers (see PROVENANCE.md). Guard that the fixture still carries them so a
     // regenerated fixture that silently dropped a symbol fails loudly rather than vacuously passing.
@@ -181,9 +209,9 @@ fn per_symbol_dedup_is_independent() {
     );
 
     // (3) Independence: replay ONLY DOGE's frames (all refdata kept so precision resolves; mktdata
-    // restricted to DOGE) and confirm DOGE's emitted count is identical. The per-symbol window means
-    // BTC/SOL traffic interleaved in the full run neither evicts nor masks any DOGE identity, so the
-    // quiet symbol dedups to exactly the same set whether or not the busy symbols are present.
+    // restricted to DOGE) and confirm DOGE's emitted count is identical. DOGE has its own
+    // high-watermark, so BTC/SOL traffic interleaved in the full run never advances or perturbs it;
+    // the quiet symbol emits exactly the same set whether or not the busy symbols are present.
     let doge_id: u32 = *symbol_by_id(&recs)
         .iter()
         .find(|(_, s)| *s == "DOGE")

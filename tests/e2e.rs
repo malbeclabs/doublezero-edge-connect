@@ -139,14 +139,15 @@ async fn tob_single_publisher_contract() {
     assertions::trades_well_formed(&msgs);
 
     let quotes = ws_client::by_type(&msgs, "quote");
-    // Identity dedup keys on (venue, symbol, source_ts, content): for a single publisher whose
-    // quotes each carry a distinct source_ts, it is a no-op (no two copies share the identity), so
-    // the count is the raw distinct-(source_ts,content) quote count — NOT collapsed to distinct BBO
-    // content the way the old adjacent content fingerprint was.
+    // Freshest-wins dedup keeps a per-(venue, symbol) source_ts high-watermark: only strictly-newer
+    // BBOs are emitted. For a single publisher whose quotes carry strictly-increasing source_ts it
+    // admits every sample (the watermark advances each time), so the count equals the raw distinct
+    // quote count — 41. (A drop below 41 here would mean this publisher's source_ts are NOT
+    // monotonic, which would be worth investigating.)
     assert_eq!(
         quotes.len(),
         41,
-        "TOB single-publisher quote count under identity dedup (no-op for distinct-source_ts quotes; was 7 under the old adjacent content fingerprint)"
+        "TOB single-publisher quote count under freshest-wins source_ts watermark (all 41 samples have strictly-increasing source_ts, so none are dropped)"
     );
 }
 

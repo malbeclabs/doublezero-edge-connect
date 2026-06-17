@@ -57,11 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tob_multi_dual.combined.bin`: BTC busy / SOL medium / DOGE quiet) that exercises the dedup's
   per-`(venue, symbol)` independent windows.
 - Multi-publisher Top-of-Book deduplication: when several independent publishers mirror one feed
-  onto a multicast group, redundant copies of each update are collapsed so consumers see it once.
-  Datagrams are demultiplexed by source IP (`FrameCtx.publisher`); the frame-sequence tracker is
-  per-publisher so a slower publisher's frames aren't dropped before dedup; quotes dedup on a
-  windowed `(venue, symbol, source_ts, bid/ask/sizes)` identity and trades on `(venue, symbol,
-  trade_id)`. (Market-by-Order depth dedup is tracked separately.)
+  onto a multicast group, the bridge merges them into one clean stream. Datagrams are demultiplexed
+  by source IP (`FrameCtx.publisher`); the frame-sequence tracker is per-publisher so a slower
+  publisher's frames aren't dropped before dedup. Quotes, being full-state BBOs, dedup on a
+  per-`(venue, symbol)` freshest-wins `source_ts` high-watermark: only strictly-newer samples are
+  emitted, so a lagging publisher's stale BBO (the market has moved on) and any duplicate are
+  dropped and the output is monotonic per symbol. Trades, being point-in-time events, dedup on a
+  windowed `(venue, symbol, trade_id)` identity so every distinct print is kept. (Market-by-Order
+  depth dedup is tracked separately.)
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry

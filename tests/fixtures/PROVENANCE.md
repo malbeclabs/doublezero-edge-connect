@@ -84,11 +84,14 @@ updates: each independently samples/coalesces the BBO, so within the shared wind
 BTC quotes and pub B emits 4669, and only ~370 (~9%) share an identical `source_ts`. When they DO
 coincide the content matches (369/370 agree on the full bid/ask/size tuple), but coincidence is
 under a tenth of each stream. So these exercise **real independent-publisher dedup** — merge two
-samplings of one book and emit each distinct top-of-book change once (fastest publisher wins) — NOT
-a "mirror collapse to one stream"; the publishers are not mirrors and the deduped count does **not**
-approach a single publisher's. A dedup test on these must assert both that overlapping content
-collapses (the ~369 coincident tuples emit once) AND that genuinely distinct samples pass through —
-not that the count halves.
+samplings of one book — NOT a "mirror collapse to one stream"; the publishers are not mirrors.
+Quotes dedup by a per-`(venue, symbol)` freshest-wins `source_ts` high-watermark: only a
+strictly-newer sample is emitted, so a lagging publisher's stale BBO (the market moved on) is
+dropped, as is any duplicate. Because the two publishers interleave (each advances `source_ts`
+independently), the merged stream is far from monotonic, so the deduped count falls well below
+either publisher's raw count — the watermark keeps only the freshest sample whenever the two cross.
+A dedup test on these must assert no business duplicates AND that emitted `source_ts` is strictly
+increasing per `(venue, symbol)` (freshest-only, monotonic).
 
 Both are `BTC` (instrument_id 0), windowed to the first 40s of the capture. The window is ≥~35s on
 purpose: the exact-`BTC` definition re-sends on a ~30s round-robin (786 instruments, ~3144
@@ -128,9 +131,10 @@ record format `tests/common/replay.rs` replays.
 ### `tob_btc_dual.combined.bin` — interleaved two-publisher golden
 
 `tob_btc_pubA`/`tob_btc_pubB` are *separate* per-publisher captures; replaying them back-to-back
-does **not** reproduce the real wire, where the two publishers' copies of each update arrive
-**interleaved**. The multi-publisher dedup collapses *adjacent* duplicates, so the dedup test needs
-the real interleaving. `tob_btc_dual.combined.bin` is that: both publishers' refdata +
+does **not** reproduce the real wire, where the two publishers' samples arrive **interleaved**. The
+freshest-wins quote watermark only emits strictly-newer `source_ts`, so its behavior depends on the
+real interleaving (a laggard's sample is stale only relative to whatever the leader has already
+advanced past); the dedup test needs that ordering. `tob_btc_dual.combined.bin` is that: both publishers' refdata +
 BTC-filtered mktdata in **capture order**, each record tagged `[u32 LE len][4B src_ip][1B role:
 0=refdata,1=mktdata][frame]` (note the extra `src_ip`/`role` prefix — this is NOT the plain
 `split_frames` format; the dedup test has its own reader). 235 refdata + 9330 mktdata frames, 0
