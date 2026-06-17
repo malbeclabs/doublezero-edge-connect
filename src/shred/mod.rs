@@ -32,7 +32,7 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::ingest::receiver::{bind_multicast, wait_for_interface_ip};
 
@@ -47,6 +47,11 @@ const CHANNEL_CAPACITY: usize = 8192;
 
 /// Log the running drop total every N drops (rate-limited so sustained backpressure doesn't spam).
 const DROP_LOG_EVERY: u64 = 1000;
+
+/// Back off this long before retrying a failed multicast bind/join, so a transient bind error
+/// (e.g. `EADDRNOTAVAIL` while the interface is still settling, or a fast flap) is retried rather
+/// than killing the receiver — and with it the whole process.
+const BIND_RETRY: Duration = Duration::from_secs(1);
 
 /// One forwarded datagram: just the shred-bearing UDP payload bytes. (A small reuse pool is a
 /// possible later optimization; not needed now.)
@@ -100,8 +105,10 @@ pub fn resolve_sources(explicit: &[String], prefix: &str, port: u16) -> Result<V
 }
 
 /// Run the shred forwarder: spawn one receiver task per source group plus a single forwarder task,
-/// wired by a bounded mpsc. Loops forever; returns only when a task exits (a fatal bind error, or
-/// the channel closing), so `main` can treat a return as terminal like the feed receivers.
+/// wired by a bounded mpsc. Loops forever; returns only when a task exits — the forwarder failing
+/// to bind its send socket, or (the normal terminal case) the channel closing once every receiver
+/// is gone. Receiver bind failures are retried, not propagated (see [`receiver_task`]), so a
+/// flapping Solana interface never brings the whole process down.
 pub async fn run(cfg: ShredConfig) -> Result<()> {
     info!(sources = ?cfg.sources, forward = ?cfg.forward, iface = %cfg.iface,
           "starting shred forwarder");
@@ -134,7 +141,9 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
 /// One receiver: bind the group's multicast socket and push every received datagram onto the mpsc.
 /// Plain `recv` (kernel RX timestamps are NOT needed here, unlike the market-data path). Survives
 /// interface flap via the [`IDLE_REJOIN`] watchdog: on idle/error it re-resolves the interface and
-/// rebinds. Returns only on a fatal bind error or when the forwarder's channel has closed.
+/// rebinds. A failed bind is retried (with [`BIND_RETRY`] backoff), never fatal — the shred
+/// forwarder is an optional add-on and must not take the market-data bridge down with it. Returns
+/// only when the forwarder's channel has closed (all consumers gone).
 async fn receiver_task(
     src: SocketAddrV4,
     iface: String,
@@ -150,7 +159,17 @@ async fn receiver_task(
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
         // coming up and fall back to the default interface (mirrors the market-data receiver).
         let iface_ip = wait_for_interface_ip(&iface, Duration::from_secs(60)).await;
-        let sock = bind_multicast(group, port, iface_ip, recv_buf)?;
+        let sock = match bind_multicast(group, port, iface_ip, recv_buf) {
+            Ok(sock) => sock,
+            Err(e) => {
+                // Non-fatal: back off and retry rather than propagate (which would terminate the
+                // whole process via main's `select!`). A flapping interface or a transient bind
+                // error must not take the market-data bridge down with the shred forwarder.
+                warn!(%group, port, %iface_ip, %e, "shred multicast bind failed; retrying");
+                tokio::time::sleep(BIND_RETRY).await;
+                continue 'rejoin;
+            }
+        };
         info!(%group, port, %iface, %iface_ip, recv_buf, "shred multicast receiver bound");
 
         loop {
@@ -168,23 +187,31 @@ async fn receiver_task(
             };
             match guard.try_io(|s| s.get_ref().recv(&mut buf)) {
                 Ok(Ok(0)) => {} // empty datagram: nothing to forward
-                Ok(Ok(n)) => match tx.try_send(buf[..n].to_vec()) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        // Forwarder backpressure: shed this datagram and count it. mpsc sheds the
-                        // newest (a producer can't pop the queue head); for loss-tolerant shreds
-                        // this is equivalent load-shedding to the WS sink's slow-client drop.
-                        let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        if total.is_multiple_of(DROP_LOG_EVERY) {
-                            warn!(%group, dropped = total,
+                Ok(Ok(n)) => {
+                    // A datagram that exactly fills the buffer was likely truncated by `recv`
+                    // (no MSG_TRUNC requested). Solana shreds are well under 2048B, so this flags
+                    // mis-bound / unexpected traffic rather than a real shred.
+                    if n == buf.len() {
+                        debug!(%group, len = n, "shred datagram filled the recv buffer; may be truncated");
+                    }
+                    match tx.try_send(buf[..n].to_vec()) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            // Forwarder backpressure: shed this datagram and count it. mpsc sheds the
+                            // newest (a producer can't pop the queue head); for loss-tolerant shreds
+                            // this is equivalent load-shedding to the WS sink's slow-client drop.
+                            let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if total.is_multiple_of(DROP_LOG_EVERY) {
+                                warn!(%group, dropped = total,
                                   "shred forwarder backpressure; dropping datagrams");
+                            }
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            warn!(%group, "shred forwarder gone; receiver exiting");
+                            return Ok(());
                         }
                     }
-                    Err(TrySendError::Closed(_)) => {
-                        warn!(%group, "shred forwarder gone; receiver exiting");
-                        return Ok(());
-                    }
-                },
+                }
                 Ok(Err(e)) => {
                     warn!(%group, %e, "shred recv error; rejoining");
                     continue 'rejoin;
@@ -199,6 +226,11 @@ async fn receiver_task(
 /// The single forwarder: own one UDP send socket and fan every datagram out to all destinations.
 /// A failing destination is logged and skipped — it never blocks delivery to the others. Returns
 /// `Ok` when the channel closes (all receivers gone).
+///
+/// Sends are sequential per destination, so effective forwarder throughput is ~`1/M` of a single
+/// send and a slow destination sheds load globally (the bounded channel fills and receivers drop).
+/// That is fine for the intended use — a few **local** destinations whose sends don't block — but
+/// don't point `--shred-forward` at a slow/remote sink.
 async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAddr>) -> Result<()> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .await
