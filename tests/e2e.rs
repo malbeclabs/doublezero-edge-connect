@@ -58,6 +58,7 @@ async fn spike_loopback_multicast_produces_a_quote() {
         })
         .await
     });
+    // Let the collector connect before replay begins.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let refdata = replay::split_frames(
@@ -69,30 +70,10 @@ async fn spike_loopback_multicast_produces_a_quote() {
         replay::TOB_MAGIC,
     );
 
-    // The golden refdata capture orders the frames ChannelReset -> InstrumentDefinition ->
-    // ManifestSummary. The subscriber state machine only *retains* a definition that arrives
-    // while a valid manifest is in effect, and it clears the def set both on a ChannelReset and
-    // on each new manifest. So the lone def in the capture (which precedes its manifest) is
-    // discarded by a single pass, and replaying the whole capture again doesn't help: every pass
-    // begins with the ChannelReset and ends with the manifest clearing defs. On the live feed
-    // definitions repeat in bursts, so one eventually lands *after* a valid manifest. We
-    // reproduce that here by replaying the full refdata (which leaves a valid manifest, seq=1, in
-    // effect) and then re-sending just the InstrumentDefinition frames last, so they are retained
-    // and the quote precision gate resolves. InstrumentDefinition is message type 0x02; every
-    // fixture frame carries msg_count=1, so byte 24 is the message type.
-    let instrument_defs: Vec<Vec<u8>> = refdata
-        .iter()
-        .filter(|f| f.len() > 24 && f[24] == 0x02)
-        .cloned()
-        .collect();
-    assert!(
-        !instrument_defs.is_empty(),
-        "refdata fixture has no InstrumentDefinition frame"
-    );
+    // Fixture is in real wire order (manifest before def), so a single refdata pass retains the
+    // def and the quote precision gate resolves immediately.
     tokio::task::spawn_blocking(move || {
         replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &instrument_defs).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
     })
