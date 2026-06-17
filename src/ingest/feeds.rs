@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
 // `Midpoint`/`MarketByOrder` are matched on by the receiver but only *constructed* by FEEDS rows,
 // which are added once their live multicast endpoints are known - hence the dead_code allow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FeedKind {
     /// Top-of-Book & Trades (frame magic `0x445A`): best bid/ask quotes + trade prints.
@@ -117,26 +117,48 @@ pub const FEEDS: &[Feed] = &[
         },
         emit_trades: true,
     },
+    // Hyperliquid Market-by-Order on the same `tiredsolid` group, host2 ports (paired with
+    // the TOB row above). Confirmed against edge-multicast-ref/docs/hyperliquid.md (mainnet-beta).
+    // Depth-only: TOB owns this venue's trades.
+    Feed {
+        venue: "Hyperliquid",
+        kind: FeedKind::MarketByOrder,
+        group: Ipv4Addr::new(233, 84, 178, 15),
+        ports: FeedPorts::ThreePort {
+            mktdata: 10201,
+            refdata: 10202,
+            snapshot: 10203,
+        },
+        emit_trades: false,
+    },
 ];
-
-/// Resolve a comma/space-free venue name (case-insensitive) to its feed.
-pub fn by_venue(venue: &str) -> Option<&'static Feed> {
-    FEEDS.iter().find(|f| f.venue.eq_ignore_ascii_case(venue))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn venues_are_unique_and_resolvable() {
+    fn venue_kind_pairs_are_unique() {
         let mut seen = std::collections::HashSet::new();
         for f in FEEDS {
-            assert!(seen.insert(f.venue), "duplicate venue {}", f.venue);
-            assert!(by_venue(f.venue).is_some());
+            assert!(
+                seen.insert((f.venue, f.kind)),
+                "duplicate (venue, kind): {} {:?}",
+                f.venue,
+                f.kind
+            );
         }
-        assert!(by_venue("hyperLIQUID").is_some()); // case-insensitive
-        assert!(by_venue("nope").is_none());
+    }
+
+    #[test]
+    fn hyperliquid_has_tob_and_mbo() {
+        let kinds: std::collections::HashSet<FeedKind> = FEEDS
+            .iter()
+            .filter(|f| f.venue.eq_ignore_ascii_case("hyperliquid"))
+            .map(|f| f.kind)
+            .collect();
+        assert!(kinds.contains(&FeedKind::TopOfBook));
+        assert!(kinds.contains(&FeedKind::MarketByOrder));
     }
 
     #[test]
