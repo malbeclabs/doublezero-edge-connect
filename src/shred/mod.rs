@@ -1,19 +1,32 @@
 //! Shred forwarder (peer of `ingest/` and `sinks/`).
 //!
 //! Joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each
-//! datagram out to one or more local UDP destinations. This is the *bare* forwarder: no dedup, no
-//! signature verification, no decode (those are follow-ups). It shares nothing with the
-//! market-data pipeline — no `FeedMessage`, no WebSocket.
+//! datagram out to one or more local UDP destinations. It shares nothing with the market-data
+//! pipeline — no `FeedMessage`, no WebSocket.
 //!
 //! ```text
 //! N source multicast groups → N receiver tasks → bounded mpsc → 1 forwarder task → fan-out UDP → M destinations
 //! ```
 //!
-//! Routing through a single forwarder even now is deliberate: it's the seam where the planned
-//! shared dedup / sigverify state will live. Receivers stay dumb (recv → push bytes); the
-//! forwarder owns the single send socket and the fan-out.
+//! Routing through a single forwarder is deliberate: it's the one place the dedup + sigverify state
+//! lives, with no cross-task sharing. Receivers stay dumb (recv → push bytes); the forwarder owns
+//! the send socket, the dedup window, and the leader-schedule lookup.
+//!
+//! Two modes, selected by whether a Solana RPC URL is configured:
+//! - **No RPC URL** → bare forward: every datagram is fanned out (the original behaviour).
+//! - **RPC URL set** → forward exactly **one valid copy** of each shred. The forwarder keys a
+//!   bounded, prefer-valid dedup window on `(slot, index, type)` ([`dedup`]); the first copy of a
+//!   key is ed25519-verified ([`verify`]) against its slot leader ([`leader`]) using fields pulled
+//!   from the raw datagram ([`parse`]). A verified copy is forwarded and recorded; later duplicates
+//!   are dropped *without* a signature check; an invalid copy is dropped but leaves the key open so
+//!   a later valid copy can still win. A slot whose leader isn't known yet fails **open** (forward,
+//!   no dedup), so we never silently drop traffic we can't judge.
 
+pub mod dedup;
 pub mod discovery;
+pub mod leader;
+pub mod parse;
+pub mod verify;
 
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -35,6 +48,8 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::ingest::receiver::{bind_multicast, wait_for_interface_ip};
+use dedup::{Action, DedupWindow};
+use leader::LeaderSchedule;
 
 /// Re-resolve the interface and rejoin if no shred arrives for this long — the same watchdog idea
 /// as the market-data receiver's `IDLE_REJOIN`, guarding against a join that landed on the wrong
@@ -47,6 +62,11 @@ const CHANNEL_CAPACITY: usize = 8192;
 
 /// Log the running drop total every N drops (rate-limited so sustained backpressure doesn't spam).
 const DROP_LOG_EVERY: u64 = 1000;
+
+/// Emit a forwarder verify/dedup tally every N parsed shreds. The valid/invalid ratio is the
+/// canary for a systematic shred-parse misread: ≈100% "invalid" means the (unvalidated) offsets are
+/// wrong, not that the network is full of forged shreds.
+const VERIFY_LOG_EVERY: u64 = 100_000;
 
 /// Back off this long before retrying a failed multicast bind/join, so a transient bind error
 /// (e.g. `EADDRNOTAVAIL` while the interface is still settling, or a fast flap) is retried rather
@@ -73,6 +93,12 @@ pub struct ShredConfig {
     pub sources: Vec<SocketAddrV4>,
     /// Local destinations every datagram is fanned out to.
     pub forward: Vec<SocketAddr>,
+    /// Solana JSON-RPC endpoint for the leader schedule. `Some` enables dedup + sigverify; `None`
+    /// keeps the bare forward-everything behaviour.
+    pub rpc_url: Option<String>,
+    /// Dedup window depth in slots: keys older than this many slots behind the tip are evicted, so
+    /// memory is bounded by `window × shreds-per-slot`.
+    pub dedup_window_slots: u64,
 }
 
 /// Parse repeatable `--shred-forward host:port` values into socket addresses, failing fast on the
@@ -122,7 +148,36 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
     let dropped = Arc::new(AtomicU64::new(0));
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    tasks.spawn(forwarder_task(rx, cfg.forward.clone()));
+
+    // Sigverify + dedup are enabled iff an RPC URL is configured. Without it we fall back to the
+    // bare forward-everything behaviour.
+    let schedule = match &cfg.rpc_url {
+        Some(url) => {
+            warn!(
+                "shred sigverify enabled: shred/merkle offsets are transcribed from the agave \
+                 layout and NOT validated against a live edge-solana hexdump — watch the periodic \
+                 verify tally and confirm against a captured frame before trusting it"
+            );
+            let sched = Arc::new(LeaderSchedule::new(url.clone()));
+            let refresher = Arc::clone(&sched);
+            tasks.spawn(async move {
+                refresher.run_refresher().await; // loops forever
+                Ok(())
+            });
+            Some(sched)
+        }
+        None => {
+            info!("shred sigverify/dedup disabled (no --shred-rpc-url); forwarding every datagram");
+            None
+        }
+    };
+
+    tasks.spawn(forwarder_task(
+        rx,
+        cfg.forward.clone(),
+        schedule,
+        cfg.dedup_window_slots,
+    ));
     for src in cfg.sources {
         tasks.spawn(receiver_task(
             src,
@@ -233,7 +288,7 @@ async fn receiver_task(
     }
 }
 
-/// The single forwarder: fan every datagram out to all destinations. A failing destination is
+/// The single forwarder: fan accepted datagrams out to all destinations. A failing destination is
 /// logged and skipped — it never blocks delivery to the others. Returns `Ok` when the channel
 /// closes (all receivers gone).
 ///
@@ -243,6 +298,9 @@ async fn receiver_task(
 /// regardless of target — so a down destination could fail (and drop) the *next* send to a
 /// *healthy* one, and mis-attribute the error. A connected socket only ever surfaces ICMP errors
 /// for its own peer, so each destination's failures stay isolated to its own socket.
+///
+/// When `schedule` is `Some`, each datagram passes the prefer-valid dedup + sigverify gate before
+/// fan-out (see the module docs); when `None`, every datagram is forwarded (the bare behaviour).
 ///
 /// Sends are sequential per destination, so effective forwarder throughput is ~`1/M` of a single
 /// send and a slow destination sheds load globally (the bounded channel fills and receivers drop).
@@ -257,7 +315,15 @@ async fn receiver_task(
 /// connectionless UDP `connect` essentially only fail on fd/memory exhaustion, which is better
 /// surfaced loudly than retried in a tight loop. Receiver *joins*, by contrast, do retry (a
 /// flapping multicast interface is an expected transient).
-async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAddr>) -> Result<()> {
+///
+/// When `schedule` is `Some`, each datagram passes the prefer-valid dedup + sigverify gate before
+/// fan-out; when `None`, every datagram is forwarded (the bare behaviour).
+async fn forwarder_task(
+    mut rx: mpsc::Receiver<ShredPacket>,
+    dests: Vec<SocketAddr>,
+    schedule: Option<Arc<LeaderSchedule>>,
+    dedup_window_slots: u64,
+) -> Result<()> {
     // Build one connected send socket per destination so ICMP errors can't cross destinations.
     // `connect` on a UDP socket only sets the default peer (no handshake), so it succeeds even for
     // a destination with nothing listening — a port-unreachable surfaces later, on this socket's
@@ -278,17 +344,81 @@ async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAd
             .with_context(|| format!("connecting shred forward socket to {dst}"))?;
         socks.push((*dst, sock));
     }
-    info!(?dests, "shred forwarder ready");
+    info!(
+        ?dests,
+        sigverify = schedule.is_some(),
+        "shred forwarder ready"
+    );
+
+    let mut window = DedupWindow::new(dedup_window_slots);
+    // Tallies for the periodic misparse canary (see VERIFY_LOG_EVERY).
+    let (mut parsed, mut forwarded, mut dropped, mut verify_calls, mut verify_ok) =
+        (0u64, 0, 0, 0, 0);
 
     while let Some(pkt) = rx.recv().await {
-        for (dst, sock) in &socks {
-            if let Err(e) = sock.send(&pkt).await {
-                warn!(%dst, %e, "shred forward send failed; skipping this destination");
+        // Bare mode (no RPC): forward unconditionally.
+        let Some(schedule) = schedule.as_ref() else {
+            fan_out(&socks, &pkt).await;
+            continue;
+        };
+
+        // Sigverify + dedup mode. An unparseable datagram can't be keyed, so forward it rather than
+        // silently drop (loss-averse; it simply isn't deduped).
+        let Some(meta) = parse::parse(&pkt) else {
+            fan_out(&socks, &pkt).await;
+            continue;
+        };
+        parsed += 1;
+
+        let leader = schedule.leader(meta.slot).await;
+        let action = {
+            let mut verify_fn = || {
+                verify_calls += 1;
+                let ok = leader.as_ref().is_some_and(|pk| verify::verify(&meta, pk));
+                if ok {
+                    verify_ok += 1;
+                }
+                ok
+            };
+            window.decide(
+                meta.slot,
+                meta.index,
+                meta.shred_type,
+                leader.is_some(),
+                &mut verify_fn,
+            )
+        };
+        match action {
+            Action::Forward => {
+                forwarded += 1;
+                fan_out(&socks, &pkt).await;
             }
+            Action::Drop => dropped += 1,
+        }
+
+        if parsed.is_multiple_of(VERIFY_LOG_EVERY) {
+            info!(
+                parsed,
+                forwarded,
+                dropped,
+                verify_calls,
+                verify_ok,
+                tracked_slots = window.tracked_slots(),
+                "shred forwarder dedup/verify tally"
+            );
         }
     }
     info!("shred forwarder channel closed; exiting");
     Ok(())
+}
+
+/// Fan one datagram out to every connected destination socket, logging and skipping any that fails.
+async fn fan_out(socks: &[(SocketAddr, UdpSocket)], pkt: &[u8]) {
+    for (dst, sock) in socks {
+        if let Err(e) = sock.send(pkt).await {
+            warn!(%dst, %e, "shred forward send failed; skipping this destination");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +524,8 @@ mod tests {
             recv_buf: 1 << 20,
             sources: vec![src],
             forward: vec![d1, d2],
+            rpc_url: None,
+            dedup_window_slots: 512,
         };
         let handle = tokio::spawn(run(cfg));
 
@@ -441,6 +573,8 @@ mod tests {
             recv_buf: 1 << 20,
             sources: vec![src],
             forward: vec![dead, live_addr], // dead first: it must not stop the live one after it
+            rpc_url: None,
+            dedup_window_slots: 512,
         };
         let handle = tokio::spawn(run(cfg));
 

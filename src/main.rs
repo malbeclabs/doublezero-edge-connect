@@ -92,6 +92,21 @@ struct Args {
     /// entirely (for tests/edge cases). When set, the shred forwarder runs even without the CLI.
     #[arg(long = "shred-source", env = "DZ_SHRED_SOURCES", value_delimiter = ',')]
     shred_sources: Vec<String>,
+
+    /// Shred forwarder: Solana JSON-RPC endpoint for the leader schedule. Setting it enables
+    /// signature verification + deduplication (forward exactly one valid copy of each shred). Unset
+    /// = forward every datagram (no dedup/sigverify).
+    #[arg(long = "shred-rpc-url", env = "DZ_SHRED_RPC_URL")]
+    shred_rpc_url: Option<String>,
+
+    /// Shred forwarder: dedup window depth in slots. Keys older than this many slots behind the tip
+    /// are evicted, bounding memory. Only used when `--shred-rpc-url` is set.
+    #[arg(
+        long = "shred-dedup-window-slots",
+        env = "DZ_SHRED_DEDUP_WINDOW_SLOTS",
+        default_value_t = 512
+    )]
+    shred_dedup_window_slots: u64,
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -179,6 +194,8 @@ async fn main() -> Result<()> {
             recv_buf: args.recv_buf,
             sources: shred_sources,
             forward: shred_forward,
+            rpc_url: args.shred_rpc_url.clone(),
+            dedup_window_slots: args.shred_dedup_window_slots,
         };
         info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
         Some(tokio::spawn(shred::run(shred_cfg)))

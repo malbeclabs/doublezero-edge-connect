@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Shred forwarder sigverify + dedup (#25): when `--shred-rpc-url` (`DZ_SHRED_RPC_URL`) is
+  set, the forwarder forwards exactly **one valid copy** of each shred. A bounded,
+  prefer-valid dedup window keyed by `(slot, index, type)` (`--shred-dedup-window-slots`,
+  default `512`) drops duplicates of an already-forwarded copy without a signature check;
+  the first copy of a key is ed25519-verified against its slot leader (fetched per epoch
+  via `getLeaderSchedule`/`getEpochInfo`) over the legacy payload or recomputed merkle
+  root; an invalid copy is dropped but leaves the key open so a later valid copy can still
+  win. A slot whose leader isn't known yet fails open (forwarded, not deduped). Without
+  `--shred-rpc-url`, behaviour is unchanged (forward every datagram). New deps:
+  `ed25519-dalek`, `sha2`, `bs58`, `reqwest` (rustls). ⚠️ The shred/merkle byte offsets are
+  transcribed from the agave layout and are **not** validated against a live `edge-solana-*`
+  hexdump (same status as the repo's unvalidated sibling codecs); the forwarder logs a
+  one-time warning and a periodic verify tally so a misparse is visible.
 - Shred forwarder (`src/shred/`): joins the DoubleZero `edge-solana-*` shred multicast
   feeds, combines them, and fans each datagram out to one or more local UDP destinations
   (no dedup / no signature verification yet). Sources are discovered via `doublezero
