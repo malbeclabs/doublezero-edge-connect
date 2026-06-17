@@ -19,6 +19,10 @@ on:
       - .github/workflows/release.docker.edge-connect.poll.yml
   workflow_dispatch: {}
 
+# Least-privilege default; the publish/smoke jobs widen this per job as needed.
+permissions:
+  contents: read
+
 jobs:
   # Resolve the release version once: the vX.Y.Z tag with leading v stripped, or
   # empty for non-tag builds (which then publish moving tags only).

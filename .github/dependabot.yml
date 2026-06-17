@@ -1,0 +1,30 @@
+# Dependabot keeps Cargo crates and the SHA-pinned GitHub Actions up to date.
+# Mirrors the grouping style of malbeclabs/doublezero, trimmed to this single Rust
+# crate (no Go/Solana ecosystems here).
+version: 2
+updates:
+  # Rust crates. Grouped so routine minor/patch bumps land in one PR, with the async
+  # and serialization stacks split out (they tend to move together and need attention).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      rust-minor-patch:
+        update-types: [minor, patch]
+      tokio:
+        patterns: ["tokio*", "tokio-*", "futures-*"]
+      serde:
+        patterns: ["serde", "serde_*"]
+
+  # GitHub Actions are pinned to commit SHAs (see .github/workflows/*). Dependabot
+  # bumps the SHA and the trailing version comment when a new release ships.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
