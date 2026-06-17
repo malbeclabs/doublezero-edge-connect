@@ -11,6 +11,10 @@ pub const MBO_MAGIC: u16 = 0x4444;
 /// by the publisher's `encode_packets` function. The splitter walks by the 4-byte u32 LE
 /// length prefix to find each frame boundary, then checks that the frame's first two bytes
 /// match the expected protocol magic. Both checks double as fixture format validation.
+///
+/// The `assert!`/`assert_eq!` panics here are intentional — vendored goldens should fail
+/// loud on corruption; switch to `Result` only if fixtures ever come from a less-trusted
+/// generator.
 pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     let mut off = 0usize;
@@ -62,6 +66,9 @@ fn multicast_sender() -> std::io::Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_multicast_loop_v4(true)?;
     sock.set_multicast_ttl_v4(1)?;
+    // TODO(#3): multi-source replay needs distinct src IPs + a re-sequenced fixture; all
+    // datagrams here share one source IP, so independent-publisher MBO demux can't be
+    // exercised yet.
     sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
     Ok(sock)
 }

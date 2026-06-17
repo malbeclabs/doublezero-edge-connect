@@ -52,6 +52,22 @@ pub fn instrument_before_price(msgs: &[Value]) {
 /// assertion catches missing dedup. Do NOT add `recv_ts_ns` to any key arm — that
 /// gives each copy a distinct key and defeats the oracle.
 ///
+/// **Quote arm:** `source_ts_ns` is venue-assigned content (identical across publishers
+/// for the same update); the transport sequence number is NOT, which is why
+/// content + source_ts is the right cross-publisher identity and a seqnum would not be.
+///
+/// **Trade arm:** `trade_id` is treated as globally unique for the run. A real
+/// multi-publisher trade deduper will be WINDOWED (bounded memory) and can only collapse
+/// copies within the window, so this oracle assumes window >= worst-case inter-publisher
+/// lag.
+///
+/// **Depth arm:** identity is content-inclusive (venue + symbol + source_ts_ns + bids +
+/// asks). Keying on source_ts_ns alone would false-fail when two publishers emit the
+/// same snapshot at the same event timestamp but with different book content (a valid
+/// divergence), and would false-collapse snapshots from a batch split across frames.
+/// Including the book content means identical state → true duplicate (correctly flagged)
+/// and different state → different key (no false fail).
+///
 /// **Known limitation — `source_ts_ns == 0` collisions.** Two genuinely distinct
 /// quotes that both have `source_ts_ns == 0` (the "unknown" sentinel) and identical
 /// bid/ask/sizes share the same key and produce a false-positive duplicate failure.
@@ -78,11 +94,16 @@ pub fn no_business_duplicates(msgs: &[Value]) {
                 s(m, "symbol"),
                 u(m, "trade_id")
             ),
+            // Depth identity is content-inclusive: venue + symbol + source_ts_ns + book state.
+            // Two snapshots that share source_ts_ns but differ in bids/asks are not duplicates
+            // (batch split or publisher divergence); two that match on all fields are.
             "depth" => format!(
-                "d|{}|{}|{}",
+                "d|{}|{}|{}|{}|{}",
                 s(m, "venue"),
                 s(m, "symbol"),
-                u(m, "source_ts_ns")
+                u(m, "source_ts_ns"),
+                m.get("bids").map(|v| v.to_string()).unwrap_or_default(),
+                m.get("asks").map(|v| v.to_string()).unwrap_or_default(),
             ),
             _ => continue,
         };

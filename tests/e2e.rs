@@ -139,6 +139,8 @@ async fn tob_single_publisher_contract() {
     assertions::trades_well_formed(&msgs);
 
     let quote_count = ws_client::by_type(&msgs, "quote").len();
+    // Baseline assumes no republish-suppression (BBO content-dedup). Whoever lands dedup (#3)
+    // must re-pin this deliberately; the "regressed" message is only correct under that assumption.
     assert_eq!(quote_count, 41, "TOB quote count regressed");
 }
 
