@@ -139,30 +139,14 @@ async fn tob_single_publisher_contract() {
     assertions::trades_well_formed(&msgs);
 
     let quotes = ws_client::by_type(&msgs, "quote");
-    // Content-dedup (#3) suppresses unchanged-BBO republishes, so every emitted quote is a distinct
-    // top-of-book state (only `source_ts` differed among the collapsed ones).
-    let distinct: std::collections::HashSet<String> = quotes
-        .iter()
-        .map(|q| {
-            format!(
-                "{}|{}|{}|{}|{}",
-                q.get("symbol").and_then(|v| v.as_str()).unwrap_or(""),
-                q.get("bid").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                q.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                q.get("bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                q.get("ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            )
-        })
-        .collect();
+    // Identity dedup keys on (venue, symbol, source_ts, content): for a single publisher whose
+    // quotes each carry a distinct source_ts, it is a no-op (no two copies share the identity), so
+    // the count is the raw distinct-(source_ts,content) quote count — NOT collapsed to distinct BBO
+    // content the way the old adjacent content fingerprint was.
     assert_eq!(
         quotes.len(),
-        distinct.len(),
-        "every emitted quote must be a distinct BBO after content-dedup"
-    );
-    assert_eq!(
-        quotes.len(),
-        7,
-        "TOB single-publisher quote count after BBO republish-suppression (was 41 pre-dedup)"
+        41,
+        "TOB single-publisher quote count under identity dedup (no-op for distinct-source_ts quotes; was 7 under the old adjacent content fingerprint)"
     );
 }
 

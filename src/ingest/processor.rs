@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        arbiter::{BboDedup, TradeDeduper, WireBbo},
+        arbiter::{QuoteId, WindowedDedup},
         book::{BookState, DeltaKind, DeltaOp},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -38,6 +38,11 @@ const DEPTH_LEVELS: usize = 10;
 /// Recent trade IDs remembered per (venue, symbol) for cross-publisher trade dedup. Const for now;
 /// promote to config alongside the multi-publisher trade test that can size it.
 const TRADE_DEDUP_WINDOW: usize = 8192;
+
+/// Recent quote identities remembered per (venue, symbol) for cross-publisher quote dedup. Sized to
+/// exceed the worst-case number of distinct BBO samples between two publishers' copies of the same
+/// update; Const for now, promote to config alongside the multi-publisher tuning data.
+const QUOTE_DEDUP_WINDOW: usize = 8192;
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
@@ -79,11 +84,12 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
-    /// Cross-publisher quote dedup: suppresses a quote whose top-of-book content matches the last
-    /// emitted for (venue, symbol) — a republish or a competing publisher's duplicate.
-    quote_dedup: BboDedup<(String, String)>,
+    /// Cross-publisher quote dedup: suppresses a quote whose windowed BBO identity (`source_ts` +
+    /// content + exponents) was already emitted for (venue, symbol) — a republish or a competing
+    /// publisher's duplicate. A fresh `source_ts` is a new sample and is kept.
+    quote_dedup: WindowedDedup<(String, String), QuoteId>,
     /// Cross-publisher trade dedup by venue trade_id per (venue, symbol).
-    trade_dedup: TradeDeduper<(String, String)>,
+    trade_dedup: WindowedDedup<(String, String), u64>,
 }
 
 impl TobProcessor {
@@ -94,16 +100,16 @@ impl TobProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
-            quote_dedup: BboDedup::default(),
-            trade_dedup: TradeDeduper::new(TRADE_DEDUP_WINDOW),
+            quote_dedup: WindowedDedup::new(QUOTE_DEDUP_WINDOW),
+            trade_dedup: WindowedDedup::new(TRADE_DEDUP_WINDOW),
         }
     }
 
-    /// Whether this quote should be forwarded: false if its BBO content matches the last emitted
+    /// Whether this quote should be forwarded: false if its windowed BBO identity was already seen
     /// for (venue, symbol).
-    fn admit_quote(&mut self, venue: &str, symbol: &str, bbo: WireBbo) -> bool {
+    fn admit_quote(&mut self, venue: &str, symbol: &str, id: QuoteId) -> bool {
         self.quote_dedup
-            .should_emit((venue.to_string(), symbol.to_string()), bbo)
+            .is_new((venue.to_string(), symbol.to_string()), id)
     }
 
     /// Whether this trade should be forwarded: false if its trade_id was seen recently.
@@ -255,10 +261,11 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    // Cross-publisher dedup on top-of-book content (timestamp-excluded): a competing
-                    // publisher's identical BBO, or an unchanged-BBO republish, is suppressed.
-                    let bbo = WireBbo {
-                        update_flags: q.update_flags,
+                    // Cross-publisher dedup on the windowed BBO identity (source_ts + content +
+                    // exponents): a competing publisher's identical copy of the same update is
+                    // suppressed, while a fresh source_ts (a new top-of-book sample) is kept.
+                    let id = QuoteId {
+                        source_ts: q.source_ts,
                         bid_price_raw: q.bid_price_raw,
                         bid_qty_raw: q.bid_qty_raw,
                         ask_price_raw: q.ask_price_raw,
@@ -266,7 +273,7 @@ impl FrameProcessor for TobProcessor {
                         price_exponent: def.price_exponent,
                         qty_exponent: def.qty_exponent,
                     };
-                    if self.admit_quote(&quote.venue, &quote.symbol, bbo) {
+                    if self.admit_quote(&quote.venue, &quote.symbol, id) {
                         let _ = ctx.tx.send(FeedMessage::Quote(quote));
                     }
                 }
@@ -677,7 +684,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor, TobProcessor, WireBbo};
+    use super::{upsert_instrument, MboProcessor, QuoteId, TobProcessor};
     use crate::{
         ingest::{
             codec_mbo::{
@@ -690,9 +697,9 @@ mod tests {
         model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
     };
 
-    fn tob_bbo(bid_price: i64, ask_price: i64) -> WireBbo {
-        WireBbo {
-            update_flags: 0,
+    fn tob_qid(source_ts: u64, bid_price: i64, ask_price: i64) -> QuoteId {
+        QuoteId {
+            source_ts,
             bid_price_raw: bid_price,
             bid_qty_raw: 1,
             ask_price_raw: ask_price,
@@ -705,10 +712,12 @@ mod tests {
     #[test]
     fn tob_quote_dedup_collapses_identical_content() {
         let mut p = TobProcessor::new(true);
-        assert!(p.admit_quote("Hyperliquid", "BTC", tob_bbo(100, 101)));
-        assert!(!p.admit_quote("Hyperliquid", "BTC", tob_bbo(100, 101))); // duplicate
-        assert!(p.admit_quote("Hyperliquid", "BTC", tob_bbo(100, 102))); // ask moved
-        assert!(p.admit_quote("Hyperliquid", "ETH", tob_bbo(100, 101))); // independent symbol
+        // Same (source_ts, content) identity collapses; a fresh source_ts is a new sample.
+        assert!(p.admit_quote("Hyperliquid", "BTC", tob_qid(1000, 100, 101)));
+        assert!(!p.admit_quote("Hyperliquid", "BTC", tob_qid(1000, 100, 101))); // duplicate
+        assert!(p.admit_quote("Hyperliquid", "BTC", tob_qid(2000, 100, 101))); // same content, new source_ts
+        assert!(p.admit_quote("Hyperliquid", "BTC", tob_qid(1000, 100, 102))); // ask moved
+        assert!(p.admit_quote("Hyperliquid", "ETH", tob_qid(1000, 100, 101))); // independent symbol
     }
 
     #[test]
