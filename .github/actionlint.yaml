@@ -1,0 +1,4 @@
+# actionlint config. The workflows here only run on the default GitHub-hosted
+# ubuntu-latest runner, so no self-hosted runner labels need declaring.
+self-hosted-runner:
+  labels: []

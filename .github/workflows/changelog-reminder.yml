@@ -1,0 +1,46 @@
+name: changelog-reminder
+
+# Nudges contributors to keep CHANGELOG.md current. Fails a PR that changes code but
+# leaves the changelog untouched, unless it carries the `skip-changelog` label.
+# Ported from malbeclabs/doublezero (.github/workflows/changelog-reminder.yml).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Require CHANGELOG.md update (or skip-changelog label)
+        shell: bash
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS" | grep -q '"skip-changelog"'; then
+            echo "skip-changelog label present — skipping changelog check."
+            exit 0
+          fi
+
+          base="${GITHUB_BASE_REF:-}"
+          if [ -z "$base" ]; then
+            base="$(git remote show origin | sed -n 's/.*HEAD branch: //p')"
+          fi
+          git fetch --quiet origin "$base"
+
+          changed="$(git diff --name-only "origin/${base}...HEAD")"
+          echo "Changed files:"; echo "$changed"
+
+          if echo "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "CHANGELOG.md updated. ✓"
+            exit 0
+          fi
+
+          echo "::error::CHANGELOG.md was not updated. Add an entry, or apply the 'skip-changelog' label if this change does not warrant one."
+          exit 1

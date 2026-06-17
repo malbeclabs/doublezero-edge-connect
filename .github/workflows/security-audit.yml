@@ -1,0 +1,34 @@
+name: security-audit
+
+# Supply-chain audit of the Cargo dependency tree via cargo-deny: known RUSTSEC
+# advisories, disallowed/duplicate crates, license policy, and source allow-listing
+# (config in deny.toml). The weekly schedule catches newly-disclosed CVEs even when
+# no code changes land.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/security-audit.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/security-audit.yml"
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@8a45e1c7c9a95dfae3276e89a553705e40ae45a2 # v2.0.20
+        with:
+          command: check advisories bans licenses sources
