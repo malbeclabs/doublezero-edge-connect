@@ -1,7 +1,7 @@
 //! Decoder for the DoubleZero Edge Top-of-Book & Trades feed (schema v1).
 //!
-//! Little-endian, fixed-size binary frames. Mirrors the Python codec in
-//! `arb/feeds/dz_edge/codec.py`. See https://github.com/malbeclabs/edge-feed-spec. The frame
+//! Little-endian, fixed-size binary frames, defined by the edge-feed-spec
+//! (https://github.com/malbeclabs/edge-feed-spec). The frame
 //! header, message header, little-endian readers and the generic frame-walker are shared with
 //! the sibling protocols in [`crate::ingest::codec_common`].
 

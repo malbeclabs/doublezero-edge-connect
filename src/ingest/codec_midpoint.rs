@@ -8,7 +8,7 @@
 //! `Midpoint` message.
 //!
 //! ⚠️ Byte offsets below come from the edge-feed-spec draft, **not** a byte-validated reference
-//! codec (unlike Top-of-Book, which is validated against `arb/feeds/dz_edge/codec.py`). They must
+//! codec (unlike Top-of-Book, which is byte-validated against a reference codec). They must
 //! be confirmed against a live frame hexdump before this decoder's output is trusted in
 //! production - the round-trip test here only pins internal self-consistency.
 

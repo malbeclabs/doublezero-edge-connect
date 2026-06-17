@@ -12,8 +12,8 @@ sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`
 `midpoint`), and **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it as full-state `depth`). Each feed maps to one venue. The input (multicast/binary) is
 an implementation detail; the *only* external contract is the WebSocket output, fully specified in
-**PROTOCOL.md** (v1). NautilusTrader (`arb/adapters/bridge/`, a separate repo) is the reference
-consumer but is not part of the protocol.
+**PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
+consumer is not part of the protocol.
 
 ## Commands
 
@@ -68,8 +68,7 @@ Modules are grouped by role under `src/`:
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).
   **`codec.rs` (TOB) offsets are validated byte-for-byte** against the authoritative Go decoder in
-  `edge-multicast-ref` and mirror `arb/feeds/dz_edge/codec.py` — **do not change them without
-  re-validating**. ⚠️ **`codec_midpoint.rs`/`codec_mbo.rs` offsets come from the edge-feed-spec
+  `edge-multicast-ref` — **do not change them without re-validating**. ⚠️ **`codec_midpoint.rs`/`codec_mbo.rs` offsets come from the edge-feed-spec
   draft and are NOT reference-validated**; their round-trip tests only pin self-consistency, so
   validate against a live frame hexdump before trusting their output (see "Conventions" below).
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
@@ -82,7 +81,7 @@ Modules are grouped by role under `src/`:
   per instrument, not on `ready()`**: a processor emits as soon as `definition(id)` resolves, so
   consumers never see a price before its precision, but a single symbol flows without waiting for
   the full set (an all-or-nothing gate could wedge the feed on a startup/reset race). Uses
-  wraparound-safe u16 sequence comparison (`is_later`). Mirrors `arb/feeds/dz_edge/subscriber.py`.
+  wraparound-safe u16 sequence comparison (`is_later`).
 - **`sinks/ws.rs`** — fans the broadcast out to clients (on by default; disable with an empty
   `--ws-bind`). On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Implements the

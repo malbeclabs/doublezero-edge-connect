@@ -1,7 +1,7 @@
 //! Reference-data subscriber state machine (DoubleZero Edge reference-data supplement).
 //!
-//! Mirrors `arb/feeds/dz_edge/subscriber.py`: collect instrument definitions tagged with
-//! the latest `ManifestSummary` sequence, decide `ready()`, and reset on a channel reset.
+//! Collects instrument definitions tagged with the latest `ManifestSummary` sequence,
+//! decides `ready()`, and resets on a channel reset.
 //!
 //! The state machine is identical across the edge-feed-spec protocols (Top-of-Book, Midpoint,
 //! Market-by-Order), which differ only in their instrument-definition *layout*, so it is generic

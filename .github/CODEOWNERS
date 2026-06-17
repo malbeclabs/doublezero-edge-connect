@@ -1,0 +1,3 @@
+# Default owners for everything in the repo. Listed owners are requested for
+# review on every PR (enforced once branch protection requires CODEOWNERS review).
+* @juan-malbeclabs @ben-dz

@@ -5,8 +5,7 @@ An **engine-agnostic** WebSocket protocol for streaming normalized two-sided top
 plain JSON, and is independent of any trading framework.
 
 `doublezero-edge-connect` is the **reference producer** (it ingests the DoubleZero Edge binary multicast feed
-and re-serves it in this format), and the NautilusTrader adapter is the **reference consumer**
-- but neither is part of the protocol. Any engine that can open a WebSocket and parse JSON can
+and re-serves it in this format) - but it is not part of the protocol. Any engine that can open a WebSocket and parse JSON can
 consume it by writing a thin (~50-100 line) adapter to its own internal types. The producer's
 *input* (multicast, binary, etc.) is an implementation detail; only the *output* below is the
 contract.
@@ -317,12 +316,11 @@ on connect:
   reply Pong to Ping; reconnect on close.
 ```
 
-### Reference consumers
+### Writing a consumer
 
-- **NautilusTrader** - `arb/adapters/bridge/` (Python): maps `instrument` -> `CryptoPerpetual`
-  and `quote` -> `QuoteTick`. ~100 lines; all the framework coupling lives there, none on the wire.
-- **Any other engine** (Freqtrade, Hummingbot, a custom bot in Rust/Go/Python): implement the
-  loop above against your engine's instrument/quote types.
+- **Any engine** (Freqtrade, Hummingbot, a custom bot in Rust/Go/Python): implement the loop
+  above against your engine's instrument/quote types. ~100 lines; all the framework coupling
+  lives in the adapter, none on the wire.
 
 ## Conventions
 

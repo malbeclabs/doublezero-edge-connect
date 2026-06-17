@@ -45,7 +45,7 @@ UDP ports, gated by a reference-data state machine. Great for latency, painful t
 
 ```
 DZ Edge sources ──multicast──▶  doublezero-edge-connect  ──WebSocket (JSON)──▶  your engine
-  (binary, 2 ports/venue)         (decode · normalize)        ws://host:8081      (NautilusTrader, …)
+  (binary, 2 ports/venue)         (decode · normalize)        ws://host:8081      (any WS+JSON engine)
 ```
 
 The binary multicast, the two-port split, the manifest/precision handshake: all of it stays on this
@@ -89,8 +89,7 @@ On connect you first get the current instrument definitions (precision), then a 
 ```
 
 Any engine that speaks WebSocket + JSON consumes it with a thin (~50-100 line) adapter, see
-[PROTOCOL.md → Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine). **NautilusTrader** is
-the reference consumer (`arb/adapters/bridge/`).
+[PROTOCOL.md → Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine).
 
 ---
 
