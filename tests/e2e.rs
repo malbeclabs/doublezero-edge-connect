@@ -139,15 +139,14 @@ async fn tob_single_publisher_contract() {
     assertions::trades_well_formed(&msgs);
 
     let quotes = ws_client::by_type(&msgs, "quote");
-    // Freshest-wins dedup keeps a per-(venue, symbol) source_ts high-watermark: only strictly-newer
-    // BBOs are emitted. For a single publisher whose quotes carry strictly-increasing source_ts it
-    // admits every sample (the watermark advances each time), so the count equals the raw distinct
-    // quote count — 41. (A drop below 41 here would mean this publisher's source_ts are NOT
-    // monotonic, which would be worth investigating.)
+    // The quote dedup is a per-(venue, symbol) source_ts staleness floor keyed on raw BBO content: it
+    // keeps every distinct (source_ts, content) at a non-decreasing floor and drops only strictly-
+    // older replays and exact duplicates. A single publisher delivers each of its samples once with
+    // non-decreasing source_ts, so none are stale and none are exact duplicates — all 41 are emitted.
     assert_eq!(
         quotes.len(),
         41,
-        "TOB single-publisher quote count under freshest-wins source_ts watermark (all 41 samples have strictly-increasing source_ts, so none are dropped)"
+        "TOB single-publisher quote count under the source_ts staleness floor (no stale replays or exact dupes from one publisher, so all 41 distinct samples emit)"
     );
 }
 

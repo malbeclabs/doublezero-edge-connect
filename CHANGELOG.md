@@ -59,12 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-publisher Top-of-Book deduplication: when several independent publishers mirror one feed
   onto a multicast group, the bridge merges them into one clean stream. Datagrams are demultiplexed
   by source IP (`FrameCtx.publisher`); the frame-sequence tracker is per-publisher so a slower
-  publisher's frames aren't dropped before dedup. Quotes, being full-state BBOs, dedup on a
-  per-`(venue, symbol)` freshest-wins `source_ts` high-watermark: only strictly-newer samples are
-  emitted, so a lagging publisher's stale BBO (the market has moved on) and any duplicate are
-  dropped and the output is monotonic per symbol. Trades, being point-in-time events, dedup on a
-  windowed `(venue, symbol, trade_id)` identity so every distinct print is kept. (Market-by-Order
-  depth dedup is tracked separately.)
+  publisher's frames aren't dropped before dedup. Quotes dedup on a per-`(venue, symbol)` `source_ts`
+  staleness floor keyed on raw BBO content: it keeps every distinct top-of-book change at the newest
+  `source_ts` (including multiple distinct BBOs that share a `source_ts` — real intra-tick updates,
+  matching the `hl-bbo-feed-race` `(symbol, source_ts, bbo_hash)` identity) but drops a lagging
+  publisher's strictly-older BBO (stale: the market moved on) and any exact `(source_ts, content)`
+  duplicate, so the emitted `source_ts` is non-decreasing (not strictly increasing) per symbol.
+  Trades, being point-in-time events, dedup on a windowed `(venue, symbol, trade_id)` identity so
+  every distinct print is kept. (Market-by-Order depth dedup is tracked separately.)
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry

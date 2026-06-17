@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        arbiter::{Watermark, WindowedDedup},
+        arbiter::{StalenessFloor, WindowedDedup},
         book::{BookState, DeltaKind, DeltaOp},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -38,6 +38,22 @@ const DEPTH_LEVELS: usize = 10;
 /// Recent trade IDs remembered per (venue, symbol) for cross-publisher trade dedup. Const for now;
 /// promote to config alongside the multi-publisher trade test that can size it.
 const TRADE_DEDUP_WINDOW: usize = 8192;
+
+/// The raw top-of-book identity of a quote, used as the per-tick content key for the quote dedup
+/// floor. Compares the raw fixed-point BBO fields **plus the instrument exponents** and EXCLUDES
+/// `source_ts` (tracked separately by the floor): two BBOs with the same raw ints but different
+/// exponents are distinct prices, and the exponents are carried so a registry/precision change can't
+/// false-dedup them. Identical content at the same `source_ts` — a republish or the other
+/// publisher's copy — is a true duplicate.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct QuoteContent {
+    bid_price_raw: i64,
+    bid_qty_raw: u64,
+    ask_price_raw: i64,
+    ask_qty_raw: u64,
+    price_exponent: i8,
+    qty_exponent: i8,
+}
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
@@ -79,11 +95,12 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
-    /// Cross-publisher quote dedup: a per-(venue, symbol) freshest-wins `source_ts` high-watermark.
-    /// A full-state BBO is a snapshot, so only a strictly-newer sample carries information — an older
-    /// BBO from a lagging publisher is stale (the market moved on) and is dropped, as is an exact or
-    /// same-`source_ts` duplicate. Output is freshest-only and monotonic per (venue, symbol).
-    quote_dedup: Watermark<(String, String)>,
+    /// Cross-publisher quote dedup: a per-(venue, symbol) `source_ts` staleness floor keyed on raw
+    /// BBO content. Keeps every distinct top-of-book change at the newest `source_ts` (incl. multiple
+    /// distinct BBOs sharing a `source_ts` — real intra-tick changes), but drops a strictly-older BBO
+    /// from a lagging publisher (stale: the market moved on) and any exact `(source_ts, content)`
+    /// duplicate. Output `source_ts` is non-decreasing per (venue, symbol).
+    quote_dedup: StalenessFloor<(String, String), QuoteContent>,
     /// Cross-publisher trade dedup by venue trade_id per (venue, symbol).
     trade_dedup: WindowedDedup<(String, String), u64>,
 }
@@ -96,16 +113,24 @@ impl TobProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
-            quote_dedup: Watermark::new(),
+            quote_dedup: StalenessFloor::new(),
             trade_dedup: WindowedDedup::new(TRADE_DEDUP_WINDOW),
         }
     }
 
-    /// Whether this quote should be forwarded: true only if `source_ts` is strictly newer than the
-    /// last emitted for (venue, symbol). Drops stale and duplicate full-state BBOs (freshest-wins).
-    fn admit_quote(&mut self, venue: &str, symbol: &str, source_ts: u64) -> bool {
+    /// Whether this quote should be forwarded under the per-(venue, symbol) staleness floor: true if
+    /// `source_ts` is at or beyond the floor AND its `content` is new at that tick. Drops strictly-
+    /// older (stale laggard) BBOs and exact `(source_ts, content)` duplicates; keeps distinct intra-
+    /// tick BBO changes.
+    fn admit_quote(
+        &mut self,
+        venue: &str,
+        symbol: &str,
+        source_ts: u64,
+        content: QuoteContent,
+    ) -> bool {
         self.quote_dedup
-            .admit((venue.to_string(), symbol.to_string()), source_ts)
+            .admit((venue.to_string(), symbol.to_string()), source_ts, content)
     }
 
     /// Whether this trade should be forwarded: false if its trade_id was seen recently.
@@ -257,11 +282,20 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    // Cross-publisher dedup on a per-(venue, symbol) freshest-wins source_ts
-                    // watermark: a full-state BBO is a snapshot, so an older sample from a lagging
-                    // publisher is stale (the market moved on) and is dropped, as are exact and
-                    // same-source_ts duplicates. Only strictly-newer BBOs are emitted (monotonic).
-                    if self.admit_quote(&quote.venue, &quote.symbol, quote.source_ts_ns) {
+                    // Cross-publisher dedup on a per-(venue, symbol) source_ts staleness floor keyed
+                    // on raw BBO content: a strictly-older sample from a lagging publisher is stale
+                    // (the market moved on) and is dropped, as is an exact (source_ts, content)
+                    // duplicate, but a distinct BBO change at the current source_ts is kept. Output
+                    // source_ts is non-decreasing per (venue, symbol).
+                    let content = QuoteContent {
+                        bid_price_raw: q.bid_price_raw,
+                        bid_qty_raw: q.bid_qty_raw,
+                        ask_price_raw: q.ask_price_raw,
+                        ask_qty_raw: q.ask_qty_raw,
+                        price_exponent: def.price_exponent,
+                        qty_exponent: def.qty_exponent,
+                    };
+                    if self.admit_quote(&quote.venue, &quote.symbol, quote.source_ts_ns, content) {
                         let _ = ctx.tx.send(FeedMessage::Quote(quote));
                     }
                 }
@@ -672,7 +706,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor, TobProcessor};
+    use super::{upsert_instrument, MboProcessor, QuoteContent, TobProcessor};
     use crate::{
         ingest::{
             codec_mbo::{
@@ -686,14 +720,29 @@ mod tests {
     };
 
     #[test]
-    fn tob_quote_dedup_is_freshest_wins() {
+    fn tob_quote_dedup_is_staleness_floor() {
         let mut p = TobProcessor::new(true);
-        // Freshest-wins source_ts watermark per (venue, symbol).
-        assert!(p.admit_quote("Hyperliquid", "BTC", 1000)); // first sample emits
-        assert!(!p.admit_quote("Hyperliquid", "BTC", 1000)); // equal source_ts dropped
-        assert!(!p.admit_quote("Hyperliquid", "BTC", 999)); // older (stale) dropped
-        assert!(p.admit_quote("Hyperliquid", "BTC", 2000)); // newer emits
-        assert!(p.admit_quote("Hyperliquid", "ETH", 1000)); // independent symbol's watermark
+        // Two distinct BBO contents that can share a source_ts (a real intra-tick change).
+        let c1 = QuoteContent {
+            bid_price_raw: 100,
+            bid_qty_raw: 5,
+            ask_price_raw: 101,
+            ask_qty_raw: 8,
+            price_exponent: -2,
+            qty_exponent: 0,
+        };
+        let c2 = QuoteContent {
+            bid_price_raw: 100,
+            bid_qty_raw: 6, // bid size changed
+            ..c1
+        };
+        // Per-(venue, symbol) staleness floor.
+        assert!(p.admit_quote("Hyperliquid", "BTC", 1000, c1)); // first sample emits
+        assert!(!p.admit_quote("Hyperliquid", "BTC", 1000, c1)); // exact (ts, content) dup dropped
+        assert!(p.admit_quote("Hyperliquid", "BTC", 1000, c2)); // NEW content at SAME tick -> KEPT
+        assert!(!p.admit_quote("Hyperliquid", "BTC", 999, c1)); // strictly older (stale) dropped
+        assert!(p.admit_quote("Hyperliquid", "BTC", 2000, c1)); // new tick emits; content set resets
+        assert!(p.admit_quote("Hyperliquid", "ETH", 1000, c1)); // independent symbol's floor
     }
 
     #[test]

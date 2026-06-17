@@ -2,8 +2,10 @@
 //! `TobProcessor` in capture order and assert the dedup contract holds across publishers. This is
 //! the cross-publisher counterpart to `tob_single_publisher_contract` in `e2e.rs`: the fixture
 //! carries two independent publishers mirroring the same Hyperliquid feed. Quotes dedup by a
-//! per-(venue, symbol) freshest-wins `source_ts` high-watermark, so a lagging publisher's stale BBO
-//! and any duplicate are dropped and the emitted stream is monotonic per symbol.
+//! per-(venue, symbol) `source_ts` staleness floor: a lagging publisher's strictly-older BBO and any
+//! exact `(source_ts, content)` duplicate are dropped, but every distinct top-of-book change at the
+//! newest `source_ts` is kept (incl. multiple distinct BBOs sharing a `source_ts`), so the emitted
+//! `source_ts` is non-decreasing — not strictly increasing — per symbol.
 
 mod common;
 
@@ -118,10 +120,12 @@ fn emitted_quotes_by_symbol(msgs: &[Value]) -> HashMap<String, usize> {
     counts
 }
 
-/// Assert that emitted quotes are strictly increasing in `source_ts_ns` per (venue, symbol). This is
-/// the freshest-wins contract: a lagging publisher's stale BBO must never appear out of order on the
-/// wire. Fails (proving the assertion bites) if the watermark is bypassed.
-fn assert_quote_source_ts_strictly_increasing(msgs: &[Value]) {
+/// Assert that emitted quotes are non-decreasing in `source_ts_ns` per (venue, symbol). This is the
+/// staleness-floor contract: a lagging publisher's strictly-older BBO must never appear out of order
+/// on the wire, but distinct BBO changes that share a `source_ts` (real intra-tick updates) are kept,
+/// so the sequence is non-decreasing, NOT strictly increasing. Fails (proving the assertion bites)
+/// if the floor is bypassed and an older quote is emitted.
+fn assert_quote_source_ts_non_decreasing(msgs: &[Value]) {
     let mut last: HashMap<(String, String), u64> = HashMap::new();
     for m in msgs.iter().filter(|m| m["type"] == "quote") {
         let venue = m["venue"].as_str().unwrap_or_default().to_string();
@@ -129,49 +133,52 @@ fn assert_quote_source_ts_strictly_increasing(msgs: &[Value]) {
         let ts = m["source_ts_ns"].as_u64().expect("quote has source_ts_ns");
         if let Some(prev) = last.insert((venue.clone(), symbol.clone()), ts) {
             assert!(
-                ts > prev,
-                "{venue}/{symbol}: emitted source_ts_ns not strictly increasing ({prev} -> {ts})"
+                ts >= prev,
+                "{venue}/{symbol}: emitted source_ts_ns went backwards ({prev} -> {ts})"
             );
         }
     }
 }
 
 #[test]
-fn two_publishers_freshest_wins_no_stale_or_dupes() {
+fn two_publishers_staleness_floor_no_stale_or_dupes() {
     let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
     let msgs = replay(&recs);
-    // No two emitted quotes share the oracle's business identity (duplicates dropped).
+    // No two emitted quotes share the oracle's business identity (exact duplicates dropped).
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
-    // Freshest-wins: per (venue, symbol) the emitted source_ts is strictly increasing — a lagging
-    // publisher's stale or duplicate BBO is never emitted.
-    assert_quote_source_ts_strictly_increasing(&msgs);
+    // Staleness floor: per (venue, symbol) the emitted source_ts is non-decreasing — a lagging
+    // publisher's strictly-older BBO is never emitted, but distinct intra-tick changes are kept.
+    assert_quote_source_ts_non_decreasing(&msgs);
 
     let quotes = msgs.iter().filter(|m| m["type"] == "quote").count();
-    // Sanity bound: the fixture carries 9330 raw mktdata frames split across two publishers
-    // mirroring the same feed. The freshest-wins watermark emits only strictly-newer samples per
-    // symbol. Because the two publishers interleave (each advances source_ts independently), the
-    // merged stream is far from monotonic, so the laggard's stale samples are dropped — the count
-    // falls well below the old windowed-identity count (4470), which kept every distinct-source_ts
-    // copy. Observed: 437.
-    assert!(
-        quotes > 0 && quotes < 1000,
-        "two-pub quote count = {quotes}"
+    // The fixture carries 8788 raw BTC mktdata quotes split across two publishers mirroring the same
+    // feed (417 distinct source_ts, 4584 distinct (source_ts, content) when decoded standalone). The
+    // production path here also runs the per-publisher SeqTracker (which drops out-of-order frames
+    // before dedup) and resolves the venue from the wire SourceID, so the emitted count is slightly
+    // below the standalone distinct-content count. The staleness floor keeps every distinct top-of-
+    // book change at the newest source_ts but drops the laggard's strictly-older replays and exact
+    // duplicates, so the count lands BETWEEN the old strict watermark (which kept only ~417 — one per
+    // tick, over-dropping real intra-tick BBO changes) and raw 8788. Observed: 4468.
+    assert_eq!(
+        quotes, 4468,
+        "two-pub staleness-floor quote count (distinct (source_ts, content) at a non-decreasing floor)"
     );
 }
 
-/// Per-`(venue, symbol)` dedup independence. The quote watermark keys on `(venue, symbol)` with an
-/// **independent high-watermark per symbol** (see `arbiter::Watermark`), so a busy symbol's volume
-/// must not perturb a quiet symbol's dedup. The single-symbol fixture above can't prove that; this uses a
-/// three-symbol fixture (BTC busy, SOL medium, DOGE quiet) from the same two publishers and asserts:
+/// Per-`(venue, symbol)` dedup independence. The quote floor keys on `(venue, symbol)` with an
+/// **independent staleness floor per symbol** (see `arbiter::StalenessFloor`), so a busy symbol's
+/// volume must not perturb a quiet symbol's dedup. The single-symbol fixture above can't prove that;
+/// this uses a three-symbol fixture (BTC busy, SOL medium, DOGE quiet) from the same two publishers
+/// and asserts:
 ///   1. `no_business_duplicates` holds across ALL symbols at once (no cross-symbol key collision);
 ///   2. all three symbols emit quotes and each dedups (emitted < raw per symbol);
 ///   3. **independence**: the quiet symbol's emitted set is byte-for-byte what it produces when
 ///      replayed ALONE — i.e. stripping BTC/SOL from the input changes nothing for DOGE.
 ///
-/// Falsifiability: with the quote watermark bypassed (always-admit), `no_business_duplicates` and
-/// the strict-increase assertion both fail (stale/out-of-order copies re-emit) and emitted == raw,
-/// so this test pins the dedup, not just the fixture.
+/// Falsifiability: with the quote floor bypassed (always-admit), `no_business_duplicates` and the
+/// non-decreasing assertion both fail (stale/out-of-order copies re-emit) and emitted == raw, so
+/// this test pins the dedup, not just the fixture.
 #[test]
 fn per_symbol_dedup_is_independent() {
     let recs = read_combined("tests/fixtures/tob_multi_dual.combined.bin");
@@ -180,13 +187,15 @@ fn per_symbol_dedup_is_independent() {
     // (1) the dedup contract holds across the whole multi-symbol stream.
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
-    // Freshest-wins monotonicity holds per (venue, symbol) across all symbols at once.
-    assert_quote_source_ts_strictly_increasing(&msgs);
+    // Staleness-floor non-decreasing monotonicity holds per (venue, symbol) across all symbols.
+    assert_quote_source_ts_non_decreasing(&msgs);
 
     let raw = raw_quotes_by_symbol(&recs);
     let emitted = emitted_quotes_by_symbol(&msgs);
-    // Observed freshest-wins emitted vs raw: BTC 405/8788, SOL 279/3010, DOGE 69/527 (was, under
-    // windowed-identity, a far smaller drop since same-content distinct-source_ts copies were kept).
+    // Observed staleness-floor emitted vs raw: BTC 4584/8788, SOL 1538/3010, DOGE 279/527. These sit
+    // above the old strict watermark (which kept only one quote per source_ts tick: BTC 417, SOL 309,
+    // DOGE 185 — over-dropping real intra-tick BBO changes) and below raw (stale laggard replays +
+    // exact duplicates dropped).
 
     // The fixture's three tiers (see PROVENANCE.md). Guard that the fixture still carries them so a
     // regenerated fixture that silently dropped a symbol fails loudly rather than vacuously passing.

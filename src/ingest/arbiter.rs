@@ -7,56 +7,82 @@
 //! operate on the merged stream — they need no per-publisher demux themselves.
 //!
 //! Two primitives, by message semantics:
-//! - quotes ([`Watermark`]): a full-state BBO is a *snapshot*. A per-`(venue, symbol)` `source_ts`
-//!   high-watermark admits only strictly-newer samples, so an older BBO from a lagging publisher
-//!   (the market has moved on) is dropped and the output is freshest-only and monotonic. This also
-//!   drops exact duplicates and any same-`source_ts` distinct copy — accepted for a full-state feed.
-//! - trades ([`WindowedDedup`]): a trade is a *point-in-time event*, not state, so freshest-wins
-//!   would lose prints. It keeps the windowed `trade_id` identity instead: a competing publisher's
-//!   copy or an in-window reorder is dropped, but every distinct print is kept.
+//! - quotes ([`StalenessFloor`]): a full-state BBO is a *snapshot*, but two distinct BBOs can share
+//!   a `source_ts` (the venue stamps at millisecond granularity while the book changes faster), and
+//!   each is a real top-of-book observation, not noise. A per-`(venue, symbol)` `source_ts` *floor*
+//!   keeps every distinct `(source_ts, content)` observation but never goes back to a `source_ts` it
+//!   has passed: a strictly-older BBO from a lagging publisher is stale (the market moved on) and is
+//!   dropped, as is an exact `(source_ts, content)` duplicate (incl. the other publisher's copy), but
+//!   a *new* BBO at the current `source_ts` is kept. Output `source_ts` is non-decreasing per key
+//!   (not strictly increasing — content can change within a tick). This matches the
+//!   `hl-bbo-feed-race` board's `(symbol, source_ts, bbo_hash)` identity. A strict high-watermark
+//!   instead over-drops: it discards real intra-tick BBO changes, not just laggard replays.
+//! - trades ([`WindowedDedup`]): a trade is a *point-in-time event*, not state, so a floor would lose
+//!   prints. It keeps the windowed `trade_id` identity instead: a competing publisher's copy or an
+//!   in-window reorder is dropped, but every distinct print is kept.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
 };
 
-/// Per-key freshest-wins high-watermark on a monotonic `source_ts`. For a full-state feed (quotes),
-/// only a strictly-newer sample carries information: an older one is stale (the market moved on) and
-/// an equal-`source_ts` one adds nothing, so both are dropped. Output is monotonic per key.
-pub struct Watermark<K> {
-    last: HashMap<K, u64>,
+/// Per-key staleness floor on `source_ts`. Tracks the highest `source_ts` emitted per key plus the
+/// set of distinct content seen *at that tick*. Admits every distinct `(source_ts, content)` while
+/// the `source_ts` never goes backwards: a strictly-older sample is stale (dropped); a new tick
+/// resets the per-tick content set and admits; an equal-tick sample admits only if its content is
+/// new (an exact `(source_ts, content)` duplicate is dropped). Output is `source_ts`-non-decreasing.
+///
+/// Memory is O(distinct content at the current tick) per key — bounded by how fast the book moves
+/// within one `source_ts`; no fixed window needed.
+pub struct StalenessFloor<K, V> {
+    /// Per key: (high_water source_ts, set of content seen at exactly high_water).
+    state: HashMap<K, (u64, HashSet<V>)>,
 }
 
-impl<K: Eq + Hash> Default for Watermark<K> {
+impl<K: Eq + Hash, V: Eq + Hash> Default for StalenessFloor<K, V> {
     fn default() -> Self {
         Self {
-            last: HashMap::new(),
+            state: HashMap::new(),
         }
     }
 }
 
-impl<K: Eq + Hash> Watermark<K> {
+impl<K: Eq + Hash, V: Eq + Hash> StalenessFloor<K, V> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// True (recording it) if `source_ts` is the newest yet seen for `key`; false if it is equal to
-    /// or older than the high-watermark. The first sample for a key always admits. Dropping an equal
-    /// `source_ts` means a same-`source_ts` distinct quote is intentionally suppressed — acceptable
-    /// for a full-state feed where the goal is freshest-monotonic output.
-    pub fn admit(&mut self, key: K, source_ts: u64) -> bool {
+    /// True (recording it) if this `(source_ts, content)` is a fresh observation for `key`:
+    /// - `source_ts < high_water` → false (stale: a tick already passed — the laggard).
+    /// - `source_ts > high_water` → advance the floor, reset the tick's content set to this one, true.
+    /// - `source_ts == high_water` → true iff this content is new at the tick (else exact duplicate).
+    ///
+    /// The first sample for a key behaves as the `>` case.
+    ///
+    /// Records on the emit *decision*: in this gateway "emit" == handing the message to the broadcast
+    /// channel, the only delivery step. A no-subscriber send desyncs no one, and a unique quote
+    /// dropped by a slow per-client channel is unrecoverable regardless — so there is no failed-send
+    /// path on which the floor must avoid advancing.
+    pub fn admit(&mut self, key: K, source_ts: u64, content: V) -> bool {
         use std::collections::hash_map::Entry;
-        match self.last.entry(key) {
+        match self.state.entry(key) {
             Entry::Vacant(v) => {
-                v.insert(source_ts);
+                let mut set = HashSet::new();
+                set.insert(content);
+                v.insert((source_ts, set));
                 true
             }
             Entry::Occupied(mut o) => {
-                if source_ts > *o.get() {
-                    o.insert(source_ts);
+                let (high_water, set) = o.get_mut();
+                if source_ts < *high_water {
+                    false
+                } else if source_ts > *high_water {
+                    *high_water = source_ts;
+                    set.clear();
+                    set.insert(content);
                     true
                 } else {
-                    false
+                    set.insert(content)
                 }
             }
         }
@@ -111,36 +137,38 @@ mod tests {
 
     #[test]
     fn quote_first_sample_admits() {
-        let mut w: Watermark<&str> = Watermark::new();
-        assert!(w.admit("BTC", 1000)); // first for this key always emits
+        let mut f: StalenessFloor<&str, u8> = StalenessFloor::new();
+        assert!(f.admit("BTC", 1000, 0)); // first for this key always emits
     }
 
     #[test]
-    fn quote_strictly_increasing_admits() {
-        let mut w: Watermark<&str> = Watermark::new();
-        assert!(w.admit("BTC", 1000));
-        assert!(w.admit("BTC", 1001));
-        assert!(w.admit("BTC", 2000));
+    fn quote_new_tick_admits() {
+        let mut f: StalenessFloor<&str, u8> = StalenessFloor::new();
+        assert!(f.admit("BTC", 1000, 0));
+        assert!(f.admit("BTC", 1001, 0)); // newer tick, even with identical content
+        assert!(f.admit("BTC", 2000, 0));
     }
 
-    /// An equal or older `source_ts` is dropped. Note that an equal `source_ts` with *distinct*
-    /// content is intentionally dropped too: this is a full-state feed, so we want freshest-monotonic
-    /// output and accept losing a same-instant distinct sample.
+    /// A strictly-older `source_ts` is dropped (stale laggard). An exact `(source_ts, content)`
+    /// duplicate is dropped. But a NEW content at the *current* `source_ts` is KEPT — this is the
+    /// real intra-tick BBO change the old strict watermark wrongly discarded.
     #[test]
-    fn quote_equal_or_older_source_ts_dropped() {
-        let mut w: Watermark<&str> = Watermark::new();
-        assert!(w.admit("BTC", 2000));
-        assert!(!w.admit("BTC", 2000)); // equal: same-source_ts distinct content also dropped
-        assert!(!w.admit("BTC", 1999)); // older: stale, market moved on
-        assert!(w.admit("BTC", 2001)); // newer again: admits
+    fn quote_stale_and_exact_dup_dropped_but_intra_tick_change_kept() {
+        let mut f: StalenessFloor<&str, u8> = StalenessFloor::new();
+        assert!(f.admit("BTC", 2000, 1)); // first
+        assert!(!f.admit("BTC", 2000, 1)); // exact (ts, content) dup dropped
+        assert!(f.admit("BTC", 2000, 2)); // NEW content at the SAME tick -> KEPT (watermark dropped this)
+        assert!(!f.admit("BTC", 2000, 1)); // content 1 still in the current tick's set -> dup dropped
+        assert!(!f.admit("BTC", 1999, 9)); // strictly older -> stale, dropped (even with new content)
+        assert!(f.admit("BTC", 2001, 1)); // new tick: content set resets, so content 1 admits again
     }
 
     #[test]
     fn quote_keys_are_independent() {
-        let mut w: Watermark<&str> = Watermark::new();
-        assert!(w.admit("BTC", 2000));
-        assert!(w.admit("ETH", 1000)); // separate high-watermark per key
-        assert!(!w.admit("BTC", 1500)); // BTC's watermark unaffected by ETH
+        let mut f: StalenessFloor<&str, u8> = StalenessFloor::new();
+        assert!(f.admit("BTC", 2000, 0));
+        assert!(f.admit("ETH", 1000, 0)); // separate floor per key
+        assert!(!f.admit("BTC", 1500, 0)); // BTC's floor unaffected by ETH
     }
 
     #[test]
