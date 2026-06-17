@@ -581,7 +581,7 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
         args.combined_with.expect("combined mode")
     );
     let mut rows: Vec<_> = per_symbol_pub.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.1));
     eprintln!("  raw kept quote messages per (symbol, publisher):");
     for ((sym, ip), n) in rows {
         eprintln!("    {sym:>8} {ip:>15}  {n}");
