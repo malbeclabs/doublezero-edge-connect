@@ -78,15 +78,17 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
     if selection.is_empty() {
         return Ok(feeds::FEEDS.iter().collect());
     }
-    let mut chosen = Vec::with_capacity(selection.len());
+    let mut chosen = Vec::new();
     for name in selection {
-        match feeds::by_venue(name) {
-            Some(f) => chosen.push(f),
-            None => {
-                let known: Vec<&str> = feeds::FEEDS.iter().map(|f| f.venue).collect();
-                bail!("unknown feed '{name}'; known feeds: {}", known.join(", "));
-            }
+        let matches: Vec<&'static feeds::Feed> = feeds::FEEDS
+            .iter()
+            .filter(|f| f.venue.eq_ignore_ascii_case(name))
+            .collect();
+        if matches.is_empty() {
+            let known: Vec<&str> = feeds::FEEDS.iter().map(|f| f.venue).collect();
+            bail!("unknown feed '{name}'; known feeds: {}", known.join(", "));
         }
+        chosen.extend(matches);
     }
     Ok(chosen)
 }

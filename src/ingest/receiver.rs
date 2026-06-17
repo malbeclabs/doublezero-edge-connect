@@ -456,7 +456,7 @@ pub async fn run_feed(
                 venue,
                 tx,
                 instruments,
-                TobProcessor::new(),
+                TobProcessor::new(feed.emit_trades),
             )
             .await
         }
@@ -496,7 +496,7 @@ pub async fn run_feed(
                 venue,
                 tx,
                 instruments,
-                MboProcessor::new(depth),
+                MboProcessor::new(depth, feed.emit_trades),
             )
             .await
         }

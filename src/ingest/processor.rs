@@ -7,7 +7,7 @@
 //! - [`MboProcessor`] - Market-by-Order (`codec_mbo`, magic `0x4444`): reconstructs the L3 book
 //!   in [`crate::ingest::book`] and re-serves it as full-state `depth` + `trade`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use tracing::{debug, info, warn};
 
@@ -31,6 +31,30 @@ use crate::{
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
 
+/// Insert or replace an instrument definition in the shared snapshot, warning if an existing
+/// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
+/// multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same key; they are expected to
+/// agree on precision, so a disagreement is a publisher inconsistency worth surfacing rather than
+/// silently clobbering.
+fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
+    let key = (inst.venue.clone(), inst.symbol.clone());
+    let mut map = instruments.lock().unwrap();
+    if let Some(prev) = map.get(&key) {
+        if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
+            warn!(
+                venue = inst.venue,
+                symbol = inst.symbol,
+                prev_price_exp = prev.price_exponent,
+                new_price_exp = inst.price_exponent,
+                prev_qty_exp = prev.qty_exponent,
+                new_qty_exp = inst.qty_exponent,
+                "conflicting instrument definitions for the same (venue, symbol) across feeds; last writer wins"
+            );
+        }
+    }
+    map.insert(key, inst.clone());
+}
+
 /// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata stream
 /// and emits normalized quotes (gated per-instrument on a known definition) on the market-data
 /// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote frames.
@@ -42,15 +66,18 @@ pub struct TobProcessor {
     warned_invalid_manifest: bool,
     /// Log an unregistered quote SourceID once, not on every quote.
     warned_source_mismatch: bool,
+    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
+    emit_trades: bool,
 }
 
 impl TobProcessor {
-    pub fn new() -> Self {
+    pub fn new(emit_trades: bool) -> Self {
         Self {
             state: RefDataState::new(),
             seq: SeqTracker::default(),
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
+            emit_trades,
         }
     }
 }
@@ -140,10 +167,7 @@ impl FrameProcessor for TobProcessor {
                     };
                     // Update the shared snapshot so newly-connecting subscribers get this
                     // instrument before any quote.
-                    ctx.instruments
-                        .lock()
-                        .unwrap()
-                        .insert((inst.venue.clone(), inst.symbol.clone()), inst.clone());
+                    upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
                     let _ = ctx.tx.send(FeedMessage::Instrument(inst));
                 }
@@ -223,7 +247,9 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    if self.emit_trades {
+                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    }
                 }
                 _ => {}
             }
@@ -296,10 +322,7 @@ impl FrameProcessor for MidpointProcessor {
                         price_exponent: d.price_exponent,
                         qty_exponent: 0,
                     };
-                    ctx.instruments
-                        .lock()
-                        .unwrap()
-                        .insert((inst.venue.clone(), inst.symbol.clone()), inst.clone());
+                    upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
                     let _ = ctx.tx.send(FeedMessage::Instrument(inst));
                 }
@@ -349,15 +372,18 @@ pub struct MboProcessor {
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
     warned_source_mismatch: bool,
+    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
+    emit_trades: bool,
 }
 
 impl MboProcessor {
-    pub fn new(depth: DepthSnapshot) -> Self {
+    pub fn new(depth: DepthSnapshot, emit_trades: bool) -> Self {
         Self {
             state: RefDataState::new(),
             books: HashMap::new(),
             depth,
             warned_source_mismatch: false,
+            emit_trades,
         }
     }
 
@@ -418,8 +444,9 @@ impl FrameProcessor for MboProcessor {
         }
 
         // Instruments whose book changed this frame; depth is emitted once per frame per instrument
-        // (coalescing many order events into a single full-state snapshot).
-        let mut changed: HashSet<u32> = HashSet::new();
+        // (coalescing many order events into a single full-state snapshot). BTreeSet gives
+        // deterministic ascending instrument_id order across frames touching multiple instruments.
+        let mut changed: BTreeSet<u32> = BTreeSet::new();
 
         for msg in messages {
             match msg {
@@ -434,10 +461,7 @@ impl FrameProcessor for MboProcessor {
                         price_exponent: d.price_exponent,
                         qty_exponent: d.qty_exponent,
                     };
-                    ctx.instruments
-                        .lock()
-                        .unwrap()
-                        .insert((inst.venue.clone(), inst.symbol.clone()), inst.clone());
+                    upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
                     let _ = ctx.tx.send(FeedMessage::Instrument(inst));
                 }
@@ -500,7 +524,9 @@ impl FrameProcessor for MboProcessor {
                             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                             ws_send_ts_ns: 0,
                         };
-                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                        if self.emit_trades {
+                            let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                        }
                     }
                 }
                 codec_mbo::Message::Trade(t) => {
@@ -530,7 +556,9 @@ impl FrameProcessor for MboProcessor {
                                   "mbo SourceID maps to a venue different from this feed's venue (logged once)");
                         }
                     }
-                    let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    if self.emit_trades {
+                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    }
                 }
                 codec_mbo::Message::InstrumentReset(r) => {
                     self.books
@@ -583,6 +611,275 @@ impl FrameProcessor for MboProcessor {
 
         for instrument_id in changed {
             self.emit_depth(instrument_id, ctx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use tokio::sync::broadcast;
+
+    use super::{upsert_instrument, MboProcessor};
+    use crate::{
+        ingest::{
+            codec_mbo::{
+                tests::{enc_order_add, enc_snapshot_begin, enc_snapshot_end, frame},
+                OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
+                MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
+            },
+            receiver::{FrameCtx, FrameProcessor, PortRole},
+        },
+        model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
+    };
+
+    /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
+    ///
+    /// Body layout matches `codec_mbo::decode_message` offsets:
+    ///   +0 channel_id (u8), +1 valid (u8), +2..+4 pad,
+    ///   +4 manifest_seq (u16le), +6..+8 pad,
+    ///   +8 instrument_count (u32le), +12 ts (u64le).
+    fn enc_manifest_summary(manifest_seq: u16, instrument_count: u32) -> Vec<u8> {
+        let mut out = vec![MSG_MANIFEST_SUMMARY, 24, 0, 0]; // 4-byte hdr + 20-byte body
+        out.push(0u8); // body+0: channel_id
+        out.push(1u8); // body+1: valid = true
+        out.extend_from_slice(&[0u8; 2]); // body+2..+4: pad
+        out.extend_from_slice(&manifest_seq.to_le_bytes()); // body+4..+6
+        out.extend_from_slice(&[0u8; 2]); // body+6..+8: pad
+        out.extend_from_slice(&instrument_count.to_le_bytes()); // body+8..+12
+        out.extend_from_slice(&0u64.to_le_bytes()); // body+12..+20: ts
+        out
+    }
+
+    /// Encode an InstrumentDefinition wire message (80 bytes total, exponents=0).
+    ///
+    /// Body layout matches `codec_mbo::decode_message` offsets:
+    ///   +0 instrument_id (u32le), +4 symbol (16 B NUL-padded),
+    ///   +20..+37 pad, +37 price_exponent (i8), +38 qty_exponent (i8),
+    ///   +39..+74 pad, +74 manifest_seq (u16le).
+    /// Total: 4 (hdr) + 76 (body) = 80 bytes = sizes::INSTRUMENT_DEFINITION.
+    fn enc_instrument_def(id: u32, symbol: &str, manifest_seq: u16) -> Vec<u8> {
+        let mut out = vec![MSG_INSTRUMENT_DEFINITION, 80, 0, 0];
+        out.extend_from_slice(&id.to_le_bytes()); // body+0..+4
+        let mut sym = [0u8; 16];
+        let sb = symbol.as_bytes();
+        sym[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
+        out.extend_from_slice(&sym); // body+4..+20
+        out.extend_from_slice(&[0u8; 17]); // body+20..+37: pad
+        out.push(0u8); // body+37: price_exponent = 0
+        out.push(0u8); // body+38: qty_exponent = 0
+        out.extend_from_slice(&[0u8; 35]); // body+39..+74: pad
+        out.extend_from_slice(&manifest_seq.to_le_bytes()); // body+74..+76
+                                                            // 4 + 4 + 16 + 17 + 1 + 1 + 35 + 2 = 80 bytes total.
+        out
+    }
+
+    fn make_ctx<'a>(
+        tx: &'a broadcast::Sender<FeedMessage>,
+        instruments: &'a crate::model::InstrumentSnapshot,
+        role: PortRole,
+    ) -> FrameCtx<'a> {
+        FrameCtx {
+            venue: "TV",
+            tx,
+            instruments,
+            kernel_rx_ts_ns: 0,
+            recv_ts_ns: 0,
+            role,
+        }
+    }
+
+    /// Drain all available `Depth` messages and return the numeric instrument ids
+    /// encoded in their symbol field (`"INST-{id}"`).
+    fn drain_depth_ids(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(FeedMessage::Depth(d)) => {
+                    ids.push(d.symbol.trim_start_matches("INST-").parse::<u32>().unwrap());
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        ids
+    }
+
+    /// `depth` messages for a frame touching multiple instruments must arrive in ascending
+    /// instrument_id order regardless of the wire order of their `OrderAdd`s. The invariant is
+    /// guaranteed by draining a `BTreeSet<u32>` rather than a `HashSet`.
+    #[test]
+    fn mbo_depth_emit_order_is_ascending_instrument_id() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+
+        // Refdata: manifest declares 2 instruments; then their definitions.
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 2),
+                enc_instrument_def(0, "INST-0", 1),
+                enc_instrument_def(1, "INST-1", 1),
+            ]),
+            &make_ctx(&tx, &instruments, PortRole::Combined),
+        );
+
+        // Sync each instrument via an empty-book anchor snapshot (0 orders, anchor_seq=0).
+        let snap = |iid: u32, sid: u32| {
+            frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: iid,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: sid,
+                    last_instrument_seq: 0,
+                    ts: sid as u64,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: iid,
+                    anchor_seq: 0,
+                    snapshot_id: sid,
+                }),
+            ])
+        };
+        let snap_ctx = make_ctx(&tx, &instruments, PortRole::Snapshot);
+        proc.on_datagram(&snap(0, 1), &snap_ctx);
+        proc.on_datagram(&snap(1, 2), &snap_ctx);
+        drain_depth_ids(&mut rx); // discard snapshot-triggered emits
+
+        // Mktdata frame: instrument 1 appears before instrument 0 in the wire order. BTreeSet must
+        // still drain 0 → 1.
+        let mktdata_frame = frame(&[
+            enc_order_add(&OrderAdd {
+                instrument_id: 1,
+                source_id: 0,
+                side: SIDE_ASK,
+                order_flags: 0,
+                per_instrument_seq: 1,
+                order_id: 101,
+                enter_ts: 10,
+                price_raw: 200,
+                qty_raw: 5,
+            }),
+            enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 0,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: 1,
+                order_id: 100,
+                enter_ts: 11,
+                price_raw: 100,
+                qty_raw: 10,
+            }),
+        ]);
+        proc.on_datagram(
+            &mktdata_frame,
+            &make_ctx(&tx, &instruments, PortRole::Mktdata),
+        );
+
+        let ids = drain_depth_ids(&mut rx);
+        assert_eq!(
+            ids.len(),
+            2,
+            "expected one depth per instrument; got {ids:?}"
+        );
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "depth must arrive in ascending instrument_id order"
+        );
+
+        // Replay with incremented per_instrument_seqs to confirm the order is stable across frames,
+        // not a lucky hash ordering on the first run.
+        let mktdata_frame2 = frame(&[
+            enc_order_add(&OrderAdd {
+                instrument_id: 1,
+                source_id: 0,
+                side: SIDE_ASK,
+                order_flags: 0,
+                per_instrument_seq: 2,
+                order_id: 201,
+                enter_ts: 20,
+                price_raw: 201,
+                qty_raw: 5,
+            }),
+            enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 0,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: 2,
+                order_id: 200,
+                enter_ts: 21,
+                price_raw: 101,
+                qty_raw: 10,
+            }),
+        ]);
+        proc.on_datagram(
+            &mktdata_frame2,
+            &make_ctx(&tx, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_depth_ids(&mut rx),
+            vec![0, 1],
+            "order must be stable across frames"
+        );
+    }
+
+    /// `upsert_instrument` is idempotent for matching exponents and last-writer-wins for
+    /// conflicting ones (exercising the warn path; the warn itself is not asserted).
+    #[test]
+    fn upsert_instrument_idempotent_and_last_writer_wins() {
+        let instruments: crate::model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+
+        let base = NormalizedInstrument {
+            venue: "TestVenue".to_string(),
+            symbol: "BTC".to_string(),
+            price_exponent: -2,
+            qty_exponent: -4,
+        };
+
+        // First insert.
+        upsert_instrument(&instruments, &base);
+        {
+            let map = instruments.lock().unwrap();
+            assert_eq!(map.len(), 1);
+            let entry = map
+                .get(&("TestVenue".to_string(), "BTC".to_string()))
+                .unwrap();
+            assert_eq!(entry.price_exponent, -2);
+            assert_eq!(entry.qty_exponent, -4);
+        }
+
+        // Second insert with identical exponents — idempotent, still one entry.
+        upsert_instrument(&instruments, &base);
+        assert_eq!(instruments.lock().unwrap().len(), 1);
+
+        // Third insert with DIFFERENT exponents — exercises the divergence warn path.
+        // Last writer wins: the snapshot ends with the new exponents.
+        let conflicting = NormalizedInstrument {
+            price_exponent: -3,
+            qty_exponent: -5,
+            ..base.clone()
+        };
+        upsert_instrument(&instruments, &conflicting);
+        {
+            let map = instruments.lock().unwrap();
+            assert_eq!(map.len(), 1, "still one entry after conflicting write");
+            let entry = map
+                .get(&("TestVenue".to_string(), "BTC".to_string()))
+                .unwrap();
+            assert_eq!(
+                entry.price_exponent, -3,
+                "last writer's price_exponent wins"
+            );
+            assert_eq!(entry.qty_exponent, -5, "last writer's qty_exponent wins");
         }
     }
 }
