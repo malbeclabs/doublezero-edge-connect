@@ -42,15 +42,18 @@ pub struct TobProcessor {
     warned_invalid_manifest: bool,
     /// Log an unregistered quote SourceID once, not on every quote.
     warned_source_mismatch: bool,
+    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
+    emit_trades: bool,
 }
 
 impl TobProcessor {
-    pub fn new() -> Self {
+    pub fn new(emit_trades: bool) -> Self {
         Self {
             state: RefDataState::new(),
             seq: SeqTracker::default(),
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
+            emit_trades,
         }
     }
 }
@@ -223,7 +226,9 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    if self.emit_trades {
+                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    }
                 }
                 _ => {}
             }
@@ -349,15 +354,17 @@ pub struct MboProcessor {
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
     warned_source_mismatch: bool,
+    emit_trades: bool,
 }
 
 impl MboProcessor {
-    pub fn new(depth: DepthSnapshot) -> Self {
+    pub fn new(depth: DepthSnapshot, emit_trades: bool) -> Self {
         Self {
             state: RefDataState::new(),
             books: HashMap::new(),
             depth,
             warned_source_mismatch: false,
+            emit_trades,
         }
     }
 
@@ -500,7 +507,9 @@ impl FrameProcessor for MboProcessor {
                             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                             ws_send_ts_ns: 0,
                         };
-                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                        if self.emit_trades {
+                            let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                        }
                     }
                 }
                 codec_mbo::Message::Trade(t) => {
@@ -530,7 +539,9 @@ impl FrameProcessor for MboProcessor {
                                   "mbo SourceID maps to a venue different from this feed's venue (logged once)");
                         }
                     }
-                    let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    if self.emit_trades {
+                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    }
                 }
                 codec_mbo::Message::InstrumentReset(r) => {
                     self.books

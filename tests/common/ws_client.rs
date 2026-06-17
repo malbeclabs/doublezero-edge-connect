@@ -25,8 +25,8 @@ pub async fn collect(
             break;
         }
         match tokio::time::timeout(remaining, ws.next()).await {
-            Err(_) => break,        // overall timeout
-            Ok(None) => break,      // server closed
+            Err(_) => break,   // overall timeout
+            Ok(None) => break, // server closed
             Ok(Some(Ok(Message::Text(txt)))) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                     msgs.push(v);

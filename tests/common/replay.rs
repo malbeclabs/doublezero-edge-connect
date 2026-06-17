@@ -21,7 +21,9 @@ pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
             "fixture truncated: expected length prefix at offset {off}, only {} bytes remain",
             bytes.len() - off
         );
-        let frame_len = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as usize;
+        let frame_len =
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                as usize;
         off += 4;
         assert!(
             frame_len >= 24 && off + frame_len <= bytes.len(),
@@ -30,7 +32,12 @@ pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
             bytes.len() - off
         );
         let got = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        assert_eq!(got, magic, "frame at offset {}: magic 0x{got:04X} != 0x{magic:04X}", off - 4);
+        assert_eq!(
+            got,
+            magic,
+            "frame at offset {}: magic 0x{got:04X} != 0x{magic:04X}",
+            off - 4
+        );
         frames.push(bytes[off..off + frame_len].to_vec());
         off += frame_len;
     }

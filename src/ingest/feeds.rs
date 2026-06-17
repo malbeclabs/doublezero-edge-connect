@@ -75,6 +75,9 @@ pub struct Feed {
     pub group: Ipv4Addr,
     /// The ports the feed splits its messages across.
     pub ports: FeedPorts,
+    /// Whether this feed emits `trade` messages. A venue carried by both TOB and MBO would
+    /// otherwise double-emit the same trades; TOB owns trades, MBO is depth-only.
+    pub emit_trades: bool,
 }
 
 /// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue. Both the group
@@ -102,6 +105,7 @@ pub const FEEDS: &[Feed] = &[
             mktdata: 9201,
             refdata: 9202,
         },
+        emit_trades: true,
     },
     Feed {
         venue: "Phoenix",
@@ -111,6 +115,7 @@ pub const FEEDS: &[Feed] = &[
             mktdata: 9201,
             refdata: 9202,
         },
+        emit_trades: true,
     },
 ];
 
@@ -132,6 +137,15 @@ mod tests {
         }
         assert!(by_venue("hyperLIQUID").is_some()); // case-insensitive
         assert!(by_venue("nope").is_none());
+    }
+
+    #[test]
+    fn hyperliquid_tob_emits_trades() {
+        let hl = FEEDS
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::TopOfBook)
+            .unwrap();
+        assert!(hl.emit_trades);
     }
 
     #[test]

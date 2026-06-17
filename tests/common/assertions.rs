@@ -64,20 +64,32 @@ pub fn no_business_duplicates(msgs: &[Value]) {
         let key = match ty(m) {
             "quote" => format!(
                 "q|{}|{}|{}|{}|{}|{}|{}",
-                s(m, "venue"), s(m, "symbol"), u(m, "source_ts_ns"),
-                f(m, "bid"), f(m, "ask"), f(m, "bid_size"), f(m, "ask_size")
+                s(m, "venue"),
+                s(m, "symbol"),
+                u(m, "source_ts_ns"),
+                f(m, "bid"),
+                f(m, "ask"),
+                f(m, "bid_size"),
+                f(m, "ask_size")
             ),
             "trade" => format!(
                 "t|{}|{}|{}",
-                s(m, "venue"), s(m, "symbol"), u(m, "trade_id")
+                s(m, "venue"),
+                s(m, "symbol"),
+                u(m, "trade_id")
             ),
             "depth" => format!(
                 "d|{}|{}|{}",
-                s(m, "venue"), s(m, "symbol"), u(m, "source_ts_ns")
+                s(m, "venue"),
+                s(m, "symbol"),
+                u(m, "source_ts_ns")
             ),
             _ => continue,
         };
-        assert!(seen.insert(key.clone()), "duplicate business message: {key}");
+        assert!(
+            seen.insert(key.clone()),
+            "duplicate business message: {key}"
+        );
     }
 }
 
@@ -86,7 +98,10 @@ pub fn quotes_well_formed(msgs: &[Value]) {
     for q in msgs.iter().filter(|m| ty(m) == "quote") {
         assert!(f(q, "bid") > 0.0, "non-positive bid: {q}");
         assert!(f(q, "ask") > 0.0, "non-positive ask: {q}");
-        assert!(f(q, "bid_size") >= 0.0 && f(q, "ask_size") >= 0.0, "negative size: {q}");
+        assert!(
+            f(q, "bid_size") >= 0.0 && f(q, "ask_size") >= 0.0,
+            "negative size: {q}"
+        );
         // source_ts_ns may be 0 ("unknown" sentinel, per model.rs/PROTOCOL.md) — do not require > 0
     }
 }
@@ -99,6 +114,9 @@ pub fn trades_well_formed(msgs: &[Value]) {
             matches!(side, "buy" | "sell" | "unknown"),
             "bad aggressor_side {side:?}: {t}"
         );
-        assert!(f(t, "price") > 0.0 && f(t, "size") > 0.0, "non-positive trade: {t}");
+        assert!(
+            f(t, "price") > 0.0 && f(t, "size") > 0.0,
+            "non-positive trade: {t}"
+        );
     }
 }

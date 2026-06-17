@@ -9,7 +9,8 @@ use std::time::Duration;
 
 #[test]
 fn tob_golden_splits_into_valid_frames() {
-    let bytes = std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
+    let bytes =
+        std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
     let frames = replay::split_frames(&bytes, replay::TOB_MAGIC);
     assert!(!frames.is_empty(), "expected at least one TOB frame");
     for f in &frames {
@@ -22,7 +23,10 @@ fn tob_golden_splits_into_valid_frames() {
 fn tob_refdata_golden_splits_into_valid_frames() {
     let bytes = std::fs::read("tests/fixtures/tob_refdata.bin").expect("read tob_refdata.bin");
     let frames = replay::split_frames(&bytes, replay::TOB_MAGIC);
-    assert!(!frames.is_empty(), "expected at least one TOB refdata frame");
+    assert!(
+        !frames.is_empty(),
+        "expected at least one TOB refdata frame"
+    );
     for f in &frames {
         assert!(f.len() >= 24);
         assert_eq!(u16::from_le_bytes([f[0], f[1]]), replay::TOB_MAGIC);
@@ -124,8 +128,14 @@ async fn tob_single_publisher_contract() {
 
     let msgs = collector.await.unwrap();
 
-    assert!(!ws_client::by_type(&msgs, "instrument").is_empty(), "no instrument messages");
-    assert!(!ws_client::by_type(&msgs, "quote").is_empty(), "no quote messages");
+    assert!(
+        !ws_client::by_type(&msgs, "instrument").is_empty(),
+        "no instrument messages"
+    );
+    assert!(
+        !ws_client::by_type(&msgs, "quote").is_empty(),
+        "no quote messages"
+    );
     assertions::instrument_before_price(&msgs);
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
