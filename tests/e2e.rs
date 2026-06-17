@@ -141,3 +141,106 @@ async fn tob_single_publisher_contract() {
     let quote_count = ws_client::by_type(&msgs, "quote").len();
     assert_eq!(quote_count, 41, "TOB quote count regressed");
 }
+
+#[test]
+fn mbo_goldens_split_into_valid_frames() {
+    for name in ["mbo_mktdata.bin", "mbo_refdata.bin", "mbo_snapshot.bin"] {
+        let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
+        let frames = replay::split_frames(&bytes, replay::MBO_MAGIC);
+        assert!(!frames.is_empty(), "{name}: no frames");
+    }
+}
+
+/// Spawn the bridge, replay the MBO golden once in wire order (refdata, snapshot, mktdata),
+/// and assert the depth output contract. The snapshot is an empty-book anchor (anchor_seq=0,
+/// last_instrument_seq=0): it flips the book to `Synced` at empty, then the 140 replayed deltas
+/// (per-instrument seq 1..=140, all contiguous after the anchor) build the live book and `depth`
+/// flows. The capture is mid-session (the first deltas cancel resting orders added before the
+/// capture began); those cancels no-op against the empty book, so the resulting depth is the
+/// real subset of orders added during the capture — no fabricated state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mbo_single_publisher_depth_contract() {
+    let bridge = Bridge::spawn("Hyperliquid", 18083);
+    let ws_addr = bridge.ws_addr.clone();
+
+    let collector = tokio::spawn(async move {
+        ws_client::collect(&ws_addr, Duration::from_secs(10), |m| {
+            !ws_client::by_type(m, "depth").is_empty()
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let refdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/mbo_refdata.bin").unwrap(),
+        replay::MBO_MAGIC,
+    );
+    let snapshot = replay::split_frames(
+        &std::fs::read("tests/fixtures/mbo_snapshot.bin").unwrap(),
+        replay::MBO_MAGIC,
+    );
+    let mktdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/mbo_mktdata.bin").unwrap(),
+        replay::MBO_MAGIC,
+    );
+
+    // Refdata first (definitions), then snapshot (anchor the book at empty), then mktdata
+    // (deltas). The book reaches `Synced` on SnapshotEnd, after which live deltas apply directly.
+    tokio::task::spawn_blocking(move || {
+        replay::send_frames(replay::HYPERLIQUID_GROUP, 10202, &refdata).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        replay::send_frames(replay::HYPERLIQUID_GROUP, 10203, &snapshot).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        replay::send_frames(replay::HYPERLIQUID_GROUP, 10201, &mktdata).unwrap();
+    })
+    .await
+    .unwrap();
+
+    let msgs = collector.await.unwrap();
+
+    let depths = ws_client::by_type(&msgs, "depth");
+    assert!(
+        !depths.is_empty(),
+        "no depth messages — book never synced (check snapshot fixture ordering/anchor)"
+    );
+    assert!(
+        !ws_client::by_type(&msgs, "instrument").is_empty(),
+        "no instrument messages"
+    );
+
+    assertions::instrument_before_price(&msgs);
+    assertions::no_business_duplicates(&msgs);
+
+    // Depth ordering + bounds: bids descending, asks ascending, <= 10 levels.
+    for d in &depths {
+        let bids = d
+            .get("bids")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let asks = d
+            .get("asks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            bids.len() <= 10 && asks.len() <= 10,
+            "depth exceeds 10 levels: {d}"
+        );
+        let px =
+            |lvl: &serde_json::Value| lvl.as_array().and_then(|a| a[0].as_f64()).unwrap_or(0.0);
+        for w in bids.windows(2) {
+            assert!(px(&w[0]) >= px(&w[1]), "bids not descending: {d}");
+        }
+        for w in asks.windows(2) {
+            assert!(px(&w[0]) <= px(&w[1]), "asks not ascending: {d}");
+        }
+    }
+
+    // MBO is depth-only: no trades from this venue (TOB owns trades, idle here).
+    assert!(
+        ws_client::by_type(&msgs, "trade").is_empty(),
+        "MBO feed emitted trades despite emit_trades=false"
+    );
+}
