@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pcap2frames --combined-with <ip>`: emits one capture-ordered, source-IP-and-role-tagged stream
   of two publishers (`tob_btc_dual.combined.bin`), preserving the real interleaving the
   multi-publisher dedup must collapse.
+- `pcap2frames --symbol` is now repeatable (and the combined report tallies kept quote messages
+  per `(symbol, publisher)`), enabling a multi-symbol two-publisher fixture
+  (`tob_multi_dual.combined.bin`: BTC busy / SOL medium / DOGE quiet) that exercises the dedup's
+  per-`(venue, symbol)` independent windows.
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry

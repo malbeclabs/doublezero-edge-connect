@@ -141,3 +141,36 @@ cargo run --example pcap2frames -- tyo_tob.pcap \
   --src 148.51.120.79 --combined-with 148.51.123.3 --symbol BTC --to 40 \
   -o tests/fixtures/tob_btc_dual
 ```
+
+### `tob_multi_dual.combined.bin` — multi-symbol two-publisher golden
+
+`tob_btc_dual.combined.bin` is BTC-only. The dedup is keyed per `(venue, symbol)` with an
+**independent window per symbol**, so a single-symbol fixture cannot prove that one symbol's volume
+does not perturb another's dedup. `tob_multi_dual.combined.bin` is the multi-symbol counterpart:
+the same two publishers, same 40s window and same record format, but carrying three symbols spanning
+a volume spread — **BTC** (busy), **SOL** (medium) and **DOGE** (quiet). 235 refdata + 12940 mktdata
+frames, 0 decode errors, ~1.4 MB.
+
+Raw kept quote messages per `(symbol, publisher)` (the pre-dedup baseline):
+
+| Symbol | 148.51.120.79 (A) | 148.51.123.3 (B) | tier |
+|--------|-------------------|------------------|------|
+| BTC    | 4370              | 4960             | busy |
+| SOL    | 1501              | 1577             | medium |
+| DOGE   | 251               | 281              | quiet |
+
+(Counts are quote messages within the *kept* frames; a TOB frame batches several instruments, so a
+frame carrying any selected symbol is kept whole and its other symbols' messages are counted too —
+hence these tally only the selected ids.) DOGE at ~532 raw vs BTC's ~9330 is a ~17x volume gap, so a
+test can assert DOGE dedups to exactly what it would on its own (no cross-symbol interference from
+BTC's traffic). Regenerate:
+
+```
+cargo run --example pcap2frames -- tyo_tob.pcap \
+  --src 148.51.120.79 --combined-with 148.51.123.3 \
+  --symbol BTC --symbol SOL --symbol DOGE --to 40 \
+  -o tests/fixtures/tob_multi_dual
+```
+
+`--symbol` is repeatable; omitting it entirely keeps all symbols (used to survey per-symbol volume
+before picking the busy/quiet pair).

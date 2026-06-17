@@ -69,9 +69,11 @@ struct Args {
     /// Which protocol's frames to extract.
     #[arg(long, value_enum, default_value = "tob")]
     protocol: Protocol,
-    /// Keep only mktdata/snapshot frames for this symbol (e.g. BTC). Omit to keep all.
+    /// Keep only mktdata/snapshot frames for these symbols (e.g. `--symbol BTC --symbol ETH`).
+    /// Repeatable. Omit to keep all symbols. A frame batches several instruments, so a frame
+    /// carrying any selected symbol is kept whole (it may also carry unselected ones).
     #[arg(long)]
-    symbol: Option<String>,
+    symbol: Vec<String>,
     /// Window start (seconds, relative to the first packet in the capture).
     #[arg(long, default_value_t = 0.0)]
     from: f64,
@@ -168,19 +170,27 @@ fn out_path(prefix: &Path, role: &str) -> PathBuf {
     prefix.with_extension(format!("{role}.bin"))
 }
 
-/// Resolve a `--symbol` to its instrument id from the discovered definitions.
-fn resolve_symbol(symbol: &Option<String>, map: &HashMap<String, u32>) -> Result<Option<u32>> {
-    match symbol {
-        None => Ok(None),
-        Some(sym) => match map.get(sym) {
-            Some(&id) => Ok(Some(id)),
+/// Resolve `--symbol` selections to their instrument ids from the discovered definitions.
+/// Returns `None` when no symbols were given (keep all), or `Some(set)` of the resolved ids.
+/// Errors if any requested symbol has no definition in the window.
+fn resolve_symbols(symbols: &[String], map: &HashMap<String, u32>) -> Result<Option<HashSet<u32>>> {
+    if symbols.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = HashSet::new();
+    for sym in symbols {
+        match map.get(sym) {
+            Some(&id) => {
+                ids.insert(id);
+            }
             None => bail!(
                 "symbol {sym:?} not found among {} definitions in the window (known: {:?})",
                 map.len(),
                 map.keys().collect::<Vec<_>>()
             ),
-        },
+        }
     }
+    Ok(Some(ids))
 }
 
 fn report_decode(label: &str, args: &Args, defs: usize, errors: u64, body: &str) {
@@ -243,16 +253,19 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         }
     }
 
-    let target = resolve_symbol(&args.symbol, &symbol_to_id)?;
-    // A TOB frame batches multiple instruments' messages, so a frame carrying the target symbol may
+    let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
+    // A TOB frame batches multiple instruments' messages, so a frame carrying a selected symbol may
     // also carry others; it is kept whole. Track that leakage so the output is not overclaimed as
-    // "target-only".
+    // "selected-only".
     let mut mktdata: Vec<Vec<u8>> = Vec::new();
     let (mut mixed_frames, mut leaked_msgs) = (0u64, 0u64);
     for (f, ids) in mkt {
-        if target.is_none_or(|t| ids.contains(&t)) {
-            if let Some(t) = target {
-                let others = ids.iter().filter(|&&id| id != t).count() as u64;
+        let keep = target
+            .as_ref()
+            .is_none_or(|t| ids.iter().any(|id| t.contains(id)));
+        if keep {
+            if let Some(t) = &target {
+                let others = ids.iter().filter(|id| !t.contains(id)).count() as u64;
                 if others > 0 {
                     mixed_frames += 1;
                     leaked_msgs += others;
@@ -273,11 +286,14 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         errors,
         &format!("decode: quotes={quotes} trades={trades} defs={defs} manifests={manifests} heartbeats={hb} other={other} errors={errors}"),
     );
-    if let Some(sym) = &args.symbol {
-        eprintln!("  filter symbol {sym:?} -> instrument_id {target:?}");
+    if !args.symbol.is_empty() {
+        eprintln!(
+            "  filter symbols {:?} -> instrument_ids {target:?}",
+            args.symbol
+        );
         if mixed_frames > 0 {
             eprintln!(
-                "  note: {mixed_frames} kept frames also batch other symbols ({leaked_msgs} non-target messages retained — frames are kept whole)"
+                "  note: {mixed_frames} kept frames also batch unselected symbols ({leaked_msgs} non-selected messages retained — frames are kept whole)"
             );
         }
     }
@@ -378,13 +394,13 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         summaries.push(fr);
     }
 
-    let target = resolve_symbol(&args.symbol, &symbol_to_id)?;
-    // Snapshot ids belonging to the target instrument's snapshot groups.
-    let target_sids: HashSet<u32> = match target {
+    let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
+    // Snapshot ids belonging to the selected instruments' snapshot groups.
+    let target_sids: HashSet<u32> = match &target {
         Some(t) => summaries
             .iter()
             .flat_map(|fr| fr.begins.iter())
-            .filter(|(inst, _)| *inst == t)
+            .filter(|(inst, _)| t.contains(inst))
             .map(|(_, sid)| *sid)
             .collect(),
         None => HashSet::new(),
@@ -398,11 +414,11 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
             refdata.push(fr.payload.clone());
         }
         if fr.snapshot {
-            let keep = match target {
+            let keep = match &target {
                 None => true,
                 Some(t) => {
-                    fr.begins.iter().any(|(inst, _)| *inst == t)
-                        || fr.end_insts.contains(&t)
+                    fr.begins.iter().any(|(inst, _)| t.contains(inst))
+                        || fr.end_insts.iter().any(|inst| t.contains(inst))
                         || fr.order_sids.iter().any(|sid| target_sids.contains(sid))
                 }
             };
@@ -410,7 +426,10 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 snapshot.push(fr.payload.clone());
             }
         }
-        if !fr.md_ids.is_empty() && target.is_none_or(|t| fr.md_ids.contains(&t)) {
+        let keep_md = target
+            .as_ref()
+            .is_none_or(|t| fr.md_ids.iter().any(|id| t.contains(id)));
+        if !fr.md_ids.is_empty() && keep_md {
             mktdata.push(fr.payload.clone());
         }
     }
@@ -428,9 +447,10 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         errors,
         &format!("decode: order_add={adds} order_cancel={cancels} order_execute={execs} trades={trades} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} other={other} errors={errors}"),
     );
-    if let Some(sym) = &args.symbol {
+    if !args.symbol.is_empty() {
         eprintln!(
-            "  filter symbol {sym:?} -> instrument_id {target:?} (snapshot ids {target_sids:?})"
+            "  filter symbols {:?} -> instrument_ids {target:?} (snapshot ids {target_sids:?})",
+            args.symbol
         );
     }
     eprintln!(
@@ -496,12 +516,20 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
             }
         }
     }
-    let target = resolve_symbol(&args.symbol, &symbol_to_id)?;
+    let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
+    // id -> symbol, for the per-symbol count report (helps pick busy vs quiet coins).
+    let id_to_symbol: HashMap<u32, String> = symbol_to_id
+        .iter()
+        .map(|(s, &id)| (id, s.clone()))
+        .collect();
 
-    // Pass 2: classify each frame (refdata vs target mktdata) and emit in capture order, tagged.
+    // Pass 2: classify each frame (refdata vs selected mktdata) and emit in capture order, tagged.
     let path = out_path(&args.out, "combined");
     let mut w = BufWriter::new(File::create(&path).with_context(|| format!("create {path:?}"))?);
     let (mut refc, mut mktc, mut errors) = (0u64, 0u64, 0u64);
+    // Raw per-(symbol, publisher) quote-message counts among the KEPT mktdata frames — the
+    // pre-dedup baseline the dedup test compares its emitted counts against.
+    let mut per_symbol_pub: HashMap<(String, Ipv4Addr), u64> = HashMap::new();
     for (src, f) in tagged {
         let Ok((_h, msgs)) = codec::decode_frame(f) else {
             errors += 1;
@@ -517,10 +545,14 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
                 _ => {}
             }
         }
-        // Keep all refdata (so precision resolves), and mktdata only for the target symbol.
+        // Keep all refdata (so precision resolves), and mktdata only for the selected symbols.
+        let keep_md = !md_ids.is_empty()
+            && target
+                .as_ref()
+                .is_none_or(|t| md_ids.iter().any(|id| t.contains(id)));
         let role: u8 = if is_ref {
             0
-        } else if !md_ids.is_empty() && target.is_none_or(|t| md_ids.contains(&t)) {
+        } else if keep_md {
             1
         } else {
             continue;
@@ -529,6 +561,13 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
             refc += 1;
         } else {
             mktc += 1;
+            for id in &md_ids {
+                if target.as_ref().is_none_or(|t| t.contains(id)) {
+                    if let Some(sym) = id_to_symbol.get(id) {
+                        *per_symbol_pub.entry((sym.clone(), *src)).or_default() += 1;
+                    }
+                }
+            }
         }
         w.write_all(&(f.len() as u32).to_le_bytes())?;
         w.write_all(&src.octets())?;
@@ -541,6 +580,12 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
         args.src,
         args.combined_with.expect("combined mode")
     );
+    let mut rows: Vec<_> = per_symbol_pub.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("  raw kept quote messages per (symbol, publisher):");
+    for ((sym, ip), n) in rows {
+        eprintln!("    {sym:>8} {ip:>15}  {n}");
+    }
     Ok(())
 }
 
