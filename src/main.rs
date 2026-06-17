@@ -7,10 +7,6 @@
 //! Run it on a host connected to DZ Edge (the `doublezero1` interface) so consumers never
 //! have to bind multicast themselves.
 
-mod ingest;
-mod model;
-mod sinks;
-
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -21,6 +17,7 @@ use clap::Parser;
 use tokio::{sync::broadcast, task::JoinSet};
 use tracing::info;
 
+use doublezero_edge_connect::{ingest, model, sinks};
 use ingest::feeds;
 
 #[derive(Parser, Debug)]

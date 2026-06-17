@@ -66,3 +66,46 @@ Regenerate the TOB/MBO mktdata+refdata by re-running the publisher's `hl_block_m
 generation (`server/tests/fixtures/hl_block_mode/generate_from_source.py`) and copying the
 goldens here. The MBO refdata reorder and the hand-crafted snapshot must be re-applied after any
 regeneration (the generator does not emit the snapshot port).
+
+## Multi-publisher TOB fixtures (live capture)
+
+`tob_btc_pubA.*` and `tob_btc_pubB.*` are **two independent publishers of the same live
+Hyperliquid TOB feed**, for the multi-publisher dedup work (issue #3). Unlike the synthetic
+goldens above, these are sliced from a real capture, so the two publishers carry identical venue
+BBO content (same `source_ts`, bid/ask, sizes) on **independent, instance-scoped frame
+sequences** — exactly the condition the dedup must collapse (a same-bytes replay would be
+collapsed by the per-channel sequence tracker instead, and prove nothing).
+
+| File | Publisher | Source IP | Infra id | mktdata port |
+|------|-----------|-----------|----------|--------------|
+| tob_btc_pubA.{refdata,mktdata}.bin | A | 148.51.120.79 | tob_aws_tyo_hl_mainnet2 | 9201 |
+| tob_btc_pubB.{refdata,mktdata}.bin | B | 148.51.123.3  | tob_gcp_tyo_hl_mainnet1 | 9601 |
+
+Both are `BTC` (instrument_id 0), windowed to the first 40s of the capture. The window is ≥~35s
+on purpose: the exact-`BTC` instrument definition re-sends on a ~30s round-robin (786 instruments,
+~3144 defs/120s), so a shorter window omits it and the bridge's precision gate never resolves BTC.
+The `.refdata.bin` files carry all in-window definitions+manifest (so precision resolves); the
+`.mktdata.bin` files carry only BTC quotes/trades.
+
+**Demux is by source IP, not UDP port** — publishers are on distinct ports today, but the feed
+team intends to normalize that, so source IP is the robust publisher key.
+
+**Codec validation:** the converter decodes every frame through the bridge's own `ingest::codec`;
+this capture produced **0 TOB decode errors** across ~130k frames from both publishers, validating
+the TOB codec byte offsets against the live feed (beyond the byte-validated reference).
+
+**Regenerating** (the raw 635 MB pcap is intentionally NOT committed):
+
+```
+# capture on the recorder (read-only sniff; multicast is multi-listener):
+sudo timeout 120 tcpdump -i doublezero1 -nn -s 0 -w tyo_tob.pcap 'host 233.84.178.15 and udp'
+# then, with the worktree built (cargo build --example pcap2frames):
+cargo run --example pcap2frames -- tyo_tob.pcap --src 148.51.120.79 --symbol BTC --to 40 \
+  -o tests/fixtures/tob_btc_pubA
+cargo run --example pcap2frames -- tyo_tob.pcap --src 148.51.123.3 --symbol BTC --to 40 \
+  -o tests/fixtures/tob_btc_pubB
+```
+
+The converter (`examples/pcap2frames.rs`) demuxes one publisher by source IP, keeps TOB frames
+(magic `0x445A`), filters mktdata to the chosen symbol, and writes the `[u32 LE length][frame]`
+record format `tests/common/replay.rs` replays.
