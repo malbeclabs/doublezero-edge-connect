@@ -236,6 +236,15 @@ async fn mbo_single_publisher_depth_contract() {
         for w in asks.windows(2) {
             assert!(px(&w[0]) <= px(&w[1]), "asks not ascending: {d}");
         }
+        // A crossed book (best bid >= best ask) indicates the MBO side labels are inverted.
+        if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
+            assert!(
+                px(best_bid) < px(best_ask),
+                "crossed book: best_bid={} >= best_ask={} (MBO side inversion?)",
+                px(best_bid),
+                px(best_ask)
+            );
+        }
     }
 
     // MBO is depth-only: no trades from this venue (TOB owns trades, idle here).

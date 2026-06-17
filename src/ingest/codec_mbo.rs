@@ -38,11 +38,12 @@ pub const MSG_SNAPSHOT_BEGIN: u8 = 0x20;
 pub const MSG_SNAPSHOT_ORDER: u8 = 0x21;
 pub const MSG_SNAPSHOT_END: u8 = 0x22;
 
-/// Order side on the book: bid (buy) or ask (sell). Wire byte 1=Bid, 2=Ask. The processor tests
-/// `side == SIDE_BID`, so `SIDE_ASK` documents the other value (used by encoders/tests).
-pub const SIDE_BID: u8 = 1;
+/// Order side on the book: bid (buy) or ask (sell). Wire byte `0`=Bid, `1`=Ask (per
+/// edge-feed-spec market-by-order). The processor tests `side == SIDE_BID`; `SIDE_ASK`
+/// documents the other value (used by encoders/tests).
+pub const SIDE_BID: u8 = 0;
 #[allow(dead_code)]
-pub const SIDE_ASK: u8 = 2;
+pub const SIDE_ASK: u8 = 1;
 
 /// On-wire message sizes (including the 4-byte header). The decoder reads each length from the
 /// wire; these are kept for parity with the spec and for the round-trip encoders.
@@ -454,6 +455,47 @@ mod tests {
             }
             other => panic!("unexpected snapshot group: {other:?}"),
         }
+    }
+
+    /// Spec (edge-feed-spec market-by-order): Side field 0=Bid/Buy, 1=Ask/Sell.
+    /// Also matches the Hyperliquid publisher: SIDE_BID=0, SIDE_ASK=1.
+    /// An inverted constant routes all wire bids to asks and vice versa, crossing the book.
+    #[test]
+    fn side_constants_match_spec() {
+        assert_eq!(
+            SIDE_BID, 0,
+            "SIDE_BID must be 0 per edge-feed-spec (0=Bid/Buy)"
+        );
+        assert_eq!(
+            SIDE_ASK, 1,
+            "SIDE_ASK must be 1 per edge-feed-spec (1=Ask/Sell)"
+        );
+    }
+
+    /// Wire byte 0 must decode as a bid and wire byte 1 as an ask.
+    #[test]
+    fn side_byte_zero_is_bid_one_is_ask() {
+        let make = |side: u8| {
+            let o = OrderAdd {
+                instrument_id: 1,
+                source_id: 0,
+                side,
+                order_flags: 0,
+                per_instrument_seq: 1,
+                order_id: 1,
+                enter_ts: 0,
+                price_raw: 100,
+                qty_raw: 1,
+            };
+            let f = frame(&[enc_order_add(&o)]);
+            let (_h, msgs) = decode_frame(&f).unwrap();
+            match &msgs[0] {
+                Message::OrderAdd(got) => got.side,
+                other => panic!("expected OrderAdd, got {other:?}"),
+            }
+        };
+        assert_eq!(make(0), SIDE_BID, "wire byte 0 must equal SIDE_BID");
+        assert_eq!(make(1), SIDE_ASK, "wire byte 1 must equal SIDE_ASK");
     }
 
     #[test]
