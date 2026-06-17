@@ -1,5 +1,6 @@
 mod common;
 
+use common::assertions;
 use common::bridge::Bridge;
 use common::replay;
 use common::ws_client;
@@ -87,4 +88,49 @@ async fn spike_loopback_multicast_produces_a_quote() {
         quotes[0].get("venue").and_then(|v| v.as_str()),
         Some("Hyperliquid")
     );
+}
+
+/// Spawn the bridge, replay the full TOB golden once (single publisher), and assert the
+/// output contract. The `quote_count` baseline is pinned on first green run (Step 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn tob_single_publisher_contract() {
+    let bridge = Bridge::spawn("Hyperliquid", 18082);
+    let ws_addr = bridge.ws_addr.clone();
+
+    // Collect for a fixed window after replay completes (we do not know the exact count
+    // up front; the window must comfortably exceed replay duration but stay under the 30s
+    // idle-rejoin watchdog).
+    let collector = tokio::spawn(async move {
+        ws_client::collect(&ws_addr, Duration::from_secs(8), |_| false).await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let refdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
+        replay::TOB_MAGIC,
+    );
+    let mktdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
+        replay::TOB_MAGIC,
+    );
+    tokio::task::spawn_blocking(move || {
+        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+    })
+    .await
+    .unwrap();
+
+    let msgs = collector.await.unwrap();
+
+    assert!(!ws_client::by_type(&msgs, "instrument").is_empty(), "no instrument messages");
+    assert!(!ws_client::by_type(&msgs, "quote").is_empty(), "no quote messages");
+    assertions::instrument_before_price(&msgs);
+    assertions::no_business_duplicates(&msgs);
+    assertions::quotes_well_formed(&msgs);
+    assertions::trades_well_formed(&msgs);
+
+    let quote_count = ws_client::by_type(&msgs, "quote").len();
+    assert_eq!(quote_count, 41, "TOB quote count regressed");
 }
