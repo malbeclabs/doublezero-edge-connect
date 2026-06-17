@@ -7,7 +7,7 @@
 //! - [`MboProcessor`] - Market-by-Order (`codec_mbo`, magic `0x4444`): reconstructs the L3 book
 //!   in [`crate::ingest::book`] and re-serves it as full-state `depth` + `trade`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use tracing::{debug, info, warn};
 
@@ -426,8 +426,9 @@ impl FrameProcessor for MboProcessor {
         }
 
         // Instruments whose book changed this frame; depth is emitted once per frame per instrument
-        // (coalescing many order events into a single full-state snapshot).
-        let mut changed: HashSet<u32> = HashSet::new();
+        // (coalescing many order events into a single full-state snapshot). BTreeSet gives
+        // deterministic ascending instrument_id order across frames touching multiple instruments.
+        let mut changed: BTreeSet<u32> = BTreeSet::new();
 
         for msg in messages {
             match msg {
@@ -596,5 +597,223 @@ impl FrameProcessor for MboProcessor {
         for instrument_id in changed {
             self.emit_depth(instrument_id, ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use tokio::sync::broadcast;
+
+    use super::MboProcessor;
+    use crate::{
+        ingest::{
+            codec_mbo::{
+                tests::{enc_order_add, enc_snapshot_begin, enc_snapshot_end, frame},
+                OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
+                MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
+            },
+            receiver::{FrameCtx, FrameProcessor, PortRole},
+        },
+        model::{DepthSnapshot, FeedMessage},
+    };
+
+    /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
+    ///
+    /// Body layout matches `codec_mbo::decode_message` offsets:
+    ///   +0 channel_id (u8), +1 valid (u8), +2..+4 pad,
+    ///   +4 manifest_seq (u16le), +6..+8 pad,
+    ///   +8 instrument_count (u32le), +12 ts (u64le).
+    fn enc_manifest_summary(manifest_seq: u16, instrument_count: u32) -> Vec<u8> {
+        let mut out = vec![MSG_MANIFEST_SUMMARY, 24, 0, 0]; // 4-byte hdr + 20-byte body
+        out.push(0u8); // body+0: channel_id
+        out.push(1u8); // body+1: valid = true
+        out.extend_from_slice(&[0u8; 2]); // body+2..+4: pad
+        out.extend_from_slice(&manifest_seq.to_le_bytes()); // body+4..+6
+        out.extend_from_slice(&[0u8; 2]); // body+6..+8: pad
+        out.extend_from_slice(&instrument_count.to_le_bytes()); // body+8..+12
+        out.extend_from_slice(&0u64.to_le_bytes()); // body+12..+20: ts
+        out
+    }
+
+    /// Encode an InstrumentDefinition wire message (80 bytes total, exponents=0).
+    ///
+    /// Body layout matches `codec_mbo::decode_message` offsets:
+    ///   +0 instrument_id (u32le), +4 symbol (16 B NUL-padded),
+    ///   +20..+37 pad, +37 price_exponent (i8), +38 qty_exponent (i8),
+    ///   +39..+74 pad, +74 manifest_seq (u16le).
+    /// Total: 4 (hdr) + 76 (body) = 80 bytes = sizes::INSTRUMENT_DEFINITION.
+    fn enc_instrument_def(id: u32, symbol: &str, manifest_seq: u16) -> Vec<u8> {
+        let mut out = vec![MSG_INSTRUMENT_DEFINITION, 80, 0, 0];
+        out.extend_from_slice(&id.to_le_bytes()); // body+0..+4
+        let mut sym = [0u8; 16];
+        let sb = symbol.as_bytes();
+        sym[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
+        out.extend_from_slice(&sym); // body+4..+20
+        out.extend_from_slice(&[0u8; 17]); // body+20..+37: pad
+        out.push(0u8); // body+37: price_exponent = 0
+        out.push(0u8); // body+38: qty_exponent = 0
+        out.extend_from_slice(&[0u8; 35]); // body+39..+74: pad
+        out.extend_from_slice(&manifest_seq.to_le_bytes()); // body+74..+76
+                                                            // 4 + 4 + 16 + 17 + 1 + 1 + 35 + 2 = 80 bytes total.
+        out
+    }
+
+    fn make_ctx<'a>(
+        tx: &'a broadcast::Sender<FeedMessage>,
+        instruments: &'a crate::model::InstrumentSnapshot,
+        role: PortRole,
+    ) -> FrameCtx<'a> {
+        FrameCtx {
+            venue: "TV",
+            tx,
+            instruments,
+            kernel_rx_ts_ns: 0,
+            recv_ts_ns: 0,
+            role,
+        }
+    }
+
+    /// Drain all available `Depth` messages and return the numeric instrument ids
+    /// encoded in their symbol field (`"INST-{id}"`).
+    fn drain_depth_ids(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(FeedMessage::Depth(d)) => {
+                    ids.push(d.symbol.trim_start_matches("INST-").parse::<u32>().unwrap());
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        ids
+    }
+
+    /// `depth` messages for a frame touching multiple instruments must arrive in ascending
+    /// instrument_id order regardless of the wire order of their `OrderAdd`s. The invariant is
+    /// guaranteed by draining a `BTreeSet<u32>` rather than a `HashSet`.
+    #[test]
+    fn mbo_depth_emit_order_is_ascending_instrument_id() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+
+        // Refdata: manifest declares 2 instruments; then their definitions.
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 2),
+                enc_instrument_def(0, "INST-0", 1),
+                enc_instrument_def(1, "INST-1", 1),
+            ]),
+            &make_ctx(&tx, &instruments, PortRole::Combined),
+        );
+
+        // Sync each instrument via an empty-book anchor snapshot (0 orders, anchor_seq=0).
+        let snap = |iid: u32, sid: u32| {
+            frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: iid,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: sid,
+                    last_instrument_seq: 0,
+                    ts: sid as u64,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: iid,
+                    anchor_seq: 0,
+                    snapshot_id: sid,
+                }),
+            ])
+        };
+        let snap_ctx = make_ctx(&tx, &instruments, PortRole::Snapshot);
+        proc.on_datagram(&snap(0, 1), &snap_ctx);
+        proc.on_datagram(&snap(1, 2), &snap_ctx);
+        drain_depth_ids(&mut rx); // discard snapshot-triggered emits
+
+        // Mktdata frame: instrument 1 appears before instrument 0 in the wire order. BTreeSet must
+        // still drain 0 → 1.
+        let mktdata_frame = frame(&[
+            enc_order_add(&OrderAdd {
+                instrument_id: 1,
+                source_id: 0,
+                side: SIDE_ASK,
+                order_flags: 0,
+                per_instrument_seq: 1,
+                order_id: 101,
+                enter_ts: 10,
+                price_raw: 200,
+                qty_raw: 5,
+            }),
+            enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 0,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: 1,
+                order_id: 100,
+                enter_ts: 11,
+                price_raw: 100,
+                qty_raw: 10,
+            }),
+        ]);
+        proc.on_datagram(
+            &mktdata_frame,
+            &make_ctx(&tx, &instruments, PortRole::Mktdata),
+        );
+
+        let ids = drain_depth_ids(&mut rx);
+        assert_eq!(
+            ids.len(),
+            2,
+            "expected one depth per instrument; got {ids:?}"
+        );
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "depth must arrive in ascending instrument_id order"
+        );
+
+        // Replay with incremented per_instrument_seqs to confirm the order is stable across frames,
+        // not a lucky hash ordering on the first run.
+        let mktdata_frame2 = frame(&[
+            enc_order_add(&OrderAdd {
+                instrument_id: 1,
+                source_id: 0,
+                side: SIDE_ASK,
+                order_flags: 0,
+                per_instrument_seq: 2,
+                order_id: 201,
+                enter_ts: 20,
+                price_raw: 201,
+                qty_raw: 5,
+            }),
+            enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 0,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: 2,
+                order_id: 200,
+                enter_ts: 21,
+                price_raw: 101,
+                qty_raw: 10,
+            }),
+        ]);
+        proc.on_datagram(
+            &mktdata_frame2,
+            &make_ctx(&tx, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_depth_ids(&mut rx),
+            vec![0, 1],
+            "order must be stable across frames"
+        );
     }
 }

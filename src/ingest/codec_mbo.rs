@@ -317,7 +317,7 @@ fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ingest::codec_common::FRAME_HEADER_SIZE;
 
