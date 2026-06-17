@@ -138,10 +138,32 @@ async fn tob_single_publisher_contract() {
     assertions::quotes_well_formed(&msgs);
     assertions::trades_well_formed(&msgs);
 
-    let quote_count = ws_client::by_type(&msgs, "quote").len();
-    // Baseline assumes no republish-suppression (BBO content-dedup). Whoever lands dedup (#3)
-    // must re-pin this deliberately; the "regressed" message is only correct under that assumption.
-    assert_eq!(quote_count, 41, "TOB quote count regressed");
+    let quotes = ws_client::by_type(&msgs, "quote");
+    // Content-dedup (#3) suppresses unchanged-BBO republishes, so every emitted quote is a distinct
+    // top-of-book state (only `source_ts` differed among the collapsed ones).
+    let distinct: std::collections::HashSet<String> = quotes
+        .iter()
+        .map(|q| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                q.get("symbol").and_then(|v| v.as_str()).unwrap_or(""),
+                q.get("bid").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                q.get("ask").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                q.get("bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                q.get("ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            )
+        })
+        .collect();
+    assert_eq!(
+        quotes.len(),
+        distinct.len(),
+        "every emitted quote must be a distinct BBO after content-dedup"
+    );
+    assert_eq!(
+        quotes.len(),
+        7,
+        "TOB single-publisher quote count after BBO republish-suppression (was 41 pre-dedup)"
+    );
 }
 
 #[test]

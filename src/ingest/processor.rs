@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
+        arbiter::{BboDedup, TradeDeduper, WireBbo},
         book::{BookState, DeltaKind, DeltaOp},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -30,6 +31,10 @@ use crate::{
 
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
+
+/// Recent trade IDs remembered per (venue, symbol) for cross-publisher trade dedup. Const for now;
+/// promote to config alongside the multi-publisher trade test that can size it.
+const TRADE_DEDUP_WINDOW: usize = 8192;
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
@@ -68,6 +73,11 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
+    /// Cross-publisher quote dedup: suppresses a quote whose top-of-book content matches the last
+    /// emitted for (venue, symbol) — a republish or a competing publisher's duplicate.
+    quote_dedup: BboDedup<(String, String)>,
+    /// Cross-publisher trade dedup by venue trade_id per (venue, symbol).
+    trade_dedup: TradeDeduper<(String, String)>,
 }
 
 impl TobProcessor {
@@ -78,7 +88,22 @@ impl TobProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
+            quote_dedup: BboDedup::default(),
+            trade_dedup: TradeDeduper::new(TRADE_DEDUP_WINDOW),
         }
+    }
+
+    /// Whether this quote should be forwarded: false if its BBO content matches the last emitted
+    /// for (venue, symbol).
+    fn admit_quote(&mut self, venue: &str, symbol: &str, bbo: WireBbo) -> bool {
+        self.quote_dedup
+            .should_emit((venue.to_string(), symbol.to_string()), bbo)
+    }
+
+    /// Whether this trade should be forwarded: false if its trade_id was seen recently.
+    fn admit_trade(&mut self, venue: &str, symbol: &str, trade_id: u64) -> bool {
+        self.trade_dedup
+            .is_new((venue.to_string(), symbol.to_string()), trade_id)
     }
 }
 
@@ -223,7 +248,20 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    let _ = ctx.tx.send(FeedMessage::Quote(quote));
+                    // Cross-publisher dedup on top-of-book content (timestamp-excluded): a competing
+                    // publisher's identical BBO, or an unchanged-BBO republish, is suppressed.
+                    let bbo = WireBbo {
+                        update_flags: q.update_flags,
+                        bid_price_raw: q.bid_price_raw,
+                        bid_qty_raw: q.bid_qty_raw,
+                        ask_price_raw: q.ask_price_raw,
+                        ask_qty_raw: q.ask_qty_raw,
+                        price_exponent: def.price_exponent,
+                        qty_exponent: def.qty_exponent,
+                    };
+                    if self.admit_quote(&quote.venue, &quote.symbol, bbo) {
+                        let _ = ctx.tx.send(FeedMessage::Quote(quote));
+                    }
                 }
                 Message::Trade(t) if handle_quotes && quotes_fresh => {
                     // Same per-instrument precision gate as quotes: a trade is dropped until we
@@ -247,7 +285,9 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    if self.emit_trades {
+                    if self.emit_trades
+                        && self.admit_trade(&trade.venue, &trade.symbol, trade.trade_id)
+                    {
                         let _ = ctx.tx.send(FeedMessage::Trade(trade));
                     }
                 }
@@ -630,7 +670,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor};
+    use super::{upsert_instrument, MboProcessor, TobProcessor, WireBbo};
     use crate::{
         ingest::{
             codec_mbo::{
@@ -642,6 +682,35 @@ mod tests {
         },
         model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
     };
+
+    fn tob_bbo(bid_price: i64, ask_price: i64) -> WireBbo {
+        WireBbo {
+            update_flags: 0,
+            bid_price_raw: bid_price,
+            bid_qty_raw: 1,
+            ask_price_raw: ask_price,
+            ask_qty_raw: 1,
+            price_exponent: -2,
+            qty_exponent: 0,
+        }
+    }
+
+    #[test]
+    fn tob_quote_dedup_collapses_identical_content() {
+        let mut p = TobProcessor::new(true);
+        assert!(p.admit_quote("Hyperliquid", "BTC", tob_bbo(100, 101)));
+        assert!(!p.admit_quote("Hyperliquid", "BTC", tob_bbo(100, 101))); // duplicate
+        assert!(p.admit_quote("Hyperliquid", "BTC", tob_bbo(100, 102))); // ask moved
+        assert!(p.admit_quote("Hyperliquid", "ETH", tob_bbo(100, 101))); // independent symbol
+    }
+
+    #[test]
+    fn tob_trade_dedup_drops_repeat() {
+        let mut p = TobProcessor::new(true);
+        assert!(p.admit_trade("Hyperliquid", "BTC", 7));
+        assert!(!p.admit_trade("Hyperliquid", "BTC", 7));
+        assert!(p.admit_trade("Hyperliquid", "BTC", 8));
+    }
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
     ///
