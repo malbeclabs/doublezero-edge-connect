@@ -25,9 +25,14 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  DEPLOY_ROLE: arn:aws:iam::879381273509:role/github-doublezero-install-deploy
   BUCKET: doublezero-install
-  DISTRIBUTION_ID: E393SM6O109RQ3
+  # Account-scoped infra (deploy-role ARN incl. the AWS account ID, and the CloudFront
+  # distribution id) lives in repo Actions Variables so it is not baked into a public
+  # workflow. Set both under Settings -> Secrets and variables -> Actions -> Variables:
+  #   DEPLOY_ROLE     = arn:aws:iam::<account-id>:role/github-doublezero-install-deploy
+  #   DISTRIBUTION_ID = <cloudfront-distribution-id>
+  DEPLOY_ROLE: ${{ vars.DEPLOY_ROLE }}
+  DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
 
 jobs:
   publish:
@@ -35,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}

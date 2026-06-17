@@ -23,6 +23,7 @@ jobs:
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
+          set -euo pipefail
           if echo "$LABELS" | grep -q '"skip-changelog"'; then
             echo "skip-changelog label present — skipping changelog check."
             exit 0
