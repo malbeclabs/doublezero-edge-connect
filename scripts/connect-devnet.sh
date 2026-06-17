@@ -261,6 +261,7 @@ for v in "${PASSTHROUGH[@]}"; do
 done
 $SUDO docker run -d --name "$DZ_NAME" \
   --restart unless-stopped \
+  --stop-timeout 60 \
   --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --device /dev/net/tun \
@@ -298,7 +299,12 @@ EXEC_TTY=""; [ -t 1 ] && EXEC_TTY="-t"
 # user onchain for $DZ_ENV. If this errors with an access-pass message, that
 # provisioning step still needs to happen. Once the tunnel is up, the bridge
 # self-heals onto the doublezero1 interface within ~30s and quotes begin flowing.
-$SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast || warn "connect failed (often: no access pass for this IP, or provider firewall/NAT). See notes above."
+if $SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast; then
+  # Record success so the container disconnects cleanly on shutdown (see docker-entrypoint.sh).
+  $SUDO docker exec "$DZ_NAME" touch /run/doublezerod/connected 2>/dev/null || true
+else
+  warn "connect failed (often: no access pass for this IP, or provider firewall/NAT). See notes above."
+fi
 
 # ----------------------------------------------------------------------------
 # 8. status + management hints
@@ -316,4 +322,4 @@ info "Manage with:"
 echo "  sudo docker logs -f $DZ_NAME                            # bridge + daemon logs"
 echo "  sudo docker exec -it $DZ_NAME doublezero status         # tunnel status"
 echo "  sudo docker exec -it $DZ_NAME doublezero latency        # device latencies"
-echo "  sudo docker rm -f $DZ_NAME                              # stop & remove"
+echo "  sudo docker stop $DZ_NAME && sudo docker rm $DZ_NAME    # disconnect, stop & remove"

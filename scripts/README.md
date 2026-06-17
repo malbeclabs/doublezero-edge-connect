@@ -90,7 +90,7 @@ RUST_LOG=debug WS_BIND=0.0.0.0:9000 \
 sudo docker logs -f doublezero-edge-connect                  # bridge + daemon logs
 sudo docker exec -it doublezero-edge-connect doublezero status   # tunnel status
 sudo docker exec -it doublezero-edge-connect doublezero latency  # device latencies
-sudo docker rm -f doublezero-edge-connect                    # stop & remove
+sudo docker stop doublezero-edge-connect && sudo docker rm doublezero-edge-connect  # disconnect, stop & remove
 ```
 
 The bridge serves:
