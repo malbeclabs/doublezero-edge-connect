@@ -4,6 +4,12 @@ name: security-audit
 # advisories, disallowed/duplicate crates, license policy, and source allow-listing
 # (config in deny.toml). The weekly schedule catches newly-disclosed CVEs even when
 # no code changes land.
+#
+# cargo-deny is a required status check, so the pull_request trigger runs
+# unconditionally: a `paths`-filtered required check is skipped (never reported) on
+# PRs that don't touch the dependency files, leaving the PR stuck on
+# "Expected — Waiting for status to be reported". The push trigger keeps its paths
+# filter since it only feeds the weekly/main signal, not a merge gate.
 on:
   push:
     branches: [main]
@@ -13,11 +19,6 @@ on:
       - "deny.toml"
       - ".github/workflows/security-audit.yml"
   pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "deny.toml"
-      - ".github/workflows/security-audit.yml"
   schedule:
     - cron: "17 6 * * 1" # Mondays 06:17 UTC
 
