@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live two-publisher Top-of-Book BTC fixtures (`tests/fixtures/tob_btc_pub{A,B}.*`) for the
   upcoming multi-publisher deduplication work; provenance and regeneration in
   `tests/fixtures/PROVENANCE.md`.
+- `pcap2frames --combined-with <ip>`: emits one capture-ordered, source-IP-and-role-tagged stream
+  of two publishers (`tob_btc_dual.combined.bin`), preserving the real interleaving the
+  multi-publisher dedup must collapse.
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry

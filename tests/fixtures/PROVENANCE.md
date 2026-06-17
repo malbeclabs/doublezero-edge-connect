@@ -124,3 +124,20 @@ cargo run --example pcap2frames -- tyo_tob.pcap --src 148.51.123.3 --symbol BTC 
 The converter (`examples/pcap2frames.rs`) demuxes one publisher by source IP, keeps TOB frames
 (magic `0x445A`), filters mktdata to the chosen symbol, and writes the `[u32 LE length][frame]`
 record format `tests/common/replay.rs` replays.
+
+### `tob_btc_dual.combined.bin` — interleaved two-publisher golden
+
+`tob_btc_pubA`/`tob_btc_pubB` are *separate* per-publisher captures; replaying them back-to-back
+does **not** reproduce the real wire, where the two publishers' copies of each update arrive
+**interleaved**. The multi-publisher dedup collapses *adjacent* duplicates, so the dedup test needs
+the real interleaving. `tob_btc_dual.combined.bin` is that: both publishers' refdata +
+BTC-filtered mktdata in **capture order**, each record tagged `[u32 LE len][4B src_ip][1B role:
+0=refdata,1=mktdata][frame]` (note the extra `src_ip`/`role` prefix — this is NOT the plain
+`split_frames` format; the dedup test has its own reader). 235 refdata + 9330 mktdata frames, 0
+decode errors. Regenerate:
+
+```
+cargo run --example pcap2frames -- tyo_tob.pcap \
+  --src 148.51.120.79 --combined-with 148.51.123.3 --symbol BTC --to 40 \
+  -o tests/fixtures/tob_btc_dual
+```

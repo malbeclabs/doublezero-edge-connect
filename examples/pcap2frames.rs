@@ -78,6 +78,13 @@ struct Args {
     /// Window end (seconds, relative to the first packet). Omit for end-of-capture.
     #[arg(long)]
     to: Option<f64>,
+    /// Second publisher source IP. When set, emit ONE combined `<out>.combined.bin` of both
+    /// publishers' refdata + symbol-filtered TOB mktdata **in capture order**, each record tagged
+    /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata][frame]`. This preserves the real
+    /// inter-publisher interleaving the multi-publisher dedup must collapse (separate per-publisher
+    /// files, replayed back-to-back, would not). TOB only.
+    #[arg(long)]
+    combined_with: Option<Ipv4Addr>,
 }
 
 /// Extract the UDP payload of an SLL-encapsulated IPv4/UDP datagram, plus its src and dst IP.
@@ -441,8 +448,117 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Collect `(src_ip, frame)` for any of `srcs`, in capture order — like `collect_frames` but tags
+/// the source and accepts a set, for the combined multi-publisher output.
+fn collect_tagged(args: &Args, srcs: &[Ipv4Addr]) -> Result<Vec<(Ipv4Addr, Vec<u8>)>> {
+    let file = File::open(&args.pcap).with_context(|| format!("open {:?}", args.pcap))?;
+    let mut reader = PcapReader::new(file).map_err(|e| anyhow!("read pcap header: {e}"))?;
+    let datalink = reader.header().datalink;
+    if datalink != DataLink::LINUX_SLL {
+        bail!("unsupported pcap link type {datalink:?}; this tool parses Linux SLL (DLT 113) only");
+    }
+    let magic = args.protocol.magic();
+    let mut out = Vec::new();
+    let mut first_ts: Option<f64> = None;
+    while let Some(pkt) = reader.next_packet() {
+        let pkt = pkt.map_err(|e| anyhow!("read packet: {e}"))?;
+        let rel =
+            pkt.timestamp.as_secs_f64() - *first_ts.get_or_insert(pkt.timestamp.as_secs_f64());
+        if rel < args.from {
+            continue;
+        }
+        if args.to.is_some_and(|to| rel > to) {
+            break;
+        }
+        let Some((src, dst, payload)) = sll_ipv4_udp(&pkt.data) else {
+            continue;
+        };
+        if srcs.contains(&src) && dst == args.group && payload.len() >= 24 && payload[..2] == magic
+        {
+            out.push((src, payload.to_vec()));
+        }
+    }
+    Ok(out)
+}
+
+/// Combined multi-publisher TOB output: both publishers' refdata + symbol-filtered mktdata in
+/// capture order, each record tagged with its source IP and role, preserving the real interleaving.
+fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<()> {
+    use codec::Message;
+    // Pass 1: build symbol -> id across both publishers (a def may follow early quotes).
+    let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
+    for (_src, f) in tagged {
+        if let Ok((_h, msgs)) = codec::decode_frame(f) {
+            for m in &msgs {
+                if let Message::InstrumentDefinition(d) = m {
+                    symbol_to_id.insert(d.symbol.clone(), d.instrument_id);
+                }
+            }
+        }
+    }
+    let target = resolve_symbol(&args.symbol, &symbol_to_id)?;
+
+    // Pass 2: classify each frame (refdata vs target mktdata) and emit in capture order, tagged.
+    let path = out_path(&args.out, "combined");
+    let mut w = BufWriter::new(File::create(&path).with_context(|| format!("create {path:?}"))?);
+    let (mut refc, mut mktc, mut errors) = (0u64, 0u64, 0u64);
+    for (src, f) in tagged {
+        let Ok((_h, msgs)) = codec::decode_frame(f) else {
+            errors += 1;
+            continue;
+        };
+        let mut is_ref = false;
+        let mut md_ids: Vec<u32> = Vec::new();
+        for m in &msgs {
+            match m {
+                Message::InstrumentDefinition(_) | Message::ManifestSummary(_) => is_ref = true,
+                Message::Quote(q) => md_ids.push(q.instrument_id),
+                Message::Trade(t) => md_ids.push(t.instrument_id),
+                _ => {}
+            }
+        }
+        // Keep all refdata (so precision resolves), and mktdata only for the target symbol.
+        let role: u8 = if is_ref {
+            0
+        } else if !md_ids.is_empty() && target.is_none_or(|t| md_ids.contains(&t)) {
+            1
+        } else {
+            continue;
+        };
+        if role == 0 {
+            refc += 1;
+        } else {
+            mktc += 1;
+        }
+        w.write_all(&(f.len() as u32).to_le_bytes())?;
+        w.write_all(&src.octets())?;
+        w.write_all(&[role])?;
+        w.write_all(f)?;
+    }
+    w.flush()?;
+    eprintln!(
+        "combined {} + {}: {refc} refdata + {mktc} mktdata frames (decode errors {errors}) -> {path:?}",
+        args.src,
+        args.combined_with.expect("combined mode")
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(second) = args.combined_with {
+        if args.protocol != Protocol::Tob {
+            bail!("--combined-with is currently TOB-only");
+        }
+        let tagged = collect_tagged(&args, &[args.src, second])?;
+        eprintln!(
+            "matched {} combined TOB frames from {} + {}",
+            tagged.len(),
+            args.src,
+            second
+        );
+        return process_tob_combined(&tagged, &args);
+    }
     let frames = collect_frames(&args)?;
     eprintln!("matched {} {:?} frames", frames.len(), args.protocol);
     match args.protocol {
