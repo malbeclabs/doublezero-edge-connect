@@ -32,7 +32,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use pcap_file::pcap::PcapReader;
+use pcap_file::{pcap::PcapReader, DataLink};
 
 use doublezero_edge_connect::ingest::{codec, codec_mbo};
 
@@ -111,9 +111,18 @@ fn sll_ipv4_udp(data: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, &[u8])> {
 fn collect_frames(args: &Args) -> Result<Vec<Vec<u8>>> {
     let file = File::open(&args.pcap).with_context(|| format!("open {:?}", args.pcap))?;
     let mut reader = PcapReader::new(file).map_err(|e| anyhow!("read pcap header: {e}"))?;
+    // Only Linux SLL v1 (DLT 113) is parsed below; bail loudly on anything else. A plain-Ethernet
+    // (DLT 1) or SLL2 (DLT 276) capture would otherwise parse zero matching frames and exit with a
+    // misleading "matched 0 frames" success — the silent bad-input trap.
+    let datalink = reader.header().datalink;
+    if datalink != DataLink::LINUX_SLL {
+        bail!("unsupported pcap link type {datalink:?}; this tool parses Linux SLL (DLT 113) only");
+    }
     let magic = args.protocol.magic();
 
     let mut frames = Vec::new();
+    // `first_ts` anchors to the FIRST packet in the file (not the first in-window packet), so
+    // `--from`/`--to` are relative to capture start.
     let mut first_ts: Option<f64> = None;
     while let Some(pkt) = reader.next_packet() {
         let pkt = pkt.map_err(|e| anyhow!("read packet: {e}"))?;
@@ -228,11 +237,23 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     }
 
     let target = resolve_symbol(&args.symbol, &symbol_to_id)?;
-    let mktdata: Vec<Vec<u8>> = mkt
-        .into_iter()
-        .filter(|(_, ids)| target.is_none_or(|t| ids.contains(&t)))
-        .map(|(f, _)| f)
-        .collect();
+    // A TOB frame batches multiple instruments' messages, so a frame carrying the target symbol may
+    // also carry others; it is kept whole. Track that leakage so the output is not overclaimed as
+    // "target-only".
+    let mut mktdata: Vec<Vec<u8>> = Vec::new();
+    let (mut mixed_frames, mut leaked_msgs) = (0u64, 0u64);
+    for (f, ids) in mkt {
+        if target.is_none_or(|t| ids.contains(&t)) {
+            if let Some(t) = target {
+                let others = ids.iter().filter(|&&id| id != t).count() as u64;
+                if others > 0 {
+                    mixed_frames += 1;
+                    leaked_msgs += others;
+                }
+            }
+            mktdata.push(f);
+        }
+    }
 
     let refdata_path = out_path(&args.out, "refdata");
     let mktdata_path = out_path(&args.out, "mktdata");
@@ -247,6 +268,11 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     );
     if let Some(sym) = &args.symbol {
         eprintln!("  filter symbol {sym:?} -> instrument_id {target:?}");
+        if mixed_frames > 0 {
+            eprintln!(
+                "  note: {mixed_frames} kept frames also batch other symbols ({leaked_msgs} non-target messages retained — frames are kept whole)"
+            );
+        }
     }
     eprintln!(
         "  wrote {} refdata frames -> {refdata_path:?}",

@@ -69,30 +69,45 @@ regeneration (the generator does not emit the snapshot port).
 
 ## Multi-publisher TOB fixtures (live capture)
 
-`tob_btc_pubA.*` and `tob_btc_pubB.*` are **two independent publishers of the same live
-Hyperliquid TOB feed**, for the multi-publisher dedup work (issue #3). Unlike the synthetic
-goldens above, these are sliced from a real capture, so the two publishers carry identical venue
-BBO content (same `source_ts`, bid/ask, sizes) on **independent, instance-scoped frame
-sequences** — exactly the condition the dedup must collapse (a same-bytes replay would be
-collapsed by the per-channel sequence tracker instead, and prove nothing).
+`tob_btc_pubA.*` and `tob_btc_pubB.*` are **two independent live publishers of the same
+Hyperliquid TOB feed**, for the multi-publisher dedup work (issue #3). They are genuinely
+independent — disjoint frame-sequence spaces (≈70.8M vs ≈53.7M) and distinct wire `source_id`
+(3 vs 1) — and time-aligned (each spans the same ~40s window, `source_ts` 1781705333..1781705373).
 
 | File | Publisher | Source IP | Infra id | mktdata port |
 |------|-----------|-----------|----------|--------------|
 | tob_btc_pubA.{refdata,mktdata}.bin | A | 148.51.120.79 | tob_aws_tyo_hl_mainnet2 | 9201 |
 | tob_btc_pubB.{refdata,mktdata}.bin | B | 148.51.123.3  | tob_gcp_tyo_hl_mainnet1 | 9601 |
 
-Both are `BTC` (instrument_id 0), windowed to the first 40s of the capture. The window is ≥~35s
-on purpose: the exact-`BTC` instrument definition re-sends on a ~30s round-robin (786 instruments,
-~3144 defs/120s), so a shorter window omits it and the bridge's precision gate never resolves BTC.
-The `.refdata.bin` files carry all in-window definitions+manifest (so precision resolves); the
-`.mktdata.bin` files carry only BTC quotes/trades.
+**What these fixtures are — and are not.** The two publishers do NOT republish the same venue
+updates: each independently samples/coalesces the BBO, so within the shared window pub A emits 4109
+BTC quotes and pub B emits 4669, and only ~370 (~9%) share an identical `source_ts`. When they DO
+coincide the content matches (369/370 agree on the full bid/ask/size tuple), but coincidence is
+under a tenth of each stream. So these exercise **real independent-publisher dedup** — merge two
+samplings of one book and emit each distinct top-of-book change once (fastest publisher wins) — NOT
+a "mirror collapse to one stream"; the publishers are not mirrors and the deduped count does **not**
+approach a single publisher's. A dedup test on these must assert both that overlapping content
+collapses (the ~369 coincident tuples emit once) AND that genuinely distinct samples pass through —
+not that the count halves.
+
+Both are `BTC` (instrument_id 0), windowed to the first 40s of the capture. The window is ≥~35s on
+purpose: the exact-`BTC` definition re-sends on a ~30s round-robin (786 instruments, ~3144
+defs/120s), so a shorter window omits it and the precision gate never resolves BTC. The
+`.refdata.bin` files carry all in-window definitions+manifest. The `.mktdata.bin` files carry
+**frames containing BTC** — a TOB frame batches several instruments, so a frame carrying BTC plus
+others is kept whole (pub A: 1 such frame, 22 non-BTC messages retained); they are not strictly
+BTC-only.
 
 **Demux is by source IP, not UDP port** — publishers are on distinct ports today, but the feed
 team intends to normalize that, so source IP is the robust publisher key.
 
-**Codec validation:** the converter decodes every frame through the bridge's own `ingest::codec`;
-this capture produced **0 TOB decode errors** across ~130k frames from both publishers, validating
-the TOB codec byte offsets against the live feed (beyond the byte-validated reference).
+**Codec validation against the live feed** (every frame decoded through the bridge's own codec):
+- TOB: **0 framing errors** across ~130k frames from both publishers.
+- MBO (same capture, `--protocol mbo`; not committed as fixtures — mktdata is ~12 MB/publisher):
+  **0 framing errors** over ~36k frames / ~1.2M messages each (pub A: order_add=273757,
+  order_cancel=273909, order_execute=4162, snapshot_msgs=384468, defs=1572, manifests=40). First
+  real-feed check of the MBO framing offsets (previously only self-consistent); per-field offsets
+  still rely on behavioral checks like the side-mapping fix.
 
 **Regenerating** (the raw 635 MB pcap is intentionally NOT committed):
 
