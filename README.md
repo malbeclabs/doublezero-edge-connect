@@ -211,6 +211,35 @@ boots, or a group activates later, those groups aren't picked up until the proce
 re-discovery is a follow-up). Once a group is resolved, its receiver survives interface flap via the
 rejoin watchdog.
 
+### Input sources
+
+The DZ Edge **multicast** feeds are always-on inputs. A second, optional input is the Hyperliquid
+**public** WebSocket feed (`wss://api.hyperliquid.xyz/ws`), which acts as a **backstop**: the edge
+feed should win essentially always (that's the product), and the public feed only matters when the
+edge feed gaps, stalls, or dies.
+
+Both inputs converge on one shared arbiter that races them per `(venue, symbol)` `source_ts` tick, so
+no second dedup stage is needed. In steady state an edge publisher opens each tick first (sub-ms vs.
+the public feed's tens of ms over the internet), so the public copy loses the race and is dropped as a
+no-op; when the edge gaps, the public copy is the first to cross the floor and fills in. The backstop
+needs no health check, and the WebSocket output is identical regardless of which input delivered a
+given update.
+
+| Input source | Default | Enable / disable | Config flags (env) |
+|--------------|---------|------------------|--------------------|
+| **DZ Edge multicast** | **on** | always on | `--feed`/`--iface`/`--recv-buf` (see above) |
+| **Hyperliquid public WS** (`ingest::ws_feeder`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
+
+```bash
+# Run the edge multicast feed with the public WS backstop for BTC and ETH:
+./target/release/doublezero-edge-connect --feed Hyperliquid --ws-input-coins BTC,ETH
+```
+
+The feeder is failure-isolated (its own task with reconnect + exponential backoff; decode/socket
+errors are logged and never touch the multicast hot path) and relies on the edge reference data for
+precision — it emits a public quote/trade only once that `(venue, symbol)` instrument is known. The
+outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
+
 ## Learn more
 
 - **[PROTOCOL.md](PROTOCOL.md)**: the full WebSocket JSON contract (v1).
