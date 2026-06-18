@@ -13,7 +13,7 @@
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
     time::Duration,
 };
@@ -25,7 +25,7 @@ use nix::sys::socket::{
     SockaddrStorage,
 };
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{io::unix::AsyncFd, sync::broadcast, time::timeout};
+use tokio::{io::unix::AsyncFd, time::timeout};
 use tracing::{info, warn};
 
 /// Re-join the multicast group(s) if no datagram arrives for this long. Guards against a join
@@ -39,14 +39,16 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 
 use crate::{
     ingest::{
+        arbiter::{lock, Publisher, SharedArbiter},
         feeds::{Feed, FeedKind, FeedPorts},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
 };
 
-/// A multicast socket with kernel RX software timestamps enabled.
-type TsSocket = AsyncFd<std::net::UdpSocket>;
+/// A multicast socket with kernel RX software timestamps enabled. `pub` so the shred forwarder
+/// (`crate::shred`) can reuse [`bind_multicast`] without re-deriving the socket plumbing.
+pub type TsSocket = AsyncFd<std::net::UdpSocket>;
 
 /// The role a feed's port plays. The market-data stream is what the liveness watchdog tracks
 /// (reference/snapshot ports keep ticking even when market data is wedged); a processor uses the
@@ -79,8 +81,11 @@ impl PortRole {
 /// timestamps and which port role the datagram arrived on. Borrowed for the duration of one
 /// `on_datagram` call so the processor only needs to hold its own protocol state.
 pub struct FrameCtx<'a> {
-    pub venue: &'a str,
-    pub tx: &'a broadcast::Sender<FeedMessage>,
+    /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
+    /// venue ultimately comes from the `&'static` `FEEDS` registry.
+    pub venue: &'static str,
+    /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
+    pub arbiter: &'a SharedArbiter,
     pub instruments: &'a InstrumentSnapshot,
     /// Kernel `SCM_TIMESTAMPNS` RX timestamp (CLOCK_REALTIME), or 0 if unavailable.
     pub kernel_rx_ts_ns: u64,
@@ -88,11 +93,24 @@ pub struct FrameCtx<'a> {
     pub recv_ts_ns: u64,
     /// Which port this datagram arrived on.
     pub role: PortRole,
+    /// Source IP of the datagram — the publisher identity. Independent publishers mirror one feed
+    /// onto the same group (sharing `channel_id`), so per-publisher state (sequence tracking, MBO
+    /// books) keys on this rather than the port.
+    pub publisher: IpAddr,
+}
+
+impl FrameCtx<'_> {
+    /// Emit a normalized message through the shared arbiter, tagged with this datagram's edge
+    /// publisher so the quote floor can race it against the other sources for the tick's leadership.
+    /// The brief critical section is the arbiter's admit-decision-plus-send.
+    pub fn emit(&self, msg: FeedMessage) {
+        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher));
+    }
 }
 
 /// Protocol-specific frame handling. Implementors own their decode (they know their frame magic
 /// and message set) and their persistent state (reference-data state machine, sequence trackers,
-/// book state, warn-once flags), and emit normalized `FeedMessage`s onto `ctx.tx`.
+/// book state, warn-once flags), and emit normalized `FeedMessage`s via `ctx.emit`.
 pub trait FrameProcessor {
     /// Decode and handle one received datagram. Errors are the processor's own concern (it logs
     /// and drops); the driver only deals with socket/transport errors.
@@ -102,8 +120,9 @@ pub trait FrameProcessor {
 /// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when the
 /// market-data multicast has gone silent past [`IDLE_REJOIN`], `"ok"` when it recovers. Consumers
 /// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
-fn emit_status(tx: &broadcast::Sender<FeedMessage>, venue: &str, state: &str, stale_ms: u64) {
-    let _ = tx.send(FeedMessage::Status(FeedStatus {
+fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
+    // Status carries no business identity to dedup, so it goes straight to the broadcast sender.
+    let _ = lock(arbiter).sender().send(FeedMessage::Status(FeedStatus {
         venue: venue.to_string(),
         state: state.to_string(),
         stale_ms,
@@ -117,7 +136,7 @@ fn emit_status(tx: &broadcast::Sender<FeedMessage>, venue: &str, state: &str, st
 /// taken in the driver softirq before user-space), or 0 if the kernel did not attach one.
 /// `user_recv_ns` is the wall clock sampled right after the syscall returns - the
 /// user-space arrival, kept so the kernel-vs-userspace jitter can be quantified.
-async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u64)> {
+async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u64, IpAddr)> {
     loop {
         let mut guard = sock.readable().await?;
         let res = guard.try_io(|inner| {
@@ -134,14 +153,23 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
                     }
                 }
             }
-            Ok((r.bytes, kernel_ns))
+            let src = datagram_src_ip(r.address);
+            Ok((r.bytes, kernel_ns, src))
         });
         match res {
-            Ok(Ok((n, kernel_ns))) => return Ok((n, kernel_ns, now_ns())),
+            Ok(Ok((n, kernel_ns, src))) => return Ok((n, kernel_ns, now_ns(), src)),
             Ok(Err(e)) => return Err(e.into()),
             Err(_would_block) => continue,
         }
     }
+}
+
+/// The source IP of a received datagram (its `recvmsg` source address), used to demultiplex
+/// independent publishers that mirror one feed onto the same multicast group. Falls back to
+/// `0.0.0.0` if the kernel attached no source address.
+fn datagram_src_ip(addr: Option<SockaddrStorage>) -> IpAddr {
+    addr.and_then(|a| a.as_sockaddr_in().map(|s| IpAddr::V4(s.ip())))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
 /// Resolve an interface name (e.g. "doublezero1") to its IPv4 address via `ip`, without logging.
@@ -171,7 +199,9 @@ pub fn try_resolve_interface_ip(iface: &str) -> Option<Ipv4Addr> {
 /// interface (e.g. `doublezero1`) rather than racing the tunnel coming up and falling back to the
 /// default interface. After `max_wait` it gives up and returns `0.0.0.0` (join on the default
 /// interface) so a genuinely-misconfigured interface degrades rather than hanging forever.
-async fn wait_for_interface_ip(iface: &str, max_wait: Duration) -> Ipv4Addr {
+// `pub` so the shred forwarder (`crate::shred`) joins on the same interface with identical
+// tunnel-up race handling instead of re-deriving it.
+pub async fn wait_for_interface_ip(iface: &str, max_wait: Duration) -> Ipv4Addr {
     if let Some(ip) = try_resolve_interface_ip(iface) {
         return ip;
     }
@@ -198,7 +228,11 @@ async fn wait_for_interface_ip(iface: &str, max_wait: Duration) -> Ipv4Addr {
 }
 
 /// Join a UDP multicast group and return an async socket bound to `port`.
-fn bind_multicast(
+///
+/// `pub` so the shred forwarder (`crate::shred`) reuses the exact bind semantics — crucially the
+/// bind-to-GROUP (not INADDR_ANY) behavior documented below, which matters identically there:
+/// all `edge-solana-*` groups share port 7733 and differ only by group.
+pub fn bind_multicast(
     group: Ipv4Addr,
     port: u16,
     iface_ip: Ipv4Addr,
@@ -309,7 +343,7 @@ struct Channel {
 /// arrived on, the channel index (so the caller can read that channel's buffer), the length, and
 /// the kernel/user-space RX timestamps. All in-flight borrows on `channels` are released by the
 /// time this returns, so the caller can index `channels[idx].buf`.
-async fn recv_any(channels: &mut [Channel]) -> Result<(PortRole, usize, usize, u64, u64)> {
+async fn recv_any(channels: &mut [Channel]) -> Result<(PortRole, usize, usize, u64, u64, IpAddr)> {
     let futs: Vec<_> = channels
         .iter_mut()
         .enumerate()
@@ -318,8 +352,8 @@ async fn recv_any(channels: &mut [Channel]) -> Result<(PortRole, usize, usize, u
             let sock = &ch.sock;
             let buf = &mut ch.buf;
             Box::pin(async move {
-                let (n, kernel_ns, recv_ns) = recv_with_ts(sock, buf).await?;
-                Ok::<_, anyhow::Error>((role, i, n, kernel_ns, recv_ns))
+                let (n, kernel_ns, recv_ns, src) = recv_with_ts(sock, buf).await?;
+                Ok::<_, anyhow::Error>((role, i, n, kernel_ns, recv_ns, src))
             })
         })
         .collect();
@@ -340,8 +374,8 @@ async fn drive<P: FrameProcessor>(
     ports: Vec<(PortRole, u16)>,
     iface: String,
     recv_buf: usize,
-    venue: String,
-    tx: broadcast::Sender<FeedMessage>,
+    venue: &'static str,
+    arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     mut processor: P,
 ) -> Result<()> {
@@ -375,13 +409,18 @@ async fn drive<P: FrameProcessor>(
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 if !down {
-                    emit_status(&tx, &venue, "down", last_mkt.elapsed().as_millis() as u64);
+                    emit_status(
+                        &arbiter,
+                        venue,
+                        "down",
+                        last_mkt.elapsed().as_millis() as u64,
+                    );
                     down = true;
                 }
                 continue 'rejoin;
             }
 
-            let (role, idx, n, kernel_ns, recv_ns) =
+            let (role, idx, n, kernel_ns, recv_ns, publisher) =
                 match timeout(remaining, recv_any(&mut channels)).await {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
@@ -392,7 +431,12 @@ async fn drive<P: FrameProcessor>(
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         if !down {
-                            emit_status(&tx, &venue, "down", last_mkt.elapsed().as_millis() as u64);
+                            emit_status(
+                                &arbiter,
+                                venue,
+                                "down",
+                                last_mkt.elapsed().as_millis() as u64,
+                            );
                             down = true;
                         }
                         continue 'rejoin;
@@ -403,18 +447,19 @@ async fn drive<P: FrameProcessor>(
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
                 if down {
-                    emit_status(&tx, &venue, "ok", 0);
+                    emit_status(&arbiter, venue, "ok", 0);
                     down = false;
                 }
             }
 
             let ctx = FrameCtx {
-                venue: &venue,
-                tx: &tx,
+                venue,
+                arbiter: &arbiter,
                 instruments: &instruments,
                 kernel_rx_ts_ns: kernel_ns,
                 recv_ts_ns: recv_ns,
                 role,
+                publisher,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -440,11 +485,11 @@ pub async fn run_feed(
     feed: Feed,
     iface: String,
     recv_buf: usize,
-    tx: broadcast::Sender<FeedMessage>,
+    arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
 ) -> Result<()> {
-    let venue = feed.venue.to_string();
+    let venue: &'static str = feed.venue;
     match feed.kind {
         FeedKind::TopOfBook => {
             let ports = two_port_roles(feed.ports);
@@ -454,7 +499,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
-                tx,
+                arbiter,
                 instruments,
                 TobProcessor::new(feed.emit_trades),
             )
@@ -468,7 +513,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
-                tx,
+                arbiter,
                 instruments,
                 MidpointProcessor::new(),
             )
@@ -494,7 +539,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
-                tx,
+                arbiter,
                 instruments,
                 MboProcessor::new(depth, feed.emit_trades),
             )
@@ -505,7 +550,26 @@ pub async fn run_feed(
 
 #[cfg(test)]
 mod tests {
-    use super::{SeqCheck, SeqTracker};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use super::{datagram_src_ip, SeqCheck, SeqTracker, SockaddrStorage};
+
+    #[test]
+    fn datagram_src_ip_extracts_v4() {
+        let sa = SockaddrStorage::from(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 5),
+            1234,
+        )));
+        assert_eq!(
+            datagram_src_ip(Some(sa)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))
+        );
+    }
+
+    #[test]
+    fn datagram_src_ip_defaults_when_absent() {
+        assert_eq!(datagram_src_ip(None), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
 
     #[test]
     fn first_frame_on_a_channel() {

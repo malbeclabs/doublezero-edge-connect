@@ -29,11 +29,12 @@ on:
         default: ""
         type: string
 
-# Reusable workflow: it runs under the caller job's permissions (publish/smoke/rebuild
-# set contents:read + packages:read/write). This default applies only to direct runs.
-permissions:
-  contents: read
-
+# No top-level permissions: this is a workflow_call-only workflow, so it inherits the
+# GITHUB_TOKEN permissions the caller job grants (publish/rebuild -> packages:write,
+# smoke -> packages:read). Declaring a block here would INTERSECT with the caller and
+# can only narrow it: `contents: read` silently stripped the packages:write the push
+# needs (GHCR denied), and adding packages:write made smoke request more than its
+# caller grants, failing the run at startup. Inheriting is the only correct option.
 jobs:
   build:
     runs-on: ubuntu-latest

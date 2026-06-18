@@ -11,7 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.29"
+# `rustls-tls-webpki-roots` adds the outbound `wss://` client TLS used by the public WS input feeder
+# (webpki bundled roots → portable container build, no system OpenSSL). The WS output sink uses the
+# same crate as a plaintext server and is unaffected.
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +24,15 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Shred forwarder sigverify (issue #25): ed25519 over the shred/merkle-root signature, SHA-256 for
+# merkle-root recomputation, base58 for leader pubkeys, and a minimal JSON-RPC client (rustls, no
+# OpenSSL) for the leader schedule. Deliberately the *light* path — no heavy solana-* crates.
+ed25519-dalek = "2"
+sha2 = "0.10"
+bs58 = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 serial_test = "3"
+# Used only by examples/pcap2frames.rs (dev tooling) — not compiled into the release binary.
+pcap-file = "2"

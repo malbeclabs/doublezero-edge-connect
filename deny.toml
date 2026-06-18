@@ -18,6 +18,10 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    # webpki-roots bundles Mozilla's root certificate dataset under the Community Data License
+    # Agreement (Permissive 2.0); pulled in by the shred forwarder's reqwest RPC client and the
+    # ws_feeder's rustls TLS client.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 # Allowing a permissive license that no current dependency uses is intentional

@@ -55,6 +55,8 @@ pub fn instrument_before_price(msgs: &[Value]) {
 /// **Quote arm:** `source_ts_ns` is venue-assigned content (identical across publishers
 /// for the same update); the transport sequence number is NOT, which is why
 /// content + source_ts is the right cross-publisher identity and a seqnum would not be.
+/// Content includes `bid_n`/`ask_n` (the source counts) — they are part of the canonical
+/// BBO identity (`bbo_hash`), so two quotes that differ only in count are NOT duplicates.
 ///
 /// **Trade arm:** `trade_id` is treated as globally unique for the run. A real
 /// multi-publisher trade deduper will be WINDOWED (bounded memory) and can only collapse
@@ -79,14 +81,16 @@ pub fn no_business_duplicates(msgs: &[Value]) {
     for m in msgs {
         let key = match ty(m) {
             "quote" => format!(
-                "q|{}|{}|{}|{}|{}|{}|{}",
+                "q|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 s(m, "venue"),
                 s(m, "symbol"),
                 u(m, "source_ts_ns"),
                 f(m, "bid"),
                 f(m, "ask"),
                 f(m, "bid_size"),
-                f(m, "ask_size")
+                f(m, "ask_size"),
+                u(m, "bid_n"),
+                u(m, "ask_n")
             ),
             "trade" => format!(
                 "t|{}|{}|{}",

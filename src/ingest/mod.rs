@@ -4,6 +4,7 @@
 //! that the output sinks (`crate::sinks`) consume. This half has no knowledge of how the data is
 //! re-served.
 
+pub mod arbiter;
 pub mod book;
 pub mod codec;
 pub mod codec_common;
@@ -13,3 +14,4 @@ pub mod feeds;
 pub mod processor;
 pub mod receiver;
 pub mod subscriber;
+pub mod ws_feeder;

@@ -17,6 +17,13 @@ pub struct NormalizedQuote {
     pub ask: f64,
     pub bid_size: f64,
     pub ask_size: f64,
+    /// Orders/sources at the best bid/ask ("Bid/Ask Source Count" in the edge-feed-spec TOB; the
+    /// canonical `bbo_hash` `bid_n`/`ask_n`). 0 when the venue does not report it. Part of the
+    /// top-of-book identity, so a change here is a distinct quote even at an unchanged price/size.
+    #[serde(default)]
+    pub bid_n: u16,
+    #[serde(default)]
+    pub ask_n: u16,
     /// Venue/source timestamp (nanoseconds since epoch), 0 if unknown.
     pub source_ts_ns: u64,
     /// When the bridge received it (user-space wall clock, nanoseconds since epoch).
@@ -178,6 +185,17 @@ pub type InstrumentSnapshot = Arc<Mutex<HashMap<(String, String), NormalizedInst
 /// subscriber (depth is full state, so one replayed snapshot bootstraps the consumer immediately
 /// instead of making it wait for the next periodic one). Updated by the MBO receiver.
 pub type DepthSnapshot = Arc<Mutex<HashMap<(String, String), NormalizedDepth>>>;
+
+/// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
+///
+/// Every shared mutex in the ingest path (`InstrumentSnapshot`, `DepthSnapshot`, the arbiter) is
+/// held only across panic-free critical sections (`HashMap`/`HashSet` work), so the protected state
+/// is always left consistent. Recovering from poisoning rather than `.lock().unwrap()` keeps an
+/// **unrelated** panic in one ingest task (e.g. the WS feeder) from cascading into every other
+/// source the moment it next takes the lock — the failure-isolation contract.
+pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Nanoseconds since the Unix epoch, for `recv_ts_ns`.
 pub fn now_ns() -> u64 {

@@ -156,6 +156,96 @@ the env var shown.
 A sink is active when its key config value is non-empty/present; the WebSocket sink simply ships a
 non-empty default bind, so it is on unless you explicitly clear it.
 
+### Solana shred forwarding
+
+Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
+joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
+out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). By
+default it forwards every datagram; set `--shred-rpc-url` to forward exactly one signature-verified
+copy of each shred (see below). Each destination gets its own `connect`ed send socket, so an async
+ICMP error from a down destination (e.g. nothing listening) stays isolated to that socket and never
+drops a datagram bound for a healthy one. `--shred-forward` targets should be local/fast sinks: sends
+are sequential per destination, so a slow or remote sink throttles the whole forwarder (and sheds
+load); the send sockets pin no egress interface.
+
+It **activates on discovery**: by default it shells out to `doublezero multicast group list
+--json-compact` and selects the activated groups whose `code` starts with `--shred-code-prefix`
+(default `edge-solana-`), binding each on `--shred-port` (default `7733`). If the CLI is missing,
+errors, or finds no matching group, the forwarder stays off. Pass `--shred-source GROUP:PORT`
+(repeatable) to override discovery entirely.
+
+**Signature verification + deduplication.** Set `--shred-rpc-url` to a Solana JSON-RPC endpoint and
+the forwarder forwards exactly **one valid copy** of each shred instead of every datagram. It keys a
+bounded, prefer-valid dedup window on `(slot, index, type)`: a duplicate of an already-forwarded copy
+is dropped without a signature check; the first copy of a key is ed25519-verified against its slot
+leader (leader schedule fetched per epoch from the RPC and cached); an invalid copy is dropped but
+leaves the key open so a later valid copy can still win. A slot whose leader isn't known yet (schedule
+still loading, or outside the cached epoch) fails **open** — forwarded but not deduped — so the
+forwarder never silently drops traffic it can't yet judge. Without `--shred-rpc-url`, behaviour is
+unchanged (every datagram forwarded).
+
+> ⚠️ The shred/merkle byte offsets are transcribed from the agave shred layout and are **not** yet
+> validated against a live `edge-solana-*` hexdump (the same caveat as the repo's unvalidated Midpoint/
+> MBO codecs). Confirm them against a captured frame before relying on sigverify in production; the
+> forwarder logs a one-time warning when sigverify is on and a periodic valid/invalid tally so a
+> systematic misparse (≈100% "invalid") is obvious.
+
+| Flag | Env | Default |
+|------|-----|---------|
+| `--shred-code-prefix` | `DZ_SHRED_CODE_PREFIX` | `edge-solana-` |
+| `--shred-port` | `DZ_SHRED_PORT` | `7733` |
+| `--shred-forward` (repeatable) | `DZ_SHRED_FORWARD` | `127.0.0.1:20000` |
+| `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
+| `--shred-rpc-url` | `DZ_SHRED_RPC_URL` | — (set to enable sigverify + dedup) |
+| `--shred-dedup-window-slots` | `DZ_SHRED_DEDUP_WINDOW_SLOTS` | `512` |
+
+The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
+at startup, and a non-loopback `--shred-forward` target is warned about (it would route raw,
+unverified shreds out the default interface, off-box). Shreds are loss-tolerant, so under forwarder
+backpressure the **newest** datagram is shed (with a periodic drop-count log) rather than blocking
+ingest. Discovery binds every matched group; a group this host isn't actually receiving on simply
+stays idle and periodically rejoins (harmless).
+
+Source resolution is **one-shot at startup**: if the `doublezero` CLI isn't ready when the bridge
+boots, or a group activates later, those groups aren't picked up until the process restarts (periodic
+re-discovery is a follow-up). Once a group is resolved, its receiver survives interface flap via the
+rejoin watchdog.
+
+### Input sources
+
+The DZ Edge **multicast** feeds are always-on inputs. A second, optional input is the Hyperliquid
+**public** WebSocket feed (`wss://api.hyperliquid.xyz/ws`), which acts as a **backstop**: the edge
+feed should win essentially always (that's the product), and the public feed only matters when the
+edge feed gaps, stalls, or dies.
+
+Both inputs converge on one shared arbiter that races them per `(venue, symbol)` `source_ts` tick, so
+no second dedup stage is needed. In steady state an edge publisher opens each tick first (sub-ms vs.
+the public feed's tens of ms over the internet), so the public copy loses the race and is dropped as a
+no-op; when the edge gaps, the public copy is the first to cross the floor and fills in. The backstop
+needs no health check, and the WebSocket output is identical regardless of which input delivered a
+given update.
+
+| Input source | Default | Enable / disable | Config flags (env) |
+|--------------|---------|------------------|--------------------|
+| **DZ Edge multicast** | **on** | always on | `--feed`/`--iface`/`--recv-buf` (see above) |
+| **Hyperliquid public WS** (`ingest::ws_feeder`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
+
+```bash
+# Run the edge multicast feed with the public WS backstop for BTC and ETH:
+./target/release/doublezero-edge-connect --feed Hyperliquid --ws-input-coins BTC,ETH
+```
+
+The feeder is failure-isolated (its own task with reconnect + exponential backoff; decode/socket
+errors are logged and never touch the multicast hot path) and relies on the edge reference data for
+precision — it emits a public quote/trade only once that `(venue, symbol)` instrument is known. The
+outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
+
+> **Caveat — trade dedup window vs. reconnect lag.** Cross-source trade dedup is a fixed-size
+> windowed `trade_id` cache. A long public reconnect can deliver trades whose ids have aged out of
+> the window during a high-volume burst, which would re-emit a duplicate trade. Sizing the window
+> against the public feed's unbounded-lag failure mode is tracked separately (window-sizing issue);
+> until then the window is a compile-time constant.
+
 ## Learn more
 
 - **[PROTOCOL.md](PROTOCOL.md)**: the full WebSocket JSON contract (v1).

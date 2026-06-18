@@ -1,2 +1,5 @@
 # Rust build artifacts
 /target/
+
+# Roadbike / Claude Code session artifacts
+.claude/
