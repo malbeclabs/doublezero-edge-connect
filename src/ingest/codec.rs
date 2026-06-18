@@ -41,6 +41,11 @@ pub struct Quote {
     pub bid_qty_raw: u64,
     pub ask_price_raw: i64,
     pub ask_qty_raw: u64,
+    /// Orders/sources at best bid/ask (`Bid/Ask Source Count`, edge-feed-spec TOB offsets 52/54;
+    /// `BidSourceCount`/`AskSourceCount` in edge-multicast-ref, the spec's `bbo_hash` `bid_n`/`ask_n`).
+    /// `0` means unavailable. Part of the canonical BBO identity.
+    pub bid_n: u16,
+    pub ask_n: u16,
 }
 
 /// A trade print (last sale) from a venue. Same `instrument_id`/`source_id`/`source_ts`
@@ -145,6 +150,8 @@ fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
             bid_qty_raw: u64le(b, body + 24),
             ask_price_raw: i64le(b, body + 32),
             ask_qty_raw: u64le(b, body + 40),
+            bid_n: u16le(b, body + 48),
+            ask_n: u16le(b, body + 50),
         }),
         MSG_TRADE => Message::Trade(Trade {
             instrument_id: u32le(b, body),
@@ -199,8 +206,8 @@ mod tests {
         body.extend_from_slice(&q.bid_qty_raw.to_le_bytes());
         body.extend_from_slice(&q.ask_price_raw.to_le_bytes());
         body.extend_from_slice(&q.ask_qty_raw.to_le_bytes());
-        body.extend_from_slice(&0u16.to_le_bytes()); // bid source count
-        body.extend_from_slice(&0u16.to_le_bytes()); // ask source count
+        body.extend_from_slice(&q.bid_n.to_le_bytes()); // bid source count (offset 52)
+        body.extend_from_slice(&q.ask_n.to_le_bytes()); // ask source count (offset 54)
         body.extend_from_slice(&[0u8; 4]); // reserved -> 60 bytes total
 
         let frame_len = (FRAME_HEADER_SIZE + body.len()) as u16;
@@ -228,6 +235,8 @@ mod tests {
             bid_qty_raw: 10657,
             ask_price_raw: 6790,
             ask_qty_raw: 10886,
+            bid_n: 5,
+            ask_n: 3,
         };
         let frame = encode_quote_frame(&q);
         let (hdr, msgs) = decode_frame(&frame).unwrap();
@@ -238,6 +247,8 @@ mod tests {
                 assert_eq!(got.instrument_id, 42);
                 assert_eq!(got.bid_price_raw, 6788);
                 assert_eq!(got.ask_qty_raw, 10886);
+                assert_eq!(got.bid_n, 5);
+                assert_eq!(got.ask_n, 3);
                 assert!((apply_exponent(got.bid_price_raw, -2) - 67.88).abs() < 1e-9);
             }
             _ => panic!("expected quote"),

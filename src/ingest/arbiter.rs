@@ -44,28 +44,31 @@ use std::{
 /// `source_ts` is non-decreasing per key; within a tick the emitted series is the leader's coherent,
 /// in-order subsequence.
 ///
-/// Memory is O(distinct leader content at the current tick) per key — bounded by how fast the book
-/// moves within one `source_ts`; no fixed window needed.
+/// Memory is O(min(distinct leader content at the current tick, `tick_cap`)) per key. The per-tick
+/// content set is FIFO-bounded to `tick_cap` so a stalled or pathologically-repeated `source_ts`
+/// (a feed that stops advancing its clock while still publishing) can't grow it without limit; the
+/// cap is set far above the real per-block max, so it never evicts in normal operation. (`source_ts
+/// == 0`, the "not available" sentinel, is handled by the caller — it must not reach the floor as a
+/// real tick, or it would pin `high_water` and drop every non-leader forever.)
 pub struct StalenessFloor<K, V, P> {
-    /// Per key: (high_water source_ts, leader publisher at that tick, leader's content set at it).
-    state: HashMap<K, (u64, P, HashSet<V>)>,
+    /// Per key: (high_water source_ts, leader publisher at that tick, leader's content set + FIFO
+    /// insertion order at it — the deque bounds the set to `tick_cap`).
+    state: HashMap<K, (u64, P, HashSet<V>, VecDeque<V>)>,
+    /// Cap on distinct leader contents tracked at one tick (safety bound; see type docs).
+    tick_cap: usize,
 }
 
-impl<K: Eq + Hash, V: Eq + Hash, P> Default for StalenessFloor<K, V, P> {
-    fn default() -> Self {
+impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq> StalenessFloor<K, V, P> {
+    pub fn new(tick_cap: usize) -> Self {
         Self {
             state: HashMap::new(),
+            tick_cap,
         }
-    }
-}
-
-impl<K: Eq + Hash, V: Eq + Hash, P: Eq> StalenessFloor<K, V, P> {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// True (recording it) iff this `(source_ts, content)` from `publisher` should be emitted under
-    /// the latch-to-leader floor (see the type docs for the three cases).
+    /// the latch-to-leader floor (see the type docs for the three cases). The per-tick content set is
+    /// FIFO-bounded to `tick_cap`.
     ///
     /// Records on the emit *decision*: in this gateway "emit" == handing the message to the broadcast
     /// channel, the only delivery step. A no-subscriber send desyncs no one, and a unique quote
@@ -76,24 +79,34 @@ impl<K: Eq + Hash, V: Eq + Hash, P: Eq> StalenessFloor<K, V, P> {
         match self.state.entry(key) {
             Entry::Vacant(v) => {
                 let mut set = HashSet::new();
-                set.insert(content);
-                v.insert((source_ts, publisher, set));
+                set.insert(content.clone());
+                v.insert((source_ts, publisher, set, VecDeque::from([content])));
                 true
             }
             Entry::Occupied(mut o) => {
-                let (high_water, leader, set) = o.get_mut();
+                let (high_water, leader, set, order) = o.get_mut();
                 if source_ts < *high_water {
                     false
                 } else if source_ts > *high_water {
                     *high_water = source_ts;
                     *leader = publisher;
                     set.clear();
-                    set.insert(content);
+                    order.clear();
+                    set.insert(content.clone());
+                    order.push_back(content);
                     true
                 } else if publisher != *leader {
                     false
+                } else if set.insert(content.clone()) {
+                    order.push_back(content);
+                    if order.len() > self.tick_cap {
+                        if let Some(old) = order.pop_front() {
+                            set.remove(&old);
+                        }
+                    }
+                    true
                 } else {
-                    set.insert(content)
+                    false
                 }
             }
         }
@@ -148,13 +161,13 @@ mod tests {
 
     #[test]
     fn quote_first_sample_admits() {
-        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new();
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
         assert!(f.admit("BTC", 1000, 0, 1)); // first for this key always emits (and latches leader)
     }
 
     #[test]
     fn quote_new_tick_admits_and_relatches_leader() {
-        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new();
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
         assert!(f.admit("BTC", 1000, 0, 1)); // pub 1 opens tick -> leader
         assert!(f.admit("BTC", 1001, 0, 2)); // newer tick re-latches to pub 2 (even identical content)
         assert!(f.admit("BTC", 2000, 0, 1)); // newer tick again, leader back to pub 1
@@ -168,7 +181,7 @@ mod tests {
     #[test]
     fn quote_latches_to_leader_within_tick() {
         let (a, b) = (1u8, 2u8);
-        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new();
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
         // Falling price within tick T; leader A observes 5, 4, 3 in its own (trustworthy) order:
         assert!(f.admit("BTC", 1000, 5, a)); // opens tick -> A is leader, emit 5
         assert!(!f.admit("BTC", 1000, 5, a)); // A's exact repeat dropped
@@ -185,7 +198,7 @@ mod tests {
     #[test]
     fn quote_stale_tick_dropped_for_any_publisher() {
         let (a, b) = (1u8, 2u8);
-        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new();
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
         assert!(f.admit("BTC", 2000, 1, a));
         assert!(!f.admit("BTC", 1999, 9, a)); // strictly older tick -> stale, dropped
         assert!(!f.admit("BTC", 1999, 9, b)); // and from the other publisher too
@@ -193,10 +206,22 @@ mod tests {
 
     #[test]
     fn quote_keys_are_independent() {
-        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new();
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
         assert!(f.admit("BTC", 2000, 0, 1));
         assert!(f.admit("ETH", 1000, 0, 1)); // separate floor + leader per key
         assert!(!f.admit("BTC", 1500, 0, 1)); // BTC's floor unaffected by ETH
+    }
+
+    /// The per-tick content set is FIFO-bounded to `tick_cap` so a stalled `source_ts` can't grow it
+    /// without limit. With cap 2, the oldest content is evicted and a recurrence re-admits.
+    #[test]
+    fn quote_tick_set_is_capacity_bounded() {
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(2);
+        assert!(f.admit("BTC", 1000, 1, 9)); // tick window {1}
+        assert!(f.admit("BTC", 1000, 2, 9)); // {1,2}
+        assert!(f.admit("BTC", 1000, 3, 9)); // {2,3} — content 1 evicted (cap 2)
+        assert!(!f.admit("BTC", 1000, 3, 9)); // 3 still in the set -> dup dropped
+        assert!(f.admit("BTC", 1000, 1, 9)); // 1 fell out of the cap window -> re-admitted
     }
 
     #[test]

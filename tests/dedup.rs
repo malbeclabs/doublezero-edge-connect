@@ -155,17 +155,14 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
 
     let quotes = msgs.iter().filter(|m| m["type"] == "quote").count();
     // The fixture carries 8788 raw BTC mktdata quotes split across two publishers mirroring the same
-    // feed (417 distinct source_ts). Cross-publisher dedup collapses that to 4468 distinct intra-tick
-    // changes at a non-decreasing floor. On THIS window latch-to-leader emits the same 4468 as the
-    // prior merge floor: the faster publisher leads nearly every tick and carries the distinct
-    // content, so its leader series already covers the full set — latch only drops a sample when the
-    // *slower* publisher leads a tick yet the faster has extra content, which doesn't occur here (the
-    // latch drop itself is exercised directly by the `StalenessFloor`/`admit_quote` unit tests). The
-    // count sits far above a strict one-per-tick watermark (~417, which over-drops real intra-tick
-    // changes). Observed: 4468.
+    // feed (417 distinct source_ts). Latch-to-leader emits the leader's distinct canonical BBOs at a
+    // non-decreasing floor — the `bbo_hash` identity (px, sz, bid_n, ask_n), so a count-only change at
+    // an unchanged price/size is a distinct quote. Observed: 4540 (the 4468 px/sz-distinct BBOs plus
+    // 72 count-only changes the source-count identity now keeps; ~1.6%). Far above a strict
+    // one-per-tick watermark (~417, which over-drops real intra-tick changes).
     assert_eq!(
-        quotes, 4468,
-        "two-pub latch-to-leader quote count (leader's distinct intra-tick changes, non-decreasing)"
+        quotes, 4540,
+        "two-pub latch-to-leader quote count (leader's distinct canonical BBOs incl. bid_n/ask_n)"
     );
 }
 

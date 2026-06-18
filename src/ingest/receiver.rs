@@ -80,7 +80,9 @@ impl PortRole {
 /// timestamps and which port role the datagram arrived on. Borrowed for the duration of one
 /// `on_datagram` call so the processor only needs to hold its own protocol state.
 pub struct FrameCtx<'a> {
-    pub venue: &'a str,
+    /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
+    /// venue ultimately comes from the `&'static` `FEEDS` registry.
+    pub venue: &'static str,
     pub tx: &'a broadcast::Sender<FeedMessage>,
     pub instruments: &'a InstrumentSnapshot,
     /// Kernel `SCM_TIMESTAMPNS` RX timestamp (CLOCK_REALTIME), or 0 if unavailable.
@@ -360,7 +362,7 @@ async fn drive<P: FrameProcessor>(
     ports: Vec<(PortRole, u16)>,
     iface: String,
     recv_buf: usize,
-    venue: String,
+    venue: &'static str,
     tx: broadcast::Sender<FeedMessage>,
     instruments: InstrumentSnapshot,
     mut processor: P,
@@ -395,7 +397,7 @@ async fn drive<P: FrameProcessor>(
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 if !down {
-                    emit_status(&tx, &venue, "down", last_mkt.elapsed().as_millis() as u64);
+                    emit_status(&tx, venue, "down", last_mkt.elapsed().as_millis() as u64);
                     down = true;
                 }
                 continue 'rejoin;
@@ -412,7 +414,7 @@ async fn drive<P: FrameProcessor>(
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         if !down {
-                            emit_status(&tx, &venue, "down", last_mkt.elapsed().as_millis() as u64);
+                            emit_status(&tx, venue, "down", last_mkt.elapsed().as_millis() as u64);
                             down = true;
                         }
                         continue 'rejoin;
@@ -423,13 +425,13 @@ async fn drive<P: FrameProcessor>(
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
                 if down {
-                    emit_status(&tx, &venue, "ok", 0);
+                    emit_status(&tx, venue, "ok", 0);
                     down = false;
                 }
             }
 
             let ctx = FrameCtx {
-                venue: &venue,
+                venue,
                 tx: &tx,
                 instruments: &instruments,
                 kernel_rx_ts_ns: kernel_ns,
@@ -465,7 +467,7 @@ pub async fn run_feed(
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
 ) -> Result<()> {
-    let venue = feed.venue.to_string();
+    let venue: &'static str = feed.venue;
     match feed.kind {
         FeedKind::TopOfBook => {
             let ports = two_port_roles(feed.ports);

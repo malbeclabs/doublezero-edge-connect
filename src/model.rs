@@ -17,6 +17,13 @@ pub struct NormalizedQuote {
     pub ask: f64,
     pub bid_size: f64,
     pub ask_size: f64,
+    /// Orders/sources at the best bid/ask ("Bid/Ask Source Count" in the edge-feed-spec TOB; the
+    /// canonical `bbo_hash` `bid_n`/`ask_n`). 0 when the venue does not report it. Part of the
+    /// top-of-book identity, so a change here is a distinct quote even at an unchanged price/size.
+    #[serde(default)]
+    pub bid_n: u16,
+    #[serde(default)]
+    pub ask_n: u16,
     /// Venue/source timestamp (nanoseconds since epoch), 0 if unknown.
     pub source_ts_ns: u64,
     /// When the bridge received it (user-space wall clock, nanoseconds since epoch).
