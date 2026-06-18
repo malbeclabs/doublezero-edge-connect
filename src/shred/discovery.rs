@@ -1,24 +1,43 @@
-//! Source discovery for the shred forwarder: shell out to `doublezero multicast group list`
-//! and select the `edge-solana-*` multicast groups to join.
+//! Source discovery for the shred forwarder: shell out to
+//! `doublezero multicast group list --json-compact` and select the `edge-solana-*` multicast
+//! groups to join.
 //!
 //! Mirrors the existing `ip -4 -o addr show` shell-out style in `ingest/receiver.rs`: the
 //! `doublezero` CLI is installed and pre-configured in the container. The container is auto-joined
 //! only to the groups its access pass grants (incl. exactly one regional retransmit), so binding
 //! every matched group is safe — the network delivers only the permitted subset.
+//!
+//! `--json-compact` is the CLI's machine-readable contract; we deserialize it with serde rather
+//! than scraping the human-readable pipe-delimited table (whose column order/width is a
+//! presentation detail with no stability guarantee, and whose breakage would be invisible —
+//! every row failing to parse just leaves the forwarder silently off).
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use serde::Deserialize;
 use tracing::{info, warn};
 
-/// Run `doublezero multicast group list`, parse the table, and return the `(group, port)` sources
-/// whose `code` starts with `prefix`. Every matched group is bound on `port`.
+/// One row of `doublezero multicast group list --json-compact`. Only the fields we act on are
+/// declared; serde ignores the rest (`account`, `max_bandwidth`, `publishers`, …). `multicast_ip`
+/// is parsed straight into `Ipv4Addr`, so a malformed address fails deserialization (→ empty list,
+/// forwarder stays off) rather than yielding a bad source.
+#[derive(Debug, Deserialize)]
+struct GroupRow {
+    code: String,
+    multicast_ip: Ipv4Addr,
+    status: String,
+}
+
+/// Run `doublezero multicast group list --json-compact`, parse the JSON, and return the
+/// `(group, port)` sources whose `code` starts with `prefix` and whose `status` is activated.
+/// Every matched group is bound on `port`.
 ///
-/// Discovery failures (binary missing, non-zero exit, empty/garbage output) are treated as "no
-/// groups": logged and returned as an empty list, so a host without the CLI simply doesn't run the
-/// shred pipeline rather than crashing.
+/// Discovery failures (binary missing, non-zero exit, empty/garbage output, JSON parse error) are
+/// treated as "no groups": logged and returned as an empty list, so a host without the CLI simply
+/// doesn't run the shred pipeline rather than crashing.
 pub fn discover_groups(prefix: &str, port: u16) -> Vec<SocketAddrV4> {
     let output = match std::process::Command::new("doublezero")
-        .args(["multicast", "group", "list"])
+        .args(["multicast", "group", "list", "--json-compact"])
         .output()
     {
         Ok(o) => o,
@@ -36,12 +55,11 @@ pub fn discover_groups(prefix: &str, port: u16) -> Vec<SocketAddrV4> {
         );
         return Vec::new();
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let groups = parse_group_table(&stdout, prefix);
+    let groups = parse_group_json(&output.stdout, prefix);
     if groups.is_empty() {
         info!(
             prefix,
-            "no `edge-solana-*` multicast groups matched discovery"
+            "no activated `edge-solana-*` multicast groups matched discovery"
         );
         return Vec::new();
     }
@@ -51,49 +69,42 @@ pub fn discover_groups(prefix: &str, port: u16) -> Vec<SocketAddrV4> {
         .collect()
 }
 
-/// Parse the pipe-delimited `doublezero multicast group list` table and return the `multicast_ip`
-/// of every row whose `code` cell starts with `prefix`.
-///
-/// The table has a header row and one row per group, each cell `|`-delimited (with a leading space
-/// per line). Header, blank, and malformed rows (too few cells, unparseable IP) are skipped so a
-/// partial/garbled table never panics or yields a bad source.
-pub fn parse_group_table(table: &str, prefix: &str) -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
-    for line in table.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+/// Deserialize the `--json-compact` array and return the `multicast_ip` of every activated row
+/// whose `code` starts with `prefix`. A JSON parse error (wrong shape, truncated, non-JSON) is a
+/// soft failure: logged and returned as an empty list so the forwarder stays off rather than
+/// crashing the process.
+pub fn parse_group_json(stdout: &[u8], prefix: &str) -> Vec<Ipv4Addr> {
+    let rows: Vec<GroupRow> = match serde_json::from_slice(stdout) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(%e, "could not parse `doublezero multicast group list --json-compact`; no shred groups discovered");
+            return Vec::new();
         }
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        // Columns: account | code | multicast_ip | ... — need at least the first three.
-        if cells.len() < 3 {
-            continue;
-        }
-        let code = cells[1];
-        if !code.starts_with(prefix) {
-            continue; // skips the header row ("code") and unrelated groups (e.g. jito-shredstream)
-        }
-        match cells[2].parse::<Ipv4Addr>() {
-            Ok(ip) => out.push(ip),
-            Err(_) => continue, // header's "multicast_ip" literal, or a garbled cell
-        }
-    }
-    out
+    };
+    rows.into_iter()
+        .filter(|r| r.code.starts_with(prefix))
+        // Skip groups that aren't activated (draining/pending) — only join live ones.
+        .filter(|r| r.status.eq_ignore_ascii_case("activated"))
+        .map(|r| r.multicast_ip)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "\
- account                                      | code                     | multicast_ip  | max_bandwidth | publishers | subscribers | status    | owner
- 7GfKjAfxZWaLZBKn2KwYQECfrFmSQ3EdBshyjMC4TnJg | edge-solana-retrans-amer | 233.84.178.14 | 150Mbps       | 2          | 32          | activated | DZf...
- 31fdXyG3x8k5Ache7jKNQsuwaMf44oqYQndoBsT1JfVj | edge-solana-shreds       | 233.84.178.1  | 100Mbps       | 759        | 154         | activated | DZj...
- 3eUvZvcpCtsfJ8wqCZvhiyBhbY2Sjn56JcQWpDwsESyX | jito-shredstream         | 233.84.178.2  | 200Mbps       | 9          | 0           | activated | 44N...";
+    // Mirrors `doublezero multicast group list --json-compact`: a JSON array of group objects.
+    // Includes the unrelated `jito-shredstream` group (must be excluded by prefix) and a
+    // non-activated `edge-solana-*` group (must be excluded by status).
+    const SAMPLE: &str = r#"[
+        {"account":"7Gf...","code":"edge-solana-retrans-amer","multicast_ip":"233.84.178.14","max_bandwidth":"150Mbps","publishers":2,"subscribers":32,"status":"activated","owner":"DZf..."},
+        {"account":"31f...","code":"edge-solana-shreds","multicast_ip":"233.84.178.1","max_bandwidth":"100Mbps","publishers":759,"subscribers":154,"status":"Activated","owner":"DZj..."},
+        {"account":"3eU...","code":"jito-shredstream","multicast_ip":"233.84.178.2","max_bandwidth":"200Mbps","publishers":9,"subscribers":0,"status":"activated","owner":"44N..."}
+    ]"#;
 
     #[test]
     fn selects_edge_solana_excludes_jito() {
-        let ips = parse_group_table(SAMPLE, "edge-solana-");
+        let ips = parse_group_json(SAMPLE.as_bytes(), "edge-solana-");
         assert_eq!(
             ips,
             vec![
@@ -106,30 +117,54 @@ mod tests {
     }
 
     #[test]
-    fn header_row_is_skipped() {
-        // The header's code cell is the literal "code" and its ip cell is "multicast_ip" — neither
-        // starts with the prefix / parses as an IP, so it never leaks in.
-        let ips = parse_group_table(SAMPLE, "edge-solana-");
-        assert_eq!(ips.len(), 2);
+    fn status_filter_excludes_non_activated() {
+        // A pending/draining group is skipped even when its code matches the prefix.
+        let json = r#"[
+            {"code":"edge-solana-shreds","multicast_ip":"233.84.178.1","status":"activated"},
+            {"code":"edge-solana-retrans-eu","multicast_ip":"233.84.178.12","status":"pending"}
+        ]"#;
+        let ips = parse_group_json(json.as_bytes(), "edge-solana-");
+        assert_eq!(ips, vec![Ipv4Addr::new(233, 84, 178, 1)]);
     }
 
     #[test]
-    fn tolerates_blank_and_garbage_lines() {
-        let messy = format!("\n\n{SAMPLE}\nnot a table row at all\n   \n|||\n");
-        let ips = parse_group_table(&messy, "edge-solana-");
-        assert_eq!(ips.len(), 2);
+    fn case_insensitive_status_is_accepted() {
+        // The CLI capitalizes `Activated`; the filter must match regardless of case.
+        let json =
+            r#"[{"code":"edge-solana-shreds","multicast_ip":"233.84.178.1","status":"Activated"}]"#;
+        let ips = parse_group_json(json.as_bytes(), "edge-solana-");
+        assert_eq!(ips, vec![Ipv4Addr::new(233, 84, 178, 1)]);
     }
 
     #[test]
-    fn empty_table_yields_nothing() {
-        assert!(parse_group_table("", "edge-solana-").is_empty());
-        assert!(parse_group_table("   \n  \n", "edge-solana-").is_empty());
+    fn invalid_json_yields_nothing() {
+        // Non-JSON, truncated, or wrong-shape output is a soft failure → empty list (forwarder off).
+        assert!(parse_group_json(b"", "edge-solana-").is_empty());
+        assert!(parse_group_json(b"not json at all", "edge-solana-").is_empty());
+        assert!(parse_group_json(b"[{\"code\":\"edge-solana-shreds\"", "edge-solana-").is_empty());
+        // Wrong shape (object, not array) is also tolerated.
+        assert!(parse_group_json(b"{\"groups\":[]}", "edge-solana-").is_empty());
+    }
+
+    #[test]
+    fn malformed_ip_fails_the_whole_parse() {
+        // A bad `multicast_ip` fails deserialization of the array → empty list (fail-safe, never a
+        // bad source). serde aborts the whole parse, which is fine: we'd rather stay off than join
+        // a garbage address.
+        let json =
+            r#"[{"code":"edge-solana-shreds","multicast_ip":"not-an-ip","status":"activated"}]"#;
+        assert!(parse_group_json(json.as_bytes(), "edge-solana-").is_empty());
+    }
+
+    #[test]
+    fn empty_array_yields_nothing() {
+        assert!(parse_group_json(b"[]", "edge-solana-").is_empty());
     }
 
     #[test]
     fn prefix_is_honored() {
         // A narrower prefix selects only the leader group.
-        let ips = parse_group_table(SAMPLE, "edge-solana-shreds");
+        let ips = parse_group_json(SAMPLE.as_bytes(), "edge-solana-shreds");
         assert_eq!(ips, vec![Ipv4Addr::new(233, 84, 178, 1)]);
     }
 }

@@ -161,14 +161,18 @@ non-empty default bind, so it is on unless you explicitly clear it.
 Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
 joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
 out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). This
-step is the bare forwarder — no dedup, no signature verification, no decode. `--shred-forward` targets
-should be local/fast sinks: sends are sequential per destination, so a slow or remote sink throttles
-the whole forwarder (and sheds load); the send socket pins no egress interface.
+step is the bare forwarder — no dedup, no signature verification, no decode. Each destination gets
+its own `connect`ed send socket, so an async ICMP error from a down destination (e.g. nothing
+listening) stays isolated to that socket and never drops a datagram bound for a healthy one.
+`--shred-forward` targets should be local/fast sinks: sends are sequential per destination, so a slow
+or remote sink throttles the whole forwarder (and sheds load); the send sockets pin no egress
+interface.
 
-It **activates on discovery**: by default it shells out to `doublezero multicast group list`, selects
-the groups whose `code` starts with `--shred-code-prefix` (default `edge-solana-`), and binds each on
-`--shred-port` (default `7733`). If the CLI is missing or finds no matching group, the forwarder stays
-off. Pass `--shred-source GROUP:PORT` (repeatable) to override discovery entirely.
+It **activates on discovery**: by default it shells out to `doublezero multicast group list
+--json-compact` and selects the activated groups whose `code` starts with `--shred-code-prefix`
+(default `edge-solana-`), binding each on `--shred-port` (default `7733`). If the CLI is missing,
+errors, or finds no matching group, the forwarder stays off. Pass `--shred-source GROUP:PORT`
+(repeatable) to override discovery entirely.
 
 | Flag | Env | Default |
 |------|-----|---------|

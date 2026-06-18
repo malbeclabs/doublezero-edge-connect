@@ -32,7 +32,7 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::ingest::receiver::{bind_multicast, wait_for_interface_ip};
 
@@ -188,11 +188,14 @@ async fn receiver_task(
             match guard.try_io(|s| s.get_ref().recv(&mut buf)) {
                 Ok(Ok(0)) => {} // empty datagram: nothing to forward
                 Ok(Ok(n)) => {
-                    // A datagram that exactly fills the buffer was likely truncated by `recv`
-                    // (no MSG_TRUNC requested). Solana shreds are well under 2048B, so this flags
-                    // mis-bound / unexpected traffic rather than a real shred.
+                    // A datagram that exactly fills the buffer was truncated by `recv` (no
+                    // MSG_TRUNC requested, so the tail is silently lost). Solana shreds are well
+                    // under 2048B, so this is mis-bound / unexpected traffic rather than a real
+                    // shred — drop it rather than forward a corrupt partial datagram downstream.
                     if n == buf.len() {
-                        debug!(%group, len = n, "shred datagram filled the recv buffer; may be truncated");
+                        warn!(%group, len = n,
+                              "shred datagram filled the recv buffer (likely truncated); dropping");
+                        continue;
                     }
                     match tx.try_send(buf[..n].to_vec()) {
                         Ok(()) => {}
@@ -225,24 +228,42 @@ async fn receiver_task(
     }
 }
 
-/// The single forwarder: own one UDP send socket and fan every datagram out to all destinations.
-/// A failing destination is logged and skipped — it never blocks delivery to the others. Returns
-/// `Ok` when the channel closes (all receivers gone).
+/// The single forwarder: fan every datagram out to all destinations. A failing destination is
+/// logged and skipped — it never blocks delivery to the others. Returns `Ok` when the channel
+/// closes (all receivers gone).
+///
+/// **One send socket per destination, each `connect`ed to its peer.** A shared socket would leak
+/// async ICMP errors across destinations: on Linux a `send_to` to a local port with no listener
+/// makes the kernel queue an `ECONNREFUSED` that is then delivered on the *next* socket operation
+/// regardless of target — so a down destination could fail (and drop) the *next* send to a
+/// *healthy* one, and mis-attribute the error. A connected socket only ever surfaces ICMP errors
+/// for its own peer, so each destination's failures stay isolated to its own socket.
 ///
 /// Sends are sequential per destination, so effective forwarder throughput is ~`1/M` of a single
 /// send and a slow destination sheds load globally (the bounded channel fills and receivers drop).
 /// That is fine for the intended use — a few **local unicast** destinations whose sends don't block
-/// — but don't point `--shred-forward` at a slow/remote sink. The send socket binds `0.0.0.0:0` and
+/// — but don't point `--shred-forward` at a slow/remote sink. Each socket binds `0.0.0.0:0` and
 /// pins no egress interface, so destinations should be loopback/local, not off-box.
 async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAddr>) -> Result<()> {
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .await
-        .context("binding shred forward send socket")?;
-    info!(?dests, local = ?sock.local_addr().ok(), "shred forwarder ready");
+    // Build one connected send socket per destination so ICMP errors can't cross destinations.
+    // `connect` on a UDP socket only sets the default peer (no handshake), so it succeeds even for
+    // a destination with nothing listening — a port-unreachable surfaces later, on this socket's
+    // own next `send`.
+    let mut socks: Vec<(SocketAddr, UdpSocket)> = Vec::with_capacity(dests.len());
+    for dst in &dests {
+        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .with_context(|| format!("binding shred forward send socket for {dst}"))?;
+        sock.connect(dst)
+            .await
+            .with_context(|| format!("connecting shred forward socket to {dst}"))?;
+        socks.push((*dst, sock));
+    }
+    info!(?dests, "shred forwarder ready");
 
     while let Some(pkt) = rx.recv().await {
-        for dst in &dests {
-            if let Err(e) = sock.send_to(&pkt, dst).await {
+        for (dst, sock) in &socks {
+            if let Err(e) = sock.send(&pkt).await {
                 warn!(%dst, %e, "shred forward send failed; skipping this destination");
             }
         }
@@ -359,7 +380,10 @@ mod tests {
 
         let sender = loopback_sender().await;
         warmup(&sender, src, &l1).await;
-        // l2's warmup copies were drained from l1 only; drain l2 too before the real batch.
+        // Drain BOTH destinations with the generous (800ms) window right before the real batch, so
+        // a warmup probe that arrives late (after warmup's tight 50ms drain) can't inflate the
+        // count past N on a loaded runner. l2 never saw warmup's drain at all.
+        drain_count(&l1).await;
         drain_count(&l2).await;
 
         const N: usize = 20;
@@ -384,9 +408,12 @@ mod tests {
     async fn dead_destination_does_not_block_live_one() {
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        // Port 0 is rejected by `send_to` (EINVAL), forcing the per-destination error path; even if
-        // a platform accepted it, the live destination below must still receive everything.
-        let dead: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // A real closed port (nothing listening on 127.0.0.1:1) so the kernel generates a genuine
+        // ICMP port-unreachable, queued on that destination's socket and delivered on a *later*
+        // send — the actual async ECONNREFUSED failure mode. (`127.0.0.1:0` would instead fail
+        // synchronously with EINVAL and never exercise this path.) With one socket per destination
+        // that error stays isolated to the dead socket and must not disturb the live one.
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
         let group = Ipv4Addr::new(239, 255, 99, 2);
         let src = SocketAddrV4::new(group, 17733);
@@ -400,6 +427,8 @@ mod tests {
 
         let sender = loopback_sender().await;
         warmup(&sender, src, &live).await;
+        // Generous drain before the real batch so no late warmup probe inflates the count past N.
+        drain_count(&live).await;
 
         const N: usize = 20;
         for i in 0..N {

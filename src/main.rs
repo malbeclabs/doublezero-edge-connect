@@ -20,7 +20,7 @@ use std::{
 use anyhow::{bail, Result};
 use clap::Parser;
 use tokio::{sync::broadcast, task::JoinSet};
-use tracing::info;
+use tracing::{info, warn};
 
 use ingest::feeds;
 
@@ -204,10 +204,21 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
-        r = async { match shred {
-            Some(handle) => handle.await,
-            None => std::future::pending().await,
-        } } => r??,
+        // The shred forwarder is an optional add-on; a shred-side failure (e.g. the forwarder
+        // failing to bind its send socket, or a task panic) must NOT take the market-data bridge
+        // down with it. Log the outcome and degrade this arm to `pending()` so the rest of the
+        // process keeps running. (Receiver bind failures are already retried, not propagated.)
+        () = async { match shred {
+            Some(handle) => {
+                match handle.await {
+                    Ok(Ok(())) => warn!("shred forwarder exited cleanly; market-data bridge continues"),
+                    Ok(Err(e)) => warn!(error = %e, "shred forwarder failed; market-data bridge continues"),
+                    Err(e) => warn!(error = %e, "shred forwarder task panicked; market-data bridge continues"),
+                }
+                std::future::pending::<()>().await
+            }
+            None => std::future::pending::<()>().await,
+        } } => {},
         Some(r) = receivers.join_next() => r??,
     }
     Ok(())
