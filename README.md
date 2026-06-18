@@ -160,13 +160,13 @@ non-empty default bind, so it is on unless you explicitly clear it.
 
 Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
 joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
-out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). This
-step is the bare forwarder — no dedup, no signature verification, no decode. Each destination gets
-its own `connect`ed send socket, so an async ICMP error from a down destination (e.g. nothing
-listening) stays isolated to that socket and never drops a datagram bound for a healthy one.
-`--shred-forward` targets should be local/fast sinks: sends are sequential per destination, so a slow
-or remote sink throttles the whole forwarder (and sheds load); the send sockets pin no egress
-interface.
+out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). By
+default it forwards every datagram; set `--shred-rpc-url` to forward exactly one signature-verified
+copy of each shred (see below). Each destination gets its own `connect`ed send socket, so an async
+ICMP error from a down destination (e.g. nothing listening) stays isolated to that socket and never
+drops a datagram bound for a healthy one. `--shred-forward` targets should be local/fast sinks: sends
+are sequential per destination, so a slow or remote sink throttles the whole forwarder (and sheds
+load); the send sockets pin no egress interface.
 
 It **activates on discovery**: by default it shells out to `doublezero multicast group list
 --json-compact` and selects the activated groups whose `code` starts with `--shred-code-prefix`
@@ -174,12 +174,30 @@ It **activates on discovery**: by default it shells out to `doublezero multicast
 errors, or finds no matching group, the forwarder stays off. Pass `--shred-source GROUP:PORT`
 (repeatable) to override discovery entirely.
 
+**Signature verification + deduplication.** Set `--shred-rpc-url` to a Solana JSON-RPC endpoint and
+the forwarder forwards exactly **one valid copy** of each shred instead of every datagram. It keys a
+bounded, prefer-valid dedup window on `(slot, index, type)`: a duplicate of an already-forwarded copy
+is dropped without a signature check; the first copy of a key is ed25519-verified against its slot
+leader (leader schedule fetched per epoch from the RPC and cached); an invalid copy is dropped but
+leaves the key open so a later valid copy can still win. A slot whose leader isn't known yet (schedule
+still loading, or outside the cached epoch) fails **open** — forwarded but not deduped — so the
+forwarder never silently drops traffic it can't yet judge. Without `--shred-rpc-url`, behaviour is
+unchanged (every datagram forwarded).
+
+> ⚠️ The shred/merkle byte offsets are transcribed from the agave shred layout and are **not** yet
+> validated against a live `edge-solana-*` hexdump (the same caveat as the repo's unvalidated Midpoint/
+> MBO codecs). Confirm them against a captured frame before relying on sigverify in production; the
+> forwarder logs a one-time warning when sigverify is on and a periodic valid/invalid tally so a
+> systematic misparse (≈100% "invalid") is obvious.
+
 | Flag | Env | Default |
 |------|-----|---------|
 | `--shred-code-prefix` | `DZ_SHRED_CODE_PREFIX` | `edge-solana-` |
 | `--shred-port` | `DZ_SHRED_PORT` | `7733` |
 | `--shred-forward` (repeatable) | `DZ_SHRED_FORWARD` | `127.0.0.1:20000` |
 | `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
+| `--shred-rpc-url` | `DZ_SHRED_RPC_URL` | — (set to enable sigverify + dedup) |
+| `--shred-dedup-window-slots` | `DZ_SHRED_DEDUP_WINDOW_SLOTS` | `512` |
 
 The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
 at startup, and a non-loopback `--shred-forward` target is warned about (it would route raw,

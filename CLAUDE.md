@@ -48,14 +48,32 @@ Modules are grouped by role under `src/`:
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
-  market-data pipeline — no `FeedMessage`, no WebSocket, no decode). Joins the DoubleZero
+  market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
   UDP destinations. Pipeline: N receiver tasks → bounded `mpsc<ShredPacket>` → 1 forwarder task →
-  fan-out `send_to` → M destinations. The single forwarder is the deliberate seam where shared
-  dedup/sigverify will later live; receivers stay dumb (recv → push bytes). It reuses
-  `ingest::receiver::{bind_multicast, wait_for_interface_ip}` (now `pub`) rather than duplicating
-  socket plumbing. `shred/discovery.rs` shells out to `doublezero multicast group list` and
-  prefix-selects the source groups. Activate-on-discovery; off when no source is found.
+  fan-out `send_to` → M destinations. The single forwarder is the deliberate seam where the
+  dedup/sigverify state lives (no cross-task sharing); receivers stay dumb (recv → push bytes). It
+  reuses `ingest::receiver::{bind_multicast, wait_for_interface_ip}` (now `pub`) rather than
+  duplicating socket plumbing. `shred/discovery.rs` shells out to `doublezero multicast group list`
+  and prefix-selects the source groups. Activate-on-discovery; off when no source is found.
+  **Sigverify + dedup (`--shred-rpc-url`):** with an RPC URL the forwarder forwards exactly one
+  valid copy of each shred; without one it forwards everything (the bare behaviour). The forwarder
+  threads each datagram through `parse` → leader lookup → `dedup`:
+  - **`shred/parse.rs`** — pure decoder pulling signature/variant/`slot`/`index` and the signed
+    message (legacy payload, or recomputed merkle root) from a raw datagram. ⚠️ **Offsets +
+    merkle layout are transcribed from the agave shred format and NOT validated against a live
+    `edge-solana-*` hexdump** — same status as `codec_midpoint`/`codec_mbo`. Round-trip tests pin
+    self-consistency only. Validate against a captured frame before trusting sigverify.
+  - **`shred/verify.rs`** — ed25519 (`ed25519-dalek`) of the signature over the signed message;
+    any malformed input fails verification rather than panicking.
+  - **`shred/leader.rs`** — slot→leader from a Solana RPC (`getLeaderSchedule`/`getEpochInfo`),
+    cached per epoch, refreshed by an off-hot-path task. `leader(slot)` returns `None` when the
+    schedule isn't loaded / slot is out of epoch, which makes the forwarder **fail open**.
+  - **`shred/dedup.rs`** — `DedupWindow`: bounded, prefer-valid window keyed by `(slot, index,
+    type)`. `decide()` is the unit-tested gate: duplicate of a winner → drop with no sig check;
+    no leader → forward (fail open, no record); else verify → valid forwards + records, invalid
+    drops but leaves the key open. Eviction is a cheap slot range-drop trailing the tip by
+    `--shred-dedup-window-slots`.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
 - **`ingest/feeds.rs`** — the hardcoded feed registry: each `Feed` is one multicast group mapped to one

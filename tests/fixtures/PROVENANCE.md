@@ -174,3 +174,33 @@ cargo run --example pcap2frames -- tyo_tob.pcap \
 
 `--symbol` is repeatable; omitting it entirely keeps all symbols (used to survey per-symbol volume
 before picking the busy/quiet pair).
+
+## Solana shred fixtures (`shred_sample.bin`, `shred_leaders.json`)
+
+Unlike the HL fixtures above, these are a **live capture** from the DoubleZero `edge-solana-*`
+shred multicast feed on mainnet-beta (an edge-scoreboard host subscribed to `edge-solana-shreds`
+233.84.178.1, `edge-solana-retrans-amer` 233.84.178.14, and `edge-solana-root` 233.84.178.16, all
+port 7733). They validate `src/shred/parse.rs`/`verify.rs`/`dedup.rs` against **real Solana shreds**
+— a stronger oracle than the self-consistency round-trips in `parse.rs`, which cannot catch a
+constant both construction and verification share.
+
+| File | What |
+|------|------|
+| shred_sample.bin | 117 real shred datagrams, `[u32 LE len][datagram]` records (same format as above), curated from a single mainnet slot (427286518, epoch 989) to cover all four chained-merkle variant bytes `0x66`/`0x76`/`0x96`/`0xb6` plus cross-group duplicates (63 unique `(slot,index,type)` keys). |
+| shred_leaders.json | `{slot: base58 leader pubkey}` for the fixture's slot, from `getLeaderSchedule`+`getEpochInfo` at capture time (epoch 989, first_slot 427248000). Slot 427286518 leader = `GREEDkgav1ox1jYyd9Anv6exLqKV2vYnxMw5prGwmNKc`. |
+
+`fixture_tests.rs` asserts every datagram parses and ed25519-verifies against its slot leader, and
+that dedup forwards exactly one copy per key. These tests caught three transcription bugs in the
+originally-unvalidated `parse.rs` offsets (all flagged "NOT validated against a live hexdump"):
+1. the chained-merkle **data** variant byte is `0x90`, not the assumed `0xa0` — `0x96` was ~half the
+   data shreds on the wire and silently fell through to "unparseable";
+2. merkle **data** shreds are **1203** bytes on the wire, code **1228** — the parser used a single
+   1228 constant and misplaced the proof for data shreds;
+3. the merkle hash domain prefixes are `\x00SOLANA_MERKLE_SHREDS_LEAF` / `\x01SOLANA_MERKLE_SHREDS_NODE`,
+   not bare `\x00`/`\x01` — so every merkle root (data **and** code) was wrong and nothing verified.
+
+**Regenerating:** capture with `tcpdump -i doublezero1 -s 0 'udp and net 233.84.178.0/24'` on a host
+subscribed to the `edge-solana-*` groups, then re-run the extraction (curate datagrams covering all
+variant bytes + multi-group keys into the record format, and build `shred_leaders.json` by inverting
+a current `getLeaderSchedule` for the captured slots). The leader schedule must be fetched while the
+captured epoch is still within the RPC's retention.
