@@ -45,8 +45,9 @@ use crate::{
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
 };
 
-/// A multicast socket with kernel RX software timestamps enabled.
-type TsSocket = AsyncFd<std::net::UdpSocket>;
+/// A multicast socket with kernel RX software timestamps enabled. `pub` so the shred forwarder
+/// (`crate::shred`) can reuse [`bind_multicast`] without re-deriving the socket plumbing.
+pub type TsSocket = AsyncFd<std::net::UdpSocket>;
 
 /// The role a feed's port plays. The market-data stream is what the liveness watchdog tracks
 /// (reference/snapshot ports keep ticking even when market data is wedged); a processor uses the
@@ -171,7 +172,9 @@ pub fn try_resolve_interface_ip(iface: &str) -> Option<Ipv4Addr> {
 /// interface (e.g. `doublezero1`) rather than racing the tunnel coming up and falling back to the
 /// default interface. After `max_wait` it gives up and returns `0.0.0.0` (join on the default
 /// interface) so a genuinely-misconfigured interface degrades rather than hanging forever.
-async fn wait_for_interface_ip(iface: &str, max_wait: Duration) -> Ipv4Addr {
+// `pub` so the shred forwarder (`crate::shred`) joins on the same interface with identical
+// tunnel-up race handling instead of re-deriving it.
+pub async fn wait_for_interface_ip(iface: &str, max_wait: Duration) -> Ipv4Addr {
     if let Some(ip) = try_resolve_interface_ip(iface) {
         return ip;
     }
@@ -198,7 +201,11 @@ async fn wait_for_interface_ip(iface: &str, max_wait: Duration) -> Ipv4Addr {
 }
 
 /// Join a UDP multicast group and return an async socket bound to `port`.
-fn bind_multicast(
+///
+/// `pub` so the shred forwarder (`crate::shred`) reuses the exact bind semantics — crucially the
+/// bind-to-GROUP (not INADDR_ANY) behavior documented below, which matters identically there:
+/// all `edge-solana-*` groups share port 7733 and differ only by group.
+pub fn bind_multicast(
     group: Ipv4Addr,
     port: u16,
     iface_ip: Ipv4Addr,

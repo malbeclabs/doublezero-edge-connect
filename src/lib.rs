@@ -8,4 +8,5 @@
 
 pub mod ingest;
 pub mod model;
+pub mod shred;
 pub mod sinks;

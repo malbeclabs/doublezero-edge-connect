@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Shred forwarder (`src/shred/`): joins the DoubleZero `edge-solana-*` shred multicast
+  feeds, combines them, and fans each datagram out to one or more local UDP destinations
+  (no dedup / no signature verification yet). Sources are discovered via `doublezero
+  multicast group list` (prefix-matched, default `edge-solana-`) or overridden with
+  repeatable `--shred-source GROUP:PORT`. Activates on discovery; configured with
+  `--shred-code-prefix`, `--shred-port` (default `7733`), `--shred-forward` (default
+  `127.0.0.1:20000`), reusing `--iface`/`--recv-buf`. Reuses the `ingest::receiver` socket
+  plumbing (`bind_multicast`, `wait_for_interface_ip`) — now `pub` (#24).
+  Discovery deserializes `doublezero multicast group list --json-compact` (the machine-readable
+  contract) instead of scraping the human table, and filters on `status == activated`. The
+  forwarder uses one `connect`ed send socket per destination so a down destination's async ICMP
+  error can't drop a datagram bound for a healthy one. A shred-side failure is logged and
+  isolated — it never takes the market-data bridge down. Datagrams that fill the recv buffer
+  (likely truncated, no `MSG_TRUNC`) are dropped rather than forwarded corrupt (#24).
 - Real Hyperliquid Market-by-Order (MBO) feed ingestion: a confirmed `FEEDS` row
   (`233.84.178.15`, ports `10201`/`10202`/`10203`, depth-only) re-served as full-state
   `depth`. `--feed <venue>` now selects every protocol feed for that venue.
