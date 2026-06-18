@@ -31,6 +31,12 @@ pub struct RefDataState<D> {
     pub defs: HashMap<u32, D>,
 }
 
+impl<D: InstrumentDef> Default for RefDataState<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<D: InstrumentDef> RefDataState<D> {
     pub fn new() -> Self {
         // Not `#[derive(Default)]`: that would impose `D: Default`, which the definition types
