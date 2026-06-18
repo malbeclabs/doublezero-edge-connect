@@ -28,6 +28,9 @@ pub mod leader;
 pub mod parse;
 pub mod verify;
 
+#[cfg(test)]
+mod fixture_tests;
+
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,

@@ -30,14 +30,18 @@ const SIZE_OF_COMMON_HEADER: usize = 83;
 const OFFSET_OF_NUM_DATA_SHREDS: usize = SIZE_OF_COMMON_HEADER; // u16 LE
 const OFFSET_OF_CODING_POSITION: usize = SIZE_OF_COMMON_HEADER + 4; // u16 LE
 
-/// Full serialized shred payload size. Data and code shreds serialize to the same width so they can
-/// share one network packet size; the merkle proof always sits at the tail, before the optional
-/// retransmitter signature. (agave `ShredData::SIZE_OF_PAYLOAD == ShredCode::SIZE_OF_PAYLOAD`.)
+/// Code-shred serialized payload size, used only by the round-trip tests below. Real parsing derives
+/// the proof offset from the datagram length (`pkt.len()`): merkle **data** shreds are 1203 bytes on
+/// the wire and **code** shreds 1228 (agave `ShredData::SIZE_OF_PAYLOAD` != `ShredCode::SIZE_OF_PAYLOAD`,
+/// firedancer `FD_SHRED_MIN_SZ`/`FD_SHRED_MAX_SZ`), so a fixed constant misplaces the proof for one.
+#[cfg(test)]
 const SHRED_PAYLOAD_SIZE: usize = 1228;
 const SIZE_OF_MERKLE_PROOF_ENTRY: usize = 20;
-/// Domain-separation prefixes guard against second-preimage attacks (agave `merkle.rs`).
-const MERKLE_PREFIX_LEAF: &[u8] = &[0x00];
-const MERKLE_PREFIX_NODE: &[u8] = &[0x01];
+/// Domain-separation prefixes (agave `merkle_tree.rs`, firedancer `fd_bmtree.h`): the leading byte
+/// guards second-preimage attacks, the ASCII tag namespaces shred merkle hashes. The whole string is
+/// hashed, not just the leading byte.
+const MERKLE_PREFIX_LEAF: &[u8] = b"\x00SOLANA_MERKLE_SHREDS_LEAF";
+const MERKLE_PREFIX_NODE: &[u8] = b"\x01SOLANA_MERKLE_SHREDS_NODE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShredType {
@@ -67,22 +71,24 @@ enum Variant {
     },
 }
 
-/// Decode the variant byte. Mirrors agave's `ShredVariant` encoding exactly:
+/// Decode the variant byte. Mirrors agave's `ShredVariant` / firedancer `fd_shred.h` encoding:
 /// `0x5a`/`0xa5` are legacy code/data; otherwise the high nibble selects merkle code (0x40/0x60/
-/// 0x70) or data (0x80/0xa0/0xb0), with 0x60/0xa0 = chained and 0x70/0xb0 = chained + resigned.
+/// 0x70) or data (0x80/0x90/0xb0), where 0x60/0x90 = chained and 0x70/0xb0 = chained + resigned.
 fn parse_variant(b: u8) -> Option<Variant> {
     match b {
         0x5a => Some(Variant::Legacy(ShredType::Code)),
         0xa5 => Some(Variant::Legacy(ShredType::Data)),
         _ => {
             let proof_size = (b & 0x0f) as usize;
-            // chained-only (0x60/0xa0) needs no special handling here: the chained merkle root sits
+            // chained-only (0x60/0x90) needs no special handling here: the chained merkle root sits
             // before the proof and is naturally folded into the leaf hash. Only `resigned` shifts
             // where the proof ends (a trailing retransmitter signature), so that's all we track.
+            // Data chained is 0x90 (NOT 0x80|0xa0) — the dominant variant on the live edge-solana
+            // feed; mapping it to anything else drops ~half the data shreds.
             let (ty, resigned) = match b & 0xf0 {
                 0x40 | 0x60 => (ShredType::Code, false),
                 0x70 => (ShredType::Code, true),
-                0x80 | 0xa0 => (ShredType::Data, false),
+                0x80 | 0x90 => (ShredType::Data, false),
                 0xb0 => (ShredType::Data, true),
                 _ => return None,
             };
@@ -142,7 +148,10 @@ fn merkle_root(
 ) -> Option<[u8; 32]> {
     let resign = if resigned { SIZE_OF_SIGNATURE } else { 0 };
     let proof_bytes = proof_size.checked_mul(SIZE_OF_MERKLE_PROOF_ENTRY)?;
-    let proof_offset = SHRED_PAYLOAD_SIZE.checked_sub(proof_bytes + resign)?;
+    // The proof sits at the tail of the datagram (before any retransmitter signature). Derive its
+    // offset from the actual datagram length, not a fixed constant — merkle data (1203) and code
+    // (1228) shreds differ in width, so a single constant would misplace the proof for one type.
+    let proof_offset = pkt.len().checked_sub(proof_bytes + resign)?;
     if pkt.len() < proof_offset + proof_bytes {
         return None;
     }
