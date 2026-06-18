@@ -27,11 +27,14 @@ BRIDGE_PID=""
 # one-shot `connect multicast` is run externally and is not re-run on restart).
 SIGNALED=0
 
-# True iff doublezerod reports a live tunnel. `doublezero status` prints a header
-# row plus one data row whose first `|`-delimited column is up/down/unknown; we
-# match a data row of `up`. `timeout` bounds a probe against a wedged daemon.
+# True iff doublezerod reports a live tunnel. `doublezero status --json` emits an
+# array whose entries carry `response.doublezero_status.session_status`
+# (up/down/unknown); we match a session of `up`. Grepping the JSON field (a stable
+# key) rather than the human table avoids depending on column layout — and on jq,
+# which the image doesn't ship. `timeout` bounds a probe against a wedged daemon.
 dz_connected() {
-    timeout 5 doublezero status 2>/dev/null | grep -qE '^[[:space:]]*up[[:space:]]*\|'
+    timeout 5 doublezero status --json 2>/dev/null \
+        | grep -qiE '"session_status"[[:space:]]*:[[:space:]]*"up"'
 }
 
 # Graceful shutdown: disconnect from DoubleZero *while the daemon is still up*,
