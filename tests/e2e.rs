@@ -160,12 +160,12 @@ fn mbo_goldens_split_into_valid_frames() {
 }
 
 /// Spawn the bridge, replay the MBO golden once in wire order (refdata, snapshot, mktdata),
-/// and assert the depth output contract. The snapshot is an empty-book anchor (anchor_seq=0,
-/// last_instrument_seq=0): it flips the book to `Synced` at empty, then the 140 replayed deltas
-/// (per-instrument seq 1..=140, all contiguous after the anchor) build the live book and `depth`
-/// flows. The capture is mid-session (the first deltas cancel resting orders added before the
-/// capture began); those cancels no-op against the empty book, so the resulting depth is the
-/// real subset of orders added during the capture — no fabricated state.
+/// and assert the depth output contract on a REAL two-sided book. The snapshot is a complete
+/// resting-order capture from the TYO recorder (publisher 148.51.123.3, BTC, snapshot_id 1106238:
+/// 44598 orders, both sides) — `book.rs` installs it on `SnapshotEnd` and the book is `Synced`
+/// two-sided immediately, then the contiguous post-anchor deltas apply live. Because the snapshot
+/// carries genuine bids AND asks, the crossed-book assertion below is ACTIVE: a real best_bid >=
+/// best_ask here would be a true side-mapping inversion, not a no-op on an empty/one-sided book.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mbo_single_publisher_depth_contract() {
@@ -241,27 +241,22 @@ async fn mbo_single_publisher_depth_contract() {
         for w in asks.windows(2) {
             assert!(px(&w[0]) <= px(&w[1]), "asks not ascending: {d}");
         }
-        // A crossed book (best bid >= best ask) indicates the MBO side labels are inverted.
-        if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
-            assert!(
-                px(best_bid) < px(best_ask),
-                "crossed book: best_bid={} >= best_ask={} (MBO side inversion?)",
-                px(best_bid),
-                px(best_ask)
-            );
-        }
+        // ACTIVE two-sided crossed-book check. The fixture's snapshot is a real two-sided BTC book,
+        // so every emitted depth carries bids AND asks; best_bid must be strictly below best_ask.
+        // A crossed or one-sided book here is a genuine signal (MBO side-constant inversion or a
+        // book-reconstruction bug) — investigate it, do NOT paper over it by swapping side labels.
+        let (best_bid, best_ask) = (bids.first(), asks.first());
+        assert!(
+            best_bid.is_some() && best_ask.is_some(),
+            "depth is one-sided on a two-sided fixture (MBO side-constant inversion?): {d}"
+        );
+        assert!(
+            px(best_bid.unwrap()) < px(best_ask.unwrap()),
+            "crossed book: best_bid={} >= best_ask={} (MBO side inversion?)",
+            px(best_bid.unwrap()),
+            px(best_ask.unwrap())
+        );
     }
-
-    // The fixture is predominantly buy-side (wire side=0=Bid). At least one depth must carry bids;
-    // if none do, the MBO side constants are inverted (bids wrongly routed to asks).
-    assert!(
-        depths.iter().any(|d| d
-            .get("bids")
-            .and_then(|v| v.as_array())
-            .map(|b| !b.is_empty())
-            .unwrap_or(false)),
-        "no depth message had a non-empty bid side — likely MBO side-constant inversion"
-    );
 
     // MBO is depth-only: no trades from this venue (TOB owns trades, idle here).
     assert!(

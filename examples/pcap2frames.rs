@@ -36,6 +36,10 @@ use pcap_file::{pcap::PcapReader, DataLink};
 
 use doublezero_edge_connect::ingest::{codec, codec_mbo};
 
+/// One replay stream: a list of complete frames (UDP payloads), each written as a length-prefixed
+/// record by [`write_log`].
+type FrameLog = Vec<Vec<u8>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Protocol {
     Tob,
@@ -80,6 +84,16 @@ struct Args {
     /// Window end (seconds, relative to the first packet). Omit for end-of-capture.
     #[arg(long)]
     to: Option<f64>,
+    /// MBO only: trim to a minimal two-sided fixture — the first COMPLETE snapshot group
+    /// (received `SnapshotOrder`s == the begin's promised `total_orders`) for the selected symbol,
+    /// plus the contiguous post-anchor deltas (capped by `--mbo-max-deltas`). A live deep-book MBO
+    /// snapshot is tens of thousands of orders; this keeps a real two-sided book without committing
+    /// the whole multi-MB window. Requires exactly one `--symbol`.
+    #[arg(long)]
+    mbo_minimal: bool,
+    /// Cap on post-anchor deltas kept under `--mbo-minimal`.
+    #[arg(long, default_value_t = 300)]
+    mbo_max_deltas: u32,
     /// Second publisher source IP. When set, emit ONE combined `<out>.combined.bin` of both
     /// publishers' refdata + symbol-filtered TOB mktdata **in capture order**, each record tagged
     /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata][frame]`. This preserves the real
@@ -434,6 +448,20 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         }
     }
 
+    if args.mbo_minimal {
+        let target_id = match &target {
+            Some(t) if t.len() == 1 => *t.iter().next().unwrap(),
+            _ => bail!("--mbo-minimal requires exactly one --symbol"),
+        };
+        (refdata, snapshot, mktdata) = trim_mbo_minimal(
+            &refdata,
+            &snapshot,
+            &mktdata,
+            target_id,
+            args.mbo_max_deltas,
+        )?;
+    }
+
     let refdata_path = out_path(&args.out, "refdata");
     let snapshot_path = out_path(&args.out, "snapshot");
     let mktdata_path = out_path(&args.out, "mktdata");
@@ -466,6 +494,157 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         mktdata.len()
     );
     Ok(())
+}
+
+/// Trim already-symbol-filtered MBO refdata+snapshot+mktdata vectors to a minimal two-sided
+/// fixture: one manifest + the target definition (enough to resolve precision), the first COMPLETE
+/// snapshot group for `target_id` (every promised order present, with a matching `SnapshotEnd`),
+/// plus the contiguous post-anchor deltas (per-instrument seq in
+/// `(last_instrument_seq, last_instrument_seq + max_deltas]`). Decoding through `codec_mbo` doubles
+/// as validation: an incomplete capture (no complete group) fails loudly here, and the bid/ask
+/// split is reported so the fixture's two-sidedness is confirmed at generation time.
+fn trim_mbo_minimal(
+    refdata: &[Vec<u8>],
+    snapshot: &[Vec<u8>],
+    mktdata: &[Vec<u8>],
+    target_id: u32,
+    max_deltas: u32,
+) -> Result<(FrameLog, FrameLog, FrameLog)> {
+    use codec_mbo::Message;
+
+    // Refdata: keep from the first ManifestSummary frame through the first frame at/after it that
+    // carries the target instrument's definition. One manifest epoch + the one definition is all the
+    // subscriber needs to resolve `target_id`'s precision; the live capture re-sends the same
+    // manifest seq on a round-robin, so the rest is redundant.
+    let manifest_idx = refdata
+        .iter()
+        .position(|f| {
+            codec_mbo::decode_frame(f)
+                .unwrap()
+                .1
+                .iter()
+                .any(|m| matches!(m, Message::ManifestSummary(_)))
+        })
+        .ok_or_else(|| anyhow!("no ManifestSummary in refdata"))?;
+    let def_off = refdata[manifest_idx..]
+        .iter()
+        .position(|f| {
+            codec_mbo::decode_frame(f).unwrap().1.iter().any(
+                |m| matches!(m, Message::InstrumentDefinition(d) if d.instrument_id == target_id),
+            )
+        })
+        .ok_or_else(|| {
+            anyhow!("no definition for instrument {target_id} at/after the first manifest")
+        })?;
+    let refdata_out = refdata[manifest_idx..=manifest_idx + def_off].to_vec();
+
+    // Pass 1: tally each snapshot group (in begin order) and find the first complete one.
+    let mut begins: Vec<(u32, u32, u32, u32)> = Vec::new(); // (sid, total, instrument_id, last_instr_seq)
+    let mut received: HashMap<u32, u32> = HashMap::new();
+    let mut ended: HashSet<u32> = HashSet::new();
+    for f in snapshot {
+        for m in &codec_mbo::decode_frame(f)?.1 {
+            match m {
+                Message::SnapshotBegin(s) => begins.push((
+                    s.snapshot_id,
+                    s.total_orders,
+                    s.instrument_id,
+                    s.last_instrument_seq,
+                )),
+                Message::SnapshotOrder(s) => *received.entry(s.snapshot_id).or_default() += 1,
+                Message::SnapshotEnd(s) => {
+                    ended.insert(s.snapshot_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    let (sid, total, _inst, last_instr_seq) = begins
+        .iter()
+        .find(|(sid, total, inst, _)| {
+            *inst == target_id && ended.contains(sid) && received.get(sid) == Some(total)
+        })
+        .copied()
+        .ok_or_else(|| {
+            anyhow!(
+                "no complete snapshot group for instrument {target_id} (capture lost packets in every group); \
+                 groups seen: {begins:?}, received: {received:?}"
+            )
+        })?;
+
+    // Pass 2: keep the chosen group's frames [BEGIN..END] inclusive, and count its two sides.
+    let begin_idx = snapshot
+        .iter()
+        .position(|f| {
+            codec_mbo::decode_frame(f)
+                .unwrap()
+                .1
+                .iter()
+                .any(|m| matches!(m, Message::SnapshotBegin(s) if s.snapshot_id == sid))
+        })
+        .unwrap();
+    let end_idx = snapshot
+        .iter()
+        .position(|f| {
+            codec_mbo::decode_frame(f)
+                .unwrap()
+                .1
+                .iter()
+                .any(|m| matches!(m, Message::SnapshotEnd(s) if s.snapshot_id == sid))
+        })
+        .unwrap();
+    let snap_out = snapshot[begin_idx..=end_idx].to_vec();
+    let (mut bid, mut ask) = (0u32, 0u32);
+    for f in &snap_out {
+        for m in &codec_mbo::decode_frame(f)?.1 {
+            if let Message::SnapshotOrder(s) = m {
+                if s.snapshot_id == sid {
+                    if s.side == codec_mbo::SIDE_BID {
+                        bid += 1
+                    } else {
+                        ask += 1
+                    }
+                }
+            }
+        }
+    }
+
+    // Post-anchor deltas: contiguous per-instrument seqs after the snapshot's last_instrument_seq.
+    let (lo, hi) = (
+        last_instr_seq + 1,
+        last_instr_seq.saturating_add(max_deltas),
+    );
+    let mut md_out = Vec::new();
+    let (mut kmin, mut kmax) = (u32::MAX, 0u32);
+    for f in mktdata {
+        let mut keep = false;
+        for m in &codec_mbo::decode_frame(f)?.1 {
+            let seq = match m {
+                Message::OrderAdd(o) if o.instrument_id == target_id => o.per_instrument_seq,
+                Message::OrderCancel(o) if o.instrument_id == target_id => o.per_instrument_seq,
+                Message::OrderExecute(o) if o.instrument_id == target_id => o.per_instrument_seq,
+                _ => continue,
+            };
+            if (lo..=hi).contains(&seq) {
+                keep = true;
+                kmin = kmin.min(seq);
+                kmax = kmax.max(seq);
+            }
+        }
+        if keep {
+            md_out.push(f.clone());
+        }
+    }
+
+    eprintln!(
+        "  mbo-minimal: {} refdata frames; snapshot group sid={sid} total_orders={total} \
+         (bid={bid} ask={ask}, two-sided), {} snapshot frames; {} mktdata frames, \
+         post-anchor seq=[{kmin}..{kmax}]",
+        refdata_out.len(),
+        snap_out.len(),
+        md_out.len()
+    );
+    Ok((refdata_out, snap_out, md_out))
 }
 
 /// Collect `(src_ip, frame)` for any of `srcs`, in capture order — like `collect_frames` but tags

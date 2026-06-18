@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        book::{BookState, DeltaKind, DeltaOp},
+        book::{BookState, DeltaKind, DeltaOp, Level},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
             Message,
@@ -441,7 +441,12 @@ pub struct MboProcessor {
     books_order: VecDeque<u32>,
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
+    /// Last emitted top-N levels per instrument, so a book change that leaves the published top-N
+    /// identical (deep-book churn) does not re-broadcast a duplicate full-state `depth`.
+    last_top: HashMap<u32, (Vec<Level>, Vec<Level>)>,
     warned_source_mismatch: bool,
+    /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
+    warned_invalid_manifest: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
 }
@@ -453,7 +458,9 @@ impl MboProcessor {
             books: HashMap::new(),
             books_order: VecDeque::new(),
             depth,
+            last_top: HashMap::new(),
             warned_source_mismatch: false,
+            warned_invalid_manifest: false,
             emit_trades,
         }
     }
@@ -500,6 +507,15 @@ impl MboProcessor {
             return; // precision unknown; don't emit a book we can't scale
         };
         let (bids_raw, asks_raw) = book.top_levels(DEPTH_LEVELS);
+        // Suppress a re-broadcast when the published top-N is byte-for-byte unchanged: a delta deep
+        // in the book (outside the top-N) still flips `changed`, but re-sending an identical
+        // full-state `depth` is pure duplication. Compare the raw integer levels (pre-scaling) for
+        // an exact match.
+        if self.last_top.get(&instrument_id) == Some(&(bids_raw.clone(), asks_raw.clone())) {
+            return;
+        }
+        self.last_top
+            .insert(instrument_id, (bids_raw.clone(), asks_raw.clone()));
         let scale = |levels: Vec<(i64, u64)>| -> Vec<[f64; 2]> {
             levels
                 .into_iter()
@@ -549,8 +565,22 @@ impl FrameProcessor for MboProcessor {
         for msg in messages {
             match msg {
                 codec_mbo::Message::ManifestSummary(m) => {
+                    // TEMP WORKAROUND: the live DZ Edge HL MBO publisher emits ManifestSummary
+                    // with Valid=0, same as the Top-of-Book publisher (see TobProcessor). Per spec
+                    // Valid=0 means "no established instrument set", which would keep RefDataState
+                    // from ever resolving a definition and block all depth. Force valid=true so the
+                    // bridge consumes the otherwise-healthy feed. REVISIT: pass `m.valid` once the
+                    // publisher manifest is corrected.
+                    if !m.valid && !self.warned_invalid_manifest {
+                        self.warned_invalid_manifest = true;
+                        warn!(
+                            manifest_seq = m.manifest_seq,
+                            instrument_count = m.instrument_count,
+                            "MBO manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
+                        );
+                    }
                     self.state
-                        .on_manifest(m.valid, m.manifest_seq, m.instrument_count);
+                        .on_manifest(true, m.manifest_seq, m.instrument_count);
                 }
                 codec_mbo::Message::InstrumentDefinition(d) => {
                     let inst = NormalizedInstrument {
