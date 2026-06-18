@@ -142,6 +142,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Warn instead of silently clobbering when two feeds for the same `(venue, symbol)` publish
   instrument definitions with different price/quantity exponents.
 
+### Security
+- Hardened the codec frame walker against out-of-bounds reads: the per-message body decoders
+  now read every field through bounds-checked little-endian readers, so a truncated or
+  malformed datagram (a runt message that under-declares its length) decodes to
+  `Message::Other` instead of panicking the receiver task — which previously propagated out
+  of `run_feed` and exited the whole process (a single crafted datagram could take the bridge
+  down for every venue and WS consumer). Applies to all three sibling codecs (TOB / Midpoint /
+  Market-by-Order).
+- Bounded the per-publisher frame-sequence map (`TobProcessor`) to `MAX_PUBLISHERS` (256) with
+  least-recently-inserted eviction. The map is keyed on the datagram source IP, which is
+  unauthenticated and spoofable, so without a cap a forged-source flood could grow it without
+  limit (memory-exhaustion DoS); an evicted legitimate publisher simply re-anchors its sequence
+  on its next frame.
+
 ## [0.1.0]
 
 ### Added

@@ -8,7 +8,7 @@
 //!   in [`crate::ingest::book`] and re-serves it as full-state `depth` + `trade`.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     net::IpAddr,
 };
 
@@ -33,6 +33,14 @@ use crate::{
 
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
+
+/// Cap on the number of distinct publishers (source IPs) tracked by [`TobProcessor`]'s per-publisher
+/// sequence map. The source IP comes from an *unauthenticated, spoofable* UDP datagram, so without a
+/// bound an attacker who can inject into the multicast group could mint a fresh `SeqTracker` per
+/// forged source IP and grow the map without limit (memory-exhaustion DoS). Real deployments have a
+/// handful of mirrored publishers, so this is set far above that; once full, the least-recently-
+/// inserted publisher is evicted (it simply re-anchors its sequence on its next frame).
+const MAX_PUBLISHERS: usize = 256;
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
@@ -66,8 +74,11 @@ pub struct TobProcessor {
     /// Per-publisher, per-channel frame sequence tracker. Independent publishers mirror this feed
     /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
     /// frames stale and drop them before dedup; keying by source IP keeps each publisher's sequence
-    /// state separate.
+    /// state separate. Bounded to [`MAX_PUBLISHERS`] entries (the source IP is spoofable, so the map
+    /// must not grow without limit); `seq_order` records insertion order for the eviction.
     seq: HashMap<IpAddr, SeqTracker>,
+    /// Insertion order of `seq` keys, oldest at the front, for the [`MAX_PUBLISHERS`] eviction.
+    seq_order: VecDeque<IpAddr>,
     /// Log the manifest `Valid=0` publisher workaround once, not on every (~1/s) manifest.
     warned_invalid_manifest: bool,
     /// Log an unregistered quote SourceID once, not on every quote.
@@ -81,10 +92,32 @@ impl TobProcessor {
         Self {
             state: RefDataState::new(),
             seq: HashMap::new(),
+            seq_order: VecDeque::new(),
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
         }
+    }
+
+    /// The sequence tracker for `publisher`, creating it on first sight. The map is bounded to
+    /// [`MAX_PUBLISHERS`]: when a *new* publisher would overflow it, the least-recently-inserted one
+    /// is evicted first. Source IPs are spoofable, so this bound is what stops a forged-source flood
+    /// from growing the map without limit; a legitimate publisher evicted under such a flood simply
+    /// re-anchors (`SeqCheck::First`) on its next frame, with no data loss beyond a stale-check reset.
+    fn seq_for(&mut self, publisher: IpAddr) -> &mut SeqTracker {
+        if !self.seq.contains_key(&publisher) {
+            while self.seq.len() >= MAX_PUBLISHERS {
+                match self.seq_order.pop_front() {
+                    Some(old) => {
+                        self.seq.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.seq.insert(publisher, SeqTracker::default());
+            self.seq_order.push_back(publisher);
+        }
+        self.seq.get_mut(&publisher).expect("just inserted/present")
     }
 }
 
@@ -112,7 +145,7 @@ impl FrameProcessor for TobProcessor {
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
         let quotes_fresh = if handle_quotes {
-            match self.seq.entry(ctx.publisher).or_default().check(
+            match self.seq_for(ctx.publisher).check(
                 header.channel_id,
                 header.reset_count,
                 header.sequence,
@@ -649,7 +682,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor};
+    use super::{upsert_instrument, MboProcessor, TobProcessor};
     use crate::{
         ingest::{
             arbiter::{Arbiter, SharedArbiter},
@@ -668,6 +701,32 @@ mod tests {
     // converge on one floor per (venue, symbol)). Their unit coverage — leader latch, non-leader
     // drop, stale-tick drop, capacity bound, source_ts==0 bypass, the bbo_hash identity incl.
     // bid_n/ask_n, and the public-loses-to-edge backstop — lives in `arbiter::tests`.
+
+    /// The per-publisher sequence map must stay bounded under a flood of distinct (spoofable) source
+    /// IPs, evicting the oldest first — otherwise a forged-source flood grows it without limit.
+    #[test]
+    fn tob_seq_map_is_bounded_under_publisher_flood() {
+        use super::MAX_PUBLISHERS;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut p = TobProcessor::new(true);
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)); // 10.x.y.z
+        let flood = (MAX_PUBLISHERS as u32) + 50;
+        for i in 0..flood {
+            let _ = p.seq_for(ip(i));
+        }
+        assert!(
+            p.seq.len() <= MAX_PUBLISHERS,
+            "seq map must stay bounded, got {}",
+            p.seq.len()
+        );
+        // The oldest publishers were evicted; the most-recent one is still tracked.
+        assert!(
+            p.seq.contains_key(&ip(flood - 1)),
+            "newest publisher retained"
+        );
+        assert!(!p.seq.contains_key(&ip(0)), "oldest publisher evicted");
+    }
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
     ///
