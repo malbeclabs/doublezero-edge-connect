@@ -110,6 +110,23 @@ struct Args {
         default_value_t = 512
     )]
     shred_dedup_window_slots: u64,
+
+    /// Coins to subscribe on the Hyperliquid **public** WebSocket input feeder, repeatable/
+    /// comma-separated (e.g. `--ws-input-coins BTC,ETH`). This is the backstop arbitrage source: it
+    /// races the public feed against the DZ Edge multicast in the shared arbiter, so the edge wins in
+    /// steady state and the public copy fills in only when the edge gaps. Empty (the default) leaves
+    /// the feeder off.
+    #[arg(long = "ws-input-coins", env = "WS_INPUT_COINS", value_delimiter = ',')]
+    ws_input_coins: Vec<String>,
+
+    /// URL for the public WS input feeder. Defaults to Hyperliquid's public endpoint; override to
+    /// point the feeder at a local mock (e.g. in tests).
+    #[arg(
+        long = "ws-input-url",
+        env = "WS_INPUT_URL",
+        default_value = "wss://api.hyperliquid.xyz/ws"
+    )]
+    ws_input_url: String,
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -230,9 +247,28 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Public WS input feeder: off unless `--ws-input-coins` is non-empty (the source/sink activation
+    // convention). It emits through the same shared arbiter as the multicast receivers, so the public
+    // feed races the edge per (venue, symbol) tick and backstops it. Failure-isolated: it reconnects
+    // internally and never returns, so its churn can't touch the multicast hot path.
+    let ws_input = if args.ws_input_coins.is_empty() {
+        info!("public WS input feeder disabled (no --ws-input-coins)");
+        None
+    } else {
+        info!(coins = ?args.ws_input_coins, url = %args.ws_input_url,
+              "starting public WS input feeder");
+        Some(tokio::spawn(ingest::ws_feeder::run(
+            args.ws_input_url.clone(),
+            args.ws_input_coins.clone(),
+            arbiter.clone(),
+            instruments.clone(),
+        )))
+    };
+
     // Exit if the WS server (when enabled) or any feed receiver returns (they loop forever). When
     // the WS sink is disabled, that arm is a never-resolving future so the process is driven by the
-    // receivers alone.
+    // receivers alone. The WS input feeder loops forever too; its arm resolves only if the task
+    // panics, surfacing that rather than letting it die silently.
     tokio::select! {
         r = async { match ws {
             Some(handle) => handle.await,
@@ -254,6 +290,10 @@ async fn main() -> Result<()> {
             None => std::future::pending::<()>().await,
         } } => {},
         Some(r) = receivers.join_next() => r??,
+        r = async { match ws_input {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r?,
     }
     Ok(())
 }
