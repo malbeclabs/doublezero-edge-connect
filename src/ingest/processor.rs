@@ -95,12 +95,13 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
-    /// Cross-publisher quote dedup: a per-(venue, symbol) `source_ts` staleness floor keyed on raw
-    /// BBO content. Keeps every distinct top-of-book change at the newest `source_ts` (incl. multiple
-    /// distinct BBOs sharing a `source_ts` — real intra-tick changes), but drops a strictly-older BBO
-    /// from a lagging publisher (stale: the market moved on) and any exact `(source_ts, content)`
-    /// duplicate. Output `source_ts` is non-decreasing per (venue, symbol).
-    quote_dedup: StalenessFloor<(String, String), QuoteContent>,
+    /// Cross-publisher quote dedup: a per-(venue, symbol) `source_ts` latch-to-leader floor keyed on
+    /// raw BBO content and the source IP. Within one `source_ts` tick it emits only the leader (first
+    /// publisher to open the tick) and drops other publishers' samples, because arrival order across
+    /// delayed publishers can't be trusted (a slower publisher's older sample landing last would read
+    /// as a phantom change). Drops a strictly-older BBO (stale laggard) and the leader's exact
+    /// `(source_ts, content)` repeats. Output `source_ts` is non-decreasing per (venue, symbol).
+    quote_dedup: StalenessFloor<(String, String), QuoteContent, IpAddr>,
     /// Cross-publisher trade dedup by venue trade_id per (venue, symbol).
     trade_dedup: WindowedDedup<(String, String), u64>,
 }
@@ -118,19 +119,24 @@ impl TobProcessor {
         }
     }
 
-    /// Whether this quote should be forwarded under the per-(venue, symbol) staleness floor: true if
-    /// `source_ts` is at or beyond the floor AND its `content` is new at that tick. Drops strictly-
-    /// older (stale laggard) BBOs and exact `(source_ts, content)` duplicates; keeps distinct intra-
-    /// tick BBO changes.
+    /// Whether this quote should be forwarded under the per-(venue, symbol) latch-to-leader floor:
+    /// true if `source_ts` is at or beyond the floor AND (it opens a new tick, or `publisher` is the
+    /// tick's latched leader and the `content` is new). Drops strictly-older (stale laggard) BBOs,
+    /// non-leader samples within a tick, and the leader's exact `(source_ts, content)` repeats.
     fn admit_quote(
         &mut self,
         venue: &str,
         symbol: &str,
         source_ts: u64,
         content: QuoteContent,
+        publisher: IpAddr,
     ) -> bool {
-        self.quote_dedup
-            .admit((venue.to_string(), symbol.to_string()), source_ts, content)
+        self.quote_dedup.admit(
+            (venue.to_string(), symbol.to_string()),
+            source_ts,
+            content,
+            publisher,
+        )
     }
 
     /// Whether this trade should be forwarded: false if its trade_id was seen recently.
@@ -282,11 +288,12 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    // Cross-publisher dedup on a per-(venue, symbol) source_ts staleness floor keyed
-                    // on raw BBO content: a strictly-older sample from a lagging publisher is stale
-                    // (the market moved on) and is dropped, as is an exact (source_ts, content)
-                    // duplicate, but a distinct BBO change at the current source_ts is kept. Output
-                    // source_ts is non-decreasing per (venue, symbol).
+                    // Cross-publisher dedup on a per-(venue, symbol) source_ts latch-to-leader floor:
+                    // within one source_ts tick only the leader (first publisher to open it) is
+                    // emitted — a slower publisher's samples at the same tick arrive in a
+                    // delay-corrupted order and can't be trusted, so they are dropped. A strictly-
+                    // older sample (stale laggard) and the leader's exact (source_ts, content)
+                    // repeats are dropped too. Output source_ts is non-decreasing per (venue, symbol).
                     let content = QuoteContent {
                         bid_price_raw: q.bid_price_raw,
                         bid_qty_raw: q.bid_qty_raw,
@@ -295,7 +302,13 @@ impl FrameProcessor for TobProcessor {
                         price_exponent: def.price_exponent,
                         qty_exponent: def.qty_exponent,
                     };
-                    if self.admit_quote(&quote.venue, &quote.symbol, quote.source_ts_ns, content) {
+                    if self.admit_quote(
+                        &quote.venue,
+                        &quote.symbol,
+                        quote.source_ts_ns,
+                        content,
+                        ctx.publisher,
+                    ) {
                         let _ = ctx.tx.send(FeedMessage::Quote(quote));
                     }
                 }
@@ -720,7 +733,12 @@ mod tests {
     };
 
     #[test]
-    fn tob_quote_dedup_is_staleness_floor() {
+    fn tob_quote_dedup_latches_to_leader() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let (a, b) = (
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        );
         let mut p = TobProcessor::new(true);
         // Two distinct BBO contents that can share a source_ts (a real intra-tick change).
         let c1 = QuoteContent {
@@ -736,13 +754,14 @@ mod tests {
             bid_qty_raw: 6, // bid size changed
             ..c1
         };
-        // Per-(venue, symbol) staleness floor.
-        assert!(p.admit_quote("Hyperliquid", "BTC", 1000, c1)); // first sample emits
-        assert!(!p.admit_quote("Hyperliquid", "BTC", 1000, c1)); // exact (ts, content) dup dropped
-        assert!(p.admit_quote("Hyperliquid", "BTC", 1000, c2)); // NEW content at SAME tick -> KEPT
-        assert!(!p.admit_quote("Hyperliquid", "BTC", 999, c1)); // strictly older (stale) dropped
-        assert!(p.admit_quote("Hyperliquid", "BTC", 2000, c1)); // new tick emits; content set resets
-        assert!(p.admit_quote("Hyperliquid", "ETH", 1000, c1)); // independent symbol's floor
+        // Per-(venue, symbol) latch-to-leader floor.
+        assert!(p.admit_quote("Hyperliquid", "BTC", 1000, c1, a)); // first sample -> A leads the tick
+        assert!(!p.admit_quote("Hyperliquid", "BTC", 1000, c1, a)); // A's exact (ts, content) dup dropped
+        assert!(p.admit_quote("Hyperliquid", "BTC", 1000, c2, a)); // A's new content at SAME tick kept
+        assert!(!p.admit_quote("Hyperliquid", "BTC", 1000, c2, b)); // B at same tick -> dropped (latch to A)
+        assert!(!p.admit_quote("Hyperliquid", "BTC", 999, c1, a)); // strictly older (stale) dropped
+        assert!(p.admit_quote("Hyperliquid", "BTC", 2000, c1, b)); // new tick: B opens it -> B leads, emit
+        assert!(p.admit_quote("Hyperliquid", "ETH", 1000, c1, a)); // independent symbol's floor
     }
 
     #[test]

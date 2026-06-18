@@ -60,13 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   onto a multicast group, the bridge merges them into one clean stream. Datagrams are demultiplexed
   by source IP (`FrameCtx.publisher`); the frame-sequence tracker is per-publisher so a slower
   publisher's frames aren't dropped before dedup. Quotes dedup on a per-`(venue, symbol)` `source_ts`
-  staleness floor keyed on raw BBO content: it keeps every distinct top-of-book change at the newest
-  `source_ts` (including multiple distinct BBOs that share a `source_ts` — real intra-tick updates,
-  matching the `hl-bbo-feed-race` `(symbol, source_ts, bbo_hash)` identity) but drops a lagging
-  publisher's strictly-older BBO (stale: the market moved on) and any exact `(source_ts, content)`
-  duplicate, so the emitted `source_ts` is non-decreasing (not strictly increasing) per symbol.
-  Trades, being point-in-time events, dedup on a windowed `(venue, symbol, trade_id)` identity so
-  every distinct print is kept. (Market-by-Order depth dedup is tracked separately.)
+  latch-to-leader floor keyed on raw BBO content: within one `source_ts` tick (the venue stamps
+  coarsely, so a tick holds a whole sub-sequence of real top-of-book changes) it emits only the
+  *leader* — the first publisher to open the tick — and drops other publishers' samples at that
+  `source_ts`. This is because arrival order across publishers is corrupted by per-publisher network
+  delay (the `hl-bbo-feed-race` board shows inter-feed skew over 100 ms), so interleaving two sources
+  inside one tick can serve a stale sample as the freshest — on a falling price, a slower publisher's
+  older, higher sample landing last would read as a phantom uptick. The leader is re-selected each
+  new tick, so the lowest-delay publisher for a given moment naturally wins. A strictly-older BBO
+  (stale laggard) and the leader's exact `(source_ts, content)` repeats are dropped too, so the
+  emitted `source_ts` is non-decreasing (not strictly increasing) per symbol and within a tick the
+  series is one publisher's coherent, in-order subsequence. Trades, being point-in-time events, dedup
+  on a windowed `(venue, symbol, trade_id)` identity so every distinct print is kept. (Market-by-Order
+  depth dedup is tracked separately.)
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry
