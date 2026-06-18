@@ -66,3 +66,111 @@ Regenerate the TOB/MBO mktdata+refdata by re-running the publisher's `hl_block_m
 generation (`server/tests/fixtures/hl_block_mode/generate_from_source.py`) and copying the
 goldens here. The MBO refdata reorder and the hand-crafted snapshot must be re-applied after any
 regeneration (the generator does not emit the snapshot port).
+
+## Multi-publisher TOB fixtures (live capture)
+
+`tob_btc_pubA.*` and `tob_btc_pubB.*` are **two independent live publishers of the same
+Hyperliquid TOB feed**, for the multi-publisher dedup work (issue #3). They are genuinely
+independent — disjoint frame-sequence spaces (≈70.8M vs ≈53.7M) and distinct wire `source_id`
+(3 vs 1) — and time-aligned (each spans the same ~40s window, `source_ts` 1781705333..1781705373).
+
+| File | Publisher | Source IP | Infra id | mktdata port |
+|------|-----------|-----------|----------|--------------|
+| tob_btc_pubA.{refdata,mktdata}.bin | A | 148.51.120.79 | tob_aws_tyo_hl_mainnet2 | 9201 |
+| tob_btc_pubB.{refdata,mktdata}.bin | B | 148.51.123.3  | tob_gcp_tyo_hl_mainnet1 | 9601 |
+
+**What these fixtures are — and are not.** The two publishers do NOT republish the same venue
+updates: each independently samples/coalesces the BBO, so within the shared window pub A emits 4109
+BTC quotes and pub B emits 4669, and only ~370 (~9%) share an identical `source_ts`. When they DO
+coincide the content matches (369/370 agree on the full bid/ask/size tuple), but coincidence is
+under a tenth of each stream. So these exercise **real independent-publisher dedup** — merge two
+samplings of one book and emit each distinct top-of-book change once (fastest publisher wins) — NOT
+a "mirror collapse to one stream"; the publishers are not mirrors and the deduped count does **not**
+approach a single publisher's. A dedup test on these must assert both that overlapping content
+collapses (the ~369 coincident tuples emit once) AND that genuinely distinct samples pass through —
+not that the count halves.
+
+Both are `BTC` (instrument_id 0), windowed to the first 40s of the capture. The window is ≥~35s on
+purpose: the exact-`BTC` definition re-sends on a ~30s round-robin (786 instruments, ~3144
+defs/120s), so a shorter window omits it and the precision gate never resolves BTC. The
+`.refdata.bin` files carry all in-window definitions+manifest. The `.mktdata.bin` files carry
+**frames containing BTC** — a TOB frame batches several instruments, so a frame carrying BTC plus
+others is kept whole (pub A: 1 such frame, 22 non-BTC messages retained); they are not strictly
+BTC-only.
+
+**Demux is by source IP, not UDP port** — publishers are on distinct ports today, but the feed
+team intends to normalize that, so source IP is the robust publisher key.
+
+**Codec validation against the live feed** (every frame decoded through the bridge's own codec):
+- TOB: **0 framing errors** across ~130k frames from both publishers.
+- MBO (same capture, `--protocol mbo`; not committed as fixtures — mktdata is ~12 MB/publisher):
+  **0 framing errors** over ~36k frames / ~1.2M messages each (pub A: order_add=273757,
+  order_cancel=273909, order_execute=4162, snapshot_msgs=384468, defs=1572, manifests=40). First
+  real-feed check of the MBO framing offsets (previously only self-consistent); per-field offsets
+  still rely on behavioral checks like the side-mapping fix.
+
+**Regenerating** (the raw 635 MB pcap is intentionally NOT committed):
+
+```
+# capture on the recorder (read-only sniff; multicast is multi-listener):
+sudo timeout 120 tcpdump -i doublezero1 -nn -s 0 -w tyo_tob.pcap 'host 233.84.178.15 and udp'
+# then, with the worktree built (cargo build --example pcap2frames):
+cargo run --example pcap2frames -- tyo_tob.pcap --src 148.51.120.79 --symbol BTC --to 40 \
+  -o tests/fixtures/tob_btc_pubA
+cargo run --example pcap2frames -- tyo_tob.pcap --src 148.51.123.3 --symbol BTC --to 40 \
+  -o tests/fixtures/tob_btc_pubB
+```
+
+The converter (`examples/pcap2frames.rs`) demuxes one publisher by source IP, keeps TOB frames
+(magic `0x445A`), filters mktdata to the chosen symbol, and writes the `[u32 LE length][frame]`
+record format `tests/common/replay.rs` replays.
+
+### `tob_btc_dual.combined.bin` — interleaved two-publisher golden
+
+`tob_btc_pubA`/`tob_btc_pubB` are *separate* per-publisher captures; replaying them back-to-back
+does **not** reproduce the real wire, where the two publishers' copies of each update arrive
+**interleaved**. The multi-publisher dedup collapses *adjacent* duplicates, so the dedup test needs
+the real interleaving. `tob_btc_dual.combined.bin` is that: both publishers' refdata +
+BTC-filtered mktdata in **capture order**, each record tagged `[u32 LE len][4B src_ip][1B role:
+0=refdata,1=mktdata][frame]` (note the extra `src_ip`/`role` prefix — this is NOT the plain
+`split_frames` format; the dedup test has its own reader). 235 refdata + 9330 mktdata frames, 0
+decode errors. Regenerate:
+
+```
+cargo run --example pcap2frames -- tyo_tob.pcap \
+  --src 148.51.120.79 --combined-with 148.51.123.3 --symbol BTC --to 40 \
+  -o tests/fixtures/tob_btc_dual
+```
+
+### `tob_multi_dual.combined.bin` — multi-symbol two-publisher golden
+
+`tob_btc_dual.combined.bin` is BTC-only. The dedup is keyed per `(venue, symbol)` with an
+**independent window per symbol**, so a single-symbol fixture cannot prove that one symbol's volume
+does not perturb another's dedup. `tob_multi_dual.combined.bin` is the multi-symbol counterpart:
+the same two publishers, same 40s window and same record format, but carrying three symbols spanning
+a volume spread — **BTC** (busy), **SOL** (medium) and **DOGE** (quiet). 235 refdata + 12940 mktdata
+frames, 0 decode errors, ~1.4 MB.
+
+Raw kept quote messages per `(symbol, publisher)` (the pre-dedup baseline):
+
+| Symbol | 148.51.120.79 (A) | 148.51.123.3 (B) | tier |
+|--------|-------------------|------------------|------|
+| BTC    | 4370              | 4960             | busy |
+| SOL    | 1501              | 1577             | medium |
+| DOGE   | 251               | 281              | quiet |
+
+(Counts are quote messages within the *kept* frames; a TOB frame batches several instruments, so a
+frame carrying any selected symbol is kept whole and its other symbols' messages are counted too —
+hence these tally only the selected ids.) DOGE at ~532 raw vs BTC's ~9330 is a ~17x volume gap, so a
+test can assert DOGE dedups to exactly what it would on its own (no cross-symbol interference from
+BTC's traffic). Regenerate:
+
+```
+cargo run --example pcap2frames -- tyo_tob.pcap \
+  --src 148.51.120.79 --combined-with 148.51.123.3 \
+  --symbol BTC --symbol SOL --symbol DOGE --to 40 \
+  -o tests/fixtures/tob_multi_dual
+```
+
+`--symbol` is repeatable; omitting it entirely keeps all symbols (used to survey per-symbol volume
+before picking the busy/quiet pair).

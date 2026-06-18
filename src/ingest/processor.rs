@@ -266,6 +266,12 @@ pub struct MidpointProcessor {
     warned_source_mismatch: bool,
 }
 
+impl Default for MidpointProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MidpointProcessor {
     pub fn new() -> Self {
         Self {

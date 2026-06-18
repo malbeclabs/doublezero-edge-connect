@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not double-emit `trade` messages (Top-of-Book owns trades; MBO is depth-only).
 - End-to-end test suite that drives the release binary over loopback multicast and asserts
   the WebSocket output contract, with deduplication-oracle assertions for future work.
+- `examples/pcap2frames.rs` dev tool: converts a multicast pcap into the test harness's
+  frame-log fixtures, demultiplexing one publisher by source IP and filtering by protocol
+  (Top-of-Book/Market-by-Order) and symbol. Decoding each frame through the real codecs
+  doubles as live-feed validation of the codec byte offsets.
+- Live two-publisher Top-of-Book BTC fixtures (`tests/fixtures/tob_btc_pub{A,B}.*`) for the
+  upcoming multi-publisher deduplication work; provenance and regeneration in
+  `tests/fixtures/PROVENANCE.md`.
+- `pcap2frames --combined-with <ip>`: emits one capture-ordered, source-IP-and-role-tagged stream
+  of two publishers (`tob_btc_dual.combined.bin`), preserving the real interleaving the
+  multi-publisher dedup must collapse.
+- `pcap2frames --symbol` is now repeatable (and the combined report tallies kept quote messages
+  per `(symbol, publisher)`), enabling a multi-symbol two-publisher fixture
+  (`tob_multi_dual.combined.bin`: BTC busy / SOL medium / DOGE quiet) that exercises the dedup's
+  per-`(venue, symbol)` independent windows.
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry
@@ -26,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `aws-actions/configure-aws-credentials` (v6.2.0). The `tokio-tungstenite`
   0.29 upgrade switched `Message::Text`/`Ping`/`Pong` payloads to
   `Utf8Bytes`/`Bytes`, updated in `src/sinks/ws.rs`.
+- Exposed the ingest pipeline, wire model, and sinks as a library (`src/lib.rs`); the binary
+  (`src/main.rs`) is now a thin wrapper, so dev tooling and tests can reuse the codecs.
 
 ### Fixed
 - Corrected inverted Market-by-Order order-book side constants (`0 = Bid`, `1 = Ask` per
