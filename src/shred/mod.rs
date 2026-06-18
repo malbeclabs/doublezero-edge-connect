@@ -53,6 +53,11 @@ const DROP_LOG_EVERY: u64 = 1000;
 /// than killing the receiver — and with it the whole process.
 const BIND_RETRY: Duration = Duration::from_secs(1);
 
+/// Per-receiver recv buffer length. Solana shreds are ~1232B plus headers, comfortably under this,
+/// so a datagram that exactly fills the buffer is treated as truncated/unexpected and dropped
+/// rather than forwarded corrupt (see [`receiver_task`]).
+const RECV_BUF_LEN: usize = 2048;
+
 /// One forwarded datagram: just the shred-bearing UDP payload bytes. (A small reuse pool is a
 /// possible later optimization; not needed now.)
 pub type ShredPacket = Vec<u8>;
@@ -153,7 +158,7 @@ async fn receiver_task(
 ) -> Result<()> {
     let group = *src.ip();
     let port = src.port();
-    let mut buf = vec![0u8; 2048];
+    let mut buf = vec![0u8; RECV_BUF_LEN];
 
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
@@ -243,7 +248,15 @@ async fn receiver_task(
 /// send and a slow destination sheds load globally (the bounded channel fills and receivers drop).
 /// That is fine for the intended use — a few **local unicast** destinations whose sends don't block
 /// — but don't point `--shred-forward` at a slow/remote sink. Each socket binds `0.0.0.0:0` and
-/// pins no egress interface, so destinations should be loopback/local, not off-box.
+/// pins no egress interface, so destinations should be loopback/local, not off-box (a non-loopback
+/// destination is warned about at startup, since it would route out the default interface).
+///
+/// Send-socket setup (bind + connect) is one-shot: a failure here returns `Err` and disables the
+/// shred forwarder for the rest of the process (main logs it and keeps the market-data bridge
+/// running — it is never fatal to the bridge). This is deliberate — binding `0.0.0.0:0` and a
+/// connectionless UDP `connect` essentially only fail on fd/memory exhaustion, which is better
+/// surfaced loudly than retried in a tight loop. Receiver *joins*, by contrast, do retry (a
+/// flapping multicast interface is an expected transient).
 async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAddr>) -> Result<()> {
     // Build one connected send socket per destination so ICMP errors can't cross destinations.
     // `connect` on a UDP socket only sets the default peer (no handshake), so it succeeds even for
@@ -251,6 +264,12 @@ async fn forwarder_task(mut rx: mpsc::Receiver<ShredPacket>, dests: Vec<SocketAd
     // own next `send`.
     let mut socks: Vec<(SocketAddr, UdpSocket)> = Vec::with_capacity(dests.len());
     for dst in &dests {
+        if !dst.ip().is_loopback() {
+            // The send sockets pin no egress interface, so a non-loopback target routes out the
+            // default interface (possibly the DZ tunnel) and forwards raw, unverified shreds
+            // off-box. Intended use is a local sink; warn loudly rather than silently relay.
+            warn!(%dst, "shred forward destination is not loopback; intended use is a local sink");
+        }
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
             .with_context(|| format!("binding shred forward send socket for {dst}"))?;
@@ -435,6 +454,12 @@ mod tests {
             sender.send_to(&[i as u8; 64], src).await.unwrap();
         }
 
+        // This asserts the guarantee that matters: the live destination receives all N despite the
+        // dead one ahead of it in the fan-out. It can't directly observe the dead socket's async
+        // ECONNREFUSED (which arrives out-of-band, possibly after the batch) — but with one
+        // connected socket per destination, that error is confined to the dead socket and cannot
+        // perturb this count regardless of when it lands. A regression to a shared socket would
+        // intermittently drop a live datagram here.
         assert_eq!(
             drain_count(&live).await,
             N,

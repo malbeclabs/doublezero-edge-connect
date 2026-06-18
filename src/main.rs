@@ -158,8 +158,17 @@ async fn main() -> Result<()> {
     };
 
     // Shred forwarder: activate-on-discovery. Runs iff an explicit `--shred-source` is given or
-    // discovery finds ≥1 `edge-solana-*` group; otherwise it stays off (no enable flag). Invalid
-    // source/destination addresses fail fast here, before anything is spawned.
+    // discovery finds ≥1 `edge-solana-*` group; otherwise it stays off (no enable flag).
+    //
+    // Validate the destinations first (pure parse, no I/O) so a `--shred-forward` typo fails fast
+    // before discovery shells out to the `doublezero` CLI.
+    //
+    // NOTE: source resolution is one-shot at startup. Discovery is not retried — if the
+    // `doublezero` CLI isn't ready yet at boot, or a group activates later, those groups are not
+    // picked up until the process restarts. This is consistent with the step-1 "activate-on-
+    // discovery" scope; periodic re-discovery is a follow-up. (Once a group IS resolved, its
+    // receiver survives interface flap via the rejoin watchdog.)
+    let shred_forward = shred::parse_forwards(&args.shred_forward)?;
     let shred_sources = shred::resolve_sources(
         &args.shred_sources,
         &args.shred_code_prefix,
@@ -173,7 +182,7 @@ async fn main() -> Result<()> {
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
             sources: shred_sources,
-            forward: shred::parse_forwards(&args.shred_forward)?,
+            forward: shred_forward,
         };
         info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
         Some(tokio::spawn(shred::run(shred_cfg)))

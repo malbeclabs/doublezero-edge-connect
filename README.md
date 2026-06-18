@@ -182,9 +182,16 @@ errors, or finds no matching group, the forwarder stays off. Pass `--shred-sourc
 | `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
 
 The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
-at startup. Shreds are loss-tolerant, so under forwarder backpressure the **newest** datagram is shed
-(with a periodic drop-count log) rather than blocking ingest. Discovery binds every matched group; a
-group this host isn't actually receiving on simply stays idle and periodically rejoins (harmless).
+at startup, and a non-loopback `--shred-forward` target is warned about (it would route raw,
+unverified shreds out the default interface, off-box). Shreds are loss-tolerant, so under forwarder
+backpressure the **newest** datagram is shed (with a periodic drop-count log) rather than blocking
+ingest. Discovery binds every matched group; a group this host isn't actually receiving on simply
+stays idle and periodically rejoins (harmless).
+
+Source resolution is **one-shot at startup**: if the `doublezero` CLI isn't ready when the bridge
+boots, or a group activates later, those groups aren't picked up until the process restarts (periodic
+re-discovery is a follow-up). Once a group is resolved, its receiver survives interface flap via the
+rejoin watchdog.
 
 ## Learn more
 
