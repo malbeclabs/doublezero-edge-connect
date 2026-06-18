@@ -18,7 +18,10 @@ use tokio::{sync::broadcast, task::JoinSet};
 use tracing::{info, warn};
 
 use doublezero_edge_connect::{ingest, model, shred, sinks};
-use ingest::feeds;
+use ingest::{
+    arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
+    feeds,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -144,6 +147,10 @@ async fn main() -> Result<()> {
     info!(feeds = ?enabled.iter().map(|f| f.venue).collect::<Vec<_>>(), "ingesting feeds");
 
     let (tx, _rx) = broadcast::channel::<model::FeedMessage>(args.ws_broadcast_capacity);
+    // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
+    // feeder) emits through this one instance, so cross-source duplicates collapse on one
+    // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
+    let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW)));
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
 
@@ -217,7 +224,7 @@ async fn main() -> Result<()> {
             *feed,
             args.iface.clone(),
             args.recv_buf,
-            tx.clone(),
+            arbiter.clone(),
             instruments.clone(),
             depth.clone(),
         ));

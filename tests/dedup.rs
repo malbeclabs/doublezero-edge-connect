@@ -13,6 +13,7 @@ mod common;
 
 use common::assertions;
 use doublezero_edge_connect::ingest::{
+    arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
     codec,
     processor::TobProcessor,
     receiver::{FrameCtx, FrameProcessor, PortRole},
@@ -43,18 +44,20 @@ fn read_combined(path: &str) -> Vec<(IpAddr, u8, Vec<u8>)> {
     out
 }
 
-/// Replay combined records through a single `TobProcessor` in capture order and collect the
-/// emitted WS messages as JSON. This is the production demux+dedup path: each record's source IP
-/// becomes `FrameCtx.publisher`, so the per-publisher SeqTracker and the cross-publisher dedup both
-/// run exactly as in the binary.
+/// Replay combined records through a single `TobProcessor` feeding the shared `Arbiter` in capture
+/// order and collect the emitted WS messages as JSON. This is the production demux+dedup path: each
+/// record's source IP becomes `FrameCtx.publisher`, so the per-publisher SeqTracker runs in the
+/// processor and the cross-publisher latch-to-leader floor + trade dedup run in the arbiter, exactly
+/// as in the binary (where the arbiter is the one process-wide emit stage).
 fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let (tx, mut rx) = broadcast::channel(1 << 16);
+    let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
     let mut p = TobProcessor::new(true);
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "Hyperliquid",
-            tx: &tx,
+            arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,

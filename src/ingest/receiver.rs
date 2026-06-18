@@ -25,7 +25,7 @@ use nix::sys::socket::{
     SockaddrStorage,
 };
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{io::unix::AsyncFd, sync::broadcast, time::timeout};
+use tokio::{io::unix::AsyncFd, time::timeout};
 use tracing::{info, warn};
 
 /// Re-join the multicast group(s) if no datagram arrives for this long. Guards against a join
@@ -39,6 +39,7 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 
 use crate::{
     ingest::{
+        arbiter::{Publisher, SharedArbiter},
         feeds::{Feed, FeedKind, FeedPorts},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
@@ -83,7 +84,8 @@ pub struct FrameCtx<'a> {
     /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
     /// venue ultimately comes from the `&'static` `FEEDS` registry.
     pub venue: &'static str,
-    pub tx: &'a broadcast::Sender<FeedMessage>,
+    /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
+    pub arbiter: &'a SharedArbiter,
     pub instruments: &'a InstrumentSnapshot,
     /// Kernel `SCM_TIMESTAMPNS` RX timestamp (CLOCK_REALTIME), or 0 if unavailable.
     pub kernel_rx_ts_ns: u64,
@@ -97,9 +99,21 @@ pub struct FrameCtx<'a> {
     pub publisher: IpAddr,
 }
 
+impl FrameCtx<'_> {
+    /// Emit a normalized message through the shared arbiter, tagged with this datagram's edge
+    /// publisher so the quote floor can race it against the other sources for the tick's leadership.
+    /// The brief critical section is the arbiter's admit-decision-plus-send.
+    pub fn emit(&self, msg: FeedMessage) {
+        self.arbiter
+            .lock()
+            .unwrap()
+            .emit(msg, Publisher::Edge(self.publisher));
+    }
+}
+
 /// Protocol-specific frame handling. Implementors own their decode (they know their frame magic
 /// and message set) and their persistent state (reference-data state machine, sequence trackers,
-/// book state, warn-once flags), and emit normalized `FeedMessage`s onto `ctx.tx`.
+/// book state, warn-once flags), and emit normalized `FeedMessage`s via `ctx.emit`.
 pub trait FrameProcessor {
     /// Decode and handle one received datagram. Errors are the processor's own concern (it logs
     /// and drops); the driver only deals with socket/transport errors.
@@ -109,13 +123,18 @@ pub trait FrameProcessor {
 /// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when the
 /// market-data multicast has gone silent past [`IDLE_REJOIN`], `"ok"` when it recovers. Consumers
 /// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
-fn emit_status(tx: &broadcast::Sender<FeedMessage>, venue: &str, state: &str, stale_ms: u64) {
-    let _ = tx.send(FeedMessage::Status(FeedStatus {
-        venue: venue.to_string(),
-        state: state.to_string(),
-        stale_ms,
-        ts_ns: now_ns(),
-    }));
+fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
+    // Status carries no business identity to dedup, so it goes straight to the broadcast sender.
+    let _ = arbiter
+        .lock()
+        .unwrap()
+        .sender()
+        .send(FeedMessage::Status(FeedStatus {
+            venue: venue.to_string(),
+            state: state.to_string(),
+            stale_ms,
+            ts_ns: now_ns(),
+        }));
 }
 
 /// Receive one datagram, returning `(len, kernel_rx_ns, user_recv_ns)`.
@@ -363,7 +382,7 @@ async fn drive<P: FrameProcessor>(
     iface: String,
     recv_buf: usize,
     venue: &'static str,
-    tx: broadcast::Sender<FeedMessage>,
+    arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     mut processor: P,
 ) -> Result<()> {
@@ -397,7 +416,7 @@ async fn drive<P: FrameProcessor>(
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 if !down {
-                    emit_status(&tx, venue, "down", last_mkt.elapsed().as_millis() as u64);
+                    emit_status(&arbiter, venue, "down", last_mkt.elapsed().as_millis() as u64);
                     down = true;
                 }
                 continue 'rejoin;
@@ -414,7 +433,7 @@ async fn drive<P: FrameProcessor>(
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         if !down {
-                            emit_status(&tx, venue, "down", last_mkt.elapsed().as_millis() as u64);
+                            emit_status(&arbiter, venue, "down", last_mkt.elapsed().as_millis() as u64);
                             down = true;
                         }
                         continue 'rejoin;
@@ -425,14 +444,14 @@ async fn drive<P: FrameProcessor>(
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
                 if down {
-                    emit_status(&tx, venue, "ok", 0);
+                    emit_status(&arbiter, venue, "ok", 0);
                     down = false;
                 }
             }
 
             let ctx = FrameCtx {
                 venue,
-                tx: &tx,
+                arbiter: &arbiter,
                 instruments: &instruments,
                 kernel_rx_ts_ns: kernel_ns,
                 recv_ts_ns: recv_ns,
@@ -463,7 +482,7 @@ pub async fn run_feed(
     feed: Feed,
     iface: String,
     recv_buf: usize,
-    tx: broadcast::Sender<FeedMessage>,
+    arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
 ) -> Result<()> {
@@ -477,7 +496,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
-                tx,
+                arbiter,
                 instruments,
                 TobProcessor::new(feed.emit_trades),
             )
@@ -491,7 +510,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
-                tx,
+                arbiter,
                 instruments,
                 MidpointProcessor::new(),
             )
@@ -517,7 +536,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
-                tx,
+                arbiter,
                 instruments,
                 MboProcessor::new(depth, feed.emit_trades),
             )

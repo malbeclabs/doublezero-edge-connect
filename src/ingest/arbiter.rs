@@ -1,12 +1,16 @@
-//! Multi-publisher output dedup primitives.
+//! Shared pre-broadcast arbiter: the single emit stage every ingest source funnels through.
 //!
-//! When several independent publishers mirror the same feed, the bridge demultiplexes them by
-//! source IP (so each publisher's frame-sequence state stays separate — see `receiver`/`processor`)
-//! but deduplicates the *output*, so a subscriber sees a clean stream regardless of which publisher
-//! delivered a given update first. These primitives are keyed on business identity and therefore
-//! operate on the merged stream — they need no per-publisher demux themselves.
+//! When several independent sources mirror the same feed — the multicast edge publishers
+//! (demultiplexed by source IP so each one's frame-sequence state stays separate, see
+//! `receiver`/`processor`) **and** the Hyperliquid public WebSocket feeder ([`crate::ingest::ws_feeder`])
+//! — they all converge on one [`Arbiter`] just before the broadcast channel. The arbiter deduplicates
+//! the *output* keyed on business identity, so a subscriber sees a clean stream regardless of which
+//! source delivered a given update first. Because every source races through the **same** per-`(venue,
+//! symbol)` floor, a public-feed copy of an update the edge already emitted collapses into a no-op —
+//! and when the edge gaps, the public copy is the first to cross the floor and fills in (the backstop,
+//! with no health check; see [`Publisher`]).
 //!
-//! Two primitives, by message semantics:
+//! Two dedup primitives, by message semantics:
 //! - quotes ([`StalenessFloor`]): a full-state BBO is a *snapshot*, but two distinct BBOs can share
 //!   a `source_ts` (the venue stamps coarsely — block-granular — while the book changes faster), so
 //!   one `source_ts` "tick" holds a whole sub-sequence of real top-of-book changes. The catch: the
@@ -26,7 +30,62 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
+    net::IpAddr,
+    sync::{Arc, Mutex},
 };
+
+use tokio::sync::broadcast;
+
+use crate::model::{FeedMessage, NormalizedQuote};
+
+/// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
+/// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
+pub const TRADE_DEDUP_WINDOW: usize = 8192;
+
+/// Which ingest source produced an update — the floor's per-tick leader identity. The edge
+/// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
+/// a single logical source with no multicast IP. Two distinct edge publishers therefore race as
+/// distinct leaders, while the public feed always races as one [`Publisher::PublicWs`].
+///
+/// The backstop falls out of this: the edge publishers deliver each `source_ts` tick sub-millisecond
+/// while the public copy arrives tens of milliseconds later over the internet, so an edge publisher
+/// essentially always opens (leads) a tick and the public copy at that tick is dropped as a
+/// non-leader no-op. When the edge feed gaps, no edge publisher opens the next tick, so the public
+/// feed's sample is the first to cross the floor — it leads and fills in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Publisher {
+    /// A DZ Edge multicast publisher, identified by its datagram source IP.
+    Edge(IpAddr),
+    /// The Hyperliquid public WebSocket feeder (a single logical source).
+    PublicWs,
+}
+
+/// The business identity of a quote at a `source_ts` tick: the normalized top-of-book `f64`s, as
+/// raw bit patterns so they are `Eq`/`Hash`. EXCLUDES `source_ts` (the floor tracks that
+/// separately). Two quotes from the *same* source with identical BBO `f64`s at the same `source_ts`
+/// are a true republish; the floor never compares one source's content against another's (a
+/// non-leader loses on identity before its content is consulted), so cross-source bit-equality is
+/// neither required nor relied upon. A precision change is captured implicitly: the scaled `f64`
+/// differs, so the bits differ and the quotes don't false-dedup.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuoteId {
+    bid: u64,
+    ask: u64,
+    bid_size: u64,
+    ask_size: u64,
+}
+
+impl QuoteId {
+    /// The content identity of a normalized quote (its four BBO `f64`s as bits).
+    pub fn of(q: &NormalizedQuote) -> Self {
+        Self {
+            bid: q.bid.to_bits(),
+            ask: q.ask.to_bits(),
+            bid_size: q.bid_size.to_bits(),
+            ask_size: q.ask_size.to_bits(),
+        }
+    }
+}
 
 /// Per-key **latch-to-leader** floor on `source_ts`. Tracks, per key, the highest `source_ts`
 /// emitted, the *leader* publisher latched for that tick, and the set of distinct content the leader
@@ -155,6 +214,66 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy> WindowedDedup<K, V> {
     }
 }
 
+/// The shared emit stage: owns the broadcast `Sender` plus the dedup state, and exposes one
+/// `emit(msg, publisher)` entry point every ingest source funnels through. Quotes pass through the
+/// per-`(venue, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Publisher`),
+/// trades through the [`WindowedDedup`] on `trade_id`, and everything else
+/// (`Instrument`/`Midpoint`/`Depth`/`Status`) is broadcast unchanged. Wrapped in
+/// [`SharedArbiter`] so the multicast receiver tasks and the WS feeder share one instance — hence one
+/// floor per `(venue, symbol)`, on which all sources race.
+pub struct Arbiter {
+    tx: broadcast::Sender<FeedMessage>,
+    quotes: StalenessFloor<(String, String), QuoteId, Publisher>,
+    trades: WindowedDedup<(String, String), u64>,
+}
+
+impl Arbiter {
+    pub fn new(tx: broadcast::Sender<FeedMessage>, trade_window: usize) -> Self {
+        Self {
+            tx,
+            quotes: StalenessFloor::new(),
+            trades: WindowedDedup::new(trade_window),
+        }
+    }
+
+    /// The broadcast sender, so output sinks can `subscribe()` and `Status` can be sent directly
+    /// (it carries no business identity to dedup).
+    pub fn sender(&self) -> &broadcast::Sender<FeedMessage> {
+        &self.tx
+    }
+
+    /// Apply the appropriate dedup and broadcast if the message survives it. `publisher` is the
+    /// source racing for the quote floor's per-tick leadership; it is ignored for non-quote
+    /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
+    /// update dropped by a slow per-client channel is unrecoverable regardless.
+    pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
+        match &msg {
+            FeedMessage::Quote(q) => {
+                let key = (q.venue.clone(), q.symbol.clone());
+                if self
+                    .quotes
+                    .admit(key, q.source_ts_ns, QuoteId::of(q), publisher)
+                {
+                    let _ = self.tx.send(msg);
+                }
+            }
+            FeedMessage::Trade(t) => {
+                let key = (t.venue.clone(), t.symbol.clone());
+                if self.trades.is_new(key, t.trade_id) {
+                    let _ = self.tx.send(msg);
+                }
+            }
+            _ => {
+                let _ = self.tx.send(msg);
+            }
+        }
+    }
+}
+
+/// Process-wide handle to the one [`Arbiter`]: every multicast receiver task and the WS feeder hold
+/// a clone and lock it for the brief admit-decision-plus-send critical section.
+pub type SharedArbiter = Arc<Mutex<Arbiter>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +359,106 @@ mod tests {
         assert!(d.is_new("BTC", 2));
         assert!(d.is_new("BTC", 3)); // window {2,3}; id 1 evicted
         assert!(d.is_new("BTC", 1)); // 1 fell out of the window -> treated as new
+    }
+
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::model::NormalizedQuote;
+
+    fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
+        NormalizedQuote {
+            venue: "Hyperliquid".to_string(),
+            symbol: "BTC".to_string(),
+            bid,
+            ask,
+            bid_size: 1.0,
+            ask_size: 2.0,
+            source_ts_ns,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// Drain every emitted quote's `(source_ts, bid)` from a receiver.
+    fn drain_quotes(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<(u64, f64)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Quote(q) = m {
+                out.push((q.source_ts_ns, q.bid));
+            }
+        }
+        out
+    }
+
+    /// `QuoteId` distinguishes distinct BBOs and equates identical ones, so the floor drops a
+    /// source's own exact `(source_ts, content)` republish through the arbiter's emit path.
+    #[test]
+    fn arbiter_emit_drops_same_source_exact_repeat() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // exact repeat -> dropped
+        a.emit(FeedMessage::Quote(quote(1000, 100.5, 101.0)), edge); // new content same tick -> kept
+        assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1000, 100.5)]);
+    }
+
+    /// The backstop in miniature: with the edge publisher leading a tick, the public WS copy of the
+    /// same `source_ts` loses the race and is dropped as a non-leader no-op — even though its content
+    /// (here) differs. When the edge gaps (no edge sample opens the next tick), the public copy is
+    /// the first to cross the floor and is emitted.
+    #[test]
+    fn arbiter_public_loses_to_edge_then_fills_gap() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        // Steady state: edge opens tick 1000, public's copy at the same tick is dropped.
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            Publisher::PublicWs,
+        );
+        // Edge gaps: the public feed opens the next tick and fills in.
+        a.emit(
+            FeedMessage::Quote(quote(1001, 100.2, 101.2)),
+            Publisher::PublicWs,
+        );
+        assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1001, 100.2)]);
+    }
+
+    /// Trades dedup by `trade_id` through the arbiter regardless of which source delivered them, so
+    /// a public copy of an edge trade is a no-op.
+    #[test]
+    fn arbiter_trade_dedup_across_sources() {
+        use crate::model::NormalizedTrade;
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let trade = |id: u64| {
+            FeedMessage::Trade(NormalizedTrade {
+                venue: "Hyperliquid".to_string(),
+                symbol: "BTC".to_string(),
+                price: 100.0,
+                size: 1.0,
+                aggressor_side: "buy".to_string(),
+                trade_id: id,
+                cumulative_volume: 0.0,
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(trade(7), edge);
+        a.emit(trade(7), Publisher::PublicWs); // same id from public -> dropped
+        a.emit(trade(8), Publisher::PublicWs);
+        let mut ids = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Trade(t) = m {
+                ids.push(t.trade_id);
+            }
+        }
+        assert_eq!(ids, vec![7, 8]);
     }
 }
