@@ -84,11 +84,17 @@ updates: each independently samples/coalesces the BBO, so within the shared wind
 BTC quotes and pub B emits 4669, and only ~370 (~9%) share an identical `source_ts`. When they DO
 coincide the content matches (369/370 agree on the full bid/ask/size tuple), but coincidence is
 under a tenth of each stream. So these exercise **real independent-publisher dedup** — merge two
-samplings of one book and emit each distinct top-of-book change once (fastest publisher wins) — NOT
-a "mirror collapse to one stream"; the publishers are not mirrors and the deduped count does **not**
-approach a single publisher's. A dedup test on these must assert both that overlapping content
-collapses (the ~369 coincident tuples emit once) AND that genuinely distinct samples pass through —
-not that the count halves.
+samplings of one book — NOT a "mirror collapse to one stream"; the publishers are not mirrors.
+Quotes dedup by a per-`(venue, symbol)` `source_ts` staleness floor keyed on raw BBO content: it
+keeps every distinct top-of-book change at the newest `source_ts` — including multiple distinct BBOs
+that share a `source_ts`, which are real intra-tick updates (this matches the `hl-bbo-feed-race`
+board's `(symbol, source_ts, bbo_hash)` identity) — but drops a lagging publisher's strictly-older
+BBO (stale: the market moved on) and any exact `(source_ts, content)` duplicate. Because the two
+publishers interleave, the laggard's older-tick replays are dropped, so the deduped count falls
+between the raw count and the much smaller per-tick count a strict high-watermark would keep (the
+watermark over-drops: it discards real intra-tick BBO changes, not just stale replays). A dedup test
+on these must assert no business duplicates AND that emitted `source_ts` is **non-decreasing** (not
+strictly increasing) per `(venue, symbol)`.
 
 Both are `BTC` (instrument_id 0), windowed to the first 40s of the capture. The window is ≥~35s on
 purpose: the exact-`BTC` definition re-sends on a ~30s round-robin (786 instruments, ~3144
@@ -128,9 +134,10 @@ record format `tests/common/replay.rs` replays.
 ### `tob_btc_dual.combined.bin` — interleaved two-publisher golden
 
 `tob_btc_pubA`/`tob_btc_pubB` are *separate* per-publisher captures; replaying them back-to-back
-does **not** reproduce the real wire, where the two publishers' copies of each update arrive
-**interleaved**. The multi-publisher dedup collapses *adjacent* duplicates, so the dedup test needs
-the real interleaving. `tob_btc_dual.combined.bin` is that: both publishers' refdata +
+does **not** reproduce the real wire, where the two publishers' samples arrive **interleaved**. The
+quote staleness floor drops a sample only when its `source_ts` is strictly older than the floor, so
+its behavior depends on the real interleaving (a laggard's sample is stale only relative to whatever
+the leader has already advanced past); the dedup test needs that ordering. `tob_btc_dual.combined.bin` is that: both publishers' refdata +
 BTC-filtered mktdata in **capture order**, each record tagged `[u32 LE len][4B src_ip][1B role:
 0=refdata,1=mktdata][frame]` (note the extra `src_ip`/`role` prefix — this is NOT the plain
 `split_frames` format; the dedup test has its own reader). 235 refdata + 9330 mktdata frames, 0
@@ -145,8 +152,8 @@ cargo run --example pcap2frames -- tyo_tob.pcap \
 ### `tob_multi_dual.combined.bin` — multi-symbol two-publisher golden
 
 `tob_btc_dual.combined.bin` is BTC-only. The dedup is keyed per `(venue, symbol)` with an
-**independent window per symbol**, so a single-symbol fixture cannot prove that one symbol's volume
-does not perturb another's dedup. `tob_multi_dual.combined.bin` is the multi-symbol counterpart:
+**independent staleness floor per symbol**, so a single-symbol fixture cannot prove that one symbol's
+volume does not perturb another's dedup. `tob_multi_dual.combined.bin` is the multi-symbol counterpart:
 the same two publishers, same 40s window and same record format, but carrying three symbols spanning
 a volume spread — **BTC** (busy), **SOL** (medium) and **DOGE** (quiet). 235 refdata + 12940 mktdata
 frames, 0 decode errors, ~1.4 MB.

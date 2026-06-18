@@ -138,10 +138,16 @@ async fn tob_single_publisher_contract() {
     assertions::quotes_well_formed(&msgs);
     assertions::trades_well_formed(&msgs);
 
-    let quote_count = ws_client::by_type(&msgs, "quote").len();
-    // Baseline assumes no republish-suppression (BBO content-dedup). Whoever lands dedup (#3)
-    // must re-pin this deliberately; the "regressed" message is only correct under that assumption.
-    assert_eq!(quote_count, 41, "TOB quote count regressed");
+    let quotes = ws_client::by_type(&msgs, "quote");
+    // The quote dedup is a per-(venue, symbol) source_ts staleness floor keyed on raw BBO content: it
+    // keeps every distinct (source_ts, content) at a non-decreasing floor and drops only strictly-
+    // older replays and exact duplicates. A single publisher delivers each of its samples once with
+    // non-decreasing source_ts, so none are stale and none are exact duplicates — all 41 are emitted.
+    assert_eq!(
+        quotes.len(),
+        41,
+        "TOB single-publisher quote count under the source_ts staleness floor (no stale replays or exact dupes from one publisher, so all 41 distinct samples emit)"
+    );
 }
 
 #[test]

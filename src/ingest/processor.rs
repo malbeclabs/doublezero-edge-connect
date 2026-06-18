@@ -7,12 +7,16 @@
 //! - [`MboProcessor`] - Market-by-Order (`codec_mbo`, magic `0x4444`): reconstructs the L3 book
 //!   in [`crate::ingest::book`] and re-serves it as full-state `depth` + `trade`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::IpAddr,
+};
 
 use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
+        arbiter::{StalenessFloor, WindowedDedup},
         book::{BookState, DeltaKind, DeltaOp},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -30,6 +34,37 @@ use crate::{
 
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
+
+/// Recent trade IDs remembered per (venue, symbol) for cross-publisher trade dedup. Const for now;
+/// promote to config alongside the multi-publisher trade test that can size it.
+const TRADE_DEDUP_WINDOW: usize = 8192;
+
+/// Cap on distinct leader BBOs tracked per `source_ts` tick by the quote floor — a safety bound so a
+/// stalled/repeated `source_ts` can't grow the per-tick set without limit. Far above the real
+/// per-block max (~hundreds of distinct BBOs share one HL block timestamp), so it never evicts in
+/// normal operation.
+const QUOTE_TICK_CAP: usize = 8192;
+
+/// The canonical top-of-book identity of a quote, used as the per-tick content key for the quote
+/// dedup floor — the components of the spec's `bbo_hash` (`malbeclabs/hyperliquid`
+/// `StableBBOHash`): raw bid/ask price + size, the source counts `bid_n`/`ask_n` (a change in the
+/// number of orders/sources at the top is a distinct BBO), **plus the instrument exponents**, and
+/// EXCLUDES `source_ts` (tracked separately by the floor). Exponents are carried so a
+/// registry/precision change can't false-dedup; within one Edge feed they are constant, so the
+/// spec's `-8/-8` canonicalization is a no-op here and is deferred to the cross-feed path (PR #32,
+/// Edge vs public WS). Identical content at the same `source_ts` — a republish or the other
+/// publisher's copy — is a true duplicate.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct QuoteContent {
+    bid_price_raw: i64,
+    bid_qty_raw: u64,
+    ask_price_raw: i64,
+    ask_qty_raw: u64,
+    bid_n: u16,
+    ask_n: u16,
+    price_exponent: i8,
+    qty_exponent: i8,
+}
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
@@ -60,25 +95,70 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 /// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote frames.
 pub struct TobProcessor {
     state: RefDataState<InstrumentDefinition>,
-    /// Per-channel frame sequence tracker, used to drop stale/out-of-order quote frames.
-    seq: SeqTracker,
+    /// Per-publisher, per-channel frame sequence tracker. Independent publishers mirror this feed
+    /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
+    /// frames stale and drop them before dedup; keying by source IP keeps each publisher's sequence
+    /// state separate.
+    seq: HashMap<IpAddr, SeqTracker>,
     /// Log the manifest `Valid=0` publisher workaround once, not on every (~1/s) manifest.
     warned_invalid_manifest: bool,
     /// Log an unregistered quote SourceID once, not on every quote.
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
+    /// Cross-publisher quote dedup: a per-(venue, symbol) `source_ts` latch-to-leader floor keyed on
+    /// raw BBO content and the source IP. Within one `source_ts` tick it emits only the leader (first
+    /// publisher to open the tick) and drops other publishers' samples, because arrival order across
+    /// delayed publishers can't be trusted (a slower publisher's older sample landing last would read
+    /// as a phantom change). Drops a strictly-older BBO (stale laggard) and the leader's exact
+    /// `(source_ts, content)` repeats. Output `source_ts` is non-decreasing per (venue, symbol).
+    quote_dedup: StalenessFloor<(&'static str, u32), QuoteContent, IpAddr>,
+    /// Cross-publisher trade dedup by venue trade_id per (venue, instrument).
+    trade_dedup: WindowedDedup<(&'static str, u32), u64>,
 }
 
 impl TobProcessor {
     pub fn new(emit_trades: bool) -> Self {
         Self {
             state: RefDataState::new(),
-            seq: SeqTracker::default(),
+            seq: HashMap::new(),
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
+            quote_dedup: StalenessFloor::new(QUOTE_TICK_CAP),
+            trade_dedup: WindowedDedup::new(TRADE_DEDUP_WINDOW),
         }
+    }
+
+    /// Whether this quote should be forwarded under the per-(venue, instrument) latch-to-leader floor:
+    /// true if `source_ts` is at or beyond the floor AND (it opens a new tick, or `publisher` is the
+    /// tick's latched leader and the `content` is new). Drops strictly-older (stale laggard) BBOs,
+    /// non-leader samples within a tick, and the leader's exact `(source_ts, content)` repeats.
+    ///
+    /// `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real time): such a
+    /// quote bypasses the floor and is always forwarded. Routing it through the floor would pin
+    /// `high_water` at 0 and drop every non-leader publisher forever — defeating the failover. The
+    /// key is `(venue, instrument_id)` — both `Copy`, so no per-quote allocation; `venue` is the
+    /// publisher-independent *resolved* venue (NOT `source_id`, which differs per publisher), so
+    /// mirrors of one feed still dedup against each other.
+    fn admit_quote(
+        &mut self,
+        venue: &'static str,
+        instrument_id: u32,
+        source_ts: u64,
+        content: QuoteContent,
+        publisher: IpAddr,
+    ) -> bool {
+        if source_ts == 0 {
+            return true;
+        }
+        self.quote_dedup
+            .admit((venue, instrument_id), source_ts, content, publisher)
+    }
+
+    /// Whether this trade should be forwarded: false if its trade_id was seen recently.
+    fn admit_trade(&mut self, venue: &'static str, instrument_id: u32, trade_id: u64) -> bool {
+        self.trade_dedup.is_new((venue, instrument_id), trade_id)
     }
 }
 
@@ -106,10 +186,11 @@ impl FrameProcessor for TobProcessor {
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
         let quotes_fresh = if handle_quotes {
-            match self
-                .seq
-                .check(header.channel_id, header.reset_count, header.sequence)
-            {
+            match self.seq.entry(ctx.publisher).or_default().check(
+                header.channel_id,
+                header.reset_count,
+                header.sequence,
+            ) {
                 SeqCheck::Stale => {
                     debug!(
                         venue = ctx.venue,
@@ -207,23 +288,52 @@ impl FrameProcessor for TobProcessor {
                             );
                         }
                     }
+                    // Venue is the wire SourceID's registered venue (2 -> Phoenix); anything
+                    // unregistered (the source_id 3 Hyperliquid superset incl. HIP-3 builder DEXs)
+                    // falls back to the feed default (Hyperliquid). So venues are exactly
+                    // Hyperliquid + Phoenix; the builder DEX, if any, stays in the symbol. Resolved
+                    // once as `&'static str` so the dedup key is allocation-free, and it is
+                    // publisher-independent (mirrors share a venue) so they dedup against each other.
+                    let venue: &'static str = source_name(q.source_id).unwrap_or(ctx.venue);
                     let quote = NormalizedQuote {
-                        // Venue is the wire SourceID's registered venue (2 -> Phoenix); anything
-                        // unregistered (the source_id 3 Hyperliquid superset incl. HIP-3 builder
-                        // DEXs) falls back to the feed default (Hyperliquid). So venues are exactly
-                        // Hyperliquid + Phoenix; the builder DEX, if any, stays in the symbol.
-                        venue: source_name(q.source_id).unwrap_or(ctx.venue).to_string(),
+                        venue: venue.to_string(),
                         symbol: def.symbol.clone(),
                         bid: apply_exponent(q.bid_price_raw, def.price_exponent),
                         ask: apply_exponent(q.ask_price_raw, def.price_exponent),
                         bid_size: apply_exponent(q.bid_qty_raw as i64, def.qty_exponent),
                         ask_size: apply_exponent(q.ask_qty_raw as i64, def.qty_exponent),
+                        bid_n: q.bid_n,
+                        ask_n: q.ask_n,
                         source_ts_ns: q.source_ts,
                         recv_ts_ns: ctx.recv_ts_ns,
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    let _ = ctx.tx.send(FeedMessage::Quote(quote));
+                    // Cross-publisher dedup on a per-(venue, instrument) source_ts latch-to-leader
+                    // floor: within one source_ts tick only the leader (first publisher to open it)
+                    // is emitted — a slower publisher's samples at the same tick arrive in a
+                    // delay-corrupted order and can't be trusted, so they are dropped. A strictly-
+                    // older sample (stale laggard) and the leader's exact (source_ts, content)
+                    // repeats are dropped too. Output source_ts is non-decreasing per instrument.
+                    let content = QuoteContent {
+                        bid_price_raw: q.bid_price_raw,
+                        bid_qty_raw: q.bid_qty_raw,
+                        ask_price_raw: q.ask_price_raw,
+                        ask_qty_raw: q.ask_qty_raw,
+                        bid_n: q.bid_n,
+                        ask_n: q.ask_n,
+                        price_exponent: def.price_exponent,
+                        qty_exponent: def.qty_exponent,
+                    };
+                    if self.admit_quote(
+                        venue,
+                        q.instrument_id,
+                        quote.source_ts_ns,
+                        content,
+                        ctx.publisher,
+                    ) {
+                        let _ = ctx.tx.send(FeedMessage::Quote(quote));
+                    }
                 }
                 Message::Trade(t) if handle_quotes && quotes_fresh => {
                     // Same per-instrument precision gate as quotes: a trade is dropped until we
@@ -231,8 +341,9 @@ impl FrameProcessor for TobProcessor {
                     let Some(def) = self.state.definition(t.instrument_id) else {
                         continue;
                     };
+                    let venue: &'static str = source_name(t.source_id).unwrap_or(ctx.venue);
                     let trade = NormalizedTrade {
-                        venue: source_name(t.source_id).unwrap_or(ctx.venue).to_string(),
+                        venue: venue.to_string(),
                         symbol: def.symbol.clone(),
                         price: apply_exponent(t.trade_price_raw, def.price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, def.qty_exponent),
@@ -247,7 +358,8 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    if self.emit_trades {
+                    if self.emit_trades && self.admit_trade(venue, t.instrument_id, trade.trade_id)
+                    {
                         let _ = ctx.tx.send(FeedMessage::Trade(trade));
                     }
                 }
@@ -630,7 +742,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor};
+    use super::{upsert_instrument, MboProcessor, QuoteContent, TobProcessor};
     use crate::{
         ingest::{
             codec_mbo::{
@@ -642,6 +754,57 @@ mod tests {
         },
         model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
     };
+
+    #[test]
+    fn tob_quote_dedup_latches_to_leader() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let (a, b) = (
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        );
+        let mut p = TobProcessor::new(true);
+        let (btc, eth) = (0u32, 1u32); // instrument ids
+                                       // Two distinct BBO contents that can share a source_ts (a real intra-tick change).
+        let c1 = QuoteContent {
+            bid_price_raw: 100,
+            bid_qty_raw: 5,
+            ask_price_raw: 101,
+            ask_qty_raw: 8,
+            bid_n: 1,
+            ask_n: 1,
+            price_exponent: -2,
+            qty_exponent: 0,
+        };
+        let c2 = QuoteContent {
+            bid_price_raw: 100,
+            bid_qty_raw: 6, // bid size changed
+            ..c1
+        };
+        // Same px/sz as c1 but a different source count -> a distinct BBO (matches bbo_hash).
+        let c1_n = QuoteContent { bid_n: 2, ..c1 };
+        // Per-(venue, instrument) latch-to-leader floor.
+        assert!(p.admit_quote("Hyperliquid", btc, 1000, c1, a)); // first sample -> A leads the tick
+        assert!(!p.admit_quote("Hyperliquid", btc, 1000, c1, a)); // A's exact (ts, content) dup dropped
+        assert!(p.admit_quote("Hyperliquid", btc, 1000, c2, a)); // A's new content at SAME tick kept
+        assert!(p.admit_quote("Hyperliquid", btc, 1000, c1_n, a)); // px/sz of c1 but new bid_n -> kept
+        assert!(!p.admit_quote("Hyperliquid", btc, 1000, c2, b)); // B at same tick -> dropped (latch to A)
+        assert!(!p.admit_quote("Hyperliquid", btc, 999, c1, a)); // strictly older (stale) dropped
+        assert!(p.admit_quote("Hyperliquid", btc, 2000, c1, b)); // new tick: B opens it -> B leads, emit
+        assert!(p.admit_quote("Hyperliquid", eth, 1000, c1, a)); // independent instrument's floor
+                                                                 // source_ts == 0 is the "not available" sentinel: bypass the floor, always forward (never
+                                                                 // latch/pin), so a 0-stamping feed can't wedge non-leaders.
+        assert!(p.admit_quote("Hyperliquid", btc, 0, c1, a));
+        assert!(p.admit_quote("Hyperliquid", btc, 0, c1, b)); // both publishers forwarded at ts=0
+    }
+
+    #[test]
+    fn tob_trade_dedup_drops_repeat() {
+        let mut p = TobProcessor::new(true);
+        let btc = 0u32;
+        assert!(p.admit_trade("Hyperliquid", btc, 7));
+        assert!(!p.admit_trade("Hyperliquid", btc, 7));
+        assert!(p.admit_trade("Hyperliquid", btc, 8));
+    }
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
     ///
@@ -696,6 +859,7 @@ mod tests {
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,
             role,
+            publisher: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         }
     }
 

@@ -76,7 +76,7 @@ to rescale integers.
 
 ```json
 {"type":"quote","venue":"Hyperliquid","symbol":"SOL",
- "bid":184.20,"ask":184.21,"bid_size":12.5,"ask_size":8.0,
+ "bid":184.20,"ask":184.21,"bid_size":12.5,"ask_size":8.0,"bid_n":3,"ask_n":2,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
 ```
@@ -90,6 +90,8 @@ to rescale integers.
 | `ask`             | number  | Best ask price (decimal).                                               |
 | `bid_size`        | number  | Size at best bid (decimal).                                             |
 | `ask_size`        | number  | Size at best ask (decimal).                                             |
+| `bid_n`           | uint16  | Orders/sources at best bid (`0` if the venue does not report it). Part of the top-of-book identity: a change here is a distinct quote even at an unchanged price/size. |
+| `ask_n`           | uint16  | Orders/sources at best ask (`0` if unavailable).                        |
 | `source_ts_ns`    | uint64  | Venue/source timestamp, ns since Unix epoch. `0` if unknown.            |
 | `recv_ts_ns`      | uint64  | Producer user-space receive time (after decode), ns since epoch.        |
 | `kernel_rx_ts_ns` | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`, `CLOCK_REALTIME`) captured in the driver softirq, before user space. `0` if unavailable. |

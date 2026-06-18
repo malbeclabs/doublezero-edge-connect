@@ -56,6 +56,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per `(symbol, publisher)`), enabling a multi-symbol two-publisher fixture
   (`tob_multi_dual.combined.bin`: BTC busy / SOL medium / DOGE quiet) that exercises the dedup's
   per-`(venue, symbol)` independent windows.
+- Multi-publisher Top-of-Book deduplication: when several independent publishers mirror one feed
+  onto a multicast group, the bridge merges them into one clean stream. Datagrams are demultiplexed
+  by source IP (`FrameCtx.publisher`); the frame-sequence tracker is per-publisher so a slower
+  publisher's frames aren't dropped before dedup. Quotes dedup on a per-`(venue, instrument)`
+  `source_ts` latch-to-leader floor keyed on the **canonical BBO identity** (the components of the
+  spec's `bbo_hash`: bid/ask price + size + the `bid_n`/`ask_n` source counts): within one `source_ts`
+  tick (the venue stamps coarsely, so a tick holds a whole sub-sequence of real top-of-book changes)
+  it emits only the *leader* — the first publisher to open the tick — and drops other publishers'
+  samples at that `source_ts`. This is because arrival order across publishers is corrupted by
+  per-publisher network delay (the `hl-bbo-feed-race` board shows inter-feed skew over 100 ms), so
+  interleaving two sources inside one tick can serve a stale sample as the freshest — on a falling
+  price, a slower publisher's older, higher sample landing last would read as a phantom uptick. The
+  leader is re-selected each new tick, so the lowest-delay publisher for a given moment naturally wins.
+  A strictly-older BBO (stale laggard) and the leader's exact `(source_ts, content)` repeats are
+  dropped too, so the emitted `source_ts` is non-decreasing (not strictly increasing) per instrument
+  and within a tick the series is one publisher's coherent, in-order subsequence. `source_ts == 0`
+  (the "not available" sentinel) bypasses the floor (always forwarded, never latched) so a feed that
+  stops stamping time can't wedge non-leaders, and the per-tick content set is capacity-bounded so a
+  stalled `source_ts` can't grow it without limit. The dedup key is allocation-free on the hot path
+  (`(&'static venue, instrument_id)`). Trades, being point-in-time events, dedup on a windowed
+  `(venue, instrument, trade_id)` identity so every distinct print is kept. (Market-by-Order depth
+  dedup is tracked separately.)
+- Top-of-Book `quote` messages now carry `bid_n`/`ask_n` (the edge-feed-spec "Bid/Ask Source Count":
+  orders/sources at the best bid/ask, `0` if unavailable). They were decoded-and-discarded before;
+  now decoded, re-served on the WebSocket (additive, forward-compatible — see PROTOCOL.md), and part
+  of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry
