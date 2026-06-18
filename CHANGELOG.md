@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `aws-actions/configure-aws-credentials` (v6.2.0). The `tokio-tungstenite`
   0.29 upgrade switched `Message::Text`/`Ping`/`Pong` payloads to
   `Utf8Bytes`/`Bytes`, updated in `src/sinks/ws.rs`.
-- Added support for graceful termination and calling `doublezero disconnect`
+- Graceful container shutdown runs `doublezero disconnect` to free the access-pass session,
+  but only on an operator `docker stop` (TERM/INT) and only when a tunnel is actually up —
+  so a bridge crash under `--restart unless-stopped` no longer releases the session. The
+  disconnect is wrapped in a `timeout` so a wedged daemon can't consume the whole stop budget.
 
 ### Fixed
 - Corrected inverted Market-by-Order order-book side constants (`0 = Bid`, `1 = Ask` per

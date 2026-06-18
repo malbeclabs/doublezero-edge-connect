@@ -299,12 +299,7 @@ EXEC_TTY=""; [ -t 1 ] && EXEC_TTY="-t"
 # user onchain for $DZ_ENV. If this errors with an access-pass message, that
 # provisioning step still needs to happen. Once the tunnel is up, the bridge
 # self-heals onto the doublezero1 interface within ~30s and quotes begin flowing.
-if $SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast; then
-  # Record success so the container disconnects cleanly on shutdown (see docker-entrypoint.sh).
-  $SUDO docker exec "$DZ_NAME" touch /run/doublezerod/connected 2>/dev/null || true
-else
-  warn "connect failed (often: no access pass for this IP, or provider firewall/NAT). See notes above."
-fi
+$SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast || warn "connect failed (often: no access pass for this IP, or provider firewall/NAT). See notes above."
 
 # ----------------------------------------------------------------------------
 # 8. status + management hints

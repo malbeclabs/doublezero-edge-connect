@@ -14,10 +14,6 @@ set -euo pipefail
 
 BASE_ENTRYPOINT=/usr/local/bin/docker-entrypoint.sh
 DZ_SOCK="${DZ_SOCK:-/run/doublezerod/doublezerod.sock}"
-# Marker the installer touches only after `doublezero connect multicast` exits 0
-# (see scripts/connect*.sh). Its presence is how we know there's a tunnel worth
-# tearing down on shutdown — disconnect runs only when it exists.
-DZ_CONNECT_MARKER="${DZ_CONNECT_MARKER:-/run/doublezerod/connected}"
 
 # Run the base entrypoint with no args: it starts doublezerod, writes the CLI
 # config, prints `doublezero status`, then `wait`s on the daemon (keeping it up).
@@ -25,25 +21,47 @@ DZ_CONNECT_MARKER="${DZ_CONNECT_MARKER:-/run/doublezerod/connected}"
 BASE_PID=$!
 
 BRIDGE_PID=""
+# Set only on the signal path (see on_signal). `disconnect` keys off this so a
+# bare child exit — a bridge crash/panic/OOM that pops `wait -n` below — never
+# releases the access pass: that would defeat `--restart unless-stopped` (the
+# one-shot `connect multicast` is run externally and is not re-run on restart).
+SIGNALED=0
 
-# Graceful shutdown: disconnect from DoubleZero (only if a successful connect was
-# recorded) *while the daemon is still up*, then tear the bridge and daemon down.
+# True iff doublezerod reports a live tunnel. `doublezero status` prints a header
+# row plus one data row whose first `|`-delimited column is up/down/unknown; we
+# match a data row of `up`. `timeout` bounds a probe against a wedged daemon.
+dz_connected() {
+    timeout 5 doublezero status 2>/dev/null | grep -qE '^[[:space:]]*up[[:space:]]*\|'
+}
+
+# Graceful shutdown: disconnect from DoubleZero *while the daemon is still up*,
+# then tear the bridge and daemon down. Disconnect runs only when (a) we got here
+# via an operator signal (SIGNALED), (b) the daemon socket still exists, and
+# (c) a tunnel is actually up — so a crash-path teardown never frees the session.
 # We must NOT `exec` into the bridge below, or this handler would be discarded and
 # the bridge would run as PID 1 with no signal handler (docker stop -> SIGKILL,
-# no disconnect). Reached both on `docker stop` (TERM/INT) and when the bridge or
-# daemon exits on its own.
+# no disconnect).
 shutdown() {
     trap '' TERM INT   # a second signal during cleanup is ignored
-    if [ -e "$DZ_CONNECT_MARKER" ]; then
+    if [ "$SIGNALED" = 1 ] && [ -S "$DZ_SOCK" ] && dz_connected; then
         echo "[bridge-entrypoint] disconnecting from DoubleZero" >&2
-        doublezero disconnect || echo "[bridge-entrypoint] disconnect failed (continuing teardown)" >&2
+        timeout 30 doublezero disconnect \
+            || echo "[bridge-entrypoint] disconnect failed or timed out (continuing teardown)" >&2
     fi
     [ -n "$BRIDGE_PID" ] && kill -TERM "$BRIDGE_PID" 2>/dev/null || true
     kill -TERM "$BASE_PID" 2>/dev/null || true
     wait 2>/dev/null || true
     exit 0
 }
-trap shutdown TERM INT
+
+# `docker stop` (TERM/INT) is the only path that should disconnect; flag it so
+# shutdown can tell an operator stop from a child exiting on its own (the
+# `wait -n` fall-through below calls shutdown directly, leaving SIGNALED=0).
+on_signal() {
+    SIGNALED=1
+    shutdown
+}
+trap on_signal TERM INT
 
 # Wait (up to ~15s) for the daemon socket before starting the bridge.
 for _ in $(seq 1 75); do
