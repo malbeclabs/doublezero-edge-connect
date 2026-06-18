@@ -518,6 +518,67 @@ mod tests {
         assert_eq!(ids, vec![7, 8]);
     }
 
+    /// Two byte-for-byte identical quote packets from the *same* multicast publisher collapse to a
+    /// single emission: the second is an exact `(source_ts, content)` repeat the floor drops. This
+    /// isolates the pure duplicate-packet case (no third distinct quote).
+    #[test]
+    fn duplicate_quote_packet_from_same_source_emitted_once() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // identical duplicate -> dropped
+        assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
+    }
+
+    /// The same BBO at the same `source_ts` mirrored by two distinct multicast publishers collapses
+    /// to one emission: the first publisher to open the tick leads it, and the second's identical
+    /// copy is a non-leader no-op. This is the cross-source duplicate-packet case.
+    #[test]
+    fn duplicate_quote_from_two_multicast_publishers_emitted_once() {
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), pub_a); // A opens the tick -> emit
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), pub_b); // B's mirror -> non-leader, dropped
+        assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
+    }
+
+    /// Two identical trade packets (same `trade_id`) from the same source collapse to one emission
+    /// via the windowed dedup, regardless of any other field.
+    #[test]
+    fn duplicate_trade_packet_from_same_source_emitted_once() {
+        use crate::model::NormalizedTrade;
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let trade = || {
+            FeedMessage::Trade(NormalizedTrade {
+                venue: "Hyperliquid".to_string(),
+                symbol: "BTC".to_string(),
+                price: 100.0,
+                size: 1.0,
+                aggressor_side: "buy".to_string(),
+                trade_id: 42,
+                cumulative_volume: 0.0,
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(trade(), edge);
+        a.emit(trade(), edge); // identical duplicate -> dropped
+        let mut ids = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Trade(t) = m {
+                ids.push(t.trade_id);
+            }
+        }
+        assert_eq!(ids, vec![42]);
+    }
+
     /// A single implausibly-far-future quote (a bad/hostile public timestamp) must NOT advance the
     /// shared floor and wedge the symbol: it is dropped, and a later real edge quote still emits.
     /// (PR review finding: one bad public `time` would otherwise latch `high_water` years ahead and
