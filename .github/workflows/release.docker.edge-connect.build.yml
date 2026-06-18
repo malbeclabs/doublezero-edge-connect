@@ -29,10 +29,14 @@ on:
         default: ""
         type: string
 
-# Reusable workflow: it runs under the caller job's permissions (publish/smoke/rebuild
-# set contents:read + packages:read/write). This default applies only to direct runs.
+# Reusable workflow: the effective GITHUB_TOKEN is the INTERSECTION of this block and
+# the caller job's permissions. It must therefore name every scope any caller grants,
+# or that scope is dropped — declaring only contents:read here silently stripped the
+# packages:write that publish/rebuild grant, so the GHCR push was denied. The push
+# itself stays gated by the caller (smoke grants packages:read -> intersection is read).
 permissions:
   contents: read
+  packages: write
 
 jobs:
   build:
