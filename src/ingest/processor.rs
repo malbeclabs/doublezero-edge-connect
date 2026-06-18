@@ -422,6 +422,14 @@ impl FrameProcessor for MidpointProcessor {
     }
 }
 
+/// Cap on the number of distinct instrument books [`MboProcessor`] tracks. The MBO `instrument_id`
+/// is an unauthenticated, spoofable wire field, so without a bound a forged stream could mint a
+/// `BookState` per distinct id and grow the map without limit (memory-exhaustion DoS) — the same
+/// threat the [`MAX_PUBLISHERS`] cap addresses for the per-publisher sequence map. Real venues
+/// carry far fewer instruments than this, so it never evicts in normal operation; once full, the
+/// least-recently-inserted book is evicted (it simply re-syncs from the next snapshot).
+const MAX_BOOKS: usize = 4096;
+
 /// Market-by-Order processor: drives the reference-data state machine (refdata port), feeds order
 /// deltas and the snapshot stream into a per-instrument [`BookState`] (mktdata + snapshot ports),
 /// and emits a full-state `depth` snapshot whenever an instrument's top-N changes - plus `trade`
@@ -429,6 +437,8 @@ impl FrameProcessor for MidpointProcessor {
 pub struct MboProcessor {
     state: RefDataState<codec_mbo::InstrumentDefinition>,
     books: HashMap<u32, BookState>,
+    /// Insertion order of `books` keys, oldest at the front, for the [`MAX_BOOKS`] eviction.
+    books_order: VecDeque<u32>,
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
     warned_source_mismatch: bool,
@@ -441,10 +451,40 @@ impl MboProcessor {
         Self {
             state: RefDataState::new(),
             books: HashMap::new(),
+            books_order: VecDeque::new(),
             depth,
             warned_source_mismatch: false,
             emit_trades,
         }
+    }
+
+    /// Get-or-create the [`BookState`] for `instrument_id`, **gated and bounded** — the two checks
+    /// that keep the unauthenticated, spoofable wire `instrument_id` from growing memory without
+    /// limit:
+    ///
+    /// 1. Returns `None` (creating no book) unless we already hold this instrument's definition. A
+    ///    book for an undefined instrument can never emit `depth` ([`Self::emit_depth`] requires the
+    ///    definition for precision), so it would be pure dead memory; this mirrors the per-instrument
+    ///    definition gate the Top-of-Book / Midpoint quote paths already apply.
+    /// 2. Bounds the map to [`MAX_BOOKS`] with least-recently-inserted eviction, so even a flood of
+    ///    *defined* forged instrument_ids can't grow it without limit. An evicted legitimate book
+    ///    simply re-syncs from the next snapshot.
+    fn book_for(&mut self, instrument_id: u32) -> Option<&mut BookState> {
+        // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
+        self.state.definition(instrument_id)?;
+        if !self.books.contains_key(&instrument_id) {
+            while self.books.len() >= MAX_BOOKS {
+                match self.books_order.pop_front() {
+                    Some(old) => {
+                        self.books.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.books.insert(instrument_id, BookState::default());
+            self.books_order.push_back(instrument_id);
+        }
+        self.books.get_mut(&instrument_id)
     }
 
     /// Build and broadcast a full-state `depth` snapshot for one instrument, updating the shared
@@ -536,8 +576,10 @@ impl FrameProcessor for MboProcessor {
                             qty_raw: o.qty_raw,
                         },
                     };
-                    if self.books.entry(o.instrument_id).or_default().on_delta(op) {
-                        changed.insert(o.instrument_id);
+                    if let Some(book) = self.book_for(o.instrument_id) {
+                        if book.on_delta(op) {
+                            changed.insert(o.instrument_id);
+                        }
                     }
                 }
                 codec_mbo::Message::OrderCancel(o) => {
@@ -549,8 +591,10 @@ impl FrameProcessor for MboProcessor {
                             order_id: o.order_id,
                         },
                     };
-                    if self.books.entry(o.instrument_id).or_default().on_delta(op) {
-                        changed.insert(o.instrument_id);
+                    if let Some(book) = self.book_for(o.instrument_id) {
+                        if book.on_delta(op) {
+                            changed.insert(o.instrument_id);
+                        }
                     }
                 }
                 codec_mbo::Message::OrderExecute(o) => {
@@ -564,8 +608,10 @@ impl FrameProcessor for MboProcessor {
                             full_fill: o.exec_flags & 0x01 != 0,
                         },
                     };
-                    if self.books.entry(o.instrument_id).or_default().on_delta(op) {
-                        changed.insert(o.instrument_id);
+                    if let Some(book) = self.book_for(o.instrument_id) {
+                        if book.on_delta(op) {
+                            changed.insert(o.instrument_id);
+                        }
                     }
                     // An execution is also a public trade print; emit it like a Top-of-Book trade.
                     if let Some(def) = self.state.definition(o.instrument_id) {
@@ -619,21 +665,19 @@ impl FrameProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::InstrumentReset(r) => {
-                    self.books
-                        .entry(r.instrument_id)
-                        .or_default()
-                        .on_instrument_reset(r.new_anchor_seq);
+                    if let Some(book) = self.book_for(r.instrument_id) {
+                        book.on_instrument_reset(r.new_anchor_seq);
+                    }
                 }
                 codec_mbo::Message::SnapshotBegin(s) => {
-                    self.books
-                        .entry(s.instrument_id)
-                        .or_default()
-                        .on_snapshot_begin(
+                    if let Some(book) = self.book_for(s.instrument_id) {
+                        book.on_snapshot_begin(
                             s.snapshot_id,
                             s.anchor_seq,
                             s.total_orders,
                             s.last_instrument_seq,
                         );
+                    }
                 }
                 codec_mbo::Message::SnapshotOrder(s) => {
                     // SnapshotOrder carries only the snapshot_id, not the instrument id; route it to
@@ -652,13 +696,10 @@ impl FrameProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::SnapshotEnd(s) => {
-                    if self
-                        .books
-                        .entry(s.instrument_id)
-                        .or_default()
-                        .on_snapshot_end(s.anchor_seq, s.snapshot_id)
-                    {
-                        changed.insert(s.instrument_id);
+                    if let Some(book) = self.book_for(s.instrument_id) {
+                        if book.on_snapshot_end(s.anchor_seq, s.snapshot_id) {
+                            changed.insert(s.instrument_id);
+                        }
                     }
                 }
                 // BatchBoundary is an emission-coalescing hint; we already emit once per frame.
@@ -974,5 +1015,86 @@ mod tests {
             );
             assert_eq!(entry.qty_exponent, -5, "last writer's qty_exponent wins");
         }
+    }
+
+    /// An `OrderAdd` for an instrument whose definition we don't yet hold must not mint a book — an
+    /// undefined instrument can never emit usable `depth`, and the wire `instrument_id` is spoofable.
+    #[test]
+    fn mbo_undefined_instrument_creates_no_book() {
+        let (tx, _rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+
+        // No manifest/definition: an OrderAdd for an unknown instrument must be dropped, not booked.
+        let f = frame(&[enc_order_add(&OrderAdd {
+            instrument_id: 42,
+            source_id: 0,
+            side: SIDE_BID,
+            order_flags: 0,
+            per_instrument_seq: 1,
+            order_id: 1,
+            enter_ts: 1,
+            price_raw: 100,
+            qty_raw: 1,
+        })]);
+        proc.on_datagram(&f, &make_ctx(&arbiter, &instruments, PortRole::Mktdata));
+        assert!(
+            proc.books.is_empty(),
+            "undefined instrument must not create a book"
+        );
+    }
+
+    /// The book map must stay bounded under a flood of distinct (defined) instrument_ids, evicting
+    /// the oldest first — otherwise a forged MBO stream grows it without limit.
+    #[test]
+    fn mbo_books_map_is_bounded_under_instrument_flood() {
+        use super::MAX_BOOKS;
+        let (tx, _rx) = broadcast::channel::<FeedMessage>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+
+        let flood = (MAX_BOOKS as u32) + 50;
+        // Declare and define every instrument so the definition gate admits each one.
+        proc.on_datagram(
+            &frame(&[enc_manifest_summary(1, flood)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        for i in 0..flood {
+            proc.on_datagram(
+                &frame(&[enc_instrument_def(i, &format!("INST-{i}"), 1)]),
+                &make_ctx(&arbiter, &instruments, PortRole::Combined),
+            );
+        }
+        // An OrderAdd for each now mints a (bounded) book.
+        for i in 0..flood {
+            proc.on_datagram(
+                &frame(&[enc_order_add(&OrderAdd {
+                    instrument_id: i,
+                    source_id: 0,
+                    side: SIDE_BID,
+                    order_flags: 0,
+                    per_instrument_seq: 1,
+                    order_id: 1,
+                    enter_ts: 1,
+                    price_raw: 100,
+                    qty_raw: 1,
+                })]),
+                &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+            );
+        }
+        assert!(
+            proc.books.len() <= MAX_BOOKS,
+            "books map must stay bounded, got {}",
+            proc.books.len()
+        );
+        assert!(
+            proc.books.contains_key(&(flood - 1)),
+            "newest instrument retained"
+        );
+        assert!(!proc.books.contains_key(&0), "oldest instrument evicted");
     }
 }
