@@ -49,7 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnect + exponential backoff; decode/socket errors are logged and swallowed), and each public
   quote/trade is gated on its `(venue, symbol)` instrument being known (precision before price). A mock
   HL WS input harness drives two new E2E cases (edge-leads-in-steady-state, edge-gap→public-fills-in).
-  The WebSocket **output** contract (PROTOCOL.md) is unchanged.
+  The feeder adds no new WebSocket output fields of its own; it populates the same `bid_n`/`ask_n`
+  (from the public `bbo` level's `n`) the edge feed serves.
+  - Reconnect backoff resets to the floor only after a session stays up past a minimum duration, so a
+    connect-then-immediate-drop loop keeps escalating instead of hammering the public endpoint.
+  - Shared mutexes (`InstrumentSnapshot`/`DepthSnapshot`/arbiter) lock via a poison-recovering helper
+    (`model::lock`), so an unrelated panic in one ingest task can't cascade into the others.
+- Cross-source quote identity is the canonical `bbo_hash` (`StableBBOHash`): bid/ask price + size at
+  the `10^-8` scale plus `bid_n`/`ask_n`. Computing it at a fixed scale (not raw `f64` bits) collapses
+  the edge's `raw * 10^exp` and the public feed's parsed float for the same economic price onto one
+  identity, so a cross-source copy dedups. The arbiter also drops a quote whose `source_ts` is
+  implausibly far in the future before it can advance the shared floor — one bad/hostile public
+  timestamp would otherwise latch the floor ahead and drop every real edge quote as stale until restart.
 - Real Hyperliquid Market-by-Order (MBO) feed ingestion: a confirmed `FEEDS` row
   (`233.84.178.15`, ports `10201`/`10202`/`10203`, depth-only) re-served as full-state
   `depth`. `--feed <venue>` now selects every protocol feed for that venue.
@@ -105,7 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the new public WS feeder — funnels through one `Arc<Mutex<Arbiter>>`, so they all race on the
   same per-`(venue, symbol)` floor instead of each owning a private one. A `Publisher { Edge(IpAddr),
   PublicWs }` enum is the floor's leader identity. Behavior-preserving for the edge path (the
-  two-publisher and single-publisher counts are unchanged); the WebSocket output contract is unchanged.
+  two-publisher and single-publisher counts are unchanged); the refactor itself adds no output fields.
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry
   multiple protocol feeds.
 - Bumped dependencies from the open Dependabot PRs: `tokio-tungstenite`

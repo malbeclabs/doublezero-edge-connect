@@ -23,7 +23,7 @@
 //! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-source
 //! dedup is decided by publisher leadership per tick, never by content equality (see the arbiter).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -51,6 +51,11 @@ const HL_MAX_SUBSCRIPTIONS_PER_CONN: usize = 1000;
 /// doubles up to the maximum across consecutive failures.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Minimum session duration that counts as "stable": only after staying connected this long do we
+/// reset the backoff to `BACKOFF_MIN`. A connect-then-immediate-drop (rejected subscriptions,
+/// instant server close) keeps escalating instead of pinning at the floor and hammering the public
+/// endpoint ~2 reconnects/sec.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 /// One Hyperliquid WS message envelope: a channel tag plus its channel-specific payload.
 #[derive(Deserialize)]
@@ -69,12 +74,15 @@ struct BboData {
     bbo: [Option<Level>; 2],
 }
 
-/// One book level. Extra fields (e.g. `n`, the source count) are ignored: the quote identity the
-/// arbiter floor uses is the BBO `f64`s only, matching the edge side.
+/// One book level. `n` is the order/source count at this level — the public-feed counterpart of the
+/// edge's `Bid/Ask Source Count`; it is part of the canonical `bbo_hash` identity the arbiter keys
+/// on, so both sources must report it (absent → 0, "unavailable", matching the edge sentinel).
 #[derive(Deserialize)]
 struct Level {
     px: String,
     sz: String,
+    #[serde(default)]
+    n: u16,
 }
 
 /// A `trades` payload element. `tid` is Hyperliquid's trade id — the same value the edge feed carries
@@ -116,19 +124,28 @@ pub async fn run(
     loop {
         match connect_async(&url).await {
             Ok((ws, _resp)) => {
-                backoff = BACKOFF_MIN; // connected; reset so a later drop reconnects promptly
                 info!(%url, coins = ?coins, "public WS input feeder connected");
+                let started = Instant::now();
                 match stream(ws, &coins, &arbiter, &instruments).await {
                     Ok(()) => info!("public WS input feeder closed; reconnecting"),
                     Err(e) => {
                         warn!(error = %e, "public WS input feeder session error; reconnecting")
                     }
                 }
+                // Reset the backoff only after a *stable* session; a connect-then-immediate-drop
+                // keeps escalating so a flapping endpoint isn't hammered (see `STABLE_SESSION`).
+                backoff = if started.elapsed() >= STABLE_SESSION {
+                    BACKOFF_MIN
+                } else {
+                    (backoff * 2).min(BACKOFF_MAX)
+                };
             }
-            Err(e) => warn!(error = %e, %url, "public WS input feeder connect failed; retrying"),
+            Err(e) => {
+                warn!(error = %e, %url, "public WS input feeder connect failed; retrying");
+                backoff = (backoff * 2).min(BACKOFF_MAX);
+            }
         }
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -196,10 +213,7 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
 /// True if the `(HL_VENUE, symbol)` instrument is already in the shared snapshot, so a price emitted
 /// for it carries known precision (precision before price).
 fn instrument_known(instruments: &InstrumentSnapshot, symbol: &str) -> bool {
-    instruments
-        .lock()
-        .unwrap()
-        .contains_key(&(HL_VENUE.to_string(), symbol.to_string()))
+    crate::model::lock(instruments).contains_key(&(HL_VENUE.to_string(), symbol.to_string()))
 }
 
 /// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`
@@ -214,15 +228,21 @@ fn parse_decimal(s: &str) -> Option<f64> {
 
 /// Parse a decimal-string level into real-unit `(price, size)` `f64`s, or `None` if either fails or
 /// is non-finite/negative.
-fn parse_level(l: &Level) -> Option<(f64, f64)> {
-    Some((parse_decimal(&l.px)?, parse_decimal(&l.sz)?))
+fn parse_level(l: &Level) -> Option<(f64, f64, u16)> {
+    Some((parse_decimal(&l.px)?, parse_decimal(&l.sz)?, l.n))
 }
 
-/// Convert a public block time in **milliseconds** to nanoseconds, or `None` if the multiply would
-/// overflow `u64`. A malformed/hostile `time` must not silently saturate: a saturated `u64::MAX`
-/// `source_ts` would advance the floor's high-water to the maximum and permanently drop every later
-/// real quote for that `(venue, symbol)` as stale (a one-symbol wedge until restart).
+/// Convert a public block time in **milliseconds** to nanoseconds, or `None` if it is unusable.
+/// Rejects `0` (the "not available" sentinel — never a real block time; passing it through would
+/// make this public quote bypass the floor and emit as an undeduped duplicate of the edge copy) and
+/// a multiply that would overflow `u64` (a saturated `u64::MAX` `source_ts` would advance the floor's
+/// high-water to the maximum and permanently drop every later real quote for that `(venue, symbol)`
+/// as stale — a one-symbol wedge until restart; the arbiter also clamps implausibly-far-future
+/// timestamps as a second line of defense).
 fn block_time_ms_to_ns(time_ms: u64) -> Option<u64> {
+    if time_ms == 0 {
+        return None;
+    }
     time_ms.checked_mul(1_000_000)
 }
 
@@ -236,7 +256,8 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     if !instrument_known(instruments, &d.coin) {
         return; // precision unknown; drop until the edge refdata defines this instrument
     }
-    let (Some((bid_px, bid_sz)), Some((ask_px, ask_sz))) = (parse_level(bid), parse_level(ask))
+    let (Some((bid_px, bid_sz, bid_n)), Some((ask_px, ask_sz, ask_n))) =
+        (parse_level(bid), parse_level(ask))
     else {
         return;
     };
@@ -252,6 +273,8 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         ask: ask_px,
         bid_size: bid_sz,
         ask_size: ask_sz,
+        bid_n,
+        ask_n,
         source_ts_ns,
         recv_ts_ns: now_ns(),
         kernel_rx_ts_ns: 0, // no kernel RX timestamp for a user-space WS read (0 = sentinel)

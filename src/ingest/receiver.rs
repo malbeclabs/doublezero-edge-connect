@@ -409,7 +409,12 @@ async fn drive<P: FrameProcessor>(
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 if !down {
-                    emit_status(&arbiter, venue, "down", last_mkt.elapsed().as_millis() as u64);
+                    emit_status(
+                        &arbiter,
+                        venue,
+                        "down",
+                        last_mkt.elapsed().as_millis() as u64,
+                    );
                     down = true;
                 }
                 continue 'rejoin;
@@ -426,7 +431,12 @@ async fn drive<P: FrameProcessor>(
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         if !down {
-                            emit_status(&arbiter, venue, "down", last_mkt.elapsed().as_millis() as u64);
+                            emit_status(
+                                &arbiter,
+                                venue,
+                                "down",
+                                last_mkt.elapsed().as_millis() as u64,
+                            );
                             down = true;
                         }
                         continue 'rejoin;

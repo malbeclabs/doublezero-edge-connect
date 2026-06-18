@@ -41,7 +41,7 @@ const DEPTH_LEVELS: usize = 10;
 /// silently clobbering.
 fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
     let key = (inst.venue.clone(), inst.symbol.clone());
-    let mut map = instruments.lock().unwrap();
+    let mut map = crate::model::lock(instruments);
     if let Some(prev) = map.get(&key) {
         if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
             warn!(
@@ -448,9 +448,7 @@ impl MboProcessor {
             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
             ws_send_ts_ns: 0, // stamped by the WS server just before send
         };
-        self.depth
-            .lock()
-            .unwrap()
+        crate::model::lock(&self.depth)
             .insert((depth.venue.clone(), depth.symbol.clone()), depth.clone());
         ctx.emit(FeedMessage::Depth(depth));
     }

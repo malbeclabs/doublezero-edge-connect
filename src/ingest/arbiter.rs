@@ -36,11 +36,24 @@ use std::{
 
 use tokio::sync::broadcast;
 
-use crate::model::{FeedMessage, NormalizedQuote};
+use crate::model::{now_ns, FeedMessage, NormalizedQuote};
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
 pub const TRADE_DEDUP_WINDOW: usize = 8192;
+
+/// Cap on distinct leader BBOs tracked per `source_ts` tick by the quote floor — a safety bound so a
+/// stalled/repeated `source_ts` can't grow the per-tick set without limit. Far above the real
+/// per-block max (~hundreds of distinct BBOs share one HL block timestamp), so it never evicts in
+/// normal operation.
+pub const QUOTE_TICK_CAP: usize = 8192;
+
+/// Reject a quote whose `source_ts` is more than this far ahead of the host wall clock before it can
+/// advance the floor. A single bad or hostile public-feed timestamp years in the future would
+/// otherwise latch `high_water` ahead and drop every real (now-stamped) quote as stale until restart
+/// — wedging the *primary* edge feed for that symbol. The bound caps the worst-case wedge to itself
+/// and self-heals; it is generous enough to absorb ordinary clock skew between the venue and host.
+const MAX_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 
 /// Which ingest source produced an update — the floor's per-tick leader identity. The edge
 /// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
@@ -60,29 +73,43 @@ pub enum Publisher {
     PublicWs,
 }
 
-/// The business identity of a quote at a `source_ts` tick: the normalized top-of-book `f64`s, as
-/// raw bit patterns so they are `Eq`/`Hash`. EXCLUDES `source_ts` (the floor tracks that
-/// separately). Two quotes from the *same* source with identical BBO `f64`s at the same `source_ts`
-/// are a true republish; the floor never compares one source's content against another's (a
-/// non-leader loses on identity before its content is consulted), so cross-source bit-equality is
-/// neither required nor relied upon. A precision change is captured implicitly: the scaled `f64`
-/// differs, so the bits differ and the quotes don't false-dedup.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// Canonical BBO scale exponent (`10^-8`), matching the capture service's `bbo_hash`
+/// (`malbeclabs/hyperliquid` `StableBBOHash`: `canonicalBBOPriceExp = canonicalBBOQtyExp = -8`).
+const CANONICAL_BBO_EXP: i32 = 8;
+
+/// The canonical business identity of a quote at a `source_ts` tick — the components of the spec's
+/// `bbo_hash`: bid/ask price + size at the canonical `10^-8` fixed-point scale, plus the source
+/// counts `bid_n`/`ask_n`. EXCLUDES `source_ts` (the floor tracks that separately).
+///
+/// Why canonical `-8` integers and not the raw `f64` bits: sources publish the same economic price
+/// in different encodings — the edge feed as `raw * 10^exp`, the public WS as a JSON float — and
+/// `raw as f64 * 10^exp` is **not** bit-identical to the parsed float for the same value (`0.1` is
+/// inexact in binary). Bit-comparing `f64`s would treat the two as distinct, so the *same* BBO from
+/// two sources would not share an identity — silently defeating cross-source dedup. Rounding each
+/// value to a fixed `10^-8` integer collapses both encodings to the same canonical key, matching
+/// `StableBBOHash`. A change in `bid_n`/`ask_n` (orders/sources at the top) is a distinct BBO.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct QuoteId {
-    bid: u64,
-    ask: u64,
-    bid_size: u64,
-    ask_size: u64,
+    bid_px: i64,
+    bid_sz: i64,
+    ask_px: i64,
+    ask_sz: i64,
+    bid_n: u16,
+    ask_n: u16,
 }
 
 impl QuoteId {
-    /// The content identity of a normalized quote (its four BBO `f64`s as bits).
+    /// The canonical content identity of a normalized quote: each BBO `f64` rounded to a `10^-8`
+    /// fixed-point integer (so two sources' encodings of the same price collapse), plus the counts.
     pub fn of(q: &NormalizedQuote) -> Self {
+        let canon = |x: f64| (x * 10f64.powi(CANONICAL_BBO_EXP)).round() as i64;
         Self {
-            bid: q.bid.to_bits(),
-            ask: q.ask.to_bits(),
-            bid_size: q.bid_size.to_bits(),
-            ask_size: q.ask_size.to_bits(),
+            bid_px: canon(q.bid),
+            bid_sz: canon(q.bid_size),
+            ask_px: canon(q.ask),
+            ask_sz: canon(q.ask_size),
+            bid_n: q.bid_n,
+            ask_n: q.ask_n,
         }
     }
 }
@@ -231,7 +258,7 @@ impl Arbiter {
     pub fn new(tx: broadcast::Sender<FeedMessage>, trade_window: usize) -> Self {
         Self {
             tx,
-            quotes: StalenessFloor::new(),
+            quotes: StalenessFloor::new(QUOTE_TICK_CAP),
             trades: WindowedDedup::new(trade_window),
         }
     }
@@ -249,6 +276,20 @@ impl Arbiter {
     pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
         match &msg {
             FeedMessage::Quote(q) => {
+                // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
+                // time): forward it but never let it touch the floor — as a tick it would pin
+                // `high_water` at 0 and drop every later quote as stale.
+                if q.source_ts_ns == 0 {
+                    let _ = self.tx.send(msg);
+                    return;
+                }
+                // Reject an implausibly-far-future `source_ts` before it can advance the floor.
+                // The floor is shared by the trusted edge and the untrusted public WS; one bad/
+                // hostile public timestamp years ahead would otherwise latch `high_water` and drop
+                // every real edge quote as stale until restart (see `MAX_FUTURE_SKEW_NS`).
+                if q.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
+                    return;
+                }
                 let key = (q.venue.clone(), q.symbol.clone());
                 if self
                     .quotes
@@ -386,6 +427,8 @@ mod tests {
             ask,
             bid_size: 1.0,
             ask_size: 2.0,
+            bid_n: 0,
+            ask_n: 0,
             source_ts_ns,
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
@@ -473,5 +516,61 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![7, 8]);
+    }
+
+    /// A single implausibly-far-future quote (a bad/hostile public timestamp) must NOT advance the
+    /// shared floor and wedge the symbol: it is dropped, and a later real edge quote still emits.
+    /// (PR review finding: one bad public `time` would otherwise latch `high_water` years ahead and
+    /// drop every real edge quote as stale until restart.)
+    #[test]
+    fn arbiter_future_timestamp_does_not_wedge_the_floor() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let now = crate::model::now_ns();
+        let bogus_future = now + 3_600_000_000_000; // 1h ahead -> rejected before touching the floor
+        a.emit(
+            FeedMessage::Quote(quote(bogus_future, 1.0, 2.0)),
+            Publisher::PublicWs,
+        );
+        // The real edge quote (at ~now) is not stale relative to the floor and still emits.
+        a.emit(FeedMessage::Quote(quote(now, 100.0, 101.0)), edge);
+        assert_eq!(drain_quotes(&mut rx), vec![(now, 100.0)]);
+    }
+
+    /// `source_ts == 0` (the "not available" sentinel) bypasses the floor: it is emitted but never
+    /// latched, so it can't pin `high_water` at 0 and drop later quotes / non-leaders forever.
+    #[test]
+    fn arbiter_zero_source_ts_bypasses_floor() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Quote(quote(0, 100.0, 101.0)), edge); // bypass -> emitted, floor untouched
+        a.emit(
+            FeedMessage::Quote(quote(0, 100.5, 101.0)),
+            Publisher::PublicWs,
+        ); // also bypass -> emitted
+        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // real tick still emits
+        assert_eq!(
+            drain_quotes(&mut rx),
+            vec![(0, 100.0), (0, 100.5), (1000, 100.0)]
+        );
+    }
+
+    /// The canonical `QuoteId` collapses two `f64` encodings of the same economic price — the edge's
+    /// `raw * 10^exp` and a parsed public float, which are not bit-identical — onto one identity, so
+    /// a cross-source copy dedups. (Raw `f64` bits would treat them as distinct.)
+    #[test]
+    fn quote_id_canonicalizes_equivalent_float_encodings() {
+        let edge_px = 6788_f64 * 10f64.powi(-1); // 678.8 via raw*10^exp
+        let parsed_px = 678.8_f64; // 678.8 parsed straight from JSON
+        let a = QuoteId::of(&quote(1000, edge_px, 999.0));
+        let b = QuoteId::of(&quote(1000, parsed_px, 999.0));
+        assert_eq!(
+            a, b,
+            "same economic price must share one canonical identity"
+        );
+        // A genuinely different price is still distinct.
+        assert_ne!(a, QuoteId::of(&quote(1000, 678.9, 999.0)));
     }
 }
