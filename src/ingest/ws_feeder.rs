@@ -31,7 +31,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 use crate::{
-    ingest::arbiter::{Publisher, SharedArbiter},
+    ingest::arbiter::{lock, Publisher, SharedArbiter},
     model::{now_ns, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade},
 };
 
@@ -202,9 +202,28 @@ fn instrument_known(instruments: &InstrumentSnapshot, symbol: &str) -> bool {
         .contains_key(&(HL_VENUE.to_string(), symbol.to_string()))
 }
 
-/// Parse a decimal-string level into real-unit `(price, size)` `f64`s, or `None` if either fails.
+/// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`
+/// (which `str::parse::<f64>` accepts from `"nan"`/`"inf"` and produces on overflow like `"1e400"`)
+/// and negatives, so a malformed public px/sz is dropped rather than emitted — a non-finite would
+/// otherwise serialize to JSON `null` on the wire (breaking the numeric contract) and a `NaN` would
+/// defeat the floor's content dedup (`NaN != NaN`).
+fn parse_decimal(s: &str) -> Option<f64> {
+    let v: f64 = s.parse().ok()?;
+    (v.is_finite() && v >= 0.0).then_some(v)
+}
+
+/// Parse a decimal-string level into real-unit `(price, size)` `f64`s, or `None` if either fails or
+/// is non-finite/negative.
 fn parse_level(l: &Level) -> Option<(f64, f64)> {
-    Some((l.px.parse().ok()?, l.sz.parse().ok()?))
+    Some((parse_decimal(&l.px)?, parse_decimal(&l.sz)?))
+}
+
+/// Convert a public block time in **milliseconds** to nanoseconds, or `None` if the multiply would
+/// overflow `u64`. A malformed/hostile `time` must not silently saturate: a saturated `u64::MAX`
+/// `source_ts` would advance the floor's high-water to the maximum and permanently drop every later
+/// real quote for that `(venue, symbol)` as stale (a one-symbol wedge until restart).
+fn block_time_ms_to_ns(time_ms: u64) -> Option<u64> {
+    time_ms.checked_mul(1_000_000)
 }
 
 /// Build a `NormalizedQuote` from a public `bbo` and emit it through the arbiter as `PublicWs`.
@@ -221,6 +240,11 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     else {
         return;
     };
+    // Public block time (ms) → ns: the SAME canonical source_ts the edge copy carries
+    // (`source_timestamp_ns = block_time_ms × 1_000_000`), so both land in one floor tick.
+    let Some(source_ts_ns) = block_time_ms_to_ns(d.time) else {
+        return;
+    };
     let quote = NormalizedQuote {
         venue: HL_VENUE.to_string(),
         symbol: d.coin,
@@ -228,17 +252,12 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         ask: ask_px,
         bid_size: bid_sz,
         ask_size: ask_sz,
-        // Public block time (ms) → ns, the SAME canonical source_ts the edge copy carries
-        // (`source_timestamp_ns = block_time_ms × 1_000_000`), so both land in one floor tick.
-        source_ts_ns: d.time.saturating_mul(1_000_000),
+        source_ts_ns,
         recv_ts_ns: now_ns(),
         kernel_rx_ts_ns: 0, // no kernel RX timestamp for a user-space WS read (0 = sentinel)
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
     };
-    arbiter
-        .lock()
-        .unwrap()
-        .emit(FeedMessage::Quote(quote), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
@@ -246,7 +265,10 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
     if !instrument_known(instruments, &t.coin) {
         return;
     }
-    let (Some(price), Some(size)) = (t.px.parse::<f64>().ok(), t.sz.parse::<f64>().ok()) else {
+    let (Some(price), Some(size)) = (parse_decimal(&t.px), parse_decimal(&t.sz)) else {
+        return;
+    };
+    let Some(source_ts_ns) = block_time_ms_to_ns(t.time) else {
         return;
     };
     let trade = NormalizedTrade {
@@ -263,15 +285,12 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         .to_string(),
         trade_id: t.tid,
         cumulative_volume: 0.0, // not carried on the public trades feed
-        source_ts_ns: t.time.saturating_mul(1_000_000),
+        source_ts_ns,
         recv_ts_ns: now_ns(),
         kernel_rx_ts_ns: 0,
         ws_send_ts_ns: 0,
     };
-    arbiter
-        .lock()
-        .unwrap()
-        .emit(FeedMessage::Trade(trade), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
 }
 
 #[cfg(test)]
@@ -337,6 +356,51 @@ mod tests {
             "bbo":[{"px":"1.0","sz":"1.0"},{"px":"2.0","sz":"1.0"}]}}"#;
         handle_text(frame, &arbiter, &instruments);
         assert!(rx.try_recv().is_err(), "no quote without an instrument def");
+    }
+
+    /// Non-finite px/sz (`NaN`/`inf`, incl. overflow like `1e400`) and negatives are rejected, so a
+    /// malformed level never reaches the wire as JSON `null` (and never defeats content dedup).
+    #[test]
+    fn non_finite_or_negative_px_sz_rejected() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments = instruments_with("BTC");
+        for frame in [
+            r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[{"px":"nan","sz":"1.0"},{"px":"2.0","sz":"1.0"}]}}"#,
+            r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[{"px":"1e400","sz":"1.0"},{"px":"2.0","sz":"1.0"}]}}"#,
+            r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[{"px":"-1.0","sz":"1.0"},{"px":"2.0","sz":"1.0"}]}}"#,
+        ] {
+            handle_text(frame, &arbiter, &instruments);
+            assert!(
+                rx.try_recv().is_err(),
+                "non-finite/negative level must not emit: {frame}"
+            );
+        }
+        assert!(parse_decimal("nan").is_none());
+        assert!(parse_decimal("inf").is_none());
+        assert!(parse_decimal("-0.5").is_none());
+        assert_eq!(parse_decimal("104783.0"), Some(104783.0));
+    }
+
+    /// A `time` whose ms→ns multiply overflows `u64` is dropped — it must not saturate to `u64::MAX`
+    /// and permanently latch the floor's high-water for that symbol.
+    #[test]
+    fn overflowing_block_time_rejected() {
+        assert_eq!(
+            block_time_ms_to_ns(1_700_000_000_000),
+            Some(1_700_000_000_000_000_000)
+        );
+        assert_eq!(block_time_ms_to_ns(u64::MAX), None);
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments = instruments_with("BTC");
+        let frame = format!(
+            r#"{{"channel":"bbo","data":{{"coin":"BTC","time":{},"bbo":[{{"px":"1.0","sz":"1.0"}},{{"px":"2.0","sz":"1.0"}}]}}}}"#,
+            u64::MAX
+        );
+        handle_text(&frame, &arbiter, &instruments);
+        assert!(
+            rx.try_recv().is_err(),
+            "overflowing block time must not emit"
+        );
     }
 
     /// A one-sided book (a null side) cannot form a two-sided quote and is skipped.

@@ -39,7 +39,7 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 
 use crate::{
     ingest::{
-        arbiter::{Publisher, SharedArbiter},
+        arbiter::{lock, Publisher, SharedArbiter},
         feeds::{Feed, FeedKind, FeedPorts},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
@@ -104,10 +104,7 @@ impl FrameCtx<'_> {
     /// publisher so the quote floor can race it against the other sources for the tick's leadership.
     /// The brief critical section is the arbiter's admit-decision-plus-send.
     pub fn emit(&self, msg: FeedMessage) {
-        self.arbiter
-            .lock()
-            .unwrap()
-            .emit(msg, Publisher::Edge(self.publisher));
+        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher));
     }
 }
 
@@ -125,16 +122,12 @@ pub trait FrameProcessor {
 /// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
 fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
     // Status carries no business identity to dedup, so it goes straight to the broadcast sender.
-    let _ = arbiter
-        .lock()
-        .unwrap()
-        .sender()
-        .send(FeedMessage::Status(FeedStatus {
-            venue: venue.to_string(),
-            state: state.to_string(),
-            stale_ms,
-            ts_ns: now_ns(),
-        }));
+    let _ = lock(arbiter).sender().send(FeedMessage::Status(FeedStatus {
+        venue: venue.to_string(),
+        state: state.to_string(),
+        stale_ms,
+        ts_ns: now_ns(),
+    }));
 }
 
 /// Receive one datagram, returning `(len, kernel_rx_ns, user_recv_ns)`.

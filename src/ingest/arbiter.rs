@@ -274,6 +274,19 @@ impl Arbiter {
 /// a clone and lock it for the brief admit-decision-plus-send critical section.
 pub type SharedArbiter = Arc<Mutex<Arbiter>>;
 
+/// Lock the shared arbiter, recovering the guard even if a previous holder panicked while holding it.
+///
+/// The emit critical section ([`Arbiter::emit`]) is panic-free by construction — it only does
+/// `HashMap`/`HashSet` work and an ignored `broadcast::send` — so the protected dedup state is always
+/// left consistent. Recovering from poisoning (rather than `.lock().unwrap()`) therefore keeps an
+/// **unrelated** panic in any one ingest task from cascading into every other source: the multicast
+/// receivers' hot path stays isolated from a WS-feeder fault, which is the failure-isolation contract.
+pub fn lock(arbiter: &SharedArbiter) -> std::sync::MutexGuard<'_, Arbiter> {
+    arbiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

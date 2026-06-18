@@ -16,7 +16,9 @@ mod common;
 use std::time::Duration;
 
 use common::{assertions, bridge::Bridge, replay, ws_client, ws_input::MockWsInput};
+use doublezero_edge_connect::ingest::codec;
 use serial_test::serial;
+use std::collections::BTreeSet;
 
 /// The edge-only quote count for the BTC single-publisher golden (pinned in `e2e.rs`). In the
 /// steady-state case the public copies must add nothing to this.
@@ -35,11 +37,32 @@ fn mktdata() -> Vec<Vec<u8>> {
     )
 }
 
+/// Every distinct `source_ts` carried by the edge mktdata golden's quotes, ascending. These are the
+/// exact ticks the edge owns; the steady-state test mirrors the public feed onto them.
+fn edge_quote_ticks() -> Vec<u64> {
+    let mut ticks = BTreeSet::new();
+    for f in mktdata() {
+        if let Ok((_h, msgs)) = codec::decode_frame(&f) {
+            for m in &msgs {
+                if let codec::Message::Quote(q) = m {
+                    ticks.insert(q.source_ts);
+                }
+            }
+        }
+    }
+    ticks.into_iter().collect()
+}
+
 /// Edge leads in steady state: replay the full edge feed (advancing the floor across all its ticks),
-/// THEN have the public feed emit copies at already-passed `source_ts`. Each public copy is below
-/// the floor's high-water, so it is dropped — the edge already won every tick. The emitted quote
-/// count therefore equals the edge-only count, and the output contract holds. Falsifiable: with the
-/// floor bypassed, the public copies would re-emit and the count would exceed `EDGE_ONLY_QUOTES`.
+/// THEN have the public feed mirror **the same `source_ts` ticks** the edge owns, with distinctive
+/// prices. Each public copy lands at-or-below the floor's high-water: copies below it are dropped as
+/// stale, and the copy at the high-water tick is dropped as a *non-leader* (the edge opened that tick,
+/// PublicWs did not) — which is the genuine steady-state backstop. Because the prices differ from the
+/// edge's, content dedup is *not* what drops them; only the floor's leader/stale logic is. The emitted
+/// count therefore equals the edge-only count. Falsifiable: bypass the floor's leader rule and the
+/// distinctive public copy at the high-water tick re-emits, pushing the count past `EDGE_ONLY_QUOTES`.
+/// The test also pins the load-bearing `source_ts = block_time_ms × 1_000_000` identity (the feeder
+/// reverses it) by asserting every edge tick is an exact ms multiple.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn edge_leads_steady_state_public_dropped() {
@@ -66,13 +89,28 @@ async fn edge_leads_steady_state_public_dropped() {
     .await
     .unwrap();
 
-    // Let the edge mktdata be fully processed (floor advanced) and the feeder connect/subscribe.
+    // Let the edge mktdata be fully processed (floor advanced to the max edge tick) and the feeder
+    // connect/subscribe.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Now the public feed mirrors several updates at long-passed source_ts (time_ms=1 → 1e6 ns,
-    // far below the edge's epoch-ns floor) with a distinctive price. Every one is stale → dropped.
-    for i in 0..5 {
-        mock.send_bbo("BTC", 1 + i, 99999.0, 1.0, 100000.0, 1.0);
+    // Mirror the public feed onto the exact ticks the edge owns, with distinctive synthetic prices
+    // (1.x — far below real BTC top-of-book, so they can't collide with an edge quote's price). The
+    // copy at the max tick (== the floor high-water) exercises the non-leader drop; the rest are
+    // stale. Distinct prices ensure content dedup isn't what drops them — only the floor's logic is.
+    let ticks = edge_quote_ticks();
+    assert!(!ticks.is_empty(), "fixture carries no edge quote source_ts");
+    let mut public_bids = Vec::new();
+    for (i, &ts) in ticks.iter().enumerate() {
+        // The edge derives source_ts = block_time_ms × 1_000_000, so each tick is an exact ms
+        // multiple; pin that identity (the feeder reverses it) and mirror onto the SAME tick.
+        assert_eq!(
+            ts % 1_000_000,
+            0,
+            "edge source_ts {ts} is not an exact ms multiple"
+        );
+        let bid = 1.0 + i as f64;
+        public_bids.push(bid);
+        mock.send_bbo("BTC", ts / 1_000_000, bid, 1.0, bid + 0.5, 1.0);
     }
 
     let msgs = collector.await.unwrap();
@@ -81,17 +119,18 @@ async fn edge_leads_steady_state_public_dropped() {
     assertions::instrument_before_price(&msgs);
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
-    // The public copies were all stale and dropped: the count is exactly the edge-only count.
+    // The public copies were all dropped (stale + non-leader): the count is exactly the edge-only one.
     assert_eq!(
         quotes.len(),
         EDGE_ONLY_QUOTES,
-        "public copies must be dropped as non-leaders; expected {EDGE_ONLY_QUOTES} edge quotes only"
+        "public copies must be dropped as stale/non-leaders; expected {EDGE_ONLY_QUOTES} edge quotes only"
     );
-    // Belt and suspenders: the distinctive public price never reached the wire.
+    // Belt and suspenders: no distinctive public price reached the wire.
     assert!(
-        !quotes
-            .iter()
-            .any(|q| q.get("bid").and_then(|v| v.as_f64()) == Some(99999.0)),
+        !quotes.iter().any(|q| {
+            let bid = q.get("bid").and_then(|v| v.as_f64());
+            bid.is_some_and(|b| public_bids.contains(&b))
+        }),
         "a public (losing) quote leaked onto the wire"
     );
 }

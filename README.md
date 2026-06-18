@@ -240,6 +240,12 @@ errors are logged and never touch the multicast hot path) and relies on the edge
 precision — it emits a public quote/trade only once that `(venue, symbol)` instrument is known. The
 outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
 
+> **Caveat — trade dedup window vs. reconnect lag.** Cross-source trade dedup is a fixed-size
+> windowed `trade_id` cache. A long public reconnect can deliver trades whose ids have aged out of
+> the window during a high-volume burst, which would re-emit a duplicate trade. Sizing the window
+> against the public feed's unbounded-lag failure mode is tracked separately (window-sizing issue);
+> until then the window is a compile-time constant.
+
 ## Learn more
 
 - **[PROTOCOL.md](PROTOCOL.md)**: the full WebSocket JSON contract (v1).
