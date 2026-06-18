@@ -32,11 +32,19 @@ impl Bridge {
     /// containers and CI. Override with `DZ_E2E_IFACE` if a specific environment needs a
     /// named interface (e.g. `eth0`).
     pub fn spawn(venue: &str, ws_port: u16) -> Self {
+        Self::spawn_with_args(venue, ws_port, &[])
+    }
+
+    /// Like [`Self::spawn`] but appends `extra_args` to the binary's argv — used to point the WS
+    /// **input** feeder at a mock (`--ws-input-url` / `--ws-input-coins`) for the arbitrage E2E.
+    pub fn spawn_with_args(venue: &str, ws_port: u16, extra_args: &[&str]) -> Self {
         let bin = env!("CARGO_BIN_EXE_doublezero-edge-connect");
         let ws_addr = format!("127.0.0.1:{ws_port}");
         let iface = std::env::var("DZ_E2E_IFACE").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let mut args = vec!["--feed", venue, "--iface", &iface, "--ws-bind", &ws_addr];
+        args.extend_from_slice(extra_args);
         let mut child = Command::new(bin)
-            .args(["--feed", venue, "--iface", &iface, "--ws-bind", &ws_addr])
+            .args(&args)
             .env("RUST_LOG", "info")
             // Capture stdout to watch for the receiver-bound marker; keep stderr inherited so
             // error/warn lines surface in test output immediately without buffering.

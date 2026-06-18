@@ -14,3 +14,4 @@ pub mod feeds;
 pub mod processor;
 pub mod receiver;
 pub mod subscriber;
+pub mod ws_feeder;

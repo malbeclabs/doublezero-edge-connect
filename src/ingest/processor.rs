@@ -16,7 +16,6 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        arbiter::{StalenessFloor, WindowedDedup},
         book::{BookState, DeltaKind, DeltaOp},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -35,37 +34,6 @@ use crate::{
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
 
-/// Recent trade IDs remembered per (venue, symbol) for cross-publisher trade dedup. Const for now;
-/// promote to config alongside the multi-publisher trade test that can size it.
-const TRADE_DEDUP_WINDOW: usize = 8192;
-
-/// Cap on distinct leader BBOs tracked per `source_ts` tick by the quote floor — a safety bound so a
-/// stalled/repeated `source_ts` can't grow the per-tick set without limit. Far above the real
-/// per-block max (~hundreds of distinct BBOs share one HL block timestamp), so it never evicts in
-/// normal operation.
-const QUOTE_TICK_CAP: usize = 8192;
-
-/// The canonical top-of-book identity of a quote, used as the per-tick content key for the quote
-/// dedup floor — the components of the spec's `bbo_hash` (`malbeclabs/hyperliquid`
-/// `StableBBOHash`): raw bid/ask price + size, the source counts `bid_n`/`ask_n` (a change in the
-/// number of orders/sources at the top is a distinct BBO), **plus the instrument exponents**, and
-/// EXCLUDES `source_ts` (tracked separately by the floor). Exponents are carried so a
-/// registry/precision change can't false-dedup; within one Edge feed they are constant, so the
-/// spec's `-8/-8` canonicalization is a no-op here and is deferred to the cross-feed path (PR #32,
-/// Edge vs public WS). Identical content at the same `source_ts` — a republish or the other
-/// publisher's copy — is a true duplicate.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct QuoteContent {
-    bid_price_raw: i64,
-    bid_qty_raw: u64,
-    ask_price_raw: i64,
-    ask_qty_raw: u64,
-    bid_n: u16,
-    ask_n: u16,
-    price_exponent: i8,
-    qty_exponent: i8,
-}
-
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
 /// multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same key; they are expected to
@@ -73,7 +41,7 @@ struct QuoteContent {
 /// silently clobbering.
 fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
     let key = (inst.venue.clone(), inst.symbol.clone());
-    let mut map = instruments.lock().unwrap();
+    let mut map = crate::model::lock(instruments);
     if let Some(prev) = map.get(&key) {
         if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
             warn!(
@@ -106,15 +74,6 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
-    /// Cross-publisher quote dedup: a per-(venue, symbol) `source_ts` latch-to-leader floor keyed on
-    /// raw BBO content and the source IP. Within one `source_ts` tick it emits only the leader (first
-    /// publisher to open the tick) and drops other publishers' samples, because arrival order across
-    /// delayed publishers can't be trusted (a slower publisher's older sample landing last would read
-    /// as a phantom change). Drops a strictly-older BBO (stale laggard) and the leader's exact
-    /// `(source_ts, content)` repeats. Output `source_ts` is non-decreasing per (venue, symbol).
-    quote_dedup: StalenessFloor<(&'static str, u32), QuoteContent, IpAddr>,
-    /// Cross-publisher trade dedup by venue trade_id per (venue, instrument).
-    trade_dedup: WindowedDedup<(&'static str, u32), u64>,
 }
 
 impl TobProcessor {
@@ -125,40 +84,7 @@ impl TobProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
-            quote_dedup: StalenessFloor::new(QUOTE_TICK_CAP),
-            trade_dedup: WindowedDedup::new(TRADE_DEDUP_WINDOW),
         }
-    }
-
-    /// Whether this quote should be forwarded under the per-(venue, instrument) latch-to-leader floor:
-    /// true if `source_ts` is at or beyond the floor AND (it opens a new tick, or `publisher` is the
-    /// tick's latched leader and the `content` is new). Drops strictly-older (stale laggard) BBOs,
-    /// non-leader samples within a tick, and the leader's exact `(source_ts, content)` repeats.
-    ///
-    /// `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real time): such a
-    /// quote bypasses the floor and is always forwarded. Routing it through the floor would pin
-    /// `high_water` at 0 and drop every non-leader publisher forever — defeating the failover. The
-    /// key is `(venue, instrument_id)` — both `Copy`, so no per-quote allocation; `venue` is the
-    /// publisher-independent *resolved* venue (NOT `source_id`, which differs per publisher), so
-    /// mirrors of one feed still dedup against each other.
-    fn admit_quote(
-        &mut self,
-        venue: &'static str,
-        instrument_id: u32,
-        source_ts: u64,
-        content: QuoteContent,
-        publisher: IpAddr,
-    ) -> bool {
-        if source_ts == 0 {
-            return true;
-        }
-        self.quote_dedup
-            .admit((venue, instrument_id), source_ts, content, publisher)
-    }
-
-    /// Whether this trade should be forwarded: false if its trade_id was seen recently.
-    fn admit_trade(&mut self, venue: &'static str, instrument_id: u32, trade_id: u64) -> bool {
-        self.trade_dedup.is_new((venue, instrument_id), trade_id)
     }
 }
 
@@ -250,7 +176,7 @@ impl FrameProcessor for TobProcessor {
                     // instrument before any quote.
                     upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
-                    let _ = ctx.tx.send(FeedMessage::Instrument(inst));
+                    ctx.emit(FeedMessage::Instrument(inst));
                 }
                 Message::ChannelReset(ts) if handle_refdata => {
                     warn!(ts, "channel reset; discarding reference-data state");
@@ -309,31 +235,13 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    // Cross-publisher dedup on a per-(venue, instrument) source_ts latch-to-leader
-                    // floor: within one source_ts tick only the leader (first publisher to open it)
-                    // is emitted — a slower publisher's samples at the same tick arrive in a
-                    // delay-corrupted order and can't be trusted, so they are dropped. A strictly-
-                    // older sample (stale laggard) and the leader's exact (source_ts, content)
-                    // repeats are dropped too. Output source_ts is non-decreasing per instrument.
-                    let content = QuoteContent {
-                        bid_price_raw: q.bid_price_raw,
-                        bid_qty_raw: q.bid_qty_raw,
-                        ask_price_raw: q.ask_price_raw,
-                        ask_qty_raw: q.ask_qty_raw,
-                        bid_n: q.bid_n,
-                        ask_n: q.ask_n,
-                        price_exponent: def.price_exponent,
-                        qty_exponent: def.qty_exponent,
-                    };
-                    if self.admit_quote(
-                        venue,
-                        q.instrument_id,
-                        quote.source_ts_ns,
-                        content,
-                        ctx.publisher,
-                    ) {
-                        let _ = ctx.tx.send(FeedMessage::Quote(quote));
-                    }
+                    // Cross-source dedup happens downstream in the shared arbiter: the per-(venue,
+                    // instrument) source_ts latch-to-leader floor races this edge publisher against
+                    // the other edge publishers and the public WS feeder for the tick, emitting only
+                    // the leader. `ctx.emit` tags the quote with this datagram's source IP as the
+                    // floor's leader identity, and the arbiter keys the BBO identity on the canonical
+                    // bbo_hash (incl. the bid_n/ask_n carried on `quote`). (See `ingest::arbiter`.)
+                    ctx.emit(FeedMessage::Quote(quote));
                 }
                 Message::Trade(t) if handle_quotes && quotes_fresh => {
                     // Same per-instrument precision gate as quotes: a trade is dropped until we
@@ -358,9 +266,10 @@ impl FrameProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    if self.emit_trades && self.admit_trade(venue, t.instrument_id, trade.trade_id)
-                    {
-                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                    // The arbiter's windowed trade dedup (on trade_id) collapses any cross-source
+                    // copy downstream; this feed only gates on whether it owns this venue's trades.
+                    if self.emit_trades {
+                        ctx.emit(FeedMessage::Trade(trade));
                     }
                 }
                 _ => {}
@@ -442,7 +351,7 @@ impl FrameProcessor for MidpointProcessor {
                     };
                     upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
-                    let _ = ctx.tx.send(FeedMessage::Instrument(inst));
+                    ctx.emit(FeedMessage::Instrument(inst));
                 }
                 codec_midpoint::Message::EndOfSession(ts) if handle_refdata => {
                     info!(ts, "midpoint end of session");
@@ -472,7 +381,7 @@ impl FrameProcessor for MidpointProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    let _ = ctx.tx.send(FeedMessage::Midpoint(midpoint));
+                    ctx.emit(FeedMessage::Midpoint(midpoint));
                 }
                 _ => {}
             }
@@ -539,11 +448,9 @@ impl MboProcessor {
             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
             ws_send_ts_ns: 0, // stamped by the WS server just before send
         };
-        self.depth
-            .lock()
-            .unwrap()
+        crate::model::lock(&self.depth)
             .insert((depth.venue.clone(), depth.symbol.clone()), depth.clone());
-        let _ = ctx.tx.send(FeedMessage::Depth(depth));
+        ctx.emit(FeedMessage::Depth(depth));
     }
 }
 
@@ -581,7 +488,7 @@ impl FrameProcessor for MboProcessor {
                     };
                     upsert_instrument(ctx.instruments, &inst);
                     self.state.on_instrument_definition(d);
-                    let _ = ctx.tx.send(FeedMessage::Instrument(inst));
+                    ctx.emit(FeedMessage::Instrument(inst));
                 }
                 codec_mbo::Message::EndOfSession(ts) => info!(ts, "mbo end of session"),
                 codec_mbo::Message::OrderAdd(o) => {
@@ -643,7 +550,7 @@ impl FrameProcessor for MboProcessor {
                             ws_send_ts_ns: 0,
                         };
                         if self.emit_trades {
-                            let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                            ctx.emit(FeedMessage::Trade(trade));
                         }
                     }
                 }
@@ -675,7 +582,7 @@ impl FrameProcessor for MboProcessor {
                         }
                     }
                     if self.emit_trades {
-                        let _ = ctx.tx.send(FeedMessage::Trade(trade));
+                        ctx.emit(FeedMessage::Trade(trade));
                     }
                 }
                 codec_mbo::Message::InstrumentReset(r) => {
@@ -742,9 +649,10 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor, QuoteContent, TobProcessor};
+    use super::{upsert_instrument, MboProcessor};
     use crate::{
         ingest::{
+            arbiter::{Arbiter, SharedArbiter},
             codec_mbo::{
                 tests::{enc_order_add, enc_snapshot_begin, enc_snapshot_end, frame},
                 OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
@@ -755,56 +663,11 @@ mod tests {
         model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
     };
 
-    #[test]
-    fn tob_quote_dedup_latches_to_leader() {
-        use std::net::{IpAddr, Ipv4Addr};
-        let (a, b) = (
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-        );
-        let mut p = TobProcessor::new(true);
-        let (btc, eth) = (0u32, 1u32); // instrument ids
-                                       // Two distinct BBO contents that can share a source_ts (a real intra-tick change).
-        let c1 = QuoteContent {
-            bid_price_raw: 100,
-            bid_qty_raw: 5,
-            ask_price_raw: 101,
-            ask_qty_raw: 8,
-            bid_n: 1,
-            ask_n: 1,
-            price_exponent: -2,
-            qty_exponent: 0,
-        };
-        let c2 = QuoteContent {
-            bid_price_raw: 100,
-            bid_qty_raw: 6, // bid size changed
-            ..c1
-        };
-        // Same px/sz as c1 but a different source count -> a distinct BBO (matches bbo_hash).
-        let c1_n = QuoteContent { bid_n: 2, ..c1 };
-        // Per-(venue, instrument) latch-to-leader floor.
-        assert!(p.admit_quote("Hyperliquid", btc, 1000, c1, a)); // first sample -> A leads the tick
-        assert!(!p.admit_quote("Hyperliquid", btc, 1000, c1, a)); // A's exact (ts, content) dup dropped
-        assert!(p.admit_quote("Hyperliquid", btc, 1000, c2, a)); // A's new content at SAME tick kept
-        assert!(p.admit_quote("Hyperliquid", btc, 1000, c1_n, a)); // px/sz of c1 but new bid_n -> kept
-        assert!(!p.admit_quote("Hyperliquid", btc, 1000, c2, b)); // B at same tick -> dropped (latch to A)
-        assert!(!p.admit_quote("Hyperliquid", btc, 999, c1, a)); // strictly older (stale) dropped
-        assert!(p.admit_quote("Hyperliquid", btc, 2000, c1, b)); // new tick: B opens it -> B leads, emit
-        assert!(p.admit_quote("Hyperliquid", eth, 1000, c1, a)); // independent instrument's floor
-                                                                 // source_ts == 0 is the "not available" sentinel: bypass the floor, always forward (never
-                                                                 // latch/pin), so a 0-stamping feed can't wedge non-leaders.
-        assert!(p.admit_quote("Hyperliquid", btc, 0, c1, a));
-        assert!(p.admit_quote("Hyperliquid", btc, 0, c1, b)); // both publishers forwarded at ts=0
-    }
-
-    #[test]
-    fn tob_trade_dedup_drops_repeat() {
-        let mut p = TobProcessor::new(true);
-        let btc = 0u32;
-        assert!(p.admit_trade("Hyperliquid", btc, 7));
-        assert!(!p.admit_trade("Hyperliquid", btc, 7));
-        assert!(p.admit_trade("Hyperliquid", btc, 8));
-    }
+    // The quote latch-to-leader floor and the trade windowed dedup now live in the shared
+    // `ingest::arbiter` (lifted out of `TobProcessor` so the multicast processors and the WS feeder
+    // converge on one floor per (venue, symbol)). Their unit coverage — leader latch, non-leader
+    // drop, stale-tick drop, capacity bound, source_ts==0 bypass, the bbo_hash identity incl.
+    // bid_n/ask_n, and the public-loses-to-edge backstop — lives in `arbiter::tests`.
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
     ///
@@ -848,13 +711,13 @@ mod tests {
     }
 
     fn make_ctx<'a>(
-        tx: &'a broadcast::Sender<FeedMessage>,
+        arbiter: &'a SharedArbiter,
         instruments: &'a crate::model::InstrumentSnapshot,
         role: PortRole,
     ) -> FrameCtx<'a> {
         FrameCtx {
             venue: "TV",
-            tx,
+            arbiter,
             instruments,
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,
@@ -885,6 +748,7 @@ mod tests {
     #[test]
     fn mbo_depth_emit_order_is_ascending_instrument_id() {
         let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, false);
@@ -896,7 +760,7 @@ mod tests {
                 enc_instrument_def(0, "INST-0", 1),
                 enc_instrument_def(1, "INST-1", 1),
             ]),
-            &make_ctx(&tx, &instruments, PortRole::Combined),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
 
         // Sync each instrument via an empty-book anchor snapshot (0 orders, anchor_seq=0).
@@ -917,7 +781,7 @@ mod tests {
                 }),
             ])
         };
-        let snap_ctx = make_ctx(&tx, &instruments, PortRole::Snapshot);
+        let snap_ctx = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
         proc.on_datagram(&snap(0, 1), &snap_ctx);
         proc.on_datagram(&snap(1, 2), &snap_ctx);
         drain_depth_ids(&mut rx); // discard snapshot-triggered emits
@@ -950,7 +814,7 @@ mod tests {
         ]);
         proc.on_datagram(
             &mktdata_frame,
-            &make_ctx(&tx, &instruments, PortRole::Mktdata),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
         let ids = drain_depth_ids(&mut rx);
@@ -993,7 +857,7 @@ mod tests {
         ]);
         proc.on_datagram(
             &mktdata_frame2,
-            &make_ctx(&tx, &instruments, PortRole::Mktdata),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert_eq!(
             drain_depth_ids(&mut rx),

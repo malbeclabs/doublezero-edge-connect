@@ -35,6 +35,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error can't drop a datagram bound for a healthy one. A shred-side failure is logged and
   isolated — it never takes the market-data bridge down. Datagrams that fill the recv buffer
   (likely truncated, no `MSG_TRUNC`) are dropped rather than forwarded corrupt (#24).
+- Hyperliquid **public** WebSocket input feeder (`src/ingest/ws_feeder.rs`), a second ingest source
+  that backstops the DZ Edge multicast feed (#8). It connects to `wss://api.hyperliquid.xyz/ws` over
+  TLS, subscribes `bbo` + `trades` per configured coin on one connection, decodes the HL JSON into the
+  same `FeedMessage`s the multicast pipeline produces, and emits them through the shared arbiter as a
+  distinct `Publisher::PublicWs`. Because it shares the per-`(venue, symbol)` latch-to-leader floor with
+  the edge feed, the backstop falls out with **no health check**: the edge wins every tick in steady
+  state (the public copy loses the race and is dropped as a no-op), and when the edge gaps the public
+  copy is the first to cross the floor and fills in. The public block time (ms) is scaled to ns so both
+  sources share the same canonical `source_ts`; trades dedup on `tid` (the edge feed's `trade_id`).
+  **Off by default**, enabled with a non-empty `--ws-input-coins` (env `WS_INPUT_COINS`);
+  `--ws-input-url` (env `WS_INPUT_URL`) overrides the endpoint. Failure-isolated (its own task with
+  reconnect + exponential backoff; decode/socket errors are logged and swallowed), and each public
+  quote/trade is gated on its `(venue, symbol)` instrument being known (precision before price). A mock
+  HL WS input harness drives two new E2E cases (edge-leads-in-steady-state, edge-gap→public-fills-in).
+  The feeder adds no new WebSocket output fields of its own; it populates the same `bid_n`/`ask_n`
+  (from the public `bbo` level's `n`) the edge feed serves.
+  - Reconnect backoff resets to the floor only after a session stays up past a minimum duration, so a
+    connect-then-immediate-drop loop keeps escalating instead of hammering the public endpoint.
+  - Shared mutexes (`InstrumentSnapshot`/`DepthSnapshot`/arbiter) lock via a poison-recovering helper
+    (`model::lock`), so an unrelated panic in one ingest task can't cascade into the others.
+- Cross-source quote identity is the canonical `bbo_hash` (`StableBBOHash`): bid/ask price + size at
+  the `10^-8` scale plus `bid_n`/`ask_n`. Computing it at a fixed scale (not raw `f64` bits) collapses
+  the edge's `raw * 10^exp` and the public feed's parsed float for the same economic price onto one
+  identity, so a cross-source copy dedups. The arbiter also drops a quote whose `source_ts` is
+  implausibly far in the future before it can advance the shared floor — one bad/hostile public
+  timestamp would otherwise latch the floor ahead and drop every real edge quote as stale until restart.
 - Real Hyperliquid Market-by-Order (MBO) feed ingestion: a confirmed `FEEDS` row
   (`233.84.178.15`, ports `10201`/`10202`/`10203`, depth-only) re-served as full-state
   `depth`. `--feed <venue>` now selects every protocol feed for that venue.
@@ -84,6 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
+- The quote latch-to-leader floor and the windowed trade dedup moved out of `TobProcessor` into a
+  shared pre-broadcast `Arbiter` (`src/ingest/arbiter.rs`) that owns the broadcast `Sender` and
+  exposes one `emit(msg, publisher)` entry point (#8). Every ingest source — each multicast receiver
+  and the new public WS feeder — funnels through one `Arc<Mutex<Arbiter>>`, so they all race on the
+  same per-`(venue, symbol)` floor instead of each owning a private one. A `Publisher { Edge(IpAddr),
+  PublicWs }` enum is the floor's leader identity. Behavior-preserving for the edge path (the
+  two-publisher and single-publisher counts are unchanged); the refactor itself adds no output fields.
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry
   multiple protocol feeds.
 - Bumped dependencies from the open Dependabot PRs: `tokio-tungstenite`
