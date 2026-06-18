@@ -7,3 +7,4 @@ pub mod assertions;
 pub mod bridge;
 pub mod replay;
 pub mod ws_client;
+pub mod ws_input;
