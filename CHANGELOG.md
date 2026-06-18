@@ -130,12 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`src/main.rs`) is now a thin wrapper, so dev tooling and tests can reuse the codecs.
 
 ### Fixed
-- Docker release workflow could not push to GHCR (`denied: installation not allowed to
-  Write organization package`): the reusable `release.docker.edge-connect.build`
-  workflow declared only `contents: read`, and since a called workflow's permissions are
-  intersected with the caller's, that silently dropped the `packages: write` the publish
-  and rebuild jobs grant. Added `packages: write` to the reusable workflow so the push is
-  authorized (smoke builds still grant only `packages: read`, so they remain push-gated).
+- Docker release workflow could not push to GHCR: the reusable
+  `release.docker.edge-connect.build` workflow declared a top-level `permissions:
+  contents: read` block, which intersects with (and so can only narrow) the caller's
+  grant — silently dropping the `packages: write` that the publish/rebuild jobs grant, so
+  the push was denied. Removed the block entirely so the `workflow_call`-only workflow
+  inherits each caller's permissions (publish/rebuild → write, smoke → read), which is the
+  only form that both authorizes the push and keeps smoke (PR) builds push-gated.
 - Corrected inverted Market-by-Order order-book side constants (`0 = Bid`, `1 = Ask` per
   the edge-feed-spec); bids and asks in `depth` were previously swapped.
 - Warn instead of silently clobbering when two feeds for the same `(venue, symbol)` publish

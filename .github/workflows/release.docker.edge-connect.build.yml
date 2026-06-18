@@ -29,15 +29,12 @@ on:
         default: ""
         type: string
 
-# Reusable workflow: the effective GITHUB_TOKEN is the INTERSECTION of this block and
-# the caller job's permissions. It must therefore name every scope any caller grants,
-# or that scope is dropped — declaring only contents:read here silently stripped the
-# packages:write that publish/rebuild grant, so the GHCR push was denied. The push
-# itself stays gated by the caller (smoke grants packages:read -> intersection is read).
-permissions:
-  contents: read
-  packages: write
-
+# No top-level permissions: this is a workflow_call-only workflow, so it inherits the
+# GITHUB_TOKEN permissions the caller job grants (publish/rebuild -> packages:write,
+# smoke -> packages:read). Declaring a block here would INTERSECT with the caller and
+# can only narrow it: `contents: read` silently stripped the packages:write the push
+# needs (GHCR denied), and adding packages:write made smoke request more than its
+# caller grants, failing the run at startup. Inheriting is the only correct option.
 jobs:
   build:
     runs-on: ubuntu-latest
