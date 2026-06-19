@@ -231,7 +231,7 @@ async fn forwarder_task_forwards_one_copy_per_shred_over_real_capture() {
     let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dst = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel::<ShredPacket>(256);
-    let handle = tokio::spawn(forwarder_task(rx, vec![dst], Some(schedule), 512));
+    let handle = tokio::spawn(forwarder_task(rx, vec![dst], Some(schedule), false, 512));
     for pkt in &datagrams {
         tx.send(pkt.clone()).await.unwrap();
     }

@@ -161,8 +161,10 @@ non-empty default bind, so it is on unless you explicitly clear it.
 Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
 joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
 out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). By
-default it forwards every datagram; set `--shred-rpc-url` to forward exactly one signature-verified
-copy of each shred (see below). Each destination gets its own `connect`ed send socket, so an async
+default it forwards every datagram; set `--shred-dedup` to forward only one copy of each shred (DoubleZero
+delivers the same shred on several overlapping multicast groups, so this collapses the duplicate fan-out),
+or `--shred-rpc-url` to additionally signature-verify that one copy (see below). Each destination gets its
+own `connect`ed send socket, so an async
 ICMP error from a down destination (e.g. nothing listening) stays isolated to that socket and never
 drops a datagram bound for a healthy one. `--shred-forward` targets should be local/fast sinks: sends
 are sequential per destination, so a slow or remote sink throttles the whole forwarder (and sheds
@@ -174,21 +176,29 @@ It **activates on discovery**: by default it shells out to `doublezero multicast
 errors, or finds no matching group, the forwarder stays off. Pass `--shred-source GROUP:PORT`
 (repeatable) to override discovery entirely.
 
-**Signature verification + deduplication.** Set `--shred-rpc-url` to a Solana JSON-RPC endpoint and
-the forwarder forwards exactly **one valid copy** of each shred instead of every datagram. It keys a
-bounded, prefer-valid dedup window on `(slot, index, type)`: a duplicate of an already-forwarded copy
-is dropped without a signature check; the first copy of a key is ed25519-verified against its slot
-leader (leader schedule fetched per epoch from the RPC and cached); an invalid copy is dropped but
-leaves the key open so a later valid copy can still win. A slot whose leader isn't known yet (schedule
-still loading, or outside the cached epoch) fails **open** — forwarded but not deduped — so the
-forwarder never silently drops traffic it can't yet judge. Without `--shred-rpc-url`, behaviour is
-unchanged (every datagram forwarded).
+**Deduplication.** The forwarder has three modes:
+
+- **Bare** (default, neither flag): every datagram is forwarded — duplicates and all.
+- **Dedup-only** (`--shred-dedup`, no RPC): forward exactly **one copy** of each shred, keyed on
+  `(slot, index, type)` in a bounded window — a duplicate of an already-forwarded copy is dropped.
+  No leader lookup, no signature work, no RPC. This is the cheap suppressor for the multicast-overlap
+  duplicates (forgery protection is moot on the trusted DoubleZero network).
+- **Dedup + sigverify** (`--shred-rpc-url`): same dedup, plus the first copy of each key is
+  ed25519-verified against its slot leader before being forwarded. The leader schedule is fetched per
+  epoch from the RPC and cached; an invalid copy is dropped but leaves the key open so a later valid
+  copy can still win; a slot whose leader isn't known yet (schedule still loading, or outside the
+  cached epoch) fails **open** — forwarded but not deduped — so the forwarder never silently drops
+  traffic it can't yet judge.
+
+Both dedup modes share the bounded `(slot, index, type)` window (`--shred-dedup-window-slots`): keys
+older than that many slots behind the tip are evicted, so memory is bounded by `window × shreds-per-slot`.
 
 > ⚠️ The shred/merkle byte offsets are transcribed from the agave shred layout and are **not** yet
 > validated against a live `edge-solana-*` hexdump (the same caveat as the repo's unvalidated Midpoint/
-> MBO codecs). Confirm them against a captured frame before relying on sigverify in production; the
-> forwarder logs a one-time warning when sigverify is on and a periodic valid/invalid tally so a
-> systematic misparse (≈100% "invalid") is obvious.
+> MBO codecs). This affects **both** dedup modes: a misparse mis-keys a shred and could over- or
+> under-deduplicate (and, in sigverify mode, mis-verify). Confirm the offsets against a captured frame
+> before relying on either in production; the forwarder logs a one-time warning when sigverify is on
+> and a periodic tally so a systematic misparse (≈100% "invalid") is obvious.
 
 | Flag | Env | Default |
 |------|-----|---------|
@@ -196,8 +206,9 @@ unchanged (every datagram forwarded).
 | `--shred-port` | `DZ_SHRED_PORT` | `7733` |
 | `--shred-forward` (repeatable) | `DZ_SHRED_FORWARD` | `127.0.0.1:20000` |
 | `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
+| `--shred-dedup` | `DZ_SHRED_DEDUP` | `false` (set to dedup without sigverify) |
 | `--shred-rpc-url` | `DZ_SHRED_RPC_URL` | — (set to enable sigverify + dedup) |
-| `--shred-dedup-window-slots` | `DZ_SHRED_DEDUP_WINDOW_SLOTS` | `512` |
+| `--shred-dedup-window-slots` | `DZ_SHRED_DEDUP_WINDOW_SLOTS` | `512` (used with `--shred-dedup` or `--shred-rpc-url`) |
 
 The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
 at startup, and a non-loopback `--shred-forward` target is warned about (it would route raw,
