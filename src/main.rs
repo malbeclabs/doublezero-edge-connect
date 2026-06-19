@@ -221,7 +221,8 @@ async fn main() -> Result<()> {
     } else {
         // A zero window evicts everything immediately, defeating dedup; reject it up front rather
         // than silently forwarding every duplicate.
-        if (args.shred_rpc_url.is_some() || args.shred_dedup) && args.shred_dedup_window_slots == 0 {
+        if (args.shred_rpc_url.is_some() || args.shred_dedup) && args.shred_dedup_window_slots == 0
+        {
             bail!("--shred-dedup-window-slots must be > 0 when --shred-rpc-url or --shred-dedup is set");
         }
         let shred_cfg = shred::ShredConfig {

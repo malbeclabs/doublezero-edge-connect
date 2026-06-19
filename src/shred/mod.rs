@@ -792,8 +792,12 @@ mod tests {
         // The production case: DoubleZero delivers the same shred on several overlapping multicast
         // groups (the measured mode was 3 copies). All copies of one key collapse to a single forward.
         let shred = legacy_shred_at_index(TEST_INDEX);
-        let got = run_forwarder_mode(None, true, vec![shred.clone(), shred.clone(), shred.clone(), shred])
-            .await;
+        let got = run_forwarder_mode(
+            None,
+            true,
+            vec![shred.clone(), shred.clone(), shred.clone(), shred],
+        )
+        .await;
         assert_eq!(got, 1, "all copies of a key collapse to one forward");
     }
 
@@ -803,7 +807,10 @@ mod tests {
         // silently dropping it (loss-averse) — it simply isn't deduplicated.
         let junk = vec![0u8; 16]; // < SIZE_OF_COMMON_HEADER -> parse() returns None
         let got = run_forwarder_mode(None, true, vec![junk.clone(), junk]).await;
-        assert_eq!(got, 2, "unparseable datagrams are forwarded undeduped, not dropped");
+        assert_eq!(
+            got, 2,
+            "unparseable datagrams are forwarded undeduped, not dropped"
+        );
     }
 
     #[tokio::test]
