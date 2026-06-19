@@ -69,6 +69,29 @@ info() { printf '%s==>%s %s\n' "$GRN" "$RST" "$*"; }
 warn() { printf '%s!! %s%s\n' "$YEL" "$*" "$RST" >&2; }
 die()  { printf '%sxx %s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
 
+# Visual countdown so a freshly-started daemon can finish probing devices before
+# we connect. A cold daemon pulls a device list to ping, and `doublezero connect
+# multicast` otherwise races that probe and times out. REVISIT: drop this once
+# `connect` waits for the daemon itself. Animates on a TTY; under `curl | bash`
+# with no terminal it just sleeps.
+spin_sleep() {
+  secs="$1"; msg="$2"
+  if [ -t 1 ]; then
+    frames='|/-\'
+    for n in $(seq "$secs" -1 1); do
+      for k in 1 2 3 4 5; do
+        f=$(printf '%s' "$frames" | cut -c "$(( (k - 1) % 4 + 1 ))")
+        printf '\r%s==>%s %s %s (%2ss) ' "$GRN" "$RST" "$msg" "$f" "$n"
+        sleep 0.2
+      done
+    done
+    printf '\r%s==>%s %s done       \n' "$GRN" "$RST" "$msg"
+  else
+    info "$msg (waiting ${secs}s)"
+    sleep "$secs"
+  fi
+}
+
 # /dev/tty so prompts work under `curl | bash` (where stdin is the script)
 TTY=/dev/tty
 ask() {  # ask "Question" "default" -> echoes answer
@@ -290,6 +313,8 @@ fi
 # ----------------------------------------------------------------------------
 # 7. connect (always `doublezero connect multicast`)
 # ----------------------------------------------------------------------------
+# Give a cold daemon a head start on device probing before connect (see spin_sleep).
+spin_sleep 15 "Letting the daemon finish bootstrapping"
 info "Connecting: doublezero connect multicast"
 # Allocate a pseudo-TTY when our stdout is a terminal so the CLI streams its
 # normal output to the screen (without -t, docker exec gives it no TTY and the
@@ -308,6 +333,8 @@ HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"; HOST_IP="${HOST_IP:-loc
 # Reflect any WS_BIND override in the printed URL (take the port after the last colon).
 [ -n "${WS_BIND:-}" ]  && WS_PORT="${WS_BIND##*:}"
 echo
+# Brief pause so the freshly-connected tunnel settles before we read status.
+spin_sleep 5 "Waiting for the tunnel to settle"
 $SUDO docker exec "$DZ_NAME" doublezero status || true
 echo
 info "Done. The bridge is serving normalized quotes:"
