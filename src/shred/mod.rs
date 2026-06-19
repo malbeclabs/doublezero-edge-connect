@@ -12,15 +12,20 @@
 //! lives, with no cross-task sharing. Receivers stay dumb (recv → push bytes); the forwarder owns
 //! the send socket, the dedup window, and the leader-schedule lookup.
 //!
-//! Two modes, selected by whether a Solana RPC URL is configured:
-//! - **No RPC URL** → bare forward: every datagram is fanned out (the original behaviour).
-//! - **RPC URL set** → forward exactly **one valid copy** of each shred. The forwarder keys a
-//!   bounded, prefer-valid dedup window on `(slot, index, type)` ([`dedup`]); the first copy of a
-//!   key is ed25519-verified ([`verify`]) against its slot leader ([`leader`]) using fields pulled
-//!   from the raw datagram ([`parse`]). A verified copy is forwarded and recorded; later duplicates
-//!   are dropped *without* a signature check; an invalid copy is dropped but leaves the key open so
-//!   a later valid copy can still win. A slot whose leader isn't known yet fails **open** (forward,
-//!   no dedup), so we never silently drop traffic we can't judge.
+//! Three modes:
+//! - **Bare forward** (default, neither flag set) → every datagram is fanned out (original behaviour).
+//! - **Dedup-only** (`--shred-dedup`, no RPC) → forward exactly **one copy** of each shred keyed on
+//!   `(slot, index, type)` ([`dedup`]), with **no** signature verification, leader lookup, or RPC.
+//!   The first copy of a key is forwarded and recorded; later duplicates are dropped. This is the
+//!   cheap suppressor for the multicast-overlap duplicates DoubleZero delivers across its several
+//!   shred groups — forgery protection is moot on the trusted network, so sigverify isn't required.
+//! - **Dedup + sigverify** (`--shred-rpc-url` set) → forward exactly **one valid copy** of each
+//!   shred. The forwarder keys the same bounded, prefer-valid dedup window on `(slot, index, type)`;
+//!   the first copy of a key is ed25519-verified ([`verify`]) against its slot leader ([`leader`])
+//!   using fields pulled from the raw datagram ([`parse`]). A verified copy is forwarded and
+//!   recorded; later duplicates are dropped *without* a signature check; an invalid copy is dropped
+//!   but leaves the key open so a later valid copy can still win. A slot whose leader isn't known
+//!   yet fails **open** (forward, no dedup), so we never silently drop traffic we can't judge.
 
 pub mod dedup;
 pub mod discovery;
@@ -97,8 +102,11 @@ pub struct ShredConfig {
     /// Local destinations every datagram is fanned out to.
     pub forward: Vec<SocketAddr>,
     /// Solana JSON-RPC endpoint for the leader schedule. `Some` enables dedup + sigverify; `None`
-    /// keeps the bare forward-everything behaviour.
+    /// falls back to dedup-only (if `dedup`) or bare forwarding.
     pub rpc_url: Option<String>,
+    /// Dedup on `(slot, index, type)` without sigverify. Ignored when `rpc_url` is `Some` (sigverify
+    /// mode already dedups); `false` + no RPC = bare forward-everything.
+    pub dedup: bool,
     /// Dedup window depth in slots: keys older than this many slots behind the tip are evicted, so
     /// memory is bounded by `window × shreds-per-slot`.
     pub dedup_window_slots: u64,
@@ -169,6 +177,13 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
             });
             Some(sched)
         }
+        None if cfg.dedup => {
+            info!(
+                "shred dedup enabled (no sigverify, no --shred-rpc-url); forwarding one copy per \
+                 (slot, index, type)"
+            );
+            None
+        }
         None => {
             info!("shred sigverify/dedup disabled (no --shred-rpc-url); forwarding every datagram");
             None
@@ -179,6 +194,7 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
         rx,
         cfg.forward.clone(),
         schedule,
+        cfg.dedup,
         cfg.dedup_window_slots,
     ));
     for src in cfg.sources {
@@ -303,7 +319,8 @@ async fn receiver_task(
 /// for its own peer, so each destination's failures stay isolated to its own socket.
 ///
 /// When `schedule` is `Some`, each datagram passes the prefer-valid dedup + sigverify gate before
-/// fan-out (see the module docs); when `None`, every datagram is forwarded (the bare behaviour).
+/// fan-out (see the module docs); when `None` and `dedup` is set, it passes a sigverify-free dedup
+/// gate keyed on `(slot, index, type)`; when neither, every datagram is forwarded (the bare behaviour).
 ///
 /// Sends are sequential per destination, so effective forwarder throughput is ~`1/M` of a single
 /// send and a slow destination sheds load globally (the bounded channel fills and receivers drop).
@@ -320,11 +337,13 @@ async fn receiver_task(
 /// flapping multicast interface is an expected transient).
 ///
 /// When `schedule` is `Some`, each datagram passes the prefer-valid dedup + sigverify gate before
-/// fan-out; when `None`, every datagram is forwarded (the bare behaviour).
+/// fan-out; when `None` and `dedup`, a sigverify-free dedup gate; when neither, every datagram is
+/// forwarded (the bare behaviour).
 async fn forwarder_task(
     mut rx: mpsc::Receiver<ShredPacket>,
     dests: Vec<SocketAddr>,
     schedule: Option<Arc<LeaderSchedule>>,
+    dedup: bool,
     dedup_window_slots: u64,
 ) -> Result<()> {
     // Build one connected send socket per destination so ICMP errors can't cross destinations.
@@ -347,9 +366,12 @@ async fn forwarder_task(
             .with_context(|| format!("connecting shred forward socket to {dst}"))?;
         socks.push((*dst, sock));
     }
+    // Dedup runs whenever sigverify is on (it dedups too) or dedup-only is requested.
+    let dedup_active = schedule.is_some() || dedup;
     info!(
         ?dests,
         sigverify = schedule.is_some(),
+        dedup = dedup_active,
         "shred forwarder ready"
     );
 
@@ -361,15 +383,15 @@ async fn forwarder_task(
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
 
     while let Some(pkt) = rx.recv().await {
-        // Bare mode (no RPC): forward unconditionally.
-        let Some(schedule) = schedule.as_ref() else {
+        // Bare mode (no sigverify, no dedup): forward unconditionally.
+        if !dedup_active {
             fan_out(&socks, &pkt).await;
             continue;
-        };
+        }
         processed += 1;
 
-        // Sigverify + dedup mode. An unparseable datagram can't be keyed, so forward it rather than
-        // silently drop (loss-averse; it simply isn't deduped).
+        // Dedup (with or without sigverify). An unparseable datagram can't be keyed, so forward it
+        // rather than silently drop (loss-averse; it simply isn't deduped).
         let Some(meta) = parse::parse(&pkt) else {
             unparsed += 1;
             forwarded += 1;
@@ -381,22 +403,29 @@ async fn forwarder_task(
         };
         parsed += 1;
 
-        let leader = schedule.leader(meta.slot).await;
-        let action = {
-            let mut verify_fn = || {
-                let ok = leader.as_ref().is_some_and(|pk| verify::verify(&meta, pk));
-                if ok {
-                    verify_ok += 1;
-                }
-                ok
-            };
-            window.decide(
-                meta.slot,
-                meta.index,
-                meta.shred_type,
-                leader.is_some(),
-                &mut verify_fn,
-            )
+        let action = match schedule.as_ref() {
+            // Dedup + sigverify: the first copy of a key is ed25519-verified against its leader.
+            Some(schedule) => {
+                let leader = schedule.leader(meta.slot).await;
+                let mut verify_fn = || {
+                    let ok = leader.as_ref().is_some_and(|pk| verify::verify(&meta, pk));
+                    if ok {
+                        verify_ok += 1;
+                    }
+                    ok
+                };
+                window.decide(
+                    meta.slot,
+                    meta.index,
+                    meta.shred_type,
+                    leader.is_some(),
+                    &mut verify_fn,
+                )
+            }
+            // Dedup-only: no leader lookup, no signature work. The first copy of a key always "wins"
+            // (leader_known = true, verify -> true), so it is forwarded + recorded and later copies
+            // drop. `verify_ok` stays 0 — nothing is signature-checked in this mode.
+            None => window.decide(meta.slot, meta.index, meta.shred_type, true, &mut || true),
         };
         match action {
             Action::Forward => {
@@ -553,6 +582,7 @@ mod tests {
             sources: vec![src],
             forward: vec![d1, d2],
             rpc_url: None,
+            dedup: false,
             dedup_window_slots: 512,
         };
         let handle = tokio::spawn(run(cfg));
@@ -602,6 +632,7 @@ mod tests {
             sources: vec![src],
             forward: vec![dead, live_addr], // dead first: it must not stop the live one after it
             rpc_url: None,
+            dedup: false,
             dedup_window_slots: 512,
         };
         let handle = tokio::spawn(run(cfg));
@@ -660,10 +691,20 @@ mod tests {
     }
 
     async fn run_forwarder(schedule: Arc<LeaderSchedule>, pkts: Vec<Vec<u8>>) -> usize {
+        run_forwarder_mode(Some(schedule), false, pkts).await
+    }
+
+    /// Drive `forwarder_task` in any mode (sigverify via `schedule`, dedup-only via `dedup`, or
+    /// bare) and return how many datagrams reach the single listener.
+    async fn run_forwarder_mode(
+        schedule: Option<Arc<LeaderSchedule>>,
+        dedup: bool,
+        pkts: Vec<Vec<u8>>,
+    ) -> usize {
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dst = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel::<ShredPacket>(64);
-        let handle = tokio::spawn(forwarder_task(rx, vec![dst], Some(schedule), 512));
+        let handle = tokio::spawn(forwarder_task(rx, vec![dst], schedule, dedup, 512));
         for pkt in pkts {
             tx.send(pkt).await.unwrap();
         }
@@ -718,5 +759,70 @@ mod tests {
             got, 2,
             "with no known leader both copies are forwarded, not deduped"
         );
+    }
+
+    // --- Dedup-only forwarder tests (no RPC, no sigverify) ---
+    //
+    // `schedule = None` + `dedup = true`: the forwarder dedups on `(slot, index, type)` without any
+    // leader lookup or signature work. Signatures on the test shreds are irrelevant in this mode.
+
+    /// A legacy data shred for `(TEST_SLOT, index)` with arbitrary (unsigned) bytes — parse only
+    /// needs the variant/slot/index fields, and dedup-only never verifies the signature.
+    fn legacy_shred_at_index(index: u32) -> Vec<u8> {
+        let mut shred = vec![0x42u8; 1228];
+        shred[64] = 0xa5; // legacy data variant
+        shred[65..73].copy_from_slice(&TEST_SLOT.to_le_bytes());
+        shred[73..77].copy_from_slice(&index.to_le_bytes());
+        shred
+    }
+
+    #[tokio::test]
+    async fn dedup_only_without_rpc_suppresses_duplicates() {
+        // The same shred arrives twice (e.g. from two overlapping multicast groups): one is forwarded.
+        // The shred carries a garbage (unsigned) signature, so this also proves dedup-only never
+        // signature-checks — an unverifiable shred is still forwarded, unlike sigverify mode where a
+        // bad signature is dropped (see `bad_signature_dropped_good_forwarded`).
+        let shred = legacy_shred_at_index(TEST_INDEX);
+        let got = run_forwarder_mode(None, true, vec![shred.clone(), shred]).await;
+        assert_eq!(got, 1, "dedup-only forwards exactly one copy per key");
+    }
+
+    #[tokio::test]
+    async fn dedup_only_collapses_many_copies_to_one() {
+        // The production case: DoubleZero delivers the same shred on several overlapping multicast
+        // groups (the measured mode was 3 copies). All copies of one key collapse to a single forward.
+        let shred = legacy_shred_at_index(TEST_INDEX);
+        let got = run_forwarder_mode(None, true, vec![shred.clone(), shred.clone(), shred.clone(), shred])
+            .await;
+        assert_eq!(got, 1, "all copies of a key collapse to one forward");
+    }
+
+    #[tokio::test]
+    async fn dedup_only_forwards_unparseable_undeduped() {
+        // A datagram too short to parse can't be keyed, so dedup-only forwards every copy rather than
+        // silently dropping it (loss-averse) — it simply isn't deduplicated.
+        let junk = vec![0u8; 16]; // < SIZE_OF_COMMON_HEADER -> parse() returns None
+        let got = run_forwarder_mode(None, true, vec![junk.clone(), junk]).await;
+        assert_eq!(got, 2, "unparseable datagrams are forwarded undeduped, not dropped");
+    }
+
+    #[tokio::test]
+    async fn dedup_only_distinct_shreds_both_forward() {
+        // Different index -> distinct key -> both forwarded (the key must discriminate, not over-drop).
+        let got = run_forwarder_mode(
+            None,
+            true,
+            vec![legacy_shred_at_index(1), legacy_shred_at_index(2)],
+        )
+        .await;
+        assert_eq!(got, 2, "distinct shreds are not deduped against each other");
+    }
+
+    #[tokio::test]
+    async fn dedup_disabled_forwards_every_copy() {
+        // Neither sigverify nor dedup: the bare default still forwards every copy.
+        let shred = legacy_shred_at_index(TEST_INDEX);
+        let got = run_forwarder_mode(None, false, vec![shred.clone(), shred]).await;
+        assert_eq!(got, 2, "bare mode forwards every datagram");
     }
 }

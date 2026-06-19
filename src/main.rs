@@ -102,8 +102,14 @@ struct Args {
     #[arg(long = "shred-rpc-url", env = "DZ_SHRED_RPC_URL")]
     shred_rpc_url: Option<String>,
 
+    /// Shred forwarder: deduplicate on `(slot, index, type)` without signature verification or any
+    /// RPC — forward one copy per key, dropping the multicast-overlap duplicates. Implied when
+    /// `--shred-rpc-url` is set (sigverify already dedups); ignored if that is set.
+    #[arg(long = "shred-dedup", env = "DZ_SHRED_DEDUP", default_value_t = false)]
+    shred_dedup: bool,
+
     /// Shred forwarder: dedup window depth in slots. Keys older than this many slots behind the tip
-    /// are evicted, bounding memory. Only used when `--shred-rpc-url` is set.
+    /// are evicted, bounding memory. Used when `--shred-rpc-url` or `--shred-dedup` is set.
     #[arg(
         long = "shred-dedup-window-slots",
         env = "DZ_SHRED_DEDUP_WINDOW_SLOTS",
@@ -215,8 +221,8 @@ async fn main() -> Result<()> {
     } else {
         // A zero window evicts everything immediately, defeating dedup; reject it up front rather
         // than silently forwarding every duplicate.
-        if args.shred_rpc_url.is_some() && args.shred_dedup_window_slots == 0 {
-            bail!("--shred-dedup-window-slots must be > 0 when --shred-rpc-url is set");
+        if (args.shred_rpc_url.is_some() || args.shred_dedup) && args.shred_dedup_window_slots == 0 {
+            bail!("--shred-dedup-window-slots must be > 0 when --shred-rpc-url or --shred-dedup is set");
         }
         let shred_cfg = shred::ShredConfig {
             iface: args.iface.clone(),
@@ -224,6 +230,7 @@ async fn main() -> Result<()> {
             sources: shred_sources,
             forward: shred_forward,
             rpc_url: args.shred_rpc_url.clone(),
+            dedup: args.shred_dedup,
             dedup_window_slots: args.shred_dedup_window_slots,
         };
         info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
