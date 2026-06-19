@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::assertions;
+use common::{assertions, replay as replay_helper};
 use doublezero_edge_connect::ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
     codec,
@@ -123,6 +123,15 @@ fn emitted_quotes_by_symbol(msgs: &[Value]) -> HashMap<String, usize> {
         *counts.entry(sym).or_default() += 1;
     }
     counts
+}
+
+/// The set of emitted trade ids (a trade is uniquely identified by its venue `trade_id`), used to
+/// prove a duplicated trade packet adds nothing to the wire.
+fn emitted_trade_ids(msgs: &[Value]) -> std::collections::BTreeSet<u64> {
+    msgs.iter()
+        .filter(|m| m["type"] == "trade")
+        .filter_map(|m| m["trade_id"].as_u64())
+        .collect()
 }
 
 /// Assert that emitted quotes are non-decreasing in `source_ts_ns` per (venue, symbol). This is the
@@ -245,6 +254,127 @@ fn per_symbol_dedup_is_independent() {
          per-symbol windows are not independent",
         emitted.get("DOGE"),
         doge_alone.get("DOGE"),
+    );
+}
+
+/// The literal duplicate-multicast-packet case for quotes: replay one publisher's stream, then
+/// replay it again with **every mktdata frame delivered twice** (byte-for-byte, same frame
+/// sequence — exactly what a redundant multicast delivery looks like). The emitted quote set must be
+/// identical. The duplicate datagram is *not* rejected at the sequence gate — an equal sequence is
+/// an accepted idempotent full-state update (`SeqTracker::duplicate_of_last_is_not_stale`) — so this
+/// pins that the duplicate's decoded payload is collapsed by the arbiter's latch-to-leader floor.
+#[test]
+fn duplicate_multicast_quote_packet_collapses() {
+    let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
+    // Restrict mktdata to a single publisher so the baseline has no cross-publisher dedup; keep all
+    // refdata so instrument definitions resolve.
+    let pub_ip = recs
+        .iter()
+        .find(|(_ip, role, _)| *role == 1)
+        .map(|(ip, _, _)| *ip)
+        .expect("fixture has mktdata");
+    let baseline: Vec<_> = recs
+        .iter()
+        .filter(|(ip, role, _)| *role == 0 || *ip == pub_ip)
+        .cloned()
+        .collect();
+
+    // Variant: each mktdata datagram is delivered a second time, immediately, from the same source.
+    let mut doubled = Vec::new();
+    for r in &baseline {
+        doubled.push(r.clone());
+        if r.1 == 1 {
+            doubled.push(r.clone());
+        }
+    }
+
+    let single = emitted_quotes_by_symbol(&replay(&baseline));
+    let dup_msgs = replay(&doubled);
+    // No duplicate ever reaches the wire, and the emitted set is byte-identical to the single feed.
+    assertions::no_business_duplicates(&dup_msgs);
+    assert!(!single.is_empty(), "baseline emitted no quotes");
+    assert_eq!(
+        single,
+        emitted_quotes_by_symbol(&dup_msgs),
+        "delivering every mktdata packet twice changed the emitted quote set"
+    );
+}
+
+/// Cross-source duplicate at the packet level: replay one publisher, then replay it with each
+/// mktdata datagram **also** delivered from a second publisher IP (a mirror of the same feed). The
+/// leader (first to open each tick) wins and the mirror is a non-leader no-op, so the emitted quote
+/// set is unchanged — the multi-publisher dedup collapses the redundant feed.
+#[test]
+fn duplicate_packet_from_second_publisher_collapses() {
+    let recs = read_combined("tests/fixtures/tob_btc_dual.combined.bin");
+    let pub_ip = recs
+        .iter()
+        .find(|(_ip, role, _)| *role == 1)
+        .map(|(ip, _, _)| *ip)
+        .expect("fixture has mktdata");
+    let baseline: Vec<_> = recs
+        .iter()
+        .filter(|(ip, role, _)| *role == 0 || *ip == pub_ip)
+        .cloned()
+        .collect();
+
+    let mirror_ip = IpAddr::V4(Ipv4Addr::new(10, 255, 255, 254));
+    assert_ne!(mirror_ip, pub_ip, "mirror IP must differ from the leader");
+    let mut mirrored = Vec::new();
+    for r in &baseline {
+        mirrored.push(r.clone());
+        if r.1 == 1 {
+            mirrored.push((mirror_ip, 1u8, r.2.clone())); // same bytes, second publisher
+        }
+    }
+
+    let single = emitted_quotes_by_symbol(&replay(&baseline));
+    let mirror_msgs = replay(&mirrored);
+    assertions::no_business_duplicates(&mirror_msgs);
+    assert!(!single.is_empty(), "baseline emitted no quotes");
+    assert_eq!(
+        single,
+        emitted_quotes_by_symbol(&mirror_msgs),
+        "mirroring every mktdata packet from a second publisher changed the emitted quote set"
+    );
+}
+
+/// The duplicate-packet case for trades: replay the single-publisher TOB golden, then replay it with
+/// every mktdata frame duplicated. Trades dedup by `trade_id` in the arbiter's windowed dedup, so
+/// the emitted trade set is unchanged. Guarded so a trade-less fixture fails loud rather than
+/// passing vacuously.
+#[test]
+fn duplicate_multicast_trade_packet_collapses() {
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let ref_bytes = std::fs::read("tests/fixtures/tob_refdata.bin").expect("read tob_refdata.bin");
+    let mkt_bytes =
+        std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
+    let ref_frames = replay_helper::split_frames(&ref_bytes, replay_helper::TOB_MAGIC);
+    let mkt_frames = replay_helper::split_frames(&mkt_bytes, replay_helper::TOB_MAGIC);
+
+    // Refdata first (instrument definitions before prices), then mktdata, all from one publisher.
+    let mut baseline: Vec<(IpAddr, u8, Vec<u8>)> = Vec::new();
+    for f in &ref_frames {
+        baseline.push((ip, 0, f.clone()));
+    }
+    for f in &mkt_frames {
+        baseline.push((ip, 1, f.clone()));
+    }
+
+    let mut doubled = baseline.clone();
+    for f in &mkt_frames {
+        doubled.push((ip, 1, f.clone())); // each mktdata datagram delivered a second time
+    }
+
+    let single = emitted_trade_ids(&replay(&baseline));
+    assert!(
+        !single.is_empty(),
+        "TOB golden carried no trades — trade dedup not exercised"
+    );
+    assert_eq!(
+        single,
+        emitted_trade_ids(&replay(&doubled)),
+        "delivering every mktdata packet twice changed the emitted trade set"
     );
 }
 

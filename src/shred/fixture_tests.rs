@@ -136,6 +136,57 @@ fn dedup_collapses_cross_group_duplicates() {
     );
 }
 
+/// The most literal duplicate-packet case: take one real datagram and feed it through the dedup
+/// window twice. The first copy verifies and forwards; the second is a duplicate of the recorded
+/// winner and is dropped *without* re-running the signature check.
+#[test]
+fn same_datagram_twice_forwards_once() {
+    let datagrams = load_datagrams();
+    let leaders = load_leaders();
+    let pkt = &datagrams[0];
+    let meta = parse(pkt).expect("real shred parses");
+    let leader = leaders.get(&meta.slot).copied();
+    assert!(leader.is_some(), "leader known for the captured slot");
+
+    let mut window = DedupWindow::new(512);
+    let mut verify_calls = 0usize;
+
+    let first = {
+        let mut verify_fn = || {
+            verify_calls += 1;
+            leader.as_ref().is_some_and(|pk| verify(&meta, pk))
+        };
+        window.decide(
+            meta.slot,
+            meta.index,
+            meta.shred_type,
+            leader.is_some(),
+            &mut verify_fn,
+        )
+    };
+    assert_eq!(first, Action::Forward, "first copy verifies and forwards");
+    let after_first = verify_calls;
+
+    let second = {
+        let mut verify_fn = || {
+            verify_calls += 1;
+            leader.as_ref().is_some_and(|pk| verify(&meta, pk))
+        };
+        window.decide(
+            meta.slot,
+            meta.index,
+            meta.shred_type,
+            leader.is_some(),
+            &mut verify_fn,
+        )
+    };
+    assert_eq!(second, Action::Drop, "duplicate of the winner is dropped");
+    assert_eq!(
+        verify_calls, after_first,
+        "second (duplicate) copy must skip the signature check"
+    );
+}
+
 /// End-to-end through the real `forwarder_task` (parse → leader → verify → dedup → fan-out), driven
 /// by the captured datagrams over the mpsc. This is the test that directly catches **silent
 /// no-dedup**: when `parse` rejects a real variant the forwarder falls back to forwarding the

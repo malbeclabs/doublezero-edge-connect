@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Explicit duplicate-packet de-duplication tests across all three dedup paths. Decoded-message unit
+  tests in `arbiter.rs` (an identical quote from the same source, the same BBO mirrored by two
+  multicast publishers, and an identical trade all collapse to one emission); raw-packet replay
+  tests in `tests/dedup.rs` that deliver every mktdata datagram twice — byte-for-byte and from a
+  second publisher IP — and assert the emitted quote/trade set is unchanged; and a shred-level
+  `same_datagram_twice_forwards_once` proving the second copy is dropped without re-verifying.
 - Shred forwarder sigverify + dedup (#25): when `--shred-rpc-url` (`DZ_SHRED_RPC_URL`) is
   set, the forwarder forwards exactly **one valid copy** of each shred. A bounded,
   prefer-valid dedup window keyed by `(slot, index, type)` (`--shred-dedup-window-slots`,
