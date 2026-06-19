@@ -16,7 +16,7 @@ use anyhow::Result;
 
 pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
 use crate::ingest::codec_common::{
-    cstr, decode_frame_with, i64le, u16le, u32le, u64le, FrameHeader,
+    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader,
 };
 
 pub const MAGIC: u16 = 0x4D44; // "DM"
@@ -104,35 +104,41 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
 }
 
 fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
+    // A message shorter than its declared type's fields decodes to `None` -> `Other` (skipped),
+    // never an out-of-bounds panic (the readers are bounds-checked; see `codec_common`).
+    decode_body(msg_type, b, o).unwrap_or(Message::Other(msg_type))
+}
+
+fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
     let body = o + MSG_HEADER_SIZE;
-    match msg_type {
+    Some(match msg_type {
         MSG_MIDPOINT => Message::Midpoint(Midpoint {
-            instrument_id: u32le(b, body),
-            source_id: u16le(b, body + 4),
-            method: b[body + 6],
-            quality_flags: b[body + 7],
-            book_ts: u64le(b, body + 8),
-            compute_ts: u64le(b, body + 16),
-            mid_price_raw: i64le(b, body + 24),
+            instrument_id: u32le(b, body)?,
+            source_id: u16le(b, body + 4)?,
+            method: u8le(b, body + 6)?,
+            quality_flags: u8le(b, body + 7)?,
+            book_ts: u64le(b, body + 8)?,
+            compute_ts: u64le(b, body + 16)?,
+            mid_price_raw: i64le(b, body + 24)?,
         }),
         MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
-            instrument_id: u32le(b, body),
-            symbol: cstr(b, body + 4, 16),
-            price_exponent: b[body + 37] as i8,
-            default_method: b[body + 38],
-            manifest_seq: u16le(b, body + 56),
+            instrument_id: u32le(b, body)?,
+            symbol: cstr(b, body + 4, 16)?,
+            price_exponent: u8le(b, body + 37)? as i8,
+            default_method: u8le(b, body + 38)?,
+            manifest_seq: u16le(b, body + 56)?,
         }),
         MSG_MANIFEST_SUMMARY => Message::ManifestSummary(ManifestSummary {
-            channel_id: b[body],
-            valid: b[body + 1] != 0,
-            manifest_seq: u16le(b, body + 4),
-            instrument_count: u32le(b, body + 8),
-            ts: u64le(b, body + 12),
+            channel_id: u8le(b, body)?,
+            valid: u8le(b, body + 1)? != 0,
+            manifest_seq: u16le(b, body + 4)?,
+            instrument_count: u32le(b, body + 8)?,
+            ts: u64le(b, body + 12)?,
         }),
         MSG_HEARTBEAT => Message::Heartbeat,
-        MSG_END_OF_SESSION => Message::EndOfSession(u64le(b, body)),
+        MSG_END_OF_SESSION => Message::EndOfSession(u64le(b, body)?),
         other => Message::Other(other),
-    }
+    })
 }
 
 #[cfg(test)]

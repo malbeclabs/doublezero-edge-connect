@@ -13,6 +13,19 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+/// Cap on resting orders held per instrument book — both the synced population and the in-flight
+/// snapshot under assembly. A real instrument's book is far smaller; this only bounds a forged or
+/// garbage book built from spoofed MBO deltas/snapshots so a single `instrument_id` can't grow
+/// memory without limit. Reaching it marks the book anomalous: it drops to `Recovering` and
+/// re-syncs from the next snapshot rather than growing further.
+const MAX_ORDERS_PER_BOOK: usize = 1 << 18;
+
+/// Cap on deltas buffered while `Recovering` (awaiting a snapshot). In normal operation the buffer
+/// holds at most one snapshot cycle of deltas; this bounds a flood of deltas for an instrument that
+/// never receives a snapshot. Excess deltas are dropped — the book re-anchors on the next snapshot
+/// regardless of which buffered deltas survived.
+const MAX_PENDING_DELTAS: usize = 1 << 18;
+
 /// One aggregated price level as `(price_raw, qty_raw)` - raw integers in the instrument's
 /// price/qty exponents (the caller scales them).
 pub type Level = (i64, u64);
@@ -169,6 +182,12 @@ impl BookState {
             self.building = None; // already advanced past this snapshot; drop it
             return;
         }
+        if total_orders as usize > MAX_ORDERS_PER_BOOK {
+            // A snapshot promising more orders than any real book holds is malformed or forged;
+            // refuse to assemble it so `building.orders` stays bounded.
+            self.building = None;
+            return;
+        }
         self.building = Some(Building {
             snapshot_id,
             anchor_seq,
@@ -192,6 +211,9 @@ impl BookState {
     ) {
         if let Some(b) = &mut self.building {
             if b.snapshot_id == snapshot_id {
+                if b.orders.len() >= MAX_ORDERS_PER_BOOK {
+                    return; // refuse to grow the in-flight snapshot beyond the cap
+                }
                 b.orders.insert(
                     order_id,
                     RestingOrder {
@@ -251,7 +273,10 @@ impl BookState {
     pub fn on_delta(&mut self, op: DeltaOp) -> bool {
         match self.state {
             SyncState::Recovering => {
-                self.pending.push(op);
+                if self.pending.len() < MAX_PENDING_DELTAS {
+                    self.pending.push(op);
+                }
+                // else: drop; the book re-anchors on the next snapshot regardless.
                 false
             }
             SyncState::Synced => self.apply_or_recover(op),
@@ -284,6 +309,17 @@ impl BookState {
                 price_raw,
                 qty_raw,
             } => {
+                if self.orders.len() >= MAX_ORDERS_PER_BOOK && !self.orders.contains_key(&order_id)
+                {
+                    // Oversized book — only reachable via a flood of forged adds. Drop it to
+                    // `Recovering` rather than growing without limit; the next snapshot
+                    // re-establishes a clean book.
+                    self.orders.clear();
+                    self.bids.clear();
+                    self.asks.clear();
+                    self.state = SyncState::Recovering;
+                    return;
+                }
                 self.orders.insert(
                     order_id,
                     RestingOrder {
@@ -575,5 +611,40 @@ mod tests {
         assert_eq!(b.last_instr_seq, 11); // only the post-anchor delta replayed
         let (bids, _) = b.top_levels(5);
         assert_eq!(bids, vec![(18_310, 2)]);
+    }
+
+    /// The pending-delta buffer must stay bounded while `Recovering`: a flood of deltas for an
+    /// instrument that never receives a snapshot can't grow it without limit.
+    #[test]
+    fn pending_buffer_is_bounded_while_recovering() {
+        let mut b = BookState::new(); // starts Recovering
+        for i in 0..(MAX_PENDING_DELTAS + 1_000) {
+            // Each delta is buffered (not applied) while recovering; once full, excess is dropped.
+            assert!(!b.on_delta(add((i as u32).wrapping_add(1), i as u64, true, 100, 1)));
+        }
+        assert!(!b.is_synced());
+        assert!(
+            b.pending.len() <= MAX_PENDING_DELTAS,
+            "pending must stay bounded, got {}",
+            b.pending.len()
+        );
+    }
+
+    /// A synced book's resting-order population must stay bounded under a flood of forged adds: at
+    /// the cap it drops to `Recovering` rather than growing without limit.
+    #[test]
+    fn resting_orders_are_bounded_under_add_flood() {
+        let mut b = synced_book(); // synced, last_instr_seq = 0
+        for i in 0..(MAX_ORDERS_PER_BOOK + 1_000) {
+            let seq = (i as u32).wrapping_add(1);
+            let oid = 1_000u64 + i as u64;
+            b.on_delta(add(seq, oid, true, 100 + (i as i64 % 64), 1));
+        }
+        assert!(
+            b.orders.len() <= MAX_ORDERS_PER_BOOK,
+            "resting orders must stay bounded, got {}",
+            b.orders.len()
+        );
+        assert!(!b.is_synced(), "an oversized book drops to Recovering");
     }
 }

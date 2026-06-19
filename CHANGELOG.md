@@ -132,6 +132,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `aws-actions/configure-aws-credentials` (v6.2.0). The `tokio-tungstenite`
   0.29 upgrade switched `Message::Text`/`Ping`/`Pong` payloads to
   `Utf8Bytes`/`Bytes`, updated in `src/sinks/ws.rs`.
+- Graceful container shutdown runs `doublezero disconnect` to free the access-pass session,
+  but only on an operator `docker stop` (TERM/INT) and only when a tunnel is actually up —
+  so a bridge crash under `--restart unless-stopped` no longer releases the session. The
+  disconnect is wrapped in a `timeout` so a wedged daemon can't consume the whole stop budget.
 - Exposed the ingest pipeline, wire model, and sinks as a library (`src/lib.rs`); the binary
   (`src/main.rs`) is now a thin wrapper, so dev tooling and tests can reuse the codecs.
 
@@ -147,6 +151,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the edge-feed-spec); bids and asks in `depth` were previously swapped.
 - Warn instead of silently clobbering when two feeds for the same `(venue, symbol)` publish
   instrument definitions with different price/quantity exponents.
+
+### Security
+- Hardened the codec frame walker against out-of-bounds reads: the per-message body decoders
+  now read every field through bounds-checked little-endian readers, so a truncated or
+  malformed datagram (a runt message that under-declares its length) decodes to
+  `Message::Other` instead of panicking the receiver task — which previously propagated out
+  of `run_feed` and exited the whole process (a single crafted datagram could take the bridge
+  down for every venue and WS consumer). Applies to all three sibling codecs (TOB / Midpoint /
+  Market-by-Order).
+- Bounded the per-publisher frame-sequence map (`TobProcessor`) to `MAX_PUBLISHERS` (256) with
+  least-recently-inserted eviction. The map is keyed on the datagram source IP, which is
+  unauthenticated and spoofable, so without a cap a forged-source flood could grow it without
+  limit (memory-exhaustion DoS); an evicted legitimate publisher simply re-anchors its sequence
+  on its next frame.
+- Gated and bounded the Market-by-Order book map (`MboProcessor`). The live Hyperliquid MBO
+  `FEEDS` row processes order deltas/snapshots keyed by an unauthenticated, spoofable wire
+  `instrument_id`, and previously minted an unbounded `BookState` per id with no definition gate
+  (unlike the Top-of-Book/Midpoint quote paths) — a strictly larger memory-exhaustion surface
+  than the sequence map above, and live (not gated behind an absent feed). A forged MBO stream
+  could grow memory two ways: distinct `instrument_id`s, or a flood of never-cancelled `OrderAdd`s
+  for one instrument. Now a book is created only once its instrument definition is known (an
+  undefined instrument can never emit `depth`); the book map is capped at `MAX_BOOKS` (4096) with
+  least-recently-inserted eviction; and each book bounds its resting-order population, in-flight
+  snapshot, and `Recovering` delta buffer (`MAX_ORDERS_PER_BOOK`/`MAX_PENDING_DELTAS`), dropping to
+  snapshot recovery rather than growing without limit. Real feeds stay far below every cap.
 
 ## [0.1.0]
 

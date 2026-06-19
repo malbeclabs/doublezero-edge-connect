@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::ingest::codec_common::{decode_frame_with, i64le, u16le, u32le, u64le};
+use crate::ingest::codec_common::{cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le};
 // Re-export the shared frame primitives under `codec::` so existing call sites
 // (`crate::ingest::codec::FrameHeader`, `apply_exponent`, ...) keep resolving here.
 pub use crate::ingest::codec_common::{apply_exponent, FrameHeader, MSG_HEADER_SIZE};
@@ -139,54 +139,56 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
 }
 
 fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
+    // A message shorter than its declared type's fields decodes to `None` -> `Other` (skipped),
+    // never an out-of-bounds panic (the readers are bounds-checked; see `codec_common`).
+    decode_body(msg_type, b, o).unwrap_or(Message::Other(msg_type))
+}
+
+fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
     let body = o + MSG_HEADER_SIZE;
-    match msg_type {
+    Some(match msg_type {
         MSG_QUOTE => Message::Quote(Quote {
-            instrument_id: u32le(b, body),
-            source_id: u16le(b, body + 4),
-            update_flags: b[body + 6],
-            source_ts: u64le(b, body + 8),
-            bid_price_raw: i64le(b, body + 16),
-            bid_qty_raw: u64le(b, body + 24),
-            ask_price_raw: i64le(b, body + 32),
-            ask_qty_raw: u64le(b, body + 40),
-            bid_n: u16le(b, body + 48),
-            ask_n: u16le(b, body + 50),
+            instrument_id: u32le(b, body)?,
+            source_id: u16le(b, body + 4)?,
+            update_flags: u8le(b, body + 6)?,
+            source_ts: u64le(b, body + 8)?,
+            bid_price_raw: i64le(b, body + 16)?,
+            bid_qty_raw: u64le(b, body + 24)?,
+            ask_price_raw: i64le(b, body + 32)?,
+            ask_qty_raw: u64le(b, body + 40)?,
+            bid_n: u16le(b, body + 48)?,
+            ask_n: u16le(b, body + 50)?,
         }),
         MSG_TRADE => Message::Trade(Trade {
-            instrument_id: u32le(b, body),
-            source_id: u16le(b, body + 4),
-            aggressor_side: b[body + 6],
-            trade_flags: b[body + 7],
-            source_ts: u64le(b, body + 8),
-            trade_price_raw: i64le(b, body + 16),
-            trade_qty_raw: u64le(b, body + 24),
-            trade_id: u64le(b, body + 32),
-            cumulative_volume_raw: u64le(b, body + 40),
+            instrument_id: u32le(b, body)?,
+            source_id: u16le(b, body + 4)?,
+            aggressor_side: u8le(b, body + 6)?,
+            trade_flags: u8le(b, body + 7)?,
+            source_ts: u64le(b, body + 8)?,
+            trade_price_raw: i64le(b, body + 16)?,
+            trade_qty_raw: u64le(b, body + 24)?,
+            trade_id: u64le(b, body + 32)?,
+            cumulative_volume_raw: u64le(b, body + 40)?,
         }),
-        MSG_INSTRUMENT_DEFINITION => {
-            let sym = &b[body + 4..body + 20];
-            let end = sym.iter().position(|&c| c == 0).unwrap_or(sym.len());
-            Message::InstrumentDefinition(InstrumentDefinition {
-                instrument_id: u32le(b, body),
-                symbol: String::from_utf8_lossy(&sym[..end]).to_string(),
-                price_exponent: b[body + 37] as i8,
-                qty_exponent: b[body + 38] as i8,
-                manifest_seq: u16le(b, body + 74),
-            })
-        }
+        MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
+            instrument_id: u32le(b, body)?,
+            symbol: cstr(b, body + 4, 16)?,
+            price_exponent: u8le(b, body + 37)? as i8,
+            qty_exponent: u8le(b, body + 38)? as i8,
+            manifest_seq: u16le(b, body + 74)?,
+        }),
         MSG_MANIFEST_SUMMARY => Message::ManifestSummary(ManifestSummary {
-            channel_id: b[body],
-            valid: b[body + 1] != 0,
-            manifest_seq: u16le(b, body + 4),
-            instrument_count: u32le(b, body + 8),
-            ts: u64le(b, body + 12),
+            channel_id: u8le(b, body)?,
+            valid: u8le(b, body + 1)? != 0,
+            manifest_seq: u16le(b, body + 4)?,
+            instrument_count: u32le(b, body + 8)?,
+            ts: u64le(b, body + 12)?,
         }),
         MSG_HEARTBEAT => Message::Heartbeat,
-        MSG_CHANNEL_RESET => Message::ChannelReset(u64le(b, body)),
-        MSG_END_OF_SESSION => Message::EndOfSession(u64le(b, body)),
+        MSG_CHANNEL_RESET => Message::ChannelReset(u64le(b, body)?),
+        MSG_END_OF_SESSION => Message::EndOfSession(u64le(b, body)?),
         other => Message::Other(other),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -348,6 +350,33 @@ mod tests {
     #[test]
     fn bad_magic_errors() {
         assert!(decode_frame(&[0u8; 30]).is_err());
+    }
+
+    #[test]
+    fn runt_message_decodes_to_other_without_panicking() {
+        // A frame declaring one MSG_QUOTE but truncated so the body is absent: the walker accepts
+        // the (under-declared) msg_len, but the bounds-checked body reader must yield `Other`
+        // instead of indexing past the 28-byte datagram. Regression for the runt-frame DoS.
+        let mut f = Vec::new();
+        f.extend_from_slice(&MAGIC.to_le_bytes());
+        f.push(1); // schema
+        f.push(0); // channel
+        f.extend_from_slice(&0u64.to_le_bytes()); // sequence
+        f.extend_from_slice(&0u64.to_le_bytes()); // send ts
+        f.push(1); // msg_count = 1
+        f.push(0); // reset count
+        f.extend_from_slice(&28u16.to_le_bytes()); // frame_length = 28 (== buf len)
+        f.push(MSG_QUOTE);
+        f.push(4); // msg_len = 4 (header only; passes the walker's >= MSG_HEADER_SIZE check)
+        f.extend_from_slice(&0u16.to_le_bytes()); // flags
+        assert_eq!(f.len(), 28);
+
+        let (hdr, msgs) = decode_frame(&f).expect("must not panic on a truncated message");
+        assert_eq!(hdr.msg_count, 1);
+        assert!(
+            matches!(msgs.as_slice(), [Message::Other(MSG_QUOTE)]),
+            "a truncated quote must decode to Other, got {msgs:?}"
+        );
     }
 
     #[test]

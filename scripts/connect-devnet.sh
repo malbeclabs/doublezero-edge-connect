@@ -261,6 +261,7 @@ for v in "${PASSTHROUGH[@]}"; do
 done
 $SUDO docker run -d --name "$DZ_NAME" \
   --restart unless-stopped \
+  --stop-timeout 60 \
   --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --device /dev/net/tun \
@@ -316,4 +317,4 @@ info "Manage with:"
 echo "  sudo docker logs -f $DZ_NAME                            # bridge + daemon logs"
 echo "  sudo docker exec -it $DZ_NAME doublezero status         # tunnel status"
 echo "  sudo docker exec -it $DZ_NAME doublezero latency        # device latencies"
-echo "  sudo docker rm -f $DZ_NAME                              # stop & remove"
+echo "  sudo docker stop $DZ_NAME && sudo docker rm $DZ_NAME    # disconnect, stop & remove"
