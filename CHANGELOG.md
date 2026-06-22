@@ -130,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
+- Shred sigverify mode (`--shred-dedup-mode sigverify`) now **prefetches the next epoch's leader
+  schedule** and **fails closed** on an unknown leader. The leader cache holds two epochs (current + next), fetched
+  by explicit slot so the result is independent of rollover timing, eliminating the routine
+  ~30s-per-epoch gap where new-epoch slots had no schedule. With prefetch in place, a slot whose
+  leader is unknown is now **dropped** rather than forwarded unverified — sigverify forwards only
+  what it can verify. Because the full current epoch is always cached, a transient RPC glitch never
+  blacks out the feed; an unknown leader now means cold start, an RPC outage past the ~epoch
+  prefetch lead, or a garbled schedule, and is surfaced as a `no_leader` counter in the periodic
+  tally. (Forward-when-unverified is exactly dedup-only mode; sigverify no longer degrades into it.)
+  Removes the now-unused `leader_known` fail-open path from `DedupWindow::decide`.
 - Shred dedup-only mode (`--shred-dedup`) now keys its dedup window on `(slot, index, type,
   content-fingerprint)` instead of `(slot, index, type)`, so it collapses copies that match over the
   signed content. A shred sharing `(slot, index, type)` but carrying different signed content

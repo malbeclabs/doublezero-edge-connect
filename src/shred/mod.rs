@@ -31,8 +31,12 @@
 //!   against its slot leader ([`leader`]) using fields pulled from the raw datagram ([`parse`]). A
 //!   verified copy is forwarded and recorded; later duplicates are dropped *without* a signature
 //!   check; an invalid copy is dropped but leaves the key open so a later valid copy can still win. A
-//!   slot whose leader isn't known yet fails **open** (forward, no dedup), so we never silently drop
-//!   traffic we can't judge.
+//!   slot whose leader isn't known fails **closed** (drop — an unverifiable shred is never
+//!   forwarded). The leader schedule prefetches the next epoch ([`leader`]), so a known leader is
+//!   normally always available across a rollover; an unknown leader means cold start, an RPC outage
+//!   past the prefetch lead (~an epoch), or a garbled schedule, and is counted as `no_leader`. (Want
+//!   forward-when-unverified? That is exactly dedup-only mode — sigverify deliberately does not
+//!   degrade into it.)
 
 pub mod dedup;
 pub mod discovery;
@@ -410,8 +414,18 @@ async fn forwarder_task(
     // Tallies for the periodic misparse canary (see VERIFY_LOG_EVERY). `unparsed` is tracked too so
     // a *total* misparse (every datagram rejected by `parse`) still trips the log — otherwise it
     // would be silent, since `parsed` would never advance.
-    let (mut processed, mut parsed, mut unparsed, mut forwarded, mut dropped, mut verify_ok) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (
+        mut processed,
+        mut parsed,
+        mut unparsed,
+        mut forwarded,
+        mut dropped,
+        mut verify_ok,
+        mut no_leader,
+    ) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    // Fire one loud warning the first time a shred is dropped for want of a leader, so an
+    // RPC-down-at-boot blackout (sigverify forwards nothing) is obvious without scraping the tally.
+    let mut no_leader_warned = false;
 
     while let Some(pkt) = rx.recv().await {
         // Bare mode (no sigverify, no dedup): forward unconditionally.
@@ -428,7 +442,7 @@ async fn forwarder_task(
             forwarded += 1;
             fan_out(&socks, &pkt).await;
             log_tally(
-                processed, parsed, unparsed, forwarded, dropped, verify_ok, &window,
+                processed, parsed, unparsed, forwarded, dropped, verify_ok, no_leader, &window,
             );
             continue;
         };
@@ -436,32 +450,42 @@ async fn forwarder_task(
 
         let action = match schedule.as_ref() {
             // Dedup + sigverify: the first copy of a key is ed25519-verified against its leader.
-            Some(schedule) => {
-                let leader = schedule.leader(meta.slot).await;
-                let mut verify_fn = || {
-                    let ok = leader.as_ref().is_some_and(|pk| verify::verify(&meta, pk));
-                    if ok {
-                        verify_ok += 1;
+            // **Fail closed**: a slot with no known leader can't be verified, so it is dropped rather
+            // than forwarded unverified. The next epoch is prefetched, so a known leader is normally
+            // always available; `None` here means cold start, a sustained RPC outage past the
+            // prefetch lead, or a garbled schedule. (For forward-when-unverified, use dedup-only.)
+            Some(schedule) => match schedule.leader(meta.slot).await {
+                Some(pk) => {
+                    let mut verify_fn = || {
+                        let ok = verify::verify(&meta, &pk);
+                        if ok {
+                            verify_ok += 1;
+                        }
+                        ok
+                    };
+                    // Sigverify keys content-agnostically (fingerprint = 0): the signature, not the
+                    // bytes, decides the valid winner, so a forged copy with different bytes
+                    // collapses onto the same key and is dropped on verify — not earn its own.
+                    window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
+                }
+                None => {
+                    no_leader += 1;
+                    if !no_leader_warned {
+                        no_leader_warned = true;
+                        warn!(
+                            "shred sigverify: no leader for a slot — dropping unverifiable shreds \
+                             (fail closed). If the RPC is unreachable this is a full blackout until \
+                             the leader schedule loads; watch the no_leader tally."
+                        );
                     }
-                    ok
-                };
-                // Sigverify keys content-agnostically (fingerprint = 0): the signature, not the
-                // bytes, decides which copy is the valid winner, so a forged copy with different
-                // bytes must collapse onto the same key and be dropped on verify — not earn its own.
-                window.decide(
-                    meta.slot,
-                    meta.index,
-                    meta.shred_type,
-                    0,
-                    leader.is_some(),
-                    &mut verify_fn,
-                )
-            }
+                    Action::Drop
+                }
+            },
             // Dedup-only: no leader lookup, no signature work. The first copy of a key always "wins"
-            // (leader_known = true, verify -> true), so it is forwarded + recorded and later copies
-            // drop. The key carries a content fingerprint, so only copies matching over the
-            // fingerprinted region dedup — a same-(slot, index, type) shred with different content
-            // still forwards (loss-averse; we can't tell which is valid without sigverify).
+            // (verify -> true), so it is forwarded + recorded and later copies drop. The key carries
+            // a content fingerprint, so only copies matching over the fingerprinted region dedup — a
+            // same-(slot, index, type) shred with different content still forwards (loss-averse; we
+            // can't tell which is valid without sigverify).
             //
             // Resigned merkle shreds carry a per-turbine-path **retransmitter signature** in the
             // trailing 64 bytes, rewritten on every hop, so cross-group copies of the *same* shred
@@ -481,7 +505,6 @@ async fn forwarder_task(
                     meta.index,
                     meta.shred_type,
                     dedup::fingerprint(region),
-                    true,
                     &mut || true,
                 )
             }
@@ -495,7 +518,7 @@ async fn forwarder_task(
         }
 
         log_tally(
-            processed, parsed, unparsed, forwarded, dropped, verify_ok, &window,
+            processed, parsed, unparsed, forwarded, dropped, verify_ok, no_leader, &window,
         );
     }
     info!("shred forwarder channel closed; exiting");
@@ -512,7 +535,9 @@ async fn fan_out(socks: &[(SocketAddr, UdpSocket)], pkt: &[u8]) {
 }
 
 /// Emit the dedup/verify tally every [`VERIFY_LOG_EVERY`] processed datagrams. The `verify_ok`
-/// share of `parsed` (and a high `unparsed`) is the canary for a systematic shred-parse misread.
+/// share of `parsed` (and a high `unparsed`) is the canary for a systematic shred-parse misread; a
+/// rising `no_leader` (sigverify mode) flags shreds dropped fail-closed for want of a leader
+/// schedule — cold start, a sustained RPC outage past the prefetch lead, or a garbled schedule.
 #[allow(clippy::too_many_arguments)]
 fn log_tally(
     processed: u64,
@@ -521,6 +546,7 @@ fn log_tally(
     forwarded: u64,
     dropped: u64,
     verify_ok: u64,
+    no_leader: u64,
     window: &DedupWindow,
 ) {
     if processed.is_multiple_of(VERIFY_LOG_EVERY) {
@@ -531,6 +557,7 @@ fn log_tally(
             forwarded,
             dropped,
             verify_ok,
+            no_leader,
             tracked_slots = window.tracked_slots(),
             "shred forwarder dedup/verify tally"
         );
@@ -815,15 +842,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_leader_fails_open() {
-        // Schedule has no leader for TEST_SLOT -> leader() is None -> forward (fail open), undeduped.
+    async fn unknown_leader_fails_closed() {
+        // Schedule has no leader for TEST_SLOT -> leader() is None -> drop (fail closed). Sigverify
+        // mode forwards only shreds it can verify; an unverifiable shred is never forwarded. (For the
+        // forward-everything-when-unverified behaviour, use dedup-only mode, which is exactly that.)
         let schedule = Arc::new(LeaderSchedule::with_seeded_cache(0, 0, vec![None; 10]));
         let signing = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
         let shred = signed_legacy_shred(&signing);
         let got = run_forwarder(schedule, vec![shred.clone(), shred]).await;
         assert_eq!(
-            got, 2,
-            "with no known leader both copies are forwarded, not deduped"
+            got, 0,
+            "with no known leader the shred cannot be verified, so it is dropped"
         );
     }
 

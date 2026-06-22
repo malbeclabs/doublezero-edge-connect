@@ -69,27 +69,23 @@ impl DedupWindow {
     }
 
     /// The prefer-valid decision for one shred. `verify` is only called when the key has no winner
-    /// yet *and* the leader is known — so signature work stays proportional to unique shreds, and a
-    /// duplicate of an already-forwarded shred is dropped without any ed25519 cost.
+    /// yet — so signature work stays proportional to unique shreds, and a duplicate of an
+    /// already-forwarded shred is dropped without any ed25519 cost.
     ///
-    /// `leader_known == false` (schedule not yet loaded, or slot outside the cached epoch) fails
-    /// **open**: we forward the datagram but record no winner, so we never silently drop traffic we
-    /// simply cannot judge yet.
+    /// The caller owns the "can't judge" policy: sigverify mode drops a shred with no known leader
+    /// before reaching here (fail closed), and dedup-only mode passes a trivially-true `verify`. So
+    /// `decide` only ever sees shreds it should judge on the `verify` verdict.
     pub fn decide<F: FnMut() -> bool>(
         &mut self,
         slot: u64,
         index: u32,
         ty: ShredType,
         fingerprint: u64,
-        leader_known: bool,
         verify: &mut F,
     ) -> Action {
         let key = (index, ty, fingerprint);
         if self.slots.get(&slot).is_some_and(|s| s.contains(&key)) {
             return Action::Drop; // duplicate of an already-forwarded winner: no sig check
-        }
-        if !leader_known {
-            return Action::Forward; // can't judge -> fail open, don't record a winner
         }
         if verify() {
             self.record_winner(slot, key);
@@ -150,15 +146,9 @@ mod tests {
     fn same_shred_twice_forwards_once_and_skips_second_verify() {
         let mut w = DedupWindow::new(100);
         let mut v = Verifier::new(true);
-        assert_eq!(
-            w.decide(10, 0, DATA, 0, true, &mut v.closure()),
-            Action::Forward
-        );
+        assert_eq!(w.decide(10, 0, DATA, 0, &mut v.closure()), Action::Forward);
         // Second copy (e.g. from the retransmit group) is a duplicate: dropped, no verify call.
-        assert_eq!(
-            w.decide(10, 0, DATA, 0, true, &mut v.closure()),
-            Action::Drop
-        );
+        assert_eq!(w.decide(10, 0, DATA, 0, &mut v.closure()), Action::Drop);
         assert_eq!(v.calls, 1, "the duplicate must not be signature-checked");
     }
 
@@ -166,14 +156,11 @@ mod tests {
     fn bad_signature_dropped_good_forwarded() {
         let mut w = DedupWindow::new(100);
         let mut bad = Verifier::new(false);
-        assert_eq!(
-            w.decide(5, 1, DATA, 0, true, &mut bad.closure()),
-            Action::Drop
-        );
+        assert_eq!(w.decide(5, 1, DATA, 0, &mut bad.closure()), Action::Drop);
 
         let mut good = Verifier::new(true);
         assert_eq!(
-            w.decide(5, 2, DATA, 0, true, &mut good.closure()),
+            w.decide(5, 2, DATA, 0, &mut good.closure()),
             Action::Forward
         );
     }
@@ -183,41 +170,18 @@ mod tests {
         let mut w = DedupWindow::new(100);
         // Forged/corrupt copy arrives first: dropped, key left open.
         let mut bad = Verifier::new(false);
-        assert_eq!(
-            w.decide(7, 3, DATA, 0, true, &mut bad.closure()),
-            Action::Drop
-        );
+        assert_eq!(w.decide(7, 3, DATA, 0, &mut bad.closure()), Action::Drop);
         // The real copy arrives later: it is still allowed to win and forward.
         let mut good = Verifier::new(true);
         assert_eq!(
-            w.decide(7, 3, DATA, 0, true, &mut good.closure()),
+            w.decide(7, 3, DATA, 0, &mut good.closure()),
             Action::Forward
         );
         assert_eq!(good.calls, 1);
         // A third copy is now a duplicate of the winner: dropped without a check.
         let mut third = Verifier::new(true);
-        assert_eq!(
-            w.decide(7, 3, DATA, 0, true, &mut third.closure()),
-            Action::Drop
-        );
+        assert_eq!(w.decide(7, 3, DATA, 0, &mut third.closure()), Action::Drop);
         assert_eq!(third.calls, 0);
-    }
-
-    #[test]
-    fn unknown_leader_fails_open_without_verifying() {
-        let mut w = DedupWindow::new(100);
-        let mut v = Verifier::new(false);
-        assert_eq!(
-            w.decide(1, 0, DATA, 0, false, &mut v.closure()),
-            Action::Forward
-        );
-        assert_eq!(v.calls, 0, "no leader -> no sig check, just forward");
-        // No winner recorded, so a later copy is still judged on its own merits.
-        let mut good = Verifier::new(true);
-        assert_eq!(
-            w.decide(1, 0, DATA, 0, true, &mut good.closure()),
-            Action::Forward
-        );
     }
 
     #[test]
@@ -225,18 +189,9 @@ mod tests {
         let mut w = DedupWindow::new(100);
         let mut v = Verifier::new(true);
         // Same slot+index but different type, and same slot+type but different index, are distinct.
-        assert_eq!(
-            w.decide(2, 0, DATA, 0, true, &mut v.closure()),
-            Action::Forward
-        );
-        assert_eq!(
-            w.decide(2, 0, CODE, 0, true, &mut v.closure()),
-            Action::Forward
-        );
-        assert_eq!(
-            w.decide(2, 1, DATA, 0, true, &mut v.closure()),
-            Action::Forward
-        );
+        assert_eq!(w.decide(2, 0, DATA, 0, &mut v.closure()), Action::Forward);
+        assert_eq!(w.decide(2, 0, CODE, 0, &mut v.closure()), Action::Forward);
+        assert_eq!(w.decide(2, 1, DATA, 0, &mut v.closure()), Action::Forward);
         assert_eq!(v.calls, 3);
     }
 
@@ -247,17 +202,17 @@ mod tests {
         let mut w = DedupWindow::new(100);
         let mut v = Verifier::new(true);
         assert_eq!(
-            w.decide(4, 0, DATA, 0xAAAA, true, &mut v.closure()),
+            w.decide(4, 0, DATA, 0xAAAA, &mut v.closure()),
             Action::Forward
         );
         assert_eq!(
-            w.decide(4, 0, DATA, 0xBBBB, true, &mut v.closure()),
+            w.decide(4, 0, DATA, 0xBBBB, &mut v.closure()),
             Action::Forward,
             "a different-content copy of the same (slot, index, type) must still forward"
         );
         // A byte-identical copy (same fingerprint) of the first is the duplicate we suppress.
         assert_eq!(
-            w.decide(4, 0, DATA, 0xAAAA, true, &mut v.closure()),
+            w.decide(4, 0, DATA, 0xAAAA, &mut v.closure()),
             Action::Drop,
             "an identical-content copy is the duplicate that should be dropped"
         );
@@ -268,7 +223,7 @@ mod tests {
         let mut w = DedupWindow::new(10);
         let mut v = Verifier::new(true);
         for slot in 0..1000u64 {
-            w.decide(slot, 0, DATA, 0, true, &mut v.closure());
+            w.decide(slot, 0, DATA, 0, &mut v.closure());
         }
         // Only slots within `window_slots` of the tip survive.
         assert!(
@@ -279,7 +234,7 @@ mod tests {
         // An ancient slot is gone: it no longer counts as a winner, so a fresh copy re-verifies.
         let mut again = Verifier::new(true);
         assert_eq!(
-            w.decide(0, 0, DATA, 0, true, &mut again.closure()),
+            w.decide(0, 0, DATA, 0, &mut again.closure()),
             Action::Forward
         );
     }
@@ -290,7 +245,7 @@ mod tests {
         let mut w = DedupWindow::new(100);
         let mut good = Verifier::new(true);
         assert_eq!(
-            w.decide(10, 0, DATA, 0, true, &mut good.closure()),
+            w.decide(10, 0, DATA, 0, &mut good.closure()),
             Action::Forward
         );
 
@@ -299,16 +254,13 @@ mod tests {
         // which would otherwise evict slot 10's winner and let its duplicates through undeduped.
         let mut forged = Verifier::new(false);
         assert_eq!(
-            w.decide(u64::MAX, 0, DATA, 0, true, &mut forged.closure()),
+            w.decide(u64::MAX, 0, DATA, 0, &mut forged.closure()),
             Action::Drop
         );
 
         // Slot 10's winner is still tracked: a duplicate is dropped without a signature check.
         let mut dup = Verifier::new(true);
-        assert_eq!(
-            w.decide(10, 0, DATA, 0, true, &mut dup.closure()),
-            Action::Drop
-        );
+        assert_eq!(w.decide(10, 0, DATA, 0, &mut dup.closure()), Action::Drop);
         assert_eq!(dup.calls, 0, "dedup must still suppress the duplicate");
     }
 }

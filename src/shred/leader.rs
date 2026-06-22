@@ -1,10 +1,12 @@
 //! Slot→leader lookup, backed by a Solana JSON-RPC endpoint and cached per epoch.
 //!
-//! One `getLeaderSchedule` call returns the whole epoch's schedule (leader pubkey → relative slot
-//! indices) in a single response, so the cache is rebuilt at most once per epoch. `getEpochInfo`
-//! tells us the current epoch and its first absolute slot, and lets a background refresher notice an
-//! epoch rollover. The forwarder only ever does a lock-read of the cache on its hot path; all RPC
-//! happens off-path in the refresher task.
+//! One `getLeaderSchedule` call returns a whole epoch's schedule (leader pubkey → relative slot
+//! indices) in a single response. The cache holds **two** epochs — the current one and the
+//! prefetched next — so a slot stays resolvable across a rollover with no gap. `getEpochInfo` gives
+//! the current epoch, its first absolute slot, and its length (to locate the next epoch); a
+//! background refresher loads whichever of the two isn't cached yet and evicts anything older. The
+//! forwarder only ever does a lock-read of the cache on its hot path; all RPC happens off-path in
+//! the refresher task.
 //!
 //! Minimal hand-rolled JSON-RPC over `reqwest` (the issue's "prefer minimal" option) — no
 //! `solana-client`.
@@ -27,18 +29,25 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_SCHEDULE_SLOTS: usize = 4_000_000;
 
 /// The cached leader pubkeys for one epoch, indexed by `slot - first_slot`. `None` marks a slot with
-/// no decodable leader (a sparse/garbled schedule), distinct from a real pubkey so the forwarder can
-/// fail **open** for it rather than verifying against a bogus zero key.
+/// no decodable leader (a sparse/garbled schedule), distinct from a real pubkey so the forwarder
+/// never verifies against a bogus zero key (it drops that slot instead — see `leader`).
 struct EpochLeaders {
     epoch: u64,
     first_slot: u64,
     leaders: Vec<Option<[u8; 32]>>,
 }
 
+/// `(epoch, first_slot, leaders)` triple for seeding the cache directly in tests.
+#[cfg(test)]
+type SeededEpoch = (u64, u64, Vec<Option<[u8; 32]>>);
+
 pub struct LeaderSchedule {
     rpc_url: String,
     client: reqwest::Client,
-    inner: RwLock<Option<EpochLeaders>>,
+    /// The current epoch's schedule plus the **prefetched next epoch's**, so a slot is resolvable
+    /// across a rollover with no gap. Holds 0..=2 entries; the refresher trims anything older than
+    /// the current epoch. A lookup scans both (only ever two).
+    inner: RwLock<Vec<EpochLeaders>>,
 }
 
 impl LeaderSchedule {
@@ -46,7 +55,7 @@ impl LeaderSchedule {
         Self {
             rpc_url,
             client: reqwest::Client::new(),
-            inner: RwLock::new(None),
+            inner: RwLock::new(Vec::new()),
         }
     }
 
@@ -58,33 +67,50 @@ impl LeaderSchedule {
         first_slot: u64,
         leaders: Vec<Option<[u8; 32]>>,
     ) -> Self {
+        Self::with_seeded_epochs(vec![(epoch, first_slot, leaders)])
+    }
+
+    /// Seed the cache with several epochs at once (current + prefetched next), for testing
+    /// cross-epoch lookups without a live RPC. Each tuple is `(epoch, first_slot, leaders)`.
+    #[cfg(test)]
+    pub(crate) fn with_seeded_epochs(epochs: Vec<SeededEpoch>) -> Self {
         Self {
             rpc_url: String::new(),
             client: reqwest::Client::new(),
-            inner: RwLock::new(Some(EpochLeaders {
-                epoch,
-                first_slot,
-                leaders,
-            })),
+            inner: RwLock::new(
+                epochs
+                    .into_iter()
+                    .map(|(epoch, first_slot, leaders)| EpochLeaders {
+                        epoch,
+                        first_slot,
+                        leaders,
+                    })
+                    .collect(),
+            ),
         }
     }
 
-    /// The slot's leader pubkey, or `None` if the schedule isn't loaded yet, the slot lies outside
-    /// the cached epoch, or that slot has no decodable leader. `None` makes the forwarder fail open
-    /// (forward, don't dedup) for that slot — we never verify against a bogus key.
-    ///
-    /// Note the epoch-rollover gap: for up to `REFRESH_INTERVAL` after a new epoch begins, slots in
-    /// the new epoch fall past the cached schedule and return `None` (fail open, undeduped) until the
-    /// refresher reloads. Acceptable — it errs toward forwarding, never toward dropping valid shreds.
+    /// The slot's leader pubkey, or `None` if no cached epoch covers the slot or that slot has no
+    /// decodable leader. In sigverify mode `None` makes the forwarder **fail closed** (drop the
+    /// shred — it can't be verified). Because the next epoch is prefetched, `None` does not occur at
+    /// a routine rollover; it means cold start, a sustained RPC outage that outlived the prefetch
+    /// lead, or a garbled schedule.
     pub async fn leader(&self, slot: u64) -> Option<[u8; 32]> {
         let guard = self.inner.read().await;
-        let e = guard.as_ref()?;
-        let rel = slot.checked_sub(e.first_slot)? as usize;
-        e.leaders.get(rel).copied().flatten()
+        guard.iter().find_map(|e| {
+            let rel = slot.checked_sub(e.first_slot)? as usize;
+            e.leaders.get(rel).copied().flatten()
+        })
     }
 
-    /// Rebuild the cache from RPC if the current epoch differs from what's cached (or nothing is
-    /// cached yet). A no-op when the cached epoch is still current.
+    /// Ensure the current epoch's schedule is cached and **prefetch the next epoch's**, so a slot
+    /// stays resolvable across a rollover with no gap. The current epoch is required (its load error
+    /// propagates and is retried); the next-epoch prefetch is best-effort (logged, not fatal) since
+    /// it isn't needed until the boundary. Epochs older than the current are evicted. A no-op once
+    /// both are cached.
+    ///
+    /// Fetching each epoch's schedule by an explicit slot (not "current") makes the result
+    /// independent of rollover timing, so there's no epoch-boundary race to guard.
     pub async fn refresh(&self) -> Result<()> {
         let info = self.fetch_epoch_info().await?;
         // Untrusted RPC input: a response with slot_index > absolute_slot would underflow.
@@ -98,36 +124,43 @@ impl LeaderSchedule {
                     info.absolute_slot
                 )
             })?;
-        if self
-            .inner
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|e| e.epoch == info.epoch)
-        {
+        let next_first_slot = first_slot
+            .checked_add(info.slots_in_epoch)
+            .ok_or_else(|| anyhow!("epoch first_slot + slots_in_epoch overflows u64"))?;
+
+        // Drop any schedule for an epoch already behind us.
+        self.inner.write().await.retain(|e| e.epoch >= info.epoch);
+
+        self.ensure_epoch(info.epoch, first_slot).await?;
+        if let Err(e) = self.ensure_epoch(info.epoch + 1, next_first_slot).await {
+            warn!(%e, epoch = info.epoch + 1, "next-epoch leader schedule prefetch failed; will retry");
+        }
+        Ok(())
+    }
+
+    /// Load and cache one epoch's schedule if not already present, indexed from `first_slot`. The
+    /// cheap read-lock check skips the fetch in the common already-cached case; the authoritative
+    /// re-check happens under the write lock after the fetch, so a duplicate epoch is never pushed
+    /// even if two callers raced the read check (today there's only the single refresher task, but
+    /// the lock keeps this correct regardless).
+    async fn ensure_epoch(&self, epoch: u64, first_slot: u64) -> Result<()> {
+        if self.inner.read().await.iter().any(|e| e.epoch == epoch) {
             return Ok(());
         }
-        let schedule = self.fetch_leader_schedule().await?;
-        // Guard the epoch-boundary race: if the epoch rolled over between the two RPC calls, the
-        // schedule we just fetched belongs to a different epoch than `info`. Bail and let the next
-        // refresh cycle reconcile, rather than caching a mislabeled schedule.
-        let after = self.fetch_epoch_info().await?;
-        if after.epoch != info.epoch {
-            return Err(anyhow!(
-                "epoch rolled over ({} -> {}) mid-refresh; retrying next cycle",
-                info.epoch,
-                after.epoch
-            ));
-        }
+        let schedule = self.fetch_leader_schedule(first_slot).await?;
         let leaders = build_leaders(&schedule)?;
+        let mut guard = self.inner.write().await;
+        if guard.iter().any(|e| e.epoch == epoch) {
+            return Ok(()); // lost the race — another fetch already cached this epoch
+        }
         info!(
-            epoch = info.epoch,
+            epoch,
             first_slot,
             slots = leaders.len(),
             "loaded leader schedule"
         );
-        *self.inner.write().await = Some(EpochLeaders {
-            epoch: info.epoch,
+        guard.push(EpochLeaders {
+            epoch,
             first_slot,
             leaders,
         });
@@ -152,9 +185,13 @@ impl LeaderSchedule {
         self.rpc("getEpochInfo", json!([])).await
     }
 
-    async fn fetch_leader_schedule(&self) -> Result<std::collections::HashMap<String, Vec<usize>>> {
-        // `null` slot = current epoch; default config returns relative slot indices per pubkey.
-        self.rpc("getLeaderSchedule", json!([null])).await
+    async fn fetch_leader_schedule(
+        &self,
+        slot: u64,
+    ) -> Result<std::collections::HashMap<String, Vec<usize>>> {
+        // An explicit slot selects the epoch containing it (independent of rollover timing); the
+        // default config returns relative slot indices per pubkey.
+        self.rpc("getLeaderSchedule", json!([slot])).await
     }
 
     /// One JSON-RPC call, returning the decoded `result`.
@@ -196,13 +233,14 @@ struct EpochInfo {
     epoch: u64,
     absolute_slot: u64,
     slot_index: u64,
+    slots_in_epoch: u64,
 }
 
 /// Turn a `getLeaderSchedule` response (base58 pubkey → relative slot indices) into a vector indexed
 /// by relative slot. Every slot in an epoch normally has an assigned leader, so the vector is fully
-/// populated; a slot with no decodable leader stays `None` so `leader()` fails **open** for it
-/// rather than verifying against a zero key. The index span is capped ([`MAX_SCHEDULE_SLOTS`]) so a
-/// hostile/garbled RPC response can't force an unbounded allocation.
+/// populated; a slot with no decodable leader stays `None` so the forwarder drops that slot (fail
+/// closed) rather than verifying against a zero key. The index span is capped
+/// ([`MAX_SCHEDULE_SLOTS`]) so a hostile/garbled RPC response can't force an unbounded allocation.
 fn build_leaders(
     schedule: &std::collections::HashMap<String, Vec<usize>>,
 ) -> Result<Vec<Option<[u8; 32]>>> {
@@ -267,7 +305,7 @@ mod tests {
         assert_eq!(leaders[1], Some(a));
         assert_eq!(
             leaders[0], None,
-            "undecodable pubkey leaves its slot None (fails open, not against a zero key)"
+            "undecodable pubkey leaves its slot None (never verified against a zero key)"
         );
     }
 
@@ -297,12 +335,39 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(rt.block_on(sched.leader(105)), Some(pk));
-        assert_eq!(rt.block_on(sched.leader(106)), None, "None slot fails open");
+        assert_eq!(rt.block_on(sched.leader(106)), None, "None slot is unknown");
         assert_eq!(rt.block_on(sched.leader(99)), None, "before first_slot");
         assert_eq!(
             rt.block_on(sched.leader(9999)),
             None,
             "past the cached epoch"
+        );
+    }
+
+    #[test]
+    fn leader_resolves_across_current_and_next_epoch() {
+        let cur = [1u8; 32];
+        let nxt = [2u8; 32];
+        // Epoch 10 spans slots 1000..1002; the prefetched epoch 11 spans 1002..1004.
+        let sched = LeaderSchedule::with_seeded_epochs(vec![
+            (10, 1000, vec![Some(cur), Some(cur)]),
+            (11, 1002, vec![Some(nxt), Some(nxt)]),
+        ]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(sched.leader(1000)), Some(cur));
+        assert_eq!(rt.block_on(sched.leader(1001)), Some(cur));
+        assert_eq!(
+            rt.block_on(sched.leader(1002)),
+            Some(nxt),
+            "a slot in the prefetched next epoch resolves before rollover, no gap"
+        );
+        assert_eq!(rt.block_on(sched.leader(1003)), Some(nxt));
+        assert_eq!(
+            rt.block_on(sched.leader(2000)),
+            None,
+            "a slot outside every cached epoch is unknown"
         );
     }
 
