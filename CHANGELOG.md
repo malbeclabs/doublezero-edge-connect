@@ -125,6 +125,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
+- Shred dedup-only mode (`--shred-dedup`) now keys its dedup window on `(slot, index, type,
+  content-fingerprint)` instead of `(slot, index, type)`, so it collapses copies that match over the
+  signed content. A shred sharing `(slot, index, type)` but carrying different signed content
+  (equivocation, corruption, a forged first-arriver) now still forwards rather than being silently
+  dropped onto the first copy — loss-averse, since without sigverify the forwarder can't tell which
+  copy is valid. The fingerprint excludes the trailing 64-byte **retransmitter signature** of
+  resigned merkle shreds (variants `0x70`/`0xb0`), which is rewritten per turbine path: cross-group
+  copies of the same shred differ *only* there, so hashing the whole datagram would give each its own
+  key and dedup none of them. Excluding that tail needs only the already-decoded `resigned` flag and
+  the datagram length, not the unvalidated merkle offsets. The fingerprint is a deterministic hash
+  computed only in dedup-only mode; sigverify mode is unchanged (keyed content-agnostically, since
+  the signature picks the valid winner). Adds `examples/bench_dedup_vs_sigverify.rs`, which measures
+  the fingerprint's marginal cost at ~135× cheaper than an ed25519 verify.
 - The quote latch-to-leader floor and the windowed trade dedup moved out of `TobProcessor` into a
   shared pre-broadcast `Arbiter` (`src/ingest/arbiter.rs`) that owns the broadcast `Sender` and
   exposes one `emit(msg, publisher)` entry point (#8). Every ingest source — each multicast receiver

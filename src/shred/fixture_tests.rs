@@ -116,6 +116,7 @@ fn dedup_collapses_cross_group_duplicates() {
             meta.slot,
             meta.index,
             meta.shred_type,
+            0,
             leader.is_some(),
             &mut verify_fn,
         ) == Action::Forward
@@ -160,6 +161,7 @@ fn same_datagram_twice_forwards_once() {
             meta.slot,
             meta.index,
             meta.shred_type,
+            0,
             leader.is_some(),
             &mut verify_fn,
         )
@@ -176,6 +178,7 @@ fn same_datagram_twice_forwards_once() {
             meta.slot,
             meta.index,
             meta.shred_type,
+            0,
             leader.is_some(),
             &mut verify_fn,
         )
@@ -184,6 +187,77 @@ fn same_datagram_twice_forwards_once() {
     assert_eq!(
         verify_calls, after_first,
         "second (duplicate) copy must skip the signature check"
+    );
+}
+
+/// Dedup-only regression for resigned merkle shreds: their trailing 64-byte **retransmitter
+/// signature** is rewritten per turbine path, so two cross-group copies of the same shred differ
+/// *only* there. The dedup-only fingerprint must exclude that tail or none of them collapse.
+///
+/// Drives the real `forwarder_task` in dedup-only mode (no schedule) over two pairs sharing
+/// `(slot, index, type)`:
+/// - a **resigned** datagram and a twin differing only in the trailing 64 bytes → must collapse to
+///   one forward (the case the whole-datagram fingerprint missed);
+/// - a **non-resigned** datagram and a twin differing in a signed payload byte → both must forward
+///   (loss-averse: without sigverify we can't tell which copy is valid).
+#[tokio::test]
+async fn dedup_only_collapses_resigned_copies_but_not_differing_content() {
+    use tokio::{
+        net::UdpSocket,
+        sync::mpsc,
+        time::{timeout, Duration},
+    };
+
+    use super::{forwarder_task, ShredPacket};
+
+    let datagrams = load_datagrams();
+    // Resigned variants are 0x70 (code) / 0xb0 (data) high-nibble; the capture carries 0x76/0xb6.
+    let resigned = datagrams
+        .iter()
+        .find(|p| matches!(p[64] & 0xf0, 0x70 | 0xb0))
+        .expect("capture has a resigned merkle shred (0x76/0xb6)")
+        .clone();
+    // A non-resigned merkle shred (0x60 code / 0x90 data here) so its key differs from `resigned`.
+    let plain = datagrams
+        .iter()
+        .find(|p| matches!(p[64] & 0xf0, 0x40 | 0x60 | 0x80 | 0x90))
+        .expect("capture has a non-resigned merkle shred (0x66/0x96)")
+        .clone();
+    assert!(
+        parse(&resigned).unwrap().resigned && !parse(&plain).unwrap().resigned,
+        "fixtures classified as expected"
+    );
+
+    // Twin of the resigned shred differing only in the retransmitter-signature tail: same shred.
+    let mut resigned_twin = resigned.clone();
+    *resigned_twin.last_mut().unwrap() ^= 0xff;
+    // Twin of the non-resigned shred differing in a signed payload byte (offset 100, well inside the
+    // merkle leaf): genuinely different signed content, so it must not be collapsed.
+    let mut plain_twin = plain.clone();
+    plain_twin[100] ^= 0xff;
+
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel::<ShredPacket>(16);
+    // schedule = None, dedup = true -> dedup-only mode.
+    let handle = tokio::spawn(forwarder_task(rx, vec![dst], None, true, 512));
+    for pkt in [&resigned, &resigned_twin, &plain, &plain_twin] {
+        tx.send(pkt.clone()).await.unwrap();
+    }
+    drop(tx);
+    handle.await.unwrap().unwrap();
+
+    let mut buf = [0u8; 2048];
+    let mut forwarded = 0usize;
+    while timeout(Duration::from_millis(500), listener.recv(&mut buf))
+        .await
+        .is_ok()
+    {
+        forwarded += 1;
+    }
+    assert_eq!(
+        forwarded, 3,
+        "resigned pair collapses to one; non-resigned differing-content pair both forward"
     );
 }
 

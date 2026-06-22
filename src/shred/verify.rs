@@ -32,6 +32,7 @@ mod tests {
             shred_type: ShredType::Data,
             signature: sig,
             signed_message: msg.to_vec(),
+            resigned: false,
         }
     }
 

@@ -58,6 +58,11 @@ pub struct ShredMeta {
     pub shred_type: ShredType,
     pub signature: [u8; 64],
     pub signed_message: Vec<u8>,
+    /// True for merkle variants carrying a **retransmitter signature** in the trailing 64 bytes
+    /// (`0x70` code / `0xb0` data). That tail is rewritten per turbine path, so two multicast copies
+    /// of the *same* shred differ only there — the dedup-only fingerprint must exclude it to collapse
+    /// them (see `mod.rs`). Legacy and non-resigned merkle shreds set this `false`.
+    pub resigned: bool,
 }
 
 /// A parsed `shred_variant` byte (offset 64). Legacy variants are two fixed byte values; merkle
@@ -113,9 +118,9 @@ pub fn parse(pkt: &[u8]) -> Option<ShredMeta> {
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&pkt[..SIZE_OF_SIGNATURE]);
 
-    let (shred_type, signed_message) = match variant {
+    let (shred_type, signed_message, resigned) = match variant {
         // Legacy shreds sign the whole payload after the signature.
-        Variant::Legacy(ty) => (ty, pkt.get(SIZE_OF_SIGNATURE..)?.to_vec()),
+        Variant::Legacy(ty) => (ty, pkt.get(SIZE_OF_SIGNATURE..)?.to_vec(), false),
         // Merkle shreds sign the merkle root, recomputed from the leaf + proof.
         Variant::Merkle {
             ty,
@@ -123,7 +128,7 @@ pub fn parse(pkt: &[u8]) -> Option<ShredMeta> {
             resigned,
         } => {
             let root = merkle_root(pkt, ty, proof_size, resigned, index)?;
-            (ty, root.to_vec())
+            (ty, root.to_vec(), resigned)
         }
     };
     Some(ShredMeta {
@@ -132,6 +137,7 @@ pub fn parse(pkt: &[u8]) -> Option<ShredMeta> {
         shred_type,
         signature,
         signed_message,
+        resigned,
     })
 }
 
