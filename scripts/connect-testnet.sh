@@ -28,7 +28,7 @@
 #   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install)
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, DZ_IFACE, RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
+# (WS_*, DZ_IFACE, DZ_SHRED_*, RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect-testnet | bash
 #
 # A DZ_-token-derived keypair is injected straight into the container and is never
@@ -263,6 +263,8 @@ PASSTHROUGH=(
   DZ_FEEDS DZ_IFACE DZ_RECV_BUF
   WS_BIND WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
+  DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
+  DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
   RUST_LOG
 )
 env_args=()

@@ -8,15 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Shred forwarder dedup-only mode: `--shred-dedup` (`DZ_SHRED_DEDUP`) deduplicates forwarded
-  shreds on `(slot, index, type)` — forwarding exactly one copy of each — **without** signature
-  verification or any Solana RPC. This collapses the multicast-overlap duplicates DoubleZero
-  delivers across its several `edge-solana-*` groups (the bare default forwarded every copy, and the
-  existing `(slot, index, type)` dedup was only reachable via `--shred-rpc-url`, which also enabled
-  ed25519 sigverify and required a reachable RPC). Reuses the same bounded `DedupWindow`
-  (`--shred-dedup-window-slots`); sigverify mode is unchanged and implies dedup. ⚠️ Like sigverify
-  mode, this depends on the unvalidated agave shred offsets, so a misparse could over- or
-  under-deduplicate — confirm against a captured frame before relying on it.
+- Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
+  (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
+  copy of each shred out of the box, collapsing the multicast-overlap duplicates DoubleZero delivers
+  across its several `edge-solana-*` groups (previously the default forwarded every copy). The three
+  modes are `dedup` (default; `(slot, index, type)` dedup, **no** signature verification or RPC),
+  `sigverify` (dedup + ed25519 leader-signature check, requires `--shred-rpc-url`), and `none`
+  (forward every datagram). The mode is the only method selector: an RPC URL set in a non-sigverify
+  mode is ignored (logged), never auto-promoting to sigverify. Replaces the boolean `--shred-dedup`
+  (`DZ_SHRED_DEDUP`) flag added earlier in this unreleased cycle. `dedup`/`sigverify` share the same
+  bounded `DedupWindow` (`--shred-dedup-window-slots`). ⚠️ Dedup still depends on the unvalidated
+  agave shred offsets, so a misparse could over- or under-deduplicate — confirm against a captured
+  frame before relying on it. The `curl … | bash` installer scripts (`scripts/connect*.sh`) now
+  relay the `DZ_SHRED_*` env vars into the container, so the shred forwarder can be tuned from the
+  one-liner (e.g. `DZ_SHRED_DEDUP_MODE=sigverify DZ_SHRED_RPC_URL=… curl … | bash`).
 - Explicit duplicate-packet de-duplication tests across all three dedup paths. Decoded-message unit
   tests in `arbiter.rs` (an identical quote from the same source, the same BBO mirrored by two
   multicast publishers, and an identical trade all collapse to one emission); raw-packet replay

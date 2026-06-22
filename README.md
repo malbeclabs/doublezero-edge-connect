@@ -161,9 +161,10 @@ non-empty default bind, so it is on unless you explicitly clear it.
 Alongside the market-data bridge, an optional **shred forwarder** (under [`src/shred/`](src/shred/))
 joins the DoubleZero `edge-solana-*` shred multicast feeds, combines them, and fans each raw datagram
 out to one or more **local unicast** UDP destinations (e.g. a Jito shredstream-proxy listener). By
-default it forwards every datagram; set `--shred-dedup` to forward only one copy of each shred (DoubleZero
-delivers the same shred on several overlapping multicast groups, so this collapses the duplicate fan-out),
-or `--shred-rpc-url` to additionally signature-verify that one copy (see below). Each destination gets its
+default it forwards **one copy of each shred** (DoubleZero delivers the same shred on several overlapping
+multicast groups, so this collapses the duplicate fan-out). `--shred-dedup-mode`
+(`DZ_SHRED_DEDUP_MODE`) is the single selector: `dedup` (default), `sigverify` to additionally
+signature-verify that one copy (see below), or `none` to forward every datagram. Each destination gets its
 own `connect`ed send socket, so an async
 ICMP error from a down destination (e.g. nothing listening) stays isolated to that socket and never
 drops a datagram bound for a healthy one. `--shred-forward` targets should be local/fast sinks: sends
@@ -176,22 +177,25 @@ It **activates on discovery**: by default it shells out to `doublezero multicast
 errors, or finds no matching group, the forwarder stays off. Pass `--shred-source GROUP:PORT`
 (repeatable) to override discovery entirely.
 
-**Deduplication.** The forwarder has three modes:
+**Deduplication.** `--shred-dedup-mode` (`DZ_SHRED_DEDUP_MODE`) picks one of three modes — it is the
+**only** method selector:
 
-- **Bare** (default, neither flag): every datagram is forwarded — duplicates and all.
-- **Dedup-only** (`--shred-dedup`, no RPC): forward exactly **one copy** of each shred, keyed on
+- **Dedup-only** (`dedup`, the **default**): forward exactly **one copy** of each shred, keyed on
   `(slot, index, type)` in a bounded window — a duplicate of an already-forwarded copy is dropped.
   No leader lookup, no signature work, no RPC. This is the cheap suppressor for the multicast-overlap
   duplicates (forgery protection is moot on the trusted DoubleZero network).
-- **Dedup + sigverify** (`--shred-rpc-url`): same dedup, plus the first copy of each key is
-  ed25519-verified against its slot leader before being forwarded. The leader schedule is fetched per
-  epoch from the RPC and cached; an invalid copy is dropped but leaves the key open so a later valid
-  copy can still win; a slot whose leader isn't known yet (schedule still loading, or outside the
-  cached epoch) fails **open** — forwarded but not deduped — so the forwarder never silently drops
-  traffic it can't yet judge.
+- **Dedup + sigverify** (`sigverify`): same dedup, plus the first copy of each key is
+  ed25519-verified against its slot leader before being forwarded. Requires `--shred-rpc-url`
+  (`DZ_SHRED_RPC_URL`) — the leader schedule is fetched per epoch from that RPC and cached; an
+  invalid copy is dropped but leaves the key open so a later valid copy can still win; a slot whose
+  leader isn't known yet (schedule still loading, or outside the cached epoch) fails **open** —
+  forwarded but not deduped — so the forwarder never silently drops traffic it can't yet judge. An
+  RPC URL set in any other mode is **ignored** (logged at startup); sigverify is never auto-selected.
+- **Bare** (`none`): every datagram is forwarded — duplicates and all (the original behaviour).
 
-Both dedup modes share the bounded `(slot, index, type)` window (`--shred-dedup-window-slots`): keys
-older than that many slots behind the tip are evicted, so memory is bounded by `window × shreds-per-slot`.
+The `dedup` and `sigverify` modes share the bounded `(slot, index, type)` window
+(`--shred-dedup-window-slots`): keys older than that many slots behind the tip are evicted, so memory
+is bounded by `window × shreds-per-slot`.
 
 > ⚠️ The shred/merkle byte offsets are transcribed from the agave shred layout and are **not** yet
 > validated against a live `edge-solana-*` hexdump (the same caveat as the repo's unvalidated Midpoint/
@@ -206,9 +210,28 @@ older than that many slots behind the tip are evicted, so memory is bounded by `
 | `--shred-port` | `DZ_SHRED_PORT` | `7733` |
 | `--shred-forward` (repeatable) | `DZ_SHRED_FORWARD` | `127.0.0.1:20000` |
 | `--shred-source` (repeatable) | `DZ_SHRED_SOURCES` | — (override discovery) |
-| `--shred-dedup` | `DZ_SHRED_DEDUP` | `false` (set to dedup without sigverify) |
-| `--shred-rpc-url` | `DZ_SHRED_RPC_URL` | — (set to enable sigverify + dedup) |
-| `--shred-dedup-window-slots` | `DZ_SHRED_DEDUP_WINDOW_SLOTS` | `512` (used with `--shred-dedup` or `--shred-rpc-url`) |
+| `--shred-dedup-mode` | `DZ_SHRED_DEDUP_MODE` | `dedup` (one copy per shred; `sigverify` / `none` to change) |
+| `--shred-rpc-url` | `DZ_SHRED_RPC_URL` | — (RPC endpoint; required by `sigverify` mode, ignored otherwise) |
+| `--shred-dedup-window-slots` | `DZ_SHRED_DEDUP_WINDOW_SLOTS` | `512` (used in `dedup` or `sigverify` mode) |
+
+Configure everything on the run command — there is no config file. The default `dedup` mode needs no
+extra flags; switch modes (and pass any other shred config) inline at install/launch time:
+
+```bash
+# From source — default dedup-only, just point it at a destination:
+./target/release/doublezero-edge-connect --iface doublezero1 --ws-bind 0.0.0.0:8081 \
+  --shred-forward 127.0.0.1:20000
+
+# Switch to sigverify (needs an RPC); or turn dedup off with --shred-dedup-mode none:
+./target/release/doublezero-edge-connect --iface doublezero1 --ws-bind 0.0.0.0:8081 \
+  --shred-dedup-mode sigverify --shred-rpc-url https://api.mainnet-beta.solana.com
+
+# In Docker the same config is passed as env vars on the one-liner:
+docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
+  -e DZ_SHRED_DEDUP_MODE=sigverify -e DZ_SHRED_RPC_URL=https://api.mainnet-beta.solana.com \
+  -e DZ_SHRED_FORWARD=127.0.0.1:20000 \
+  doublezero-edge-connect
+```
 
 The forwarder reuses `--iface` and `--recv-buf`. Invalid `host:port` / `GROUP:PORT` values fail fast
 at startup, and a non-loopback `--shred-forward` target is warned about (it would route raw,
