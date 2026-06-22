@@ -112,14 +112,8 @@ fn dedup_collapses_cross_group_duplicates() {
         keys.insert((meta.slot, meta.index, meta.shred_type));
         let leader = leaders.get(&meta.slot).copied();
         let mut verify_fn = || leader.as_ref().is_some_and(|pk| verify(&meta, pk));
-        if window.decide(
-            meta.slot,
-            meta.index,
-            meta.shred_type,
-            0,
-            leader.is_some(),
-            &mut verify_fn,
-        ) == Action::Forward
+        if window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
+            == Action::Forward
         {
             forwarded += 1;
         }
@@ -157,14 +151,7 @@ fn same_datagram_twice_forwards_once() {
             verify_calls += 1;
             leader.as_ref().is_some_and(|pk| verify(&meta, pk))
         };
-        window.decide(
-            meta.slot,
-            meta.index,
-            meta.shred_type,
-            0,
-            leader.is_some(),
-            &mut verify_fn,
-        )
+        window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
     };
     assert_eq!(first, Action::Forward, "first copy verifies and forwards");
     let after_first = verify_calls;
@@ -174,14 +161,7 @@ fn same_datagram_twice_forwards_once() {
             verify_calls += 1;
             leader.as_ref().is_some_and(|pk| verify(&meta, pk))
         };
-        window.decide(
-            meta.slot,
-            meta.index,
-            meta.shred_type,
-            0,
-            leader.is_some(),
-            &mut verify_fn,
-        )
+        window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
     };
     assert_eq!(second, Action::Drop, "duplicate of the winner is dropped");
     assert_eq!(

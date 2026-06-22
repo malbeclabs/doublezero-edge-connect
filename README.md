@@ -186,11 +186,19 @@ errors, or finds no matching group, the forwarder stays off. Pass `--shred-sourc
   duplicates (forgery protection is moot on the trusted DoubleZero network).
 - **Dedup + sigverify** (`sigverify`): same dedup, plus the first copy of each key is
   ed25519-verified against its slot leader before being forwarded. Requires `--shred-rpc-url`
-  (`DZ_SHRED_RPC_URL`) — the leader schedule is fetched per epoch from that RPC and cached; an
-  invalid copy is dropped but leaves the key open so a later valid copy can still win; a slot whose
-  leader isn't known yet (schedule still loading, or outside the cached epoch) fails **open** —
-  forwarded but not deduped — so the forwarder never silently drops traffic it can't yet judge. An
-  RPC URL set in any other mode is **ignored** (logged at startup); sigverify is never auto-selected.
+  (`DZ_SHRED_RPC_URL`); the leader schedule is fetched from that RPC and cached, and the **next epoch
+  is prefetched** so a slot stays resolvable across a rollover with no gap. An invalid copy is dropped
+  but leaves the key open so a later valid copy can still win; a slot whose leader isn't known fails
+  **closed** — the shred is dropped, never forwarded unverified.
+  - **Sigverify never falls back to forwarding.** If the RPC is unreachable at startup the cache is
+    empty and the forwarder drops **every** shred until the first schedule loads — an unreachable RPC
+    means nothing flows, indefinitely. This is a deliberate reversal of the bare/dedup behaviour: if
+    you want forward-when-unverified, use dedup-only. Once the current epoch is cached, prefetch keeps
+    it resolvable, so beyond cold start `no_leader` drops only occur on a sustained RPC outage past the
+    ~epoch prefetch lead or a garbled schedule. Every such drop increments the `no_leader` periodic
+    tally, and the first one logs a `warn!` — the signal to watch for a blackout.
+  - An RPC URL set in any other mode is **ignored** (logged at startup); sigverify is never
+    auto-selected.
 - **Bare** (`none`): every datagram is forwarded — duplicates and all (the original behaviour).
 
 The `dedup` and `sigverify` modes share the bounded `(slot, index, type)` window
