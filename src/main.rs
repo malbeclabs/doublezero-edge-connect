@@ -96,20 +96,25 @@ struct Args {
     #[arg(long = "shred-source", env = "DZ_SHRED_SOURCES", value_delimiter = ',')]
     shred_sources: Vec<String>,
 
-    /// Shred forwarder: Solana JSON-RPC endpoint for the leader schedule. Setting it enables
-    /// signature verification + deduplication (forward exactly one valid copy of each shred). Unset
-    /// = forward every datagram (no dedup/sigverify).
+    /// Shred forwarder: deduplication mode — the single selector for forwarder behaviour.
+    /// `dedup` (default) forwards one copy of each shred with no sigverify or RPC; `sigverify`
+    /// additionally ed25519-verifies that copy against its slot leader (and requires
+    /// `--shred-rpc-url`); `none` forwards every datagram (duplicates and all).
+    #[arg(
+        long = "shred-dedup-mode",
+        env = "DZ_SHRED_DEDUP_MODE",
+        value_enum,
+        default_value_t = shred::DedupMode::Dedup
+    )]
+    shred_dedup_mode: shred::DedupMode,
+
+    /// Shred forwarder: Solana JSON-RPC endpoint for the leader schedule. Required (and consumed)
+    /// only by `--shred-dedup-mode sigverify`; ignored (with a warning) in any other mode.
     #[arg(long = "shred-rpc-url", env = "DZ_SHRED_RPC_URL")]
     shred_rpc_url: Option<String>,
 
-    /// Shred forwarder: deduplicate on `(slot, index, type)` without signature verification or any
-    /// RPC — forward one copy per key, dropping the multicast-overlap duplicates. Implied when
-    /// `--shred-rpc-url` is set (sigverify already dedups); ignored if that is set.
-    #[arg(long = "shred-dedup", env = "DZ_SHRED_DEDUP", default_value_t = false)]
-    shred_dedup: bool,
-
     /// Shred forwarder: dedup window depth in slots. Keys older than this many slots behind the tip
-    /// are evicted, bounding memory. Used when `--shred-rpc-url` or `--shred-dedup` is set.
+    /// are evicted, bounding memory. Used in `dedup` and `sigverify` modes.
     #[arg(
         long = "shred-dedup-window-slots",
         env = "DZ_SHRED_DEDUP_WINDOW_SLOTS",
@@ -219,19 +224,30 @@ async fn main() -> Result<()> {
         info!("shred forwarder disabled (no --shred-source and discovery found no groups)");
         None
     } else {
+        let mode = args.shred_dedup_mode;
+        // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
+        // any other mode is ignored (warn rather than silently promote — the user chose the mode).
+        if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
+            bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
+        }
+        if mode != shred::DedupMode::Sigverify && args.shred_rpc_url.is_some() {
+            warn!(
+                ?mode,
+                "--shred-rpc-url is set but ignored (only --shred-dedup-mode sigverify uses it)"
+            );
+        }
         // A zero window evicts everything immediately, defeating dedup; reject it up front rather
         // than silently forwarding every duplicate.
-        if (args.shred_rpc_url.is_some() || args.shred_dedup) && args.shred_dedup_window_slots == 0
-        {
-            bail!("--shred-dedup-window-slots must be > 0 when --shred-rpc-url or --shred-dedup is set");
+        if mode != shred::DedupMode::None && args.shred_dedup_window_slots == 0 {
+            bail!("--shred-dedup-window-slots must be > 0 unless --shred-dedup-mode is none");
         }
         let shred_cfg = shred::ShredConfig {
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
             sources: shred_sources,
             forward: shred_forward,
+            mode,
             rpc_url: args.shred_rpc_url.clone(),
-            dedup: args.shred_dedup,
             dedup_window_slots: args.shred_dedup_window_slots,
         };
         info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");

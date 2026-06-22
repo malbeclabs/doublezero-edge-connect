@@ -12,25 +12,27 @@
 //! lives, with no cross-task sharing. Receivers stay dumb (recv → push bytes); the forwarder owns
 //! the send socket, the dedup window, and the leader-schedule lookup.
 //!
-//! Three modes:
-//! - **Bare forward** (default, neither flag set) → every datagram is fanned out (original behaviour).
-//! - **Dedup-only** (`--shred-dedup`, no RPC) → forward exactly **one copy** of each shred keyed on
-//!   `(slot, index, type, content-fingerprint)` ([`dedup`]), with **no** signature verification,
-//!   leader lookup, or RPC. The first copy of a key is forwarded and recorded; later copies that
-//!   match over the fingerprinted region are dropped. The fingerprint covers the whole datagram
-//!   except the trailing **retransmitter signature** of resigned merkle shreds (rewritten per
-//!   turbine path), so cross-group copies of the same shred collapse even though that tail differs.
-//!   A shred sharing `(slot, index, type)` but carrying different signed content still forwards
-//!   (loss-averse — without sigverify we can't tell which copy is valid). This is the cheap
+//! Three modes, selected by the single [`DedupMode`] setting (`--shred-dedup-mode` /
+//! `DZ_SHRED_DEDUP_MODE`):
+//! - **Dedup-only** ([`DedupMode::Dedup`], the **default**) → forward exactly **one copy** of each
+//!   shred keyed on `(slot, index, type, content-fingerprint)` ([`dedup`]), with **no** signature
+//!   verification, leader lookup, or RPC. The first copy of a key is forwarded and recorded; later
+//!   copies that match over the fingerprinted region are dropped. The fingerprint covers the whole
+//!   datagram except the trailing **retransmitter signature** of resigned merkle shreds (rewritten
+//!   per turbine path), so cross-group copies of the same shred collapse even though that tail
+//!   differs. A shred sharing `(slot, index, type)` but carrying different signed content still
+//!   forwards (loss-averse — without sigverify we can't tell which copy is valid). This is the cheap
 //!   suppressor for the multicast-overlap duplicates DoubleZero delivers across its several shred
 //!   groups — forgery protection is moot on the trusted network, so sigverify isn't required.
-//! - **Dedup + sigverify** (`--shred-rpc-url` set) → forward exactly **one valid copy** of each
-//!   shred. The forwarder keys the same bounded, prefer-valid dedup window on `(slot, index, type)`;
-//!   the first copy of a key is ed25519-verified ([`verify`]) against its slot leader ([`leader`])
-//!   using fields pulled from the raw datagram ([`parse`]). A verified copy is forwarded and
-//!   recorded; later duplicates are dropped *without* a signature check; an invalid copy is dropped
-//!   but leaves the key open so a later valid copy can still win. A slot whose leader isn't known
-//!   yet fails **open** (forward, no dedup), so we never silently drop traffic we can't judge.
+//! - **Bare forward** ([`DedupMode::None`]) → every datagram is fanned out (the original behaviour).
+//! - **Dedup + sigverify** ([`DedupMode::Sigverify`]; also requires `--shred-rpc-url`) → forward
+//!   exactly **one valid copy** of each shred. The forwarder keys the same bounded, prefer-valid
+//!   dedup window on `(slot, index, type)`; the first copy of a key is ed25519-verified ([`verify`])
+//!   against its slot leader ([`leader`]) using fields pulled from the raw datagram ([`parse`]). A
+//!   verified copy is forwarded and recorded; later duplicates are dropped *without* a signature
+//!   check; an invalid copy is dropped but leaves the key open so a later valid copy can still win. A
+//!   slot whose leader isn't known yet fails **open** (forward, no dedup), so we never silently drop
+//!   traffic we can't judge.
 
 pub mod dedup;
 pub mod discovery;
@@ -100,6 +102,22 @@ const RETRANSMITTER_SIG_LEN: usize = parse::SIZE_OF_SIGNATURE;
 /// possible later optimization; not needed now.)
 pub type ShredPacket = Vec<u8>;
 
+/// How the forwarder deduplicates, selected by `--shred-dedup-mode` / `DZ_SHRED_DEDUP_MODE`. This
+/// single setting is the only method selector — there is no implicit promotion from `--shred-rpc-url`
+/// (which is just the endpoint parameter consumed by [`DedupMode::Sigverify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DedupMode {
+    /// **Default.** Forward one copy per `(slot, index, type, content-fingerprint)`; no signature
+    /// verification, leader lookup, or RPC. Collapses DoubleZero's multicast-overlap duplicates.
+    #[default]
+    Dedup,
+    /// Dedup + ed25519 sigverify of the one forwarded copy against its slot leader. Requires a
+    /// reachable RPC via `--shred-rpc-url`.
+    Sigverify,
+    /// Forward every datagram, duplicates and all (the original bare behaviour).
+    None,
+}
+
 /// Resolved configuration for the shred forwarder. Built in `main` from the CLI/env flags.
 #[derive(Debug, Clone)]
 pub struct ShredConfig {
@@ -111,12 +129,11 @@ pub struct ShredConfig {
     pub sources: Vec<SocketAddrV4>,
     /// Local destinations every datagram is fanned out to.
     pub forward: Vec<SocketAddr>,
-    /// Solana JSON-RPC endpoint for the leader schedule. `Some` enables dedup + sigverify; `None`
-    /// falls back to dedup-only (if `dedup`) or bare forwarding.
+    /// Deduplication mode. The single source of truth for forwarder behaviour.
+    pub mode: DedupMode,
+    /// Solana JSON-RPC endpoint for the leader schedule. Consumed only when `mode` is
+    /// [`DedupMode::Sigverify`] (and required there); ignored otherwise.
     pub rpc_url: Option<String>,
-    /// Dedup on `(slot, index, type)` without sigverify. Ignored when `rpc_url` is `Some` (sigverify
-    /// mode already dedups); `false` + no RPC = bare forward-everything.
-    pub dedup: bool,
     /// Dedup window depth in slots: keys older than this many slots behind the tip are evicted, so
     /// memory is bounded by `window × shreds-per-slot`.
     pub dedup_window_slots: u64,
@@ -170,16 +187,20 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-    // Sigverify + dedup are enabled iff an RPC URL is configured. Without it we fall back to the
-    // bare forward-everything behaviour.
-    let schedule = match &cfg.rpc_url {
-        Some(url) => {
+    // The mode is the single source of truth. Sigverify builds a leader schedule (and requires an
+    // RPC URL — main rejects `Sigverify` without one before we get here); dedup-only and bare run
+    // with no schedule, distinguished by the `dedup` bool passed to the forwarder below.
+    let schedule = match cfg.mode {
+        DedupMode::Sigverify => {
+            let url = cfg.rpc_url.clone().expect(
+                "sigverify mode requires an RPC URL; main validates this before building ShredConfig",
+            );
             warn!(
                 "shred sigverify enabled: shred/merkle offsets are transcribed from the agave \
                  layout and NOT validated against a live edge-solana hexdump — watch the periodic \
                  verify tally and confirm against a captured frame before trusting it"
             );
-            let sched = Arc::new(LeaderSchedule::new(url.clone()));
+            let sched = Arc::new(LeaderSchedule::new(url));
             let refresher = Arc::clone(&sched);
             tasks.spawn(async move {
                 refresher.run_refresher().await; // loops forever
@@ -187,15 +208,15 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
             });
             Some(sched)
         }
-        None if cfg.dedup => {
+        DedupMode::Dedup => {
             info!(
-                "shred dedup enabled (no sigverify, no --shred-rpc-url); forwarding one copy per \
+                "shred dedup-only enabled (default; no sigverify, no RPC); forwarding one copy per \
                  (slot, index, type)"
             );
             None
         }
-        None => {
-            info!("shred sigverify/dedup disabled (no --shred-rpc-url); forwarding every datagram");
+        DedupMode::None => {
+            info!("shred dedup disabled (--shred-dedup-mode none); forwarding every datagram");
             None
         }
     };
@@ -204,7 +225,7 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
         rx,
         cfg.forward.clone(),
         schedule,
-        cfg.dedup,
+        cfg.mode == DedupMode::Dedup,
         cfg.dedup_window_slots,
     ));
     for src in cfg.sources {
@@ -521,6 +542,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_dedup_mode_is_dedup_only() {
+        // The out-of-the-box behaviour is dedup-only (collapse multicast-overlap duplicates), not
+        // the old bare forward-everything. Pin it so a default change can't slip in silently.
+        assert_eq!(DedupMode::default(), DedupMode::Dedup);
+    }
+
+    #[test]
     fn parse_forwards_accepts_valid_and_rejects_invalid() {
         let ok = parse_forwards(&["127.0.0.1:20000".into(), "10.0.0.1:7000".into()]).unwrap();
         assert_eq!(ok.len(), 2);
@@ -619,8 +647,8 @@ mod tests {
             recv_buf: 1 << 20,
             sources: vec![src],
             forward: vec![d1, d2],
+            mode: DedupMode::None,
             rpc_url: None,
-            dedup: false,
             dedup_window_slots: 512,
         };
         let handle = tokio::spawn(run(cfg));
@@ -669,8 +697,8 @@ mod tests {
             recv_buf: 1 << 20,
             sources: vec![src],
             forward: vec![dead, live_addr], // dead first: it must not stop the live one after it
+            mode: DedupMode::None,
             rpc_url: None,
-            dedup: false,
             dedup_window_slots: 512,
         };
         let handle = tokio::spawn(run(cfg));

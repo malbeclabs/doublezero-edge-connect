@@ -56,8 +56,10 @@ The installer relays **any** of the bridge's own env vars that are set straight 
 `docker run`, so this is all the wiring needed to tune the bridge from the one-liner — no
 per-feature flags in the script.
 
-Common ones: `DZ_IFACE`, `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `RUST_LOG`. See the
-bridge's `Args` in [`../src/main.rs`](../src/main.rs) and the sink table in the
+Common ones: `DZ_IFACE`, `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `RUST_LOG`, and the shred
+forwarder's `DZ_SHRED_*` (notably `DZ_SHRED_DEDUP_MODE` — `dedup` by default, `sigverify` / `none`
+to change — and `DZ_SHRED_RPC_URL` for sigverify mode). See the bridge's `Args` in
+[`../src/main.rs`](../src/main.rs) and the sink/shred tables in the
 [top-level README](../README.md) for the full list and defaults.
 
 > **Limitation:** only **non-empty** values are forwarded, so you can't pass an *empty* override
@@ -81,6 +83,10 @@ DZ_SECRET=DZ_… DZ_GHCR_TOKEN=ghp_… \
 
 # More verbose logging + a non-default WebSocket port
 RUST_LOG=debug WS_BIND=0.0.0.0:9000 \
+  curl -fsSL https://get.doublezero.xyz/connect | bash
+
+# Shred forwarder with sigverify (dedup-only is the default and needs no vars)
+DZ_SECRET=DZ_… DZ_SHRED_DEDUP_MODE=sigverify DZ_SHRED_RPC_URL=https://api.mainnet-beta.solana.com \
   curl -fsSL https://get.doublezero.xyz/connect | bash
 ```
 
