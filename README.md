@@ -64,7 +64,7 @@ environment. See [scripts/README.md](scripts/README.md) for the full requirement
 All configuration is via **environment variables set before the pipe**. No config file:
 
 ```bash
-DZ_SECRET=DZ_… DZ_FEEDS=Hyperliquid curl -fsSL https://get.doublezero.xyz/connect | bash
+DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero.xyz/connect | bash
 ```
 
 **Installer variables:**
@@ -75,7 +75,8 @@ DZ_SECRET=DZ_… DZ_FEEDS=Hyperliquid curl -fsSL https://get.doublezero.xyz/conn
 | `DZ_ENV` | per script | `mainnet-beta` \| `testnet` \| `devnet`. |
 | `DZ_IMAGE` | per script | Override the container image. |
 | `DZ_NAME` | `doublezero-edge-connect` | Container name. |
-| `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion (e.g. `Hyperliquid,Phoenix`). |
+| `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion. Does **not** affect Solana shred forwarding. |
+| `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
 | `DZ_GHCR_TOKEN` | — | **devnet only**, required: a GHCR token with `read:packages` (the devnet image is private). |
 | `DZ_GHCR_USER` | `malbeclabs` | **devnet only**, optional: the GHCR username for the login. |
@@ -119,7 +120,8 @@ sudo docker stop doublezero-edge-connect && sudo docker rm doublezero-edge-conne
 > **No TLS.** The bridge targets a trusted/local network; terminate TLS at a reverse proxy if you
 > expose it.
 
-## Consume the feed
+## Consume Edge Feeds
+_For Edge Feeds (not solana-shreds)_
 
 Open a WebSocket to `ws://<host>:8081` and read JSON. You receive only the venues you're authorized
 for; an optional `subscribe` control frame narrows the stream further:

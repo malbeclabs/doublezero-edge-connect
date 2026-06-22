@@ -1,9 +1,8 @@
 # Input sources
 
-The DZ Edge **multicast** feeds are always-on inputs. A second, optional input is the Hyperliquid
-**public** WebSocket feed (`wss://api.hyperliquid.xyz/ws`), which acts as a **backstop**: the edge
-feed should win essentially always (that's the product), and the public feed only matters when the
-edge feed gaps, stalls, or dies.
+The DZ Edge **multicast** feeds are always-on inputs. A second, optional input for some feeds are a
+**public** WebSocket feed which acts as a **backstop**: the edge feed should win essentially always, 
+so the public feed only matters when the edge feed gaps, stalls, or dies.
 
 Both inputs converge on one shared arbiter that races them per `(venue, symbol)` `source_ts` tick,
 so no second dedup stage is needed. In steady state an edge publisher opens each tick first (sub-ms
