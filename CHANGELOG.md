@@ -140,7 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefetch lead, or a garbled schedule, and is surfaced as a `no_leader` counter in the periodic
   tally. (Forward-when-unverified is exactly dedup-only mode; sigverify no longer degrades into it.)
   Removes the now-unused `leader_known` fail-open path from `DedupWindow::decide`.
-- Shred dedup-only mode (`--shred-dedup`) now keys its dedup window on `(slot, index, type,
+- Shred dedup-only mode (`--shred-dedup-mode dedup`) now keys its dedup window on `(slot, index, type,
   content-fingerprint)` instead of `(slot, index, type)`, so it collapses copies that match over the
   signed content. A shred sharing `(slot, index, type)` but carrying different signed content
   (equivocation, corruption, a forged first-arriver) now still forwards rather than being silently
