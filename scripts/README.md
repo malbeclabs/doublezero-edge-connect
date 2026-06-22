@@ -59,8 +59,8 @@ per-feature flags in the script.
 Common ones: `DZ_IFACE`, `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `RUST_LOG`, and the shred
 forwarder's `DZ_SHRED_*` (notably `DZ_SHRED_DEDUP_MODE` — `dedup` by default, `sigverify` / `none`
 to change — and `DZ_SHRED_RPC_URL` for sigverify mode). See the bridge's `Args` in
-[`../src/main.rs`](../src/main.rs) and the sink/shred tables in the
-[top-level README](../README.md) for the full list and defaults.
+[`../src/main.rs`](../src/main.rs) and the sink/shred/input tables in the
+[`docs/`](../docs/) reference for the full list and defaults.
 
 > **Limitation:** only **non-empty** values are forwarded, so you can't pass an *empty* override
 > (e.g. `WS_BIND=""` to disable the WebSocket sink) through the installer. For that edge case, run

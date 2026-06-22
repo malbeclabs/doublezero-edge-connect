@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- README refocused on the **operator**: it now leads with what the bridge does, the install
+  one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
+  variants), and how to configure/override it via environment variables before the pipe. The
+  detailed per-feature reference (self-hosting/from-source + Docker, output sinks, input sources,
+  Solana shred forwarding) moved into a new `docs/` directory the README links out to. Removed the
+  misleading `https://doublezero.xyz/install` command that contradicted the canonical
+  `get.doublezero.xyz/connect` one-liner.
+
 ### Added
 - Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
   (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
