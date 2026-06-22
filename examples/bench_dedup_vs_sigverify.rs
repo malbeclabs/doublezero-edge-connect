@@ -8,8 +8,7 @@
 //! This times each primitive in isolation plus the two full per-datagram paths, so the hash-vs-
 //! ed25519 cost is directly comparable. Run with: `cargo run --release --example bench_dedup_vs_sigverify`.
 
-use std::hint::black_box;
-use std::time::Instant;
+use std::{hint::black_box, time::Instant};
 
 use doublezero_edge_connect::shred::{dedup, parse, verify};
 use ed25519_dalek::{Signer, SigningKey};
@@ -33,7 +32,9 @@ fn build_signed_shred(signing: &SigningKey) -> (Vec<u8>, [u8; 32]) {
     buf[OFFSET_OF_FEC_SET_INDEX..OFFSET_OF_FEC_SET_INDEX + 4].copy_from_slice(&0u32.to_le_bytes());
 
     // First parse gives us the merkle root parse computes; sign exactly that so verify() passes.
-    let root = parse::parse(&buf).expect("benchmark shred must parse").signed_message;
+    let root = parse::parse(&buf)
+        .expect("benchmark shred must parse")
+        .signed_message;
     let sig = signing.sign(&root).to_bytes();
     buf[..64].copy_from_slice(&sig);
     (buf, signing.verifying_key().to_bytes())
@@ -61,7 +62,10 @@ fn main() {
     let signing = SigningKey::from_bytes(&[7u8; 32]);
     let (pkt, pubkey) = build_signed_shred(&signing);
     let meta = parse::parse(&pkt).expect("shred parses");
-    assert!(verify::verify(&meta, &pubkey), "benchmark shred must verify");
+    assert!(
+        verify::verify(&meta, &pubkey),
+        "benchmark shred must verify"
+    );
 
     println!(
         "shred datagram = {} bytes, merkle root (signed msg) = {} bytes\n",

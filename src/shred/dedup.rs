@@ -15,9 +15,10 @@
 //! Eviction is a cheap range drop: the window keeps only slots within `window_slots` of the highest
 //! slot seen, so memory is bounded by (window_slots × shreds-per-slot) regardless of uptime.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
+    hash::{Hash, Hasher},
+};
 
 use super::parse::ShredType;
 

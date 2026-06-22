@@ -125,6 +125,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
+- Shred dedup-only mode (`--shred-dedup`) now keys its dedup window on `(slot, index, type,
+  content-fingerprint)` instead of `(slot, index, type)`, so it collapses only **byte-identical**
+  copies. A shred sharing `(slot, index, type)` but carrying different content (equivocation,
+  corruption, a forged first-arriver) now still forwards rather than being silently dropped onto the
+  first copy — loss-averse, since without sigverify the forwarder can't tell which copy is valid. The
+  fingerprint is a deterministic per-datagram hash computed only in dedup-only mode; sigverify mode is
+  unchanged (keyed content-agnostically, since the signature picks the valid winner). Adds
+  `examples/bench_dedup_vs_sigverify.rs`, which measures the fingerprint's marginal cost at ~135×
+  cheaper than an ed25519 verify.
 - The quote latch-to-leader floor and the windowed trade dedup moved out of `TobProcessor` into a
   shared pre-broadcast `Arbiter` (`src/ingest/arbiter.rs`) that owns the broadcast `Sender` and
   exposes one `emit(msg, publisher)` entry point (#8). Every ingest source — each multicast receiver
