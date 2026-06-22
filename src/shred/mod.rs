@@ -15,10 +15,13 @@
 //! Three modes:
 //! - **Bare forward** (default, neither flag set) → every datagram is fanned out (original behaviour).
 //! - **Dedup-only** (`--shred-dedup`, no RPC) → forward exactly **one copy** of each shred keyed on
-//!   `(slot, index, type)` ([`dedup`]), with **no** signature verification, leader lookup, or RPC.
-//!   The first copy of a key is forwarded and recorded; later duplicates are dropped. This is the
-//!   cheap suppressor for the multicast-overlap duplicates DoubleZero delivers across its several
-//!   shred groups — forgery protection is moot on the trusted network, so sigverify isn't required.
+//!   `(slot, index, type, content-fingerprint)` ([`dedup`]), with **no** signature verification,
+//!   leader lookup, or RPC. The first copy of a key is forwarded and recorded; later *byte-identical*
+//!   copies are dropped. A shred sharing `(slot, index, type)` but carrying different content still
+//!   forwards (loss-averse — without sigverify we can't tell which copy is valid). This is the cheap
+//!   suppressor for the byte-identical multicast-overlap duplicates DoubleZero delivers across its
+//!   several shred groups — forgery protection is moot on the trusted network, so sigverify isn't
+//!   required.
 //! - **Dedup + sigverify** (`--shred-rpc-url` set) → forward exactly **one valid copy** of each
 //!   shred. The forwarder keys the same bounded, prefer-valid dedup window on `(slot, index, type)`;
 //!   the first copy of a key is ed25519-verified ([`verify`]) against its slot leader ([`leader`])
@@ -414,18 +417,32 @@ async fn forwarder_task(
                     }
                     ok
                 };
+                // Sigverify keys content-agnostically (fingerprint = 0): the signature, not the
+                // bytes, decides which copy is the valid winner, so a forged copy with different
+                // bytes must collapse onto the same key and be dropped on verify — not earn its own.
                 window.decide(
                     meta.slot,
                     meta.index,
                     meta.shred_type,
+                    0,
                     leader.is_some(),
                     &mut verify_fn,
                 )
             }
             // Dedup-only: no leader lookup, no signature work. The first copy of a key always "wins"
             // (leader_known = true, verify -> true), so it is forwarded + recorded and later copies
-            // drop. `verify_ok` stays 0 — nothing is signature-checked in this mode.
-            None => window.decide(meta.slot, meta.index, meta.shred_type, true, &mut || true),
+            // drop. The key carries a content fingerprint of the whole datagram, so only
+            // byte-identical copies dedup — a same-(slot, index, type) shred with different content
+            // still forwards (loss-averse; we can't tell which is valid without sigverify).
+            // `verify_ok` stays 0 — nothing is signature-checked in this mode.
+            None => window.decide(
+                meta.slot,
+                meta.index,
+                meta.shred_type,
+                dedup::fingerprint(&pkt),
+                true,
+                &mut || true,
+            ),
         };
         match action {
             Action::Forward => {

@@ -116,6 +116,7 @@ fn dedup_collapses_cross_group_duplicates() {
             meta.slot,
             meta.index,
             meta.shred_type,
+            0,
             leader.is_some(),
             &mut verify_fn,
         ) == Action::Forward
@@ -160,6 +161,7 @@ fn same_datagram_twice_forwards_once() {
             meta.slot,
             meta.index,
             meta.shred_type,
+            0,
             leader.is_some(),
             &mut verify_fn,
         )
@@ -176,6 +178,7 @@ fn same_datagram_twice_forwards_once() {
             meta.slot,
             meta.index,
             meta.shred_type,
+            0,
             leader.is_some(),
             &mut verify_fn,
         )
