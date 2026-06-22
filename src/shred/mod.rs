@@ -16,12 +16,14 @@
 //! - **Bare forward** (default, neither flag set) → every datagram is fanned out (original behaviour).
 //! - **Dedup-only** (`--shred-dedup`, no RPC) → forward exactly **one copy** of each shred keyed on
 //!   `(slot, index, type, content-fingerprint)` ([`dedup`]), with **no** signature verification,
-//!   leader lookup, or RPC. The first copy of a key is forwarded and recorded; later *byte-identical*
-//!   copies are dropped. A shred sharing `(slot, index, type)` but carrying different content still
-//!   forwards (loss-averse — without sigverify we can't tell which copy is valid). This is the cheap
-//!   suppressor for the byte-identical multicast-overlap duplicates DoubleZero delivers across its
-//!   several shred groups — forgery protection is moot on the trusted network, so sigverify isn't
-//!   required.
+//!   leader lookup, or RPC. The first copy of a key is forwarded and recorded; later copies that
+//!   match over the fingerprinted region are dropped. The fingerprint covers the whole datagram
+//!   except the trailing **retransmitter signature** of resigned merkle shreds (rewritten per
+//!   turbine path), so cross-group copies of the same shred collapse even though that tail differs.
+//!   A shred sharing `(slot, index, type)` but carrying different signed content still forwards
+//!   (loss-averse — without sigverify we can't tell which copy is valid). This is the cheap
+//!   suppressor for the multicast-overlap duplicates DoubleZero delivers across its several shred
+//!   groups — forgery protection is moot on the trusted network, so sigverify isn't required.
 //! - **Dedup + sigverify** (`--shred-rpc-url` set) → forward exactly **one valid copy** of each
 //!   shred. The forwarder keys the same bounded, prefer-valid dedup window on `(slot, index, type)`;
 //!   the first copy of a key is ed25519-verified ([`verify`]) against its slot leader ([`leader`])
@@ -88,6 +90,11 @@ const BIND_RETRY: Duration = Duration::from_secs(1);
 /// so a datagram that exactly fills the buffer is treated as truncated/unexpected and dropped
 /// rather than forwarded corrupt (see [`receiver_task`]).
 const RECV_BUF_LEN: usize = 2048;
+
+/// Length of the trailing **retransmitter signature** on resigned merkle shreds. It is rewritten per
+/// turbine path, so the dedup-only fingerprint excludes these last bytes to collapse cross-group
+/// copies that are otherwise identical (see the dedup-only branch in [`forwarder_task`]).
+const RETRANSMITTER_SIG_LEN: usize = parse::SIZE_OF_SIGNATURE;
 
 /// One forwarded datagram: just the shred-bearing UDP payload bytes. (A small reuse pool is a
 /// possible later optimization; not needed now.)
@@ -431,18 +438,32 @@ async fn forwarder_task(
             }
             // Dedup-only: no leader lookup, no signature work. The first copy of a key always "wins"
             // (leader_known = true, verify -> true), so it is forwarded + recorded and later copies
-            // drop. The key carries a content fingerprint of the whole datagram, so only
-            // byte-identical copies dedup — a same-(slot, index, type) shred with different content
+            // drop. The key carries a content fingerprint, so only copies matching over the
+            // fingerprinted region dedup — a same-(slot, index, type) shred with different content
             // still forwards (loss-averse; we can't tell which is valid without sigverify).
-            // `verify_ok` stays 0 — nothing is signature-checked in this mode.
-            None => window.decide(
-                meta.slot,
-                meta.index,
-                meta.shred_type,
-                dedup::fingerprint(&pkt),
-                true,
-                &mut || true,
-            ),
+            //
+            // Resigned merkle shreds carry a per-turbine-path **retransmitter signature** in the
+            // trailing 64 bytes, rewritten on every hop, so cross-group copies of the *same* shred
+            // differ only there. Fingerprinting the whole datagram would give each its own key and
+            // dedup none of them, so the fingerprint excludes that tail; everything before it (leader
+            // sig, headers, payload, merkle proof, chained root) is identical across copies. This
+            // needs only the already-decoded `resigned` flag and the datagram length, not the
+            // unvalidated merkle offsets. `verify_ok` stays 0 — nothing is signature-checked here.
+            None => {
+                let region = if meta.resigned && pkt.len() >= RETRANSMITTER_SIG_LEN {
+                    &pkt[..pkt.len() - RETRANSMITTER_SIG_LEN]
+                } else {
+                    &pkt[..]
+                };
+                window.decide(
+                    meta.slot,
+                    meta.index,
+                    meta.shred_type,
+                    dedup::fingerprint(region),
+                    true,
+                    &mut || true,
+                )
+            }
         };
         match action {
             Action::Forward => {

@@ -8,9 +8,10 @@
 //! The trailing `fingerprint` discriminates content. In **sigverify** mode it is a fixed `0`
 //! (content-agnostic — the signature, not the bytes, picks the winner, so a forged different-byte
 //! copy collapses onto the same key and is dropped on verify). In **dedup-only** mode it is a
-//! per-datagram content hash, so only byte-identical copies share a key and a same-`(slot, index,
-//! type)` shred with different content still forwards (loss-averse: without sigverify we can't tell
-//! which copy is valid).
+//! content hash over the datagram minus any trailing retransmitter signature (rewritten per turbine
+//! path; the caller strips it before hashing), so copies of the same shred share a key while a
+//! same-`(slot, index, type)` shred with different signed content still forwards (loss-averse:
+//! without sigverify we can't tell which copy is valid).
 //!
 //! Eviction is a cheap range drop: the window keeps only slots within `window_slots` of the highest
 //! slot seen, so memory is bounded by (window_slots × shreds-per-slot) regardless of uptime.
@@ -22,12 +23,13 @@ use std::{
 
 use super::parse::ShredType;
 
-/// Cheap, **deterministic** content fingerprint of a whole datagram, used as the dedup discriminator
-/// in **dedup-only** mode so only byte-identical copies collapse. `DefaultHasher` has a fixed seed
-/// (unlike `RandomState`), so identical bytes always fingerprint the same. This is not a security
-/// boundary — forgery protection is the sigverify mode's job — so a fast non-crypto hash is the
-/// right tool; collisions inside a bounded slot window are astronomically unlikely and the worst
-/// case is merely one extra forwarded copy.
+/// Cheap, **deterministic** content fingerprint of a byte region, used as the dedup discriminator in
+/// **dedup-only** mode so copies sharing that region collapse. The caller passes the datagram minus
+/// any trailing retransmitter signature, so cross-turbine-path copies of the same shred fingerprint
+/// the same. `DefaultHasher` has a fixed seed (unlike `RandomState`), so identical bytes always
+/// fingerprint the same. This is not a security boundary — forgery protection is the sigverify
+/// mode's job — so a fast non-crypto hash is the right tool; collisions inside a bounded slot window
+/// are astronomically unlikely and the worst case is merely one extra forwarded copy.
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
