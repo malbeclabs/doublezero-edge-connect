@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests in `tests/dedup.rs` that deliver every mktdata datagram twice — byte-for-byte and from a
   second publisher IP — and assert the emitted quote/trade set is unchanged; and a shred-level
   `same_datagram_twice_forwards_once` proving the second copy is dropped without re-verifying.
+- Real two-sided Market-by-Order E2E fixture (#5): `mbo_{refdata,snapshot,mktdata}.bin` are now a
+  live TYO recorder capture (publisher 148.51.123.3, BTC) of a complete 44,598-order snapshot
+  (28,345 bids + 16,253 asks) plus contiguous post-anchor deltas, replacing the hand-crafted
+  empty-anchor anchor from PR #2. `mbo_single_publisher_depth_contract` now asserts an active,
+  unconditional two-sided crossed-book check (`best_bid < best_ask`). The `pcap2frames` example
+  gained `--mbo-minimal` (with `--mbo-max-deltas`) to extract this minimal fixture in one command:
+  the first complete snapshot group + capped post-anchor deltas + a minimal refdata. See
+  `tests/fixtures/PROVENANCE.md`.
 - Shred forwarder sigverify + dedup (#25): when `--shred-rpc-url` (`DZ_SHRED_RPC_URL`) is
   set, the forwarder forwards exactly **one valid copy** of each shred. A bounded,
   prefer-valid dedup window keyed by `(slot, index, type)` (`--shred-dedup-window-slots`,
@@ -195,6 +203,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only form that both authorizes the push and keeps smoke (PR) builds push-gated.
 - Corrected inverted Market-by-Order order-book side constants (`0 = Bid`, `1 = Ask` per
   the edge-feed-spec); bids and asks in `depth` were previously swapped.
+- Market-by-Order manifest `Valid=0` workaround (#5): the live HL MBO publisher emits
+  `ManifestSummary` with `Valid=0`, same as the Top-of-Book publisher. `MboProcessor` passed
+  `m.valid` straight through, so the manifest was rejected, no instrument definition ever
+  resolved, and `depth` was silently never emitted. It now overrides to valid (logged once),
+  mirroring `TobProcessor`. Surfaced by the real two-sided MBO fixture below.
+- `MboProcessor` no longer re-broadcasts a duplicate full-state `depth` when a book change
+  leaves the published top-N unchanged (deep-book churn): it now emits only when the top-N
+  actually changes, matching the documented contract and avoiding redundant WS traffic.
 - Warn instead of silently clobbering when two feeds for the same `(venue, symbol)` publish
   instrument definitions with different price/quantity exponents.
 

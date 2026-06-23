@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        book::{BookState, DeltaKind, DeltaOp},
+        book::{BookState, DeltaKind, DeltaOp, Level},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
             Message,
@@ -441,7 +441,14 @@ pub struct MboProcessor {
     books_order: VecDeque<u32>,
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
+    /// Last emitted top-N levels per instrument, so a book change that leaves the published top-N
+    /// identical (deep-book churn) does not re-broadcast a duplicate full-state `depth`. Evicted in
+    /// lockstep with `books` and cleared on `InstrumentReset`, so it can never outgrow the book map
+    /// (its keys are always a subset of `books`' keys).
+    last_top: HashMap<u32, (Vec<Level>, Vec<Level>)>,
     warned_source_mismatch: bool,
+    /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
+    warned_invalid_manifest: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
 }
@@ -453,7 +460,9 @@ impl MboProcessor {
             books: HashMap::new(),
             books_order: VecDeque::new(),
             depth,
+            last_top: HashMap::new(),
             warned_source_mismatch: false,
+            warned_invalid_manifest: false,
             emit_trades,
         }
     }
@@ -467,9 +476,11 @@ impl MboProcessor {
     ///    definition for precision), so it would be pure dead memory; this mirrors the per-instrument
     ///    definition gate the Top-of-Book / Midpoint quote paths already apply.
     /// 2. Bounds the map to [`MAX_BOOKS`] with least-recently-inserted eviction, so even a flood of
-    ///    *defined* forged instrument_ids can't grow it without limit. An evicted legitimate book
-    ///    simply re-syncs from the next snapshot.
-    fn book_for(&mut self, instrument_id: u32) -> Option<&mut BookState> {
+    ///    *defined* forged instrument_ids can't grow it without limit. Eviction also drops the
+    ///    evicted instrument's `last_top` and shared `depth` (WS replay) entries in lockstep, so
+    ///    neither sibling map outgrows `books`. An evicted legitimate book simply re-syncs from the
+    ///    next snapshot.
+    fn book_for(&mut self, instrument_id: u32, ctx: &FrameCtx) -> Option<&mut BookState> {
         // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
         self.state.definition(instrument_id)?;
         if !self.books.contains_key(&instrument_id) {
@@ -477,6 +488,16 @@ impl MboProcessor {
                 match self.books_order.pop_front() {
                     Some(old) => {
                         self.books.remove(&old);
+                        // Evict the two sibling maps keyed off this book in lockstep, or each would
+                        // grow without limit while `books` stays bounded - the exact
+                        // forged-`instrument_id`-flood vector `MAX_BOOKS` guards against. `last_top`
+                        // by id; the shared `depth` (WS replay) map by (venue, symbol), so a
+                        // reconnecting client never replays a stale depth for an evicted instrument.
+                        self.last_top.remove(&old);
+                        if let Some(def) = self.state.definition(old) {
+                            crate::model::lock(&self.depth)
+                                .remove(&(ctx.venue.to_string(), def.symbol.clone()));
+                        }
                     }
                     None => break,
                 }
@@ -500,10 +521,18 @@ impl MboProcessor {
             return; // precision unknown; don't emit a book we can't scale
         };
         let (bids_raw, asks_raw) = book.top_levels(DEPTH_LEVELS);
-        let scale = |levels: Vec<(i64, u64)>| -> Vec<[f64; 2]> {
+        // Suppress a re-broadcast when the published top-N is byte-for-byte unchanged: a delta deep
+        // in the book (outside the top-N) still flips `changed`, but re-sending an identical
+        // full-state `depth` is pure duplication. Compare the raw integer levels (pre-scaling) by
+        // reference - no clone.
+        if matches!(self.last_top.get(&instrument_id), Some((b, a)) if *b == bids_raw && *a == asks_raw)
+        {
+            return;
+        }
+        let scale = |levels: &[(i64, u64)]| -> Vec<[f64; 2]> {
             levels
-                .into_iter()
-                .map(|(p, q)| {
+                .iter()
+                .map(|&(p, q)| {
                     [
                         apply_exponent(p, def.price_exponent),
                         apply_exponent(q as i64, def.qty_exponent),
@@ -514,13 +543,16 @@ impl MboProcessor {
         let depth = NormalizedDepth {
             venue: ctx.venue.to_string(),
             symbol: def.symbol.clone(),
-            bids: scale(bids_raw),
-            asks: scale(asks_raw),
+            bids: scale(&bids_raw),
+            asks: scale(&asks_raw),
             source_ts_ns: book.last_event_ts(),
             recv_ts_ns: ctx.recv_ts_ns,
             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
             ws_send_ts_ns: 0, // stamped by the WS server just before send
         };
+        // Record the published top-N, moving the raw vectors in (no clone), so the next identical
+        // book state suppresses.
+        self.last_top.insert(instrument_id, (bids_raw, asks_raw));
         crate::model::lock(&self.depth)
             .insert((depth.venue.clone(), depth.symbol.clone()), depth.clone());
         ctx.emit(FeedMessage::Depth(depth));
@@ -549,8 +581,22 @@ impl FrameProcessor for MboProcessor {
         for msg in messages {
             match msg {
                 codec_mbo::Message::ManifestSummary(m) => {
+                    // TEMP WORKAROUND: the live DZ Edge HL MBO publisher emits ManifestSummary
+                    // with Valid=0, same as the Top-of-Book publisher (see TobProcessor). Per spec
+                    // Valid=0 means "no established instrument set", which would keep RefDataState
+                    // from ever resolving a definition and block all depth. Force valid=true so the
+                    // bridge consumes the otherwise-healthy feed. REVISIT: pass `m.valid` once the
+                    // publisher manifest is corrected.
+                    if !m.valid && !self.warned_invalid_manifest {
+                        self.warned_invalid_manifest = true;
+                        warn!(
+                            manifest_seq = m.manifest_seq,
+                            instrument_count = m.instrument_count,
+                            "MBO manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
+                        );
+                    }
                     self.state
-                        .on_manifest(m.valid, m.manifest_seq, m.instrument_count);
+                        .on_manifest(true, m.manifest_seq, m.instrument_count);
                 }
                 codec_mbo::Message::InstrumentDefinition(d) => {
                     let inst = NormalizedInstrument {
@@ -576,7 +622,7 @@ impl FrameProcessor for MboProcessor {
                             qty_raw: o.qty_raw,
                         },
                     };
-                    if let Some(book) = self.book_for(o.instrument_id) {
+                    if let Some(book) = self.book_for(o.instrument_id, ctx) {
                         if book.on_delta(op) {
                             changed.insert(o.instrument_id);
                         }
@@ -591,7 +637,7 @@ impl FrameProcessor for MboProcessor {
                             order_id: o.order_id,
                         },
                     };
-                    if let Some(book) = self.book_for(o.instrument_id) {
+                    if let Some(book) = self.book_for(o.instrument_id, ctx) {
                         if book.on_delta(op) {
                             changed.insert(o.instrument_id);
                         }
@@ -608,7 +654,7 @@ impl FrameProcessor for MboProcessor {
                             full_fill: o.exec_flags & 0x01 != 0,
                         },
                     };
-                    if let Some(book) = self.book_for(o.instrument_id) {
+                    if let Some(book) = self.book_for(o.instrument_id, ctx) {
                         if book.on_delta(op) {
                             changed.insert(o.instrument_id);
                         }
@@ -665,12 +711,16 @@ impl FrameProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::InstrumentReset(r) => {
-                    if let Some(book) = self.book_for(r.instrument_id) {
+                    // Drop the stale suppression entry so the first depth after the book re-syncs is
+                    // always published (and its timestamps are fresh), never suppressed against the
+                    // pre-reset top-N.
+                    self.last_top.remove(&r.instrument_id);
+                    if let Some(book) = self.book_for(r.instrument_id, ctx) {
                         book.on_instrument_reset(r.new_anchor_seq);
                     }
                 }
                 codec_mbo::Message::SnapshotBegin(s) => {
-                    if let Some(book) = self.book_for(s.instrument_id) {
+                    if let Some(book) = self.book_for(s.instrument_id, ctx) {
                         book.on_snapshot_begin(
                             s.snapshot_id,
                             s.anchor_seq,
@@ -696,7 +746,7 @@ impl FrameProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::SnapshotEnd(s) => {
-                    if let Some(book) = self.book_for(s.instrument_id) {
+                    if let Some(book) = self.book_for(s.instrument_id, ctx) {
                         if book.on_snapshot_end(s.anchor_seq, s.snapshot_id) {
                             changed.insert(s.instrument_id);
                         }
@@ -1046,8 +1096,10 @@ mod tests {
         );
     }
 
-    /// The book map must stay bounded under a flood of distinct (defined) instrument_ids, evicting
-    /// the oldest first — otherwise a forged MBO stream grows it without limit.
+    /// The book map **and** the `last_top` depth-suppression map must both stay bounded under a flood
+    /// of distinct (defined) instrument_ids, evicting the oldest first — otherwise a forged MBO
+    /// stream grows them without limit. Each instrument is driven all the way to `Synced` with an
+    /// emitted `depth`, so `last_top` is actually populated (an unsynced book never reaches it).
     #[test]
     fn mbo_books_map_is_bounded_under_instrument_flood() {
         use super::MAX_BOOKS;
@@ -1069,21 +1121,38 @@ mod tests {
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
         }
-        // An OrderAdd for each now mints a (bounded) book.
+        // For each instrument: an empty-anchor snapshot syncs the book, then one OrderAdd gives it a
+        // resting level, so emit_depth fires and records a `last_top` entry. book_for must evict the
+        // oldest from BOTH maps as the flood grows past MAX_BOOKS.
         for i in 0..flood {
             proc.on_datagram(
-                &frame(&[enc_order_add(&OrderAdd {
-                    instrument_id: i,
-                    source_id: 0,
-                    side: SIDE_BID,
-                    order_flags: 0,
-                    per_instrument_seq: 1,
-                    order_id: 1,
-                    enter_ts: 1,
-                    price_raw: 100,
-                    qty_raw: 1,
-                })]),
-                &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+                &frame(&[
+                    enc_snapshot_begin(&SnapshotBegin {
+                        instrument_id: i,
+                        anchor_seq: 0,
+                        total_orders: 0,
+                        snapshot_id: i + 1,
+                        last_instrument_seq: 0,
+                        ts: 0,
+                    }),
+                    enc_snapshot_end(&SnapshotEnd {
+                        instrument_id: i,
+                        anchor_seq: 0,
+                        snapshot_id: i + 1,
+                    }),
+                    enc_order_add(&OrderAdd {
+                        instrument_id: i,
+                        source_id: 0,
+                        side: SIDE_BID,
+                        order_flags: 0,
+                        per_instrument_seq: 1,
+                        order_id: 1,
+                        enter_ts: 1,
+                        price_raw: 100,
+                        qty_raw: 1,
+                    }),
+                ]),
+                &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
         }
         assert!(
@@ -1092,9 +1161,125 @@ mod tests {
             proc.books.len()
         );
         assert!(
-            proc.books.contains_key(&(flood - 1)),
-            "newest instrument retained"
+            proc.last_top.len() <= MAX_BOOKS,
+            "last_top map must stay bounded in lockstep with books, got {}",
+            proc.last_top.len()
         );
-        assert!(!proc.books.contains_key(&0), "oldest instrument evicted");
+        assert!(
+            proc.books.contains_key(&(flood - 1)) && proc.last_top.contains_key(&(flood - 1)),
+            "newest instrument retained in both maps"
+        );
+        assert!(
+            !proc.books.contains_key(&0) && !proc.last_top.contains_key(&0),
+            "oldest instrument evicted from both maps"
+        );
+        // The shared `depth` (WS replay) map is keyed by (venue, symbol) and must be purged in
+        // lockstep too, or it grows without limit and a reconnecting client replays evicted books.
+        let depth_map = crate::model::lock(&proc.depth);
+        assert!(
+            depth_map.len() <= MAX_BOOKS,
+            "depth replay map must stay bounded in lockstep with books, got {}",
+            depth_map.len()
+        );
+        assert!(
+            depth_map.contains_key(&("TV".to_string(), format!("INST-{}", flood - 1))),
+            "newest instrument's depth replay entry retained"
+        );
+        assert!(
+            !depth_map.contains_key(&("TV".to_string(), "INST-0".to_string())),
+            "oldest instrument's depth replay entry evicted too"
+        );
+    }
+
+    /// The full-state `depth` re-broadcast suppression: a book change that leaves the published
+    /// top-N byte-identical (deep-book churn outside the top-N) must NOT re-emit `depth`, while a
+    /// change that moves a top-N level must. Without suppression every deep delta would duplicate
+    /// the whole book on the wire.
+    #[test]
+    fn mbo_depth_suppressed_when_top_n_unchanged() {
+        use super::DEPTH_LEVELS;
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+
+        // Define instrument 0 and sync it with an empty-anchor snapshot.
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 1),
+                enc_instrument_def(0, "INST-0", 1),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 1,
+                    last_instrument_seq: 0,
+                    ts: 0,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 1,
+                }),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        drain_depth_ids(&mut rx); // discard the snapshot-triggered (empty) depth
+
+        // Frame 1: add DEPTH_LEVELS+1 bids at distinct ascending prices. The lowest price is the
+        // (N+1)th level — outside the published top-N. One coalesced depth for the frame.
+        let bid = |seq: u32, price: i64| {
+            enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 0,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: seq,
+                order_id: seq as u64,
+                enter_ts: seq as u64,
+                price_raw: price,
+                qty_raw: 10,
+            })
+        };
+        let levels = DEPTH_LEVELS as u32 + 1;
+        let establish: Vec<_> = (0..levels).map(|k| bid(k + 1, 100 + k as i64)).collect();
+        proc.on_datagram(
+            &frame(&establish),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_depth_ids(&mut rx).len(),
+            1,
+            "frame 1 establishes the book: exactly one depth"
+        );
+
+        // Frame 2: churn the worst (lowest) bid price 100 — outside the top-N. Book changes, but the
+        // top-N is byte-identical, so depth must be suppressed.
+        proc.on_datagram(
+            &frame(&[bid(levels + 1, 100)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_depth_ids(&mut rx).len(),
+            0,
+            "deep-book churn outside the top-N must be suppressed"
+        );
+
+        // Frame 3: add a new best bid above every existing level — moves the top-N, must emit.
+        proc.on_datagram(
+            &frame(&[bid(levels + 2, 100 + levels as i64)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_depth_ids(&mut rx).len(),
+            1,
+            "a top-N change must re-emit depth"
+        );
     }
 }
