@@ -48,7 +48,7 @@ Recorded by the multicast receivers (`src/ingest/receiver.rs`). Labelled by `ven
 | `dz_socket_errors_total` | counter | `venue` | Socket/transport receive errors (each triggers a rejoin). |
 | `dz_idle_rejoin_total` | counter | `venue` | Idle-rejoin watchdog firings (market data went silent past the idle window). |
 | `dz_feed_up` | gauge | `venue` | `1` while the market-data multicast is up, `0` while down. |
-| `dz_feed_stale_ms` | gauge | `venue` | Staleness at the last `down` transition, in milliseconds. |
+| `dz_feed_stale_ms` | gauge | `venue` | Staleness in milliseconds: `0` while up; the staleness at the last `down` transition (reset to `0` on recovery). |
 | `dz_seq_events_total` | counter | `venue`, `kind` | Frame-sequence classifications (`first`/`ok`/`reset`/`stale`). |
 
 ## Arbiter emit stage (per feed)
@@ -57,7 +57,8 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `dz_emit_total` | counter | `venue`, `kind` | Messages broadcast after dedup, by `kind` (quote/trade/instrument/midpoint/depth/status). |
+| `dz_emit_total` | counter | `venue`, `kind` | Messages broadcast after dedup, by `kind` (quote/trade/instrument/midpoint/depth). `status` is structurally possible but never routed through the arbiter today, so it is not recorded in practice. |
+| `dz_quotes_admitted_total` | counter | `venue`, `publisher` | Quotes admitted by the staleness floor, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the direct signal of the public backstop filling an edge gap. |
 | `dz_quotes_dropped_total` | counter | `venue` | Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat). |
 | `dz_trades_dropped_total` | counter | `venue` | Trades dropped by the windowed dedup (duplicate `trade_id` still inside the window). |
 | `dz_quotes_future_rejected_total` | counter | `venue` | Quotes rejected for an implausibly-far-future `source_ts`. |
@@ -77,6 +78,19 @@ Recorded by the WebSocket sink (`src/sinks/ws.rs`).
 | `dz_ws_inbound_total` | counter | `kind` | Inbound control messages, by `kind` (ping/subscribe/unsubscribe/error). |
 | `dz_ws_rate_limited_total` | counter | — | Clients disconnected for exceeding the inbound rate limit. |
 | `dz_ws_idle_timeout_total` | counter | — | Clients reaped for crossing the idle timeout. |
+
+## Public WS input feeder
+
+Recorded by the optional Hyperliquid public WebSocket backstop (`src/ingest/ws_feeder.rs`; off by
+default — see [Input sources](input-sources.md)). Its quote/trade contribution to the arbiter floor
+is attributed via `dz_quotes_admitted_total{publisher="public"}` above.
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `dz_ws_feeder_up` | gauge | — | `1` while the public WS session is connected, `0` while down/reconnecting. |
+| `dz_ws_feeder_reconnects_total` | counter | — | (Re)connect cycles — a session ended or a connect attempt failed and the feeder backed off to retry. |
+| `dz_ws_feeder_decode_errors_total` | counter | — | Public WS frames that failed to decode (dropped best-effort). |
+| `dz_ws_feeder_messages_total` | counter | `kind` | Business messages decoded from the public WS and emitted, by `kind` (quote/trade). |
 
 ## Shred forwarder
 

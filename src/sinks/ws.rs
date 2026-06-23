@@ -69,6 +69,21 @@ enum ClientMsg {
     Unsubscribe { subscription: SubFilter },
 }
 
+/// Releases a connection's accounting on drop — the live-client atomic and the `dz_ws_clients`
+/// gauge — so an unexpected panic inside `serve_client` cannot leak the slot. Without this the
+/// `clients` count would drift up on each panic and eventually wedge new connections at
+/// `max_clients` (and the gauge would over-report forever).
+struct ClientGuard {
+    clients: Arc<AtomicUsize>,
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.clients.fetch_sub(1, Ordering::SeqCst);
+        metrics().ws_clients.dec();
+    }
+}
+
 pub async fn run(
     bind: String,
     tx: broadcast::Sender<FeedMessage>,
@@ -78,6 +93,17 @@ pub async fn run(
 ) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     info!(%bind, max_clients = cfg.max_clients, "WebSocket server listening");
+    serve(listener, tx, instruments, depth, cfg).await
+}
+
+/// The accept loop, split out so tests can drive a pre-bound listener on an ephemeral port.
+async fn serve(
+    listener: TcpListener,
+    tx: broadcast::Sender<FeedMessage>,
+    instruments: InstrumentSnapshot,
+    depth: DepthSnapshot,
+    cfg: WsConfig,
+) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
 
     loop {
@@ -102,13 +128,16 @@ pub async fn run(
         let instruments = instruments.clone();
         let depth = depth.clone();
         let cfg = cfg.clone();
-        let clients = clients.clone();
+        // The guard releases the slot + gauge on drop, so the accounting is correct even if
+        // `serve_client` panics rather than returning.
+        let guard = ClientGuard {
+            clients: clients.clone(),
+        };
         tokio::spawn(async move {
+            let _guard = guard;
             if let Err(e) = serve_client(stream, rx, instruments, depth, cfg).await {
                 warn!(%peer, "client ended: {e}");
             }
-            clients.fetch_sub(1, Ordering::SeqCst);
-            metrics().ws_clients.dec();
         });
     }
 }
@@ -273,7 +302,21 @@ async fn serve_client(
 
 #[cfg(test)]
 mod tests {
-    use super::SubFilter;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use futures_util::StreamExt;
+    use serial_test::serial;
+    use tokio::{net::TcpListener, sync::broadcast, time::timeout};
+
+    use super::{serve, SubFilter, WsConfig, WsMessage};
+    use crate::{
+        metrics::metrics,
+        model::{FeedMessage, NormalizedQuote},
+    };
 
     fn filter(venue: Option<&str>, symbol: Option<&str>) -> SubFilter {
         SubFilter {
@@ -298,5 +341,99 @@ mod tests {
         assert!(filter(None, None).matches("Phoenix", "BTC")); // {} = everything
         assert!(filter(None, Some("BTC")).matches("Phoenix", "BTC"));
         assert!(!filter(None, Some("btc")).matches("Phoenix", "BTC")); // symbol stays exact
+    }
+
+    /// Poll `cond` until it holds, failing the test if it doesn't within ~2s. The metric updates we
+    /// wait on happen on another task, so a short poll is more robust than a fixed sleep.
+    async fn wait_until(mut cond: impl FnMut() -> bool) {
+        let ok = timeout(Duration::from_secs(2), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ok.is_ok(), "condition not met within timeout");
+    }
+
+    fn sample_quote() -> NormalizedQuote {
+        NormalizedQuote {
+            venue: "Hyperliquid".to_string(),
+            symbol: "BTC".to_string(),
+            bid: 1.0,
+            ask: 2.0,
+            bid_size: 1.0,
+            ask_size: 1.0,
+            bid_n: 1,
+            ask_n: 1,
+            source_ts_ns: 1,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// A client connect→disconnect must leave the live-client gauge where it started and record
+    /// exactly one accepted connection; a forwarded quote must advance the per-kind byte counter.
+    /// `#[serial]` because `dz_ws_clients` is a process-global gauge shared with any concurrent test
+    /// (see the `metrics()` docs); the assertions are baseline-relative for the same reason.
+    #[tokio::test]
+    #[serial]
+    async fn ws_client_accounting_and_byte_counter() {
+        let m = metrics();
+        let accepted_before = m.ws_connections.with_label_values(&["accepted"]).get();
+        let clients_before = m.ws_clients.get();
+        let bytes_before = m.ws_bytes_sent.with_label_values(&["quote"]).get();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<FeedMessage>(16);
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+        };
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // The server accounts the client on its own task, so wait for the gauge to reflect it.
+        wait_until(|| m.ws_clients.get() == clients_before + 1).await;
+        assert_eq!(
+            m.ws_connections.with_label_values(&["accepted"]).get(),
+            accepted_before + 1
+        );
+
+        // Push a quote and drain the client until it arrives, then the byte counter must have moved.
+        // (Retry the send: the subscriber is created inside the spawned task, so an immediate first
+        // send can race ahead of the subscribe.)
+        let mut got_quote = false;
+        for _ in 0..100 {
+            let _ = tx.send(FeedMessage::Quote(sample_quote()));
+            match timeout(Duration::from_millis(50), ws.next()).await {
+                Ok(Some(Ok(WsMessage::Text(txt)))) if txt.contains("\"quote\"") => {
+                    got_quote = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue, // replayed snapshot frame / other; keep draining
+                _ => continue,
+            }
+        }
+        assert!(got_quote, "client never received the forwarded quote");
+        assert!(
+            m.ws_bytes_sent.with_label_values(&["quote"]).get() > bytes_before,
+            "quote byte counter did not advance"
+        );
+
+        // Disconnect and confirm the gauge nets back to the baseline (the RAII guard fires).
+        drop(ws);
+        wait_until(|| m.ws_clients.get() == clients_before).await;
+
+        srv.abort();
     }
 }

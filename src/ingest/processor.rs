@@ -35,13 +35,37 @@ use crate::{
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
 
-/// The low-cardinality metric label for a frame-sequence classification.
-fn seq_kind(check: &SeqCheck) -> &'static str {
-    match check {
-        SeqCheck::First => "first",
-        SeqCheck::Ok => "ok",
-        SeqCheck::Reset => "reset",
-        SeqCheck::Stale => "stale",
+/// Pre-resolved `dz_seq_events_total{venue, kind}` children (one per [`SeqCheck`] outcome) for a
+/// single feed, so the per-frame hot path increments a cached counter instead of doing a label-map
+/// lookup. The processor doesn't know its venue until the first frame (`ctx.venue`, fixed for the
+/// feed's lifetime), so the children are bound lazily on first use.
+#[derive(Default)]
+struct SeqEvents {
+    children: Option<[prometheus::IntCounter; 4]>,
+}
+
+impl SeqEvents {
+    /// Index into `children`, matching the order they are resolved in below.
+    fn index(check: &SeqCheck) -> usize {
+        match check {
+            SeqCheck::First => 0,
+            SeqCheck::Ok => 1,
+            SeqCheck::Reset => 2,
+            SeqCheck::Stale => 3,
+        }
+    }
+
+    fn record(&mut self, venue: &str, check: &SeqCheck) {
+        let children = self.children.get_or_insert_with(|| {
+            let m = metrics();
+            [
+                m.seq_events.with_label_values(&[venue, "first"]),
+                m.seq_events.with_label_values(&[venue, "ok"]),
+                m.seq_events.with_label_values(&[venue, "reset"]),
+                m.seq_events.with_label_values(&[venue, "stale"]),
+            ]
+        });
+        children[Self::index(check)].inc();
     }
 }
 
@@ -96,6 +120,8 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
+    /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
+    seq_events: SeqEvents,
 }
 
 impl TobProcessor {
@@ -107,6 +133,7 @@ impl TobProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             emit_trades,
+            seq_events: SeqEvents::default(),
         }
     }
 
@@ -161,10 +188,7 @@ impl FrameProcessor for TobProcessor {
                 header.reset_count,
                 header.sequence,
             );
-            metrics()
-                .seq_events
-                .with_label_values(&[ctx.venue, seq_kind(&check)])
-                .inc();
+            self.seq_events.record(ctx.venue, &check);
             match check {
                 SeqCheck::Stale => {
                     debug!(
@@ -334,6 +358,8 @@ pub struct MidpointProcessor {
     state: RefDataState<codec_midpoint::InstrumentDefinition>,
     seq: SeqTracker,
     warned_source_mismatch: bool,
+    /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
+    seq_events: SeqEvents,
 }
 
 impl Default for MidpointProcessor {
@@ -348,6 +374,7 @@ impl MidpointProcessor {
             state: RefDataState::new(),
             seq: SeqTracker::default(),
             warned_source_mismatch: false,
+            seq_events: SeqEvents::default(),
         }
     }
 }
@@ -374,10 +401,7 @@ impl FrameProcessor for MidpointProcessor {
             let check = self
                 .seq
                 .check(header.channel_id, header.reset_count, header.sequence);
-            metrics()
-                .seq_events
-                .with_label_values(&[ctx.venue, seq_kind(&check)])
-                .inc();
+            self.seq_events.record(ctx.venue, &check);
             !matches!(check, SeqCheck::Stale)
         } else {
             true

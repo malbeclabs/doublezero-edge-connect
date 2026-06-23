@@ -35,15 +35,20 @@ pub struct Metrics {
     pub idle_rejoin: IntCounterVec,
     /// Feed health: 1 while the market-data multicast is up, 0 while it is considered down.
     pub feed_up: IntGaugeVec,
-    /// How stale the market-data stream was at the last `down` transition, in milliseconds.
+    /// Market-data staleness: 0 while up; the staleness in milliseconds at the last `down`
+    /// transition (reset to 0 on recovery).
     pub feed_stale_ms: IntGaugeVec,
     /// Frame-sequence classifications per feed, by `kind` (first/ok/reset/stale).
     pub seq_events: IntCounterVec,
 
     // --- Arbiter emit stage (labelled by `venue`) ---
-    /// Messages that survived dedup and were broadcast, by `kind`
-    /// (quote/trade/instrument/midpoint/depth/status).
+    /// Messages that survived dedup and were broadcast, by `kind` (quote/trade/instrument/midpoint/
+    /// depth). `status` is structurally possible but currently never routed through the arbiter, so
+    /// that child is not recorded in practice.
     pub emit: IntCounterVec,
+    /// Quotes admitted by the staleness floor, attributed to the winning `publisher` (edge/public).
+    /// A rise in `publisher="public"` is the direct signal of the public backstop filling a gap.
+    pub quotes_admitted: IntCounterVec,
     /// Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat — collapsed).
     pub quotes_dropped: IntCounterVec,
     /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
@@ -70,6 +75,18 @@ pub struct Metrics {
     pub ws_rate_limited: IntCounter,
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
+
+    // --- Public WS input feeder (Hyperliquid backstop; off by default) ---
+    /// Feeder health: 1 while the public WebSocket session is connected, 0 while down/reconnecting.
+    pub ws_feeder_up: IntGauge,
+    /// Public WS (re)connect cycles — incremented each time a session ends or a connect attempt fails
+    /// and the feeder backs off to retry.
+    pub ws_feeder_reconnects: IntCounter,
+    /// Public WS frames that failed to decode (undecodable envelope; dropped best-effort).
+    pub ws_feeder_decode_errors: IntCounter,
+    /// Business messages decoded from the public WS and emitted through the arbiter, by `kind`
+    /// (quote/trade).
+    pub ws_feeder_messages: IntCounterVec,
 
     // --- Shred forwarder ---
     /// Shred datagrams received per source `group`.
@@ -176,7 +193,7 @@ impl Metrics {
             feed_stale_ms: gauge_vec(
                 &registry,
                 "dz_feed_stale_ms",
-                "Market-data staleness at the last down transition, in milliseconds",
+                "Market-data staleness in ms: 0 while up; staleness at the last down transition",
                 &["venue"],
             ),
             seq_events: counter_vec(
@@ -190,6 +207,12 @@ impl Metrics {
                 "dz_emit_total",
                 "Messages broadcast after dedup, by venue and kind",
                 &["venue", "kind"],
+            ),
+            quotes_admitted: counter_vec(
+                &registry,
+                "dz_quotes_admitted_total",
+                "Quotes admitted by the staleness floor, by winning publisher (edge/public)",
+                &["venue", "publisher"],
             ),
             quotes_dropped: counter_vec(
                 &registry,
@@ -258,6 +281,27 @@ impl Metrics {
                 &registry,
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
+            ),
+            ws_feeder_up: gauge(
+                &registry,
+                "dz_ws_feeder_up",
+                "Public WS input feeder health: 1 while connected, 0 while down/reconnecting",
+            ),
+            ws_feeder_reconnects: counter(
+                &registry,
+                "dz_ws_feeder_reconnects_total",
+                "Public WS (re)connect cycles (session ended or connect attempt failed)",
+            ),
+            ws_feeder_decode_errors: counter(
+                &registry,
+                "dz_ws_feeder_decode_errors_total",
+                "Public WS frames that failed to decode (dropped best-effort)",
+            ),
+            ws_feeder_messages: counter_vec(
+                &registry,
+                "dz_ws_feeder_messages_total",
+                "Business messages decoded from the public WS and emitted, by kind",
+                &["kind"],
             ),
             shred_datagrams_received: counter_vec(
                 &registry,
@@ -342,6 +386,11 @@ impl Metrics {
 static METRICS: OnceLock<Metrics> = OnceLock::new();
 
 /// The process-wide [`Metrics`], initialized on first use. Cheap to call repeatedly.
+///
+/// **Test isolation.** This registry is a single process-global, shared by every test in a binary
+/// that runs in parallel. A test asserting an exact metric *value* must therefore either key on a
+/// label value unique to that test (so no other test touches the same child) or assert relative to a
+/// captured baseline under `#[serial_test::serial]` — never assume a counter/gauge starts at zero.
 pub fn metrics() -> &'static Metrics {
     METRICS.get_or_init(Metrics::new)
 }

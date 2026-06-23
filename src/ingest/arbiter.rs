@@ -76,6 +76,18 @@ pub enum Publisher {
     PublicWs,
 }
 
+impl Publisher {
+    /// A stable, low-cardinality metric label for the source class. Deliberately collapses the
+    /// edge publisher's source IP to `"edge"` — the per-IP identity matters to the floor but would
+    /// blow up metric cardinality (and is spoofable), so it is never used as a label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Publisher::Edge(_) => "edge",
+            Publisher::PublicWs => "public",
+        }
+    }
+}
+
 /// Canonical BBO scale exponent (`10^-8`), matching the capture service's `bbo_hash`
 /// (`malbeclabs/hyperliquid` `StableBBOHash`: `canonicalBBOPriceExp = canonicalBBOQtyExp = -8`).
 const CANONICAL_BBO_EXP: i32 = 8;
@@ -305,6 +317,12 @@ impl Arbiter {
                     .admit(key, q.source_ts_ns, QuoteId::of(q), publisher)
                 {
                     m.emit.with_label_values(&[&q.venue, "quote"]).inc();
+                    // Attribute the admitted quote to its winning publisher. A rise in
+                    // `publisher="public"` is the direct signal of the public backstop filling an
+                    // edge gap (in steady state the edge publisher leads every tick).
+                    m.quotes_admitted
+                        .with_label_values(&[&q.venue, publisher.label()])
+                        .inc();
                     let _ = self.tx.send(msg);
                 } else {
                     m.quotes_dropped.with_label_values(&[&q.venue]).inc();
@@ -319,16 +337,32 @@ impl Arbiter {
                     m.trades_dropped.with_label_values(&[&t.venue]).inc();
                 }
             }
-            other => {
-                let (venue, kind) = match other {
-                    FeedMessage::Instrument(i) => (i.venue.as_str(), "instrument"),
-                    FeedMessage::Midpoint(mp) => (mp.venue.as_str(), "midpoint"),
-                    FeedMessage::Depth(d) => (d.venue.as_str(), "depth"),
-                    FeedMessage::Status(s) => (s.venue.as_str(), "status"),
-                    // Quote/Trade are handled above; this arm only sees the passthrough kinds.
-                    FeedMessage::Quote(_) | FeedMessage::Trade(_) => unreachable!(),
-                };
-                m.emit.with_label_values(&[venue, kind]).inc();
+            // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
+            // future `FeedMessage` variant is a compile error here, not a silent miss / runtime panic.
+            FeedMessage::Instrument(i) => {
+                m.emit
+                    .with_label_values(&[i.venue.as_str(), "instrument"])
+                    .inc();
+                let _ = self.tx.send(msg);
+            }
+            FeedMessage::Midpoint(mp) => {
+                m.emit
+                    .with_label_values(&[mp.venue.as_str(), "midpoint"])
+                    .inc();
+                let _ = self.tx.send(msg);
+            }
+            FeedMessage::Depth(d) => {
+                m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
+                let _ = self.tx.send(msg);
+            }
+            // `Status` is currently never routed through `emit` — receivers send it straight via
+            // `sender()` (see `emit_status`), and no other source produces it — so `dz_emit_total
+            // {kind="status"}` is unreachable in practice today. The arm is kept for match
+            // exhaustiveness and stays correct if a future source ever emits status through here.
+            FeedMessage::Status(s) => {
+                m.emit
+                    .with_label_values(&[s.venue.as_str(), "status"])
+                    .inc();
                 let _ = self.tx.send(msg);
             }
         }
