@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
+  with the per-type oracle strength documented honestly rather than claimed uniform:
+  - **Shared-with-TOB** layouts (frame/message headers, `InstrumentDefinition`, `Trade`,
+    `ManifestSummary`, type tags) reuse the byte-validated TOB `codec.rs`; a new cross-codec test
+    (`tob_shared_layouts_decode_identically`) decodes the same bytes through both codecs and asserts
+    equal fields, so the sharing is self-enforcing.
+  - **Real publisher capture** backs `Order{Add,Cancel,Execute}`, `BatchBoundary`, the full
+    `Snapshot{Begin,Order,End}` group, and the shared `InstrumentDefinition`/`ManifestSummary` via a
+    new real-frame decode test (`tests/codec_mbo_fixtures.rs`) over the two-sided TYO recorder
+    fixtures (#36). The snapshot is BTC's complete 44,598-order book, so `SnapshotOrder` is
+    well-covered, and the test asserts `total_orders == decoded order count` as a cross-field check.
+  - **Offset-test-only** (no committed fixture; pinned by the offset-independent unit tests, confirm
+    against a live frame before a live MBO feed): `InstrumentReset`, `Heartbeat`, `EndOfSession`.
+  No offset discrepancies found — the side-mapping bug fixed in #2 was the only one. The "size 20 vs
+  fields-to-24" `ManifestSummary` suspicion was a non-issue: the body is 20 bytes (on-wire 24),
+  identical to TOB, and no size-20 constant exists in code.
 - README refocused on the **operator**: it now leads with what the bridge does, the install
   one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
   variants), and how to configure/override it via environment variables before the pipe. The

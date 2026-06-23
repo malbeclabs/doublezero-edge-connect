@@ -69,8 +69,9 @@ Modules are grouped by role under `src/`:
   - **`shred/parse.rs`** — pure decoder pulling signature/variant/`slot`/`index` and the signed
     message (legacy payload, or recomputed merkle root) from a raw datagram. ⚠️ **Offsets +
     merkle layout are transcribed from the agave shred format and NOT validated against a live
-    `edge-solana-*` hexdump** — same status as `codec_midpoint`/`codec_mbo`. Round-trip tests pin
-    self-consistency only. Validate against a captured frame before trusting sigverify.
+    `edge-solana-*` hexdump** — same draft status `codec_midpoint` had (`codec_mbo` is now
+    validated, #4). Round-trip tests pin self-consistency only. Validate against a captured frame
+    before trusting sigverify.
   - **`shred/verify.rs`** — ed25519 (`ed25519-dalek`) of the signature over the signed message;
     any malformed input fails verification rather than panicking.
   - **`shred/leader.rs`** — slot→leader from a Solana RPC (`getLeaderSchedule`/`getEpochInfo`),
@@ -122,9 +123,13 @@ Modules are grouped by role under `src/`:
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).
   **`codec.rs` (TOB) offsets are validated byte-for-byte** against the authoritative Go decoder in
-  `edge-multicast-ref` — **do not change them without re-validating**. ⚠️ **`codec_midpoint.rs`/`codec_mbo.rs` offsets come from the edge-feed-spec
-  draft and are NOT reference-validated**; their round-trip tests only pin self-consistency, so
-  validate against a live frame hexdump before trusting their output (see "Conventions" below).
+  `edge-multicast-ref` — **do not change them without re-validating**. **`codec_mbo.rs` is now
+  field-by-field validated too (#4):** shared-with-TOB types reuse the byte-validated TOB layout,
+  and the MBO-specific types are pinned by offset-independent unit tests plus a real-frame decode
+  test over the byte-validated committed golden fixtures (`tests/codec_mbo_fixtures.rs`). ⚠️
+  **`codec_midpoint.rs` offsets still come from the edge-feed-spec draft and are NOT
+  reference-validated**; its round-trip tests only pin self-consistency, so validate against a live
+  frame hexdump before trusting its output (see "Conventions" below).
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
   Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
@@ -152,11 +157,21 @@ Modules are grouped by role under `src/`:
 - **PROTOCOL.md is the contract.** Any change to the WebSocket JSON (field names, message types,
   control frames) must keep the forward-compat rule (consumers ignore unknown types/fields) and
   be reflected in PROTOCOL.md. There is no `v` field on the wire.
-- **Sibling-protocol offsets are unvalidated.** The Midpoint/Market-by-Order byte layouts in
-  `codec_midpoint.rs`/`codec_mbo.rs` came from the edge-feed-spec *draft*, not a reference codec
-  (only TOB is byte-validated). Before enabling a live Midpoint/MBO feed, run the bridge with
-  `RUST_LOG=debug` against the real group/ports and confirm decoded fields against a frame
-  hexdump. No `FEEDS` row uses these kinds until their endpoints + offsets are confirmed.
+- **Midpoint offsets are still unvalidated.** The `codec_midpoint.rs` byte layout came from the
+  edge-feed-spec *draft*, not a reference codec; its round-trip tests only pin self-consistency.
+  Before enabling a live Midpoint feed, run the bridge with `RUST_LOG=debug` against the real
+  group/ports and confirm decoded fields against a frame hexdump. **`codec_mbo.rs` is validated
+  (#4):** shared-with-TOB types (frame/message headers, `InstrumentDefinition`, `Trade`,
+  `ManifestSummary`, type tags) reuse the byte-validated TOB layout, and the MBO-specific types are
+  pinned by offset-independent unit tests + a real-frame decode test over the committed fixtures
+  (`tests/codec_mbo_fixtures.rs`). Oracle strength varies by type:
+  `Order{Add,Cancel,Execute}`/`BatchBoundary`/`Snapshot{Begin,Order,End}` have **real-capture**
+  backing from the two-sided TYO recorder fixture (#36 — the snapshot is BTC's full 44,598-order
+  book, so `SnapshotOrder` is well-covered); `Trade` has no MBO fixture but shares the
+  byte-validated TOB layout (pinned by a cross-codec equality test); and
+  `InstrumentReset`/`Heartbeat`/`EndOfSession` have **no fixture** (offset-test-only — confirm
+  against a live frame before a live MBO feed). No `FEEDS` row uses these kinds until their
+  endpoints are confirmed.
 - **MBO is re-served as derived full-state `depth`, never raw deltas.** The bridge reconstructs the
   L3 book and runs snapshot+delta recovery internally (`book.rs`), so the WS contract's "every
   message is full state and self-heals" guarantee holds. Do not expose order add/cancel/execute
