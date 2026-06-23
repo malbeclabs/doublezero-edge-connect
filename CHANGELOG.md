@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get.doublezero.xyz/connect` one-liner.
 
 ### Added
+- Installer one-liner (`scripts/connect*.sh`) now runs a **pre-flight access-pass check before
+  installing anything**. Right after reading the access secret — and before installing Docker,
+  pulling the image, or touching the host network — it verifies onchain that the configured identity
+  has an access pass bound to this host's public IP **or** to `0.0.0.0` (the any-IP wildcard), and
+  aborts with a clear, non-technical message — directing the operator to contact DoubleZero to
+  arrange access, and printing the identity + public IP to share with support — if not. The check
+  is pure host-side (no Docker, no CLI): it derives the identity from the
+  DZ_-token/keypair, computes the access-pass PDA, and reads it over the DoubleZero ledger's public
+  JSON-RPC via an embedded `python3` helper. It **degrades to a warning** (and continues, letting
+  `doublezero connect` be the fallback) when the host's public IP can't be determined, the ledger
+  RPC is unreachable, or `python3` is absent. New installer env vars: `DZ_CLIENT_IP` (override the
+  detected public IP) and `DZ_LEDGER_RPC_URL` (override the ledger RPC).
 - Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
   (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
   copy of each shred out of the box, collapsing the multicast-overlap duplicates DoubleZero delivers

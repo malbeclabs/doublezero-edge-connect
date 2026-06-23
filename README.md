@@ -44,11 +44,14 @@ curl -fsSL https://get.doublezero.xyz/connect-devnet | bash
 
 What the script does:
 
-1. Checks preconditions (Linux/amd64, root or `sudo`) and ensures Docker is present (offers to
-   install it).
-2. Preps the host kernel/network for the GRE tunnel: loads `tun`/`ip_gre`, raises
-   `net.core.rmem_max`, warns about firewalls and cloud-provider rules.
-3. Loads the access secret (a `DZ_`-prefixed token, or a keypair file path).
+1. Checks preconditions (Linux/amd64, root or `sudo`).
+2. Loads the access secret (a `DZ_`-prefixed token, or a keypair file path) and **verifies its
+   access pass onchain before installing anything** — aborting with a descriptive error if the
+   identity has no access pass for this host's public IP (or `0.0.0.0`). This is a pure host-side
+   check (no Docker, no CLI) over the ledger's public JSON-RPC.
+3. Ensures Docker is present (offers to install it) and preps the host kernel/network for the GRE
+   tunnel: loads `tun`/`ip_gre`, raises `net.core.rmem_max`, warns about firewalls and
+   cloud-provider rules.
 4. Runs the bridge container (`--network host`, `NET_ADMIN`/`NET_RAW`, `/dev/net/tun`) and runs
    `doublezero connect multicast`.
 
@@ -78,6 +81,8 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion. Does **not** affect Solana shred forwarding. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
+| `DZ_CLIENT_IP` | *(auto-detected)* | Override the host public IP used by the access-pass pre-check (set if auto-detection is wrong). |
+| `DZ_LEDGER_RPC_URL` | per env | Override the DoubleZero ledger RPC the access-pass pre-check queries. |
 | `DZ_GHCR_TOKEN` | — | **devnet only**, required: a GHCR token with `read:packages` (the devnet image is private). |
 | `DZ_GHCR_USER` | `malbeclabs` | **devnet only**, optional: the GHCR username for the login. |
 

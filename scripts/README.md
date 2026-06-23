@@ -18,10 +18,16 @@ each must stay self-contained (no shared sourced file).
 ## What they do
 
 1. Check preconditions (Linux/amd64, root or `sudo`).
-2. Ensure Docker is present (offer to install it via `get.docker.com`).
-3. Prep the host kernel/network for GRE: load `tun`/`ip_gre`, raise `net.core.rmem_max`, warn
+2. Load the access secret (a `DZ_`-prefixed token or a keypair file path) and **verify its access
+   pass onchain before installing anything** — a pure host-side check (no Docker, no CLI) that
+   derives the identity, computes the access-pass PDA, and reads it over the ledger's public
+   JSON-RPC. If the identity has no access pass for this host's public IP (or `0.0.0.0`, the any-IP
+   wildcard), the installer aborts with a descriptive error instead of failing later at `connect`.
+   The check degrades to a warning (and continues) if the public IP can't be determined, the ledger
+   RPC is unreachable, or `python3` is missing.
+3. Ensure Docker is present (offer to install it via `get.docker.com`).
+4. Prep the host kernel/network for GRE: load `tun`/`ip_gre`, raise `net.core.rmem_max`, warn
    about active firewalls and cloud provider rules (AWS/GCP/Azure).
-4. Load the access secret (a `DZ_`-prefixed token or a keypair file path).
 5. Run the bridge container (`--network host`, `NET_ADMIN`/`NET_RAW`, `/dev/net/tun`), inject the
    keypair, and run `doublezero connect multicast`.
 6. Print connection URLs and management hints.
@@ -47,6 +53,8 @@ DZ_SECRET=DZ_… DZ_FEEDS=Hyperliquid curl -fsSL https://get.doublezero.xyz/conn
 | `DZ_NAME` | `doublezero-edge-connect` | Container name. |
 | `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion (e.g. `Hyperliquid,Phoenix`). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
+| `DZ_CLIENT_IP` | *(auto-detected)* | Override the host public IP used by the access-pass pre-check. Set this if auto-detection picks the wrong IP. |
+| `DZ_LEDGER_RPC_URL` | per env | Override the DoubleZero ledger JSON-RPC URL the access-pass pre-check queries. |
 | `DZ_GHCR_TOKEN` | — | **devnet only**, required: a GHCR token with `read:packages` (the devnet image is private). |
 | `DZ_GHCR_USER` | `malbeclabs` | **devnet only**, optional: the GHCR username for the login. |
 
@@ -109,6 +117,10 @@ The bridge serves:
 - **GRE connectivity.** On a cloud host you must also allow IP protocol 47 at the provider level
   (and, on AWS, disable the ENI source/dest check) — the script warns but can't fix this for you.
 - **Access pass.** `doublezero connect` requires the host's public IP to be authorized onchain for
-  the chosen environment; otherwise the tunnel won't come up (the rest of the setup still applies).
+  the chosen environment; otherwise the tunnel won't come up. The installer now checks this **up
+  front** (step 2) and aborts before installing anything if the identity has no access pass for the
+  host's public IP or `0.0.0.0`. Provision one with
+  `doublezero access-pass set --accesspass-type prepaid --user-payer <IDENTITY> --client-ip <IP>`
+  (use `--client-ip 0.0.0.0` to allow any IP). Override the detected IP with `DZ_CLIENT_IP` if needed.
 - **No TLS.** The bridge targets a trusted/local network; terminate TLS at a reverse proxy if you
   expose it.
