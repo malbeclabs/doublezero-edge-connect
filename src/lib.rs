@@ -7,6 +7,7 @@
 //! against the live feed).
 
 pub mod ingest;
+pub mod metrics;
 pub mod model;
 pub mod shred;
 pub mod sinks;

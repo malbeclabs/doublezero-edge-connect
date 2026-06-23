@@ -31,6 +31,10 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 bs58 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Prometheus metrics: an explicit `Registry` + text encoder, served by a hand-rolled minimal HTTP
+# handler (no HTTP framework — see `sinks::metrics`). `default-features = false` drops the unused
+# protobuf encoder; `process` adds the Linux process collector (CPU/RSS/fds) for free.
+prometheus = { version = "0.13", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 serial_test = "3"

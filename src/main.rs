@@ -17,7 +17,7 @@ use clap::Parser;
 use tokio::{sync::broadcast, task::JoinSet};
 use tracing::{info, warn};
 
-use doublezero_edge_connect::{ingest, model, shred, sinks};
+use doublezero_edge_connect::{ingest, metrics, model, shred, sinks};
 use ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
     feeds,
@@ -138,6 +138,12 @@ struct Args {
         default_value = "wss://api.hyperliquid.xyz/ws"
     )]
     ws_input_url: String,
+
+    /// Prometheus metrics HTTP endpoint bind address (e.g. `127.0.0.1:9090`). Off by default
+    /// (opt-in): empty means no endpoint is exposed. Metrics are recorded regardless; this only
+    /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
+    #[arg(long = "metrics-bind", env = "METRICS_BIND", default_value = "")]
+    metrics_bind: String,
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -174,6 +180,11 @@ async fn main() -> Result<()> {
     let enabled = select_feeds(&args.feeds)?;
     info!(feeds = ?enabled.iter().map(|f| f.venue).collect::<Vec<_>>(), "ingesting feeds");
 
+    // Force the metrics registry to initialize up front (registering the process collector and all
+    // metric families) so the very first recorded sample lands in a ready registry, whether or not
+    // the scrape endpoint below is enabled.
+    metrics::metrics();
+
     let (tx, _rx) = broadcast::channel::<model::FeedMessage>(args.ws_broadcast_capacity);
     // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
     // feeder) emits through this one instance, so cross-source duplicates collapse on one
@@ -201,6 +212,16 @@ async fn main() -> Result<()> {
             depth.clone(),
             ws_cfg,
         )))
+    };
+
+    // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always
+    // on; this only exposes the registry over HTTP for scraping.
+    let metrics_srv = if args.metrics_bind.is_empty() {
+        info!("metrics endpoint disabled (empty --metrics-bind)");
+        None
+    } else {
+        info!(bind = %args.metrics_bind, "metrics endpoint enabled");
+        Some(tokio::spawn(sinks::metrics::run(args.metrics_bind.clone())))
     };
 
     // Shred forwarder: activate-on-discovery. Runs iff an explicit `--shred-source` is given or
@@ -318,6 +339,12 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r?,
+        // The metrics endpoint (when enabled) loops forever; its arm resolves only on a bind/accept
+        // failure or a task panic, surfacing that like the WS server arm.
+        r = async { match metrics_srv {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
     }
     Ok(())
 }

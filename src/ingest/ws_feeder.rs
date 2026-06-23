@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::arbiter::{lock, Publisher, SharedArbiter},
+    metrics::metrics,
     model::{now_ns, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade},
 };
 
@@ -120,11 +121,13 @@ pub async fn run(
         );
     }
 
+    let m = metrics();
     let mut backoff = BACKOFF_MIN;
     loop {
         match connect_async(&url).await {
             Ok((ws, _resp)) => {
                 info!(%url, coins = ?coins, "public WS input feeder connected");
+                m.ws_feeder_up.set(1);
                 let started = Instant::now();
                 match stream(ws, &coins, &arbiter, &instruments).await {
                     Ok(()) => info!("public WS input feeder closed; reconnecting"),
@@ -132,6 +135,7 @@ pub async fn run(
                         warn!(error = %e, "public WS input feeder session error; reconnecting")
                     }
                 }
+                m.ws_feeder_up.set(0);
                 // Reset the backoff only after a *stable* session; a connect-then-immediate-drop
                 // keeps escalating so a flapping endpoint isn't hammered (see `STABLE_SESSION`).
                 backoff = if started.elapsed() >= STABLE_SESSION {
@@ -142,9 +146,13 @@ pub async fn run(
             }
             Err(e) => {
                 warn!(error = %e, %url, "public WS input feeder connect failed; retrying");
+                m.ws_feeder_up.set(0);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
+        // Each loop iteration past the initial connect is one reconnect cycle (a drop or a failed
+        // attempt, now backing off to retry).
+        m.ws_feeder_reconnects.inc();
         tokio::time::sleep(backoff).await;
     }
 }
@@ -189,6 +197,7 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
     let env: Envelope = match serde_json::from_str(txt) {
         Ok(e) => e,
         Err(e) => {
+            metrics().ws_feeder_decode_errors.inc();
             debug!(error = %e, "public WS: undecodable frame ignored");
             return;
         }
@@ -280,6 +289,10 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         kernel_rx_ts_ns: 0, // no kernel RX timestamp for a user-space WS read (0 = sentinel)
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
     };
+    metrics()
+        .ws_feeder_messages
+        .with_label_values(&["quote"])
+        .inc();
     lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs);
 }
 
@@ -313,6 +326,10 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         kernel_rx_ts_ns: 0,
         ws_send_ts_ns: 0,
     };
+    metrics()
+        .ws_feeder_messages
+        .with_label_values(&["trade"])
+        .inc();
     lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
 }
 

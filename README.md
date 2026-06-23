@@ -83,8 +83,9 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 
 **Bridge variables.** The installer relays **any** non-empty bridge env var straight through to
 the container, so the bridge is tuned entirely from the one-liner. Common ones: `DZ_IFACE`,
-`DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `RUST_LOG`, and the shred forwarder's `DZ_SHRED_*`
-(notably `DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`). The full list with defaults is the `Args`
+`DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `METRICS_BIND` (turn on the Prometheus `/metrics`
+endpoint — off by default), `RUST_LOG`, and the shred forwarder's `DZ_SHRED_*` (notably
+`DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`). The full list with defaults is the `Args`
 struct in [`src/main.rs`](src/main.rs); per-feature config lives in the [docs](docs/) (see below).
 
 > **Limitation:** only **non-empty** values are forwarded, so you can't pass an *empty* override
@@ -127,7 +128,7 @@ Open a WebSocket to `ws://<host>:8081` and read JSON. You receive only the venue
 for; an optional `subscribe` control frame narrows the stream further:
 
 ```json
-{"method":"subscribe","subscription":{"venue":"Hyperliquid","symbol":"SOL"}}
+{"method":"subscribe","subscription":{"venue":"<venue-name>","symbol":"SOL"}}
 ```
 
 On connect you first get the current instrument definitions (precision), then a stream of quotes.
@@ -140,6 +141,7 @@ wire contract is in **[PROTOCOL.md](PROTOCOL.md)** (see
 - **[docs/](docs/)** — operating reference:
   [Self-hosting](docs/self-hosting.md) ·
   [Output sinks](docs/output-sinks.md) ·
+  [Metrics](docs/metrics.md) ·
   [Input sources](docs/input-sources.md) ·
   [Shred forwarding](docs/shred-forwarding.md)
 - **[PROTOCOL.md](PROTOCOL.md)** — the WebSocket JSON contract (v1).

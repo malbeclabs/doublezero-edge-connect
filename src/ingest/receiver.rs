@@ -43,6 +43,7 @@ use crate::{
         feeds::{Feed, FeedKind, FeedPorts},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
+    metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
 };
 
@@ -74,6 +75,15 @@ impl PortRole {
     /// Whether a processor should handle market-data (quote/trade/etc.) messages on this role.
     pub fn handles_mktdata(self) -> bool {
         matches!(self, PortRole::Mktdata | PortRole::Combined)
+    }
+    /// A stable, low-cardinality label for the metrics `role` dimension.
+    fn label(self) -> &'static str {
+        match self {
+            PortRole::Mktdata => "mktdata",
+            PortRole::Refdata => "refdata",
+            PortRole::Snapshot => "snapshot",
+            PortRole::Combined => "combined",
+        }
     }
 }
 
@@ -117,10 +127,29 @@ pub trait FrameProcessor {
     fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx);
 }
 
+/// Materialize the feed-health gauges for `venue` in their healthy at-rest state (`feed_up=1`,
+/// `feed_stale_ms=0`) at task setup. Without this the gauges' per-venue children are created only on
+/// the first down/ok edge (see [`emit_status`]), so a feed healthy from boot would have no
+/// `dz_feed_up{venue}` series at all — making the headline `dz_feed_up == 0` alert un-fireable.
+fn init_feed_health(venue: &str) {
+    let m = metrics();
+    m.feed_up.with_label_values(&[venue]).set(1);
+    m.feed_stale_ms.with_label_values(&[venue]).set(0);
+}
+
 /// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when the
 /// market-data multicast has gone silent past [`IDLE_REJOIN`], `"ok"` when it recovers. Consumers
 /// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
 fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
+    // Mirror the transition into the feed-health gauges (cheap; only fires on a down/ok edge).
+    metrics()
+        .feed_up
+        .with_label_values(&[venue])
+        .set(i64::from(state == "ok"));
+    metrics()
+        .feed_stale_ms
+        .with_label_values(&[venue])
+        .set(stale_ms as i64);
     // Status carries no business identity to dedup, so it goes straight to the broadcast sender.
     let _ = lock(arbiter).sender().send(FeedMessage::Status(FeedStatus {
         venue: venue.to_string(),
@@ -337,6 +366,9 @@ struct Channel {
     role: PortRole,
     sock: TsSocket,
     buf: Vec<u8>,
+    /// Pre-resolved `dz_datagrams_received_total{venue, role}` child, so the hot path increments
+    /// without a per-datagram label lookup.
+    dgrams: prometheus::IntCounter,
 }
 
 /// Await the next datagram across all of a feed's sockets concurrently. Returns the role it
@@ -383,6 +415,16 @@ async fn drive<P: FrameProcessor>(
     // (silent past IDLE_REJOIN). Persists across rejoins so we emit `down`/`ok` only on the edge.
     let mut down = false;
 
+    // Per-feed metric handles resolved once (venue is `&'static`); the per-channel datagram counter
+    // is resolved per role at bind time below.
+    let m = metrics();
+    let bytes_ctr = m.datagram_bytes.with_label_values(&[venue]);
+    let socket_errors = m.socket_errors.with_label_values(&[venue]);
+    let idle_rejoin = m.idle_rejoin.with_label_values(&[venue]);
+    // Create the feed-health gauge series up front in their healthy state, so a feed that never
+    // goes down still exposes `dz_feed_up{venue}=1` (the down/ok edges in `emit_status` flip it).
+    init_feed_health(venue);
+
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
         // coming up and fall back to the default interface.
@@ -395,6 +437,9 @@ async fn drive<P: FrameProcessor>(
                 role,
                 sock,
                 buf: vec![0u8; 2048],
+                dgrams: m
+                    .datagrams_received
+                    .with_label_values(&[venue, role.label()]),
             });
         }
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, "DZ Edge multicast receiver bound");
@@ -408,6 +453,7 @@ async fn drive<P: FrameProcessor>(
             if remaining.is_zero() {
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
+                idle_rejoin.inc();
                 if !down {
                     emit_status(
                         &arbiter,
@@ -425,11 +471,13 @@ async fn drive<P: FrameProcessor>(
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
                         warn!(%group, "recv error: {e}; rejoining");
+                        socket_errors.inc();
                         continue 'rejoin;
                     }
                     Err(_) => {
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
+                        idle_rejoin.inc();
                         if !down {
                             emit_status(
                                 &arbiter,
@@ -442,6 +490,9 @@ async fn drive<P: FrameProcessor>(
                         continue 'rejoin;
                     }
                 };
+
+            channels[idx].dgrams.inc();
+            bytes_ctr.inc_by(n as u64);
 
             // Reset the liveness watchdog only on the market-data stream; recovery clears `down`.
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
@@ -552,7 +603,20 @@ pub async fn run_feed(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    use super::{datagram_src_ip, SeqCheck, SeqTracker, SockaddrStorage};
+    use super::{datagram_src_ip, init_feed_health, SeqCheck, SeqTracker, SockaddrStorage};
+    use crate::metrics::metrics;
+
+    #[test]
+    fn feed_health_gauges_materialize_up_at_setup() {
+        // A unique venue label keeps this independent of any other test touching the shared,
+        // process-global metrics registry (see `metrics()` docs).
+        let venue = "FeedHealthInitTest";
+        init_feed_health(venue);
+        // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
+        // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
+        assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);
+        assert_eq!(metrics().feed_stale_ms.with_label_values(&[venue]).get(), 0);
+    }
 
     #[test]
     fn datagram_src_ip_extracts_v4() {
