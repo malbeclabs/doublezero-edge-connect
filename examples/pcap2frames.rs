@@ -496,6 +496,22 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Index of the first frame in `frames` whose decoded messages satisfy `pred`, or `Ok(None)` if
+/// none match. Unlike a `position()` closure - which would have to `.unwrap()` the decode and panic
+/// on a malformed frame - this propagates a decode error via `?`, matching the rest of the
+/// generator's fail-loud handling.
+fn first_frame_with(
+    frames: &[Vec<u8>],
+    pred: impl Fn(&codec_mbo::Message) -> bool,
+) -> Result<Option<usize>> {
+    for (i, f) in frames.iter().enumerate() {
+        if codec_mbo::decode_frame(f)?.1.iter().any(&pred) {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
 /// Trim already-symbol-filtered MBO refdata+snapshot+mktdata vectors to a minimal two-sided
 /// fixture: one manifest + the target definition (enough to resolve precision), the first COMPLETE
 /// snapshot group for `target_id` (every promised order present, with a matching `SnapshotEnd`),
@@ -516,29 +532,19 @@ fn trim_mbo_minimal(
     // carries the target instrument's definition. One manifest epoch + the one definition is all the
     // subscriber needs to resolve `target_id`'s precision; the live capture re-sends the same
     // manifest seq on a round-robin, so the rest is redundant.
-    let manifest_idx = refdata
-        .iter()
-        .position(|f| {
-            codec_mbo::decode_frame(f)
-                .unwrap()
-                .1
-                .iter()
-                .any(|m| matches!(m, Message::ManifestSummary(_)))
-        })
+    let manifest_idx = first_frame_with(refdata, |m| matches!(m, Message::ManifestSummary(_)))?
         .ok_or_else(|| anyhow!("no ManifestSummary in refdata"))?;
-    let def_off = refdata[manifest_idx..]
-        .iter()
-        .position(|f| {
-            codec_mbo::decode_frame(f).unwrap().1.iter().any(
-                |m| matches!(m, Message::InstrumentDefinition(d) if d.instrument_id == target_id),
-            )
-        })
-        .ok_or_else(|| {
-            anyhow!("no definition for instrument {target_id} at/after the first manifest")
-        })?;
+    let def_off = first_frame_with(
+        &refdata[manifest_idx..],
+        |m| matches!(m, Message::InstrumentDefinition(d) if d.instrument_id == target_id),
+    )?
+    .ok_or_else(|| {
+        anyhow!("no definition for instrument {target_id} at/after the first manifest")
+    })?;
     let refdata_out = refdata[manifest_idx..=manifest_idx + def_off].to_vec();
 
-    // Pass 1: tally each snapshot group (in begin order) and find the first complete one.
+    // Pass 1: tally each snapshot group (in begin order) - promised total, received order count,
+    // and whether it ended - so the selection below can pick the first complete one.
     let mut begins: Vec<(u32, u32, u32, u32)> = Vec::new(); // (sid, total, instrument_id, last_instr_seq)
     let mut received: HashMap<u32, u32> = HashMap::new();
     let mut ended: HashSet<u32> = HashSet::new();
@@ -559,40 +565,44 @@ fn trim_mbo_minimal(
             }
         }
     }
-    let (sid, total, _inst, last_instr_seq) = begins
-        .iter()
-        .find(|(sid, total, inst, _)| {
-            *inst == target_id && ended.contains(sid) && received.get(sid) == Some(total)
-        })
-        .copied()
-        .ok_or_else(|| {
-            anyhow!(
-                "no complete snapshot group for instrument {target_id} (capture lost packets in every group); \
-                 groups seen: {begins:?}, received: {received:?}"
-            )
-        })?;
+    // Pick the first complete group for target_id (every promised order present). A group whose
+    // SnapshotOrder count doesn't match its begin's promised total is lossy or replayed - book.rs
+    // rejects it on SnapshotEnd (`received != total`), so it can't seed the fixture; warn to surface
+    // the malformed capture rather than silently passing it over, then keep scanning.
+    let mut chosen = None;
+    for &(sid, total, inst, last_instr_seq) in &begins {
+        if inst != target_id || !ended.contains(&sid) {
+            continue;
+        }
+        let got = received.get(&sid).copied().unwrap_or(0);
+        if got != total {
+            eprintln!(
+                "  mbo-minimal: WARNING snapshot group sid={sid} (instrument {target_id}) carried \
+                 {got} SnapshotOrders but its begin promised {total} (lossy or replayed capture); skipping"
+            );
+            continue;
+        }
+        chosen = Some((sid, total, last_instr_seq));
+        break;
+    }
+    let (sid, total, last_instr_seq) = chosen.ok_or_else(|| {
+        anyhow!(
+            "no complete snapshot group for instrument {target_id} (capture lost packets in every group); \
+             groups seen: {begins:?}, received: {received:?}"
+        )
+    })?;
 
     // Pass 2: keep the chosen group's frames [BEGIN..END] inclusive, and count its two sides.
-    let begin_idx = snapshot
-        .iter()
-        .position(|f| {
-            codec_mbo::decode_frame(f)
-                .unwrap()
-                .1
-                .iter()
-                .any(|m| matches!(m, Message::SnapshotBegin(s) if s.snapshot_id == sid))
-        })
-        .unwrap();
-    let end_idx = snapshot
-        .iter()
-        .position(|f| {
-            codec_mbo::decode_frame(f)
-                .unwrap()
-                .1
-                .iter()
-                .any(|m| matches!(m, Message::SnapshotEnd(s) if s.snapshot_id == sid))
-        })
-        .unwrap();
+    let begin_idx = first_frame_with(
+        snapshot,
+        |m| matches!(m, Message::SnapshotBegin(s) if s.snapshot_id == sid),
+    )?
+    .expect("chosen snapshot group has a begin frame");
+    let end_idx = first_frame_with(
+        snapshot,
+        |m| matches!(m, Message::SnapshotEnd(s) if s.snapshot_id == sid),
+    )?
+    .expect("chosen snapshot group has an end frame");
     let snap_out = snapshot[begin_idx..=end_idx].to_vec();
     let (mut bid, mut ask) = (0u32, 0u32);
     for f in &snap_out {
