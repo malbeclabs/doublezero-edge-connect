@@ -24,8 +24,10 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
-use crate::metrics::metrics;
-use crate::model::{now_ns, DepthSnapshot, FeedMessage, InstrumentSnapshot};
+use crate::{
+    metrics::metrics,
+    model::{now_ns, DepthSnapshot, FeedMessage, InstrumentSnapshot},
+};
 
 /// Tunable server limits / liveness (from CLI args).
 #[derive(Clone, Debug)]
@@ -84,11 +86,17 @@ pub async fn run(
         if clients.fetch_add(1, Ordering::SeqCst) >= cfg.max_clients {
             clients.fetch_sub(1, Ordering::SeqCst);
             warn!(%peer, max = cfg.max_clients, "max clients reached; rejecting connection");
-            metrics().ws_connections.with_label_values(&["rejected"]).inc();
+            metrics()
+                .ws_connections
+                .with_label_values(&["rejected"])
+                .inc();
             drop(stream);
             continue;
         }
-        metrics().ws_connections.with_label_values(&["accepted"]).inc();
+        metrics()
+            .ws_connections
+            .with_label_values(&["accepted"])
+            .inc();
         metrics().ws_clients.inc();
         let rx = tx.subscribe();
         let instruments = instruments.clone();

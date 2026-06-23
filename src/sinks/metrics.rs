@@ -69,12 +69,22 @@ async fn handle_conn(mut stream: TcpStream) -> Result<()> {
             write_response(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok\n").await
         }
         Some(_) => {
-            write_response(&mut stream, "404 Not Found", "text/plain; charset=utf-8", b"not found\n")
-                .await
+            write_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found\n",
+            )
+            .await
         }
         None => {
-            write_response(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"bad request\n")
-                .await
+            write_response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                b"bad request\n",
+            )
+            .await
         }
     }
 }

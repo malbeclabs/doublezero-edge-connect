@@ -36,8 +36,10 @@ use std::{
 
 use tokio::sync::broadcast;
 
-use crate::metrics::metrics;
-use crate::model::{now_ns, FeedMessage, NormalizedQuote};
+use crate::{
+    metrics::metrics,
+    model::{now_ns, FeedMessage, NormalizedQuote},
+};
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
@@ -292,7 +294,9 @@ impl Arbiter {
                 // hostile public timestamp years ahead would otherwise latch `high_water` and drop
                 // every real edge quote as stale until restart (see `MAX_FUTURE_SKEW_NS`).
                 if q.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
-                    m.quotes_future_rejected.with_label_values(&[&q.venue]).inc();
+                    m.quotes_future_rejected
+                        .with_label_values(&[&q.venue])
+                        .inc();
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());

@@ -105,7 +105,8 @@ pub struct Metrics {
 /// or bad label set is a programming bug, surfaced loudly at startup).
 fn counter_vec(reg: &Registry, name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
     let c = IntCounterVec::new(Opts::new(name, help), labels).expect("valid counter vec");
-    reg.register(Box::new(c.clone())).expect("register counter vec");
+    reg.register(Box::new(c.clone()))
+        .expect("register counter vec");
     c
 }
 
@@ -117,7 +118,8 @@ fn counter(reg: &Registry, name: &str, help: &str) -> IntCounter {
 
 fn gauge_vec(reg: &Registry, name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
     let g = IntGaugeVec::new(Opts::new(name, help), labels).expect("valid gauge vec");
-    reg.register(Box::new(g.clone())).expect("register gauge vec");
+    reg.register(Box::new(g.clone()))
+        .expect("register gauge vec");
     g
 }
 
@@ -135,7 +137,9 @@ impl Metrics {
         #[cfg(target_os = "linux")]
         {
             let pc = prometheus::process_collector::ProcessCollector::for_self();
-            registry.register(Box::new(pc)).expect("register process collector");
+            registry
+                .register(Box::new(pc))
+                .expect("register process collector");
         }
 
         Self {

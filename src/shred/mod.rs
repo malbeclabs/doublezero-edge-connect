@@ -66,8 +66,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::ingest::receiver::{bind_multicast, wait_for_interface_ip};
-use crate::metrics::metrics;
+use crate::{
+    ingest::receiver::{bind_multicast, wait_for_interface_ip},
+    metrics::metrics,
+};
 use dedup::{Action, DedupWindow};
 use leader::LeaderSchedule;
 
@@ -419,15 +421,11 @@ async fn forwarder_task(
         socks.push(Dest {
             addr: *dst,
             sock,
-            sends_ok: metrics()
-                .shred_sends
-                .with_label_values(&[&dst_label, "ok"]),
+            sends_ok: metrics().shred_sends.with_label_values(&[&dst_label, "ok"]),
             sends_err: metrics()
                 .shred_sends
                 .with_label_values(&[&dst_label, "error"]),
-            bytes_sent: metrics()
-                .shred_bytes_sent
-                .with_label_values(&[&dst_label]),
+            bytes_sent: metrics().shred_bytes_sent.with_label_values(&[&dst_label]),
         });
     }
     // Dedup runs whenever sigverify is on (it dedups too) or dedup-only is requested.

@@ -424,7 +424,9 @@ async fn drive<P: FrameProcessor>(
                 role,
                 sock,
                 buf: vec![0u8; 2048],
-                dgrams: m.datagrams_received.with_label_values(&[venue, role.label()]),
+                dgrams: m
+                    .datagrams_received
+                    .with_label_values(&[venue, role.label()]),
             });
         }
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, "DZ Edge multicast receiver bound");
