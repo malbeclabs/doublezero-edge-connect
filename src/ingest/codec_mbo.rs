@@ -559,8 +559,9 @@ pub(crate) mod tests {
     }
 
     /// 24-byte frame header layout (codec_common::FrameHeader, same as the byte-validated TOB
-    /// `codec.rs`): magic u16@0, schema_version u8@2, channel_id u8@3, sequence u64@4,
-    /// send_ts u64@12, msg_count u8@20, reset_count u8@21, frame_length u16@22.
+    /// `codec.rs`). This test pins the fields it asserts below: schema_version u8@2, channel_id
+    /// u8@3, sequence u64@4, send_ts u64@12, msg_count u8@20. (reset_count u8@21 / frame_length
+    /// u16@22 round out the header but are not asserted here.)
     #[test]
     fn frame_header_offsets_match_authority() {
         let body = vec![0u8; 8]; // EndOfSession body (ts u64@0)
@@ -597,33 +598,39 @@ pub(crate) mod tests {
 
     /// OrderAdd (0x10): instrument_id u32@0, source_id u16@4, side u8@6, order_flags u8@7,
     /// per_instrument_seq u32@8, order_id u64@12, enter_ts u64@20, price_raw i64@28, qty_raw u64@36.
+    /// `source_id` is given a distinct multi-byte value (`0x0102`, not a side sentinel) and `side`
+    /// is asserted both ways, so a decoder misreading `side` from the `source_id` offset can't pass.
     #[test]
     fn order_add_offsets_match_authority() {
-        let mut body = vec![0u8; 48]; // size 52 - 4 header
-        put(&mut body, 0, &7u32.to_le_bytes());
-        put(&mut body, 4, &1u16.to_le_bytes());
-        body[6] = SIDE_ASK;
-        body[7] = 0;
-        put(&mut body, 8, &5u32.to_le_bytes());
-        put(&mut body, 12, &12_345u64.to_le_bytes());
-        put(&mut body, 20, &1_780_000_000_000_000_000u64.to_le_bytes());
-        put(&mut body, 28, &18_420i64.to_le_bytes());
-        put(&mut body, 36, &1_000u64.to_le_bytes());
-        let f = frame_one(MSG_ORDER_ADD, sizes::ORDER_ADD, &body);
-        match &decode_frame(&f).unwrap().1[0] {
-            Message::OrderAdd(g) => {
-                assert_eq!(g.instrument_id, 7);
-                assert_eq!(g.source_id, 1);
-                assert_eq!(g.side, SIDE_ASK);
-                assert_eq!(g.order_flags, 0);
-                assert_eq!(g.per_instrument_seq, 5);
-                assert_eq!(g.order_id, 12_345);
-                assert_eq!(g.enter_ts, 1_780_000_000_000_000_000);
-                assert_eq!(g.price_raw, 18_420);
-                assert_eq!(g.qty_raw, 1_000);
+        let decode_side = |side: u8| {
+            let mut body = vec![0u8; 48]; // size 52 - 4 header
+            put(&mut body, 0, &7u32.to_le_bytes());
+            put(&mut body, 4, &0x0102u16.to_le_bytes());
+            body[6] = side;
+            body[7] = 0;
+            put(&mut body, 8, &5u32.to_le_bytes());
+            put(&mut body, 12, &12_345u64.to_le_bytes());
+            put(&mut body, 20, &1_780_000_000_000_000_000u64.to_le_bytes());
+            put(&mut body, 28, &18_420i64.to_le_bytes());
+            put(&mut body, 36, &1_000u64.to_le_bytes());
+            let f = frame_one(MSG_ORDER_ADD, sizes::ORDER_ADD, &body);
+            match decode_frame(&f).unwrap().1.remove(0) {
+                Message::OrderAdd(g) => {
+                    assert_eq!(g.instrument_id, 7);
+                    assert_eq!(g.source_id, 0x0102);
+                    assert_eq!(g.order_flags, 0);
+                    assert_eq!(g.per_instrument_seq, 5);
+                    assert_eq!(g.order_id, 12_345);
+                    assert_eq!(g.enter_ts, 1_780_000_000_000_000_000);
+                    assert_eq!(g.price_raw, 18_420);
+                    assert_eq!(g.qty_raw, 1_000);
+                    g.side
+                }
+                other => panic!("expected OrderAdd, got {other:?}"),
             }
-            other => panic!("expected OrderAdd, got {other:?}"),
-        }
+        };
+        assert_eq!(decode_side(0), SIDE_BID);
+        assert_eq!(decode_side(1), SIDE_ASK);
     }
 
     /// OrderCancel (0x11): instrument_id u32@0, source_id u16@4, reason u8@6,

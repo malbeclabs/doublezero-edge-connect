@@ -263,9 +263,8 @@ fn committed_mbo_fixtures_decode_cleanly() {
 /// The refdata fixture defines BTC (instrument_id 0) among ~640 instruments. Asserting BTC's exact
 /// decoded definition pins the `InstrumentDefinition` exponent offsets (37/38) and the symbol field
 /// (16B cstr @ 4) against real publisher bytes. NOTE: the real capture's BTC carries
-/// price_exponent=-8, qty_exponent=-5 (the older hand-crafted fixture used -1/-8; PROVENANCE.md's
-/// prose still says -1/-8, which is stale for this capture — the bytes are authoritative and the
-/// shared offset is cross-validated against the byte-validated TOB codec by
+/// price_exponent=-8, qty_exponent=-5 (the older hand-crafted fixture used -1/-8) — the bytes are
+/// authoritative and the shared offset is cross-validated against the byte-validated TOB codec by
 /// `tob_shared_layouts_decode_identically`).
 #[test]
 fn refdata_fixture_matches_btc_definition() {
