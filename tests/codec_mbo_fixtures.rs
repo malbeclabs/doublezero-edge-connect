@@ -10,9 +10,9 @@
 mod common;
 
 use common::replay;
-use doublezero_edge_connect::ingest::codec;
-use doublezero_edge_connect::ingest::codec_mbo::{
-    decode_frame, Message, MAGIC, SIDE_ASK, SIDE_BID,
+use doublezero_edge_connect::ingest::{
+    codec,
+    codec_mbo::{decode_frame, Message, MAGIC, SIDE_ASK, SIDE_BID},
 };
 use std::collections::BTreeSet;
 
