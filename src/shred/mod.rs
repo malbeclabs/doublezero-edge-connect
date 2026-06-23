@@ -67,6 +67,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::ingest::receiver::{bind_multicast, wait_for_interface_ip};
+use crate::metrics::metrics;
 use dedup::{Action, DedupWindow};
 use leader::LeaderSchedule;
 
@@ -269,6 +270,18 @@ async fn receiver_task(
     let port = src.port();
     let mut buf = vec![0u8; RECV_BUF_LEN];
 
+    // Per-group metric handles resolved once (the group address is fixed for this task).
+    let group_label = group.to_string();
+    let received_ctr = metrics()
+        .shred_datagrams_received
+        .with_label_values(&[&group_label]);
+    let bytes_ctr = metrics()
+        .shred_datagram_bytes
+        .with_label_values(&[&group_label]);
+    let dropped_ctr = metrics()
+        .shred_receiver_dropped
+        .with_label_values(&[&group_label]);
+
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
         // coming up and fall back to the default interface (mirrors the market-data receiver).
@@ -311,9 +324,12 @@ async fn receiver_task(
                               "shred datagram filled the recv buffer (likely truncated); dropping");
                         continue;
                     }
+                    received_ctr.inc();
+                    bytes_ctr.inc_by(n as u64);
                     match tx.try_send(buf[..n].to_vec()) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
+                            dropped_ctr.inc();
                             // Forwarder backpressure: shed the NEWEST datagram (this one) and count
                             // it. `try_send` rejects the incoming datagram on a full queue; a
                             // producer can't evict the queue head, so this is drop-newest, not
@@ -385,7 +401,7 @@ async fn forwarder_task(
     // `connect` on a UDP socket only sets the default peer (no handshake), so it succeeds even for
     // a destination with nothing listening — a port-unreachable surfaces later, on this socket's
     // own next `send`.
-    let mut socks: Vec<(SocketAddr, UdpSocket)> = Vec::with_capacity(dests.len());
+    let mut socks: Vec<Dest> = Vec::with_capacity(dests.len());
     for dst in &dests {
         if !dst.ip().is_loopback() {
             // The send sockets pin no egress interface, so a non-loopback target routes out the
@@ -399,7 +415,20 @@ async fn forwarder_task(
         sock.connect(dst)
             .await
             .with_context(|| format!("connecting shred forward socket to {dst}"))?;
-        socks.push((*dst, sock));
+        let dst_label = dst.to_string();
+        socks.push(Dest {
+            addr: *dst,
+            sock,
+            sends_ok: metrics()
+                .shred_sends
+                .with_label_values(&[&dst_label, "ok"]),
+            sends_err: metrics()
+                .shred_sends
+                .with_label_values(&[&dst_label, "error"]),
+            bytes_sent: metrics()
+                .shred_bytes_sent
+                .with_label_values(&[&dst_label]),
+        });
     }
     // Dedup runs whenever sigverify is on (it dedups too) or dedup-only is requested.
     let dedup_active = schedule.is_some() || dedup;
@@ -410,6 +439,7 @@ async fn forwarder_task(
         "shred forwarder ready"
     );
 
+    let m = metrics();
     let mut window = DedupWindow::new(dedup_window_slots);
     // Tallies for the periodic misparse canary (see VERIFY_LOG_EVERY). `unparsed` is tracked too so
     // a *total* misparse (every datagram rejected by `parse`) still trips the log — otherwise it
@@ -434,12 +464,15 @@ async fn forwarder_task(
             continue;
         }
         processed += 1;
+        m.shred_processed.inc();
 
         // Dedup (with or without sigverify). An unparseable datagram can't be keyed, so forward it
         // rather than silently drop (loss-averse; it simply isn't deduped).
         let Some(meta) = parse::parse(&pkt) else {
             unparsed += 1;
             forwarded += 1;
+            m.shred_unparsed.inc();
+            m.shred_forwarded.inc();
             fan_out(&socks, &pkt).await;
             log_tally(
                 processed, parsed, unparsed, forwarded, dropped, verify_ok, no_leader, &window,
@@ -447,6 +480,7 @@ async fn forwarder_task(
             continue;
         };
         parsed += 1;
+        m.shred_parsed.inc();
 
         let action = match schedule.as_ref() {
             // Dedup + sigverify: the first copy of a key is ed25519-verified against its leader.
@@ -460,6 +494,7 @@ async fn forwarder_task(
                         let ok = verify::verify(&meta, &pk);
                         if ok {
                             verify_ok += 1;
+                            m.shred_verify_ok.inc();
                         }
                         ok
                     };
@@ -470,6 +505,7 @@ async fn forwarder_task(
                 }
                 None => {
                     no_leader += 1;
+                    m.shred_no_leader.inc();
                     if !no_leader_warned {
                         no_leader_warned = true;
                         warn!(
@@ -512,9 +548,13 @@ async fn forwarder_task(
         match action {
             Action::Forward => {
                 forwarded += 1;
+                m.shred_forwarded.inc();
                 fan_out(&socks, &pkt).await;
             }
-            Action::Drop => dropped += 1,
+            Action::Drop => {
+                dropped += 1;
+                m.shred_dropped.inc();
+            }
         }
 
         log_tally(
@@ -525,11 +565,28 @@ async fn forwarder_task(
     Ok(())
 }
 
+/// One forward destination: its address, a connected send socket, and the pre-resolved per-outcome
+/// send counters so [`fan_out`] records without a per-send label lookup.
+struct Dest {
+    addr: SocketAddr,
+    sock: UdpSocket,
+    sends_ok: prometheus::IntCounter,
+    sends_err: prometheus::IntCounter,
+    bytes_sent: prometheus::IntCounter,
+}
+
 /// Fan one datagram out to every connected destination socket, logging and skipping any that fails.
-async fn fan_out(socks: &[(SocketAddr, UdpSocket)], pkt: &[u8]) {
-    for (dst, sock) in socks {
-        if let Err(e) = sock.send(pkt).await {
-            warn!(%dst, %e, "shred forward send failed; skipping this destination");
+async fn fan_out(socks: &[Dest], pkt: &[u8]) {
+    for dest in socks {
+        match dest.sock.send(pkt).await {
+            Ok(_) => {
+                dest.sends_ok.inc();
+                dest.bytes_sent.inc_by(pkt.len() as u64);
+            }
+            Err(e) => {
+                dest.sends_err.inc();
+                warn!(dst = %dest.addr, %e, "shred forward send failed; skipping this destination");
+            }
         }
     }
 }
@@ -550,6 +607,10 @@ fn log_tally(
     window: &DedupWindow,
 ) {
     if processed.is_multiple_of(VERIFY_LOG_EVERY) {
+        let tracked_slots = window.tracked_slots();
+        metrics()
+            .shred_dedup_tracked_slots
+            .set(tracked_slots as i64);
         info!(
             processed,
             parsed,
@@ -558,7 +619,7 @@ fn log_tally(
             dropped,
             verify_ok,
             no_leader,
-            tracked_slots = window.tracked_slots(),
+            tracked_slots,
             "shred forwarder dedup/verify tally"
         );
     }

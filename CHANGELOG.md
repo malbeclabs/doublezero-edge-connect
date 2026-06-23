@@ -17,6 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get.doublezero.xyz/connect` one-liner.
 
 ### Added
+- **Prometheus metrics endpoint** (`--metrics-bind` / `METRICS_BIND`, **off by default**). When a
+  bind address is given (e.g. `127.0.0.1:9090`) the bridge serves the Prometheus text format at
+  `GET /metrics` (plus a `GET /` / `GET /healthz` liveness probe) over a hand-rolled minimal HTTP
+  handler — no HTTP framework, no TLS (terminate at a reverse proxy if exposed). Metrics are
+  recorded regardless of whether the endpoint is enabled. Coverage spans the whole pipeline:
+  ingest reception (`dz_datagrams_received_total`, `dz_datagram_bytes_total`,
+  `dz_socket_errors_total`, `dz_idle_rejoin_total`, `dz_feed_up`, `dz_feed_stale_ms`,
+  `dz_seq_events_total`), the arbiter emit stage (`dz_emit_total`, `dz_quotes_dropped_total`,
+  `dz_trades_dropped_total`, `dz_quotes_future_rejected_total`, `dz_quotes_no_source_ts_total`),
+  the WebSocket sink (`dz_ws_clients`, `dz_ws_connections_total`, `dz_ws_messages_sent_total`,
+  `dz_ws_bytes_sent_total`, `dz_ws_client_lagged_total`, `dz_ws_inbound_total`,
+  `dz_ws_rate_limited_total`, `dz_ws_idle_timeout_total`), and the shred forwarder (`dz_shred_*` —
+  datagrams and bytes received per group, processed/parsed/unparsed/forwarded/dropped, verify-ok,
+  no-leader, dedup tracked slots, per-destination sends and bytes sent), plus the standard Linux
+  process metrics. Both the ingest and client-output paths expose message **and** byte counters
+  (UDP and WebSocket). Labels are bounded (`venue`/`group`/`dest` and small fixed enums; no
+  per-symbol labels).
 - Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
   (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
   copy of each shred out of the box, collapsing the multicast-overlap duplicates DoubleZero delivers

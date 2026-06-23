@@ -24,6 +24,7 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
+use crate::metrics::metrics;
 use crate::model::{now_ns, DepthSnapshot, FeedMessage, InstrumentSnapshot};
 
 /// Tunable server limits / liveness (from CLI args).
@@ -83,9 +84,12 @@ pub async fn run(
         if clients.fetch_add(1, Ordering::SeqCst) >= cfg.max_clients {
             clients.fetch_sub(1, Ordering::SeqCst);
             warn!(%peer, max = cfg.max_clients, "max clients reached; rejecting connection");
+            metrics().ws_connections.with_label_values(&["rejected"]).inc();
             drop(stream);
             continue;
         }
+        metrics().ws_connections.with_label_values(&["accepted"]).inc();
+        metrics().ws_clients.inc();
         let rx = tx.subscribe();
         let instruments = instruments.clone();
         let depth = depth.clone();
@@ -96,6 +100,7 @@ pub async fn run(
                 warn!(%peer, "client ended: {e}");
             }
             clients.fetch_sub(1, Ordering::SeqCst);
+            metrics().ws_clients.dec();
         });
     }
 }
@@ -161,12 +166,17 @@ async fn serve_client(
                     }
                     win_count += 1;
                     if win_count > cfg.max_inbound_per_min {
+                        metrics().ws_rate_limited.inc();
                         write.send(text(json!({"channel": "error", "error": "inbound rate limit exceeded"}))).await?;
                         break;
                     }
                     match serde_json::from_str::<ClientMsg>(&txt) {
-                        Ok(ClientMsg::Ping) => write.send(text(json!({"channel": "pong"}))).await?,
+                        Ok(ClientMsg::Ping) => {
+                            metrics().ws_inbound.with_label_values(&["ping"]).inc();
+                            write.send(text(json!({"channel": "pong"}))).await?
+                        }
                         Ok(ClientMsg::Subscribe { subscription }) => {
+                            metrics().ws_inbound.with_label_values(&["subscribe"]).inc();
                             if subs.len() >= cfg.max_subs {
                                 write.send(text(json!({"channel": "error", "error": "max subscriptions reached"}))).await?;
                             } else {
@@ -180,13 +190,17 @@ async fn serve_client(
                             }
                         }
                         Ok(ClientMsg::Unsubscribe { subscription }) => {
+                            metrics().ws_inbound.with_label_values(&["unsubscribe"]).inc();
                             subs.retain(|s| s != &subscription);
                             write.send(text(json!({
                                 "channel": "subscription_response", "method": "unsubscribe",
                                 "subscription": subscription,
                             }))).await?;
                         }
-                        Err(_) => write.send(text(json!({"channel": "error", "error": "unrecognized message"}))).await?,
+                        Err(_) => {
+                            metrics().ws_inbound.with_label_values(&["error"]).inc();
+                            write.send(text(json!({"channel": "error", "error": "unrecognized message"}))).await?
+                        }
                     }
                 }
                 Some(Ok(WsMessage::Ping(p))) => { last_seen = Instant::now(); write.send(WsMessage::Pong(p)).await?; }
@@ -199,6 +213,7 @@ async fn serve_client(
             // Heartbeat tick: reap silent clients, otherwise ping to keep liveness measurable.
             _ = hb.tick() => {
                 if last_seen.elapsed() > cfg.idle_timeout {
+                    metrics().ws_idle_timeout.inc();
                     let _ = write.send(WsMessage::Close(None)).await;
                     break;
                 }
@@ -226,17 +241,21 @@ async fn serve_client(
                     };
                     if pass {
                         // Stamp the WS hand-off time on the latency-bearing data messages.
-                        match m {
-                            FeedMessage::Quote(ref mut q) => q.ws_send_ts_ns = now_ns(),
-                            FeedMessage::Trade(ref mut t) => t.ws_send_ts_ns = now_ns(),
-                            FeedMessage::Midpoint(ref mut mp) => mp.ws_send_ts_ns = now_ns(),
-                            FeedMessage::Depth(ref mut d) => d.ws_send_ts_ns = now_ns(),
-                            _ => {}
-                        }
-                        write.send(WsMessage::Text(serde_json::to_string(&m)?.into())).await?;
+                        let kind = match m {
+                            FeedMessage::Quote(ref mut q) => { q.ws_send_ts_ns = now_ns(); "quote" }
+                            FeedMessage::Trade(ref mut t) => { t.ws_send_ts_ns = now_ns(); "trade" }
+                            FeedMessage::Midpoint(ref mut mp) => { mp.ws_send_ts_ns = now_ns(); "midpoint" }
+                            FeedMessage::Depth(ref mut d) => { d.ws_send_ts_ns = now_ns(); "depth" }
+                            FeedMessage::Instrument(_) => "instrument",
+                            FeedMessage::Status(_) => "status",
+                        };
+                        let payload = serde_json::to_string(&m)?;
+                        metrics().ws_messages_sent.with_label_values(&[kind]).inc();
+                        metrics().ws_bytes_sent.with_label_values(&[kind]).inc_by(payload.len() as u64);
+                        write.send(WsMessage::Text(payload.into())).await?;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => warn!("subscriber lagged, dropped {n}"),
+                Err(broadcast::error::RecvError::Lagged(n)) => { metrics().ws_client_lagged.inc(); warn!("subscriber lagged, dropped {n}"); }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         }

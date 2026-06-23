@@ -36,6 +36,7 @@ use std::{
 
 use tokio::sync::broadcast;
 
+use crate::metrics::metrics;
 use crate::model::{now_ns, FeedMessage, NormalizedQuote};
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
@@ -274,12 +275,15 @@ impl Arbiter {
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
     pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
+        let m = metrics();
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
                 // time): forward it but never let it touch the floor — as a tick it would pin
                 // `high_water` at 0 and drop every later quote as stale.
                 if q.source_ts_ns == 0 {
+                    m.quotes_no_source_ts.with_label_values(&[&q.venue]).inc();
+                    m.emit.with_label_values(&[&q.venue, "quote"]).inc();
                     let _ = self.tx.send(msg);
                     return;
                 }
@@ -288,6 +292,7 @@ impl Arbiter {
                 // hostile public timestamp years ahead would otherwise latch `high_water` and drop
                 // every real edge quote as stale until restart (see `MAX_FUTURE_SKEW_NS`).
                 if q.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
+                    m.quotes_future_rejected.with_label_values(&[&q.venue]).inc();
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
@@ -295,16 +300,31 @@ impl Arbiter {
                     .quotes
                     .admit(key, q.source_ts_ns, QuoteId::of(q), publisher)
                 {
+                    m.emit.with_label_values(&[&q.venue, "quote"]).inc();
                     let _ = self.tx.send(msg);
+                } else {
+                    m.quotes_dropped.with_label_values(&[&q.venue]).inc();
                 }
             }
             FeedMessage::Trade(t) => {
                 let key = (t.venue.clone(), t.symbol.clone());
                 if self.trades.is_new(key, t.trade_id) {
+                    m.emit.with_label_values(&[&t.venue, "trade"]).inc();
                     let _ = self.tx.send(msg);
+                } else {
+                    m.trades_dropped.with_label_values(&[&t.venue]).inc();
                 }
             }
-            _ => {
+            other => {
+                let (venue, kind) = match other {
+                    FeedMessage::Instrument(i) => (i.venue.as_str(), "instrument"),
+                    FeedMessage::Midpoint(mp) => (mp.venue.as_str(), "midpoint"),
+                    FeedMessage::Depth(d) => (d.venue.as_str(), "depth"),
+                    FeedMessage::Status(s) => (s.venue.as_str(), "status"),
+                    // Quote/Trade are handled above; this arm only sees the passthrough kinds.
+                    FeedMessage::Quote(_) | FeedMessage::Trade(_) => unreachable!(),
+                };
+                m.emit.with_label_values(&[venue, kind]).inc();
                 let _ = self.tx.send(msg);
             }
         }

@@ -25,6 +25,7 @@ use crate::{
         receiver::{FrameCtx, FrameProcessor, SeqCheck, SeqTracker},
         subscriber::RefDataState,
     },
+    metrics::metrics,
     model::{
         DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedInstrument, NormalizedMidpoint,
         NormalizedQuote, NormalizedTrade,
@@ -33,6 +34,16 @@ use crate::{
 
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
+
+/// The low-cardinality metric label for a frame-sequence classification.
+fn seq_kind(check: &SeqCheck) -> &'static str {
+    match check {
+        SeqCheck::First => "first",
+        SeqCheck::Ok => "ok",
+        SeqCheck::Reset => "reset",
+        SeqCheck::Stale => "stale",
+    }
+}
 
 /// Cap on the number of distinct publishers (source IPs) tracked by [`TobProcessor`]'s per-publisher
 /// sequence map. The source IP comes from an *unauthenticated, spoofable* UDP datagram, so without a
@@ -145,11 +156,16 @@ impl FrameProcessor for TobProcessor {
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
         let quotes_fresh = if handle_quotes {
-            match self.seq_for(ctx.publisher).check(
+            let check = self.seq_for(ctx.publisher).check(
                 header.channel_id,
                 header.reset_count,
                 header.sequence,
-            ) {
+            );
+            metrics()
+                .seq_events
+                .with_label_values(&[ctx.venue, seq_kind(&check)])
+                .inc();
+            match check {
                 SeqCheck::Stale => {
                     debug!(
                         venue = ctx.venue,
@@ -355,11 +371,14 @@ impl FrameProcessor for MidpointProcessor {
 
         // Same stale/out-of-order rejection as quotes: a midpoint is full state per instrument.
         let mids_fresh = if handle_mids {
-            !matches!(
-                self.seq
-                    .check(header.channel_id, header.reset_count, header.sequence),
-                SeqCheck::Stale
-            )
+            let check = self
+                .seq
+                .check(header.channel_id, header.reset_count, header.sequence);
+            metrics()
+                .seq_events
+                .with_label_values(&[ctx.venue, seq_kind(&check)])
+                .inc();
+            !matches!(check, SeqCheck::Stale)
         } else {
             true
         };

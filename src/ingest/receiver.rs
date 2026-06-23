@@ -43,6 +43,7 @@ use crate::{
         feeds::{Feed, FeedKind, FeedPorts},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
+    metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
 };
 
@@ -74,6 +75,15 @@ impl PortRole {
     /// Whether a processor should handle market-data (quote/trade/etc.) messages on this role.
     pub fn handles_mktdata(self) -> bool {
         matches!(self, PortRole::Mktdata | PortRole::Combined)
+    }
+    /// A stable, low-cardinality label for the metrics `role` dimension.
+    fn label(self) -> &'static str {
+        match self {
+            PortRole::Mktdata => "mktdata",
+            PortRole::Refdata => "refdata",
+            PortRole::Snapshot => "snapshot",
+            PortRole::Combined => "combined",
+        }
     }
 }
 
@@ -121,6 +131,15 @@ pub trait FrameProcessor {
 /// market-data multicast has gone silent past [`IDLE_REJOIN`], `"ok"` when it recovers. Consumers
 /// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
 fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
+    // Mirror the transition into the feed-health gauges (cheap; only fires on a down/ok edge).
+    metrics()
+        .feed_up
+        .with_label_values(&[venue])
+        .set(i64::from(state == "ok"));
+    metrics()
+        .feed_stale_ms
+        .with_label_values(&[venue])
+        .set(stale_ms as i64);
     // Status carries no business identity to dedup, so it goes straight to the broadcast sender.
     let _ = lock(arbiter).sender().send(FeedMessage::Status(FeedStatus {
         venue: venue.to_string(),
@@ -337,6 +356,9 @@ struct Channel {
     role: PortRole,
     sock: TsSocket,
     buf: Vec<u8>,
+    /// Pre-resolved `dz_datagrams_received_total{venue, role}` child, so the hot path increments
+    /// without a per-datagram label lookup.
+    dgrams: prometheus::IntCounter,
 }
 
 /// Await the next datagram across all of a feed's sockets concurrently. Returns the role it
@@ -383,6 +405,13 @@ async fn drive<P: FrameProcessor>(
     // (silent past IDLE_REJOIN). Persists across rejoins so we emit `down`/`ok` only on the edge.
     let mut down = false;
 
+    // Per-feed metric handles resolved once (venue is `&'static`); the per-channel datagram counter
+    // is resolved per role at bind time below.
+    let m = metrics();
+    let bytes_ctr = m.datagram_bytes.with_label_values(&[venue]);
+    let socket_errors = m.socket_errors.with_label_values(&[venue]);
+    let idle_rejoin = m.idle_rejoin.with_label_values(&[venue]);
+
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
         // coming up and fall back to the default interface.
@@ -395,6 +424,7 @@ async fn drive<P: FrameProcessor>(
                 role,
                 sock,
                 buf: vec![0u8; 2048],
+                dgrams: m.datagrams_received.with_label_values(&[venue, role.label()]),
             });
         }
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, "DZ Edge multicast receiver bound");
@@ -408,6 +438,7 @@ async fn drive<P: FrameProcessor>(
             if remaining.is_zero() {
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
+                idle_rejoin.inc();
                 if !down {
                     emit_status(
                         &arbiter,
@@ -425,11 +456,13 @@ async fn drive<P: FrameProcessor>(
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
                         warn!(%group, "recv error: {e}; rejoining");
+                        socket_errors.inc();
                         continue 'rejoin;
                     }
                     Err(_) => {
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
+                        idle_rejoin.inc();
                         if !down {
                             emit_status(
                                 &arbiter,
@@ -442,6 +475,9 @@ async fn drive<P: FrameProcessor>(
                         continue 'rejoin;
                     }
                 };
+
+            channels[idx].dgrams.inc();
+            bytes_ctr.inc_by(n as u64);
 
             // Reset the liveness watchdog only on the market-data stream; recovery clears `down`.
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
