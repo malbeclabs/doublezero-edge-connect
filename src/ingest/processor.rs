@@ -476,9 +476,11 @@ impl MboProcessor {
     ///    definition for precision), so it would be pure dead memory; this mirrors the per-instrument
     ///    definition gate the Top-of-Book / Midpoint quote paths already apply.
     /// 2. Bounds the map to [`MAX_BOOKS`] with least-recently-inserted eviction, so even a flood of
-    ///    *defined* forged instrument_ids can't grow it without limit. An evicted legitimate book
-    ///    simply re-syncs from the next snapshot.
-    fn book_for(&mut self, instrument_id: u32) -> Option<&mut BookState> {
+    ///    *defined* forged instrument_ids can't grow it without limit. Eviction also drops the
+    ///    evicted instrument's `last_top` and shared `depth` (WS replay) entries in lockstep, so
+    ///    neither sibling map outgrows `books`. An evicted legitimate book simply re-syncs from the
+    ///    next snapshot.
+    fn book_for(&mut self, instrument_id: u32, ctx: &FrameCtx) -> Option<&mut BookState> {
         // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
         self.state.definition(instrument_id)?;
         if !self.books.contains_key(&instrument_id) {
@@ -486,10 +488,16 @@ impl MboProcessor {
                 match self.books_order.pop_front() {
                     Some(old) => {
                         self.books.remove(&old);
-                        // Evict the depth-suppression entry in lockstep with its book, or `last_top`
-                        // would grow without limit while `books` stays bounded - the exact
-                        // forged-`instrument_id`-flood vector `MAX_BOOKS` guards against.
+                        // Evict the two sibling maps keyed off this book in lockstep, or each would
+                        // grow without limit while `books` stays bounded - the exact
+                        // forged-`instrument_id`-flood vector `MAX_BOOKS` guards against. `last_top`
+                        // by id; the shared `depth` (WS replay) map by (venue, symbol), so a
+                        // reconnecting client never replays a stale depth for an evicted instrument.
                         self.last_top.remove(&old);
+                        if let Some(def) = self.state.definition(old) {
+                            crate::model::lock(&self.depth)
+                                .remove(&(ctx.venue.to_string(), def.symbol.clone()));
+                        }
                     }
                     None => break,
                 }
@@ -614,7 +622,7 @@ impl FrameProcessor for MboProcessor {
                             qty_raw: o.qty_raw,
                         },
                     };
-                    if let Some(book) = self.book_for(o.instrument_id) {
+                    if let Some(book) = self.book_for(o.instrument_id, ctx) {
                         if book.on_delta(op) {
                             changed.insert(o.instrument_id);
                         }
@@ -629,7 +637,7 @@ impl FrameProcessor for MboProcessor {
                             order_id: o.order_id,
                         },
                     };
-                    if let Some(book) = self.book_for(o.instrument_id) {
+                    if let Some(book) = self.book_for(o.instrument_id, ctx) {
                         if book.on_delta(op) {
                             changed.insert(o.instrument_id);
                         }
@@ -646,7 +654,7 @@ impl FrameProcessor for MboProcessor {
                             full_fill: o.exec_flags & 0x01 != 0,
                         },
                     };
-                    if let Some(book) = self.book_for(o.instrument_id) {
+                    if let Some(book) = self.book_for(o.instrument_id, ctx) {
                         if book.on_delta(op) {
                             changed.insert(o.instrument_id);
                         }
@@ -707,12 +715,12 @@ impl FrameProcessor for MboProcessor {
                     // always published (and its timestamps are fresh), never suppressed against the
                     // pre-reset top-N.
                     self.last_top.remove(&r.instrument_id);
-                    if let Some(book) = self.book_for(r.instrument_id) {
+                    if let Some(book) = self.book_for(r.instrument_id, ctx) {
                         book.on_instrument_reset(r.new_anchor_seq);
                     }
                 }
                 codec_mbo::Message::SnapshotBegin(s) => {
-                    if let Some(book) = self.book_for(s.instrument_id) {
+                    if let Some(book) = self.book_for(s.instrument_id, ctx) {
                         book.on_snapshot_begin(
                             s.snapshot_id,
                             s.anchor_seq,
@@ -738,7 +746,7 @@ impl FrameProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::SnapshotEnd(s) => {
-                    if let Some(book) = self.book_for(s.instrument_id) {
+                    if let Some(book) = self.book_for(s.instrument_id, ctx) {
                         if book.on_snapshot_end(s.anchor_seq, s.snapshot_id) {
                             changed.insert(s.instrument_id);
                         }
@@ -1164,6 +1172,22 @@ mod tests {
         assert!(
             !proc.books.contains_key(&0) && !proc.last_top.contains_key(&0),
             "oldest instrument evicted from both maps"
+        );
+        // The shared `depth` (WS replay) map is keyed by (venue, symbol) and must be purged in
+        // lockstep too, or it grows without limit and a reconnecting client replays evicted books.
+        let depth_map = crate::model::lock(&proc.depth);
+        assert!(
+            depth_map.len() <= MAX_BOOKS,
+            "depth replay map must stay bounded in lockstep with books, got {}",
+            depth_map.len()
+        );
+        assert!(
+            depth_map.contains_key(&("TV".to_string(), format!("INST-{}", flood - 1))),
+            "newest instrument's depth replay entry retained"
+        );
+        assert!(
+            !depth_map.contains_key(&("TV".to_string(), "INST-0".to_string())),
+            "oldest instrument's depth replay entry evicted too"
         );
     }
 
