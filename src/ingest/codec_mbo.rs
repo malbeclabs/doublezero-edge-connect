@@ -8,9 +8,31 @@
 //! group (`SnapshotBegin`/`SnapshotOrder`/`SnapshotEnd`) on a dedicated port. The reconstructed
 //! book is re-served as a full-state `depth` product (see PROTOCOL.md), never as raw deltas.
 //!
-//! ⚠️ Byte offsets below come from the edge-feed-spec draft, **not** a byte-validated reference
-//! codec. They must be confirmed against a live frame hexdump before this decoder's output is
-//! trusted in production; the round-trip tests here only pin internal self-consistency.
+//! Byte offsets below are field-validated (issue #4), no longer draft — but the strength of the
+//! oracle differs by message type, so be precise about what is proven:
+//!   * **Shared-with-TOB types** (strongest) — the frame header, message header,
+//!     `InstrumentDefinition`, `Trade`, `ManifestSummary`, and type tags `0x01/0x02/0x04/0x06/0x07`
+//!     use the exact same wire layout as the **byte-validated** Top-of-Book [`crate::ingest::codec`]
+//!     (validated against the edge-multicast-ref Go decoder). `tests/codec_mbo_fixtures.rs`'s
+//!     `tob_shared_layouts_decode_identically` decodes the same bytes through both codecs and
+//!     asserts equal fields, so this sharing is self-enforcing, not eyeballed.
+//!   * **Real publisher capture** (strong) — `Order{Add,Cancel,Execute}`, `BatchBoundary`, the full
+//!     `Snapshot{Begin,Order,End}` group, and the `InstrumentDefinition`/`ManifestSummary` above are
+//!     decoded from the **real two-sided TYO recorder capture** (#36; `tests/fixtures/mbo_*.bin` —
+//!     see `fixtures/PROVENANCE.md`) and their real field values asserted in
+//!     `tests/codec_mbo_fixtures.rs`. The snapshot fixture is BTC's complete 44,598-order two-sided
+//!     book, so `SnapshotOrder` (which populates the book) has tens of thousands of real orders of
+//!     coverage; `total_orders == decoded order count` is asserted as a cross-field check.
+//!   * **Offset-test-only** (weakest — confirm against a live frame before trusting) — `InstrumentReset`,
+//!     `Heartbeat` and `EndOfSession` appear in **no** committed fixture; they are pinned solely by
+//!     the offset-independent unit tests here, whose offsets are transcribed from the spec, so these
+//!     catch a test-vs-decoder typo but not a shared misreading of the spec. (`Trade` has no MBO
+//!     fixture either but is in the shared-with-TOB tier above, pinned to the byte-validated TOB
+//!     codec.)
+//!
+//! `side` (the one enum the book logic branches on) is pinned to `0=Bid/1=Ask` (#2). The remaining
+//! `reason`/`*_flags` bytes are opaque pass-through (no decoder branches on them), so a value
+//! mismatch cannot corrupt the decode. Per-field offset citations live on the matching tests.
 
 use anyhow::Result;
 
@@ -228,6 +250,9 @@ fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
     decode_body(msg_type, b, o).unwrap_or(Message::Other(msg_type))
 }
 
+// Field offsets per arm are validated against the authorities documented in the module header and
+// asserted by the offset-independent tests below (e.g. `order_add_offsets_match_authority`, which
+// carries the OrderAdd field map). Do not change an offset without updating its matching test.
 fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
     let body = o + MSG_HEADER_SIZE;
     Some(match msg_type {
@@ -502,6 +527,381 @@ pub(crate) mod tests {
         };
         assert_eq!(make(0), SIDE_BID, "wire byte 0 must equal SIDE_BID");
         assert_eq!(make(1), SIDE_ASK, "wire byte 1 must equal SIDE_ASK");
+    }
+
+    // --- Offset-independent field validation ---
+    //
+    // These build each message body by writing every field at a **literal** offset (via `put`),
+    // wrap it in a real frame, decode through `decode_frame`, and assert each decoded field equals
+    // the value written. Unlike the `enc_*` round-trips above (which mirror the decoder's own
+    // sequential layout and so cannot catch a symmetric offset error), a decoder offset that
+    // disagrees with the asserted layout fails here. The layouts asserted are:
+    //   * shared-with-TOB types (frame header, message header, InstrumentDefinition, Trade,
+    //     ManifestSummary, type tags 0x01/0x02/0x04/0x06/0x07): the byte-validated `codec.rs`
+    //     (validated against the edge-multicast-ref Go decoder) — these offsets are identical there;
+    //   * Order{Add,Cancel,Execute}/BatchBoundary/Snapshot{Begin,Order,End}: also backed by the real
+    //     two-sided capture decoded in `tests/codec_mbo_fixtures.rs` (#36).
+    // For the types with NO committed fixture (InstrumentReset, Heartbeat, EndOfSession), the test
+    // below shares its sole human source with the decoder: it catches a test-vs-decoder typo, not a
+    // common misreading of the spec. See the module header for the per-type oracle strength.
+
+    /// Write `bytes` at a literal offset into a zeroed body.
+    fn put(buf: &mut [u8], off: usize, bytes: &[u8]) {
+        buf[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Wrap one message body (fields placed at authoritative offsets) in a real frame. `msg_len`
+    /// is the on-wire message length (4-byte header + body); reuses the `frame` helper's 24B header.
+    fn frame_one(msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
+        let mut msg = vec![msg_type, msg_len, 0, 0]; // type, len, flags:u16
+        msg.extend_from_slice(body);
+        frame(&[msg])
+    }
+
+    /// 24-byte frame header layout (codec_common::FrameHeader, same as the byte-validated TOB
+    /// `codec.rs`): magic u16@0, schema_version u8@2, channel_id u8@3, sequence u64@4,
+    /// send_ts u64@12, msg_count u8@20, reset_count u8@21, frame_length u16@22.
+    #[test]
+    fn frame_header_offsets_match_authority() {
+        let body = vec![0u8; 8]; // EndOfSession body (ts u64@0)
+        let mut f = frame_one(MSG_END_OF_SESSION, 12, &body);
+        f[2] = 1; // schema_version
+        f[3] = 0; // channel_id
+        put(&mut f, 4, &0x1122u64.to_le_bytes()); // sequence
+        put(&mut f, 12, &0x3344u64.to_le_bytes()); // send_ts
+        let (h, _msgs) = decode_frame(&f).unwrap();
+        assert_eq!(h.schema_version, 1);
+        assert_eq!(h.channel_id, 0);
+        assert_eq!(h.sequence, 0x1122);
+        assert_eq!(h.send_ts, 0x3344);
+        assert_eq!(h.msg_count, 1);
+    }
+
+    /// Message-type tags per edge-feed-spec MBO + publisher constants. A wrong tag misroutes a type.
+    #[test]
+    fn message_type_tags_match_authority() {
+        assert_eq!(MSG_HEARTBEAT, 0x01);
+        assert_eq!(MSG_INSTRUMENT_DEFINITION, 0x02);
+        assert_eq!(MSG_TRADE, 0x04);
+        assert_eq!(MSG_END_OF_SESSION, 0x06);
+        assert_eq!(MSG_MANIFEST_SUMMARY, 0x07);
+        assert_eq!(MSG_ORDER_ADD, 0x10);
+        assert_eq!(MSG_ORDER_CANCEL, 0x11);
+        assert_eq!(MSG_ORDER_EXECUTE, 0x12);
+        assert_eq!(MSG_BATCH_BOUNDARY, 0x13);
+        assert_eq!(MSG_INSTRUMENT_RESET, 0x14);
+        assert_eq!(MSG_SNAPSHOT_BEGIN, 0x20);
+        assert_eq!(MSG_SNAPSHOT_ORDER, 0x21);
+        assert_eq!(MSG_SNAPSHOT_END, 0x22);
+    }
+
+    /// OrderAdd (0x10): instrument_id u32@0, source_id u16@4, side u8@6, order_flags u8@7,
+    /// per_instrument_seq u32@8, order_id u64@12, enter_ts u64@20, price_raw i64@28, qty_raw u64@36.
+    #[test]
+    fn order_add_offsets_match_authority() {
+        let mut body = vec![0u8; 48]; // size 52 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, &1u16.to_le_bytes());
+        body[6] = SIDE_ASK;
+        body[7] = 0;
+        put(&mut body, 8, &5u32.to_le_bytes());
+        put(&mut body, 12, &12_345u64.to_le_bytes());
+        put(&mut body, 20, &1_780_000_000_000_000_000u64.to_le_bytes());
+        put(&mut body, 28, &18_420i64.to_le_bytes());
+        put(&mut body, 36, &1_000u64.to_le_bytes());
+        let f = frame_one(MSG_ORDER_ADD, sizes::ORDER_ADD, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::OrderAdd(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.source_id, 1);
+                assert_eq!(g.side, SIDE_ASK);
+                assert_eq!(g.order_flags, 0);
+                assert_eq!(g.per_instrument_seq, 5);
+                assert_eq!(g.order_id, 12_345);
+                assert_eq!(g.enter_ts, 1_780_000_000_000_000_000);
+                assert_eq!(g.price_raw, 18_420);
+                assert_eq!(g.qty_raw, 1_000);
+            }
+            other => panic!("expected OrderAdd, got {other:?}"),
+        }
+    }
+
+    /// OrderCancel (0x11): instrument_id u32@0, source_id u16@4, reason u8@6,
+    /// per_instrument_seq u32@8, order_id u64@12, ts u64@20.
+    #[test]
+    fn order_cancel_offsets_match_authority() {
+        let mut body = vec![0u8; 28]; // size 32 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, &1u16.to_le_bytes());
+        body[6] = 3; // reason (opaque pass-through byte)
+        put(&mut body, 8, &9u32.to_le_bytes());
+        put(&mut body, 12, &555u64.to_le_bytes());
+        put(&mut body, 20, &42u64.to_le_bytes());
+        let f = frame_one(MSG_ORDER_CANCEL, sizes::ORDER_CANCEL, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::OrderCancel(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.source_id, 1);
+                assert_eq!(g.reason, 3);
+                assert_eq!(g.per_instrument_seq, 9);
+                assert_eq!(g.order_id, 555);
+                assert_eq!(g.ts, 42);
+            }
+            other => panic!("expected OrderCancel, got {other:?}"),
+        }
+    }
+
+    /// OrderExecute (0x12): instrument_id u32@0, source_id u16@4, aggressor_side u8@6,
+    /// exec_flags u8@7, per_instrument_seq u32@8, order_id u64@12, trade_id u64@20, ts u64@28,
+    /// exec_price_raw i64@36, exec_qty_raw u64@44.
+    #[test]
+    fn order_execute_offsets_match_authority() {
+        let mut body = vec![0u8; 52]; // size 56 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, &1u16.to_le_bytes());
+        body[6] = SIDE_BID;
+        body[7] = 2;
+        put(&mut body, 8, &11u32.to_le_bytes());
+        put(&mut body, 12, &555u64.to_le_bytes());
+        put(&mut body, 20, &7_777u64.to_le_bytes());
+        put(&mut body, 28, &84u64.to_le_bytes());
+        put(&mut body, 36, &18_400i64.to_le_bytes());
+        put(&mut body, 44, &250u64.to_le_bytes());
+        let f = frame_one(MSG_ORDER_EXECUTE, sizes::ORDER_EXECUTE, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::OrderExecute(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.source_id, 1);
+                assert_eq!(g.aggressor_side, SIDE_BID);
+                assert_eq!(g.exec_flags, 2);
+                assert_eq!(g.per_instrument_seq, 11);
+                assert_eq!(g.order_id, 555);
+                assert_eq!(g.trade_id, 7_777);
+                assert_eq!(g.ts, 84);
+                assert_eq!(g.exec_price_raw, 18_400);
+                assert_eq!(g.exec_qty_raw, 250);
+            }
+            other => panic!("expected OrderExecute, got {other:?}"),
+        }
+    }
+
+    /// SnapshotBegin (0x20): instrument_id u32@0, anchor_seq u64@4, total_orders u32@12,
+    /// snapshot_id u32@16, last_instrument_seq u32@20, ts u64@24.
+    #[test]
+    fn snapshot_begin_offsets_match_authority() {
+        let mut body = vec![0u8; 32]; // size 36 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, &100u64.to_le_bytes());
+        put(&mut body, 12, &3u32.to_le_bytes());
+        put(&mut body, 16, &9u32.to_le_bytes());
+        put(&mut body, 20, &42u32.to_le_bytes());
+        put(&mut body, 24, &1u64.to_le_bytes());
+        let f = frame_one(MSG_SNAPSHOT_BEGIN, sizes::SNAPSHOT_BEGIN, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::SnapshotBegin(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.anchor_seq, 100);
+                assert_eq!(g.total_orders, 3);
+                assert_eq!(g.snapshot_id, 9);
+                assert_eq!(g.last_instrument_seq, 42);
+                assert_eq!(g.ts, 1);
+            }
+            other => panic!("expected SnapshotBegin, got {other:?}"),
+        }
+    }
+
+    /// SnapshotOrder (0x21): snapshot_id u32@0, order_id u64@4, side u8@12, order_flags u8@13,
+    /// enter_ts u64@16, price_raw i64@24, qty_raw u64@32. Side asserted both ways.
+    #[test]
+    fn snapshot_order_offsets_match_authority() {
+        let decode_side = |side: u8| {
+            let mut body = vec![0u8; 40]; // size 44 - 4 header
+            put(&mut body, 0, &9u32.to_le_bytes());
+            put(&mut body, 4, &555u64.to_le_bytes());
+            body[12] = side;
+            body[13] = 0;
+            put(&mut body, 16, &2u64.to_le_bytes());
+            put(&mut body, 24, &18_430i64.to_le_bytes());
+            put(&mut body, 32, &500u64.to_le_bytes());
+            let f = frame_one(MSG_SNAPSHOT_ORDER, sizes::SNAPSHOT_ORDER, &body);
+            match decode_frame(&f).unwrap().1.remove(0) {
+                Message::SnapshotOrder(g) => {
+                    assert_eq!(g.snapshot_id, 9);
+                    assert_eq!(g.order_id, 555);
+                    assert_eq!(g.enter_ts, 2);
+                    assert_eq!(g.price_raw, 18_430);
+                    assert_eq!(g.qty_raw, 500);
+                    g.side
+                }
+                other => panic!("expected SnapshotOrder, got {other:?}"),
+            }
+        };
+        assert_eq!(decode_side(0), SIDE_BID);
+        assert_eq!(decode_side(1), SIDE_ASK);
+    }
+
+    /// SnapshotEnd (0x22): instrument_id u32@0, anchor_seq u64@4, snapshot_id u32@12.
+    #[test]
+    fn snapshot_end_offsets_match_authority() {
+        let mut body = vec![0u8; 16]; // size 20 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, &100u64.to_le_bytes());
+        put(&mut body, 12, &9u32.to_le_bytes());
+        let f = frame_one(MSG_SNAPSHOT_END, sizes::SNAPSHOT_END, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::SnapshotEnd(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.anchor_seq, 100);
+                assert_eq!(g.snapshot_id, 9);
+            }
+            other => panic!("expected SnapshotEnd, got {other:?}"),
+        }
+    }
+
+    /// ManifestSummary (0x07): channel_id u8@0, valid u8@1, manifest_seq u16@4,
+    /// instrument_count u32@8, ts u64@12 — identical to the byte-validated TOB `codec.rs` layout
+    /// (body spans 0..20 -> on-wire size 24). `valid` decodes both 0 and non-0 (the `Valid=0`
+    /// flag the processor overrides). Resolves the plan's "size 20 vs fields-to-24" suspicion:
+    /// the body is 20 bytes; there is no size-20 constant in code.
+    #[test]
+    fn manifest_summary_offsets_match_authority() {
+        let build = |valid: u8| {
+            let mut body = vec![0u8; 20];
+            body[0] = 2; // channel_id
+            body[1] = valid;
+            put(&mut body, 4, &13u16.to_le_bytes()); // manifest_seq
+            put(&mut body, 8, &786u32.to_le_bytes()); // instrument_count
+            put(&mut body, 12, &1_780u64.to_le_bytes()); // ts
+            let f = frame_one(MSG_MANIFEST_SUMMARY, 24, &body);
+            match decode_frame(&f).unwrap().1.remove(0) {
+                Message::ManifestSummary(g) => g,
+                other => panic!("expected ManifestSummary, got {other:?}"),
+            }
+        };
+        let g = build(1);
+        assert_eq!(g.channel_id, 2);
+        assert!(g.valid);
+        assert_eq!(g.manifest_seq, 13);
+        assert_eq!(g.instrument_count, 786);
+        assert_eq!(g.ts, 1_780);
+        assert!(!build(0).valid, "valid byte 0 must decode false");
+    }
+
+    /// InstrumentDefinition (0x02): instrument_id u32@0, symbol cstr@4 (16B NUL-padded),
+    /// price_exponent i8@37, qty_exponent i8@38, manifest_seq u16@74 — the 80-byte layout shared
+    /// byte-for-byte with the byte-validated TOB `codec.rs` InstrumentDefinition.
+    #[test]
+    fn instrument_definition_offsets_match_authority() {
+        let mut body = vec![0u8; 76]; // size 80 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, b"BTC"); // rest stays NUL
+        body[37] = (-1i8) as u8; // price_exponent
+        body[38] = (-8i8) as u8; // qty_exponent
+        put(&mut body, 74, &13u16.to_le_bytes()); // manifest_seq
+        let f = frame_one(
+            MSG_INSTRUMENT_DEFINITION,
+            sizes::INSTRUMENT_DEFINITION,
+            &body,
+        );
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::InstrumentDefinition(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.symbol, "BTC");
+                assert_eq!(g.price_exponent, -1);
+                assert_eq!(g.qty_exponent, -8);
+                assert_eq!(g.manifest_seq, 13);
+            }
+            other => panic!("expected InstrumentDefinition, got {other:?}"),
+        }
+    }
+
+    /// Trade (0x04): instrument_id u32@0, source_id u16@4, aggressor_side u8@6, trade_flags u8@7,
+    /// source_ts u64@8, trade_price_raw i64@16, trade_qty_raw u64@24, trade_id u64@32,
+    /// cumulative_volume_raw u64@40 — the 52-byte layout shared byte-for-byte with TOB `codec.rs`.
+    #[test]
+    fn trade_offsets_match_authority() {
+        let mut body = vec![0u8; 48]; // size 52 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        put(&mut body, 4, &1u16.to_le_bytes());
+        body[6] = 2; // aggressor_side (sell, per TOB aggressor_side mapping)
+        body[7] = 0;
+        put(&mut body, 8, &1_780_000_000_000_000_000u64.to_le_bytes());
+        put(&mut body, 16, &18_420i64.to_le_bytes());
+        put(&mut body, 24, &1_500u64.to_le_bytes());
+        put(&mut body, 32, &99_887_766u64.to_le_bytes());
+        put(&mut body, 40, &5_000_000u64.to_le_bytes());
+        let f = frame_one(MSG_TRADE, sizes::TRADE, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::Trade(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.source_id, 1);
+                assert_eq!(g.aggressor_side, 2);
+                assert_eq!(g.trade_flags, 0);
+                assert_eq!(g.source_ts, 1_780_000_000_000_000_000);
+                assert_eq!(g.trade_price_raw, 18_420);
+                assert_eq!(g.trade_qty_raw, 1_500);
+                assert_eq!(g.trade_id, 99_887_766);
+                assert_eq!(g.cumulative_volume_raw, 5_000_000);
+            }
+            other => panic!("expected Trade, got {other:?}"),
+        }
+    }
+
+    /// BatchBoundary (0x13): batch_id u32@0, batch_time u64@4.
+    #[test]
+    fn batch_boundary_offsets_match_authority() {
+        let mut body = vec![0u8; 12]; // size 16 - 4 header
+        put(&mut body, 0, &77u32.to_le_bytes());
+        put(&mut body, 4, &1_780u64.to_le_bytes());
+        let f = frame_one(MSG_BATCH_BOUNDARY, sizes::BATCH_BOUNDARY, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::BatchBoundary(id, time) => {
+                assert_eq!(*id, 77);
+                assert_eq!(*time, 1_780);
+            }
+            other => panic!("expected BatchBoundary, got {other:?}"),
+        }
+    }
+
+    /// InstrumentReset (0x14): instrument_id u32@0, reason u8@4, new_anchor_seq u64@8, ts u64@16.
+    #[test]
+    fn instrument_reset_offsets_match_authority() {
+        let mut body = vec![0u8; 24]; // size 28 - 4 header
+        put(&mut body, 0, &7u32.to_le_bytes());
+        body[4] = 1; // reason (opaque pass-through byte)
+        put(&mut body, 8, &200u64.to_le_bytes());
+        put(&mut body, 16, &42u64.to_le_bytes());
+        let f = frame_one(MSG_INSTRUMENT_RESET, sizes::INSTRUMENT_RESET, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::InstrumentReset(g) => {
+                assert_eq!(g.instrument_id, 7);
+                assert_eq!(g.reason, 1);
+                assert_eq!(g.new_anchor_seq, 200);
+                assert_eq!(g.ts, 42);
+            }
+            other => panic!("expected InstrumentReset, got {other:?}"),
+        }
+    }
+
+    /// EndOfSession (0x06): ts u64@0.
+    #[test]
+    fn end_of_session_offsets_match_authority() {
+        let mut body = vec![0u8; 8];
+        put(&mut body, 0, &1_780u64.to_le_bytes());
+        let f = frame_one(MSG_END_OF_SESSION, 12, &body);
+        match &decode_frame(&f).unwrap().1[0] {
+            Message::EndOfSession(ts) => assert_eq!(*ts, 1_780),
+            other => panic!("expected EndOfSession, got {other:?}"),
+        }
+    }
+
+    /// Heartbeat (0x01): header only, no body. Decodes to the variant with msg_count 1.
+    #[test]
+    fn heartbeat_decodes_with_no_body() {
+        let f = frame_one(MSG_HEARTBEAT, 4, &[]);
+        let (h, msgs) = decode_frame(&f).unwrap();
+        assert_eq!(h.msg_count, 1);
+        assert!(matches!(msgs.as_slice(), [Message::Heartbeat]));
     }
 
     #[test]
