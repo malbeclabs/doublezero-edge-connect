@@ -26,6 +26,8 @@
 #   DZ_NAME=doublezero-edge-connect      container name
 #   DZ_FEEDS=<venue,venue>               optional: narrow ingested venues (default: all)
 #   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install)
+#   DZ_CLIENT_IP=<ipv4>                  override the public IP used by the access-pass pre-check
+#   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
 # (WS_*, DZ_IFACE, DZ_SHRED_*, RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
@@ -138,65 +140,7 @@ if [ -n "$SUDO" ] && ! $SUDO -n true 2>/dev/null; then
 fi
 
 # ----------------------------------------------------------------------------
-# 2. docker present? offer install
-# ----------------------------------------------------------------------------
-if ! command -v docker >/dev/null 2>&1; then
-  warn "Docker is not installed."
-  if confirm "Install Docker now via get.docker.com?"; then
-    info "Installing Docker..."
-    curl -fsSL https://get.docker.com | $SUDO sh
-    $SUDO systemctl enable --now docker 2>/dev/null || true
-  else
-    die "Docker is required. Install it and re-run."
-  fi
-fi
-$SUDO docker info >/dev/null 2>&1 || die "Docker is installed but the daemon isn't reachable. Start it (e.g. 'sudo systemctl start docker') and re-run."
-
-# ----------------------------------------------------------------------------
-# 3. host kernel / network prep (host-side; safe to attempt)
-# ----------------------------------------------------------------------------
-info "Preparing host for DoubleZero Edge Connect"
-$SUDO modprobe tun 2>/dev/null    || warn "Could not load 'tun' module (may be built-in)."
-$SUDO modprobe ip_gre 2>/dev/null || warn "Could not load 'ip_gre' module (will auto-load on tunnel create)."
-[ -e /dev/net/tun ] || warn "/dev/net/tun is missing; tunnel creation may fail."
-
-# The bridge wants a large SO_RCVBUF for bursty multicast; raise the host ceiling
-# best-effort so the in-container setsockopt isn't silently clamped. Never fatal.
-if [ "$($SUDO sysctl -n net.core.rmem_max 2>/dev/null || echo 0)" -lt "$RECV_BUF_MAX" ]; then
-  $SUDO sysctl -w net.core.rmem_max="$RECV_BUF_MAX" >/dev/null 2>&1 \
-    || warn "Could not raise net.core.rmem_max to $RECV_BUF_MAX (the bridge will use the host's current ceiling)."
-fi
-
-# best-effort firewall hints (don't auto-edit the user's firewall)
-if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi "Status: active"; then
-  warn "ufw is active: ensure IP protocol 47 (GRE) and UDP $LIVENESS_UDP_PORT are allowed."
-fi
-if command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state 2>/dev/null | grep -qi running; then
-  warn "firewalld is running: ensure GRE (protocol 47) and UDP $LIVENESS_UDP_PORT are allowed."
-fi
-
-# ----------------------------------------------------------------------------
-# 4. cloud detection -> warn about provider-level firewall (script can't fix)
-# ----------------------------------------------------------------------------
-detect_cloud() {
-  local md="http://169.254.169.254"
-  # AWS IMDSv2
-  local tok
-  tok=$(curl -fsS -m 1 -X PUT "$md/latest/api/token" -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)
-  if [ -n "$tok" ] && curl -fsS -m 1 -H "X-aws-ec2-metadata-token: $tok" "$md/latest/meta-data/instance-id" >/dev/null 2>&1; then echo aws; return; fi
-  if curl -fsS -m 1 -H 'Metadata-Flavor: Google' "$md/computeMetadata/v1/instance/id" >/dev/null 2>&1; then echo gcp; return; fi
-  if curl -fsS -m 1 -H 'Metadata: true' "$md/metadata/instance?api-version=2021-02-01" >/dev/null 2>&1; then echo azure; return; fi
-  echo none
-}
-CLOUD="$(detect_cloud)"
-case "$CLOUD" in
-  aws)   warn "AWS detected. GRE will not work until you (in AWS, NOT on this host): 1) allow inbound IP protocol 47 in the Security Group; 2) DISABLE the ENI source/dest check.";;
-  gcp)   warn "GCP detected. Add a firewall rule allowing IP protocol 47 (gre) to this instance.";;
-  azure) warn "Azure detected. Add an NSG rule allowing IP protocol 47 to this VM.";;
-esac
-
-# ----------------------------------------------------------------------------
-# 5. input: the access secret (the only thing we ask for)
+# 2. the access secret + onchain access-pass pre-check (before any install)
 # ----------------------------------------------------------------------------
 # Environment: default mainnet-beta, override via DZ_ENV; never prompted.
 case "$DZ_ENV" in testnet|devnet|mainnet-beta) : ;; *) die "Invalid DZ_ENV '$DZ_ENV' (testnet|devnet|mainnet-beta)";; esac
@@ -242,6 +186,219 @@ esac
 # SELinux relabel for the bind mount
 MNT_OPT=ro
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then MNT_OPT=ro,Z; fi
+
+# Pre-flight: confirm the identity has an access pass onchain for this host's
+# public IP (or 0.0.0.0, the any-IP wildcard) BEFORE we install Docker, pull the
+# image, or touch the host network -- so a missing pass fails fast and clearly
+# instead of surfacing as a cryptic `doublezero connect` error much later. This
+# is pure host-side: derive the identity, compute the access-pass PDA, and read
+# it over the ledger's public JSON-RPC. Resolve env -> ledger RPC + serviceability
+# program id (DZ_LEDGER_RPC_URL overrides the RPC).
+case "$DZ_ENV" in
+  mainnet-beta) DZ_RPC_DEF="https://doublezero-mainnet-beta.rpcpool.com/db336024-e7a8-46b1-80e5-352dd77060ab"; DZ_PROG="ser2VaTMAcYTaauMrTSfSrxBaUDq7BLNs2xfUugTAGv";;
+  testnet)      DZ_RPC_DEF="https://doublezerolocalnet.rpcpool.com/8a4fd3f4-0977-449f-88c7-63d4b0f10f16"; DZ_PROG="DZtnuQ839pSaDMFG5q1ad2V95G82S5EC4RrB3Ndw2Heb";;
+  devnet)       DZ_RPC_DEF="https://doublezerolocalnet.rpcpool.com/8a4fd3f4-0977-449f-88c7-63d4b0f10f16"; DZ_PROG="GYhQDKuESrasNZGyhMJhGYFtbzNijYhcrN9poSqCQVah";;
+esac
+DZ_RPC="${DZ_LEDGER_RPC_URL:-$DZ_RPC_DEF}"
+
+# Best-effort public IP (DZ_CLIENT_IP overrides; empty if undetectable -> we degrade to a warning).
+detect_public_ip() {
+  [ -n "${DZ_CLIENT_IP:-}" ] && { printf '%s' "$DZ_CLIENT_IP"; return; }
+  local ip
+  for url in https://checkip.amazonaws.com https://api.ipify.org https://ifconfig.me/ip; do
+    ip="$(curl -fsS -m 3 "$url" 2>/dev/null | tr -d '[:space:]')"
+    case "$ip" in *.*.*.*) printf '%s' "$ip"; return;; esac
+  done
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+  warn "python3 not found; skipping the onchain access-pass pre-check (\`doublezero connect\` will be the fallback)."
+else
+  info "Verifying the access pass onchain (env=$DZ_ENV)..."
+  AP_PUB_IP="$(detect_public_ip)"
+  # Whether the public IP was asserted by the operator (explicit) or merely guessed
+  # (auto): a confirmed miss only hard-aborts when the operator asserted the IP.
+  if [ -n "${DZ_CLIENT_IP:-}" ]; then AP_IP_SRC=explicit; else AP_IP_SRC=auto; fi
+  # Feed the 64-byte keypair to python on stdin only (never argv/env), preserving the
+  # "plaintext key is never printed or written to host disk" rule; only the public key is shown.
+  # The python program is delivered via a /dev/fd process substitution so stdin stays free for the key.
+  set +e
+  # Read the keyfile under `set +e`: a root-owned 0600 key is readable by the docker
+  # mount (root) but maybe not by this user -- degrade to a warning, never abort the install.
+  if [ "$KEY_SRC" = token ]; then AP_FEED="$KEY_JSON"; else AP_FEED="$(cat "$KEYFILE" 2>/dev/null)"; fi
+  AP_OUT="$(printf '%s' "$AP_FEED" | DZ_RPC="$DZ_RPC" DZ_PROG="$DZ_PROG" PUB_IP="$AP_PUB_IP" DZ_ENV="$DZ_ENV" python3 <(cat <<'PY'
+# Host-side access-pass check. stdin: JSON array of the 64 keypair bytes (identity = last 32).
+# env: DZ_RPC (ledger JSON-RPC), DZ_PROG (serviceability program id, base58), PUB_IP (this host's
+# public IP, "" if unknown). Prints "IDENTITY <b58>" then a verdict line. Exit codes:
+#   0 pass found   2 confirmed miss (PUB_IP known; neither it nor 0.0.0.0 has a pass)
+#   3 inconclusive (PUB_IP unknown and no 0.0.0.0 pass)   4 inconclusive (RPC/decode error)
+#   5 keypair could not be read/parsed (not a 64-int JSON array)
+# An access pass is the PDA find_program_address([b"doublezero", b"accesspass", client_ip(4),
+# identity(32)], program_id); existence (account data[0]==11 == AccountType::AccessPass) == it exists.
+import os, sys, json, socket, hashlib, base64, urllib.request
+_AB = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58decode(s):
+    n = 0
+    for c in s:
+        n = n * 58 + _AB.index(c)
+    full = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\x00" * (len(s) - len(s.lstrip("1"))) + full
+def b58encode(b):
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _AB[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\x00"))) + out
+_P = 2**255 - 19
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+def _on_curve(b):
+    if len(b) != 32:
+        return False
+    y = int.from_bytes(b, "little"); sign = (y >> 255) & 1; y &= (1 << 255) - 1
+    if y >= _P:
+        return False
+    y2 = (y * y) % _P; u = (y2 - 1) % _P; v = (_D * y2 + 1) % _P
+    x = (u * pow(v, 3, _P) * pow((u * pow(v, 7, _P)) % _P, (_P - 5) // 8, _P)) % _P
+    vx2 = (v * x * x) % _P
+    if vx2 == (u % _P):
+        pass
+    elif vx2 == ((-u) % _P):
+        x = (x * pow(2, (_P - 1) // 4, _P)) % _P
+    else:
+        return False
+    return not (x == 0 and sign)
+def _find_pda(seeds, program_id):
+    for bump in range(255, -1, -1):
+        h = hashlib.sha256()
+        for s in seeds:
+            h.update(s)
+        h.update(bytes([bump])); h.update(program_id); h.update(b"ProgramDerivedAddress")
+        d = h.digest()
+        if not _on_curve(d):
+            return d
+    raise ValueError("no off-curve bump")
+def _pda(client_ip, identity, program_id):
+    return b58encode(_find_pda([b"doublezero", b"accesspass", socket.inet_aton(client_ip), identity], program_id))
+def _exists(rpc, addr):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [addr, {"encoding": "base64"}]}).encode()
+    req = urllib.request.Request(rpc, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        resp = json.load(r)
+    if "error" in resp:
+        raise RuntimeError(resp["error"])
+    val = resp.get("result", {}).get("value")
+    if not val:
+        return False
+    data = val.get("data"); data = data[0] if isinstance(data, list) else data
+    raw = base64.b64decode(data) if data else b""
+    return len(raw) >= 1 and raw[0] == 11
+def _norm_ip(ip):
+    # Strict dotted-quad check: inet_aton alone accepts 3-part ("1.2.3") and some
+    # trailing-junk forms, so round-trip through inet_ntoa and require an exact match.
+    try:
+        return ip if socket.inet_ntoa(socket.inet_aton(ip)) == ip else None
+    except OSError:
+        return None
+def main():
+    rpc = os.environ["DZ_RPC"]; program_id = b58decode(os.environ["DZ_PROG"]); pub_ip = os.environ.get("PUB_IP", "").strip()
+    if not rpc.startswith(("http://", "https://")):
+        print("ledger RPC URL must be http(s)", file=sys.stderr); return 4
+    try:
+        kp = json.loads(sys.stdin.read())
+        if not (isinstance(kp, list) and len(kp) == 64 and all(isinstance(b, int) and 0 <= b <= 255 for b in kp)):
+            raise ValueError
+    except Exception:
+        print("keypair is not a 64-int JSON array", file=sys.stderr); return 5
+    if pub_ip and _norm_ip(pub_ip) is None:
+        print("ignoring malformed public IP " + repr(pub_ip), file=sys.stderr); pub_ip = ""
+    identity = bytes(kp[32:64]); print("IDENTITY " + b58encode(identity))
+    try:
+        for ip in ([pub_ip] if pub_ip else []) + ["0.0.0.0"]:
+            if _exists(rpc, _pda(ip, identity, program_id)):
+                print("found access pass bound to " + ip); return 0
+    except Exception as e:
+        print("RPC error: " + str(e), file=sys.stderr); return 4
+    if pub_ip:
+        print("no access pass for %s or 0.0.0.0" % pub_ip); return 2
+    print("no 0.0.0.0 access pass and host public IP unknown"); return 3
+sys.exit(main())
+PY
+))"
+  AP_RC=$?
+  set -e
+  AP_ID="$(printf '%s\n' "$AP_OUT" | sed -n 's/^IDENTITY //p')"
+  case "$AP_RC" in
+    0) info "Access pass OK${AP_ID:+ (identity $AP_ID)} -- $(printf '%s\n' "$AP_OUT" | tail -1)";;
+    2) if [ "$AP_IP_SRC" = explicit ]; then
+         die "Your keypair is not authorized to connect to DoubleZero ($DZ_ENV) from $AP_PUB_IP. Please contact DoubleZero to arrange access (a service contract) for this identity.
+   Details for DoubleZero support: identity ${AP_ID:-unknown}, public IP ${AP_PUB_IP:-unknown}."
+       else
+         warn "No access pass for this host's auto-detected public IP (${AP_PUB_IP:-unknown}) or 0.0.0.0; the pass may be bound to a different IP. If you know your public IP, re-run with DZ_CLIENT_IP=<your public IP>, or contact DoubleZero to arrange access (identity ${AP_ID:-unknown}). Continuing."
+       fi;;
+    3) warn "Could not determine this host's public IP and identity ${AP_ID:-?} has no 0.0.0.0 access pass; cannot confirm access. Set DZ_CLIENT_IP=<ip> to verify. Continuing.";;
+    5) warn "Could not read or parse the keypair to verify the access pass (expected a 64-int JSON array); continuing (\`doublezero connect\` will be the fallback).";;
+    *) warn "Could not query the DoubleZero ledger ($DZ_RPC) to verify the access pass; continuing (\`doublezero connect\` will be the fallback).";;
+  esac
+fi
+
+# ----------------------------------------------------------------------------
+# 3. docker present? offer install
+# ----------------------------------------------------------------------------
+if ! command -v docker >/dev/null 2>&1; then
+  warn "Docker is not installed."
+  if confirm "Install Docker now via get.docker.com?"; then
+    info "Installing Docker..."
+    curl -fsSL https://get.docker.com | $SUDO sh
+    $SUDO systemctl enable --now docker 2>/dev/null || true
+  else
+    die "Docker is required. Install it and re-run."
+  fi
+fi
+$SUDO docker info >/dev/null 2>&1 || die "Docker is installed but the daemon isn't reachable. Start it (e.g. 'sudo systemctl start docker') and re-run."
+
+# ----------------------------------------------------------------------------
+# 4. host kernel / network prep (host-side; safe to attempt)
+# ----------------------------------------------------------------------------
+info "Preparing host for DoubleZero Edge Connect"
+$SUDO modprobe tun 2>/dev/null    || warn "Could not load 'tun' module (may be built-in)."
+$SUDO modprobe ip_gre 2>/dev/null || warn "Could not load 'ip_gre' module (will auto-load on tunnel create)."
+[ -e /dev/net/tun ] || warn "/dev/net/tun is missing; tunnel creation may fail."
+
+# The bridge wants a large SO_RCVBUF for bursty multicast; raise the host ceiling
+# best-effort so the in-container setsockopt isn't silently clamped. Never fatal.
+if [ "$($SUDO sysctl -n net.core.rmem_max 2>/dev/null || echo 0)" -lt "$RECV_BUF_MAX" ]; then
+  $SUDO sysctl -w net.core.rmem_max="$RECV_BUF_MAX" >/dev/null 2>&1 \
+    || warn "Could not raise net.core.rmem_max to $RECV_BUF_MAX (the bridge will use the host's current ceiling)."
+fi
+
+# best-effort firewall hints (don't auto-edit the user's firewall)
+if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi "Status: active"; then
+  warn "ufw is active: ensure IP protocol 47 (GRE) and UDP $LIVENESS_UDP_PORT are allowed."
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state 2>/dev/null | grep -qi running; then
+  warn "firewalld is running: ensure GRE (protocol 47) and UDP $LIVENESS_UDP_PORT are allowed."
+fi
+
+# ----------------------------------------------------------------------------
+# 5. cloud detection -> warn about provider-level firewall (script can't fix)
+# ----------------------------------------------------------------------------
+detect_cloud() {
+  local md="http://169.254.169.254"
+  # AWS IMDSv2
+  local tok
+  tok=$(curl -fsS -m 1 -X PUT "$md/latest/api/token" -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)
+  if [ -n "$tok" ] && curl -fsS -m 1 -H "X-aws-ec2-metadata-token: $tok" "$md/latest/meta-data/instance-id" >/dev/null 2>&1; then echo aws; return; fi
+  if curl -fsS -m 1 -H 'Metadata-Flavor: Google' "$md/computeMetadata/v1/instance/id" >/dev/null 2>&1; then echo gcp; return; fi
+  if curl -fsS -m 1 -H 'Metadata: true' "$md/metadata/instance?api-version=2021-02-01" >/dev/null 2>&1; then echo azure; return; fi
+  echo none
+}
+CLOUD="$(detect_cloud)"
+case "$CLOUD" in
+  aws)   warn "AWS detected. GRE will not work until you (in AWS, NOT on this host): 1) allow inbound IP protocol 47 in the Security Group; 2) DISABLE the ENI source/dest check.";;
+  gcp)   warn "GCP detected. Add a firewall rule allowing IP protocol 47 (gre) to this instance.";;
+  azure) warn "Azure detected. Add an NSG rule allowing IP protocol 47 to this VM.";;
+esac
 
 # ----------------------------------------------------------------------------
 # 6. run the container (detached, long-lived: daemon + bridge)

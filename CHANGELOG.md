@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Installer pre-flight access-pass check (`scripts/connect*.sh`) hardened after review:
+  - A confirmed miss (an identity with no pass for the host IP or `0.0.0.0`) now only hard-aborts
+    when the public IP was **explicitly supplied** via `DZ_CLIENT_IP`; when the IP was only
+    **auto-detected** (best-effort egress lookup, which can differ from the bound IP behind
+    NAT/CGNAT/multi-homed hosts) it now **warns and continues** instead of aborting a
+    legitimately-provisioned operator, leaving `doublezero connect` as the real check.
+  - Reading the keypair file for the check no longer runs under `set -e`, so a root-owned `0600`
+    key (readable by the root Docker mount but not by the invoking user) degrades to a warning
+    instead of silently aborting the whole installer.
+  - The detected/supplied public IP is now strictly validated as a dotted quad (round-tripped
+    through `inet_ntoa(inet_aton(ip))`), rejecting lenient `inet_aton` forms (`1.2.3`, trailing
+    junk) that could yield a confident-but-wrong verdict; a malformed IP is treated as unknown.
+  - An unreadable/invalid keypair (not a 64-int JSON array) now produces a distinct "could not
+    read or parse the keypair" warning instead of misattributing the failure to the ledger RPC.
+  - The ledger RPC URL is asserted to be `http(s)://` before use, so a `DZ_LEDGER_RPC_URL` with a
+    `file://` (or other) scheme can't be dereferenced.
+
 ### Changed
 - `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
   with the per-type oracle strength documented honestly rather than claimed uniform:
@@ -33,6 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get.doublezero.xyz/connect` one-liner.
 
 ### Added
+- Installer one-liner (`scripts/connect*.sh`) now runs a **pre-flight access-pass check before
+  installing anything**. Right after reading the access secret — and before installing Docker,
+  pulling the image, or touching the host network — it verifies onchain that the configured identity
+  has an access pass bound to this host's public IP **or** to `0.0.0.0` (the any-IP wildcard), and
+  aborts with a clear, non-technical message — directing the operator to contact DoubleZero to
+  arrange access, and printing the identity + public IP to share with support — if not. The check
+  is pure host-side (no Docker, no CLI): it derives the identity from the
+  DZ_-token/keypair, computes the access-pass PDA, and reads it over the DoubleZero ledger's public
+  JSON-RPC via an embedded `python3` helper. It **degrades to a warning** (and continues, letting
+  `doublezero connect` be the fallback) when the host's public IP can't be determined, the ledger
+  RPC is unreachable, or `python3` is absent. New installer env vars: `DZ_CLIENT_IP` (override the
+  detected public IP) and `DZ_LEDGER_RPC_URL` (override the ledger RPC).
 - Shred forwarder opt-out kill switch, `--shred-forward-disable` (`DZ_SHRED_DISABLE`), **default
   off** so existing behaviour is unchanged. The forwarder is otherwise activate-on-discovery — it
   runs whenever `doublezero multicast group list` reports an `edge-solana-*` group, which a mainnet
