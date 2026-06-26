@@ -44,7 +44,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     metrics::metrics,
-    model::{now_ns, FeedMessage, NormalizedDepth, NormalizedQuote},
+    model::{self, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote},
 };
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
@@ -403,6 +403,13 @@ pub struct Arbiter {
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
     /// collapses redundant BBOs — latch-to-leader per `(venue, symbol)` tick, keyed on [`DepthId`].
     depths: StalenessFloor<(String, String), DepthId, Publisher>,
+    /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
+    /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
+    /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
+    /// the floor. `None` when no WS replay map is wired (e.g. unit tests that only inspect the
+    /// broadcast). The `MboProcessor` still purges this map on book eviction (bounding); it no longer
+    /// writes it (single writer = this admit branch).
+    depth_replay: Option<DepthSnapshot>,
 }
 
 impl Arbiter {
@@ -412,7 +419,15 @@ impl Arbiter {
             quotes: StalenessFloor::new(QUOTE_TICK_CAP),
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
+            depth_replay: None,
         }
+    }
+
+    /// Wire the shared WS-replay `depth` map so the arbiter updates it on each admitted (leader)
+    /// depth. The bridge calls this once at startup; without it the depth floor still dedups the
+    /// broadcast but maintains no replay snapshot.
+    pub fn set_depth_replay(&mut self, depth: DepthSnapshot) {
+        self.depth_replay = Some(depth);
     }
 
     /// The broadcast sender, so output sinks can `subscribe()` and `Status` can be sent directly
@@ -562,6 +577,13 @@ impl Arbiter {
                         m.depth_admitted
                             .with_label_values(&[d.venue.as_str(), publisher.label()])
                             .inc();
+                        // Update the WS-replay snapshot with the leader's admitted book, so a client
+                        // connecting mid-stream replays exactly what was broadcast (not a dropped
+                        // non-leader's divergent copy).
+                        if let Some(replay) = &self.depth_replay {
+                            model::lock(replay)
+                                .insert((d.venue.clone(), d.symbol.clone()), d.clone());
+                        }
                         let _ = self.tx.send(msg);
                     }
                     // A cross-publisher follower lost this depth tick (its arrival order vs the
@@ -1170,5 +1192,35 @@ mod tests {
             edge,
         );
         assert_eq!(drain_depths(&mut rx), vec![(now, 100.0)]);
+    }
+
+    /// The WS-replay map records the LEADER's admitted book, never a dropped non-leader's divergent
+    /// copy. Pins the review fix: the replay snapshot must match what was broadcast, so a client
+    /// connecting mid-stream never bootstraps from a book that never crossed the floor.
+    #[test]
+    fn arbiter_depth_replay_records_leader_not_dropped_nonleader() {
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, _rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
+            pub_a,
+        ); // A leads tick 1000 -> admitted, recorded
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[99.0, 2.0]], vec![])),
+            pub_b,
+        ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
+        let map = model::lock(&replay);
+        let entry = map
+            .get(&("Hyperliquid".to_string(), "BTC".to_string()))
+            .expect("leader depth recorded in replay map");
+        assert_eq!(
+            entry.bids,
+            vec![[100.0, 1.0]],
+            "replay map must hold the leader's book, not the dropped non-leader's"
+        );
     }
 }

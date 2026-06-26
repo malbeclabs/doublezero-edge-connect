@@ -610,8 +610,10 @@ impl MboProcessor {
         // Record the published top-N, moving the raw vectors in (no clone), so the next identical
         // book state suppresses.
         self.last_top.insert(key, (bids_raw, asks_raw));
-        crate::model::lock(&self.depth)
-            .insert((depth.venue.clone(), depth.symbol.clone()), depth.clone());
+        // The shared WS-replay map is written by the arbiter on the floor's admit decision (so it
+        // holds the leader's broadcast book, not a dropped non-leader's), NOT here — emitting
+        // pre-floor would record a book that may never reach the wire. The processor still purges
+        // this map on book eviction (see `book_for`).
         ctx.emit(FeedMessage::Depth(depth));
     }
 }
@@ -1235,9 +1237,15 @@ mod tests {
     fn mbo_books_map_is_bounded_under_instrument_flood() {
         use super::MAX_BOOKS;
         let (tx, _rx) = broadcast::channel::<FeedMessage>(256);
-        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        // Wire the shared replay map so the arbiter populates it on admit (the processor only purges
+        // it on eviction now), keeping the in-lockstep bounding assertion below meaningful.
+        let arbiter: SharedArbiter = {
+            let mut a = Arbiter::new(tx, 8);
+            a.set_depth_replay(depth.clone());
+            Arc::new(Mutex::new(a))
+        };
         let mut proc = MboProcessor::new(depth, false);
 
         let flood = (MAX_BOOKS as u32) + 50;
