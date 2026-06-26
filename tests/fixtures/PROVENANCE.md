@@ -38,7 +38,7 @@ goldens here. The `tob_refdata.bin` reorder must be re-applied after regeneratio
 `mbo_refdata.bin`, `mbo_snapshot.bin`, and `mbo_mktdata.bin` are extracted from the same TYO
 recorder capture as the multi-publisher TOB fixtures below (the raw 635 MB pcap is NOT committed),
 publisher **148.51.123.3** (wire `source_id=1`), instrument **BTC** (instrument_id 0,
-price_exponent -1, qty_exponent -8). They are a **real, two-sided** book — not the hand-crafted
+price_exponent -8, qty_exponent -5). They are a **real, two-sided** book — not the hand-crafted
 empty-anchor of PR #2 — so `mbo_single_publisher_depth_contract`'s crossed-book assertion
 (`best_bid < best_ask`) is active and green.
 

@@ -36,7 +36,10 @@ use std::{
 
 use tokio::sync::broadcast;
 
-use crate::model::{now_ns, FeedMessage, NormalizedQuote};
+use crate::{
+    metrics::metrics,
+    model::{now_ns, FeedMessage, NormalizedQuote},
+};
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
@@ -71,6 +74,18 @@ pub enum Publisher {
     Edge(IpAddr),
     /// The Hyperliquid public WebSocket feeder (a single logical source).
     PublicWs,
+}
+
+impl Publisher {
+    /// A stable, low-cardinality metric label for the source class. Deliberately collapses the
+    /// edge publisher's source IP to `"edge"` — the per-IP identity matters to the floor but would
+    /// blow up metric cardinality (and is spoofable), so it is never used as a label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Publisher::Edge(_) => "edge",
+            Publisher::PublicWs => "public",
+        }
+    }
 }
 
 /// Canonical BBO scale exponent (`10^-8`), matching the capture service's `bbo_hash`
@@ -274,12 +289,15 @@ impl Arbiter {
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
     pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
+        let m = metrics();
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
                 // time): forward it but never let it touch the floor — as a tick it would pin
                 // `high_water` at 0 and drop every later quote as stale.
                 if q.source_ts_ns == 0 {
+                    m.quotes_no_source_ts.with_label_values(&[&q.venue]).inc();
+                    m.emit.with_label_values(&[&q.venue, "quote"]).inc();
                     let _ = self.tx.send(msg);
                     return;
                 }
@@ -288,6 +306,9 @@ impl Arbiter {
                 // hostile public timestamp years ahead would otherwise latch `high_water` and drop
                 // every real edge quote as stale until restart (see `MAX_FUTURE_SKEW_NS`).
                 if q.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
+                    m.quotes_future_rejected
+                        .with_label_values(&[&q.venue])
+                        .inc();
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
@@ -295,16 +316,53 @@ impl Arbiter {
                     .quotes
                     .admit(key, q.source_ts_ns, QuoteId::of(q), publisher)
                 {
+                    m.emit.with_label_values(&[&q.venue, "quote"]).inc();
+                    // Attribute the admitted quote to its winning publisher. A rise in
+                    // `publisher="public"` is the direct signal of the public backstop filling an
+                    // edge gap (in steady state the edge publisher leads every tick).
+                    m.quotes_admitted
+                        .with_label_values(&[&q.venue, publisher.label()])
+                        .inc();
                     let _ = self.tx.send(msg);
+                } else {
+                    m.quotes_dropped.with_label_values(&[&q.venue]).inc();
                 }
             }
             FeedMessage::Trade(t) => {
                 let key = (t.venue.clone(), t.symbol.clone());
                 if self.trades.is_new(key, t.trade_id) {
+                    m.emit.with_label_values(&[&t.venue, "trade"]).inc();
                     let _ = self.tx.send(msg);
+                } else {
+                    m.trades_dropped.with_label_values(&[&t.venue]).inc();
                 }
             }
-            _ => {
+            // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
+            // future `FeedMessage` variant is a compile error here, not a silent miss / runtime panic.
+            FeedMessage::Instrument(i) => {
+                m.emit
+                    .with_label_values(&[i.venue.as_str(), "instrument"])
+                    .inc();
+                let _ = self.tx.send(msg);
+            }
+            FeedMessage::Midpoint(mp) => {
+                m.emit
+                    .with_label_values(&[mp.venue.as_str(), "midpoint"])
+                    .inc();
+                let _ = self.tx.send(msg);
+            }
+            FeedMessage::Depth(d) => {
+                m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
+                let _ = self.tx.send(msg);
+            }
+            // `Status` is currently never routed through `emit` — receivers send it straight via
+            // `sender()` (see `emit_status`), and no other source produces it — so `dz_emit_total
+            // {kind="status"}` is unreachable in practice today. The arm is kept for match
+            // exhaustiveness and stays correct if a future source ever emits status through here.
+            FeedMessage::Status(s) => {
+                m.emit
+                    .with_label_values(&[s.venue.as_str(), "status"])
+                    .inc();
                 let _ = self.tx.send(msg);
             }
         }

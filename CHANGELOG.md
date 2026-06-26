@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `file://` (or other) scheme can't be dereferenced.
 
 ### Changed
+- `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
+  with the per-type oracle strength documented honestly rather than claimed uniform:
+  - **Shared-with-TOB** layouts (frame/message headers, `InstrumentDefinition`, `Trade`,
+    `ManifestSummary`, type tags) reuse the byte-validated TOB `codec.rs`; a new cross-codec test
+    (`tob_shared_layouts_decode_identically`) decodes the same bytes through both codecs and asserts
+    equal fields, so the sharing is self-enforcing.
+  - **Real publisher capture** backs `Order{Add,Cancel,Execute}`, `BatchBoundary`, the full
+    `Snapshot{Begin,Order,End}` group, and the shared `InstrumentDefinition`/`ManifestSummary` via a
+    new real-frame decode test (`tests/codec_mbo_fixtures.rs`) over the two-sided TYO recorder
+    fixtures (#36). The snapshot is BTC's complete 44,598-order book, so `SnapshotOrder` is
+    well-covered, and the test asserts `total_orders == decoded order count` as a cross-field check.
+  - **Offset-test-only** (no committed fixture; pinned by the offset-independent unit tests, confirm
+    against a live frame before a live MBO feed): `InstrumentReset`, `Heartbeat`, `EndOfSession`.
+  No offset discrepancies found — the side-mapping bug fixed in #2 was the only one. The "size 20 vs
+  fields-to-24" `ManifestSummary` suspicion was a non-issue: the body is 20 bytes (on-wire 24),
+  identical to TOB, and no size-20 constant exists in code.
 - README refocused on the **operator**: it now leads with what the bridge does, the install
   one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
   variants), and how to configure/override it via environment variables before the pipe. The
@@ -47,6 +63,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doublezero connect` be the fallback) when the host's public IP can't be determined, the ledger
   RPC is unreachable, or `python3` is absent. New installer env vars: `DZ_CLIENT_IP` (override the
   detected public IP) and `DZ_LEDGER_RPC_URL` (override the ledger RPC).
+- **Prometheus metrics endpoint** (`--metrics-bind` / `METRICS_BIND`, **off by default**). When a
+  bind address is given (e.g. `127.0.0.1:9090`) the bridge serves the Prometheus text format at
+  `GET /metrics` (plus a `GET /` / `GET /healthz` liveness probe) over a hand-rolled minimal HTTP
+  handler — no HTTP framework, no TLS (terminate at a reverse proxy if exposed). Metrics are
+  recorded regardless of whether the endpoint is enabled. Coverage spans the whole pipeline:
+  ingest reception (`dz_datagrams_received_total`, `dz_datagram_bytes_total`,
+  `dz_socket_errors_total`, `dz_idle_rejoin_total`, `dz_feed_up`, `dz_feed_stale_ms`,
+  `dz_seq_events_total`), the arbiter emit stage (`dz_emit_total`, `dz_quotes_dropped_total`,
+  `dz_trades_dropped_total`, `dz_quotes_future_rejected_total`, `dz_quotes_no_source_ts_total`),
+  `dz_quotes_admitted_total` (attributing each admitted quote to its winning `publisher`,
+  `edge`/`public` — the direct signal of the public backstop filling an edge gap)), the WebSocket
+  sink (`dz_ws_clients`, `dz_ws_connections_total`, `dz_ws_messages_sent_total`,
+  `dz_ws_bytes_sent_total`, `dz_ws_client_lagged_total`, `dz_ws_inbound_total`,
+  `dz_ws_rate_limited_total`, `dz_ws_idle_timeout_total`), the public WS input feeder
+  (`dz_ws_feeder_up`, `dz_ws_feeder_reconnects_total`, `dz_ws_feeder_decode_errors_total`,
+  `dz_ws_feeder_messages_total`), and the shred forwarder (`dz_shred_*` —
+  datagrams and bytes received per group, processed/parsed/unparsed/forwarded/dropped, verify-ok,
+  no-leader, dedup tracked slots, per-destination sends and bytes sent), plus the standard Linux
+  process metrics. Both the ingest and client-output paths expose message **and** byte counters
+  (UDP and WebSocket). The feed-health gauges (`dz_feed_up`/`dz_feed_stale_ms`) are initialized to
+  their healthy state at startup, so a feed that never goes down still exposes a `dz_feed_up{venue}`
+  series for `dz_feed_up == 0` alerting. The `/metrics` HTTP server is GET-only with per-connection
+  read/write timeouts and a concurrency cap. Labels are bounded (`venue`/`group`/`dest`/`publisher`
+  and small fixed enums; no per-symbol labels).
 - Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
   (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
   copy of each shred out of the box, collapsing the multicast-overlap duplicates DoubleZero delivers
