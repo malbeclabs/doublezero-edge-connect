@@ -72,6 +72,18 @@ struct Args {
     #[arg(long, env = "WS_BROADCAST_CAPACITY", default_value_t = 4096)]
     ws_broadcast_capacity: usize,
 
+    /// Shred forwarder: opt-out kill switch. The forwarder is otherwise **automatic** — it
+    /// activates whenever `doublezero multicast group list` reports an `edge-solana-*` group (which
+    /// a mainnet access pass always makes discoverable), and forwards the shred firehose to
+    /// `--shred-forward`. Set this to force it off regardless of discovery (e.g. when no consumer
+    /// listens on the forward target). Default off: behaviour is unchanged unless you set it.
+    #[arg(
+        long = "shred-forward-disable",
+        env = "DZ_SHRED_DISABLE",
+        default_value_t = false
+    )]
+    shred_disable: bool,
+
     /// Shred forwarder: only join discovered multicast groups whose `code` starts with this
     /// prefix (`doublezero multicast group list`). Excludes unrelated groups (e.g. jito-shredstream).
     #[arg(long, env = "DZ_SHRED_CODE_PREFIX", default_value = "edge-solana-")]
@@ -224,55 +236,67 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(sinks::metrics::run(args.metrics_bind.clone())))
     };
 
-    // Shred forwarder: activate-on-discovery. Runs iff an explicit `--shred-source` is given or
-    // discovery finds ≥1 `edge-solana-*` group; otherwise it stays off (no enable flag).
+    // Shred forwarder: activate-on-discovery, with an explicit opt-out. By default it runs iff an
+    // explicit `--shred-source` is given or discovery finds ≥1 `edge-solana-*` group;
+    // `--shred-forward-disable` / `DZ_SHRED_DISABLE` forces it off regardless (and skips discovery
+    // entirely, so no pointless shell-out to the `doublezero` CLI when the operator opted out).
     //
-    // Validate the destinations first (pure parse, no I/O) so a `--shred-forward` typo fails fast
-    // before discovery shells out to the `doublezero` CLI.
+    // Validate the destinations first (pure parse, no I/O) so a `--shred-forward` typo fails fast.
     //
     // NOTE: source resolution is one-shot at startup. Discovery is not retried — if the
     // `doublezero` CLI isn't ready yet at boot, or a group activates later, those groups are not
-    // picked up until the process restarts. This is consistent with the step-1 "activate-on-
-    // discovery" scope; periodic re-discovery is a follow-up. (Once a group IS resolved, its
-    // receiver survives interface flap via the rejoin watchdog.)
+    // picked up until the process restarts. This is consistent with the "activate-on-discovery"
+    // scope; periodic re-discovery is a follow-up. (Once a group IS resolved, its receiver
+    // survives interface flap via the rejoin watchdog.)
     let shred_forward = shred::parse_forwards(&args.shred_forward)?;
-    let shred_sources = shred::resolve_sources(
-        &args.shred_sources,
-        &args.shred_code_prefix,
-        args.shred_port,
-    )?;
-    let shred = if shred_sources.is_empty() {
-        info!("shred forwarder disabled (no --shred-source and discovery found no groups)");
-        None
+    let shred_sources = if args.shred_disable {
+        Vec::new()
     } else {
-        let mode = args.shred_dedup_mode;
-        // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
-        // any other mode is ignored (warn rather than silently promote — the user chose the mode).
-        if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
-            bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
+        shred::resolve_sources(
+            &args.shred_sources,
+            &args.shred_code_prefix,
+            args.shred_port,
+        )?
+    };
+    let shred = match shred::decide_activation(args.shred_disable, shred_sources.len()) {
+        shred::ShredActivation::Disabled => {
+            info!("shred forwarder disabled (--shred-forward-disable / DZ_SHRED_DISABLE set)");
+            None
         }
-        if mode != shred::DedupMode::Sigverify && args.shred_rpc_url.is_some() {
-            warn!(
+        shred::ShredActivation::NoSources => {
+            info!("shred forwarder disabled (no --shred-source and discovery found no groups)");
+            None
+        }
+        shred::ShredActivation::Run => {
+            let mode = args.shred_dedup_mode;
+            // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
+            // any other mode is ignored (warn rather than silently promote — the user chose the mode).
+            if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
+                bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
+            }
+            if mode != shred::DedupMode::Sigverify && args.shred_rpc_url.is_some() {
+                warn!(
                 ?mode,
                 "--shred-rpc-url is set but ignored (only --shred-dedup-mode sigverify uses it)"
             );
+            }
+            // A zero window evicts everything immediately, defeating dedup; reject it up front rather
+            // than silently forwarding every duplicate.
+            if mode != shred::DedupMode::None && args.shred_dedup_window_slots == 0 {
+                bail!("--shred-dedup-window-slots must be > 0 unless --shred-dedup-mode is none");
+            }
+            let shred_cfg = shred::ShredConfig {
+                iface: args.iface.clone(),
+                recv_buf: args.recv_buf,
+                sources: shred_sources,
+                forward: shred_forward,
+                mode,
+                rpc_url: args.shred_rpc_url.clone(),
+                dedup_window_slots: args.shred_dedup_window_slots,
+            };
+            info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
+            Some(tokio::spawn(shred::run(shred_cfg)))
         }
-        // A zero window evicts everything immediately, defeating dedup; reject it up front rather
-        // than silently forwarding every duplicate.
-        if mode != shred::DedupMode::None && args.shred_dedup_window_slots == 0 {
-            bail!("--shred-dedup-window-slots must be > 0 unless --shred-dedup-mode is none");
-        }
-        let shred_cfg = shred::ShredConfig {
-            iface: args.iface.clone(),
-            recv_buf: args.recv_buf,
-            sources: shred_sources,
-            forward: shred_forward,
-            mode,
-            rpc_url: args.shred_rpc_url.clone(),
-            dedup_window_slots: args.shred_dedup_window_slots,
-        };
-        info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
-        Some(tokio::spawn(shred::run(shred_cfg)))
     };
 
     // One receiver task per feed; all publish onto the shared broadcast tagged with the

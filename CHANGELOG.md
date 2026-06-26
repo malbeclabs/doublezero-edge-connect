@@ -63,6 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doublezero connect` be the fallback) when the host's public IP can't be determined, the ledger
   RPC is unreachable, or `python3` is absent. New installer env vars: `DZ_CLIENT_IP` (override the
   detected public IP) and `DZ_LEDGER_RPC_URL` (override the ledger RPC).
+- Shred forwarder opt-out kill switch, `--shred-forward-disable` (`DZ_SHRED_DISABLE`), **default
+  off** so existing behaviour is unchanged. The forwarder is otherwise activate-on-discovery — it
+  runs whenever `doublezero multicast group list` reports an `edge-solana-*` group, which a mainnet
+  access pass always makes discoverable, and there was previously no way to turn it off short of
+  abusing `--shred-code-prefix` to match nothing. A deployment with no consumer on the forward
+  target (`127.0.0.1:20000` by default) thus silently burned CPU forwarding the full shred firehose
+  into a dead port. When set, the flag forces the forwarder off regardless of discovery and skips
+  the discovery shell-out to the `doublezero` CLI entirely. The activation decision is now a single
+  unit-tested contract, `shred::decide_activation(disabled, source_count) -> ShredActivation`
+  (`Disabled`/`NoSources`/`Run`), that `main` matches on to drive both the spawn and its
+  operator-facing log line. Dockerfile one-liner examples document the opt-out.
 - **Prometheus metrics endpoint** (`--metrics-bind` / `METRICS_BIND`, **off by default**). When a
   bind address is given (e.g. `127.0.0.1:9090`) the bridge serves the Prometheus text format at
   `GET /metrics` (plus a `GET /` / `GET /healthz` liveness probe) over a hand-rolled minimal HTTP
