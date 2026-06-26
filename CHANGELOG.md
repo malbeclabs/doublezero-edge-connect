@@ -136,6 +136,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get.doublezero.xyz/connect` one-liner.
 
 ### Added
+- **Multi-publisher dedup for Market-by-Order `depth`** (#28, the MBO half of #3 — TOB shipped
+  earlier). `MboProcessor` now reconstructs an **independent L3 book per `(publisher, instrument)`**
+  (keyed on the datagram source IP), since two publishers' instance-scoped per-instrument delta
+  sequences collide and cannot be merged into one book; `SnapshotOrder` (which carries only a
+  `snapshot_id`, no instrument id) routes only to the originating publisher's building book. The
+  resulting redundant `depth` is collapsed at the shared `Arbiter` by a **latch-to-leader staleness
+  floor** keyed on `(venue, symbol)` with a content-inclusive `DepthId` (top-N levels at canonical
+  `10^-8` fixed-point) — the same primitive as the quote floor, **but with no `source_ts == 0`
+  bypass**: the two identical synced-but-empty book anchors two publishers emit at `source_ts == 0`
+  deliberately collapse to one. The WS-replay depth map is written by the arbiter on the admit
+  decision (the leader's broadcast book), not pre-floor. New metrics
+  `dz_depth_admitted_total{venue,publisher}` (who is winning the book race), `dz_depth_dropped_total`,
+  `dz_depth_future_rejected_total`. Fixture-backed two-publisher MBO depth test over
+  `mbo_btc_dual.combined.bin` (falsifiable: bypassing the floor re-emits the duplicate empty anchor).
 - Installer one-liner (`scripts/connect*.sh`) now runs a **pre-flight access-pass check before
   installing anything**. Right after reading the access secret — and before installing Docker,
   pulling the image, or touching the host network — it verifies onchain that the configured identity

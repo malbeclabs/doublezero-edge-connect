@@ -130,13 +130,21 @@ Modules are grouped by role under `src/`:
   `arbiter` (not a raw `tx`); `ctx.emit(msg)` routes through it tagged `Publisher::Edge(src_ip)`.
 - **`ingest/arbiter.rs`** — the shared **pre-broadcast emit stage** every ingest source funnels
   through. `Arbiter` owns the broadcast `Sender` plus the dedup state — the per-`(venue, symbol)`
-  latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the BBO `f64`-bits, with the
-  `Publisher` enum as the per-tick leader identity) and the `WindowedDedup` on `trade_id` for trades
-  — and exposes one `emit(msg, publisher)` (quotes → floor, trades → window, everything else
-  passthrough). Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS
-  feeder share **one** floor per `(venue, symbol)` and race on it. The floor lived inside
-  `TobProcessor` under PR #29; it was lifted here so a different transport (the WS feeder) can race in
-  the same floor. `Status` routes straight to `sender()` (no business identity to dedup).
+  latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the canonical BBO fixed-point, with
+  the `Publisher` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
+  (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point), and the
+  `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
+  floor, depth → depth floor, trades → window, everything else passthrough). Wrapped
+  `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share **one**
+  floor per `(venue, symbol)` and race on it. The quote floor lived inside `TobProcessor` under PR #29;
+  it was lifted here so a different transport (the WS feeder) can race in the same floor.
+  **Depth diverges from quotes in one deliberate way: it has NO `source_ts == 0` bypass** (#28). For
+  quotes 0 is the "not available" sentinel and is forwarded unlatched; for depth 0 is a *real* state —
+  the initial synced-but-empty book each publisher emits right after its snapshot anchor — and the two
+  publishers' identical empty anchors at `source_ts == 0` are routed through the floor so the
+  non-leader's collapses (the content-inclusive depth oracle would otherwise flag the pair as
+  duplicates). No wedge: a real later event has `source_ts > 0` and re-advances the floor. `Status`
+  routes straight to `sender()` (no business identity to dedup).
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -164,7 +172,17 @@ Modules are grouped by role under `src/`:
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
   + trades). All gate emission **per instrument** on a known definition (precision before price). The
-  quote/trade cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
+  quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
+  `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
+  datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
+  sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
+  instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
+  `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *frame*, so two
+  frames in one tick can emit two depths with the same `source_ts`; this is **benign** under the
+  content-inclusive depth floor (same tick + same leader + new content → both admitted, distinct
+  content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
+  tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
+  `source_ts` per depth).
 - **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs`** — pure decoders for each protocol's
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).

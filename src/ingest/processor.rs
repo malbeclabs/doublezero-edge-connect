@@ -479,16 +479,21 @@ const MAX_BOOKS: usize = 4096;
 /// prints. The reconstructed book lives here so consumers never see raw deltas (PROTOCOL.md).
 pub struct MboProcessor {
     state: RefDataState<codec_mbo::InstrumentDefinition>,
-    books: HashMap<u32, BookState>,
+    /// One independent L3 book per `(publisher, instrument)`. Two publishers mirror the same feed but
+    /// reconstruct from independent, instance-scoped per-instrument delta sequences (whose sequence
+    /// spaces collide), so their books CANNOT be merged — each runs its own recovery state machine.
+    /// The redundant publishers' resulting `depth` is collapsed downstream at the shared arbiter's
+    /// latch-to-leader floor (see [`crate::ingest::arbiter`]), not here.
+    books: HashMap<(IpAddr, u32), BookState>,
     /// Insertion order of `books` keys, oldest at the front, for the [`MAX_BOOKS`] eviction.
-    books_order: VecDeque<u32>,
+    books_order: VecDeque<(IpAddr, u32)>,
     /// Shared latest-depth map the WS server replays on connect.
     depth: DepthSnapshot,
-    /// Last emitted top-N levels per instrument, so a book change that leaves the published top-N
-    /// identical (deep-book churn) does not re-broadcast a duplicate full-state `depth`. Evicted in
-    /// lockstep with `books` and cleared on `InstrumentReset`, so it can never outgrow the book map
-    /// (its keys are always a subset of `books`' keys).
-    last_top: HashMap<u32, (Vec<Level>, Vec<Level>)>,
+    /// Last emitted top-N levels per `(publisher, instrument)`, so a book change that leaves the
+    /// published top-N identical (deep-book churn) does not re-broadcast a duplicate full-state
+    /// `depth`. Evicted in lockstep with `books` and cleared on `InstrumentReset`, so it can never
+    /// outgrow the book map (its keys are always a subset of `books`' keys).
+    last_top: HashMap<(IpAddr, u32), (Vec<Level>, Vec<Level>)>,
     warned_source_mismatch: bool,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
@@ -518,43 +523,52 @@ impl MboProcessor {
     ///    book for an undefined instrument can never emit `depth` ([`Self::emit_depth`] requires the
     ///    definition for precision), so it would be pure dead memory; this mirrors the per-instrument
     ///    definition gate the Top-of-Book / Midpoint quote paths already apply.
-    /// 2. Bounds the map to [`MAX_BOOKS`] with least-recently-inserted eviction, so even a flood of
-    ///    *defined* forged instrument_ids can't grow it without limit. Eviction also drops the
-    ///    evicted instrument's `last_top` and shared `depth` (WS replay) entries in lockstep, so
-    ///    neither sibling map outgrows `books`. An evicted legitimate book simply re-syncs from the
-    ///    next snapshot.
+    /// 2. Bounds the map to [`MAX_BOOKS`] `(publisher, instrument)` pairs with least-recently-inserted
+    ///    eviction, so even a flood of *defined* forged instrument_ids (the source IP is also
+    ///    spoofable — the same threat the cap already addresses) can't grow it without limit. Eviction
+    ///    also drops the evicted pair's `last_top` and (when no other publisher still serves that
+    ///    symbol) the shared `depth` (WS replay) entry in lockstep, so neither sibling map outgrows
+    ///    `books`. An evicted legitimate book simply re-syncs from the next snapshot.
     fn book_for(&mut self, instrument_id: u32, ctx: &FrameCtx) -> Option<&mut BookState> {
         // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
         self.state.definition(instrument_id)?;
-        if !self.books.contains_key(&instrument_id) {
+        let key = (ctx.publisher, instrument_id);
+        if !self.books.contains_key(&key) {
             while self.books.len() >= MAX_BOOKS {
                 match self.books_order.pop_front() {
                     Some(old) => {
                         self.books.remove(&old);
                         // Evict the two sibling maps keyed off this book in lockstep, or each would
                         // grow without limit while `books` stays bounded - the exact
-                        // forged-`instrument_id`-flood vector `MAX_BOOKS` guards against. `last_top`
-                        // by id; the shared `depth` (WS replay) map by (venue, symbol), so a
-                        // reconnecting client never replays a stale depth for an evicted instrument.
+                        // forged-`(publisher, instrument)`-flood vector `MAX_BOOKS` guards against.
+                        // `last_top` by the same key; the shared `depth` (WS replay) map by
+                        // (venue, symbol) — purge it ONLY when no other publisher still holds a book
+                        // for the same instrument (else that publisher's depth would be wrongly
+                        // dropped from replay; it self-heals via full-state otherwise).
                         self.last_top.remove(&old);
-                        if let Some(def) = self.state.definition(old) {
-                            crate::model::lock(&self.depth)
-                                .remove(&(ctx.venue.to_string(), def.symbol.clone()));
+                        let (_old_pub, old_id) = old;
+                        let symbol_still_served = self.books.keys().any(|(_p, i)| *i == old_id);
+                        if !symbol_still_served {
+                            if let Some(def) = self.state.definition(old_id) {
+                                crate::model::lock(&self.depth)
+                                    .remove(&(ctx.venue.to_string(), def.symbol.clone()));
+                            }
                         }
                     }
                     None => break,
                 }
             }
-            self.books.insert(instrument_id, BookState::default());
-            self.books_order.push_back(instrument_id);
+            self.books.insert(key, BookState::default());
+            self.books_order.push_back(key);
         }
-        self.books.get_mut(&instrument_id)
+        self.books.get_mut(&key)
     }
 
     /// Build and broadcast a full-state `depth` snapshot for one instrument, updating the shared
     /// replay map. No-op unless the book is synced and the instrument's precision is known.
     fn emit_depth(&mut self, instrument_id: u32, ctx: &FrameCtx) {
-        let Some(book) = self.books.get(&instrument_id) else {
+        let key = (ctx.publisher, instrument_id);
+        let Some(book) = self.books.get(&key) else {
             return;
         };
         if !book.is_synced() {
@@ -564,12 +578,12 @@ impl MboProcessor {
             return; // precision unknown; don't emit a book we can't scale
         };
         let (bids_raw, asks_raw) = book.top_levels(DEPTH_LEVELS);
-        // Suppress a re-broadcast when the published top-N is byte-for-byte unchanged: a delta deep
-        // in the book (outside the top-N) still flips `changed`, but re-sending an identical
-        // full-state `depth` is pure duplication. Compare the raw integer levels (pre-scaling) by
-        // reference - no clone.
-        if matches!(self.last_top.get(&instrument_id), Some((b, a)) if *b == bids_raw && *a == asks_raw)
-        {
+        // Suppress a re-broadcast when this publisher's published top-N is byte-for-byte unchanged: a
+        // delta deep in the book (outside the top-N) still flips `changed`, but re-sending an
+        // identical full-state `depth` is pure duplication. Compare the raw integer levels
+        // (pre-scaling) by reference - no clone. (Cross-publisher dedup is the arbiter floor's job;
+        // this only collapses one publisher's own consecutive identical top-N.)
+        if matches!(self.last_top.get(&key), Some((b, a)) if *b == bids_raw && *a == asks_raw) {
             return;
         }
         let scale = |levels: &[(i64, u64)]| -> Vec<[f64; 2]> {
@@ -595,7 +609,7 @@ impl MboProcessor {
         };
         // Record the published top-N, moving the raw vectors in (no clone), so the next identical
         // book state suppresses.
-        self.last_top.insert(instrument_id, (bids_raw, asks_raw));
+        self.last_top.insert(key, (bids_raw, asks_raw));
         crate::model::lock(&self.depth)
             .insert((depth.venue.clone(), depth.symbol.clone()), depth.clone());
         ctx.emit(FeedMessage::Depth(depth));
@@ -757,8 +771,8 @@ impl FrameProcessor for MboProcessor {
                 codec_mbo::Message::InstrumentReset(r) => {
                     // Drop the stale suppression entry so the first depth after the book re-syncs is
                     // always published (and its timestamps are fresh), never suppressed against the
-                    // pre-reset top-N.
-                    self.last_top.remove(&r.instrument_id);
+                    // pre-reset top-N. Per-publisher: only this publisher's book is resetting.
+                    self.last_top.remove(&(ctx.publisher, r.instrument_id));
                     if let Some(book) = self.book_for(r.instrument_id, ctx) {
                         book.on_instrument_reset(r.new_anchor_seq);
                     }
@@ -775,11 +789,17 @@ impl FrameProcessor for MboProcessor {
                 }
                 codec_mbo::Message::SnapshotOrder(s) => {
                     // SnapshotOrder carries only the snapshot_id, not the instrument id; route it to
-                    // whichever book is currently assembling that snapshot. snapshot_id is monotonic
-                    // per (channel, instrument) - not globally unique - but the spec forbids
-                    // interleaving snapshot groups across instruments, so at most one book is
-                    // `building` at a time and only it matches.
-                    for book in self.books.values_mut() {
+                    // whichever of THIS publisher's books is currently assembling that snapshot.
+                    // snapshot_id is monotonic per (channel, instrument) - not globally unique, and
+                    // certainly not across publishers - but the spec forbids interleaving snapshot
+                    // groups across instruments per channel, so at most one of this publisher's books
+                    // is `building` at a time. Restricting to `ctx.publisher` keeps a SnapshotOrder
+                    // from leaking into the other publisher's same-snapshot_id building book.
+                    for ((_p, _id), book) in self
+                        .books
+                        .iter_mut()
+                        .filter(|((p, _), _)| *p == ctx.publisher)
+                    {
                         book.on_snapshot_order(
                             s.snapshot_id,
                             s.order_id,
@@ -904,6 +924,10 @@ mod tests {
         out
     }
 
+    /// The single-publisher source IP `make_ctx` stamps on every frame, so book-map keys in these
+    /// tests are `(TEST_PUB, instrument_id)` (the MBO books re-key by publisher).
+    const TEST_PUB: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+
     fn make_ctx<'a>(
         arbiter: &'a SharedArbiter,
         instruments: &'a crate::model::InstrumentSnapshot,
@@ -916,7 +940,7 @@ mod tests {
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,
             role,
-            publisher: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            publisher: TEST_PUB,
         }
     }
 
@@ -1273,11 +1297,12 @@ mod tests {
             proc.last_top.len()
         );
         assert!(
-            proc.books.contains_key(&(flood - 1)) && proc.last_top.contains_key(&(flood - 1)),
+            proc.books.contains_key(&(TEST_PUB, flood - 1))
+                && proc.last_top.contains_key(&(TEST_PUB, flood - 1)),
             "newest instrument retained in both maps"
         );
         assert!(
-            !proc.books.contains_key(&0) && !proc.last_top.contains_key(&0),
+            !proc.books.contains_key(&(TEST_PUB, 0)) && !proc.last_top.contains_key(&(TEST_PUB, 0)),
             "oldest instrument evicted from both maps"
         );
         // The shared `depth` (WS replay) map is keyed by (venue, symbol) and must be purged in

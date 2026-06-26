@@ -15,7 +15,7 @@ use common::{assertions, replay as replay_helper};
 use doublezero_edge_connect::ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
     codec,
-    processor::TobProcessor,
+    processor::{MboProcessor, TobProcessor},
     receiver::{FrameCtx, FrameProcessor, PortRole},
 };
 use serde_json::Value;
@@ -25,6 +25,64 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
+
+/// Map a combined-record role byte to its `PortRole`. MBO adds a third role over TOB's two:
+/// `0 = refdata`, `1 = mktdata`, `2 = snapshot` (the converter's `--combined-with --protocol mbo`
+/// encoding; see `examples/pcap2frames.rs`).
+fn port_role(role: u8) -> PortRole {
+    match role {
+        0 => PortRole::Refdata,
+        2 => PortRole::Snapshot,
+        _ => PortRole::Mktdata,
+    }
+}
+
+/// Replay combined MBO records through a single re-keyed `MboProcessor` feeding the shared `Arbiter`
+/// in capture order, collecting the emitted WS messages as JSON. The production demux+dedup path:
+/// each record's source IP becomes `FrameCtx.publisher`, so the processor reconstructs an independent
+/// book per `(publisher, instrument)` and the cross-publisher latch-to-leader depth floor runs in the
+/// arbiter — exactly as in the binary.
+fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
+    let (tx, mut rx) = broadcast::channel(1 << 16);
+    let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
+    let instruments = Arc::new(Mutex::new(HashMap::new()));
+    let depth = Arc::new(Mutex::new(HashMap::new()));
+    let mut p = MboProcessor::new(depth, true);
+    for (ip, role, frame) in recs {
+        let ctx = FrameCtx {
+            venue: "Hyperliquid",
+            arbiter: &arbiter,
+            instruments: &instruments,
+            kernel_rx_ts_ns: 0,
+            recv_ts_ns: 0,
+            role: port_role(*role),
+            publisher: *ip,
+        };
+        p.on_datagram(frame, &ctx);
+    }
+    let mut msgs = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        msgs.push(serde_json::to_value(&m).unwrap());
+    }
+    msgs
+}
+
+/// Emitted `depth` messages (full-state book snapshots).
+fn depths(msgs: &[Value]) -> Vec<&Value> {
+    msgs.iter().filter(|m| m["type"] == "depth").collect()
+}
+
+/// Count emitted depths whose book is empty at the `source_ts == 0` anchor (`bids == asks == []`).
+fn empty_anchor_depths(msgs: &[Value]) -> usize {
+    depths(msgs)
+        .iter()
+        .filter(|d| {
+            d["source_ts_ns"].as_u64() == Some(0)
+                && d["bids"].as_array().is_some_and(|a| a.is_empty())
+                && d["asks"].as_array().is_some_and(|a| a.is_empty())
+        })
+        .count()
+}
 
 /// Combined fixture record: `[u32 len LE][4B src_ip octets][1B role: 0=refdata,1=mktdata][frame]`.
 fn read_combined(path: &str) -> Vec<(IpAddr, u8, Vec<u8>)> {
@@ -376,6 +434,126 @@ fn duplicate_multicast_trade_packet_collapses() {
         emitted_trade_ids(&replay(&doubled)),
         "delivering every mktdata packet twice changed the emitted trade set"
     );
+}
+
+/// Two-publisher **Market-by-Order** depth dedup over the real combined golden: two live HL
+/// publishers' interleaved BTC capture, each reconstructing its own book from a synthetic empty
+/// anchor + its independent delta stream. The cross-publisher contract:
+///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity) — the leader's
+///      book is served per `source_ts` tick, the redundant publisher's collapsed.
+///   2. The two identical synced-but-empty depths at `source_ts == 0` (one per publisher's anchor)
+///      collapse to exactly ONE — the deliberate no-`source_ts==0`-bypass for depth.
+///   3. Both publishers reconstruct independently: each replayed ALONE emits depth (its book syncs
+///      from its own anchor + deltas — proving the per-`(publisher, instrument)` re-key).
+///   4. The combined emission collapses redundancy: fewer depths than the two publishers emit
+///      separately (the floor dropped the non-leader's mirror).
+///
+/// Falsifiable: with the depth floor bypassed (always-admit) the two anchors at `source_ts == 0`
+/// both emit and `no_business_duplicates` flags the identical `(0, [], [])` pair; sharing one book
+/// across publishers (the pre-#28 key) collides their delta sequence spaces and corrupts the book.
+#[test]
+fn two_publishers_mbo_depth_dedup() {
+    let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
+    let pubs: Vec<IpAddr> = {
+        let mut v: Vec<IpAddr> = recs.iter().map(|(ip, _, _)| *ip).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    assert_eq!(pubs.len(), 2, "golden must carry exactly two publishers");
+
+    let msgs = replay_mbo(&recs);
+
+    // (1) the cross-publisher dedup contract holds on the emitted depth.
+    assertions::no_business_duplicates(&msgs);
+    assertions::instrument_before_price(&msgs);
+    let combined_depths = depths(&msgs).len();
+    assert!(combined_depths > 0, "no depth emitted from the golden");
+
+    // (2) the two empty-book anchors at source_ts==0 collapse to one.
+    assert_eq!(
+        empty_anchor_depths(&msgs),
+        1,
+        "the two publishers' identical empty-book anchors at source_ts==0 must collapse to one"
+    );
+
+    // (3) each publisher independently reconstructs its book: replayed alone it still emits depth.
+    let mut alone_total = 0usize;
+    for p in &pubs {
+        let alone: Vec<_> = recs.iter().filter(|(ip, _, _)| ip == p).cloned().collect();
+        let n = depths(&replay_mbo(&alone)).len();
+        assert!(
+            n > 0,
+            "publisher {p} alone emitted no depth — its book never synced"
+        );
+        alone_total += n;
+    }
+
+    // (4) redundancy collapsed: the combined run emits fewer depths than the two publishers do
+    // separately (the floor dropped the non-leader publisher's redundant book states).
+    assert!(
+        combined_depths < alone_total,
+        "combined depth {combined_depths} not below per-publisher sum {alone_total} — \
+         cross-publisher dedup collapsed nothing"
+    );
+}
+
+/// Strict packet-level falsifiability for MBO depth, mirroring the TOB
+/// `duplicate_packet_from_second_publisher_collapses`: replay one publisher, then replay it with each
+/// snapshot+mktdata datagram **also** delivered byte-for-byte from a second publisher IP. The two
+/// books reconstruct identically, so every depth the mirror produces is an exact `(source_ts,
+/// content)` duplicate the leader already emitted — all dropped as non-leader no-ops, leaving the
+/// emitted depth set unchanged. With dedup off the mirror would double every depth and
+/// `no_business_duplicates` would flag them.
+#[test]
+fn mbo_depth_mirror_from_second_publisher_collapses() {
+    let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
+    let pub_ip = recs
+        .iter()
+        .map(|(ip, _, _)| *ip)
+        .next()
+        .expect("fixture not empty");
+    let baseline: Vec<_> = recs
+        .iter()
+        .filter(|(ip, _, _)| *ip == pub_ip)
+        .cloned()
+        .collect();
+
+    let mirror_ip = IpAddr::V4(Ipv4Addr::new(10, 255, 255, 254));
+    assert_ne!(mirror_ip, pub_ip, "mirror IP must differ from the original");
+    let mut mirrored = Vec::new();
+    for r in &baseline {
+        mirrored.push(r.clone());
+        mirrored.push((mirror_ip, r.1, r.2.clone())); // same bytes (all roles), second publisher
+    }
+
+    let base_depths = depth_identities(&replay_mbo(&baseline));
+    let mirror_msgs = replay_mbo(&mirrored);
+    assertions::no_business_duplicates(&mirror_msgs);
+    assert!(!base_depths.is_empty(), "baseline emitted no depth");
+    assert_eq!(
+        base_depths,
+        depth_identities(&mirror_msgs),
+        "mirroring every packet from a second publisher changed the emitted depth set"
+    );
+}
+
+/// The content-inclusive identity set of emitted depths (`venue|symbol|source_ts|bids|asks`), the
+/// same key the `no_business_duplicates` oracle uses — for comparing two runs' emitted depth sets.
+fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
+    depths(msgs)
+        .iter()
+        .map(|d| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                d["venue"].as_str().unwrap_or_default(),
+                d["symbol"].as_str().unwrap_or_default(),
+                d["source_ts_ns"].as_u64().unwrap_or_default(),
+                d["bids"],
+                d["asks"]
+            )
+        })
+        .collect()
 }
 
 /// True if the frame carries a quote for `id` (used to build the DOGE-only subset; a TOB frame
