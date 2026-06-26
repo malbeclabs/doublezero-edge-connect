@@ -182,6 +182,53 @@ cargo run --example pcap2frames -- tyo_tob.pcap \
 `--symbol` is repeatable; omitting it entirely keeps all symbols (used to survey per-symbol volume
 before picking the busy/quiet pair).
 
+### `mbo_btc_dual.combined.bin` — two-publisher Market-by-Order golden
+
+The MBO counterpart of `tob_btc_dual.combined.bin`, for the multi-publisher **depth** dedup (issue #3,
+MBO half). Same two live HL publishers (A `148.51.120.79`, B `148.51.123.3`) and same `tyo_tob.pcap`,
+BTC only. Record format is the same `[u32 len][4B src_ip][1B role][frame]`, with a third role for the
+snapshot port: **0=refdata, 1=mktdata, 2=snapshot**. 130 refdata + 2 snapshot + 1267 mktdata frames, 0
+decode errors, ~1.6 MB. Replaying each publisher's records through `MboProcessor` reconstructs its BTC
+book and emits depth (pub A 636, pub B 633) over an overlapping `source_ts` range — the cross-publisher
+region the dedup must collapse.
+
+**The 2 snapshot frames are SYNTHESIZED, not captured.** They are the same honest empty-book anchor
+`mbo_snapshot.bin` uses, but `pcap2frames --empty-anchor` computes one per publisher from that
+publisher's first in-window delta: `SnapshotBegin total_orders=0` + `SnapshotEnd`, with
+`last_instrument_seq`/`anchor_seq` set one below that delta so it is contiguous after the anchor and the
+book syncs immediately. Against the empty book the pre-window orders' cancels/executes no-op (as in the
+single fixture) and the window's real, interleaved deltas build a coherent subset — real interleaving
+and real dedup, no fabricated book state.
+
+Why not **real** snapshots: the snapshot port round-robins the full book ~once per ~30 s, the two
+publishers are out of phase (for BTC, pub B dumps it in 19 ms at t≈3.6 s while pub A streams it over
+~31 s; for DOGE, pub B at t≈2.5 s, pub A at t≈15.7 s), and a book syncs only on a snapshot that arrives
+**after** its definition (the def is itself on a ~30 s round-robin). No small window satisfies "def,
+then a complete real snapshot, then contiguous deltas" for *both* publishers at once; the empty anchor
+sidesteps all of it. `pcap2frames` keeps the real-snapshot mode (default) plus a window-coherence
+report (definition time + per-publisher snapshot groups) so an aligned capture could still use it.
+
+**MBO `Valid=0` manifest workaround (found minting this).** The raw capture's MBO `ManifestSummary`
+carries `Valid=0` (seq=5, count=786) — the same live-publisher quirk `TobProcessor` already overrides.
+`MboProcessor` previously passed `m.valid` through, which clears all definitions, so precision never
+resolves and the **MBO feed emits zero depth in production**. The e2e MBO test missed it because the
+vendored golden has `Valid=1`. `MboProcessor` now overrides `Valid=0`→true exactly like TOB (logged
+once, `REVISIT`); `mbo_manifest_valid_zero_is_overridden_so_depth_flows` pins it. Without the override
+this fixture's books never sync.
+
+Regenerate (BTC, 3 s delta window after the t≈7.5 s definition):
+
+```
+cargo run --example pcap2frames -- tyo_tob.pcap \
+  --protocol mbo --src 148.51.120.79 --combined-with 148.51.123.3 \
+  --symbol BTC --from 9 --to 12 --empty-anchor -o tests/fixtures/mbo_btc_dual
+```
+
+`--from`/`--to` bound the snapshot/delta window; refdata is always kept from t=0 so the slow-round-robin
+BTC definition resolves. A combined two-publisher depth dedup test must reconstruct an **independent book
+per `(publisher, instrument)`** (issue #3, MBO item 1) — feeding both publishers' BTC deltas to one
+instrument-keyed book collides their per-instrument sequences.
+
 ## Solana shred fixtures (`shred_sample.bin`, `shred_leaders.json`)
 
 Unlike the HL fixtures above, these are a **live capture** from the DoubleZero `edge-solana-*`

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **MBO depth was silently broken on the live feed.** The live HL publisher emits MBO
+  `ManifestSummary` with `Valid=0` (the same quirk `TobProcessor` already overrides); `MboProcessor`
+  honored it, which clears all instrument definitions, so precision never resolved and the feed emitted
+  zero `depth`. `MboProcessor` now overrides `Valid=0`→true like TOB (logged once, `REVISIT`).
+  Regression test: `mbo_manifest_valid_zero_is_overridden_so_depth_flows`. The e2e MBO test missed this
+  because its vendored golden carries `Valid=1`; the bug surfaced minting a real-capture MBO fixture.
+
 ### Changed
 - README refocused on the **operator**: it now leads with what the bridge does, the install
   one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
@@ -17,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get.doublezero.xyz/connect` one-liner.
 
 ### Added
+- Two-publisher **Market-by-Order** depth-dedup golden `tests/fixtures/mbo_btc_dual.combined.bin` plus
+  the tooling to mint it. `examples/pcap2frames.rs` `--combined-with` now supports `--protocol mbo`
+  (three port roles — refdata/snapshot/mktdata — vs TOB's two, with per-publisher `SnapshotOrder`
+  routing); it keeps refdata across the whole scan while windowing snapshot+deltas to `[--from,--to]`
+  (so the slow-round-robin instrument definition still resolves precision), reports a window-coherence
+  summary, and adds `--empty-anchor`, which synthesizes a per-publisher empty-book snapshot anchor
+  (real per-instrument snapshots ride a ~30 s, per-publisher-phased round-robin and can't be captured
+  coherently in a small window — see `tests/fixtures/PROVENANCE.md`).
 - Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
   (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
   copy of each shred out of the box, collapsing the multicast-overlap duplicates DoubleZero delivers
