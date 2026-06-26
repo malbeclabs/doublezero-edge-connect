@@ -21,10 +21,12 @@ each must stay self-contained (no shared sourced file).
 2. Load the access secret (a `DZ_`-prefixed token or a keypair file path) and **verify its access
    pass onchain before installing anything** — a pure host-side check (no Docker, no CLI) that
    derives the identity, computes the access-pass PDA, and reads it over the ledger's public
-   JSON-RPC. If the identity has no access pass for this host's public IP (or `0.0.0.0`, the any-IP
-   wildcard), the installer aborts with a descriptive error instead of failing later at `connect`.
-   The check degrades to a warning (and continues) if the public IP can't be determined, the ledger
-   RPC is unreachable, or `python3` is missing.
+   JSON-RPC. If the identity has no access pass for `0.0.0.0` (the any-IP wildcard) nor for this
+   host's public IP, the installer aborts with a descriptive error (instead of failing later at
+   `connect`) when that IP was supplied explicitly via `DZ_CLIENT_IP`; if the IP was only
+   auto-detected (which can be wrong behind NAT) it warns and continues. The check also degrades to
+   a warning (and continues) if the public IP can't be determined, the ledger RPC is unreachable,
+   the keypair can't be read/parsed, or `python3` is missing.
 3. Ensure Docker is present (offer to install it via `get.docker.com`).
 4. Prep the host kernel/network for GRE: load `tun`/`ip_gre`, raise `net.core.rmem_max`, warn
    about active firewalls and cloud provider rules (AWS/GCP/Azure).
@@ -118,8 +120,9 @@ The bridge serves:
   (and, on AWS, disable the ENI source/dest check) — the script warns but can't fix this for you.
 - **Access pass.** `doublezero connect` requires the host's public IP to be authorized onchain for
   the chosen environment; otherwise the tunnel won't come up. The installer now checks this **up
-  front** (step 2) and aborts before installing anything if the identity has no access pass for the
-  host's public IP or `0.0.0.0`. Provision one with
+  front** (step 2): if the identity has no access pass for the host's public IP or `0.0.0.0` it
+  aborts before installing anything when the IP was given via `DZ_CLIENT_IP`, and warns-and-continues
+  when the IP was only auto-detected. Provision one with
   `doublezero access-pass set --accesspass-type prepaid --user-payer <IDENTITY> --client-ip <IP>`
   (use `--client-ip 0.0.0.0` to allow any IP). Override the detected IP with `DZ_CLIENT_IP` if needed.
 - **No TLS.** The bridge targets a trusted/local network; terminate TLS at a reverse proxy if you

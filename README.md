@@ -46,9 +46,11 @@ What the script does:
 
 1. Checks preconditions (Linux/amd64, root or `sudo`).
 2. Loads the access secret (a `DZ_`-prefixed token, or a keypair file path) and **verifies its
-   access pass onchain before installing anything** — aborting with a descriptive error if the
-   identity has no access pass for this host's public IP (or `0.0.0.0`). This is a pure host-side
-   check (no Docker, no CLI) over the ledger's public JSON-RPC.
+   access pass onchain before installing anything** — a pure host-side check (no Docker, no CLI)
+   over the ledger's public JSON-RPC. If the identity has no access pass for `0.0.0.0` (the any-IP
+   wildcard) nor for the host's public IP, it aborts with a descriptive error when that IP was
+   given explicitly via `DZ_CLIENT_IP`, and otherwise (the IP was only auto-detected, which can be
+   wrong behind NAT) just warns and continues, leaving `doublezero connect` as the real check.
 3. Ensures Docker is present (offers to install it) and preps the host kernel/network for the GRE
    tunnel: loads `tun`/`ip_gre`, raises `net.core.rmem_max`, warns about firewalls and
    cloud-provider rules.

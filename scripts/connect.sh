@@ -216,17 +216,23 @@ if ! command -v python3 >/dev/null 2>&1; then
 else
   info "Verifying the access pass onchain (env=$DZ_ENV)..."
   AP_PUB_IP="$(detect_public_ip)"
+  # Whether the public IP was asserted by the operator (explicit) or merely guessed
+  # (auto): a confirmed miss only hard-aborts when the operator asserted the IP.
+  if [ -n "${DZ_CLIENT_IP:-}" ]; then AP_IP_SRC=explicit; else AP_IP_SRC=auto; fi
   # Feed the 64-byte keypair to python on stdin only (never argv/env), preserving the
   # "plaintext key is never printed or written to host disk" rule; only the public key is shown.
   # The python program is delivered via a /dev/fd process substitution so stdin stays free for the key.
-  if [ "$KEY_SRC" = token ]; then AP_FEED="$KEY_JSON"; else AP_FEED="$(cat "$KEYFILE")"; fi
   set +e
+  # Read the keyfile under `set +e`: a root-owned 0600 key is readable by the docker
+  # mount (root) but maybe not by this user -- degrade to a warning, never abort the install.
+  if [ "$KEY_SRC" = token ]; then AP_FEED="$KEY_JSON"; else AP_FEED="$(cat "$KEYFILE" 2>/dev/null)"; fi
   AP_OUT="$(printf '%s' "$AP_FEED" | DZ_RPC="$DZ_RPC" DZ_PROG="$DZ_PROG" PUB_IP="$AP_PUB_IP" DZ_ENV="$DZ_ENV" python3 <(cat <<'PY'
 # Host-side access-pass check. stdin: JSON array of the 64 keypair bytes (identity = last 32).
 # env: DZ_RPC (ledger JSON-RPC), DZ_PROG (serviceability program id, base58), PUB_IP (this host's
 # public IP, "" if unknown). Prints "IDENTITY <b58>" then a verdict line. Exit codes:
 #   0 pass found   2 confirmed miss (PUB_IP known; neither it nor 0.0.0.0 has a pass)
 #   3 inconclusive (PUB_IP unknown and no 0.0.0.0 pass)   4 inconclusive (RPC/decode error)
+#   5 keypair could not be read/parsed (not a 64-int JSON array)
 # An access pass is the PDA find_program_address([b"doublezero", b"accesspass", client_ip(4),
 # identity(32)], program_id); existence (account data[0]==11 == AccountType::AccessPass) == it exists.
 import os, sys, json, socket, hashlib, base64, urllib.request
@@ -287,11 +293,25 @@ def _exists(rpc, addr):
     data = val.get("data"); data = data[0] if isinstance(data, list) else data
     raw = base64.b64decode(data) if data else b""
     return len(raw) >= 1 and raw[0] == 11
+def _norm_ip(ip):
+    # Strict dotted-quad check: inet_aton alone accepts 3-part ("1.2.3") and some
+    # trailing-junk forms, so round-trip through inet_ntoa and require an exact match.
+    try:
+        return ip if socket.inet_ntoa(socket.inet_aton(ip)) == ip else None
+    except OSError:
+        return None
 def main():
     rpc = os.environ["DZ_RPC"]; program_id = b58decode(os.environ["DZ_PROG"]); pub_ip = os.environ.get("PUB_IP", "").strip()
-    kp = json.loads(sys.stdin.read())
-    if not isinstance(kp, list) or len(kp) != 64:
-        print("keypair is not a 64-byte array", file=sys.stderr); return 4
+    if not rpc.startswith(("http://", "https://")):
+        print("ledger RPC URL must be http(s)", file=sys.stderr); return 4
+    try:
+        kp = json.loads(sys.stdin.read())
+        if not (isinstance(kp, list) and len(kp) == 64 and all(isinstance(b, int) and 0 <= b <= 255 for b in kp)):
+            raise ValueError
+    except Exception:
+        print("keypair is not a 64-int JSON array", file=sys.stderr); return 5
+    if pub_ip and _norm_ip(pub_ip) is None:
+        print("ignoring malformed public IP " + repr(pub_ip), file=sys.stderr); pub_ip = ""
     identity = bytes(kp[32:64]); print("IDENTITY " + b58encode(identity))
     try:
         for ip in ([pub_ip] if pub_ip else []) + ["0.0.0.0"]:
@@ -310,9 +330,14 @@ PY
   AP_ID="$(printf '%s\n' "$AP_OUT" | sed -n 's/^IDENTITY //p')"
   case "$AP_RC" in
     0) info "Access pass OK${AP_ID:+ (identity $AP_ID)} -- $(printf '%s\n' "$AP_OUT" | tail -1)";;
-    2) die "Your keypair is not authorized to connect to DoubleZero ($DZ_ENV). Please contact DoubleZero to arrange access (a service contract) for this identity.
-   Details for DoubleZero support: identity ${AP_ID:-unknown}, public IP ${AP_PUB_IP:-unknown}. (If that IP is not this host's real public IP, re-run with DZ_CLIENT_IP=<your public IP>.)";;
+    2) if [ "$AP_IP_SRC" = explicit ]; then
+         die "Your keypair is not authorized to connect to DoubleZero ($DZ_ENV) from $AP_PUB_IP. Please contact DoubleZero to arrange access (a service contract) for this identity.
+   Details for DoubleZero support: identity ${AP_ID:-unknown}, public IP ${AP_PUB_IP:-unknown}."
+       else
+         warn "No access pass for this host's auto-detected public IP (${AP_PUB_IP:-unknown}) or 0.0.0.0; the pass may be bound to a different IP. If you know your public IP, re-run with DZ_CLIENT_IP=<your public IP>, or contact DoubleZero to arrange access (identity ${AP_ID:-unknown}). Continuing."
+       fi;;
     3) warn "Could not determine this host's public IP and identity ${AP_ID:-?} has no 0.0.0.0 access pass; cannot confirm access. Set DZ_CLIENT_IP=<ip> to verify. Continuing.";;
+    5) warn "Could not read or parse the keypair to verify the access pass (expected a 64-int JSON array); continuing (\`doublezero connect\` will be the fallback).";;
     *) warn "Could not query the DoubleZero ledger ($DZ_RPC) to verify the access pass; continuing (\`doublezero connect\` will be the fallback).";;
   esac
 fi
