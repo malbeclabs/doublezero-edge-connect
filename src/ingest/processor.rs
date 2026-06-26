@@ -624,18 +624,19 @@ impl FrameProcessor for MboProcessor {
         for msg in messages {
             match msg {
                 codec_mbo::Message::ManifestSummary(m) => {
-                    // TEMP WORKAROUND: the live DZ Edge HL MBO publisher emits ManifestSummary
-                    // with Valid=0, same as the Top-of-Book publisher (see TobProcessor). Per spec
-                    // Valid=0 means "no established instrument set", which would keep RefDataState
-                    // from ever resolving a definition and block all depth. Force valid=true so the
-                    // bridge consumes the otherwise-healthy feed. REVISIT: pass `m.valid` once the
-                    // publisher manifest is corrected.
+                    // Same TEMP WORKAROUND as TobProcessor: the live DZ Edge HL publisher emits
+                    // ManifestSummary with Valid=0 on the MBO feed too (verified against a real
+                    // capture — see tests/fixtures/PROVENANCE.md). Per spec Valid=0 means "no
+                    // established instrument set", which keeps RefDataState from ever resolving a
+                    // definition and so blocks ALL depth (`book_for` gates on the definition). Force
+                    // valid=true so the otherwise-healthy feed produces depth. REVISIT: drop this
+                    // override and pass `m.valid` once the publisher manifest is corrected.
                     if !m.valid && !self.warned_invalid_manifest {
                         self.warned_invalid_manifest = true;
                         warn!(
                             manifest_seq = m.manifest_seq,
                             instrument_count = m.instrument_count,
-                            "MBO manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
+                            "mbo manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
                         );
                     }
                     self.state
@@ -933,6 +934,69 @@ mod tests {
             }
         }
         ids
+    }
+
+    /// The live DZ Edge HL publisher emits MBO `ManifestSummary` with Valid=0 (confirmed against a
+    /// real capture). Honoring it would clear every definition, so `book_for` would find none, the
+    /// snapshot would never assemble, and NO depth would ever emit — the MBO feed would be silent in
+    /// production. `MboProcessor` overrides Valid=0 to true, mirroring `TobProcessor`. This pins that:
+    /// fed a Valid=0 manifest + definition + empty-book anchor + one delta, depth still flows. The
+    /// Valid=1 goldens the other MBO tests use never exercised this path (that's why it shipped).
+    #[test]
+    fn mbo_manifest_valid_zero_is_overridden_so_depth_flows() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+
+        // Refdata: a Valid=0 manifest (the live publisher's quirk) + the BTC definition under it.
+        let mut manifest = enc_manifest_summary(5, 1);
+        manifest[5] = 0; // body+1 is the `valid` byte; force the live-feed Valid=0 case
+        proc.on_datagram(
+            &frame(&[manifest, enc_instrument_def(0, "INST-0", 5)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+
+        // Empty-book anchor (anchor_seq=0, last_instrument_seq=0), then a contiguous delta (seq 1).
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 1,
+                    last_instrument_seq: 0,
+                    ts: 1,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 1,
+                }),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &frame(&[enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 0,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: 1,
+                order_id: 100,
+                enter_ts: 10,
+                price_raw: 100,
+                qty_raw: 5,
+            })]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        let ids = drain_depth_ids(&mut rx);
+        assert!(
+            ids.contains(&0),
+            "no BTC depth — a Valid=0 manifest blocked precision (the override is missing)"
+        );
     }
 
     /// `depth` messages for a frame touching multiple instruments must arrive in ascending
