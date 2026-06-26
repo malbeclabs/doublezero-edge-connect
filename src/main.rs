@@ -201,9 +201,15 @@ async fn main() -> Result<()> {
     // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
     // feeder) emits through this one instance, so cross-source duplicates collapse on one
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
-    let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW)));
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    let arbiter: SharedArbiter = {
+        let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
+        // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
+        // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
+        a.set_depth_replay(depth.clone());
+        Arc::new(Mutex::new(a))
+    };
 
     // WebSocket sink: on by default; disable it by passing an empty `--ws-bind`.
     let ws = if args.ws_bind.is_empty() {
