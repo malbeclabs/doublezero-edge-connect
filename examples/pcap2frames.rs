@@ -95,12 +95,24 @@ struct Args {
     #[arg(long, default_value_t = 300)]
     mbo_max_deltas: u32,
     /// Second publisher source IP. When set, emit ONE combined `<out>.combined.bin` of both
-    /// publishers' refdata + symbol-filtered TOB mktdata **in capture order**, each record tagged
-    /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata][frame]`. This preserves the real
-    /// inter-publisher interleaving the multi-publisher dedup must collapse (separate per-publisher
-    /// files, replayed back-to-back, would not). TOB only.
+    /// publishers' refdata + symbol-filtered mktdata (TOB) — or refdata + snapshot +
+    /// symbol-filtered order-deltas/trades (MBO) — **in capture order**, each record tagged
+    /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata, 2=snapshot][frame]`. This preserves the
+    /// real inter-publisher interleaving the multi-publisher dedup must collapse (separate
+    /// per-publisher files, replayed back-to-back, would not). Works for `--protocol tob` and
+    /// `--protocol mbo`.
     #[arg(long)]
     combined_with: Option<Ipv4Addr>,
+    /// MBO combined only: instead of keeping real snapshot frames, synthesize a per-publisher
+    /// empty-book anchor (`SnapshotBegin total_orders=0` + `SnapshotEnd`) just before each
+    /// publisher's first in-window delta, with `anchor_seq`/`last_instrument_seq` derived from that
+    /// delta so it is contiguous after the anchor and the book syncs immediately. Use when real
+    /// snapshots can't be captured in a small window: they ride a slow, per-publisher-phased
+    /// round-robin, and a book syncs only on a snapshot that arrives AFTER its definition — which the
+    /// two publishers' independent round-robins rarely both satisfy in a short window. This is the
+    /// same honest empty anchor `tests/fixtures/mbo_snapshot.bin` uses, computed per publisher.
+    #[arg(long)]
+    empty_anchor: bool,
 }
 
 /// Extract the UDP payload of an SLL-encapsulated IPv4/UDP datagram, plus its src and dst IP.
@@ -657,9 +669,13 @@ fn trim_mbo_minimal(
     Ok((refdata_out, snap_out, md_out))
 }
 
-/// Collect `(src_ip, frame)` for any of `srcs`, in capture order — like `collect_frames` but tags
-/// the source and accepts a set, for the combined multi-publisher output.
-fn collect_tagged(args: &Args, srcs: &[Ipv4Addr]) -> Result<Vec<(Ipv4Addr, Vec<u8>)>> {
+/// Collect `(rel_ts, src_ip, frame)` for any of `srcs`, in capture order, each frame's time relative
+/// to the first packet in the file — like `collect_frames` but tags source + timestamp and accepts a
+/// set, for the combined multi-publisher output. Applies only the `--to` upper bound; the `--from`
+/// lower bound is left to the caller so it can be applied **per role** (MBO keeps refdata — the
+/// slow-round-robin instrument definitions — from t=0 so the symbol's precision resolves even when
+/// the snapshot/delta window starts later).
+fn collect_tagged_ts(args: &Args, srcs: &[Ipv4Addr]) -> Result<Vec<(f64, Ipv4Addr, Vec<u8>)>> {
     let file = File::open(&args.pcap).with_context(|| format!("open {:?}", args.pcap))?;
     let mut reader = PcapReader::new(file).map_err(|e| anyhow!("read pcap header: {e}"))?;
     let datalink = reader.header().datalink;
@@ -673,21 +689,28 @@ fn collect_tagged(args: &Args, srcs: &[Ipv4Addr]) -> Result<Vec<(Ipv4Addr, Vec<u
         let pkt = pkt.map_err(|e| anyhow!("read packet: {e}"))?;
         let rel =
             pkt.timestamp.as_secs_f64() - *first_ts.get_or_insert(pkt.timestamp.as_secs_f64());
-        if rel < args.from {
-            continue;
-        }
         if args.to.is_some_and(|to| rel > to) {
-            break;
+            break; // pcap is time-ordered; past the window
         }
         let Some((src, dst, payload)) = sll_ipv4_udp(&pkt.data) else {
             continue;
         };
         if srcs.contains(&src) && dst == args.group && payload.len() >= 24 && payload[..2] == magic
         {
-            out.push((src, payload.to_vec()));
+            out.push((rel, src, payload.to_vec()));
         }
     }
     Ok(out)
+}
+
+/// `collect_tagged_ts` with the `--from` lower bound applied and timestamps dropped — the input
+/// `process_tob_combined` consumes (TOB applies `--from` uniformly across roles).
+fn collect_tagged(args: &Args, srcs: &[Ipv4Addr]) -> Result<Vec<(Ipv4Addr, Vec<u8>)>> {
+    Ok(collect_tagged_ts(args, srcs)?
+        .into_iter()
+        .filter(|(rel, _, _)| *rel >= args.from)
+        .map(|(_, src, f)| (src, f))
+        .collect())
 }
 
 /// Combined multi-publisher TOB output: both publishers' refdata + symbol-filtered mktdata in
@@ -778,20 +801,302 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
     Ok(())
 }
 
+/// Hand-encode a synthetic empty-book MBO snapshot frame (`SnapshotBegin total_orders=0` +
+/// `SnapshotEnd`) anchored at `(anchor_seq, last_instrument_seq)` for `instrument_id`, in the
+/// codec_mbo wire layout (the codec's own encoders are test-only). Used by `--empty-anchor`: the
+/// same honest empty anchor `tests/fixtures/mbo_snapshot.bin` uses, computed per publisher per window
+/// so a mid-stream delta window gets a synced book without a (slow, round-robin) real snapshot.
+fn synth_empty_anchor_frame(
+    instrument_id: u32,
+    anchor_seq: u64,
+    last_instrument_seq: u32,
+) -> Vec<u8> {
+    const SNAPSHOT_ID: u32 = 0xE0E0_0001; // arbitrary; only begin/end consistency matters
+    let mut begin = vec![0x20u8, 36, 0, 0]; // type, len, 2 reserved
+    begin.extend_from_slice(&instrument_id.to_le_bytes());
+    begin.extend_from_slice(&anchor_seq.to_le_bytes());
+    begin.extend_from_slice(&0u32.to_le_bytes()); // total_orders = 0 (empty book)
+    begin.extend_from_slice(&SNAPSHOT_ID.to_le_bytes());
+    begin.extend_from_slice(&last_instrument_seq.to_le_bytes());
+    begin.extend_from_slice(&0u64.to_le_bytes()); // ts
+    let mut end = vec![0x22u8, 20, 0, 0];
+    end.extend_from_slice(&instrument_id.to_le_bytes());
+    end.extend_from_slice(&anchor_seq.to_le_bytes());
+    end.extend_from_slice(&SNAPSHOT_ID.to_le_bytes());
+    let body: Vec<u8> = begin.into_iter().chain(end).collect();
+    let frame_len = (24 + body.len()) as u16; // 24B frame header + body
+    let mut f = vec![0x44u8, 0x44, 1, 0]; // magic 0x4444 LE, schema 1, channel 0
+    f.extend_from_slice(&0u64.to_le_bytes()); // sequence (book reads the anchor from the message)
+    f.extend_from_slice(&0u64.to_le_bytes()); // send ts
+    f.push(2); // message count
+    f.push(0); // reset count
+    f.extend_from_slice(&frame_len.to_le_bytes());
+    f.extend_from_slice(&body);
+    f
+}
+
+/// `(instrument_id, per_instrument_seq, mktdata_seq)` of the first order delta for a target
+/// instrument in `frame` — the seqs `--empty-anchor` anchors a synthetic snapshot just below, so the
+/// delta is contiguous after it. `None` if the frame carries no target delta or fails to decode.
+fn first_target_delta_seq(frame: &[u8], target: &Option<HashSet<u32>>) -> Option<(u32, u32, u64)> {
+    use codec_mbo::Message;
+    let (h, msgs) = codec_mbo::decode_frame(frame).ok()?;
+    for m in &msgs {
+        let (id, seq) = match m {
+            Message::OrderAdd(o) => (o.instrument_id, o.per_instrument_seq),
+            Message::OrderCancel(o) => (o.instrument_id, o.per_instrument_seq),
+            Message::OrderExecute(o) => (o.instrument_id, o.per_instrument_seq),
+            _ => continue,
+        };
+        if target.as_ref().is_none_or(|t| t.contains(&id)) {
+            return Some((id, seq, h.sequence));
+        }
+    }
+    None
+}
+
+/// Combined multi-publisher MBO output: both publishers' refdata + snapshot + symbol-filtered
+/// order-delta/trade mktdata in capture order, each record tagged `[u32 len][4B src_ip][1B role:
+/// 0=refdata, 1=mktdata, 2=snapshot][frame]`. The MBO counterpart to `process_tob_combined`, with two
+/// differences: MBO has three port roles (refdata / snapshot / mktdata) instead of two, and the
+/// `snapshot_id` spaces are **per publisher**, so a `SnapshotOrder` (which carries only a
+/// `snapshot_id`, no instrument id) is mapped back to its instrument via the `(publisher,
+/// snapshot_id)` of the `SnapshotBegin` that opened its group — never across publishers.
+///
+/// Windowing is split by role: **refdata** is kept across the whole `[0, --to]` scan (so a
+/// slow-round-robin instrument definition resolves the symbol's precision even when it predates the
+/// data window), while **snapshot + mktdata** are kept only within `[--from, --to]`. This lets a
+/// committed fixture stay small (a tight delta window) while still carrying the definition.
+fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Result<()> {
+    use codec_mbo::Message;
+    // Pass 1: symbol -> id, and (publisher, snapshot_id) -> instrument_id, across the whole scan
+    // (a def or a SnapshotBegin may follow the frames that reference it; defs are also collected
+    // before `--from` so a slow-round-robin definition still resolves the symbol).
+    let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
+    let mut snapshot_inst: HashMap<(Ipv4Addr, u32), u32> = HashMap::new();
+    for (_rel, src, f) in tagged {
+        if let Ok((_h, msgs)) = codec_mbo::decode_frame(f) {
+            for m in &msgs {
+                match m {
+                    Message::InstrumentDefinition(d) => {
+                        symbol_to_id.insert(d.symbol.clone(), d.instrument_id);
+                    }
+                    Message::SnapshotBegin(s) => {
+                        snapshot_inst.insert((*src, s.snapshot_id), s.instrument_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
+    let id_to_symbol: HashMap<u32, String> = symbol_to_id
+        .iter()
+        .map(|(s, &id)| (id, s.clone()))
+        .collect();
+
+    // Pass 2: classify each frame (refdata / snapshot / mktdata) and emit in capture order, tagged.
+    // Frames are port-segregated in practice, so each is one role; if one ever carries more than one
+    // kind, refdata wins over snapshot over mktdata (matching process_tob_combined's ref > mkt).
+    let path = out_path(&args.out, "combined");
+    let mut w = BufWriter::new(File::create(&path).with_context(|| format!("create {path:?}"))?);
+    let (mut refc, mut snapc, mut mktc, mut errors) = (0u64, 0u64, 0u64, 0u64);
+    // Raw per-(symbol, publisher) order-delta/trade message counts among the KEPT mktdata frames —
+    // the pre-dedup baseline the dedup test compares its emitted depth/trade counts against.
+    let mut per_symbol_pub: HashMap<(String, Ipv4Addr), u64> = HashMap::new();
+    // Window-sizing diagnostics: when the target symbol's definition first appears (refdata is kept
+    // from t=0, but the book's precision resolves only once it is seen), and every COMPLETE target
+    // snapshot group per publisher (a real snapshot syncs a book only via a SnapshotBegin..End pair).
+    let mut def_first_ts: Option<f64> = None;
+    let mut cur_begin: HashMap<Ipv4Addr, f64> = HashMap::new();
+    let mut groups: HashMap<Ipv4Addr, Vec<(f64, f64)>> = HashMap::new();
+    // `--empty-anchor`: per publisher, the synthesized anchor's (instrument_id, last_instrument_seq,
+    // anchor_seq), emitted once before that publisher's first delta. Unused when real snapshots are kept.
+    let mut anchor_done: HashMap<Ipv4Addr, (u32, u32, u64)> = HashMap::new();
+    for (rel, src, f) in tagged {
+        let Ok((_h, msgs)) = codec_mbo::decode_frame(f) else {
+            errors += 1;
+            continue;
+        };
+        let in_window = *rel >= args.from;
+        let mut is_ref = false;
+        let mut is_snap = false;
+        let mut snap_keep = false;
+        let mut md_ids: Vec<u32> = Vec::new();
+        for m in &msgs {
+            match m {
+                Message::ManifestSummary(_) => is_ref = true,
+                Message::InstrumentDefinition(d) => {
+                    is_ref = true;
+                    if def_first_ts.is_none()
+                        && target.as_ref().is_none_or(|t| t.contains(&d.instrument_id))
+                    {
+                        def_first_ts = Some(*rel);
+                    }
+                }
+                Message::SnapshotBegin(s) => {
+                    is_snap = true;
+                    if target.as_ref().is_none_or(|t| t.contains(&s.instrument_id)) {
+                        snap_keep = true;
+                        if in_window {
+                            cur_begin.insert(*src, *rel); // a new begin supersedes a half-open one
+                        }
+                    }
+                }
+                Message::SnapshotEnd(s) => {
+                    is_snap = true;
+                    if target.as_ref().is_none_or(|t| t.contains(&s.instrument_id)) {
+                        snap_keep = true;
+                        if in_window {
+                            if let Some(b) = cur_begin.remove(src) {
+                                groups.entry(*src).or_default().push((b, *rel));
+                            }
+                        }
+                    }
+                }
+                Message::SnapshotOrder(s) => {
+                    is_snap = true;
+                    let inst = snapshot_inst.get(&(*src, s.snapshot_id));
+                    snap_keep |= target
+                        .as_ref()
+                        .is_none_or(|t| inst.is_some_and(|i| t.contains(i)));
+                }
+                Message::OrderAdd(o) => md_ids.push(o.instrument_id),
+                Message::OrderCancel(o) => md_ids.push(o.instrument_id),
+                Message::OrderExecute(o) => md_ids.push(o.instrument_id),
+                Message::Trade(t) => md_ids.push(t.instrument_id),
+                _ => {}
+            }
+        }
+        let keep_md = in_window
+            && !md_ids.is_empty()
+            && target
+                .as_ref()
+                .is_none_or(|t| md_ids.iter().any(|id| t.contains(id)));
+        // refdata: kept across the whole scan; snapshot/mktdata: only inside [--from, --to]. With
+        // --empty-anchor, real snapshot frames are dropped (a synthetic anchor is emitted before each
+        // publisher's first delta instead), so a snapshot-role frame falls through to `continue`.
+        let role: u8 = if is_ref {
+            0
+        } else if !args.empty_anchor && in_window && is_snap && snap_keep {
+            2
+        } else if keep_md {
+            1
+        } else {
+            continue;
+        };
+        match role {
+            0 => refc += 1,
+            2 => snapc += 1,
+            _ => {
+                mktc += 1;
+                for id in &md_ids {
+                    if target.as_ref().is_none_or(|t| t.contains(id)) {
+                        if let Some(sym) = id_to_symbol.get(id) {
+                            *per_symbol_pub.entry((sym.clone(), *src)).or_default() += 1;
+                        }
+                    }
+                }
+                // --empty-anchor: synthesize this publisher's empty-book anchor right before its first
+                // delta, derived from that delta's per-instrument + mktdata seq so the delta is
+                // contiguous after the anchor and the book syncs immediately.
+                if args.empty_anchor && !anchor_done.contains_key(src) {
+                    if let Some((id, seq, mseq)) = first_target_delta_seq(f, &target) {
+                        let (anchor_seq, last_instr) =
+                            (mseq.saturating_sub(1), seq.saturating_sub(1));
+                        let af = synth_empty_anchor_frame(id, anchor_seq, last_instr);
+                        w.write_all(&(af.len() as u32).to_le_bytes())?;
+                        w.write_all(&src.octets())?;
+                        w.write_all(&[2u8])?;
+                        w.write_all(&af)?;
+                        snapc += 1;
+                        anchor_done.insert(*src, (id, last_instr, anchor_seq));
+                    }
+                }
+            }
+        }
+        w.write_all(&(f.len() as u32).to_le_bytes())?;
+        w.write_all(&src.octets())?;
+        w.write_all(&[role])?;
+        w.write_all(f)?;
+    }
+    w.flush()?;
+    eprintln!(
+        "combined MBO {} + {}: {refc} refdata + {snapc} snapshot + {mktc} mktdata frames (decode errors {errors}) -> {path:?}",
+        args.src,
+        args.combined_with.expect("combined mode")
+    );
+    match def_first_ts {
+        Some(t) => {
+            eprintln!("  target definition first seen at t={t:.3}s (refdata is kept from t=0)")
+        }
+        None => eprintln!("  target definition NOT seen in the scan — widen --to to capture it"),
+    }
+    for src in [args.src, args.combined_with.expect("combined mode")] {
+        if args.empty_anchor {
+            match anchor_done.get(&src) {
+                Some((id, last_instr, anchor_seq)) => eprintln!(
+                    "  publisher {src}: synthesized empty-book anchor (instrument_id={id}, last_instrument_seq={last_instr}, anchor_seq={anchor_seq})"
+                ),
+                None => eprintln!(
+                    "  publisher {src}: NO in-window delta — no anchor synthesized; widen [--from, --to]"
+                ),
+            }
+            continue;
+        }
+        let gs = groups.get(&src).map(Vec::as_slice).unwrap_or(&[]);
+        if gs.is_empty() {
+            eprintln!(
+                "  publisher {src}: NO complete target snapshot group in [--from, --to] — book will not sync; widen the window"
+            );
+        } else {
+            eprintln!(
+                "  publisher {src}: {} complete target snapshot group(s) in window:",
+                gs.len()
+            );
+            for (b, e) in gs.iter().take(6) {
+                eprintln!("      begin t={b:.3}s end t={e:.3}s span {:.3}s", e - b);
+            }
+            if gs.len() > 6 {
+                eprintln!("      … and {} more", gs.len() - 6);
+            }
+        }
+    }
+    let mut rows: Vec<_> = per_symbol_pub.into_iter().collect();
+    rows.sort_by_key(|b| std::cmp::Reverse(b.1));
+    eprintln!("  raw kept order-delta/trade messages per (symbol, publisher):");
+    for ((sym, ip), n) in rows {
+        eprintln!("    {sym:>8} {ip:>15}  {n}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(second) = args.combined_with {
-        if args.protocol != Protocol::Tob {
-            bail!("--combined-with is currently TOB-only");
-        }
-        let tagged = collect_tagged(&args, &[args.src, second])?;
-        eprintln!(
-            "matched {} combined TOB frames from {} + {}",
-            tagged.len(),
-            args.src,
-            second
-        );
-        return process_tob_combined(&tagged, &args);
+        let srcs = [args.src, second];
+        return match args.protocol {
+            Protocol::Tob => {
+                let tagged = collect_tagged(&args, &srcs)?;
+                eprintln!(
+                    "matched {} combined TOB frames from {} + {}",
+                    tagged.len(),
+                    args.src,
+                    second
+                );
+                process_tob_combined(&tagged, &args)
+            }
+            Protocol::Mbo => {
+                let tagged = collect_tagged_ts(&args, &srcs)?;
+                eprintln!(
+                    "matched {} combined MBO frames from {} + {}",
+                    tagged.len(),
+                    args.src,
+                    second
+                );
+                process_mbo_combined(&tagged, &args)
+            }
+        };
     }
     let frames = collect_frames(&args)?;
     eprintln!("matched {} {:?} frames", frames.len(), args.protocol);
