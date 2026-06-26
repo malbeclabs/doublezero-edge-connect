@@ -11,6 +11,9 @@
 #     doublezero-edge-connect                            # ingest ALL known feeds (default)
 #   docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
 #     doublezero-edge-connect --feed Hyperliquid         # narrow to specific venue(s)
+#   docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
+#     -e DZ_SHRED_DISABLE=true doublezero-edge-connect   # opt out of the auto shred forwarder
+#                                                        # (or append --shred-forward-disable)
 #
 # Host networking (`--network host`) is required: the bridge joins the DZ Edge multicast
 # group on the host's `doublezero1` interface, which a bridged container network can't see.
