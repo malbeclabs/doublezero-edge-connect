@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Container logs can no longer fill the host disk, and the default is quieter:
+  - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with
+    `max-size=20m` + `max-file=3`, capping the long-lived container's on-disk log at ~60 MB
+    (previously unbounded — the default driver rotated nothing). Documented for by-hand runs in
+    `docs/self-hosting.md`.
+  - The default log filter (when `RUST_LOG` is unset) is now `warn,doublezero_edge_connect=info`
+    instead of a blanket `info`: the bridge's own startup/operational breadcrumbs stay at `info`
+    while noisy dependency chatter is held to `warn`. Set `RUST_LOG=debug` for verbose output.
+    Applied in both `src/main.rs` and the image `ENV`.
+
 ### Fixed
 - Installer pre-flight access-pass check (`scripts/connect*.sh`) hardened after review:
   - A confirmed miss (an identity with no pass for the host IP or `0.0.0.0`) now only hard-aborts

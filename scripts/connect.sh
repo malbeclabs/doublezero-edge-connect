@@ -410,6 +410,9 @@ info "Starting edge-connect bridge (env=$DZ_ENV)..."
 $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
 # Bind-mount the keypair only when the secret was a file; a token-derived key is
 # injected into the container after it starts (so it never touches the host disk).
+# The json-file log driver is set explicitly with a size/count cap so this long-lived
+# container can't fill the host disk (max-size=20m x max-file=3 ~= 60 MB ceiling),
+# independent of the host daemon's default driver — and `docker logs` still works.
 mount_args=()
 [ "$KEY_SRC" = file ] && mount_args=(-v "$KEYFILE":"$KEYPAIR_DEST":"$MNT_OPT")
 # Relay bridge env vars to the container. The bridge reads every flag from an env var, so this is
@@ -431,6 +434,9 @@ done
 $SUDO docker run -d --name "$DZ_NAME" \
   --restart unless-stopped \
   --stop-timeout 60 \
+  --log-driver json-file \
+  --log-opt max-size=20m \
+  --log-opt max-file=3 \
   --network host \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --device /dev/net/tun \
