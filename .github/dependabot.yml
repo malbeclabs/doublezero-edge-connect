@@ -8,8 +8,12 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
+      interval: "monthly"
     open-pull-requests-limit: 10
+    labels:
+      - "skip-changelog"
+      - "dependencies"
+      - "rust"
     groups:
       rust-minor-patch:
         update-types: [minor, patch]
@@ -23,8 +27,12 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 10
+    labels:
+      - "skip-changelog"
+      - "dependencies"
+      - "github_actions"
     groups:
       actions-minor-patch:
         update-types: [minor, patch]
