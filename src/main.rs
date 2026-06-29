@@ -151,6 +151,27 @@ struct Args {
     )]
     ws_input_url: String,
 
+    /// EDGE symbols to back on the Phoenix **public-API** trade feeder, repeatable/comma-separated
+    /// (e.g. `--phoenix-ws-input-markets SOL-PERP`). This backstop races Phoenix's public trades
+    /// against the DZ Edge Phoenix multicast in the shared arbiter (deduped on trade_id), so the edge
+    /// wins in steady state and the public copy fills in only when the edge gaps. Trades only — no
+    /// quote backstop. Empty (the default) leaves the feeder off.
+    #[arg(
+        long = "phoenix-ws-input-markets",
+        env = "PHOENIX_WS_INPUT_MARKETS",
+        value_delimiter = ','
+    )]
+    phoenix_ws_input_markets: Vec<String>,
+
+    /// URL for the Phoenix public WS trade feeder. Defaults to Phoenix's public endpoint; override to
+    /// point the feeder at a local mock (e.g. in tests).
+    #[arg(
+        long = "phoenix-ws-input-url",
+        env = "PHOENIX_WS_INPUT_URL",
+        default_value = "wss://perp-api.phoenix.trade/v1/ws"
+    )]
+    phoenix_ws_input_url: String,
+
     /// Prometheus metrics HTTP endpoint bind address (e.g. `127.0.0.1:9090`). Off by default
     /// (opt-in): empty means no endpoint is exposed. Metrics are recorded regardless; this only
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
@@ -339,6 +360,23 @@ async fn main() -> Result<()> {
         )))
     };
 
+    // Phoenix public-API trade feeder: off unless `--phoenix-ws-input-markets` is non-empty. Same
+    // shape as the HL feeder — its own failure-isolated task emitting through the shared arbiter, so
+    // public trades race the edge Phoenix multicast (deduped on trade_id) and backstop it.
+    let phoenix_ws_input = if args.phoenix_ws_input_markets.is_empty() {
+        info!("Phoenix public WS trade feeder disabled (no --phoenix-ws-input-markets)");
+        None
+    } else {
+        info!(markets = ?args.phoenix_ws_input_markets, url = %args.phoenix_ws_input_url,
+              "starting Phoenix public WS trade feeder");
+        Some(tokio::spawn(ingest::phoenix_feeder::run(
+            args.phoenix_ws_input_url.clone(),
+            args.phoenix_ws_input_markets.clone(),
+            arbiter.clone(),
+            instruments.clone(),
+        )))
+    };
+
     // Exit if the WS server (when enabled) or any feed receiver returns (they loop forever). When
     // the WS sink is disabled, that arm is a never-resolving future so the process is driven by the
     // receivers alone. The WS input feeder loops forever too; its arm resolves only if the task
@@ -365,6 +403,10 @@ async fn main() -> Result<()> {
         } } => {},
         Some(r) = receivers.join_next() => r??,
         r = async { match ws_input {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r?,
+        r = async { match phoenix_ws_input {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r?,
