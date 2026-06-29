@@ -114,16 +114,17 @@ pub struct Metrics {
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
 
-    // --- Public WS input feeder (Hyperliquid backstop; off by default) ---
-    /// Feeder health: 1 while the public WebSocket session is connected, 0 while down/reconnecting.
-    pub ws_feeder_up: IntGauge,
-    /// Public WS (re)connect cycles — incremented each time a session ends or a connect attempt fails
-    /// and the feeder backs off to retry.
-    pub ws_feeder_reconnects: IntCounter,
-    /// Public WS frames that failed to decode (undecodable envelope; dropped best-effort).
-    pub ws_feeder_decode_errors: IntCounter,
-    /// Business messages decoded from the public WS and emitted through the arbiter, by `kind`
-    /// (quote/trade).
+    // --- Public WS input feeders (per-venue backstops; off by default) ---
+    /// Feeder health per `venue`: 1 while the public WebSocket session is connected, 0 while
+    /// down/reconnecting.
+    pub ws_feeder_up: IntGaugeVec,
+    /// Public WS (re)connect cycles per `venue` — incremented each time a session ends or a connect
+    /// attempt fails and the feeder backs off to retry.
+    pub ws_feeder_reconnects: IntCounterVec,
+    /// Public WS frames that failed to decode (undecodable envelope; dropped best-effort), by `venue`.
+    pub ws_feeder_decode_errors: IntCounterVec,
+    /// Business messages decoded from the public WS and emitted through the arbiter, by `venue` and
+    /// `kind` (quote/trade).
     pub ws_feeder_messages: IntCounterVec,
 
     // --- Shred forwarder ---
@@ -370,26 +371,29 @@ impl Metrics {
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
             ),
-            ws_feeder_up: gauge(
+            ws_feeder_up: gauge_vec(
                 &registry,
                 "dz_ws_feeder_up",
                 "Public WS input feeder health: 1 while connected, 0 while down/reconnecting",
+                &["venue"],
             ),
-            ws_feeder_reconnects: counter(
+            ws_feeder_reconnects: counter_vec(
                 &registry,
                 "dz_ws_feeder_reconnects_total",
                 "Public WS (re)connect cycles (session ended or connect attempt failed)",
+                &["venue"],
             ),
-            ws_feeder_decode_errors: counter(
+            ws_feeder_decode_errors: counter_vec(
                 &registry,
                 "dz_ws_feeder_decode_errors_total",
                 "Public WS frames that failed to decode (dropped best-effort)",
+                &["venue"],
             ),
             ws_feeder_messages: counter_vec(
                 &registry,
                 "dz_ws_feeder_messages_total",
-                "Business messages decoded from the public WS and emitted, by kind",
-                &["kind"],
+                "Business messages decoded from the public WS and emitted, by venue and kind",
+                &["venue", "kind"],
             ),
             shred_datagrams_received: counter_vec(
                 &registry,
