@@ -34,7 +34,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Prometheus metrics: an explicit `Registry` + text encoder, served by a hand-rolled minimal HTTP
 # handler (no HTTP framework — see `sinks::metrics`). `default-features = false` drops the unused
 # protobuf encoder; `process` adds the Linux process collector (CPU/RSS/fds) for free.
-prometheus = { version = "0.13", default-features = false, features = ["process"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
 
 [dev-dependencies]
 serial_test = "3"
