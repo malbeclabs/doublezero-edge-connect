@@ -39,20 +39,22 @@ One WS-server task plus **one receiver task per selected feed** share a single
 `tokio::sync::broadcast` channel of `FeedMessage` (the fan-out backbone) and a `Mutex<HashMap>`
 instrument snapshot. `main.rs` selects feeds (`--feed`, or all of `ingest::feeds::FEEDS` by
 default), builds the shared `Arbiter` around the broadcast `Sender`, spawns the receivers into a
-`JoinSet` (and the optional WS input feeder), and exits if the WS server, any receiver, or the
+`JoinSet` (and the optional public WS input feeders), and exits if the WS server, any receiver, or a
 feeder task returns.
 
 Ingest has **two source transports** that converge on one shared `arbiter` before the broadcast:
-the always-on DZ Edge **multicast** receivers, and an optional Hyperliquid **public WebSocket**
-feeder (`ingest::ws_feeder`, off by default) that backstops the edge feed. Both emit the same
-`FeedMessage`s and race in the arbiter's one per-`(venue, symbol)` floor (see `ingest/arbiter.rs`
-below), so cross-source duplicates collapse and the public copy fills in only when the edge gaps.
+the always-on DZ Edge **multicast** receivers, and optional **public WebSocket** feeders (off by
+default) that backstop the edge feed — Hyperliquid (`ingest::ws_feeder`, quotes + trades) and
+Phoenix (`ingest::phoenix_feeder`, trades only). Both transports emit the same `FeedMessage`s and
+race in the arbiter's one per-`(venue, symbol)` floor (see `ingest/arbiter.rs` below), so
+cross-source duplicates collapse and the public copy fills in only when the edge gaps.
 
 Modules are grouped by role under `src/`:
 - **`ingest/`** — the source→`FeedMessage` pipeline (always on): `feeds`, `receiver`,
-  `processor`, `book`, `subscriber`, `arbiter`, the optional `ws_feeder`, and the codecs (`codec`,
-  `codec_common`, `codec_midpoint`, `codec_mbo`). Intra-pipeline references use `crate::ingest::*`;
-  this half knows nothing about how the data is re-served.
+  `processor`, `book`, `subscriber`, `arbiter`, the optional public feeders (`public_feeder`
+  scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
+  `codec_midpoint`, `codec_mbo`). Intra-pipeline references use `crate::ingest::*`; this half knows
+  nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
@@ -106,15 +108,28 @@ Modules are grouped by role under `src/`:
   feeder share **one** floor per `(venue, symbol)` and race on it. The floor lived inside
   `TobProcessor` under PR #29; it was lifted here so a different transport (the WS feeder) can race in
   the same floor. `Status` routes straight to `sender()` (no business identity to dedup).
-- **`ingest/ws_feeder.rs`** — the optional Hyperliquid **public** WS input feeder (off by default).
+- **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
+  public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
+  reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
+  `venue`; no-op when `subscribe_msgs()` is empty; never propagates an error), the frame pump, and the
+  decode helpers (`instrument_known`, `parse_decimal`, `finite_non_negative`). Each venue implements
+  only its URL + subscribe frames + wire decode.
+- **`ingest/ws_feeder.rs`** — the Hyperliquid `PublicVenue` (off by default), the first public backstop.
   Connects `wss://api.hyperliquid.xyz/ws` over TLS, subscribes `bbo` + `trades` per coin on one
   connection, decodes the HL JSON → `FeedMessage`, scales the public block time (ms) to ns so it
   shares the **same canonical `source_ts`** as the edge copy, and emits through the shared arbiter as
   `Publisher::PublicWs`. Gates each emission on the `(venue, symbol)` instrument being known in the
-  shared snapshot (precision before price, supplied by edge refdata). Its own task with reconnect +
-  backoff; decode/socket errors are logged and swallowed so the multicast hot path is never touched.
-  Backstop behavior falls out of the floor: edge leads each tick in steady state (public copy dropped
-  as a no-op), public fills in on an edge gap — no health check.
+  shared snapshot (precision before price, supplied by edge refdata). Backstop behavior falls out of
+  the floor: edge leads each tick in steady state (public copy dropped as a no-op), public fills in on
+  an edge gap — no health check.
+- **`ingest/phoenix_feeder.rs`** — the Phoenix `PublicVenue` (off by default), **trades only** (the
+  edge Quote is a spline-blended BBO; the public book is resting-only, a different quantity, so no
+  quote backstop). Subscribes Phoenix's public `trades` channel per market, maps each EDGE symbol to
+  its public base by stripping a trailing `-PERP` (`SOL-PERP` → `SOL`), derives the trade price as
+  `quoteAmount / baseAmount`, and emits `NormalizedTrade`s as `Publisher::PublicWs` keyed on
+  `trade_id` = the public `tradeSequenceNumber` (the arbiter's windowed trade dedup races them). ⚠️
+  The public schema (field names/units, the `-PERP` strip rule, the `trade_id` equivalence) is from
+  docs (closed beta) and **not yet reference-validated**; no `FEEDS` row depends on it.
 - **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`

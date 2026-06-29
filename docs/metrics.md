@@ -79,18 +79,19 @@ Recorded by the WebSocket sink (`src/sinks/ws.rs`).
 | `dz_ws_rate_limited_total` | counter | — | Clients disconnected for exceeding the inbound rate limit. |
 | `dz_ws_idle_timeout_total` | counter | — | Clients reaped for crossing the idle timeout. |
 
-## Public WS input feeder
+## Public WS input feeders
 
-Recorded by the optional Hyperliquid public WebSocket backstop (`src/ingest/ws_feeder.rs`; off by
-default — see [Input sources](input-sources.md)). Its quote/trade contribution to the arbiter floor
-is attributed via `dz_quotes_admitted_total{publisher="public"}` above.
+Recorded by the optional public WebSocket backstops (Hyperliquid `src/ingest/ws_feeder.rs`, Phoenix
+`src/ingest/phoenix_feeder.rs`; both off by default — see [Input sources](input-sources.md)). Every
+series is labelled by `venue` so multiple feeders don't collide. Their quote/trade contribution to
+the arbiter floor is attributed via `dz_quotes_admitted_total{publisher="public"}` above.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `dz_ws_feeder_up` | gauge | — | `1` while the public WS session is connected, `0` while down/reconnecting. |
-| `dz_ws_feeder_reconnects_total` | counter | — | (Re)connect cycles — a session ended or a connect attempt failed and the feeder backed off to retry. |
-| `dz_ws_feeder_decode_errors_total` | counter | — | Public WS frames that failed to decode (dropped best-effort). |
-| `dz_ws_feeder_messages_total` | counter | `kind` | Business messages decoded from the public WS and emitted, by `kind` (quote/trade). |
+| `dz_ws_feeder_up` | gauge | `venue` | `1` while the public WS session is connected, `0` while down/reconnecting. |
+| `dz_ws_feeder_reconnects_total` | counter | `venue` | (Re)connect cycles — a session ended or a connect attempt failed and the feeder backed off to retry. |
+| `dz_ws_feeder_decode_errors_total` | counter | `venue` | Public WS frames that failed to decode (dropped best-effort). |
+| `dz_ws_feeder_messages_total` | counter | `venue`, `kind` | Business messages decoded from the public WS and emitted, by `kind` (quote/trade). |
 
 ## Shred forwarder
 
