@@ -51,6 +51,15 @@ pub struct Metrics {
     pub quotes_admitted: IntCounterVec,
     /// Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat — collapsed).
     pub quotes_dropped: IntCounterVec,
+    /// MBO `depth` snapshots admitted by the staleness floor, attributed to the winning `publisher`
+    /// (edge/public). Per-publisher books race on one floor per (venue, symbol); a rise here for a
+    /// given publisher class shows which source is currently leading the reconstructed book.
+    pub depth_admitted: IntCounterVec,
+    /// MBO `depth` snapshots dropped by the staleness floor (stale tick, non-leader publisher's
+    /// redundant book, or the leader's exact content repeat — the cross-publisher collapse).
+    pub depth_dropped: IntCounterVec,
+    /// `depth` rejected for an implausibly-far-future `source_ts` before it could advance the floor.
+    pub depth_future_rejected: IntCounterVec,
     /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
     pub trades_dropped: IntCounterVec,
     /// Quotes rejected for an implausibly-far-future `source_ts` before they could advance the floor.
@@ -218,6 +227,24 @@ impl Metrics {
                 &registry,
                 "dz_quotes_dropped_total",
                 "Quotes dropped by the staleness floor",
+                &["venue"],
+            ),
+            depth_admitted: counter_vec(
+                &registry,
+                "dz_depth_admitted_total",
+                "MBO depth admitted by the staleness floor, by winning publisher (edge/public)",
+                &["venue", "publisher"],
+            ),
+            depth_dropped: counter_vec(
+                &registry,
+                "dz_depth_dropped_total",
+                "MBO depth dropped by the staleness floor",
+                &["venue"],
+            ),
+            depth_future_rejected: counter_vec(
+                &registry,
+                "dz_depth_future_rejected_total",
+                "MBO depth rejected for an implausibly-far-future source_ts",
                 &["venue"],
             ),
             trades_dropped: counter_vec(
