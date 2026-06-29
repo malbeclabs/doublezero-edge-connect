@@ -16,7 +16,11 @@ It removes operator guesswork that produced empty runs before:
 
 PREREQUISITES (run on a host with BOTH edge + public reach)
   - On the DZ Edge network, receiving the Phoenix multicast group (--group, default 233.84.178.18)
-    on its edge interface (--iface, default doublezero1; pass a name, an IPv4, or 0.0.0.0).
+    on its edge interface (--iface, default doublezero1). NOTE: --iface scopes ONLY the multicast
+    join; the public REST + WebSocket use the host's normal internet route (a different interface)
+    and are unaffected by it. So the host needs BOTH: edge multicast on --iface AND internet reach to
+    perp-api.phoenix.trade. Keep --iface as the edge interface (doublezero1); don't use 0.0.0.0, which
+    can join the multicast on the wrong interface and receive nothing.
   - Reach to https://perp-api.phoenix.trade (REST market list) and wss://perp-api.phoenix.trade/v1/ws.
   - Python 3.9+ and `pip install websockets`. No root needed. Passive (SO_REUSEPORT) — safe next to a
     running bridge/publisher.
@@ -479,7 +483,10 @@ def main():
     ap.add_argument("--group", default="233.84.178.18", help="edge Phoenix multicast group")
     ap.add_argument("--mktdata-port", type=int, default=9201)
     ap.add_argument("--refdata-port", type=int, default=9202)
-    ap.add_argument("--iface", default="doublezero1", help="interface name, IPv4, or 0.0.0.0 (default iface)")
+    ap.add_argument("--iface", default="doublezero1",
+                    help="EDGE MULTICAST interface only (name or IPv4) — the DZ tunnel that carries the "
+                         "Phoenix group. The public REST/WS are NOT bound to it (they use the host's "
+                         "internet route). Avoid 0.0.0.0: it can join multicast on the wrong interface.")
     ap.add_argument("--ws-url", default="wss://perp-api.phoenix.trade/v1/ws")
     ap.add_argument("--markets-url", default=DEFAULT_MARKETS_URL, help="REST endpoint listing exchange markets")
     ap.add_argument("--markets", default="", help="restrict to these PUBLIC symbols (default: all active, discovered)")
