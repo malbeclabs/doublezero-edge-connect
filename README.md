@@ -95,6 +95,11 @@ endpoint — off by default), `RUST_LOG`, and the shred forwarder's `DZ_SHRED_*`
 `DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`). The full list with defaults is the `Args`
 struct in [`src/main.rs`](src/main.rs); per-feature config lives in the [docs](docs/) (see below).
 
+> **Logging defaults.** Unset, `RUST_LOG` defaults to `warn,doublezero_edge_connect=info`: the
+> bridge's own startup/operational lines stay at `info` while noisy dependency chatter is held to
+> `warn`. Set `RUST_LOG=debug` for verbose output. The installer also caps the container log on
+> disk (json-file driver, ~60 MB ceiling) so it can't fill the host.
+
 > **Limitation:** only **non-empty** values are forwarded, so you can't pass an *empty* override
 > (e.g. `WS_BIND=""` to disable the WebSocket sink) through the installer. For that, run a
 > hand-written `docker run` — see [Self-hosting](docs/self-hosting.md).

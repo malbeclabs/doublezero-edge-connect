@@ -180,9 +180,14 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // RUST_LOG, when set, is honored verbatim. Unset, we default to a quiet base of `warn`
+    // (so noisy dependency chatter stays out of the container log, which the json-file driver
+    // caps on disk) while keeping our own crate at `info` for startup/operational breadcrumbs.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("warn,doublezero_edge_connect=info")
+            }),
         )
         .init();
 

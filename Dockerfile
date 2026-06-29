@@ -82,8 +82,10 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/bridge-entrypoint.sh
 # DZ_RECORD — see `Args` in src/main.rs), so downstream projects override behaviour with
 # `-e VAR=...` / compose `environment:` without rebuilding (e.g. `-e DZ_FEEDS=Hyperliquid`).
 # We only set RUST_LOG here; the binary's own clap defaults remain the source of truth for
-# the rest (avoids this file drifting from the code).
-ENV RUST_LOG=info
+# the rest (avoids this file drifting from the code). The quiet default keeps the bridge's
+# own logs at info while silencing noisy dependency chatter (mirrors the binary's built-in
+# default in src/main.rs); override with `-e RUST_LOG=debug` to get verbose output.
+ENV RUST_LOG=warn,doublezero_edge_connect=info
 
 # Documentational: host networking ignores published ports, but this records the WS port (8081).
 EXPOSE 8081

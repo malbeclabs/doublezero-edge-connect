@@ -30,7 +30,8 @@ sudo sysctl -w net.core.rmem_max=268435456   # allow a large SO_RCVBUF (recommen
 ```
 
 All CLI flags also read from env vars (`DZ_FEEDS`, `DZ_IFACE`, `WS_BIND`, etc. — see the
-`Args` struct in `src/main.rs`). Logging is via `tracing` with `RUST_LOG` env-filter (default `info`).
+`Args` struct in `src/main.rs`). Logging is via `tracing` with `RUST_LOG` env-filter; unset it
+defaults to `warn,doublezero_edge_connect=info` (our crate at `info`, deps quiet at `warn`).
 
 ## Architecture
 
