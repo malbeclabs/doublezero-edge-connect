@@ -73,12 +73,22 @@ struct PhoenixVenue {
 
 impl PhoenixVenue {
     /// Build a venue from the EDGE symbols to back (e.g. `["SOL-PERP"]`). The public key for each is
-    /// the edge symbol with a `-PERP` suffix stripped (`SOL-PERP` → `SOL`).
+    /// the edge symbol with a `-PERP` suffix stripped (`SOL-PERP` → `SOL`). Two edge symbols that
+    /// strip to the same public base would collapse to one map entry (last wins, silently dropping
+    /// the other market), so warn on a collision rather than swallow it.
     fn new(url: String, markets: Vec<String>) -> Self {
-        let symbol_map = markets
-            .into_iter()
-            .map(|edge| (public_symbol(&edge).to_string(), edge))
-            .collect();
+        let mut symbol_map = BTreeMap::new();
+        for edge in markets {
+            let public = public_symbol(&edge).to_string();
+            if let Some(prev) = symbol_map.insert(public.clone(), edge.clone()) {
+                tracing::warn!(
+                    public_symbol = %public,
+                    dropped = %prev,
+                    kept = %edge,
+                    "Phoenix markets collide on the same public base; dropping the earlier one"
+                );
+            }
+        }
         Self { url, symbol_map }
     }
 
