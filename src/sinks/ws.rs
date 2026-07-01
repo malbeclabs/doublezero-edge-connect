@@ -84,20 +84,17 @@ impl Drop for ClientGuard {
     }
 }
 
-pub async fn run(
-    bind: String,
-    tx: broadcast::Sender<FeedMessage>,
-    instruments: InstrumentSnapshot,
-    depth: DepthSnapshot,
-    cfg: WsConfig,
-) -> Result<()> {
-    let listener = TcpListener::bind(&bind).await?;
-    info!(%bind, max_clients = cfg.max_clients, "WebSocket server listening");
-    serve(listener, tx, instruments, depth, cfg).await
+/// Bind the WebSocket listener up front so the caller can decide what a bind failure means.
+/// A taken port must not be fatal to the whole process (it would take the DoubleZero tunnel
+/// down with it — see `main.rs`), so binding is a separate, awaitable step from serving.
+pub async fn bind(addr: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(addr).await?;
+    info!(bind = %addr, "WebSocket server listening");
+    Ok(listener)
 }
 
-/// The accept loop, split out so tests can drive a pre-bound listener on an ephemeral port.
-async fn serve(
+/// The accept loop, split out so tests (and `main`) can drive a pre-bound listener.
+pub async fn serve(
     listener: TcpListener,
     tx: broadcast::Sender<FeedMessage>,
     instruments: InstrumentSnapshot,

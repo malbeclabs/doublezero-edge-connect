@@ -40,7 +40,10 @@ One WS-server task plus **one receiver task per selected feed** share a single
 instrument snapshot. `main.rs` selects feeds (`--feed`, or all of `ingest::feeds::FEEDS` by
 default), builds the shared `Arbiter` around the broadcast `Sender`, spawns the receivers into a
 `JoinSet` (and the optional public WS input feeders), and exits if the WS server, any receiver, or a
-feeder task returns.
+feeder task returns. **Exception:** the WS listener is bound *eagerly* before its task is spawned,
+and a bind failure (e.g. the port is already taken) is logged as a warning and the process runs
+without the sink — never fatal, so a taken WS port can't crash-loop the container and tear down the
+DoubleZero tunnel.
 
 Ingest has **two source transports** that converge on one shared `arbiter` before the broadcast:
 the always-on DZ Edge **multicast** receivers, and optional **public WebSocket** feeders (off by
@@ -163,7 +166,9 @@ Modules are grouped by role under `src/`:
   `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose), app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
-  (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest).
+  (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
+  listener is bound via `ws::bind()` (separate from `ws::serve()`) so `main.rs` can treat a bind
+  failure as non-fatal — a taken port disables the sink but leaves the tunnel running.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the `now_ns()` /
   `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by

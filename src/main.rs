@@ -234,24 +234,41 @@ async fn main() -> Result<()> {
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
 
     // WebSocket sink: on by default; disable it by passing an empty `--ws-bind`.
+    //
+    // Bind eagerly here rather than inside the spawned task so a bind failure (e.g. the port is
+    // already taken — `0.0.0.0:8081` collides with any pre-existing `127.0.0.1:8081` listener) is
+    // NOT fatal: it would otherwise propagate through the `select!` below, exit the process, and —
+    // under the container's `--restart unless-stopped` — crash-loop the whole bridge, tearing down
+    // doublezerod and the DoubleZero tunnel with it. Instead we log a warning and run without the
+    // sink; the tunnel and shred forwarding are unaffected.
     let ws = if args.ws_bind.is_empty() {
         info!("WebSocket sink disabled (empty --ws-bind)");
         None
     } else {
-        let ws_cfg = sinks::ws::WsConfig {
-            heartbeat: std::time::Duration::from_secs(args.ws_heartbeat_secs),
-            idle_timeout: std::time::Duration::from_secs(args.ws_idle_timeout_secs),
-            max_clients: args.ws_max_clients,
-            max_subs: args.ws_max_subs,
-            max_inbound_per_min: args.ws_max_inbound_per_min,
-        };
-        Some(tokio::spawn(sinks::ws::run(
-            args.ws_bind.clone(),
-            tx.clone(),
-            instruments.clone(),
-            depth.clone(),
-            ws_cfg,
-        )))
+        match sinks::ws::bind(&args.ws_bind).await {
+            Ok(listener) => {
+                let ws_cfg = sinks::ws::WsConfig {
+                    heartbeat: std::time::Duration::from_secs(args.ws_heartbeat_secs),
+                    idle_timeout: std::time::Duration::from_secs(args.ws_idle_timeout_secs),
+                    max_clients: args.ws_max_clients,
+                    max_subs: args.ws_max_subs,
+                    max_inbound_per_min: args.ws_max_inbound_per_min,
+                };
+                Some(tokio::spawn(sinks::ws::serve(
+                    listener,
+                    tx.clone(),
+                    instruments.clone(),
+                    depth.clone(),
+                    ws_cfg,
+                )))
+            }
+            Err(e) => {
+                warn!(bind = %args.ws_bind, error = %e,
+                    "WebSocket sink failed to bind (port already in use?); continuing without it \
+                     — the DoubleZero tunnel and shred forwarding are unaffected");
+                None
+            }
+        }
     };
 
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always

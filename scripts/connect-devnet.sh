@@ -377,13 +377,79 @@ if [ "$($SUDO sysctl -n net.core.rmem_max 2>/dev/null || echo 0)" -lt "$RECV_BUF
     || warn "Could not raise net.core.rmem_max to $RECV_BUF_MAX (the bridge will use the host's current ceiling)."
 fi
 
-# best-effort firewall hints (don't auto-edit the user's firewall)
+# best-effort firewall hints (don't auto-edit the user's firewall). Beyond GRE + the liveness
+# port, a *default-deny-incoming* host also has to admit the decapsulated inner traffic: the GRE
+# rule lets the outer encapsulated packets in, but once the kernel decapsulates them the inner
+# multicast UDP re-traverses the INPUT chain on the tunnel interface (doublezero1) and is dropped
+# unless that interface is allowed. The interface only exists once the tunnel is up, but the rule
+# can be added ahead of time.
 if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi "Status: active"; then
-  warn "ufw is active: ensure IP protocol 47 (GRE) and UDP $LIVENESS_UDP_PORT are allowed."
+  warn "ufw is active: allow GRE (IP protocol 47) and UDP $LIVENESS_UDP_PORT, e.g.
+       sudo ufw allow proto gre from any to any
+       sudo ufw allow $LIVENESS_UDP_PORT/udp
+     If your policy is default-deny-incoming, also admit the decapsulated inner multicast on the tunnel:
+       sudo ufw allow in on doublezero1"
 fi
 if command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state 2>/dev/null | grep -qi running; then
-  warn "firewalld is running: ensure GRE (protocol 47) and UDP $LIVENESS_UDP_PORT are allowed."
+  warn "firewalld is running: allow GRE (protocol 47) and UDP $LIVENESS_UDP_PORT. If your default zone denies incoming, also place the tunnel interface in a trusted zone once it exists:
+       sudo firewall-cmd --zone=trusted --change-interface=doublezero1"
 fi
+
+# ----------------------------------------------------------------------------
+# 4b. WebSocket sink port preflight (host-side)
+# ----------------------------------------------------------------------------
+# A taken WS port would make the bridge fail to bind that listener. The bridge now degrades
+# gracefully (it logs a warning and runs without the sink — the DoubleZero tunnel is unaffected),
+# but catch the conflict here too so the operator can pick another port or disable the sink up
+# front instead of silently losing the WS output. Also defines ws_disabled/ws_port, reused by the
+# env passthrough and the final status print.
+
+# The WS sink is disabled when WS_BIND is set-but-empty (WS_BIND="").
+ws_disabled() { [ "${WS_BIND+set}" = set ] && [ -z "${WS_BIND}" ]; }
+# The WS port: WS_BIND's trailing :port when set non-empty, else the default WS_PORT.
+ws_port() { if [ -n "${WS_BIND:-}" ]; then printf '%s' "${WS_BIND##*:}"; else printf '%s' "$WS_PORT"; fi; }
+
+# Is a TCP port already bound on this host? Prefer ss, fall back to netstat; if neither exists we
+# can't tell (rc 2 -> skip). A ':'/'.' immediately before the port anchors the match so e.g. 8081
+# doesn't match 18081.
+port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    $SUDO ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  elif command -v netstat >/dev/null 2>&1; then
+    $SUDO netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  else
+    return 2
+  fi
+}
+
+preflight_ws_port() {
+  ws_disabled && return 0                       # sink off -> nothing to bind
+  local p; p="$(ws_port)"
+  case "$p" in *[!0-9]*|'') return 0;; esac      # not a plain numeric port -> let the bridge validate WS_BIND
+  port_in_use "$p"; local rc=$?
+  if [ "$rc" -eq 2 ]; then
+    warn "Can't check whether TCP port $p is free (no ss/netstat installed); if it's in use the WS sink won't bind (the tunnel is unaffected)."
+    return 0
+  fi
+  [ "$rc" -ne 0 ] && return 0                    # free
+  # In use — name the holder when ss can show it.
+  local who=""
+  command -v ss >/dev/null 2>&1 && who="$($SUDO ss -Hltnp 2>/dev/null | awk -v p=":${p}\$" '$4 ~ p {print $NF; exit}')"
+  warn "TCP port $p is already in use${who:+ ($who)}; the WS market-data sink can't bind there."
+  if [ -r "$TTY" ] && [ "$DZ_ASSUME_YES" != 1 ]; then
+    local choice; choice="$(ask 'WS port in use — [p]ick another port, [d]isable the WS sink, or [c]ontinue anyway' 'c')"
+    case "$choice" in
+      p|P) local np; np="$(ask 'New WS port' '8181')"; WS_BIND="0.0.0.0:${np}"; WS_PORT="$np"
+           info "WS sink will use 0.0.0.0:${np}."; preflight_ws_port ;;   # re-check the new choice
+      d|D) WS_BIND=""; info "WS sink disabled (WS_BIND=\"\")." ;;
+      *)   warn "Continuing; the bridge starts without the WS sink (the tunnel is unaffected)." ;;
+    esac
+  else
+    warn "Continuing non-interactively; the bridge starts without the WS sink (the tunnel is unaffected). Re-run with WS_BIND=<host>:<free-port> to serve it, or WS_BIND=\"\" to disable it explicitly."
+  fi
+}
+preflight_ws_port
 
 # ----------------------------------------------------------------------------
 # 5. cloud detection -> warn about provider-level firewall (script can't fix)
@@ -427,11 +493,10 @@ mount_args=()
 [ "$KEY_SRC" = file ] && mount_args=(-v "$KEYFILE":"$KEYPAIR_DEST":"$MNT_OPT")
 # Relay bridge env vars to the container. The bridge reads every flag from an env var, so this is
 # the only wiring needed to tune the WS sink, narrow feeds, or raise log level — no per-feature
-# logic here. Only non-empty values are forwarded (so an empty override like WS_BIND="" to disable
-# the WS sink can't be passed this way — use a hand-written `docker run` for that edge case).
+# logic here. Only non-empty values are forwarded, with one exception (WS_BIND, below).
 PASSTHROUGH=(
   DZ_FEEDS DZ_IFACE DZ_RECV_BUF
-  WS_BIND WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
+  WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
   DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
   DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
@@ -441,6 +506,10 @@ env_args=()
 for v in "${PASSTHROUGH[@]}"; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
+# WS_BIND is the one var forwarded whenever it is *set* — including set-but-empty (WS_BIND="") —
+# so the WS sink can be disabled straight from the one-liner (an empty --ws-bind turns the sink
+# off in the bridge). The preflight above may also have set/cleared it in response to a conflict.
+[ "${WS_BIND+set}" = set ] && env_args+=(-e "WS_BIND=${WS_BIND}")
 $SUDO docker run -d --name "$DZ_NAME" \
   --restart unless-stopped \
   --stop-timeout 60 \
@@ -483,7 +552,7 @@ EXEC_TTY=""; [ -t 1 ] && EXEC_TTY="-t"
 # user onchain for $DZ_ENV. If this errors with an access-pass message, that
 # provisioning step still needs to happen. Once the tunnel is up, the bridge
 # self-heals onto the doublezero1 interface within ~30s and quotes begin flowing.
-$SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast || warn "connect failed (often: no access pass for this IP, or provider firewall/NAT). See notes above."
+$SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast || warn "connect failed (often: no access pass for this IP; provider firewall/NAT; or a default-deny host firewall dropping the decapsulated inner multicast on doublezero1). See the firewall notes above."
 
 # ----------------------------------------------------------------------------
 # 8. status + management hints
@@ -496,8 +565,12 @@ echo
 spin_sleep 5 "Waiting for the tunnel to settle"
 $SUDO docker exec "$DZ_NAME" doublezero status || true
 echo
-info "Done. The bridge is serving normalized quotes:"
-echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+if ws_disabled; then
+  info "Done. The WebSocket sink is disabled (WS_BIND=\"\"); the bridge ingests DZ Edge and (if configured) forwards shreds, but serves no WebSocket."
+else
+  info "Done. The bridge is serving normalized quotes:"
+  echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+fi
 echo
 info "Manage with:"
 echo "  sudo docker logs -f $DZ_NAME                            # bridge + daemon logs"
