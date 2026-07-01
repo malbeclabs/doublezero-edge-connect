@@ -17,8 +17,9 @@
 //! slot seen, so memory is bounded by (window_slots × shreds-per-slot) regardless of uptime.
 
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
+    collections::{hash_map::DefaultHasher, BTreeMap},
     hash::{Hash, Hasher},
+    net::Ipv4Addr,
 };
 
 use super::parse::ShredType;
@@ -40,16 +41,28 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Forward,
+    /// Dropped with no cross-group contest to report: an invalid copy, or a duplicate from the same
+    /// group that already forwarded this shred (a within-group retransmit).
     Drop,
+    /// Dropped as a duplicate from a *different* group than the one that first forwarded this shred:
+    /// `winner_group` beat this copy by `lead_ns` nanoseconds. The head-to-head cross-group win.
+    DropDuplicate {
+        winner_group: Ipv4Addr,
+        lead_ns: u64,
+    },
 }
+
+/// Winners recorded for one slot: each `(index, type, fingerprint)` key mapped to the
+/// `(group, arrival_ns)` of the copy that first forwarded it — for cross-group win attribution and
+/// the lead-time measure. The `fingerprint` discriminates content: a per-datagram content hash in
+/// dedup-only mode (so only byte-identical copies share a key) and a fixed `0` in sigverify mode
+/// (content-agnostic, so the signature alone decides the winner).
+type SlotWinners = BTreeMap<(u32, ShredType, u64), (Ipv4Addr, u64)>;
 
 pub struct DedupWindow {
     window_slots: u64,
-    /// slot -> set of `(index, type, fingerprint)` keys that already have a forwarded winner. The
-    /// `fingerprint` discriminates content: it is a per-datagram content hash in dedup-only mode (so
-    /// only byte-identical copies share a key) and a fixed `0` in sigverify mode (content-agnostic,
-    /// so the signature alone decides the winner).
-    slots: BTreeMap<u64, BTreeSet<(u32, ShredType, u64)>>,
+    /// Recently-seen slots, each to the keys already forwarded for it (see [`SlotWinners`]).
+    slots: BTreeMap<u64, SlotWinners>,
     /// Highest slot observed; the eviction horizon trails it by `window_slots`.
     tip: u64,
 }
@@ -75,20 +88,35 @@ impl DedupWindow {
     /// The caller owns the "can't judge" policy: sigverify mode drops a shred with no known leader
     /// before reaching here (fail closed), and dedup-only mode passes a trivially-true `verify`. So
     /// `decide` only ever sees shreds it should judge on the `verify` verdict.
+    #[allow(clippy::too_many_arguments)]
     pub fn decide<F: FnMut() -> bool>(
         &mut self,
         slot: u64,
         index: u32,
         ty: ShredType,
         fingerprint: u64,
+        group: Ipv4Addr,
+        arrival_ns: u64,
         verify: &mut F,
     ) -> Action {
         let key = (index, ty, fingerprint);
-        if self.slots.get(&slot).is_some_and(|s| s.contains(&key)) {
-            return Action::Drop; // duplicate of an already-forwarded winner: no sig check
+        if let Some(&(winner_group, winner_arrival_ns)) =
+            self.slots.get(&slot).and_then(|s| s.get(&key))
+        {
+            // Duplicate of an already-forwarded winner: dropped without a sig check. A copy from a
+            // *different* group is a cross-group contest the winner won — report the lead; a
+            // same-group retransmit is just a plain drop.
+            return if winner_group == group {
+                Action::Drop
+            } else {
+                Action::DropDuplicate {
+                    winner_group,
+                    lead_ns: arrival_ns.saturating_sub(winner_arrival_ns),
+                }
+            };
         }
         if verify() {
-            self.record_winner(slot, key);
+            self.record_winner(slot, key, group, arrival_ns);
             Action::Forward
         } else {
             Action::Drop // invalid copy: leave the key open for a later valid contender
@@ -99,7 +127,13 @@ impl DedupWindow {
     /// **only here**, from verified shreds — never from the raw datagram slot — so a forged shred
     /// carrying a far-future slot can't poison the eviction horizon and silently disable dedup. A
     /// very late shred for an already-evicted slot is forwarded (it won the verify) but not tracked.
-    fn record_winner(&mut self, slot: u64, key: (u32, ShredType, u64)) {
+    fn record_winner(
+        &mut self,
+        slot: u64,
+        key: (u32, ShredType, u64),
+        group: Ipv4Addr,
+        arrival_ns: u64,
+    ) {
         if slot > self.tip {
             self.tip = slot;
             let horizon = self.horizon();
@@ -107,7 +141,10 @@ impl DedupWindow {
             self.slots = self.slots.split_off(&horizon);
         }
         if slot >= self.horizon() {
-            self.slots.entry(slot).or_default().insert(key);
+            self.slots
+                .entry(slot)
+                .or_default()
+                .insert(key, (group, arrival_ns));
         }
     }
 
@@ -123,6 +160,9 @@ mod tests {
 
     const DATA: ShredType = ShredType::Data;
     const CODE: ShredType = ShredType::Code;
+    // A single source group for the legacy tests: with one group, every duplicate is a same-group
+    // retransmit (`Action::Drop`), so these assertions are unaffected by cross-group attribution.
+    const G: Ipv4Addr = Ipv4Addr::new(239, 0, 0, 1);
 
     // A verify closure that counts calls and returns a fixed verdict, so tests can assert *whether*
     // the signature was even checked (the "no sigverify on a loser" requirement).
@@ -146,9 +186,15 @@ mod tests {
     fn same_shred_twice_forwards_once_and_skips_second_verify() {
         let mut w = DedupWindow::new(100);
         let mut v = Verifier::new(true);
-        assert_eq!(w.decide(10, 0, DATA, 0, &mut v.closure()), Action::Forward);
+        assert_eq!(
+            w.decide(10, 0, DATA, 0, G, 0, &mut v.closure()),
+            Action::Forward
+        );
         // Second copy (e.g. from the retransmit group) is a duplicate: dropped, no verify call.
-        assert_eq!(w.decide(10, 0, DATA, 0, &mut v.closure()), Action::Drop);
+        assert_eq!(
+            w.decide(10, 0, DATA, 0, G, 0, &mut v.closure()),
+            Action::Drop
+        );
         assert_eq!(v.calls, 1, "the duplicate must not be signature-checked");
     }
 
@@ -156,11 +202,14 @@ mod tests {
     fn bad_signature_dropped_good_forwarded() {
         let mut w = DedupWindow::new(100);
         let mut bad = Verifier::new(false);
-        assert_eq!(w.decide(5, 1, DATA, 0, &mut bad.closure()), Action::Drop);
+        assert_eq!(
+            w.decide(5, 1, DATA, 0, G, 0, &mut bad.closure()),
+            Action::Drop
+        );
 
         let mut good = Verifier::new(true);
         assert_eq!(
-            w.decide(5, 2, DATA, 0, &mut good.closure()),
+            w.decide(5, 2, DATA, 0, G, 0, &mut good.closure()),
             Action::Forward
         );
     }
@@ -170,17 +219,23 @@ mod tests {
         let mut w = DedupWindow::new(100);
         // Forged/corrupt copy arrives first: dropped, key left open.
         let mut bad = Verifier::new(false);
-        assert_eq!(w.decide(7, 3, DATA, 0, &mut bad.closure()), Action::Drop);
+        assert_eq!(
+            w.decide(7, 3, DATA, 0, G, 0, &mut bad.closure()),
+            Action::Drop
+        );
         // The real copy arrives later: it is still allowed to win and forward.
         let mut good = Verifier::new(true);
         assert_eq!(
-            w.decide(7, 3, DATA, 0, &mut good.closure()),
+            w.decide(7, 3, DATA, 0, G, 0, &mut good.closure()),
             Action::Forward
         );
         assert_eq!(good.calls, 1);
         // A third copy is now a duplicate of the winner: dropped without a check.
         let mut third = Verifier::new(true);
-        assert_eq!(w.decide(7, 3, DATA, 0, &mut third.closure()), Action::Drop);
+        assert_eq!(
+            w.decide(7, 3, DATA, 0, G, 0, &mut third.closure()),
+            Action::Drop
+        );
         assert_eq!(third.calls, 0);
     }
 
@@ -189,9 +244,18 @@ mod tests {
         let mut w = DedupWindow::new(100);
         let mut v = Verifier::new(true);
         // Same slot+index but different type, and same slot+type but different index, are distinct.
-        assert_eq!(w.decide(2, 0, DATA, 0, &mut v.closure()), Action::Forward);
-        assert_eq!(w.decide(2, 0, CODE, 0, &mut v.closure()), Action::Forward);
-        assert_eq!(w.decide(2, 1, DATA, 0, &mut v.closure()), Action::Forward);
+        assert_eq!(
+            w.decide(2, 0, DATA, 0, G, 0, &mut v.closure()),
+            Action::Forward
+        );
+        assert_eq!(
+            w.decide(2, 0, CODE, 0, G, 0, &mut v.closure()),
+            Action::Forward
+        );
+        assert_eq!(
+            w.decide(2, 1, DATA, 0, G, 0, &mut v.closure()),
+            Action::Forward
+        );
         assert_eq!(v.calls, 3);
     }
 
@@ -202,17 +266,17 @@ mod tests {
         let mut w = DedupWindow::new(100);
         let mut v = Verifier::new(true);
         assert_eq!(
-            w.decide(4, 0, DATA, 0xAAAA, &mut v.closure()),
+            w.decide(4, 0, DATA, 0xAAAA, G, 0, &mut v.closure()),
             Action::Forward
         );
         assert_eq!(
-            w.decide(4, 0, DATA, 0xBBBB, &mut v.closure()),
+            w.decide(4, 0, DATA, 0xBBBB, G, 0, &mut v.closure()),
             Action::Forward,
             "a different-content copy of the same (slot, index, type) must still forward"
         );
         // A byte-identical copy (same fingerprint) of the first is the duplicate we suppress.
         assert_eq!(
-            w.decide(4, 0, DATA, 0xAAAA, &mut v.closure()),
+            w.decide(4, 0, DATA, 0xAAAA, G, 0, &mut v.closure()),
             Action::Drop,
             "an identical-content copy is the duplicate that should be dropped"
         );
@@ -223,7 +287,7 @@ mod tests {
         let mut w = DedupWindow::new(10);
         let mut v = Verifier::new(true);
         for slot in 0..1000u64 {
-            w.decide(slot, 0, DATA, 0, &mut v.closure());
+            w.decide(slot, 0, DATA, 0, G, 0, &mut v.closure());
         }
         // Only slots within `window_slots` of the tip survive.
         assert!(
@@ -234,7 +298,7 @@ mod tests {
         // An ancient slot is gone: it no longer counts as a winner, so a fresh copy re-verifies.
         let mut again = Verifier::new(true);
         assert_eq!(
-            w.decide(0, 0, DATA, 0, &mut again.closure()),
+            w.decide(0, 0, DATA, 0, G, 0, &mut again.closure()),
             Action::Forward
         );
     }
@@ -245,7 +309,7 @@ mod tests {
         let mut w = DedupWindow::new(100);
         let mut good = Verifier::new(true);
         assert_eq!(
-            w.decide(10, 0, DATA, 0, &mut good.closure()),
+            w.decide(10, 0, DATA, 0, G, 0, &mut good.closure()),
             Action::Forward
         );
 
@@ -254,13 +318,46 @@ mod tests {
         // which would otherwise evict slot 10's winner and let its duplicates through undeduped.
         let mut forged = Verifier::new(false);
         assert_eq!(
-            w.decide(u64::MAX, 0, DATA, 0, &mut forged.closure()),
+            w.decide(u64::MAX, 0, DATA, 0, G, 0, &mut forged.closure()),
             Action::Drop
         );
 
         // Slot 10's winner is still tracked: a duplicate is dropped without a signature check.
         let mut dup = Verifier::new(true);
-        assert_eq!(w.decide(10, 0, DATA, 0, &mut dup.closure()), Action::Drop);
+        assert_eq!(
+            w.decide(10, 0, DATA, 0, G, 0, &mut dup.closure()),
+            Action::Drop
+        );
         assert_eq!(dup.calls, 0, "dedup must still suppress the duplicate");
+    }
+
+    /// A duplicate from a *different* group than the winner is a cross-group contest: dropped as
+    /// `DropDuplicate` reporting the winner group and how far it led. A same-group retransmit stays a
+    /// plain `Drop`, and neither loser is signature-checked.
+    #[test]
+    fn cross_group_duplicate_reports_winner_and_lead() {
+        let group_a = Ipv4Addr::new(239, 0, 0, 1);
+        let group_b = Ipv4Addr::new(239, 0, 0, 2);
+        let mut w = DedupWindow::new(100);
+        let mut v = Verifier::new(true);
+        // Group A delivers first at t=1000 and forwards (the only signature check).
+        assert_eq!(
+            w.decide(10, 0, DATA, 0, group_a, 1000, &mut v.closure()),
+            Action::Forward
+        );
+        // Group B's copy arrives at t=1250: it lost the race by 250ns.
+        assert_eq!(
+            w.decide(10, 0, DATA, 0, group_b, 1250, &mut v.closure()),
+            Action::DropDuplicate {
+                winner_group: group_a,
+                lead_ns: 250
+            }
+        );
+        // A same-group (A) retransmit is a plain drop, not a cross-group contest.
+        assert_eq!(
+            w.decide(10, 0, DATA, 0, group_a, 1300, &mut v.closure()),
+            Action::Drop
+        );
+        assert_eq!(v.calls, 1, "only the first copy is signature-checked");
     }
 }

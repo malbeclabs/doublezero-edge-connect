@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Cross-source de-duplication **win metrics**, surfacing how the edge feed beats the
+  original/public sources in both quantity and latency at each de-dup contest:
+  - Quotes/trades (`src/ingest/arbiter.rs`): the staleness floor and windowed dedup now report
+    the first cross-source follower of a `source_ts` tick / `trade_id` as a contest, recording
+    `dz_quote_lead_ns` and `dz_trade_lead_ns` histograms (labelled by `winner` **and** `loser`,
+    each `edge`/`public`; `_count` is the head-to-head win count, the buckets are the lead margin)
+    plus `dz_trades_admitted_total` (the trade-side mirror of `dz_quotes_admitted_total`). The
+    `loser` label keeps an edge-vs-edge mirror race (`{winner="edge",loser="edge"}`) out of the
+    headline edge-vs-public margin (`{winner="edge",loser="public"}`) in multi-mirror deployments.
+  - Shreds (`src/shred/`): each datagram now carries its source multicast group and a monotonic
+    arrival timestamp, and the dedup window records the winning group, so a duplicate from a
+    *different* group emits `dz_shred_wins_total{winner}` and `dz_shred_lead_ns{winner}` (how far
+    the group that delivered first led by). A same-group retransmit stays a plain drop.
+  - Recording is always on (only the `/metrics` exposer stays gated by `--metrics-bind`); lead
+    times are clamped non-negative.
+
 ### Changed
 - Container logs can no longer fill the host disk, and the default is quieter:
   - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with
