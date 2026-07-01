@@ -23,8 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the group that delivered first led by). A same-group retransmit stays a plain drop.
   - Recording is always on (only the `/metrics` exposer stays gated by `--metrics-bind`); lead
     times are clamped non-negative.
+- Phoenix public-API trade feeder (`ingest::phoenix_feeder`), an off-by-default backstop for the edge
+  Phoenix multicast TRADE stream (#53). It subscribes Phoenix's public `trades` channel per market,
+  emits `NormalizedTrade`s through the shared arbiter as `Publisher::PublicWs` (deduped on
+  `trade_id` = the public `tradeSequenceNumber`), and is enabled with `--phoenix-ws-input-markets`
+  (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) / `--phoenix-ws-input-url`. Trades only —
+  no quote backstop (the edge BBO is spline-blended; Phoenix's public book is resting-only). Validated
+  against a live edge+public capture (2026-06-30): Phoenix uses the same bare symbol on both feeds
+  (edge `instrument_id == public assetId`) and `trade_id == tradeSequenceNumber` on shared fills. No
+  `FEEDS` row depends on it.
 
 ### Changed
+- Public-feeder transport scaffolding extracted into a venue-generic `ingest::public_feeder`
+  (a `PublicVenue` trait + one reconnecting run loop + shared decode helpers); Hyperliquid
+  (`ingest::ws_feeder`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
+  labelled by `venue` so a second venue's series don't collide.
 - Container logs can no longer fill the host disk, and the default is quieter:
   - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with
     `max-size=20m` + `max-file=3`, capping the long-lived container's on-disk log at ~60 MB

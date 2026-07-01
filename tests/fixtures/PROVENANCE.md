@@ -14,6 +14,8 @@ files, and the shreds) are described in their own sections.
 | mbo_refdata.bin | TYO recorder capture, publisher 148.51.123.3 (see "MBO fixtures") | MBO refdata |
 | mbo_snapshot.bin | TYO recorder capture, publisher 148.51.123.3 (see "MBO fixtures") | MBO snapshot (real two-sided) |
 | mbo_mktdata.bin | TYO recorder capture, publisher 148.51.123.3 (see "MBO fixtures") | MBO mktdata |
+| phoenix_tob_refdata.bin | Phoenix capture, publisher 148.51.122.75 / source_id=2 (see "Phoenix TOB fixtures") | TOB refdata |
+| phoenix_tob_marketdata.bin | Phoenix capture, publisher 148.51.122.75 / source_id=2 (see "Phoenix TOB fixtures") | TOB mktdata |
 
 The TOB goldens carry `source_id=3` (beta publisher-host value; becomes `source_id=1` in
 production); the MBO trio carries `source_id=1` (publisher 148.51.123.3). Do not hard-code the
@@ -190,6 +192,42 @@ cargo run --example pcap2frames -- tyo_tob.pcap \
 
 `--symbol` is repeatable; omitting it entirely keeps all symbols (used to survey per-symbol volume
 before picking the busy/quiet pair).
+
+## Phoenix TOB fixtures (live edge+public capture)
+
+`phoenix_tob_refdata.bin` / `phoenix_tob_marketdata.bin` are a clean **Phoenix-only** slice of a
+concurrent edge-multicast + public-API capture taken 2026-06-30 (`scripts/phoenix_capture.py` on
+branch `bdz/phoenix-capture-script`; raw artifacts archived under
+`worktrees/edge-pcaps/phoenix-capture-20260630/`). They back the Phoenix public-trade backstop
+(`ingest::phoenix_feeder`, #53), its decode golden (`tests/codec_phoenix_fixtures.rs`), and its E2E
+(`tests/phoenix_arbitrage.rs`).
+
+**Why a slice — the source-id filter.** The capture host wildcard-bound `("", 9201/9202)`, so it
+received BOTH publishers on the Phoenix ports: Phoenix (`148.51.122.75`, `source_id=2`) plus the
+Hyperliquid publisher (`148.51.120.79`, `source_id=1`) leaking in (10,580 of 10,839 captured trades
+were the Hyperliquid leak). The bridge itself does NOT see this — its receiver binds the group
+address, not INADDR_ANY (`receiver::bind_multicast`). Only the `148.51.122.75` datagrams (Phoenix,
+`source_id=2`) were kept; every Hyperliquid datagram was dropped before writing the fixtures.
+
+**Contents.**
+- `phoenix_tob_refdata.bin` (5 datagrams): one complete manifest epoch — `ManifestSummary{valid,
+  manifest_seq=11, instrument_count=51}` first, then all 51 Phoenix `InstrumentDefinition`s at seq
+  11. The manifest leads on purpose: the subscriber drops a definition whose `manifest_seq` doesn't
+  match the latest manifest, so a def-before-manifest fixture would define nothing.
+- `phoenix_tob_marketdata.bin` (409 datagrams, ~36 KB): the first Phoenix mktdata datagrams, carrying
+  8 real `source_id=2` trade prints (SOL, BTC, AMD, INTC, META, MSFT, CRWV, AMZN) plus quotes. The
+  pinned trade ids (BTC 869424, SOL 1188189, AMD 20418) are the on-chain trade sequence numbers; the
+  same capture's public side reported them verbatim as `tradeSequenceNumber` — dedup-key verification
+  #1 (257/257 shared fills matched, 0 mismatches).
+
+Phoenix names each market with the same bare ticker on the edge and public feeds, and the edge
+`instrument_id` equals the public `assetId` (id 0 = SOL, 1 = BTC, 45 = AMD, …). These carry
+`source_id=2`; do not hard-code the source id.
+
+**Regenerate.** Re-run `scripts/phoenix_capture.py --iface doublezero1 --secs 180` on a host with
+both edge multicast and internet reach, keep only the datagrams from the Phoenix publisher IP (the
+one carrying `source_id=2`), assemble a manifest-first refdata epoch, take a small mktdata slice with
+real trades, and length-prefix both files (`[u32 LE len][frame]`).
 
 ## Solana shred fixtures (`shred_sample.bin`, `shred_leaders.json`)
 

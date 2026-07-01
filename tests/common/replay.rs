@@ -58,6 +58,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// `lo` interface having the MULTICAST flag (it usually does not inside a container).
 pub const HYPERLIQUID_GROUP: Ipv4Addr = Ipv4Addr::new(233, 84, 178, 15);
 
+/// The real Phoenix mainnet multicast group (codename `scottsdale`, SourceID 2), joined by the
+/// bridge's `--feed Phoenix` receiver. Same loopback delivery story as [`HYPERLIQUID_GROUP`].
+pub const PHOENIX_GROUP: Ipv4Addr = Ipv4Addr::new(233, 84, 178, 18);
+
 /// Sender configured exactly like the HL publisher's own loopback E2E test (which runs in
 /// their Linux CI): bound to UNSPECIFIED, multicast loopback on, TTL 1, and NO pinned
 /// outgoing interface — let the kernel route the multicast and loop it back locally. Do

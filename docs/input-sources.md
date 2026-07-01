@@ -15,6 +15,7 @@ input delivered a given update.
 |--------------|---------|------------------|--------------------|
 | **DZ Edge multicast** | **on** | always on | `--feed`/`--iface`/`--recv-buf` |
 | **Hyperliquid public WS** (`ingest::ws_feeder`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
+| **Phoenix public WS** (`ingest::phoenix_feeder`) | **off** | on when `--phoenix-ws-input-markets` is non-empty | `--phoenix-ws-input-markets` (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) · `--phoenix-ws-input-url` (`PHOENIX_WS_INPUT_URL`, default `wss://perp-api.phoenix.trade/v1/ws`) |
 
 ```bash
 # From source — run the edge multicast feed with the public WS backstop for BTC and ETH:
@@ -24,10 +25,19 @@ input delivered a given update.
 WS_INPUT_COINS=BTC,ETH curl -fsSL https://get.doublezero.xyz/connect | bash
 ```
 
-The feeder is failure-isolated (its own task with reconnect + exponential backoff; decode/socket
-errors are logged and never touch the multicast hot path) and relies on the edge reference data
-for precision — it emits a public quote/trade only once that `(venue, symbol)` instrument is known.
-The outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
+Every public feeder is failure-isolated (its own task with reconnect + exponential backoff;
+decode/socket errors are logged and never touch the multicast hot path) and relies on the edge
+reference data for precision — it emits a public quote/trade only once that `(venue, symbol)`
+instrument is known. The outbound `wss://` client is the one place TLS is used (rustls + bundled
+webpki roots).
+
+The **Phoenix** feeder is **trades only** — it does not backstop quotes, because the edge Phoenix
+Quote is a spline-blended BBO while Phoenix's public orderbook channel is resting-only (a different
+quantity). Phoenix names each market with the same bare ticker on the edge and public feeds (the edge
+`instrument_id` equals the public `assetId`), so the configured symbol is used verbatim — to subscribe
+the public feed and to tag the emitted trade — and trade dedup keys on the public `tradeSequenceNumber`.
+Validated against a concurrent edge+public capture (2026-06-30): the public `tradeSequenceNumber`
+equals the edge `trade_id` on every shared fill (257/257) and `side` maps `bid -> buy` / `ask -> sell`.
 
 > **Caveat — trade dedup window vs. reconnect lag.** Cross-source trade dedup is a fixed-size
 > windowed `trade_id` cache. A long public reconnect can deliver trades whose ids have aged out of

@@ -380,7 +380,7 @@ impl Arbiter {
                 // `high_water` at 0 and drop every later quote as stale.
                 if q.source_ts_ns == 0 {
                     m.quotes_no_source_ts.with_label_values(&[&q.venue]).inc();
-                    m.emit.with_label_values(&[&q.venue, "quote"]).inc();
+                    m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
                     let _ = self.tx.send(msg);
                     return;
                 }
@@ -405,12 +405,12 @@ impl Arbiter {
                     q.recv_ts_ns,
                 ) {
                     Admit::Emitted => {
-                        m.emit.with_label_values(&[&q.venue, "quote"]).inc();
+                        m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
                         // Attribute the admitted quote to its winning publisher. A rise in
                         // `publisher="public"` is the direct signal of the public backstop filling
                         // an edge gap (in steady state the edge publisher leads every tick).
                         m.quotes_admitted
-                            .with_label_values(&[&q.venue, publisher.label()])
+                            .with_label_values(&[q.venue.as_str(), publisher.label()])
                             .inc();
                         let _ = self.tx.send(msg);
                     }
@@ -421,7 +421,11 @@ impl Arbiter {
                     Admit::Contest { winner, lead_ns } => {
                         m.quotes_dropped.with_label_values(&[&q.venue]).inc();
                         m.quote_lead_ns
-                            .with_label_values(&[&q.venue, winner.label(), publisher.label()])
+                            .with_label_values(&[
+                                q.venue.as_str(),
+                                winner.label(),
+                                publisher.label(),
+                            ])
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
@@ -433,16 +437,20 @@ impl Arbiter {
                 let key = (t.venue.clone(), t.symbol.clone());
                 match self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns) {
                     Admit::Emitted => {
-                        m.emit.with_label_values(&[&t.venue, "trade"]).inc();
+                        m.emit.with_label_values(&[t.venue.as_str(), "trade"]).inc();
                         m.trades_admitted
-                            .with_label_values(&[&t.venue, publisher.label()])
+                            .with_label_values(&[t.venue.as_str(), publisher.label()])
                             .inc();
                         let _ = self.tx.send(msg);
                     }
                     Admit::Contest { winner, lead_ns } => {
                         m.trades_dropped.with_label_values(&[&t.venue]).inc();
                         m.trade_lead_ns
-                            .with_label_values(&[&t.venue, winner.label(), publisher.label()])
+                            .with_label_values(&[
+                                t.venue.as_str(),
+                                winner.label(),
+                                publisher.label(),
+                            ])
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {

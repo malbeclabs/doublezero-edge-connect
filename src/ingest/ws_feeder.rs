@@ -1,18 +1,11 @@
-//! Hyperliquid **public** WebSocket input feeder — a second ingest source, off by default, that
-//! backstops the DZ Edge multicast feed.
+//! Hyperliquid **public** WebSocket input feeder — the first [`PublicVenue`] backstop, off by
+//! default.
 //!
 //! It connects to Hyperliquid's own `wss://api.hyperliquid.xyz/ws`, subscribes `bbo` + `trades` per
 //! configured coin, decodes the JSON into the same `FeedMessage`s the multicast pipeline produces,
-//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. It is
-//! a different transport from the multicast receiver — it never touches the `FrameProcessor` /
-//! `recv_any` machinery — but it converges on the *same* per-`(venue, symbol)` latch-to-leader floor,
-//! so a public copy of an update the edge already emitted collapses into a no-op, and when the edge
-//! gaps the public copy is the first to cross the floor and fills in. That backstop falls out of the
-//! floor with no health check (see the arbiter docs).
-//!
-//! **Failure isolation.** The feeder is its own task with reconnect + exponential backoff; every
-//! decode/socket error is logged and swallowed, so neither a reconnect storm nor a malformed frame
-//! can ever wedge the multicast hot path.
+//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. The
+//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_feeder`];
+//! this module owns only the Hyperliquid wire decode.
 //!
 //! **Precision before price.** Each public quote/trade is gated on its `(venue, symbol)` instrument
 //! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata stream).
@@ -23,15 +16,14 @@
 //! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-source
 //! dedup is decided by publisher leadership per tick, never by content equality (see the arbiter).
 
-use std::time::{Duration, Instant};
-
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info, warn};
+use tracing::warn;
 
 use crate::{
-    ingest::arbiter::{lock, Publisher, SharedArbiter},
+    ingest::{
+        arbiter::{lock, Publisher, SharedArbiter},
+        public_feeder::{self, instrument_known, parse_decimal, PublicVenue},
+    },
     metrics::metrics,
     model::{now_ns, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade},
 };
@@ -47,16 +39,6 @@ const HL_VENUE: &str = "Hyperliquid";
 /// subscriptions (`bbo` + `trades`) per coin over a single connection and log if the configured coin
 /// set would exceed the cap.
 const HL_MAX_SUBSCRIPTIONS_PER_CONN: usize = 1000;
-
-/// Reconnect backoff bounds. Backoff resets to the minimum once a connection is established, then
-/// doubles up to the maximum across consecutive failures.
-const BACKOFF_MIN: Duration = Duration::from_millis(500);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// Minimum session duration that counts as "stable": only after staying connected this long do we
-/// reset the backoff to `BACKOFF_MIN`. A connect-then-immediate-drop (rejected subscriptions,
-/// instant server close) keeps escalating instead of pinning at the floor and hammering the public
-/// endpoint ~2 reconnects/sec.
-const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 /// One Hyperliquid WS message envelope: a channel tag plus its channel-specific payload.
 #[derive(Deserialize)]
@@ -98,18 +80,48 @@ struct TradeData {
     tid: u64,
 }
 
-/// Run the public WS input feeder forever (reconnecting on any failure). Returns immediately as a
-/// no-op when `coins` is empty (the feeder is off by default). Spawned as its own task; it never
-/// propagates an error, so the multicast hot path is unaffected by its churn.
+/// The Hyperliquid public-WS [`PublicVenue`]: connects to one URL and subscribes `bbo` + `trades`
+/// per coin on a single connection.
+struct HyperliquidVenue {
+    url: String,
+    coins: Vec<String>,
+}
+
+impl PublicVenue for HyperliquidVenue {
+    fn venue(&self) -> &str {
+        HL_VENUE
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn subscribe_msgs(&self) -> Vec<String> {
+        let mut subs = Vec::with_capacity(self.coins.len() * 2);
+        for coin in &self.coins {
+            for kind in ["bbo", "trades"] {
+                subs.push(format!(
+                    r#"{{"method":"subscribe","subscription":{{"type":"{kind}","coin":"{coin}"}}}}"#
+                ));
+            }
+        }
+        subs
+    }
+
+    fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
+        handle_text(txt, arbiter, instruments)
+    }
+}
+
+/// Run the Hyperliquid public WS input feeder forever (reconnecting on any failure). Returns
+/// immediately as a no-op when `coins` is empty (the feeder is off by default). Thin wrapper over the
+/// venue-generic [`public_feeder::run`].
 pub async fn run(
     url: String,
     coins: Vec<String>,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
 ) {
-    if coins.is_empty() {
-        return;
-    }
     let want_subs = coins.len() * 2; // bbo + trades per coin
     if want_subs > HL_MAX_SUBSCRIPTIONS_PER_CONN {
         warn!(
@@ -120,75 +132,7 @@ pub async fn run(
              some subscriptions may be rejected"
         );
     }
-
-    let m = metrics();
-    let mut backoff = BACKOFF_MIN;
-    loop {
-        match connect_async(&url).await {
-            Ok((ws, _resp)) => {
-                info!(%url, coins = ?coins, "public WS input feeder connected");
-                m.ws_feeder_up.set(1);
-                let started = Instant::now();
-                match stream(ws, &coins, &arbiter, &instruments).await {
-                    Ok(()) => info!("public WS input feeder closed; reconnecting"),
-                    Err(e) => {
-                        warn!(error = %e, "public WS input feeder session error; reconnecting")
-                    }
-                }
-                m.ws_feeder_up.set(0);
-                // Reset the backoff only after a *stable* session; a connect-then-immediate-drop
-                // keeps escalating so a flapping endpoint isn't hammered (see `STABLE_SESSION`).
-                backoff = if started.elapsed() >= STABLE_SESSION {
-                    BACKOFF_MIN
-                } else {
-                    (backoff * 2).min(BACKOFF_MAX)
-                };
-            }
-            Err(e) => {
-                warn!(error = %e, %url, "public WS input feeder connect failed; retrying");
-                m.ws_feeder_up.set(0);
-                backoff = (backoff * 2).min(BACKOFF_MAX);
-            }
-        }
-        // Each loop iteration past the initial connect is one reconnect cycle (a drop or a failed
-        // attempt, now backing off to retry).
-        m.ws_feeder_reconnects.inc();
-        tokio::time::sleep(backoff).await;
-    }
-}
-
-/// Subscribe `bbo` + `trades` for every coin on the open connection, then pump decoded messages into
-/// the arbiter until the socket closes or errors.
-async fn stream<S>(
-    mut ws: S,
-    coins: &[String],
-    arbiter: &SharedArbiter,
-    instruments: &InstrumentSnapshot,
-) -> Result<(), tokio_tungstenite::tungstenite::Error>
-where
-    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
-        + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
-{
-    for coin in coins {
-        for kind in ["bbo", "trades"] {
-            let sub = format!(
-                r#"{{"method":"subscribe","subscription":{{"type":"{kind}","coin":"{coin}"}}}}"#
-            );
-            ws.send(Message::Text(sub.into())).await?;
-        }
-    }
-
-    while let Some(msg) = ws.next().await {
-        match msg? {
-            Message::Text(txt) => handle_text(&txt, arbiter, instruments),
-            // Reply to server pings so the connection is not reaped while a coin is quiet.
-            Message::Ping(payload) => ws.send(Message::Pong(payload)).await?,
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-    Ok(())
+    public_feeder::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
 }
 
 /// Decode one text frame and emit any resulting quote/trade. Unknown channels (e.g.
@@ -197,8 +141,11 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
     let env: Envelope = match serde_json::from_str(txt) {
         Ok(e) => e,
         Err(e) => {
-            metrics().ws_feeder_decode_errors.inc();
-            debug!(error = %e, "public WS: undecodable frame ignored");
+            metrics()
+                .ws_feeder_decode_errors
+                .with_label_values(&[HL_VENUE])
+                .inc();
+            tracing::debug!(error = %e, "public WS: undecodable frame ignored");
             return;
         }
     };
@@ -217,22 +164,6 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
         }
         _ => {} // subscriptionResponse, pong, error, etc. — nothing to emit
     }
-}
-
-/// True if the `(HL_VENUE, symbol)` instrument is already in the shared snapshot, so a price emitted
-/// for it carries known precision (precision before price).
-fn instrument_known(instruments: &InstrumentSnapshot, symbol: &str) -> bool {
-    crate::model::lock(instruments).contains_key(&(HL_VENUE.to_string(), symbol.to_string()))
-}
-
-/// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`
-/// (which `str::parse::<f64>` accepts from `"nan"`/`"inf"` and produces on overflow like `"1e400"`)
-/// and negatives, so a malformed public px/sz is dropped rather than emitted — a non-finite would
-/// otherwise serialize to JSON `null` on the wire (breaking the numeric contract) and a `NaN` would
-/// defeat the floor's content dedup (`NaN != NaN`).
-fn parse_decimal(s: &str) -> Option<f64> {
-    let v: f64 = s.parse().ok()?;
-    (v.is_finite() && v >= 0.0).then_some(v)
 }
 
 /// Parse a decimal-string level into real-unit `(price, size)` `f64`s, or `None` if either fails or
@@ -262,7 +193,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     let (Some(bid), Some(ask)) = (&d.bbo[0], &d.bbo[1]) else {
         return; // one-sided book; cannot form a two-sided quote
     };
-    if !instrument_known(instruments, &d.coin) {
+    if !instrument_known(instruments, HL_VENUE, &d.coin) {
         return; // precision unknown; drop until the edge refdata defines this instrument
     }
     let (Some((bid_px, bid_sz, bid_n)), Some((ask_px, ask_sz, ask_n))) =
@@ -291,14 +222,14 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     };
     metrics()
         .ws_feeder_messages
-        .with_label_values(&["quote"])
+        .with_label_values(&[HL_VENUE, "quote"])
         .inc();
     lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
 fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
-    if !instrument_known(instruments, &t.coin) {
+    if !instrument_known(instruments, HL_VENUE, &t.coin) {
         return;
     }
     let (Some(price), Some(size)) = (parse_decimal(&t.px), parse_decimal(&t.sz)) else {
@@ -328,7 +259,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
     };
     metrics()
         .ws_feeder_messages
-        .with_label_values(&["trade"])
+        .with_label_values(&[HL_VENUE, "trade"])
         .inc();
     lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
 }
@@ -490,5 +421,22 @@ mod tests {
             rx.try_recv().is_err(),
             "no business message from control/garbage frames"
         );
+    }
+
+    /// The Hyperliquid venue builds two subscribe frames (bbo + trades) per coin.
+    #[test]
+    fn subscribe_msgs_bbo_and_trades_per_coin() {
+        let v = HyperliquidVenue {
+            url: DEFAULT_WS_INPUT_URL.to_string(),
+            coins: vec!["BTC".to_string(), "ETH".to_string()],
+        };
+        let subs = v.subscribe_msgs();
+        assert_eq!(subs.len(), 4);
+        assert!(subs
+            .iter()
+            .any(|s| s.contains(r#""type":"bbo""#) && s.contains(r#""coin":"BTC""#)));
+        assert!(subs
+            .iter()
+            .any(|s| s.contains(r#""type":"trades""#) && s.contains(r#""coin":"ETH""#)));
     }
 }
