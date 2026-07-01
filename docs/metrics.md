@@ -59,10 +59,13 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 |--------|------|--------|---------|
 | `dz_emit_total` | counter | `venue`, `kind` | Messages broadcast after dedup, by `kind` (quote/trade/instrument/midpoint/depth). `status` is structurally possible but never routed through the arbiter today, so it is not recorded in practice. |
 | `dz_quotes_admitted_total` | counter | `venue`, `publisher` | Quotes admitted by the staleness floor, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the direct signal of the public backstop filling an edge gap. |
+| `dz_trades_admitted_total` | counter | `venue`, `publisher` | Trades admitted by the windowed dedup, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the trade-side signal of the public backstop filling an edge gap — the counterpart to `dz_quotes_admitted_total` for a trades-only backstop like Phoenix. |
 | `dz_quotes_dropped_total` | counter | `venue` | Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat). |
 | `dz_trades_dropped_total` | counter | `venue` | Trades dropped by the windowed dedup (duplicate `trade_id` still inside the window). |
 | `dz_quotes_future_rejected_total` | counter | `venue` | Quotes rejected for an implausibly-far-future `source_ts`. |
 | `dz_quotes_no_source_ts_total` | counter | `venue` | Quotes forwarded with the `source_ts == 0` sentinel (floor bypassed). |
+| `dz_quote_lead_ns` | histogram | `venue`, `winner`, `loser` | Nanoseconds the winning publisher led the losing duplicate by, per quote-tick cross-source contest (`winner`/`loser` each `edge`/`public`). `{winner="edge",loser="public"}` is "DZ beat the public feed"; `_count` is the head-to-head win count, the buckets the lead margin. |
+| `dz_trade_lead_ns` | histogram | `venue`, `winner`, `loser` | The trade-side counterpart of `dz_quote_lead_ns`, per `trade_id` cross-source contest. |
 
 ## WebSocket output
 
@@ -83,8 +86,11 @@ Recorded by the WebSocket sink (`src/sinks/ws.rs`).
 
 Recorded by the optional public WebSocket backstops (Hyperliquid `src/ingest/ws_feeder.rs`, Phoenix
 `src/ingest/phoenix_feeder.rs`; both off by default — see [Input sources](input-sources.md)). Every
-series is labelled by `venue` so multiple feeders don't collide. Their quote/trade contribution to
-the arbiter floor is attributed via `dz_quotes_admitted_total{publisher="public"}` above.
+series is labelled by `venue` so multiple feeders don't collide. A feeder's actual contribution to the
+served feed shows up on the arbiter counters above, attributed to `publisher="public"`:
+`dz_quotes_admitted_total` for a quote backstop, `dz_trades_admitted_total` for a trade backstop
+(Phoenix is **trades-only**, so watch the trade counter, not quotes), with `dz_quote_lead_ns` /
+`dz_trade_lead_ns` giving the win margin over the source it beat.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|

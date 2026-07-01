@@ -11,13 +11,15 @@
 //! Phoenix's public orderbook channel is resting-only — a different quantity. A BBO backstop is
 //! deferred until a comparable public blended source is identified.
 //!
-//! Validated against a concurrent edge+public capture (2026-06-30, `edge-pcaps/phoenix-capture-20260630`):
-//! Phoenix uses the **same bare ticker on both feeds** (the edge `instrument_id` equals the public
-//! `assetId`; no namespace prefix, no `-PERP` suffix), the public `tradeSequenceNumber` equals the
-//! edge on-chain `trade_id` **exactly** (257/257 shared fills, zero mismatches), and `side` maps
-//! `bid -> buy` / `ask -> sell`. So a public fill tagged `(venue="Phoenix", symbol, trade_id)` lines
-//! up 1:1 with the edge copy and dedups. No `FEEDS` row depends on this feeder; it stays off until
-//! explicitly enabled with `--phoenix-ws-input-markets`.
+//! Validated against a concurrent edge+public capture (2026-06-30, `edge-pcaps/phoenix-capture-20260630`),
+//! on the 257 fills shared by both feeds: the public `tradeSequenceNumber` equals the edge on-chain
+//! `trade_id` **exactly** (zero mismatches); Phoenix uses the **same bare ticker on both feeds** (edge
+//! `instrument_id == public assetId`; no namespace prefix, no `-PERP` suffix); `side` maps
+//! `bid -> buy` / `ask -> sell`; and the fill's `baseAmount` (size) and `quoteAmount / baseAmount`
+//! (price) equal the edge's size and trade price (every shared fill had `numFills == 1`). So a public
+//! fill tagged `(venue="Phoenix", symbol, trade_id)` lines up 1:1 with the edge copy and dedups. No
+//! `FEEDS` row depends on this feeder; it stays off until explicitly enabled with
+//! `--phoenix-ws-input-markets`.
 
 use std::collections::BTreeSet;
 
@@ -153,6 +155,11 @@ impl PhoenixVenue {
         if base == 0.0 {
             return; // no VWAP divide-by-zero
         }
+        // Fill price = quoteAmount / baseAmount, verified equal to the edge `trade_price` on all 257
+        // shared fills in the capture (each a single fill, `numFills == 1`). If Phoenix ever emitted a
+        // `trades` element aggregating multiple resting orders (`numFills > 1`), this would be that
+        // element's VWAP; dedup keys on `trade_id` only, so it can't mis-dedup — a backstop fill-in
+        // would simply carry the element VWAP as its price.
         let price = quote / base;
         if !price.is_finite() {
             return;

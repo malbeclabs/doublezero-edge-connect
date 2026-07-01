@@ -35,6 +35,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// instant server close) keeps escalating instead of pinning at the floor and hammering the public
 /// endpoint ~2 reconnects/sec.
 const STABLE_SESSION: Duration = Duration::from_secs(30);
+/// Client-initiated keepalive interval. A quiet market sends no data, and some public venues reap a
+/// silent connection, so we ping rather than relying only on the server pinging us. Matches the
+/// reference public-API client's 20s keepalive.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// One public venue's transport contract: where to connect, what to subscribe, and how to decode a
 /// text frame into emitted `FeedMessage`s. The reconnect loop and frame pump are venue-agnostic and
@@ -119,13 +123,24 @@ where
         ws.send(Message::Text(sub.clone().into())).await?;
     }
 
-    while let Some(msg) = ws.next().await {
-        match msg? {
-            Message::Text(txt) => venue.handle_text(&txt, arbiter, instruments),
-            // Reply to server pings so the connection is not reaped while a market is quiet.
-            Message::Ping(payload) => ws.send(Message::Pong(payload)).await?,
-            Message::Close(_) => break,
-            _ => {}
+    // Pump inbound frames, and ping on an interval so a silent (quiet-market) session isn't reaped.
+    // tokio-tungstenite auto-answers inbound pings but never initiates one, so the client keepalive
+    // is ours to send.
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.tick().await; // first tick is immediate — skip it so the first ping is one interval in
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                let Some(msg) = msg else { break }; // stream ended
+                match msg? {
+                    Message::Text(txt) => venue.handle_text(&txt, arbiter, instruments),
+                    // Reply to server pings so the connection is not reaped while a market is quiet.
+                    Message::Ping(payload) => ws.send(Message::Pong(payload)).await?,
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            _ = keepalive.tick() => ws.send(Message::Ping(Default::default())).await?,
         }
     }
     Ok(())
