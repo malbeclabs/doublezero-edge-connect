@@ -94,9 +94,18 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 **Bridge variables.** The installer relays **any** non-empty bridge env var straight through to
 the container, so the bridge is tuned entirely from the one-liner. Common ones: `DZ_IFACE`,
 `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `METRICS_BIND` (turn on the Prometheus `/metrics`
-endpoint — off by default), `RUST_LOG`, and the shred forwarder's `DZ_SHRED_*` (notably
-`DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`). The full list with defaults is the `Args`
+endpoint — off by default), `RUST_LOG`, the shred forwarder's `DZ_SHRED_*` (notably
+`DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`), and the reconciler's `DZ_SUBSCRIPTION_REFRESH_SECS`
+/ `DZ_SUBSCRIPTION_GATING_DISABLE`. The full list with defaults is the `Args`
 struct in [`src/main.rs`](src/main.rs); per-feature config lives in the [docs](docs/) (see below).
+
+> **Subscription-driven activation.** The bridge only runs the feeds this host is actually
+> subscribed to: a reconciler polls `doublezero status` every `DZ_SUBSCRIPTION_REFRESH_SECS`
+> (default 30) and activates/deactivates market-data receivers, the shred forwarder, and the
+> WebSocket sink as subscriptions change. The **WebSocket sink comes up only when a market-data feed
+> is subscribed** — so a shreds-only host serves no WS (and won't collide with an existing `:8081`
+> service) with no config. Running from source without the `doublezero` CLI, gating falls open to
+> the static always-on behaviour; `DZ_SUBSCRIPTION_GATING_DISABLE=1` forces that model explicitly.
 
 > **Logging defaults.** Unset, `RUST_LOG` defaults to `warn,doublezero_edge_connect=info`: the
 > bridge's own startup/operational lines stay at `info` while noisy dependency chatter is held to

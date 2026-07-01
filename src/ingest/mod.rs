@@ -15,5 +15,7 @@ pub mod phoenix_feeder;
 pub mod processor;
 pub mod public_feeder;
 pub mod receiver;
+pub mod reconcile;
 pub mod subscriber;
+pub mod subscriptions;
 pub mod ws_feeder;

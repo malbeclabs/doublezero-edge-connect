@@ -187,46 +187,6 @@ pub fn parse_sources(raw: &[String]) -> Result<Vec<SocketAddrV4>> {
         .collect()
 }
 
-/// Resolve the source groups: an explicit `--shred-source` list overrides discovery entirely
-/// (for tests/edge cases); otherwise discover `<prefix>*` groups via the `doublezero` CLI and bind
-/// each on `port`. Returns an empty list when neither yields anything (the caller then leaves the
-/// shred pipeline inactive — activate-on-discovery, consistent with the "sink active when its
-/// config is non-empty" rule).
-pub fn resolve_sources(explicit: &[String], prefix: &str, port: u16) -> Result<Vec<SocketAddrV4>> {
-    if !explicit.is_empty() {
-        return parse_sources(explicit);
-    }
-    Ok(discovery::discover_groups(prefix, port))
-}
-
-/// The forwarder's activation decision, and *why* — so `main` drives both the spawn and its
-/// operator-facing log line from one tested contract.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ShredActivation {
-    /// Forced off by the operator opt-out (`--shred-forward-disable` / `DZ_SHRED_DISABLE`),
-    /// regardless of what discovery found. The explicit kill switch for the otherwise-automatic
-    /// activate-on-discovery behaviour.
-    Disabled,
-    /// Not disabled, but no source group resolved (none discovered and none given explicitly):
-    /// nothing to forward, so stay off.
-    NoSources,
-    /// Not disabled and ≥1 source resolved: run the forwarder (the default activate-on-discovery).
-    Run,
-}
-
-/// Decide whether the shred forwarder should run. Activation stays **automatic** on discovery (≥1
-/// `edge-solana-*` group resolved → run); the `disabled` opt-out is the master override that forces
-/// it off even when groups are discoverable.
-pub fn decide_activation(disabled: bool, source_count: usize) -> ShredActivation {
-    if disabled {
-        ShredActivation::Disabled
-    } else if source_count == 0 {
-        ShredActivation::NoSources
-    } else {
-        ShredActivation::Run
-    }
-}
-
 /// Run the shred forwarder: spawn one receiver task per source group plus a single forwarder task,
 /// wired by a bounded mpsc. Loops forever; returns only when a task exits — the forwarder failing
 /// to bind its send socket, or (the normal terminal case) the channel closing once every receiver
@@ -708,26 +668,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opt_out_forces_off_even_with_discovered_groups() {
-        // The kill switch: --shred-forward-disable overrides activate-on-discovery, so even when
-        // discovery resolved groups the forwarder stays off.
-        assert_eq!(decide_activation(true, 5), ShredActivation::Disabled);
-        assert_eq!(decide_activation(true, 0), ShredActivation::Disabled);
-    }
-
-    #[test]
-    fn auto_activates_on_discovery_by_default() {
-        // Default (not disabled) preserves activate-on-discovery: ≥1 source → run.
-        assert_eq!(decide_activation(false, 3), ShredActivation::Run);
-    }
-
-    #[test]
-    fn no_sources_stays_off_when_not_disabled() {
-        // Not disabled, but nothing discovered/explicit: nothing to forward.
-        assert_eq!(decide_activation(false, 0), ShredActivation::NoSources);
-    }
-
-    #[test]
     fn default_dedup_mode_is_dedup_only() {
         // The out-of-the-box behaviour is dedup-only (collapse multicast-overlap duplicates), not
         // the old bare forward-everything. Pin it so a default change can't slip in silently.
@@ -754,16 +694,6 @@ mod tests {
 
         assert!(parse_sources(&["233.84.178.1".into()]).is_err()); // missing port
         assert!(parse_sources(&["garbage".into()]).is_err());
-    }
-
-    #[test]
-    fn resolve_sources_prefers_explicit_override() {
-        // Explicit override is used verbatim and never touches discovery (the CLI isn't required).
-        let got = resolve_sources(&["233.84.178.1:7733".into()], "edge-solana-", 7733).unwrap();
-        assert_eq!(
-            got,
-            vec!["233.84.178.1:7733".parse::<SocketAddrV4>().unwrap()]
-        );
     }
 
     // --- Loopback forwarding integration tests ---
