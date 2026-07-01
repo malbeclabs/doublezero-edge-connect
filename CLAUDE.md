@@ -124,12 +124,13 @@ Modules are grouped by role under `src/`:
   an edge gap — no health check.
 - **`ingest/phoenix_feeder.rs`** — the Phoenix `PublicVenue` (off by default), **trades only** (the
   edge Quote is a spline-blended BBO; the public book is resting-only, a different quantity, so no
-  quote backstop). Subscribes Phoenix's public `trades` channel per market, maps each EDGE symbol to
-  its public base by stripping a trailing `-PERP` (`SOL-PERP` → `SOL`), derives the trade price as
-  `quoteAmount / baseAmount`, and emits `NormalizedTrade`s as `Publisher::PublicWs` keyed on
-  `trade_id` = the public `tradeSequenceNumber` (the arbiter's windowed trade dedup races them). ⚠️
-  The public schema (field names/units, the `-PERP` strip rule, the `trade_id` equivalence) is from
-  docs (closed beta) and **not yet reference-validated**; no `FEEDS` row depends on it.
+  quote backstop). Subscribes Phoenix's public `trades` channel per market; Phoenix names each market
+  with the **same bare ticker on the edge and public feeds** (edge `instrument_id == public assetId`),
+  so the wire symbol is used verbatim — no mapping. Derives the trade price as `quoteAmount /
+  baseAmount` and emits `NormalizedTrade`s as `Publisher::PublicWs` keyed on `trade_id` = the public
+  `tradeSequenceNumber` (the arbiter's windowed trade dedup races them). Validated against a live
+  edge+public capture (2026-06-30): `trade_id == tradeSequenceNumber` on 257/257 shared fills and
+  `side` maps `bid->buy`/`ask->sell`. No `FEEDS` row depends on it (off until enabled).
 - **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`

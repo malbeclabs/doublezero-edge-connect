@@ -1,10 +1,11 @@
-//! Mock Hyperliquid public WebSocket **input** server for E2E tests.
+//! Mock public WebSocket **input** server for E2E tests (Hyperliquid and Phoenix shapes).
 //!
-//! Stands in for `wss://api.hyperliquid.xyz/ws`: it accepts the bridge's WS-feeder connection,
-//! drains its `subscribe` frames, and emits scripted `bbo`/`trades` JSON on demand (the test pushes
-//! frames through a channel, so it controls exactly when each public update lands relative to the
-//! multicast replay). This is the input-side counterpart to `replay` (multicast) — the output side
-//! (`ws_client` + `assertions`) is reused unchanged.
+//! Stands in for a venue's public `wss://`: it accepts the bridge's WS-feeder connection, drains its
+//! `subscribe` frames, and emits scripted JSON on demand (the test pushes frames through a channel,
+//! so it controls exactly when each public update lands relative to the multicast replay). It speaks
+//! both the Hyperliquid `bbo`/`trades` shape ([`Self::send_bbo`]/[`Self::send_trade`]) and the
+//! Phoenix `trades` shape ([`Self::send_phoenix_trade`]). This is the input-side counterpart to
+//! `replay` (multicast) — the output side (`ws_client` + `assertions`) is reused unchanged.
 
 use std::time::Duration;
 
@@ -102,6 +103,24 @@ impl MockWsInput {
     pub fn send_trade(&self, coin: &str, side: &str, px: f64, sz: f64, time_ms: u64, tid: u64) {
         self.send_raw(format!(
             r#"{{"channel":"trades","data":[{{"coin":"{coin}","side":"{side}","px":"{px}","sz":"{sz}","time":{time_ms},"tid":{tid},"hash":"0x0"}}]}}"#
+        ));
+    }
+
+    /// Queue a one-element Phoenix `trades` frame, exactly as `perp-api.phoenix.trade/v1/ws` encodes
+    /// it. `side` is `"bid"` (aggressing buy) or `"ask"` (aggressing sell); `seq` is the public
+    /// `tradeSequenceNumber` (= the edge `trade_id`); `ts_secs` is the Unix-seconds timestamp string.
+    /// The feeder derives price as `quote / base`.
+    pub fn send_phoenix_trade(
+        &self,
+        symbol: &str,
+        seq: u64,
+        side: &str,
+        base: f64,
+        quote: f64,
+        ts_secs: u64,
+    ) {
+        self.send_raw(format!(
+            r#"{{"channel":"trades","symbol":"{symbol}","trades":[{{"tradeSequenceNumber":"{seq}","side":"{side}","baseAmount":{base},"quoteAmount":{quote},"timestamp":"{ts_secs}","slot":1,"taker":"x"}}]}}"#
         ));
     }
 }

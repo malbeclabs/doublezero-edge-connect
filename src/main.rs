@@ -151,11 +151,13 @@ struct Args {
     )]
     ws_input_url: String,
 
-    /// EDGE symbols to back on the Phoenix **public-API** trade feeder, repeatable/comma-separated
-    /// (e.g. `--phoenix-ws-input-markets SOL-PERP`). This backstop races Phoenix's public trades
-    /// against the DZ Edge Phoenix multicast in the shared arbiter (deduped on trade_id), so the edge
-    /// wins in steady state and the public copy fills in only when the edge gaps. Trades only — no
-    /// quote backstop. Empty (the default) leaves the feeder off.
+    /// Phoenix market symbols to back on the **public-API** trade feeder, repeatable/comma-separated
+    /// (bare tickers, e.g. `--phoenix-ws-input-markets SOL,BTC`). Phoenix uses the same symbol on the
+    /// edge and public feeds (edge `instrument_id == public assetId`), so these are both the public
+    /// subscribe symbols and the edge symbols. This backstop races Phoenix's public trades against the
+    /// DZ Edge Phoenix multicast in the shared arbiter (deduped on trade_id), so the edge wins in
+    /// steady state and the public copy fills in only when the edge gaps. Trades only — no quote
+    /// backstop. Empty (the default) leaves the feeder off.
     #[arg(
         long = "phoenix-ws-input-markets",
         env = "PHOENIX_WS_INPUT_MARKETS",

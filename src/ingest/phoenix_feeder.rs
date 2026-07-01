@@ -11,12 +11,15 @@
 //! Phoenix's public orderbook channel is resting-only — a different quantity. A BBO backstop is
 //! deferred until a comparable public blended source is identified.
 //!
-//! ⚠️ The public trades schema (field names/units, the `-PERP` strip rule, whether
-//! `tradeSequenceNumber` equals the edge on-chain `trade_sequence_number`) is taken from
-//! docs.phoenix.trade (closed beta) and is NOT yet reference-validated against a live socket. No
-//! `FEEDS` row depends on this feeder; confirm the schema before production enablement.
+//! Validated against a concurrent edge+public capture (2026-06-30, `edge-pcaps/phoenix-capture-20260630`):
+//! Phoenix uses the **same bare ticker on both feeds** (the edge `instrument_id` equals the public
+//! `assetId`; no namespace prefix, no `-PERP` suffix), the public `tradeSequenceNumber` equals the
+//! edge on-chain `trade_id` **exactly** (257/257 shared fills, zero mismatches), and `side` maps
+//! `bid -> buy` / `ask -> sell`. So a public fill tagged `(venue="Phoenix", symbol, trade_id)` lines
+//! up 1:1 with the edge copy and dedups. No `FEEDS` row depends on this feeder; it stays off until
+//! explicitly enabled with `--phoenix-ws-input-markets`.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
@@ -63,33 +66,23 @@ struct Fill {
     timestamp: String,
 }
 
-/// The Phoenix public-WS [`PublicVenue`]: subscribes the `trades` channel per market. `symbol_map`
-/// maps the public base symbol (the wire `symbol`, e.g. `SOL`) → the EDGE symbol (e.g. `SOL-PERP`),
-/// so an emitted trade carries the same `(venue, symbol)` identity as the edge copy.
+/// The Phoenix public-WS [`PublicVenue`]: subscribes the `trades` channel per market. Phoenix carries
+/// the **same bare ticker on the edge and public feeds** (edge `instrument_id == public assetId`), so
+/// the wire `symbol` is already the edge symbol — there is no mapping, only the set of markets to back.
 struct PhoenixVenue {
     url: String,
-    symbol_map: BTreeMap<String, String>,
+    symbols: BTreeSet<String>,
 }
 
 impl PhoenixVenue {
-    /// Build a venue from the EDGE symbols to back (e.g. `["SOL-PERP"]`). The public key for each is
-    /// the edge symbol with a `-PERP` suffix stripped (`SOL-PERP` → `SOL`). Two edge symbols that
-    /// strip to the same public base would collapse to one map entry (last wins, silently dropping
-    /// the other market), so warn on a collision rather than swallow it.
+    /// Build a venue from the market symbols to back (bare tickers, e.g. `["SOL", "BTC"]`). The same
+    /// symbol subscribes the public feed and tags the emitted trade, because the edge and public
+    /// feeds share it verbatim.
     fn new(url: String, markets: Vec<String>) -> Self {
-        let mut symbol_map = BTreeMap::new();
-        for edge in markets {
-            let public = public_symbol(&edge).to_string();
-            if let Some(prev) = symbol_map.insert(public.clone(), edge.clone()) {
-                tracing::warn!(
-                    public_symbol = %public,
-                    dropped = %prev,
-                    kept = %edge,
-                    "Phoenix markets collide on the same public base; dropping the earlier one"
-                );
-            }
+        Self {
+            url,
+            symbols: markets.into_iter().collect(),
         }
-        Self { url, symbol_map }
     }
 
     /// Decode one Phoenix `trades` frame and emit each fill as a `NormalizedTrade`.
@@ -105,27 +98,27 @@ impl PhoenixVenue {
         if frame.channel != "trades" {
             return; // subscription confirmations / other channels — nothing to emit
         }
-        let (Some(public_symbol), Some(fills)) = (frame.symbol, frame.trades) else {
+        let (Some(symbol), Some(fills)) = (frame.symbol, frame.trades) else {
             return; // a trades frame missing its symbol or fills carries nothing actionable
         };
         for fill in &fills {
-            self.emit_trade(&public_symbol, fill, arbiter, instruments);
+            self.emit_trade(&symbol, fill, arbiter, instruments);
         }
     }
 
-    /// Map one public fill onto a `NormalizedTrade` (venue `Phoenix`, the edge symbol) and emit it
-    /// through the arbiter. Every malformed/unmappable field path drops the fill (best-effort feed).
+    /// Map one public fill onto a `NormalizedTrade` (venue `Phoenix`, the shared bare symbol) and emit
+    /// it through the arbiter. Every malformed/unknown field path drops the fill (best-effort feed).
     fn emit_trade(
         &self,
-        public_symbol: &str,
+        symbol: &str,
         fill: &Fill,
         arbiter: &SharedArbiter,
         instruments: &InstrumentSnapshot,
     ) {
-        let Some(edge_symbol) = self.symbol_map.get(public_symbol) else {
-            return; // unsubscribed/unmappable market
-        };
-        if !instrument_known(instruments, PHOENIX_VENUE, edge_symbol) {
+        if !self.symbols.contains(symbol) {
+            return; // a market we didn't subscribe to; ignore
+        }
+        if !instrument_known(instruments, PHOENIX_VENUE, symbol) {
             return; // precision unknown; drop until the edge refdata defines this instrument
         }
         let Ok(trade_id) = fill.trade_sequence_number.parse::<u64>() else {
@@ -155,10 +148,10 @@ impl PhoenixVenue {
             .unwrap_or(0);
         let trade = NormalizedTrade {
             venue: PHOENIX_VENUE.to_string(),
-            symbol: edge_symbol.clone(),
+            symbol: symbol.to_string(),
             price,
             size: base,
-            // Phoenix trade side: "bid" = aggressing buy, "ask" = aggressing sell.
+            // Phoenix trade side: "bid" = aggressing buy, "ask" = aggressing sell (capture-confirmed).
             aggressor_side: match fill.side.as_str() {
                 "bid" => "buy",
                 "ask" => "sell",
@@ -197,11 +190,11 @@ impl PublicVenue for PhoenixVenue {
     }
 
     fn subscribe_msgs(&self) -> Vec<String> {
-        self.symbol_map
-            .keys()
-            .map(|public| {
+        self.symbols
+            .iter()
+            .map(|symbol| {
                 format!(
-                    r#"{{"type":"subscribe","subscription":{{"channel":"trades","symbol":"{public}"}}}}"#
+                    r#"{{"type":"subscribe","subscription":{{"channel":"trades","symbol":"{symbol}"}}}}"#
                 )
             })
             .collect()
@@ -210,12 +203,6 @@ impl PublicVenue for PhoenixVenue {
     fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
         PhoenixVenue::handle_text(self, txt, arbiter, instruments)
     }
-}
-
-/// The public base symbol for an EDGE symbol: strip a trailing `-PERP` (`SOL-PERP` → `SOL`), else
-/// pass through unchanged.
-fn public_symbol(edge: &str) -> &str {
-    edge.strip_suffix("-PERP").unwrap_or(edge)
 }
 
 /// Run the Phoenix public-API trade feeder forever (reconnecting on any failure). Returns
@@ -281,13 +268,13 @@ mod tests {
         )
     }
 
-    /// A well-formed trades frame maps onto a Phoenix trade with the edge symbol, derived VWAP price,
-    /// base size, mapped side, and seconds→ns source_ts.
+    /// A well-formed trades frame maps onto a Phoenix trade with the shared bare symbol, derived VWAP
+    /// price, base size, mapped side, and seconds→ns source_ts.
     #[test]
     fn trades_frame_emits_trade() {
         let (arbiter, mut rx) = arbiter_with_rx();
-        let instruments = instruments_with("SOL-PERP");
-        let v = venue(&["SOL-PERP"]);
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL"]);
         v.handle_text(
             &trades_frame("SOL", "100", "bid", 10.0, 1500.0, "1775578550"),
             &arbiter,
@@ -296,7 +283,7 @@ mod tests {
         match rx.try_recv().expect("a trade was emitted") {
             FeedMessage::Trade(t) => {
                 assert_eq!(t.venue, "Phoenix");
-                assert_eq!(t.symbol, "SOL-PERP");
+                assert_eq!(t.symbol, "SOL");
                 assert_eq!(t.trade_id, 100);
                 assert_eq!(t.price, 150.0);
                 assert_eq!(t.size, 10.0);
@@ -307,26 +294,26 @@ mod tests {
         }
     }
 
-    /// A fill for an unconfigured public market is dropped (no mapping to an edge symbol).
+    /// A fill for a market we didn't subscribe to is dropped.
     #[test]
-    fn unmapped_symbol_dropped() {
+    fn unsubscribed_symbol_dropped() {
         let (arbiter, mut rx) = arbiter_with_rx();
-        let instruments = instruments_with("SOL-PERP");
-        let v = venue(&["SOL-PERP"]);
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL"]);
         v.handle_text(
             &trades_frame("BTC", "1", "bid", 1.0, 100.0, "1775578550"),
             &arbiter,
             &instruments,
         );
-        assert!(rx.try_recv().is_err(), "unmapped market must not emit");
+        assert!(rx.try_recv().is_err(), "unsubscribed market must not emit");
     }
 
-    /// Precision-before-price: a mapped market with no instrument def yet is dropped.
+    /// Precision-before-price: a subscribed market with no instrument def yet is dropped.
     #[test]
     fn trade_without_instrument_dropped() {
         let (arbiter, mut rx) = arbiter_with_rx();
         let instruments: InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let v = venue(&["SOL-PERP"]);
+        let v = venue(&["SOL"]);
         v.handle_text(
             &trades_frame("SOL", "1", "bid", 1.0, 100.0, "1775578550"),
             &arbiter,
@@ -339,8 +326,8 @@ mod tests {
     #[test]
     fn malformed_fills_rejected() {
         let (arbiter, mut rx) = arbiter_with_rx();
-        let instruments = instruments_with("SOL-PERP");
-        let v = venue(&["SOL-PERP"]);
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL"]);
         for frame in [
             trades_frame("SOL", "notanumber", "bid", 10.0, 1500.0, "1775578550"),
             trades_frame("SOL", "1", "bid", 0.0, 1500.0, "1775578550"),
@@ -358,8 +345,8 @@ mod tests {
     #[test]
     fn non_trades_and_garbage_ignored() {
         let (arbiter, mut rx) = arbiter_with_rx();
-        let instruments = instruments_with("SOL-PERP");
-        let v = venue(&["SOL-PERP"]);
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL"]);
         v.handle_text(
             r#"{"channel":"orderbook","symbol":"SOL","bids":[],"asks":[]}"#,
             &arbiter,
@@ -377,18 +364,14 @@ mod tests {
         );
     }
 
-    /// Subscribe frames strip the `-PERP` suffix and carry the public base per configured market.
+    /// Subscribe frames carry the configured bare symbols verbatim (no transform), one per market.
     #[test]
-    fn subscribe_msgs_strip_perp() {
-        let v = venue(&["SOL-PERP", "BTC-PERP"]);
+    fn subscribe_msgs_carry_configured_symbols() {
+        let v = venue(&["SOL", "BTC"]);
         let subs = v.subscribe_msgs();
         assert_eq!(subs.len(), 2);
         assert!(subs.iter().all(|s| s.contains(r#""channel":"trades""#)));
         assert!(subs.iter().any(|s| s.contains(r#""symbol":"SOL""#)));
         assert!(subs.iter().any(|s| s.contains(r#""symbol":"BTC""#)));
-        assert!(
-            !subs.iter().any(|s| s.contains("-PERP")),
-            "subscribe frames must carry public base symbols, not edge -PERP symbols"
-        );
     }
 }

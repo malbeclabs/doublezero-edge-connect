@@ -27,10 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Phoenix multicast TRADE stream (#53). It subscribes Phoenix's public `trades` channel per market,
   emits `NormalizedTrade`s through the shared arbiter as `Publisher::PublicWs` (deduped on
   `trade_id` = the public `tradeSequenceNumber`), and is enabled with `--phoenix-ws-input-markets`
-  (`PHOENIX_WS_INPUT_MARKETS`, EDGE symbols e.g. `SOL-PERP`) / `--phoenix-ws-input-url`. Trades only —
-  no quote backstop (the edge BBO is spline-blended; Phoenix's public book is resting-only). The
-  public schema is taken from docs (closed beta) and is not yet reference-validated; no `FEEDS` row
-  depends on it.
+  (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) / `--phoenix-ws-input-url`. Trades only —
+  no quote backstop (the edge BBO is spline-blended; Phoenix's public book is resting-only). Validated
+  against a live edge+public capture (2026-06-30): Phoenix uses the same bare symbol on both feeds
+  (edge `instrument_id == public assetId`) and `trade_id == tradeSequenceNumber` on shared fills. No
+  `FEEDS` row depends on it.
 
 ### Changed
 - Public-feeder transport scaffolding extracted into a venue-generic `ingest::public_feeder`
