@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FEEDS` row depends on it.
 
 ### Changed
+- Installer (`scripts/connect*.sh`) usability fixes after review:
+  - **WebSocket port preflight**: before starting the container the installer checks whether the WS
+    port is already bound on the host and, interactively, offers to pick another port, disable the
+    sink, or continue (non-interactively it warns and continues — the bridge then runs without the
+    sink, tunnel unaffected).
+  - **`WS_BIND=""` now works through the one-liner**: `WS_BIND` is forwarded whenever it is *set*,
+    including set-but-empty, so the WS sink can be disabled straight from the pipe (previously only
+    non-empty values were relayed, forcing a hand-written `docker run`).
+  - **Firewall guidance for default-deny-incoming hosts**: the ufw/firewalld hints now note that
+    allowing GRE + UDP 44880 admits only the *outer* encapsulated packets — the decapsulated inner
+    multicast re-traverses `INPUT` on the tunnel interface (`doublezero1`) and must be allowed too
+    (`sudo ufw allow in on doublezero1`). Mirrored in `README.md` / `scripts/README.md`.
 - Public-feeder transport scaffolding extracted into a venue-generic `ingest::public_feeder`
   (a `PublicVenue` trait + one reconnecting run loop + shared decode helpers); Hyperliquid
   (`ingest::ws_feeder`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
@@ -49,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Applied in both `src/main.rs` and the image `ENV`.
 
 ### Fixed
+- A taken WebSocket-sink port no longer takes the whole bridge down. A bind failure on `--ws-bind`
+  (e.g. the default `0.0.0.0:8081` colliding with a pre-existing `127.0.0.1:8081` listener) was
+  fatal: the process exited, the container's `--restart unless-stopped` restarted it, doublezerod
+  and the DoubleZero tunnel came down with it, and — since `doublezero connect multicast` runs only
+  once from the installer — the tunnel never re-established (status stuck `disconnected`, the real
+  cause buried in the restart loop). The listener is now bound eagerly (`sinks::ws::bind`, split
+  from `serve`) and a bind failure is logged and skipped: the bridge runs without the sink while
+  the tunnel and shred forwarding keep going (`src/main.rs`, `src/sinks/ws.rs`).
 - Installer pre-flight access-pass check (`scripts/connect*.sh`) hardened after review:
   - A confirmed miss (an identity with no pass for the host IP or `0.0.0.0`) now only hard-aborts
     when the public IP was **explicitly supplied** via `DZ_CLIENT_IP`; when the IP was only

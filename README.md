@@ -62,7 +62,10 @@ What the script does:
 
 Requirements: **Linux/amd64**, GRE connectivity (allow IP protocol 47 at the cloud provider; on
 AWS disable the ENI source/dest check), and a host public IP authorized onchain for the chosen
-environment. See [scripts/README.md](scripts/README.md) for the full requirements and caveats.
+environment. If the host runs a **default-deny-incoming** firewall, also admit the decapsulated
+inner multicast on the tunnel interface (e.g. `sudo ufw allow in on doublezero1`) — allowing GRE
+alone isn't enough, since the inner UDP re-traverses `INPUT` on `doublezero1` after decapsulation.
+See [scripts/README.md](scripts/README.md) for the full requirements and caveats.
 
 ## Configure (override the one-liner)
 
@@ -100,9 +103,14 @@ struct in [`src/main.rs`](src/main.rs); per-feature config lives in the [docs](d
 > `warn`. Set `RUST_LOG=debug` for verbose output. The installer also caps the container log on
 > disk (json-file driver, ~60 MB ceiling) so it can't fill the host.
 
-> **Limitation:** only **non-empty** values are forwarded, so you can't pass an *empty* override
-> (e.g. `WS_BIND=""` to disable the WebSocket sink) through the installer. For that, run a
-> hand-written `docker run` — see [Self-hosting](docs/self-hosting.md).
+> **Note:** only **non-empty** values are forwarded, with one exception: `WS_BIND` is forwarded
+> whenever it is *set* — including set-but-empty — so `WS_BIND="" curl … | bash` disables the
+> WebSocket sink straight from the one-liner. The installer also runs a host-side **port
+> preflight**: if the WS port is already taken it warns and (interactively) offers to pick another
+> port, disable the sink, or continue. Even if a conflict slips through, a WS bind failure is
+> non-fatal — the bridge logs it and keeps running (the tunnel and shred forwarding are
+> unaffected). A hand-written `docker run` is still an option — see
+> [Self-hosting](docs/self-hosting.md).
 
 Examples:
 

@@ -118,6 +118,16 @@ The bridge serves:
   kernel tunnels.
 - **GRE connectivity.** On a cloud host you must also allow IP protocol 47 at the provider level
   (and, on AWS, disable the ENI source/dest check) — the script warns but can't fix this for you.
+- **Host firewall (default-deny-incoming).** Allowing GRE (protocol 47) + UDP 44880 admits the
+  *outer* encapsulated packets, but the kernel decapsulates them and the *inner* multicast UDP
+  re-traverses the `INPUT` chain on the tunnel interface (`doublezero1`), where a default-deny
+  policy drops it. Also admit that interface, e.g. `sudo ufw allow in on doublezero1` (or place
+  `doublezero1` in a firewalld trusted zone). The installer warns about this when it detects an
+  active ufw/firewalld.
+- **WebSocket port.** The bridge serves the WS sink on `:8081` by default. If that port is already
+  in use the installer's preflight flags it and (interactively) offers to pick another port,
+  disable the sink (`WS_BIND=""`), or continue; a bind failure is non-fatal either way (the tunnel
+  is unaffected).
 - **Access pass.** `doublezero connect` requires the host's public IP to be authorized onchain for
   the chosen environment; otherwise the tunnel won't come up. The installer now checks this **up
   front** (step 2): if the identity has no access pass for the host's public IP or `0.0.0.0` it

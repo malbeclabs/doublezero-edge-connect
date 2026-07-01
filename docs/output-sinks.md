@@ -45,6 +45,8 @@ quotes/trades/midpoints/depth, with optional per-client subscribe/unsubscribe fi
 heartbeat/limit enforcement.
 
 > **Note:** when running via the installer one-liner, set these as env vars before the pipe (or
-> with `docker run -e`). The `WS_BIND=""` disable case can't go through the installer (it only
-> forwards non-empty values) — run a hand-written `docker run` for that. See
+> with `docker run -e`). `WS_BIND=""` (disable the sink) **does** go through the installer —
+> `WS_BIND` is forwarded whenever it is set, including set-but-empty — and the installer runs a
+> host-side port preflight that flags a taken WS port before starting the container. A taken port
+> is non-fatal regardless: the bridge logs the bind failure and runs without the sink. See
 > [Configure](../README.md#configure-override-the-one-liner).
