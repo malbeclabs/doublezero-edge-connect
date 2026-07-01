@@ -35,15 +35,26 @@ defaults to `warn,doublezero_edge_connect=info` (our crate at `info`, deps quiet
 
 ## Architecture
 
-One WS-server task plus **one receiver task per selected feed** share a single
+A WS-server task plus **one receiver task per active feed** share a single
 `tokio::sync::broadcast` channel of `FeedMessage` (the fan-out backbone) and a `Mutex<HashMap>`
-instrument snapshot. `main.rs` selects feeds (`--feed`, or all of `ingest::feeds::FEEDS` by
-default), builds the shared `Arbiter` around the broadcast `Sender`, spawns the receivers into a
-`JoinSet` (and the optional public WS input feeders), and exits if the WS server, any receiver, or a
-feeder task returns. **Exception:** the WS listener is bound *eagerly* before its task is spawned,
-and a bind failure (e.g. the port is already taken) is logged as a warning and the process runs
-without the sink — never fatal, so a taken WS port can't crash-loop the container and tear down the
-DoubleZero tunnel.
+instrument snapshot. `main.rs` selects the *candidate* feeds (`--feed`, or all of
+`ingest::feeds::FEEDS` by default), builds the shared `Arbiter` around the broadcast `Sender`, and
+hands everything to the **subscription reconciler** (`ingest::reconcile`), which is the single
+activation authority: it decides *which* of those feeds (plus the WS sink and the shred forwarder)
+actually run, based on what the host is subscribed to. `main.rs`'s top-level `select!` then awaits
+the reconciler plus the independently-spawned public WS input feeders and metrics endpoint; the
+process exits only if one of those tasks panics.
+
+**Activation is subscription-driven and dynamic** (`ingest::reconcile` + `ingest::subscriptions`):
+the reconciler polls the host's multicast subscriptions from `doublezero status --json` every
+`--subscription-refresh-secs` and reconciles the running task set — spawning receivers for
+newly-subscribed feeds, aborting ones that go away, bringing the **WS sink up only when ≥1
+market-data feed is subscribed** (bound non-fatally: a taken port disables the sink but never
+crash-loops the tunnel), and restarting the shred forwarder when its subscribed source set changes.
+It is **default-on with fail-open**: no `doublezero` CLI (running from source) → the static
+always-on set; a transient CLI error → keep current activations. `--subscription-gating-disable`
+forces the static model. A single feed dying no longer exits the process — the reconciler respawns
+it on the next tick.
 
 Ingest has **two source transports** that converge on one shared `arbiter` before the broadcast:
 the always-on DZ Edge **multicast** receivers, and optional **public WebSocket** feeders (off by
@@ -53,8 +64,9 @@ race in the arbiter's one per-`(venue, symbol)` floor (see `ingest/arbiter.rs` b
 cross-source duplicates collapse and the public copy fills in only when the edge gaps.
 
 Modules are grouped by role under `src/`:
-- **`ingest/`** — the source→`FeedMessage` pipeline (always on): `feeds`, `receiver`,
-  `processor`, `book`, `subscriber`, `arbiter`, the optional public feeders (`public_feeder`
+- **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
+  `subscriber`, `arbiter`, the **`subscriptions`** detector + **`reconcile`** activation loop (which
+  decide what runs — see Architecture above), the optional public feeders (`public_feeder`
   scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
   `codec_midpoint`, `codec_mbo`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
@@ -91,10 +103,24 @@ Modules are grouped by role under `src/`:
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
 - **`ingest/feeds.rs`** — the hardcoded feed registry: each `Feed` is one multicast group mapped to one
-  venue, with a `FeedKind` (which protocol) and `FeedPorts` (`TwoPort` for TOB/Midpoint, or
-  `ThreePort` adding a snapshot port for MBO). `FEEDS` is the built-in list; add a row to ingest
-  another venue (sibling-protocol rows are added once their live endpoints are known). `--feed
-  <venue>` selects a subset; consumers then filter by venue over the WS.
+  venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
+  matched by the reconciler), a `FeedKind` (which protocol) and `FeedPorts` (`TwoPort` for
+  TOB/Midpoint, or `ThreePort` adding a snapshot port for MBO). `FEEDS` is the built-in list; add a
+  row to ingest another venue (sibling-protocol rows are added once their live endpoints are known).
+  `--feed <venue>` selects a subset; consumers then filter by venue over the WS.
+- **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
+  `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
+  entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
+  `multicast group list` (`shred::discovery::parse_group_code_ips`) for the shred groups (market-data
+  IPs come from `FEEDS`). Classifies into `market_data_feeds()` (subscribed enabled feeds) and
+  `shred_sources()` (subscribed `edge-solana-*` → `ip:port`). Sync `Command` soft-fail; the
+  `Detected` enum distinguishes `CliMissing` (fail open) from `Unavailable` (transient, keep current).
+- **`ingest/reconcile.rs`** — the **activation authority**. `Reconciler::run()` polls `detect()`
+  every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
+  market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
+  (spawn/abort). Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
+  finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
+  one `static_desired()`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
@@ -167,8 +193,9 @@ Modules are grouped by role under `src/`:
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose), app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
-  listener is bound via `ws::bind()` (separate from `ws::serve()`) so `main.rs` can treat a bind
-  failure as non-fatal — a taken port disables the sink but leaves the tunnel running.
+  listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
+  failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
+  the sink only once a market-data feed is subscribed.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the `now_ns()` /
   `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
@@ -209,9 +236,12 @@ Modules are grouped by role under `src/`:
 - `--iface` accepts an interface name (resolved to its IPv4 via `ip -4 -o addr show`) or an IPv4
   literal directly.
 - **Source/sink activation is uniform**: a source or sink runs when its key config value is
-  non-empty/present. ws (output) is on by default (non-empty default `--ws-bind`; `--ws-bind ""`
-  disables it); the public WS input feeder is **off** by default (on when `--ws-input-coins` is
-  non-empty). README has the full activation tables.
+  non-empty/present, **and** (for the subscription-gated ones — market-data receivers, the WS sink,
+  the shred forwarder) when the reconciler sees the host subscribed to the relevant group. ws
+  (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only
+  *activated* when a market-data feed is subscribed; the public WS input feeder is **off** by
+  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated. README has the
+  full activation tables.
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
   `wss://` client in `ingest/ws_feeder.rs` (public HL feed), which uses rustls + bundled webpki roots.

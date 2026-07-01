@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{bail, Result};
 use clap::Parser;
-use tokio::{sync::broadcast, task::JoinSet};
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use doublezero_edge_connect::{ingest, metrics, model, shred, sinks};
@@ -179,6 +179,27 @@ struct Args {
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
     #[arg(long = "metrics-bind", env = "METRICS_BIND", default_value = "")]
     metrics_bind: String,
+
+    /// How often (seconds) the subscription reconciler re-reads `doublezero status` and reconciles
+    /// which market-data receivers, the WebSocket sink, and shred sources are active. Subscriptions
+    /// change rarely, so the default is coarse.
+    #[arg(
+        long = "subscription-refresh-secs",
+        env = "DZ_SUBSCRIPTION_REFRESH_SECS",
+        default_value_t = 30
+    )]
+    subscription_refresh_secs: u64,
+
+    /// Disable subscription-driven activation and force the static always-on model: run every
+    /// selected feed's receiver + the WS sink (if `--ws-bind` is set) from startup, and resolve
+    /// shred sources once. The same fallback kicks in automatically when the `doublezero` CLI is
+    /// absent (running from source).
+    #[arg(
+        long = "subscription-gating-disable",
+        env = "DZ_SUBSCRIPTION_GATING_DISABLE",
+        default_value_t = false
+    )]
+    subscription_gating_disable: bool,
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -233,42 +254,19 @@ async fn main() -> Result<()> {
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
 
-    // WebSocket sink: on by default; disable it by passing an empty `--ws-bind`.
-    //
-    // Bind eagerly here rather than inside the spawned task so a bind failure (e.g. the port is
-    // already taken — `0.0.0.0:8081` collides with any pre-existing `127.0.0.1:8081` listener) is
-    // NOT fatal: it would otherwise propagate through the `select!` below, exit the process, and —
-    // under the container's `--restart unless-stopped` — crash-loop the whole bridge, tearing down
-    // doublezerod and the DoubleZero tunnel with it. Instead we log a warning and run without the
-    // sink; the tunnel and shred forwarding are unaffected.
-    let ws = if args.ws_bind.is_empty() {
+    // WebSocket sink config. The sink itself is activated by the subscription reconciler (below),
+    // not here: it comes up only when a market-data feed is actually subscribed, and its listener is
+    // bound non-fatally (a taken port disables the sink but never crash-loops the tunnel). An empty
+    // `--ws-bind` disables it outright.
+    if args.ws_bind.is_empty() {
         info!("WebSocket sink disabled (empty --ws-bind)");
-        None
-    } else {
-        match sinks::ws::bind(&args.ws_bind).await {
-            Ok(listener) => {
-                let ws_cfg = sinks::ws::WsConfig {
-                    heartbeat: std::time::Duration::from_secs(args.ws_heartbeat_secs),
-                    idle_timeout: std::time::Duration::from_secs(args.ws_idle_timeout_secs),
-                    max_clients: args.ws_max_clients,
-                    max_subs: args.ws_max_subs,
-                    max_inbound_per_min: args.ws_max_inbound_per_min,
-                };
-                Some(tokio::spawn(sinks::ws::serve(
-                    listener,
-                    tx.clone(),
-                    instruments.clone(),
-                    depth.clone(),
-                    ws_cfg,
-                )))
-            }
-            Err(e) => {
-                warn!(bind = %args.ws_bind, error = %e,
-                    "WebSocket sink failed to bind (port already in use?); continuing without it \
-                     — the DoubleZero tunnel and shred forwarding are unaffected");
-                None
-            }
-        }
+    }
+    let ws_cfg = sinks::ws::WsConfig {
+        heartbeat: std::time::Duration::from_secs(args.ws_heartbeat_secs),
+        idle_timeout: std::time::Duration::from_secs(args.ws_idle_timeout_secs),
+        max_clients: args.ws_max_clients,
+        max_subs: args.ws_max_subs,
+        max_inbound_per_min: args.ws_max_inbound_per_min,
     };
 
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always
@@ -281,85 +279,41 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(sinks::metrics::run(args.metrics_bind.clone())))
     };
 
-    // Shred forwarder: activate-on-discovery, with an explicit opt-out. By default it runs iff an
-    // explicit `--shred-source` is given or discovery finds ≥1 `edge-solana-*` group;
-    // `--shred-forward-disable` / `DZ_SHRED_DISABLE` forces it off regardless (and skips discovery
-    // entirely, so no pointless shell-out to the `doublezero` CLI when the operator opted out).
-    //
-    // Validate the destinations first (pure parse, no I/O) so a `--shred-forward` typo fails fast.
-    //
-    // NOTE: source resolution is one-shot at startup. Discovery is not retried — if the
-    // `doublezero` CLI isn't ready yet at boot, or a group activates later, those groups are not
-    // picked up until the process restarts. This is consistent with the "activate-on-discovery"
-    // scope; periodic re-discovery is a follow-up. (Once a group IS resolved, its receiver
-    // survives interface flap via the rejoin watchdog.)
+    // Shred-forwarder parameters. Sources are NOT resolved here anymore — the subscription
+    // reconciler derives them (from the host's subscribed `edge-solana-*` groups, or an explicit
+    // `--shred-source` override) and restarts the forwarder when they change. Validate the pieces up
+    // front (pure parse, no I/O) so a bad `--shred-forward`/mode/window fails fast.
     let shred_forward = shred::parse_forwards(&args.shred_forward)?;
-    let shred_sources = if args.shred_disable {
-        Vec::new()
-    } else {
-        shred::resolve_sources(
-            &args.shred_sources,
-            &args.shred_code_prefix,
-            args.shred_port,
-        )?
-    };
-    let shred = match shred::decide_activation(args.shred_disable, shred_sources.len()) {
-        shred::ShredActivation::Disabled => {
-            info!("shred forwarder disabled (--shred-forward-disable / DZ_SHRED_DISABLE set)");
-            None
+    let shred_explicit_sources = shred::parse_sources(&args.shred_sources)?;
+    if !args.shred_disable {
+        let mode = args.shred_dedup_mode;
+        // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
+        // any other mode is ignored (warn rather than silently promote — the user chose the mode).
+        if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
+            bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
         }
-        shred::ShredActivation::NoSources => {
-            info!("shred forwarder disabled (no --shred-source and discovery found no groups)");
-            None
-        }
-        shred::ShredActivation::Run => {
-            let mode = args.shred_dedup_mode;
-            // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
-            // any other mode is ignored (warn rather than silently promote — the user chose the mode).
-            if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
-                bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
-            }
-            if mode != shred::DedupMode::Sigverify && args.shred_rpc_url.is_some() {
-                warn!(
+        if mode != shred::DedupMode::Sigverify && args.shred_rpc_url.is_some() {
+            warn!(
                 ?mode,
                 "--shred-rpc-url is set but ignored (only --shred-dedup-mode sigverify uses it)"
             );
-            }
-            // A zero window evicts everything immediately, defeating dedup; reject it up front rather
-            // than silently forwarding every duplicate.
-            if mode != shred::DedupMode::None && args.shred_dedup_window_slots == 0 {
-                bail!("--shred-dedup-window-slots must be > 0 unless --shred-dedup-mode is none");
-            }
-            let shred_cfg = shred::ShredConfig {
-                iface: args.iface.clone(),
-                recv_buf: args.recv_buf,
-                sources: shred_sources,
-                forward: shred_forward,
-                mode,
-                rpc_url: args.shred_rpc_url.clone(),
-                dedup_window_slots: args.shred_dedup_window_slots,
-            };
-            info!(sources = ?shred_cfg.sources, forward = ?shred_cfg.forward, "shred forwarder enabled");
-            Some(tokio::spawn(shred::run(shred_cfg)))
         }
-    };
-
-    // One receiver task per feed; all publish onto the shared broadcast tagged with the
-    // feed's venue, and the WS server fans them out to consumers (who filter by venue).
-    let mut receivers = JoinSet::new();
-    for feed in enabled {
-        info!(venue = feed.venue, kind = ?feed.kind, group = %feed.group,
-              mktdata_port = feed.ports.mktdata(), refdata_port = feed.ports.refdata(),
-              snapshot_port = ?feed.ports.snapshot(), "starting feed receiver");
-        receivers.spawn(ingest::receiver::run_feed(
-            *feed,
-            args.iface.clone(),
-            args.recv_buf,
-            arbiter.clone(),
-            instruments.clone(),
-            depth.clone(),
-        ));
+        // A zero window evicts everything immediately, defeating dedup; reject it up front rather
+        // than silently forwarding every duplicate.
+        if mode != shred::DedupMode::None && args.shred_dedup_window_slots == 0 {
+            bail!("--shred-dedup-window-slots must be > 0 unless --shred-dedup-mode is none");
+        }
     }
+    let shred_params = ingest::reconcile::ShredParams {
+        disabled: args.shred_disable,
+        explicit_sources: shred_explicit_sources,
+        code_prefix: args.shred_code_prefix.clone(),
+        port: args.shred_port,
+        forward: shred_forward,
+        mode: args.shred_dedup_mode,
+        rpc_url: args.shred_rpc_url.clone(),
+        dedup_window_slots: args.shred_dedup_window_slots,
+    };
 
     // Public WS input feeder: off unless `--ws-input-coins` is non-empty (the source/sink activation
     // convention). It emits through the same shared arbiter as the multicast receivers, so the public
@@ -396,31 +350,32 @@ async fn main() -> Result<()> {
         )))
     };
 
-    // Exit if the WS server (when enabled) or any feed receiver returns (they loop forever). When
-    // the WS sink is disabled, that arm is a never-resolving future so the process is driven by the
-    // receivers alone. The WS input feeder loops forever too; its arm resolves only if the task
-    // panics, surfacing that rather than letting it die silently.
+    // The subscription reconciler owns market-data receivers, the WebSocket sink, and the shred
+    // forwarder: it polls `doublezero status` and activates/deactivates them as the host's
+    // subscriptions change (default-on with fail-open; `--subscription-gating-disable` forces the
+    // static always-on model). It loops forever, so its arm resolves only on a task panic.
+    let reconciler = tokio::spawn(
+        ingest::reconcile::Reconciler::new(ingest::reconcile::ReconcilerConfig {
+            tx: tx.clone(),
+            arbiter,
+            instruments,
+            depth,
+            enabled,
+            iface: args.iface.clone(),
+            recv_buf: args.recv_buf,
+            refresh: std::time::Duration::from_secs(args.subscription_refresh_secs),
+            gating_disabled: args.subscription_gating_disable,
+            ws_bind: args.ws_bind.clone(),
+            ws_cfg,
+            shred: shred_params,
+        })
+        .run(),
+    );
+
+    // The reconciler and the (independent, config-gated) public feeders + metrics endpoint all loop
+    // forever; the process exits only if one of them panics or the metrics server fails to bind.
     tokio::select! {
-        r = async { match ws {
-            Some(handle) => handle.await,
-            None => std::future::pending().await,
-        } } => r??,
-        // The shred forwarder is an optional add-on; a shred-side failure (e.g. the forwarder
-        // failing to bind its send socket, or a task panic) must NOT take the market-data bridge
-        // down with it. Log the outcome and degrade this arm to `pending()` so the rest of the
-        // process keeps running. (Receiver bind failures are already retried, not propagated.)
-        () = async { match shred {
-            Some(handle) => {
-                match handle.await {
-                    Ok(Ok(())) => warn!("shred forwarder exited cleanly; market-data bridge continues"),
-                    Ok(Err(e)) => warn!(error = %e, "shred forwarder failed; market-data bridge continues"),
-                    Err(e) => warn!(error = %e, "shred forwarder task panicked; market-data bridge continues"),
-                }
-                std::future::pending::<()>().await
-            }
-            None => std::future::pending::<()>().await,
-        } } => {},
-        Some(r) = receivers.join_next() => r??,
+        r = reconciler => r??,
         r = async { match ws_input {
             Some(handle) => handle.await,
             None => std::future::pending().await,
@@ -430,7 +385,7 @@ async fn main() -> Result<()> {
             None => std::future::pending().await,
         } } => r?,
         // The metrics endpoint (when enabled) loops forever; its arm resolves only on a bind/accept
-        // failure or a task panic, surfacing that like the WS server arm.
+        // failure or a task panic.
         r = async { match metrics_srv {
             Some(handle) => handle.await,
             None => std::future::pending().await,

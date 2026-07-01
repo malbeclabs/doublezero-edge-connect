@@ -41,7 +41,19 @@ impl Bridge {
         let bin = env!("CARGO_BIN_EXE_doublezero-edge-connect");
         let ws_addr = format!("127.0.0.1:{ws_port}");
         let iface = std::env::var("DZ_E2E_IFACE").unwrap_or_else(|_| "0.0.0.0".to_string());
-        let mut args = vec!["--feed", venue, "--iface", &iface, "--ws-bind", &ws_addr];
+        // Disable subscription-driven activation: the E2E harness feeds *synthetic* multicast on
+        // loopback and expects the receivers + WS sink to come up unconditionally, independent of
+        // whatever the host's real `doublezero status` reports. Without this the reconciler would
+        // (correctly) keep the sink off on a host that isn't subscribed to the venue's group.
+        let mut args = vec![
+            "--feed",
+            venue,
+            "--iface",
+            &iface,
+            "--ws-bind",
+            &ws_addr,
+            "--subscription-gating-disable",
+        ];
         args.extend_from_slice(extra_args);
         let mut child = Command::new(bin)
             .args(&args)

@@ -13,11 +13,15 @@ and never drops a datagram bound for a healthy one. `--shred-forward` targets sh
 local/fast sinks: sends are sequential per destination, so a slow or remote sink throttles the
 whole forwarder (and sheds load); the send sockets pin no egress interface.
 
-It **activates on discovery**: by default it shells out to `doublezero multicast group list
---json-compact` and selects the activated groups whose `code` starts with `--shred-code-prefix`
-(default `edge-solana-`), binding each on `--shred-port` (default `7733`). If the CLI is missing,
-errors, or finds no matching group, the forwarder stays off. Pass `--shred-source GROUP:PORT`
-(repeatable) to override discovery entirely.
+It **activates on subscription**: source resolution is driven by the shared subscription reconciler
+(`ingest::reconcile`, see the main README/CLAUDE.md), which reads the groups **this host is
+subscribed to** from `doublezero status` every `--subscription-refresh-secs` and picks the
+subscribed groups whose `code` starts with `--shred-code-prefix` (default `edge-solana-`), resolving
+each to its multicast IP via `doublezero multicast group list --json-compact` and binding it on
+`--shred-port` (default `7733`). The forwarder starts when ≥1 such group is subscribed, and is
+**restarted whenever that set changes** (a newly-subscribed group is picked up, a dropped one torn
+down) — no process restart needed. If the `doublezero` CLI is missing, the forwarder runs only from
+an explicit `--shred-source GROUP:PORT` (repeatable), which bypasses subscription discovery entirely.
 
 ## Deduplication
 
@@ -100,7 +104,8 @@ forwarder backpressure the **newest** datagram is shed (with a periodic drop-cou
 than blocking ingest. Discovery binds every matched group; a group this host isn't actually
 receiving on simply stays idle and periodically rejoins (harmless).
 
-Source resolution is **one-shot at startup**: if the `doublezero` CLI isn't ready when the bridge
-boots, or a group activates later, those groups aren't picked up until the process restarts
-(periodic re-discovery is a follow-up). Once a group is resolved, its receiver survives interface
-flap via the rejoin watchdog.
+Source resolution is **refreshed periodically** (every `--subscription-refresh-secs`): the bridge
+starts before `doublezero connect multicast` runs, so subscriptions aren't present at boot — the
+reconciler picks them up on a later tick, and likewise reacts to a group subscribed/unsubscribed at
+runtime by restarting the forwarder with the new source set. Once a group is running, its receiver
+survives interface flap via the rejoin watchdog.

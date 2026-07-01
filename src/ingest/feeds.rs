@@ -69,6 +69,12 @@ pub struct Feed {
     /// Venue name stamped on every instrument and message from this feed. Matches the
     /// edge-feed-spec source registry name (e.g. "Hyperliquid" for SourceID 1).
     pub venue: &'static str,
+    /// The DoubleZero multicast group **code** for this feed's group (e.g. "tiredsolid",
+    /// "scottsdale") — the identifier `doublezero status`/`multicast group list` report. The
+    /// subscription reconciler matches this against the host's subscribed `S:<code>` entries to
+    /// decide whether to activate the feed. Multiple feeds (e.g. a venue's TOB + MBO) can share one
+    /// code, since they ride the same multicast group.
+    pub code: &'static str,
     /// Which edge-feed-spec protocol this feed speaks (selects decoder + processor).
     pub kind: FeedKind,
     /// Multicast group for the feed.
@@ -99,6 +105,7 @@ pub const FEEDS: &[Feed] = &[
     // tiredsolid). Each feed gets its own receiver + reference-data state, keyed by group address.
     Feed {
         venue: "Hyperliquid",
+        code: "tiredsolid",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 15),
         ports: FeedPorts::TwoPort {
@@ -112,6 +119,7 @@ pub const FEEDS: &[Feed] = &[
     // Depth-only: TOB owns this venue's trades.
     Feed {
         venue: "Hyperliquid",
+        code: "tiredsolid",
         kind: FeedKind::MarketByOrder,
         group: Ipv4Addr::new(233, 84, 178, 15),
         ports: FeedPorts::ThreePort {
@@ -123,6 +131,7 @@ pub const FEEDS: &[Feed] = &[
     },
     Feed {
         venue: "Phoenix",
+        code: "scottsdale",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
         ports: FeedPorts::TwoPort {
@@ -147,6 +156,23 @@ mod tests {
                 f.venue,
                 f.kind
             );
+        }
+    }
+
+    #[test]
+    fn every_feed_has_a_group_code() {
+        // The reconciler matches `code` against `doublezero status` subscriptions, so every row
+        // must carry one. Both Hyperliquid rows share the group `tiredsolid`; Phoenix is `scottsdale`.
+        for f in FEEDS {
+            assert!(!f.code.is_empty(), "{} {:?} has no code", f.venue, f.kind);
+        }
+        for f in FEEDS {
+            let expected = match f.venue {
+                "Hyperliquid" => "tiredsolid",
+                "Phoenix" => "scottsdale",
+                other => panic!("unexpected venue {other}"),
+            };
+            assert_eq!(f.code, expected, "{} has wrong code", f.venue);
         }
     }
 

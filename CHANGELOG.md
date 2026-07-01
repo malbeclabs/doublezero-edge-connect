@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Subscription-driven feed activation** — the bridge now activates only the feeds this host is
+  actually subscribed to, and adds/removes them at runtime as subscriptions change:
+  - A single detector (`src/ingest/subscriptions.rs`) reads the host's subscriptions from
+    `doublezero status --json` (`multicast_groups`, the `S:<code>` entries — the authoritative
+    per-host view, unlike the network-wide `multicast group list`), resolving shred-group IPs via
+    `multicast group list` (`src/shred/discovery.rs::parse_group_code_ips`). Each market-data feed
+    now carries its group `code` (`src/ingest/feeds.rs`: `tiredsolid` = Hyperliquid, `scottsdale` =
+    Phoenix).
+  - A periodic reconciler (`src/ingest/reconcile.rs`) polls every `--subscription-refresh-secs`
+    (`DZ_SUBSCRIPTION_REFRESH_SECS`, default 30) and diffs desired-vs-running, spawning/aborting
+    market-data receivers, the WebSocket sink, and the shred forwarder. The **WebSocket sink comes
+    up only when ≥1 market-data feed is subscribed** (so a shreds-only host serves no WS and can't
+    collide with an existing `:8081` service); shred sources come from the subscribed
+    `edge-solana-*` groups.
+  - **Default-on with fail-open**: with no `doublezero` CLI (running from source) gating falls open
+    to the static always-on set; a transient CLI failure keeps the current activations rather than
+    flapping. `--subscription-gating-disable` (`DZ_SUBSCRIPTION_GATING_DISABLE`) forces the static
+    model. A single feed dying no longer exits the process — the reconciler respawns it.
 - Cross-source de-duplication **win metrics**, surfacing how the edge feed beats the
   original/public sources in both quantity and latency at each de-dup contest:
   - Quotes/trades (`src/ingest/arbiter.rs`): the staleness floor and windowed dedup now report

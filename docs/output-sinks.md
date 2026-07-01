@@ -7,12 +7,18 @@ sink can't stall ingest. Every flag also reads from the env var shown.
 
 | Sink | Default | Enable / disable | Config flags (env) |
 |------|---------|------------------|--------------------|
-| **WebSocket** (`sinks::ws`) | **on** | on unless `--ws-bind` is empty; `--ws-bind ""` disables it | `--ws-bind` (`WS_BIND`, default `0.0.0.0:8081`) + the `--ws-*` limits |
+| **WebSocket** (`sinks::ws`) | **on when subscribed** | configured unless `--ws-bind` is empty (`--ws-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed | `--ws-bind` (`WS_BIND`, default `0.0.0.0:8081`) + the `--ws-*` limits |
 | **Metrics** (`sinks::metrics`) | **off** | on when `--metrics-bind` is non-empty | `--metrics-bind` (`METRICS_BIND`, default empty) |
 
-A sink is active when its key config value is non-empty/present; the WebSocket sink simply ships
-a non-empty default bind, so it is on unless you explicitly clear it, while the metrics endpoint
-ships an empty default, so it is off unless you give it a bind.
+The metrics endpoint is active when its key config value is non-empty. The WebSocket sink ships a
+non-empty default bind (so it's *configured* unless you clear it), but the **subscription
+reconciler** only *activates* it once this host is actually subscribed to a market-data feed —
+so a shreds-only host serves no WebSocket and can't collide with an existing `:8081` service, with
+no manual config. Its listener is bound non-fatally: a taken port disables the sink for that cycle
+(retried on the next reconcile) but never crash-loops the process or the DoubleZero tunnel. Running
+from source without the `doublezero` CLI, gating falls open and the sink is active whenever
+configured. See the main README for the reconciler flags (`--subscription-refresh-secs`,
+`--subscription-gating-disable`).
 
 ## Metrics (Prometheus)
 
