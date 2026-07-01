@@ -475,10 +475,12 @@ async fn forwarder_task(
         socks.push(Dest {
             addr: *dst,
             sock,
-            sends_ok: metrics().shred_sends.with_label_values(&[&dst_label, "ok"]),
+            sends_ok: metrics()
+                .shred_sends
+                .with_label_values(&[dst_label.as_str(), "ok"]),
             sends_err: metrics()
                 .shred_sends
-                .with_label_values(&[&dst_label, "error"]),
+                .with_label_values(&[dst_label.as_str(), "error"]),
             bytes_sent: metrics().shred_bytes_sent.with_label_values(&[&dst_label]),
         });
     }
