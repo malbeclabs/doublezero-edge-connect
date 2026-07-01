@@ -40,15 +40,20 @@ pub const DEFAULT_PHOENIX_WS_URL: &str = "wss://perp-api.phoenix.trade/v1/ws";
 const PHOENIX_VENUE: &str = "Phoenix";
 
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
-/// `trades` channel is acted on; confirmations/other channels parse with `trades` absent and are
-/// ignored.
+/// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
+/// no `channel` key at all) is ignored without counting as a decode error — so
+/// `dz_ws_feeder_decode_errors_total{venue=Phoenix}` stays a real health signal on a chatty control
+/// channel. Fills are decoded **per element** (as raw JSON here, then one-by-one in `handle_text`) so
+/// a single malformed fill can't fail the whole batch — the backstop matters most during bursts, when
+/// `trades` arrays are largest.
 #[derive(Deserialize)]
 struct TradesFrame {
-    channel: String,
+    #[serde(default)]
+    channel: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
     #[serde(default)]
-    trades: Option<Vec<Fill>>,
+    trades: Option<Vec<serde_json::Value>>,
 }
 
 /// One fill in a Phoenix `trades` frame. Fields beyond these (slot, slotIndex, taker, lots, fees,
@@ -95,14 +100,22 @@ impl PhoenixVenue {
                 return;
             }
         };
-        if frame.channel != "trades" {
-            return; // subscription confirmations / other channels — nothing to emit
+        if frame.channel.as_deref() != Some("trades") {
+            return; // subscription status / heartbeats / other (or no) channels — nothing to emit
         }
         let (Some(symbol), Some(fills)) = (frame.symbol, frame.trades) else {
             return; // a trades frame missing its symbol or fills carries nothing actionable
         };
-        for fill in &fills {
-            self.emit_trade(&symbol, fill, arbiter, instruments);
+        // Decode each fill on its own: one malformed element (a missing field, a null, a new shape)
+        // is skipped with a single decode-error bump, so the rest of the batch still emits.
+        for fill in fills {
+            match serde_json::from_value::<Fill>(fill) {
+                Ok(fill) => self.emit_trade(&symbol, &fill, arbiter, instruments),
+                Err(e) => {
+                    self.decode_error();
+                    tracing::debug!(error = %e, "Phoenix public WS: undecodable fill skipped");
+                }
+            }
         }
     }
 
@@ -118,8 +131,14 @@ impl PhoenixVenue {
         if !self.symbols.contains(symbol) {
             return; // a market we didn't subscribe to; ignore
         }
+        // Precision-before-price, and the load-bearing safety net for the edge==public symbol
+        // assumption: we only emit under a `(Phoenix, symbol)` the edge refdata has actually defined.
+        // If Phoenix ever renamed a market on one side so the two feeds diverged, a public fill whose
+        // symbol the edge doesn't define is DROPPED here (the backstop silently stops for it) rather
+        // than emitted under a mismatched key that would double-print alongside the edge copy. The
+        // resolved market set is logged at startup (see `run`) so a divergence is at least visible.
         if !instrument_known(instruments, PHOENIX_VENUE, symbol) {
-            return; // precision unknown; drop until the edge refdata defines this instrument
+            return; // precision unknown / symbol not defined by the edge; drop
         }
         let Ok(trade_id) = fill.trade_sequence_number.parse::<u64>() else {
             self.decode_error();
@@ -138,18 +157,16 @@ impl PhoenixVenue {
         if !price.is_finite() {
             return;
         }
-        // Unix seconds → ns. trade dedup keys on trade_id, so a bad/overflowing timestamp falls back
-        // to the 0 "not available" sentinel rather than dropping the trade.
-        let source_ts_ns = fill
-            .timestamp
-            .parse::<u64>()
-            .ok()
-            .and_then(|s| s.checked_mul(1_000_000_000))
-            .unwrap_or(0);
+        // trade dedup keys on trade_id, so an unparseable timestamp falls back to the 0 "not
+        // available" sentinel rather than dropping the trade.
+        let source_ts_ns = unix_seconds_to_ns(&fill.timestamp);
         let trade = NormalizedTrade {
             venue: PHOENIX_VENUE.to_string(),
             symbol: symbol.to_string(),
             price,
+            // `baseAmount` is the fill's base-asset quantity in the *same real units* the edge emits
+            // (edge `trade_qty_raw * 10^qty_exponent`) — verified equal on all 257 shared fills in the
+            // 2026-06-30 capture, so a backstop fill carries the same magnitude as its edge copy.
             size: base,
             // Phoenix trade side: "bid" = aggressing buy, "ask" = aggressing sell (capture-confirmed).
             aggressor_side: match fill.side.as_str() {
@@ -205,6 +222,19 @@ impl PublicVenue for PhoenixVenue {
     }
 }
 
+/// Parse a Phoenix public `timestamp` (Unix **seconds**) into nanoseconds. The capture shows integral
+/// seconds (e.g. `"1782831977"`); this tolerates a fractional suffix (`"1782831977.5"`) by taking the
+/// whole-seconds part rather than failing — so a fractional value degrades to second precision instead
+/// of silently becoming the `0` "not available" sentinel for every affected fill. Returns `0` only
+/// when the whole-seconds part is unparseable or overflows ns.
+fn unix_seconds_to_ns(ts: &str) -> u64 {
+    let secs = ts.split_once('.').map_or(ts, |(whole, _frac)| whole);
+    secs.parse::<u64>()
+        .ok()
+        .and_then(|s| s.checked_mul(1_000_000_000))
+        .unwrap_or(0)
+}
+
 /// Run the Phoenix public-API trade feeder forever (reconnecting on any failure). Returns
 /// immediately as a no-op when `markets` is empty (the feeder is off by default). Thin wrapper over
 /// the venue-generic [`public_feeder::run`].
@@ -214,6 +244,16 @@ pub async fn run(
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
 ) {
+    if !markets.is_empty() {
+        // Surface the resolved market set: each symbol must match the edge Phoenix symbol verbatim
+        // (edge `instrument_id == public assetId`) or its public fills are dropped at the precision
+        // gate (no dedup, no backstop) — logging it makes an edge/public symbol divergence visible.
+        tracing::info!(
+            venue = PHOENIX_VENUE,
+            markets = ?markets,
+            "Phoenix public trade feeder backing markets (must match the edge Phoenix symbols verbatim)"
+        );
+    }
     public_feeder::run(PhoenixVenue::new(url, markets), arbiter, instruments).await
 }
 
@@ -373,5 +413,75 @@ mod tests {
         assert!(subs.iter().all(|s| s.contains(r#""channel":"trades""#)));
         assert!(subs.iter().any(|s| s.contains(r#""symbol":"SOL""#)));
         assert!(subs.iter().any(|s| s.contains(r#""symbol":"BTC""#)));
+    }
+
+    /// A **verbatim** public `trades` frame captured from `perp-api.phoenix.trade` (2026-06-30,
+    /// INTC seq 20274) decodes and emits — pinning the live wire types (`baseAmount`/`quoteAmount`
+    /// as JSON numbers, `tradeSequenceNumber`/`timestamp`/`side` as strings) and the extra fields
+    /// (`slot`, `slotIndex`, `taker`, `*LotsFilled`, `numFills`) the decoder must ignore. The emitted
+    /// `size` is `baseAmount` verbatim, in the same units the edge emits (capture-verified).
+    #[test]
+    fn real_public_trades_frame_decodes_and_emits() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments = instruments_with("INTC");
+        let v = venue(&["INTC"]);
+        let real = r#"{"channel":"trades","symbol":"INTC","trades":[{"slot":"429901814","slotIndex":1304,"timestamp":"1782831977","symbol":"INTC","taker":"CrhWhzxEohhjooVdd8G9ZQnyWg9Kpuo2fmqWHhtZvEq2","tradeSequenceNumber":"20274","side":"ask","baseLotsFilled":"24","quoteLotsFilled":"3326640","feeInQuoteLots":"0","baseAmount":0.024,"quoteAmount":3.32664,"numFills":1}]}"#;
+        v.handle_text(real, &arbiter, &instruments);
+        match rx.try_recv().expect("the real frame emitted a trade") {
+            FeedMessage::Trade(t) => {
+                assert_eq!(t.symbol, "INTC");
+                assert_eq!(t.trade_id, 20274);
+                assert_eq!(t.aggressor_side, "sell"); // "ask" -> sell
+                assert_eq!(t.size, 0.024); // baseAmount verbatim
+                assert_eq!(t.price, 3.32664 / 0.024); // quoteAmount / baseAmount
+                assert_eq!(t.source_ts_ns, 1_782_831_977_000_000_000);
+            }
+            other => panic!("expected a trade, got {other:?}"),
+        }
+    }
+
+    /// One malformed fill (a `baseAmount` sent as a string) must not sink the rest of the batch: the
+    /// good fill alongside it still emits. Guards the burst path, where `trades` arrays are largest.
+    #[test]
+    fn one_malformed_fill_does_not_sink_the_batch() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL"]);
+        let frame = r#"{"channel":"trades","symbol":"SOL","trades":[{"tradeSequenceNumber":"199","side":"bid","baseAmount":"not-a-number","quoteAmount":1.0,"timestamp":"1"},{"tradeSequenceNumber":"200","side":"bid","baseAmount":10.0,"quoteAmount":1500.0,"timestamp":"1775578550"}]}"#;
+        v.handle_text(frame, &arbiter, &instruments);
+        match rx.try_recv().expect("the good fill still emitted") {
+            FeedMessage::Trade(t) => assert_eq!(t.trade_id, 200),
+            other => panic!("expected the good fill, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "only the good fill should emit");
+    }
+
+    /// A control frame with no `channel` key (e.g. a heartbeat/pong) deserializes fine and is ignored
+    /// — it must not emit, and must not be treated as a decode error (channel is `Option`).
+    #[test]
+    fn control_frame_without_channel_is_ignored() {
+        let (arbiter, mut rx) = arbiter_with_rx();
+        let instruments = instruments_with("SOL");
+        let v = venue(&["SOL"]);
+        v.handle_text(r#"{"type":"pong"}"#, &arbiter, &instruments);
+        v.handle_text(
+            r#"{"channel":"subscriptionStatus","status":"subscribed"}"#,
+            &arbiter,
+            &instruments,
+        );
+        assert!(rx.try_recv().is_err(), "control frames must not emit");
+    }
+
+    /// `unix_seconds_to_ns` scales integral seconds, degrades a fractional value to whole-second
+    /// precision (never a silent `0`), and returns the `0` sentinel only for an unparseable value.
+    #[test]
+    fn unix_seconds_to_ns_scales_and_degrades() {
+        assert_eq!(unix_seconds_to_ns("1782831977"), 1_782_831_977_000_000_000);
+        assert_eq!(
+            unix_seconds_to_ns("1775578550.5"),
+            1_775_578_550_000_000_000
+        );
+        assert_eq!(unix_seconds_to_ns(""), 0);
+        assert_eq!(unix_seconds_to_ns("notanumber"), 0);
     }
 }
