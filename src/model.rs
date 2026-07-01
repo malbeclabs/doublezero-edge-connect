@@ -210,8 +210,8 @@ pub fn now_ns() -> u64 {
 /// `clock_gettime` value is **comparable across processes on the same kernel**, so two
 /// collectors (e.g. doublezero-edge-connect and hl-collector) can measure an inter-feed delta immune to
 /// NTP steps/slew. Pair with `now_ns()` (wall clock) only to correlate with `source_ts`.
-/// Provided for standalone collectors / null tests; not referenced by the bridge itself.
-#[allow(dead_code)]
+/// Also the arrival clock the shred forwarder stamps per datagram for its cross-group lead-time
+/// metric (single process, so monotonic ns are directly comparable and immune to NTP steps).
 pub fn now_mono_ns() -> u64 {
     use nix::time::{clock_gettime, ClockId};
     clock_gettime(ClockId::CLOCK_MONOTONIC)

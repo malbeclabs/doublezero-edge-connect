@@ -17,7 +17,30 @@
 
 use std::sync::OnceLock;
 
-use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+};
+
+/// Buckets (nanoseconds) for the de-dup *lead-time* histograms: how far ahead the winning source
+/// was when the losing duplicate arrived. Spans ~50µs … 1s, dense in the sub-millisecond range
+/// where the edge feed beats the public/cross-group copy in steady state, with a long tail for the
+/// tens-to-hundreds-of-ms inter-feed skew seen when a path is slow.
+const LEAD_NS_BUCKETS: &[f64] = &[
+    50_000.0,
+    100_000.0,
+    250_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_500_000.0,
+    5_000_000.0,
+    10_000_000.0,
+    25_000_000.0,
+    50_000_000.0,
+    100_000_000.0,
+    250_000_000.0,
+    500_000_000.0,
+    1_000_000_000.0,
+];
 
 /// Every metric the bridge exports, plus the [`Registry`] they are registered against. Built once
 /// via [`Metrics::new`] and reachable through [`metrics`].
@@ -51,8 +74,23 @@ pub struct Metrics {
     pub quotes_admitted: IntCounterVec,
     /// Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat — collapsed).
     pub quotes_dropped: IntCounterVec,
+    /// Trades admitted by the windowed dedup, attributed to the winning `publisher` (edge/public) —
+    /// the trade-side mirror of [`quotes_admitted`].
+    pub trades_admitted: IntCounterVec,
     /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
     pub trades_dropped: IntCounterVec,
+    /// Quote-tick *cross-source* contest lead time (ns): on a `source_ts` tick another publisher
+    /// already led, how far ahead the leader was when this publisher's first copy arrived, labelled
+    /// by the `winner` **and** `loser` (edge/public). Its `_count` is the head-to-head contest
+    /// count. Labelling both ends keeps an edge-vs-edge mirror race (small, sub-ms leads in a
+    /// multi-mirror deployment) from diluting the headline edge-vs-public margin: the buckets of
+    /// `{winner="edge",loser="public"}` are the margin by which DZ (edge) beats the public feed,
+    /// while `{winner="edge",loser="edge"}` is the inter-mirror skew. See [`LEAD_NS_BUCKETS`].
+    pub quote_lead_ns: HistogramVec,
+    /// Trade *cross-source* contest lead time (ns): when a duplicate `trade_id` arrives from a
+    /// different publisher than the one that first delivered it, how far ahead the first was,
+    /// labelled by the `winner` and `loser` (see [`quote_lead_ns`](Self::quote_lead_ns)).
+    pub trade_lead_ns: HistogramVec,
     /// Quotes rejected for an implausibly-far-future `source_ts` before they could advance the floor.
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
@@ -111,6 +149,14 @@ pub struct Metrics {
     pub shred_no_leader: IntCounter,
     /// Slots currently tracked by the dedup window.
     pub shred_dedup_tracked_slots: IntGauge,
+    /// Cross-group shred contests won, by the multicast `winner` group that delivered first. Each
+    /// increment is a duplicate from a *different* group dropped because this group's copy already
+    /// forwarded — the head-to-head "this group beat the others" count.
+    pub shred_wins: IntCounterVec,
+    /// Cross-group shred contest lead time (ns): when a duplicate arrives from a different group
+    /// than the one that first forwarded the shred, how far ahead the winner was, labelled by the
+    /// `winner` group. See [`LEAD_NS_BUCKETS`].
+    pub shred_lead_ns: HistogramVec,
     /// Per-destination forward sends, by `dest` and `outcome` (ok/error).
     pub shred_sends: IntCounterVec,
     /// Bytes successfully forwarded to each destination, by `dest` (sum of datagram lengths on a
@@ -144,6 +190,23 @@ fn gauge(reg: &Registry, name: &str, help: &str) -> IntGauge {
     let g = IntGauge::with_opts(Opts::new(name, help)).expect("valid gauge");
     reg.register(Box::new(g.clone())).expect("register gauge");
     g
+}
+
+fn histogram_vec(
+    reg: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    buckets: &[f64],
+) -> HistogramVec {
+    let h = HistogramVec::new(
+        HistogramOpts::new(name, help).buckets(buckets.to_vec()),
+        labels,
+    )
+    .expect("valid histogram vec");
+    reg.register(Box::new(h.clone()))
+        .expect("register histogram vec");
+    h
 }
 
 impl Metrics {
@@ -220,11 +283,36 @@ impl Metrics {
                 "Quotes dropped by the staleness floor",
                 &["venue"],
             ),
+            trades_admitted: counter_vec(
+                &registry,
+                "dz_trades_admitted_total",
+                "Trades admitted by the windowed dedup, by winning publisher (edge/public)",
+                &["venue", "publisher"],
+            ),
             trades_dropped: counter_vec(
                 &registry,
                 "dz_trades_dropped_total",
                 "Trades dropped by the windowed dedup",
                 &["venue"],
+            ),
+            quote_lead_ns: histogram_vec(
+                &registry,
+                "dz_quote_lead_ns",
+                "Nanoseconds the winning publisher led the losing duplicate by, per quote-tick \
+                 cross-source contest, by winner and loser (edge/public). Splitting on both ends \
+                 keeps an edge-vs-edge mirror race out of the headline edge-vs-public margin: \
+                 {winner=\"edge\",loser=\"public\"} is 'DZ beats the public feed'.",
+                &["venue", "winner", "loser"],
+                LEAD_NS_BUCKETS,
+            ),
+            trade_lead_ns: histogram_vec(
+                &registry,
+                "dz_trade_lead_ns",
+                "Nanoseconds the winning publisher led the losing duplicate by, per trade \
+                 cross-source contest, by winner and loser (edge/public). See dz_quote_lead_ns \
+                 for why both ends are labelled.",
+                &["venue", "winner", "loser"],
+                LEAD_NS_BUCKETS,
             ),
             quotes_future_rejected: counter_vec(
                 &registry,
@@ -361,6 +449,20 @@ impl Metrics {
                 "dz_shred_dedup_tracked_slots",
                 "Slots currently tracked by the dedup window",
             ),
+            shred_wins: counter_vec(
+                &registry,
+                "dz_shred_wins_total",
+                "Cross-group shred contests won, by the multicast group that delivered first",
+                &["winner"],
+            ),
+            shred_lead_ns: histogram_vec(
+                &registry,
+                "dz_shred_lead_ns",
+                "Nanoseconds the winning group led the losing duplicate by, per cross-group shred \
+                 contest, by winner group",
+                &["winner"],
+                LEAD_NS_BUCKETS,
+            ),
             shred_sends: counter_vec(
                 &registry,
                 "dz_shred_sends_total",
@@ -411,6 +513,19 @@ mod tests {
         m.emit.with_label_values(&["Hyperliquid", "quote"]).inc();
         m.ws_clients.set(0);
         m.shred_processed.inc();
+        m.trades_admitted
+            .with_label_values(&["Hyperliquid", "edge"])
+            .inc();
+        m.quote_lead_ns
+            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .observe(123_456.0);
+        m.trade_lead_ns
+            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .observe(123_456.0);
+        m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
+        m.shred_lead_ns
+            .with_label_values(&["239.0.0.1"])
+            .observe(123_456.0);
 
         let mut buf = Vec::new();
         let encoder = TextEncoder::new();
@@ -424,6 +539,11 @@ mod tests {
             "dz_emit_total",
             "dz_ws_clients",
             "dz_shred_processed_total",
+            "dz_trades_admitted_total",
+            "dz_quote_lead_ns",
+            "dz_trade_lead_ns",
+            "dz_shred_wins_total",
+            "dz_shred_lead_ns",
         ] {
             assert!(out.contains(name), "expected `{name}` in metrics output");
         }

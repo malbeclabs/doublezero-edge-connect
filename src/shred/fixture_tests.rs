@@ -10,13 +10,20 @@
 //!   (`0x66/0x76/0x96/0xb6`) plus cross-group duplicates, from one mainnet slot.
 //! - `shred_leaders.json` — `{slot: base58 leader pubkey}` from `getLeaderSchedule` at capture time.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    net::Ipv4Addr,
+};
 
 use super::{
     dedup::{Action, DedupWindow},
     parse::{parse, ShredType},
     verify::verify,
 };
+
+/// A single source group for the fixture dedup calls (these tests count forwards / assert
+/// forward-vs-drop, not cross-group attribution, so one constant group suffices).
+const GROUP: Ipv4Addr = Ipv4Addr::new(239, 0, 0, 1);
 
 fn fixture_path(name: &str) -> String {
     format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
@@ -112,8 +119,15 @@ fn dedup_collapses_cross_group_duplicates() {
         keys.insert((meta.slot, meta.index, meta.shred_type));
         let leader = leaders.get(&meta.slot).copied();
         let mut verify_fn = || leader.as_ref().is_some_and(|pk| verify(&meta, pk));
-        if window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
-            == Action::Forward
+        if window.decide(
+            meta.slot,
+            meta.index,
+            meta.shred_type,
+            0,
+            GROUP,
+            0,
+            &mut verify_fn,
+        ) == Action::Forward
         {
             forwarded += 1;
         }
@@ -151,7 +165,15 @@ fn same_datagram_twice_forwards_once() {
             verify_calls += 1;
             leader.as_ref().is_some_and(|pk| verify(&meta, pk))
         };
-        window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
+        window.decide(
+            meta.slot,
+            meta.index,
+            meta.shred_type,
+            0,
+            GROUP,
+            0,
+            &mut verify_fn,
+        )
     };
     assert_eq!(first, Action::Forward, "first copy verifies and forwards");
     let after_first = verify_calls;
@@ -161,7 +183,15 @@ fn same_datagram_twice_forwards_once() {
             verify_calls += 1;
             leader.as_ref().is_some_and(|pk| verify(&meta, pk))
         };
-        window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
+        window.decide(
+            meta.slot,
+            meta.index,
+            meta.shred_type,
+            0,
+            GROUP,
+            0,
+            &mut verify_fn,
+        )
     };
     assert_eq!(second, Action::Drop, "duplicate of the winner is dropped");
     assert_eq!(
@@ -222,7 +252,7 @@ async fn dedup_only_collapses_resigned_copies_but_not_differing_content() {
     // schedule = None, dedup = true -> dedup-only mode.
     let handle = tokio::spawn(forwarder_task(rx, vec![dst], None, true, 512));
     for pkt in [&resigned, &resigned_twin, &plain, &plain_twin] {
-        tx.send(pkt.clone()).await.unwrap();
+        tx.send(pkt.clone().into()).await.unwrap();
     }
     drop(tx);
     handle.await.unwrap().unwrap();
@@ -287,7 +317,7 @@ async fn forwarder_task_forwards_one_copy_per_shred_over_real_capture() {
     let (tx, rx) = mpsc::channel::<ShredPacket>(256);
     let handle = tokio::spawn(forwarder_task(rx, vec![dst], Some(schedule), false, 512));
     for pkt in &datagrams {
-        tx.send(pkt.clone()).await.unwrap();
+        tx.send(pkt.clone().into()).await.unwrap();
     }
     drop(tx); // close the channel so the forwarder drains and exits
     handle.await.unwrap().unwrap();

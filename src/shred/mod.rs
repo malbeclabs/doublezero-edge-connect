@@ -105,9 +105,28 @@ const RECV_BUF_LEN: usize = 2048;
 /// copies that are otherwise identical (see the dedup-only branch in [`forwarder_task`]).
 const RETRANSMITTER_SIG_LEN: usize = parse::SIZE_OF_SIGNATURE;
 
-/// One forwarded datagram: just the shred-bearing UDP payload bytes. (A small reuse pool is a
-/// possible later optimization; not needed now.)
-pub type ShredPacket = Vec<u8>;
+/// One datagram handed from a receiver to the forwarder: the shred-bearing UDP payload plus the
+/// source `group` (multicast IP) that delivered it and the monotonic arrival time stamped at recv.
+/// The group + arrival drive the cross-group de-dup win metrics (`dz_shred_wins_total` /
+/// `dz_shred_lead_ns`); the forwarder otherwise only reads `data`.
+pub struct ShredPacket {
+    pub data: Vec<u8>,
+    pub group: Ipv4Addr,
+    pub arrival_ns: u64,
+}
+
+#[cfg(test)]
+impl From<Vec<u8>> for ShredPacket {
+    /// Test convenience: wrap raw bytes with a sentinel group/arrival, for the forwarder tests that
+    /// only assert forward/drop counts and don't exercise cross-group attribution.
+    fn from(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            group: Ipv4Addr::UNSPECIFIED,
+            arrival_ns: 0,
+        }
+    }
+}
 
 /// How the forwarder deduplicates, selected by `--shred-dedup-mode` / `DZ_SHRED_DEDUP_MODE`. This
 /// single setting is the only method selector — there is no implicit promotion from `--shred-rpc-url`
@@ -356,7 +375,14 @@ async fn receiver_task(
                     }
                     received_ctr.inc();
                     bytes_ctr.inc_by(n as u64);
-                    match tx.try_send(buf[..n].to_vec()) {
+                    // Stamp arrival here, closest to the wire, so the forwarder's cross-group
+                    // lead-time measure reflects inter-group delivery skew, not mpsc queueing.
+                    let pkt = ShredPacket {
+                        data: buf[..n].to_vec(),
+                        group,
+                        arrival_ns: crate::model::now_mono_ns(),
+                    };
+                    match tx.try_send(pkt) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
                             dropped_ctr.inc();
@@ -486,7 +512,7 @@ async fn forwarder_task(
     while let Some(pkt) = rx.recv().await {
         // Bare mode (no sigverify, no dedup): forward unconditionally.
         if !dedup_active {
-            fan_out(&socks, &pkt).await;
+            fan_out(&socks, &pkt.data).await;
             continue;
         }
         processed += 1;
@@ -494,12 +520,12 @@ async fn forwarder_task(
 
         // Dedup (with or without sigverify). An unparseable datagram can't be keyed, so forward it
         // rather than silently drop (loss-averse; it simply isn't deduped).
-        let Some(meta) = parse::parse(&pkt) else {
+        let Some(meta) = parse::parse(&pkt.data) else {
             unparsed += 1;
             forwarded += 1;
             m.shred_unparsed.inc();
             m.shred_forwarded.inc();
-            fan_out(&socks, &pkt).await;
+            fan_out(&socks, &pkt.data).await;
             log_tally(
                 processed, parsed, unparsed, forwarded, dropped, verify_ok, no_leader, &window,
             );
@@ -527,7 +553,15 @@ async fn forwarder_task(
                     // Sigverify keys content-agnostically (fingerprint = 0): the signature, not the
                     // bytes, decides the valid winner, so a forged copy with different bytes
                     // collapses onto the same key and is dropped on verify — not earn its own.
-                    window.decide(meta.slot, meta.index, meta.shred_type, 0, &mut verify_fn)
+                    window.decide(
+                        meta.slot,
+                        meta.index,
+                        meta.shred_type,
+                        0,
+                        pkt.group,
+                        pkt.arrival_ns,
+                        &mut verify_fn,
+                    )
                 }
                 None => {
                     no_leader += 1;
@@ -557,16 +591,18 @@ async fn forwarder_task(
             // needs only the already-decoded `resigned` flag and the datagram length, not the
             // unvalidated merkle offsets. `verify_ok` stays 0 — nothing is signature-checked here.
             None => {
-                let region = if meta.resigned && pkt.len() >= RETRANSMITTER_SIG_LEN {
-                    &pkt[..pkt.len() - RETRANSMITTER_SIG_LEN]
+                let region = if meta.resigned && pkt.data.len() >= RETRANSMITTER_SIG_LEN {
+                    &pkt.data[..pkt.data.len() - RETRANSMITTER_SIG_LEN]
                 } else {
-                    &pkt[..]
+                    &pkt.data[..]
                 };
                 window.decide(
                     meta.slot,
                     meta.index,
                     meta.shred_type,
                     dedup::fingerprint(region),
+                    pkt.group,
+                    pkt.arrival_ns,
                     &mut || true,
                 )
             }
@@ -575,7 +611,21 @@ async fn forwarder_task(
             Action::Forward => {
                 forwarded += 1;
                 m.shred_forwarded.inc();
-                fan_out(&socks, &pkt).await;
+                fan_out(&socks, &pkt.data).await;
+            }
+            // A duplicate from a different group than the one that forwarded first: count the drop,
+            // and record which group won and by how much (the cross-group de-dup win metrics).
+            Action::DropDuplicate {
+                winner_group,
+                lead_ns,
+            } => {
+                dropped += 1;
+                m.shred_dropped.inc();
+                let winner = winner_group.to_string();
+                m.shred_wins.with_label_values(&[&winner]).inc();
+                m.shred_lead_ns
+                    .with_label_values(&[&winner])
+                    .observe(lead_ns as f64);
             }
             Action::Drop => {
                 dropped += 1;
@@ -895,11 +945,24 @@ mod tests {
     }
 
     /// Drive `forwarder_task` in any mode (sigverify via `schedule`, dedup-only via `dedup`, or
-    /// bare) and return how many datagrams reach the single listener.
+    /// bare) and return how many datagrams reach the single listener. Raw-bytes packets are wrapped
+    /// with the sentinel group, so every duplicate is same-group; use [`run_forwarder_packets`] when
+    /// the test needs distinct source groups (cross-group attribution).
     async fn run_forwarder_mode(
         schedule: Option<Arc<LeaderSchedule>>,
         dedup: bool,
         pkts: Vec<Vec<u8>>,
+    ) -> usize {
+        run_forwarder_packets(schedule, dedup, pkts.into_iter().map(Into::into).collect()).await
+    }
+
+    /// Drive `forwarder_task` over a list of already-built [`ShredPacket`]s (explicit source group +
+    /// arrival), so a test can exercise the cross-group de-dup path end-to-end. Returns how many
+    /// datagrams reach the single listener.
+    async fn run_forwarder_packets(
+        schedule: Option<Arc<LeaderSchedule>>,
+        dedup: bool,
+        pkts: Vec<ShredPacket>,
     ) -> usize {
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dst = listener.local_addr().unwrap();
@@ -1033,5 +1096,54 @@ mod tests {
         let shred = legacy_shred_at_index(TEST_INDEX);
         let got = run_forwarder_mode(None, false, vec![shred.clone(), shred]).await;
         assert_eq!(got, 2, "bare mode forwards every datagram");
+    }
+
+    /// End-to-end cross-group de-dup win metrics: the *same* shred arriving from two distinct source
+    /// groups forwards exactly one copy, and the `Action::DropDuplicate` arm in `forwarder_task`
+    /// reaches `dz_shred_wins_total{winner}` + `dz_shred_lead_ns{winner}` (not just the plain-drop
+    /// counter). This closes the gap the `From<Vec<u8>>` (sentinel-group) helper leaves: with one
+    /// group every duplicate is a same-group plain drop, so that arm was never exercised end-to-end.
+    /// Uses source groups unique to this test and asserts on the metric *delta* (the registry is a
+    /// process-global shared across the bin's tests), so it holds without `#[serial]`.
+    #[tokio::test]
+    async fn cross_group_duplicate_records_win_and_lead_metric() {
+        let group_a = Ipv4Addr::new(239, 7, 7, 7);
+        let group_b = Ipv4Addr::new(239, 7, 7, 8);
+        let m = metrics();
+        let win_a = m.shred_wins.with_label_values(&[&group_a.to_string()]);
+        let lead_a = m.shred_lead_ns.with_label_values(&[&group_a.to_string()]);
+        let (wins0, leads0, sum0) = (
+            win_a.get(),
+            lead_a.get_sample_count(),
+            lead_a.get_sample_sum(),
+        );
+
+        let shred = legacy_shred_at_index(TEST_INDEX);
+        let pkt = |group, arrival_ns| ShredPacket {
+            data: shred.clone(),
+            group,
+            arrival_ns,
+        };
+        // Group A delivers first at t=1000; group B's identical copy arrives at t=1300 -> B lost the
+        // cross-group race by 300ns.
+        let got =
+            run_forwarder_packets(None, true, vec![pkt(group_a, 1000), pkt(group_b, 1300)]).await;
+
+        assert_eq!(got, 1, "the cross-group duplicate collapses to one forward");
+        assert_eq!(
+            win_a.get() - wins0,
+            1,
+            "group A is recorded as the cross-group winner"
+        );
+        assert_eq!(
+            lead_a.get_sample_count() - leads0,
+            1,
+            "the contest reached the lead-time histogram"
+        );
+        assert_eq!(
+            (lead_a.get_sample_sum() - sum0) as u64,
+            300,
+            "the observed lead is the inter-group arrival delta"
+        );
     }
 }

@@ -129,6 +129,46 @@ impl QuoteId {
     }
 }
 
+/// The outcome of a de-dup admission decision, shared by [`StalenessFloor`] and [`WindowedDedup`].
+/// The caller forwards on [`Admit::Emitted`] and drops otherwise; [`Admit::Contest`] additionally
+/// reports a *cross-source* head-to-head: another publisher already won this identity, and this is
+/// the first losing copy from a different publisher, arriving `lead_ns` after the `winner` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit<P> {
+    /// Forwarded: opened a new tick / new content (floor), or a first-seen identity (window).
+    Emitted,
+    /// Dropped with no cross-source contest to report: stale tick, exact repeat, a same-publisher
+    /// duplicate, or a subsequent follower at a tick whose contest was already counted.
+    Dropped,
+    /// Dropped as the first losing copy of a cross-source contest: `winner` delivered this identity
+    /// `lead_ns` nanoseconds earlier. Recorded once per identity so the count is one-per-contest.
+    Contest { winner: P, lead_ns: u64 },
+}
+
+impl<P> Admit<P> {
+    /// Whether the message should be forwarded (true only for [`Admit::Emitted`]).
+    pub fn emitted(&self) -> bool {
+        matches!(self, Admit::Emitted)
+    }
+}
+
+/// Per-key tick state for the [`StalenessFloor`]: the leader latched at the current `source_ts`
+/// tick, when that leader's opening copy arrived (for the cross-source lead-time measure), whether
+/// a losing follower has already been counted at this tick, and the leader's distinct content set
+/// (FIFO-bounded to `tick_cap`).
+struct TickState<V, P> {
+    high_water: u64,
+    leader: P,
+    /// Arrival wall-clock (ns) of the copy that opened this tick — the baseline a later follower's
+    /// arrival is compared against to compute the lead.
+    leader_arrival_ns: u64,
+    /// Set once the first cross-publisher follower at this tick is counted, so additional followers
+    /// of the same tick don't inflate the contest count.
+    follower_recorded: bool,
+    content: HashSet<V>,
+    order: VecDeque<V>,
+}
+
 /// Per-key **latch-to-leader** floor on `source_ts`. Tracks, per key, the highest `source_ts`
 /// emitted, the *leader* publisher latched for that tick, and the set of distinct content the leader
 /// has emitted at it. The `source_ts` never goes backwards, and within one tick only the leader is
@@ -152,14 +192,13 @@ impl QuoteId {
 /// == 0`, the "not available" sentinel, is handled by the caller — it must not reach the floor as a
 /// real tick, or it would pin `high_water` and drop every non-leader forever.)
 pub struct StalenessFloor<K, V, P> {
-    /// Per key: (high_water source_ts, leader publisher at that tick, leader's content set + FIFO
-    /// insertion order at it — the deque bounds the set to `tick_cap`).
-    state: HashMap<K, (u64, P, HashSet<V>, VecDeque<V>)>,
+    /// Per key: the latched tick state (high-water `source_ts`, leader + its arrival, content set).
+    state: HashMap<K, TickState<V, P>>,
     /// Cap on distinct leader contents tracked at one tick (safety bound; see type docs).
     tick_cap: usize,
 }
 
-impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq> StalenessFloor<K, V, P> {
+impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
     pub fn new(tick_cap: usize) -> Self {
         Self {
             state: HashMap::new(),
@@ -167,47 +206,76 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq> StalenessFloor<K, V, P> {
         }
     }
 
-    /// True (recording it) iff this `(source_ts, content)` from `publisher` should be emitted under
-    /// the latch-to-leader floor (see the type docs for the three cases). The per-tick content set is
-    /// FIFO-bounded to `tick_cap`.
+    /// The latch-to-leader decision for this `(source_ts, content)` from `publisher`, arriving at
+    /// `arrival_ns` (wall clock). [`Admit::Emitted`] forwards (new tick / new leader content / first
+    /// sample); a non-leader sample at the current tick returns [`Admit::Contest`] *the first time*
+    /// (reporting how far `leader` led) and [`Admit::Dropped`] thereafter; stale ticks and exact
+    /// repeats return [`Admit::Dropped`]. The per-tick content set is FIFO-bounded to `tick_cap`.
     ///
     /// Records on the emit *decision*: in this gateway "emit" == handing the message to the broadcast
     /// channel, the only delivery step. A no-subscriber send desyncs no one, and a unique quote
     /// dropped by a slow per-client channel is unrecoverable regardless — so there is no failed-send
     /// path on which the floor must avoid advancing.
-    pub fn admit(&mut self, key: K, source_ts: u64, content: V, publisher: P) -> bool {
+    pub fn admit(
+        &mut self,
+        key: K,
+        source_ts: u64,
+        content: V,
+        publisher: P,
+        arrival_ns: u64,
+    ) -> Admit<P> {
         use std::collections::hash_map::Entry;
         match self.state.entry(key) {
             Entry::Vacant(v) => {
                 let mut set = HashSet::new();
                 set.insert(content.clone());
-                v.insert((source_ts, publisher, set, VecDeque::from([content])));
-                true
+                v.insert(TickState {
+                    high_water: source_ts,
+                    leader: publisher,
+                    leader_arrival_ns: arrival_ns,
+                    follower_recorded: false,
+                    content: set,
+                    order: VecDeque::from([content]),
+                });
+                Admit::Emitted
             }
             Entry::Occupied(mut o) => {
-                let (high_water, leader, set, order) = o.get_mut();
-                if source_ts < *high_water {
-                    false
-                } else if source_ts > *high_water {
-                    *high_water = source_ts;
-                    *leader = publisher;
-                    set.clear();
-                    order.clear();
-                    set.insert(content.clone());
-                    order.push_back(content);
-                    true
-                } else if publisher != *leader {
-                    false
-                } else if set.insert(content.clone()) {
-                    order.push_back(content);
-                    if order.len() > self.tick_cap {
-                        if let Some(old) = order.pop_front() {
-                            set.remove(&old);
+                let st = o.get_mut();
+                if source_ts < st.high_water {
+                    Admit::Dropped
+                } else if source_ts > st.high_water {
+                    st.high_water = source_ts;
+                    st.leader = publisher;
+                    st.leader_arrival_ns = arrival_ns;
+                    st.follower_recorded = false;
+                    st.content.clear();
+                    st.order.clear();
+                    st.content.insert(content.clone());
+                    st.order.push_back(content);
+                    Admit::Emitted
+                } else if publisher != st.leader {
+                    // A non-leader sample at this tick: its arrival order vs the leader is
+                    // delay-corrupted so it is dropped, but the *first* one is a cross-source
+                    // contest the leader won — report the lead once (later followers just drop).
+                    if st.follower_recorded {
+                        Admit::Dropped
+                    } else {
+                        st.follower_recorded = true;
+                        Admit::Contest {
+                            winner: st.leader,
+                            lead_ns: arrival_ns.saturating_sub(st.leader_arrival_ns),
                         }
                     }
-                    true
+                } else if st.content.insert(content.clone()) {
+                    st.order.push_back(content);
+                    if st.order.len() > self.tick_cap {
+                        if let Some(old) = st.order.pop_front() {
+                            st.content.remove(&old);
+                        }
+                    }
+                    Admit::Emitted
                 } else {
-                    false
+                    Admit::Dropped
                 }
             }
         }
@@ -221,12 +289,17 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq> StalenessFloor<K, V, P> {
 /// Window correctness depends on the `no_business_duplicates` oracle's assumption that each identity
 /// is unique per `(venue, symbol)`: the window must exceed the worst-case number of distinct values
 /// between competing publishers' copies of the same value, or a late duplicate re-emits.
-pub struct WindowedDedup<K, V> {
+/// Per-key window contents: each tracked value mapped to the `(publisher, arrival_ns)` of the copy
+/// that first delivered it, plus a FIFO of values for bounded (capacity) eviction.
+type DedupSeen<V, P> = (HashMap<V, (P, u64)>, VecDeque<V>);
+
+pub struct WindowedDedup<K, V, P> {
     capacity: usize,
-    seen: HashMap<K, (HashSet<V>, VecDeque<V>)>,
+    /// Per key: the most recent `capacity` values and their first-deliverer attribution.
+    seen: HashMap<K, DedupSeen<V, P>>,
 }
 
-impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy> WindowedDedup<K, V> {
+impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V, P> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -234,25 +307,35 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy> WindowedDedup<K, V> {
         }
     }
 
-    /// True if `value` has not been seen recently for `key` (recording it); false if it is a
-    /// duplicate still inside the window.
+    /// [`Admit::Emitted`] if `value` is first-seen for `key` (recording `publisher`/`arrival_ns`);
+    /// otherwise a duplicate still in the window — [`Admit::Contest`] (reporting the lead) when it
+    /// comes from a *different* publisher than the one that first delivered it, else
+    /// [`Admit::Dropped`] (a same-publisher repeat).
     ///
     /// Records on the emit *decision*: in this gateway "emit" == handing the message to the
     /// broadcast channel, the only delivery step. A no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless — so there is no
     /// failed-send path on which the cache must avoid advancing.
-    pub fn is_new(&mut self, key: K, value: V) -> bool {
-        let (set, order) = self.seen.entry(key).or_default();
-        if !set.insert(value) {
-            return false;
+    pub fn admit(&mut self, key: K, value: V, publisher: P, arrival_ns: u64) -> Admit<P> {
+        let (seen, order) = self.seen.entry(key).or_default();
+        if let Some(&(winner, winner_arrival_ns)) = seen.get(&value) {
+            return if winner == publisher {
+                Admit::Dropped
+            } else {
+                Admit::Contest {
+                    winner,
+                    lead_ns: arrival_ns.saturating_sub(winner_arrival_ns),
+                }
+            };
         }
+        seen.insert(value, (publisher, arrival_ns));
         order.push_back(value);
         if order.len() > self.capacity {
             if let Some(old) = order.pop_front() {
-                set.remove(&old);
+                seen.remove(&old);
             }
         }
-        true
+        Admit::Emitted
     }
 }
 
@@ -266,7 +349,7 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy> WindowedDedup<K, V> {
 pub struct Arbiter {
     tx: broadcast::Sender<FeedMessage>,
     quotes: StalenessFloor<(String, String), QuoteId, Publisher>,
-    trades: WindowedDedup<(String, String), u64>,
+    trades: WindowedDedup<(String, String), u64, Publisher>,
 }
 
 impl Arbiter {
@@ -312,29 +395,59 @@ impl Arbiter {
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
-                if self
-                    .quotes
-                    .admit(key, q.source_ts_ns, QuoteId::of(q), publisher)
-                {
-                    m.emit.with_label_values(&[&q.venue, "quote"]).inc();
-                    // Attribute the admitted quote to its winning publisher. A rise in
-                    // `publisher="public"` is the direct signal of the public backstop filling an
-                    // edge gap (in steady state the edge publisher leads every tick).
-                    m.quotes_admitted
-                        .with_label_values(&[&q.venue, publisher.label()])
-                        .inc();
-                    let _ = self.tx.send(msg);
-                } else {
-                    m.quotes_dropped.with_label_values(&[&q.venue]).inc();
+                // `recv_ts_ns` is the cross-source-comparable arrival clock (host wall clock,
+                // sampled for both the edge receiver and the public WS feeder).
+                match self.quotes.admit(
+                    key,
+                    q.source_ts_ns,
+                    QuoteId::of(q),
+                    publisher,
+                    q.recv_ts_ns,
+                ) {
+                    Admit::Emitted => {
+                        m.emit.with_label_values(&[&q.venue, "quote"]).inc();
+                        // Attribute the admitted quote to its winning publisher. A rise in
+                        // `publisher="public"` is the direct signal of the public backstop filling
+                        // an edge gap (in steady state the edge publisher leads every tick).
+                        m.quotes_admitted
+                            .with_label_values(&[&q.venue, publisher.label()])
+                            .inc();
+                        let _ = self.tx.send(msg);
+                    }
+                    // A cross-source follower lost this tick: record how far the winner led, on top
+                    // of the plain drop count. The losing copy is `publisher` (the non-leader at
+                    // this tick) — labelling both ends keeps an edge-vs-edge mirror race out of the
+                    // headline edge-vs-public margin (see `quote_lead_ns` docs).
+                    Admit::Contest { winner, lead_ns } => {
+                        m.quotes_dropped.with_label_values(&[&q.venue]).inc();
+                        m.quote_lead_ns
+                            .with_label_values(&[&q.venue, winner.label(), publisher.label()])
+                            .observe(lead_ns as f64);
+                    }
+                    Admit::Dropped => {
+                        m.quotes_dropped.with_label_values(&[&q.venue]).inc();
+                    }
                 }
             }
             FeedMessage::Trade(t) => {
                 let key = (t.venue.clone(), t.symbol.clone());
-                if self.trades.is_new(key, t.trade_id) {
-                    m.emit.with_label_values(&[&t.venue, "trade"]).inc();
-                    let _ = self.tx.send(msg);
-                } else {
-                    m.trades_dropped.with_label_values(&[&t.venue]).inc();
+                match self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns) {
+                    Admit::Emitted => {
+                        m.emit.with_label_values(&[&t.venue, "trade"]).inc();
+                        m.trades_admitted
+                            .with_label_values(&[&t.venue, publisher.label()])
+                            .inc();
+                        let _ = self.tx.send(msg);
+                    }
+                    Admit::Contest { winner, lead_ns } => {
+                        m.trades_dropped.with_label_values(&[&t.venue]).inc();
+                        m.trade_lead_ns
+                            .with_label_values(&[&t.venue, winner.label(), publisher.label()])
+                            .observe(lead_ns as f64);
+                    }
+                    Admit::Dropped => {
+                        m.trades_dropped.with_label_values(&[&t.venue]).inc();
+                    }
                 }
             }
             // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
@@ -393,15 +506,15 @@ mod tests {
     #[test]
     fn quote_first_sample_admits() {
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
-        assert!(f.admit("BTC", 1000, 0, 1)); // first for this key always emits (and latches leader)
+        assert!(f.admit("BTC", 1000, 0, 1, 0).emitted()); // first for this key always emits (latches leader)
     }
 
     #[test]
     fn quote_new_tick_admits_and_relatches_leader() {
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
-        assert!(f.admit("BTC", 1000, 0, 1)); // pub 1 opens tick -> leader
-        assert!(f.admit("BTC", 1001, 0, 2)); // newer tick re-latches to pub 2 (even identical content)
-        assert!(f.admit("BTC", 2000, 0, 1)); // newer tick again, leader back to pub 1
+        assert!(f.admit("BTC", 1000, 0, 1, 0).emitted()); // pub 1 opens tick -> leader
+        assert!(f.admit("BTC", 1001, 0, 2, 0).emitted()); // newer tick re-latches to pub 2 (even identical content)
+        assert!(f.admit("BTC", 2000, 0, 1, 0).emitted()); // newer tick again, leader back to pub 1
     }
 
     /// Latch-to-leader within one tick: the leader (first publisher to open the tick) emits its
@@ -414,33 +527,33 @@ mod tests {
         let (a, b) = (1u8, 2u8);
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
         // Falling price within tick T; leader A observes 5, 4, 3 in its own (trustworthy) order:
-        assert!(f.admit("BTC", 1000, 5, a)); // opens tick -> A is leader, emit 5
-        assert!(!f.admit("BTC", 1000, 5, a)); // A's exact repeat dropped
-        assert!(f.admit("BTC", 1000, 4, a)); // A's next distinct content kept
-        assert!(f.admit("BTC", 1000, 3, a)); // A's next distinct content kept
-                                             // B (higher delay) samples 39 at the same tick, arriving last. DROPPED even though A never
-                                             // sent 39: its order relative to A is delay-corrupted, so emitting it risks a phantom tick.
-        assert!(!f.admit("BTC", 1000, 39, b));
+        assert!(f.admit("BTC", 1000, 5, a, 0).emitted()); // opens tick -> A is leader, emit 5
+        assert!(!f.admit("BTC", 1000, 5, a, 0).emitted()); // A's exact repeat dropped
+        assert!(f.admit("BTC", 1000, 4, a, 0).emitted()); // A's next distinct content kept
+        assert!(f.admit("BTC", 1000, 3, a, 0).emitted()); // A's next distinct content kept
+                                                          // B (higher delay) samples 39 at the same tick, arriving last. DROPPED even though A never
+                                                          // sent 39: its order relative to A is delay-corrupted, so emitting it risks a phantom tick.
+        assert!(!f.admit("BTC", 1000, 39, b, 0).emitted());
         // A new tick re-opens the latch; whichever publisher gets there first leads it.
-        assert!(f.admit("BTC", 1001, 39, b)); // B opens the next tick -> B leads, emit
-        assert!(!f.admit("BTC", 1001, 2, a)); // A is now the non-leader at this tick -> dropped
+        assert!(f.admit("BTC", 1001, 39, b, 0).emitted()); // B opens the next tick -> B leads, emit
+        assert!(!f.admit("BTC", 1001, 2, a, 0).emitted()); // A is now the non-leader at this tick -> dropped
     }
 
     #[test]
     fn quote_stale_tick_dropped_for_any_publisher() {
         let (a, b) = (1u8, 2u8);
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
-        assert!(f.admit("BTC", 2000, 1, a));
-        assert!(!f.admit("BTC", 1999, 9, a)); // strictly older tick -> stale, dropped
-        assert!(!f.admit("BTC", 1999, 9, b)); // and from the other publisher too
+        assert!(f.admit("BTC", 2000, 1, a, 0).emitted());
+        assert!(!f.admit("BTC", 1999, 9, a, 0).emitted()); // strictly older tick -> stale, dropped
+        assert!(!f.admit("BTC", 1999, 9, b, 0).emitted()); // and from the other publisher too
     }
 
     #[test]
     fn quote_keys_are_independent() {
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
-        assert!(f.admit("BTC", 2000, 0, 1));
-        assert!(f.admit("ETH", 1000, 0, 1)); // separate floor + leader per key
-        assert!(!f.admit("BTC", 1500, 0, 1)); // BTC's floor unaffected by ETH
+        assert!(f.admit("BTC", 2000, 0, 1, 0).emitted());
+        assert!(f.admit("ETH", 1000, 0, 1, 0).emitted()); // separate floor + leader per key
+        assert!(!f.admit("BTC", 1500, 0, 1, 0).emitted()); // BTC's floor unaffected by ETH
     }
 
     /// The per-tick content set is FIFO-bounded to `tick_cap` so a stalled `source_ts` can't grow it
@@ -448,29 +561,56 @@ mod tests {
     #[test]
     fn quote_tick_set_is_capacity_bounded() {
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(2);
-        assert!(f.admit("BTC", 1000, 1, 9)); // tick window {1}
-        assert!(f.admit("BTC", 1000, 2, 9)); // {1,2}
-        assert!(f.admit("BTC", 1000, 3, 9)); // {2,3} — content 1 evicted (cap 2)
-        assert!(!f.admit("BTC", 1000, 3, 9)); // 3 still in the set -> dup dropped
-        assert!(f.admit("BTC", 1000, 1, 9)); // 1 fell out of the cap window -> re-admitted
+        assert!(f.admit("BTC", 1000, 1, 9, 0).emitted()); // tick window {1}
+        assert!(f.admit("BTC", 1000, 2, 9, 0).emitted()); // {1,2}
+        assert!(f.admit("BTC", 1000, 3, 9, 0).emitted()); // {2,3} — content 1 evicted (cap 2)
+        assert!(!f.admit("BTC", 1000, 3, 9, 0).emitted()); // 3 still in the set -> dup dropped
+        assert!(f.admit("BTC", 1000, 1, 9, 0).emitted()); // 1 fell out of the cap window -> re-admitted
+    }
+
+    /// A new tick's first cross-publisher follower is reported as a `Contest` with the lead time;
+    /// later followers of the same tick drop silently (one contest sample per tick).
+    #[test]
+    fn quote_contest_reports_leader_and_lead_once() {
+        let (a, b) = (1u8, 2u8);
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
+        assert!(f.admit("BTC", 1000, 5, a, 100).emitted()); // A opens tick at t=100
+                                                            // B's first copy of this tick arrives at t=150 -> contest, A led by 50.
+        assert_eq!(
+            f.admit("BTC", 1000, 9, b, 150),
+            Admit::Contest {
+                winner: a,
+                lead_ns: 50
+            }
+        );
+        // A second B follower of the same tick is just a drop (contest already counted).
+        assert_eq!(f.admit("BTC", 1000, 7, b, 170), Admit::Dropped);
     }
 
     #[test]
     fn trade_new_admitted_repeat_dropped() {
-        let mut d: WindowedDedup<&str, u64> = WindowedDedup::new(8);
-        assert!(d.is_new("BTC", 1));
-        assert!(!d.is_new("BTC", 1)); // competing publisher's copy
-        assert!(d.is_new("BTC", 2));
+        let mut d: WindowedDedup<&str, u64, u8> = WindowedDedup::new(8);
+        assert!(d.admit("BTC", 1, 1, 0).emitted());
+        // A competing publisher's copy of the same id -> a cross-source contest (the loser), the
+        // first publisher led by the arrival delta.
+        assert_eq!(
+            d.admit("BTC", 1, 2, 40),
+            Admit::Contest {
+                winner: 1,
+                lead_ns: 40
+            }
+        );
+        assert!(d.admit("BTC", 2, 1, 0).emitted());
     }
 
     #[test]
     fn trade_keys_independent_and_window_evicts() {
-        let mut d: WindowedDedup<&str, u64> = WindowedDedup::new(2);
-        assert!(d.is_new("BTC", 1));
-        assert!(d.is_new("ETH", 1)); // same id, different key
-        assert!(d.is_new("BTC", 2));
-        assert!(d.is_new("BTC", 3)); // window {2,3}; id 1 evicted
-        assert!(d.is_new("BTC", 1)); // 1 fell out of the window -> treated as new
+        let mut d: WindowedDedup<&str, u64, u8> = WindowedDedup::new(2);
+        assert!(d.admit("BTC", 1, 1, 0).emitted());
+        assert!(d.admit("ETH", 1, 1, 0).emitted()); // same id, different key
+        assert!(d.admit("BTC", 2, 1, 0).emitted());
+        assert!(d.admit("BTC", 3, 1, 0).emitted()); // window {2,3}; id 1 evicted
+        assert!(d.admit("BTC", 1, 1, 0).emitted()); // 1 fell out of the window -> treated as new
     }
 
     use std::net::{IpAddr, Ipv4Addr};
@@ -691,5 +831,121 @@ mod tests {
         );
         // A genuinely different price is still distinct.
         assert_ne!(a, QuoteId::of(&quote(1000, 678.9, 999.0)));
+    }
+
+    /// End-to-end through `emit`: a cross-source quote contest must reach the lead-time histogram
+    /// (attributed to the right `winner`/`loser` child) and bump the drop counter — not just return
+    /// `Admit::Contest`. Keyed on a venue unique to this test so its metric children start at 0 and
+    /// no parallel test touches them, so the absolute counts are assertable without `#[serial]`.
+    #[test]
+    fn arbiter_emit_records_quote_contest_into_lead_histogram() {
+        let venue = "ArbiterQuoteContestMetricTest";
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mk = |source_ts: u64, recv: u64, bid: f64| {
+            let mut q = quote(source_ts, bid, 101.0);
+            q.venue = venue.to_string();
+            q.recv_ts_ns = recv;
+            FeedMessage::Quote(q)
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        // Edge opens tick 1000 arriving at t=100; the public copy at the same tick arrives at t=150
+        // -> contest, edge led the public copy by 50ns.
+        a.emit(mk(1000, 100, 100.0), edge);
+        a.emit(mk(1000, 150, 100.5), Publisher::PublicWs);
+
+        let m = metrics();
+        let edge_beats_public = m
+            .quote_lead_ns
+            .with_label_values(&[venue, "edge", "public"]);
+        assert_eq!(
+            edge_beats_public.get_sample_count(),
+            1,
+            "the contest must reach the edge-vs-public histogram"
+        );
+        assert_eq!(
+            edge_beats_public.get_sample_sum() as u64,
+            50,
+            "the observed lead is the arrival delta"
+        );
+        assert_eq!(
+            m.quotes_dropped.with_label_values(&[venue]).get(),
+            1,
+            "the losing copy must also count as a drop"
+        );
+        // M1: the mirror-race child stays empty — this contest was edge-vs-public, not edge-vs-edge.
+        assert_eq!(
+            m.quote_lead_ns
+                .with_label_values(&[venue, "edge", "edge"])
+                .get_sample_count(),
+            0
+        );
+    }
+
+    /// The edge-vs-edge mirror race lands in its own histogram child (`winner=edge,loser=edge`),
+    /// kept out of the headline `loser="public"` margin — the M1 fix.
+    #[test]
+    fn arbiter_emit_separates_edge_mirror_race_from_public_margin() {
+        let venue = "ArbiterMirrorRaceMetricTest";
+        let mirror_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mirror_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let mk = |recv: u64, bid: f64| {
+            let mut q = quote(1000, bid, 101.0);
+            q.venue = venue.to_string();
+            q.recv_ts_ns = recv;
+            FeedMessage::Quote(q)
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(mk(100, 100.0), mirror_a); // A opens the tick
+        a.emit(mk(120, 100.0), mirror_b); // B's mirror copy loses by 20ns
+
+        let m = metrics();
+        let mirror_race = m.quote_lead_ns.with_label_values(&[venue, "edge", "edge"]);
+        assert_eq!(mirror_race.get_sample_count(), 1);
+        assert_eq!(mirror_race.get_sample_sum() as u64, 20);
+        // The edge-vs-public child is untouched: this was a mirror race.
+        assert_eq!(
+            m.quote_lead_ns
+                .with_label_values(&[venue, "edge", "public"])
+                .get_sample_count(),
+            0
+        );
+    }
+
+    /// End-to-end through `emit`: a cross-source trade contest reaches the trade lead-time histogram
+    /// and the drop counter (the trade-side mirror of the quote test above).
+    #[test]
+    fn arbiter_emit_records_trade_contest_into_lead_histogram() {
+        use crate::model::NormalizedTrade;
+        let venue = "ArbiterTradeContestMetricTest";
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let trade = |recv: u64| {
+            FeedMessage::Trade(NormalizedTrade {
+                venue: venue.to_string(),
+                symbol: "BTC".to_string(),
+                price: 100.0,
+                size: 1.0,
+                aggressor_side: "buy".to_string(),
+                trade_id: 7,
+                cumulative_volume: 0.0,
+                source_ts_ns: 1,
+                recv_ts_ns: recv,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(trade(100), edge); // edge delivers id 7 first at t=100
+        a.emit(trade(175), Publisher::PublicWs); // public's copy loses by 75ns
+
+        let m = metrics();
+        let edge_beats_public = m
+            .trade_lead_ns
+            .with_label_values(&[venue, "edge", "public"]);
+        assert_eq!(edge_beats_public.get_sample_count(), 1);
+        assert_eq!(edge_beats_public.get_sample_sum() as u64, 75);
+        assert_eq!(m.trades_dropped.with_label_values(&[venue]).get(), 1);
     }
 }
