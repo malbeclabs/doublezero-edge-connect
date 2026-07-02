@@ -12,6 +12,8 @@
 //! be confirmed against a live frame hexdump before this decoder's output is trusted in
 //! production - the round-trip test here only pins internal self-consistency.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
@@ -41,7 +43,7 @@ pub const MIDPOINT_SIZE: u8 = 40;
 #[derive(Debug, Clone)]
 pub struct InstrumentDefinition {
     pub instrument_id: u32,
-    pub symbol: String,
+    pub symbol: Arc<str>,
     pub price_exponent: i8,
     pub default_method: u8,
     pub manifest_seq: u16,
@@ -123,7 +125,7 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
         }),
         MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
             instrument_id: u32le(b, body)?,
-            symbol: cstr(b, body + 4, 16)?,
+            symbol: cstr(b, body + 4, 16)?.into(),
             price_exponent: u8le(b, body + 37)? as i8,
             default_method: u8le(b, body + 38)?,
             manifest_seq: u16le(b, body + 56)?,
@@ -229,7 +231,7 @@ mod tests {
         assert_eq!(INSTRUMENT_DEFINITION_SIZE, 64);
         let d = InstrumentDefinition {
             instrument_id: 7,
-            symbol: "SOL".to_string(),
+            symbol: "SOL".into(),
             price_exponent: -2,
             default_method: 3,
             manifest_seq: 5,
@@ -240,7 +242,7 @@ mod tests {
         match &msgs[0] {
             Message::InstrumentDefinition(got) => {
                 assert_eq!(got.instrument_id, 7);
-                assert_eq!(got.symbol, "SOL");
+                assert_eq!(got.symbol.as_ref(), "SOL");
                 assert_eq!(got.price_exponent, -2);
                 assert_eq!(got.default_method, 3);
                 assert_eq!(got.manifest_seq, 5);

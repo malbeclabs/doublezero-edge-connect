@@ -34,6 +34,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use prometheus::{Histogram, IntCounter};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -347,23 +348,109 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 /// [`SharedArbiter`] so the multicast receiver tasks and the WS feeder share one instance — hence one
 /// floor per `(venue, symbol)`, on which all sources race.
 pub struct Arbiter {
-    tx: broadcast::Sender<FeedMessage>,
-    quotes: StalenessFloor<(String, String), QuoteId, Publisher>,
-    trades: WindowedDedup<(String, String), u64, Publisher>,
+    tx: broadcast::Sender<Arc<FeedMessage>>,
+    quotes: StalenessFloor<(Arc<str>, Arc<str>), QuoteId, Publisher>,
+    trades: WindowedDedup<(Arc<str>, Arc<str>), u64, Publisher>,
+    /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
+    /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
+    /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
+    venue_metrics: HashMap<Arc<str>, VenueMetrics>,
 }
 
+/// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
+fn pub_idx(p: Publisher) -> usize {
+    match p {
+        Publisher::Edge(_) => 0,
+        Publisher::PublicWs => 1,
+    }
+}
+
+/// Pre-resolved `dz_*` metric children for one venue. Built once per venue via [`VenueMetrics::new`];
+/// every field is a cheap-to-`inc()` handle, so the per-message emit path pays no label lookup.
+struct VenueMetrics {
+    /// `dz_emit_total{kind}` indexed by kind: quote/trade/instrument/midpoint/depth/status.
+    emit: [IntCounter; 6],
+    /// `dz_quotes_admitted_total{publisher}` / `dz_trades_admitted_total{publisher}`, `[edge, public]`.
+    quotes_admitted: [IntCounter; 2],
+    trades_admitted: [IntCounter; 2],
+    quotes_dropped: IntCounter,
+    trades_dropped: IntCounter,
+    quotes_future_rejected: IntCounter,
+    quotes_no_source_ts: IntCounter,
+    /// `dz_quote_lead_ns{winner,loser}` / `dz_trade_lead_ns{winner,loser}` indexed
+    /// `winner_idx * 2 + loser_idx` over `[edge, public]`.
+    quote_lead: [Histogram; 4],
+    trade_lead: [Histogram; 4],
+}
+
+impl VenueMetrics {
+    fn new(venue: &str) -> Self {
+        let m = metrics();
+        let emit_kind = |k: &str| m.emit.with_label_values(&[venue, k]);
+        let lead = |h: &prometheus::HistogramVec| {
+            [
+                h.with_label_values(&[venue, "edge", "edge"]),
+                h.with_label_values(&[venue, "edge", "public"]),
+                h.with_label_values(&[venue, "public", "edge"]),
+                h.with_label_values(&[venue, "public", "public"]),
+            ]
+        };
+        Self {
+            emit: [
+                emit_kind("quote"),
+                emit_kind("trade"),
+                emit_kind("instrument"),
+                emit_kind("midpoint"),
+                emit_kind("depth"),
+                emit_kind("status"),
+            ],
+            quotes_admitted: [
+                m.quotes_admitted.with_label_values(&[venue, "edge"]),
+                m.quotes_admitted.with_label_values(&[venue, "public"]),
+            ],
+            trades_admitted: [
+                m.trades_admitted.with_label_values(&[venue, "edge"]),
+                m.trades_admitted.with_label_values(&[venue, "public"]),
+            ],
+            quotes_dropped: m.quotes_dropped.with_label_values(&[venue]),
+            trades_dropped: m.trades_dropped.with_label_values(&[venue]),
+            quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
+            quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
+            quote_lead: lead(&m.quote_lead_ns),
+            trade_lead: lead(&m.trade_lead_ns),
+        }
+    }
+}
+
+/// Kind index into [`VenueMetrics::emit`].
+const EMIT_QUOTE: usize = 0;
+const EMIT_TRADE: usize = 1;
+const EMIT_INSTRUMENT: usize = 2;
+const EMIT_MIDPOINT: usize = 3;
+const EMIT_DEPTH: usize = 4;
+const EMIT_STATUS: usize = 5;
+
 impl Arbiter {
-    pub fn new(tx: broadcast::Sender<FeedMessage>, trade_window: usize) -> Self {
+    pub fn new(tx: broadcast::Sender<Arc<FeedMessage>>, trade_window: usize) -> Self {
         Self {
             tx,
             quotes: StalenessFloor::new(QUOTE_TICK_CAP),
             trades: WindowedDedup::new(trade_window),
+            venue_metrics: HashMap::new(),
         }
     }
 
+    /// The pre-resolved metric children for `venue`, created on first use.
+    fn vm(&mut self, venue: &Arc<str>) -> &VenueMetrics {
+        self.venue_metrics
+            .entry(venue.clone())
+            .or_insert_with(|| VenueMetrics::new(venue))
+    }
+
     /// The broadcast sender, so output sinks can `subscribe()` and `Status` can be sent directly
-    /// (it carries no business identity to dedup).
-    pub fn sender(&self) -> &broadcast::Sender<FeedMessage> {
+    /// (it carries no business identity to dedup). The backbone carries `Arc<FeedMessage>` so a
+    /// per-receiver delivery is a refcount bump, not a deep clone of the message's `String`/`Vec`s.
+    pub fn sender(&self) -> &broadcast::Sender<Arc<FeedMessage>> {
         &self.tx
     }
 
@@ -371,120 +458,110 @@ impl Arbiter {
     /// source racing for the quote floor's per-tick leadership; it is ignored for non-quote
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
+    ///
+    /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
+    /// increments a cached handle rather than doing a label-map lookup for each counter.
     pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
-        let m = metrics();
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
                 // time): forward it but never let it touch the floor — as a tick it would pin
                 // `high_water` at 0 and drop every later quote as stale.
                 if q.source_ts_ns == 0 {
-                    m.quotes_no_source_ts.with_label_values(&[&q.venue]).inc();
-                    m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
-                    let _ = self.tx.send(msg);
+                    let vm = self.vm(&q.venue);
+                    vm.quotes_no_source_ts.inc();
+                    vm.emit[EMIT_QUOTE].inc();
+                    let _ = self.tx.send(Arc::new(msg));
                     return;
                 }
                 // Reject an implausibly-far-future `source_ts` before it can advance the floor.
                 // The floor is shared by the trusted edge and the untrusted public WS; one bad/
                 // hostile public timestamp years ahead would otherwise latch `high_water` and drop
                 // every real edge quote as stale until restart (see `MAX_FUTURE_SKEW_NS`).
-                if q.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
-                    m.quotes_future_rejected
-                        .with_label_values(&[&q.venue])
-                        .inc();
+                //
+                // Compare against the quote's own arrival wall clock (`recv_ts_ns`, sampled at
+                // receive) rather than sampling `now_ns()` again here — one fewer clock read per
+                // quote on the hot path. Fall back to a fresh sample only if it was never stamped.
+                let now = if q.recv_ts_ns != 0 {
+                    q.recv_ts_ns
+                } else {
+                    now_ns()
+                };
+                if q.source_ts_ns > now.saturating_add(MAX_FUTURE_SKEW_NS) {
+                    self.vm(&q.venue).quotes_future_rejected.inc();
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
                 // `recv_ts_ns` is the cross-source-comparable arrival clock (host wall clock,
                 // sampled for both the edge receiver and the public WS feeder).
-                match self.quotes.admit(
-                    key,
-                    q.source_ts_ns,
-                    QuoteId::of(q),
-                    publisher,
-                    q.recv_ts_ns,
-                ) {
+                let decision =
+                    self.quotes
+                        .admit(key, q.source_ts_ns, QuoteId::of(q), publisher, q.recv_ts_ns);
+                let vm = self.vm(&q.venue);
+                match decision {
                     Admit::Emitted => {
-                        m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
+                        vm.emit[EMIT_QUOTE].inc();
                         // Attribute the admitted quote to its winning publisher. A rise in
                         // `publisher="public"` is the direct signal of the public backstop filling
                         // an edge gap (in steady state the edge publisher leads every tick).
-                        m.quotes_admitted
-                            .with_label_values(&[q.venue.as_str(), publisher.label()])
-                            .inc();
-                        let _ = self.tx.send(msg);
+                        vm.quotes_admitted[pub_idx(publisher)].inc();
+                        let _ = self.tx.send(Arc::new(msg));
                     }
                     // A cross-source follower lost this tick: record how far the winner led, on top
                     // of the plain drop count. The losing copy is `publisher` (the non-leader at
                     // this tick) — labelling both ends keeps an edge-vs-edge mirror race out of the
                     // headline edge-vs-public margin (see `quote_lead_ns` docs).
                     Admit::Contest { winner, lead_ns } => {
-                        m.quotes_dropped.with_label_values(&[&q.venue]).inc();
-                        m.quote_lead_ns
-                            .with_label_values(&[
-                                q.venue.as_str(),
-                                winner.label(),
-                                publisher.label(),
-                            ])
+                        vm.quotes_dropped.inc();
+                        vm.quote_lead[pub_idx(winner) * 2 + pub_idx(publisher)]
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
-                        m.quotes_dropped.with_label_values(&[&q.venue]).inc();
+                        vm.quotes_dropped.inc();
                     }
                 }
             }
             FeedMessage::Trade(t) => {
                 let key = (t.venue.clone(), t.symbol.clone());
-                match self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns) {
+                let decision = self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns);
+                let vm = self.vm(&t.venue);
+                match decision {
                     Admit::Emitted => {
-                        m.emit.with_label_values(&[t.venue.as_str(), "trade"]).inc();
-                        m.trades_admitted
-                            .with_label_values(&[t.venue.as_str(), publisher.label()])
-                            .inc();
-                        let _ = self.tx.send(msg);
+                        vm.emit[EMIT_TRADE].inc();
+                        vm.trades_admitted[pub_idx(publisher)].inc();
+                        let _ = self.tx.send(Arc::new(msg));
                     }
                     Admit::Contest { winner, lead_ns } => {
-                        m.trades_dropped.with_label_values(&[&t.venue]).inc();
-                        m.trade_lead_ns
-                            .with_label_values(&[
-                                t.venue.as_str(),
-                                winner.label(),
-                                publisher.label(),
-                            ])
+                        vm.trades_dropped.inc();
+                        vm.trade_lead[pub_idx(winner) * 2 + pub_idx(publisher)]
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
-                        m.trades_dropped.with_label_values(&[&t.venue]).inc();
+                        vm.trades_dropped.inc();
                     }
                 }
             }
             // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
             // future `FeedMessage` variant is a compile error here, not a silent miss / runtime panic.
             FeedMessage::Instrument(i) => {
-                m.emit
-                    .with_label_values(&[i.venue.as_str(), "instrument"])
-                    .inc();
-                let _ = self.tx.send(msg);
+                self.vm(&i.venue).emit[EMIT_INSTRUMENT].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
-                m.emit
-                    .with_label_values(&[mp.venue.as_str(), "midpoint"])
-                    .inc();
-                let _ = self.tx.send(msg);
+                self.vm(&mp.venue).emit[EMIT_MIDPOINT].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Depth(d) => {
-                m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
-                let _ = self.tx.send(msg);
+                self.vm(&d.venue).emit[EMIT_DEPTH].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
             // `Status` is currently never routed through `emit` — receivers send it straight via
             // `sender()` (see `emit_status`), and no other source produces it — so `dz_emit_total
             // {kind="status"}` is unreachable in practice today. The arm is kept for match
             // exhaustiveness and stays correct if a future source ever emits status through here.
             FeedMessage::Status(s) => {
-                m.emit
-                    .with_label_values(&[s.venue.as_str(), "status"])
-                    .inc();
-                let _ = self.tx.send(msg);
+                self.vm(&s.venue).emit[EMIT_STATUS].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
         }
     }
@@ -623,12 +700,12 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::NormalizedQuote;
+    use crate::model::{NormalizedQuote, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
-            venue: "Hyperliquid".to_string(),
-            symbol: "BTC".to_string(),
+            venue: "Hyperliquid".into(),
+            symbol: "BTC".into(),
             bid,
             ask,
             bid_size: 1.0,
@@ -643,10 +720,10 @@ mod tests {
     }
 
     /// Drain every emitted quote's `(source_ts, bid)` from a receiver.
-    fn drain_quotes(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<(u64, f64)> {
+    fn drain_quotes(rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>) -> Vec<(u64, f64)> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Quote(q) = m {
+            if let FeedMessage::Quote(q) = &*m {
                 out.push((q.source_ts_ns, q.bid));
             }
         }
@@ -697,11 +774,11 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |id: u64| {
             FeedMessage::Trade(NormalizedTrade {
-                venue: "Hyperliquid".to_string(),
-                symbol: "BTC".to_string(),
+                venue: "Hyperliquid".into(),
+                symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
-                aggressor_side: "buy".to_string(),
+                aggressor_side: Side::Buy,
                 trade_id: id,
                 cumulative_volume: 0.0,
                 source_ts_ns: 1,
@@ -717,7 +794,7 @@ mod tests {
         a.emit(trade(8), Publisher::PublicWs);
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Trade(t) = m {
+            if let FeedMessage::Trade(t) = &*m {
                 ids.push(t.trade_id);
             }
         }
@@ -759,11 +836,11 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = || {
             FeedMessage::Trade(NormalizedTrade {
-                venue: "Hyperliquid".to_string(),
-                symbol: "BTC".to_string(),
+                venue: "Hyperliquid".into(),
+                symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
-                aggressor_side: "buy".to_string(),
+                aggressor_side: Side::Buy,
                 trade_id: 42,
                 cumulative_volume: 0.0,
                 source_ts_ns: 1,
@@ -778,7 +855,7 @@ mod tests {
         a.emit(trade(), edge); // identical duplicate -> dropped
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Trade(t) = m {
+            if let FeedMessage::Trade(t) = &*m {
                 ids.push(t.trade_id);
             }
         }
@@ -851,7 +928,7 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |source_ts: u64, recv: u64, bid: f64| {
             let mut q = quote(source_ts, bid, 101.0);
-            q.venue = venue.to_string();
+            q.venue = venue.into();
             q.recv_ts_ns = recv;
             FeedMessage::Quote(q)
         };
@@ -899,7 +976,7 @@ mod tests {
         let mirror_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let mk = |recv: u64, bid: f64| {
             let mut q = quote(1000, bid, 101.0);
-            q.venue = venue.to_string();
+            q.venue = venue.into();
             q.recv_ts_ns = recv;
             FeedMessage::Quote(q)
         };
@@ -930,11 +1007,11 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |recv: u64| {
             FeedMessage::Trade(NormalizedTrade {
-                venue: venue.to_string(),
-                symbol: "BTC".to_string(),
+                venue: venue.into(),
+                symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
-                aggressor_side: "buy".to_string(),
+                aggressor_side: Side::Buy,
                 trade_id: 7,
                 cumulative_volume: 0.0,
                 source_ts_ns: 1,
