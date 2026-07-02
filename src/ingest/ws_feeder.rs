@@ -25,7 +25,9 @@ use crate::{
         public_feeder::{self, instrument_known, parse_decimal, PublicVenue},
     },
     metrics::metrics,
-    model::{now_ns, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade},
+    model::{
+        now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade, Side,
+    },
 };
 
 /// Hyperliquid's public WebSocket endpoint.
@@ -207,8 +209,8 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         return;
     };
     let quote = NormalizedQuote {
-        venue: HL_VENUE.to_string(),
-        symbol: d.coin,
+        venue: venue_arc(HL_VENUE),
+        symbol: d.coin.into(),
         bid: bid_px,
         ask: ask_px,
         bid_size: bid_sz,
@@ -239,17 +241,16 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         return;
     };
     let trade = NormalizedTrade {
-        venue: HL_VENUE.to_string(),
-        symbol: t.coin,
+        venue: venue_arc(HL_VENUE),
+        symbol: t.coin.into(),
         price,
         size,
         // HL trade side: "B" = aggressing buy, "A" = aggressing sell.
         aggressor_side: match t.side.as_str() {
-            "B" => "buy",
-            "A" => "sell",
-            _ => "unknown",
-        }
-        .to_string(),
+            "B" => Side::Buy,
+            "A" => Side::Sell,
+            _ => Side::Unknown,
+        },
         trade_id: t.tid,
         cumulative_volume: 0.0, // not carried on the public trades feed
         source_ts_ns,
@@ -279,10 +280,10 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (HL_VENUE.to_string(), symbol.to_string()),
+            (HL_VENUE.into(), symbol.into()),
             NormalizedInstrument {
-                venue: HL_VENUE.to_string(),
-                symbol: symbol.to_string(),
+                venue: HL_VENUE.into(),
+                symbol: symbol.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
@@ -290,7 +291,7 @@ mod tests {
         map
     }
 
-    fn arbiter_with_rx() -> (SharedArbiter, broadcast::Receiver<FeedMessage>) {
+    fn arbiter_with_rx() -> (SharedArbiter, broadcast::Receiver<std::sync::Arc<FeedMessage>>) {
         let (tx, rx) = broadcast::channel(64);
         (Arc::new(Mutex::new(Arbiter::new(tx, 8))), rx)
     }
@@ -303,10 +304,10 @@ mod tests {
         let frame = r#"{"channel":"bbo","data":{"coin":"BTC","time":1700000000000,
             "bbo":[{"px":"104783.0","sz":"1.5","n":3},{"px":"104784.0","sz":"2.0","n":4}]}}"#;
         handle_text(frame, &arbiter, &instruments);
-        match rx.try_recv().expect("a quote was emitted") {
+        match &*rx.try_recv().expect("a quote was emitted") {
             FeedMessage::Quote(q) => {
-                assert_eq!(q.venue, "Hyperliquid");
-                assert_eq!(q.symbol, "BTC");
+                assert_eq!(q.venue, "Hyperliquid".into());
+                assert_eq!(q.symbol, "BTC".into());
                 assert_eq!(q.bid, 104783.0);
                 assert_eq!(q.ask, 104784.0);
                 assert_eq!(q.bid_size, 1.5);
@@ -393,12 +394,12 @@ mod tests {
         let frame = r#"{"channel":"trades","data":[
             {"coin":"ETH","side":"B","px":"2500.5","sz":"0.3","time":1700000000000,"tid":42}]}"#;
         handle_text(frame, &arbiter, &instruments);
-        match rx.try_recv().expect("a trade was emitted") {
+        match &*rx.try_recv().expect("a trade was emitted") {
             FeedMessage::Trade(t) => {
-                assert_eq!(t.symbol, "ETH");
+                assert_eq!(t.symbol, "ETH".into());
                 assert_eq!(t.price, 2500.5);
                 assert_eq!(t.size, 0.3);
-                assert_eq!(t.aggressor_side, "buy");
+                assert_eq!(t.aggressor_side, crate::model::Side::Buy);
                 assert_eq!(t.trade_id, 42);
             }
             other => panic!("expected a trade, got {other:?}"),

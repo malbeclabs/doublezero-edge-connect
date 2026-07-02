@@ -34,6 +34,8 @@
 //! `reason`/`*_flags` bytes are opaque pass-through (no decoder branches on them), so a value
 //! mismatch cannot corrupt the decode. Per-field offset citations live on the matching tests.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
@@ -89,7 +91,7 @@ pub mod sizes {
 #[derive(Debug, Clone)]
 pub struct InstrumentDefinition {
     pub instrument_id: u32,
-    pub symbol: String,
+    pub symbol: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
     pub manifest_seq: u16,
@@ -330,7 +332,7 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
         }),
         MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
             instrument_id: u32le(b, body)?,
-            symbol: cstr(b, body + 4, 16)?,
+            symbol: cstr(b, body + 4, 16)?.into(),
             price_exponent: u8le(b, body + 37)? as i8,
             qty_exponent: u8le(b, body + 38)? as i8,
             manifest_seq: u16le(b, body + 74)?,
@@ -830,7 +832,7 @@ pub(crate) mod tests {
         match &decode_frame(&f).unwrap().1[0] {
             Message::InstrumentDefinition(g) => {
                 assert_eq!(g.instrument_id, 7);
-                assert_eq!(g.symbol, "BTC");
+                assert_eq!(g.symbol.as_ref(), "BTC");
                 assert_eq!(g.price_exponent, -1);
                 assert_eq!(g.qty_exponent, -8);
                 assert_eq!(g.manifest_seq, 13);

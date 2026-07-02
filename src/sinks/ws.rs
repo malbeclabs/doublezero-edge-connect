@@ -21,13 +21,74 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
 };
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::{Message as WsMessage, Utf8Bytes};
 use tracing::{info, warn};
 
 use crate::{
     metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, InstrumentSnapshot},
 };
+
+/// A message serialized **once** for all clients: the JSON text plus the fields the per-client
+/// filter needs. Built by the single serializer task (see [`serve`]) and shared by reference-count
+/// (`Arc` + `Utf8Bytes`, both cheap to clone) to every connected client, so the same quote is never
+/// serialized more than once no matter how many consumers are attached.
+struct PreparedFrame {
+    /// The complete JSON text frame, ready to write. `ws_send_ts_ns` is already stamped in here
+    /// (once, shared by all clients — see PROTOCOL.md).
+    payload: Utf8Bytes,
+    /// Message kind for the `dz_ws_*{kind}` metrics.
+    kind: &'static str,
+    /// The message's venue, for subscription filtering.
+    venue: Arc<str>,
+    /// The message's symbol, or `None` for a venue-level `status` (matched by venue alone).
+    symbol: Option<Arc<str>>,
+}
+
+/// Serialize one backbone message once: clone it, stamp the shared `ws_send_ts_ns`, render the JSON,
+/// and capture the fields the per-client filter needs. Returns `None` only if serialization fails
+/// (never expected for our own types).
+fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
+    let mut m = m.clone();
+    let now = now_ns();
+    // Stamp the WS hand-off time on the latency-bearing kinds. One stamp, shared by every client
+    // (the accepted trade-off for serializing once — see PROTOCOL.md `ws_send_ts_ns`).
+    let kind = match &mut m {
+        FeedMessage::Quote(q) => {
+            q.ws_send_ts_ns = now;
+            "quote"
+        }
+        FeedMessage::Trade(t) => {
+            t.ws_send_ts_ns = now;
+            "trade"
+        }
+        FeedMessage::Midpoint(mp) => {
+            mp.ws_send_ts_ns = now;
+            "midpoint"
+        }
+        FeedMessage::Depth(d) => {
+            d.ws_send_ts_ns = now;
+            "depth"
+        }
+        FeedMessage::Instrument(_) => "instrument",
+        FeedMessage::Status(_) => "status",
+    };
+    let payload: Utf8Bytes = serde_json::to_string(&m).ok()?.into();
+    let (venue, symbol) = match &m {
+        FeedMessage::Instrument(i) => (i.venue.clone(), Some(i.symbol.clone())),
+        FeedMessage::Quote(q) => (q.venue.clone(), Some(q.symbol.clone())),
+        FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone())),
+        FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone())),
+        FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone())),
+        FeedMessage::Status(s) => (s.venue.clone(), None),
+    };
+    Some(Arc::new(PreparedFrame {
+        payload,
+        kind,
+        venue,
+        symbol,
+    }))
+}
 
 /// Tunable server limits / liveness (from CLI args).
 #[derive(Clone, Debug)]
@@ -37,6 +98,9 @@ pub struct WsConfig {
     pub max_clients: usize,
     pub max_subs: usize,
     pub max_inbound_per_min: u32,
+    /// Capacity of the internal "prepared frame" broadcast (the serialize-once fan-out); sized to
+    /// match the backbone so a client that keeps up with the backbone keeps up here too.
+    pub broadcast_capacity: usize,
 }
 
 /// A subscription filter: a `None` field matches any value (so `{}` = everything).
@@ -96,12 +160,45 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 /// The accept loop, split out so tests (and `main`) can drive a pre-bound listener.
 pub async fn serve(
     listener: TcpListener,
-    tx: broadcast::Sender<FeedMessage>,
+    tx: broadcast::Sender<Arc<FeedMessage>>,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
     cfg: WsConfig,
 ) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
+
+    // Serialize-once fan-out: a single task reads the `Arc<FeedMessage>` backbone, serializes each
+    // surviving message to JSON exactly once (stamping one shared `ws_send_ts_ns`), and re-broadcasts
+    // the ready-to-write `Arc<PreparedFrame>` to every client. Client tasks then only filter and write
+    // a cheap `Utf8Bytes` clone — the same quote is never serialized N times for N clients. With no
+    // clients attached the serializer skips the work entirely (see the `receiver_count` guard), so the
+    // no-consumer case stays as cheap as the old no-subscriber `send`.
+    let (prepared_tx, _prepared_rx) =
+        broadcast::channel::<Arc<PreparedFrame>>(cfg.broadcast_capacity);
+    {
+        let prepared_tx = prepared_tx.clone();
+        let mut backbone = tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match backbone.recv().await {
+                    Ok(m) => {
+                        // No connected clients → don't spend CPU serializing.
+                        if prepared_tx.receiver_count() == 0 {
+                            continue;
+                        }
+                        if let Some(frame) = prepare(&m) {
+                            let _ = prepared_tx.send(frame);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        metrics().ws_client_lagged.inc();
+                        warn!("ws serializer lagged, dropped {n}");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -121,7 +218,7 @@ pub async fn serve(
             .with_label_values(&["accepted"])
             .inc();
         metrics().ws_clients.inc();
-        let rx = tx.subscribe();
+        let rx = prepared_tx.subscribe();
         let instruments = instruments.clone();
         let depth = depth.clone();
         let cfg = cfg.clone();
@@ -145,7 +242,7 @@ fn text(value: serde_json::Value) -> WsMessage {
 
 async fn serve_client(
     stream: TcpStream,
-    mut rx: broadcast::Receiver<FeedMessage>,
+    mut rx: broadcast::Receiver<Arc<PreparedFrame>>,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
     cfg: WsConfig,
@@ -254,39 +351,29 @@ async fn serve_client(
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
             },
 
-            // Forward broadcast feed messages this subscriber wants.
+            // Forward already-serialized frames this subscriber wants. The frame was serialized once
+            // upstream (see `serve`); here we only filter and write a cheap `Utf8Bytes` clone.
             msg = rx.recv() => match msg {
-                Ok(mut m) => {
-                    let pass = match &m {
+                Ok(frame) => {
+                    let pass = match &frame.symbol {
                         // A venue-level status has no symbol, so match it by venue alone - else a
                         // symbol-scoped subscription (e.g. {venue,symbol:"SOL"}) would never see it.
-                        FeedMessage::Status(st) => {
+                        None => {
                             subs.is_empty()
                                 || subs.iter().any(|f| {
                                     f.venue
                                         .as_deref()
-                                        .is_none_or(|v| v.eq_ignore_ascii_case(&st.venue))
+                                        .is_none_or(|v| v.eq_ignore_ascii_case(&frame.venue))
                                 })
                         }
-                        _ => {
-                            let (v, s) = m.venue_symbol();
-                            subs.is_empty() || subs.iter().any(|f| f.matches(v, s))
+                        Some(sym) => {
+                            subs.is_empty() || subs.iter().any(|f| f.matches(&frame.venue, sym))
                         }
                     };
                     if pass {
-                        // Stamp the WS hand-off time on the latency-bearing data messages.
-                        let kind = match m {
-                            FeedMessage::Quote(ref mut q) => { q.ws_send_ts_ns = now_ns(); "quote" }
-                            FeedMessage::Trade(ref mut t) => { t.ws_send_ts_ns = now_ns(); "trade" }
-                            FeedMessage::Midpoint(ref mut mp) => { mp.ws_send_ts_ns = now_ns(); "midpoint" }
-                            FeedMessage::Depth(ref mut d) => { d.ws_send_ts_ns = now_ns(); "depth" }
-                            FeedMessage::Instrument(_) => "instrument",
-                            FeedMessage::Status(_) => "status",
-                        };
-                        let payload = serde_json::to_string(&m)?;
-                        metrics().ws_messages_sent.with_label_values(&[kind]).inc();
-                        metrics().ws_bytes_sent.with_label_values(&[kind]).inc_by(payload.len() as u64);
-                        write.send(WsMessage::Text(payload.into())).await?;
+                        metrics().ws_messages_sent.with_label_values(&[frame.kind]).inc();
+                        metrics().ws_bytes_sent.with_label_values(&[frame.kind]).inc_by(frame.payload.len() as u64);
+                        write.send(WsMessage::Text(frame.payload.clone())).await?;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => { metrics().ws_client_lagged.inc(); warn!("subscriber lagged, dropped {n}"); }
@@ -354,8 +441,8 @@ mod tests {
 
     fn sample_quote() -> NormalizedQuote {
         NormalizedQuote {
-            venue: "Hyperliquid".to_string(),
-            symbol: "BTC".to_string(),
+            venue: "Hyperliquid".into(),
+            symbol: "BTC".into(),
             bid: 1.0,
             ask: 2.0,
             bid_size: 1.0,
@@ -383,7 +470,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (tx, _rx) = broadcast::channel::<FeedMessage>(16);
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth = Arc::new(Mutex::new(HashMap::new()));
         let cfg = WsConfig {
@@ -392,6 +479,7 @@ mod tests {
             max_clients: 8,
             max_subs: 8,
             max_inbound_per_min: 600,
+            broadcast_capacity: 16,
         };
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
 
@@ -411,7 +499,7 @@ mod tests {
         // send can race ahead of the subscribe.)
         let mut got_quote = false;
         for _ in 0..100 {
-            let _ = tx.send(FeedMessage::Quote(sample_quote()));
+            let _ = tx.send(std::sync::Arc::new(FeedMessage::Quote(sample_quote())));
             match timeout(Duration::from_millis(50), ws.next()).await {
                 Ok(Some(Ok(WsMessage::Text(txt)))) if txt.contains("\"quote\"") => {
                     got_quote = true;
@@ -430,6 +518,74 @@ mod tests {
         // Disconnect and confirm the gauge nets back to the baseline (the RAII guard fires).
         drop(ws);
         wait_until(|| m.ws_clients.get() == clients_before).await;
+
+        srv.abort();
+    }
+
+    /// Serialize-once: a single backbone message is rendered to JSON exactly once and the identical
+    /// frame is fanned out to every client, so two clients receive **byte-for-byte equal** payloads
+    /// (including a single shared `ws_send_ts_ns`). `#[serial]` for the shared `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn ws_serializes_once_identical_payload_across_clients() {
+        let m = metrics();
+        let clients_before = m.ws_clients.get();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+
+        let (mut ws1, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let (mut ws2, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // Both clients accounted (so both prepared-frame receivers are subscribed) and the serializer
+        // has subscribed to the backbone, before the single send — so exactly one prepared frame is
+        // built and delivered to both, with no second send racing in a different `ws_send_ts_ns`.
+        wait_until(|| m.ws_clients.get() == clients_before + 2).await;
+        wait_until(|| tx.receiver_count() >= 1).await;
+
+        tx.send(std::sync::Arc::new(FeedMessage::Quote(sample_quote())))
+            .expect("backbone has the serializer as a receiver");
+
+        // Read the first `quote` frame each client receives (skipping any empty-snapshot replay).
+        async fn next_quote<S>(ws: &mut S) -> String
+        where
+            S: futures_util::StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+                + Unpin,
+        {
+            loop {
+                match timeout(Duration::from_secs(2), ws.next()).await {
+                    Ok(Some(Ok(WsMessage::Text(t)))) if t.contains("\"quote\"") => {
+                        return t.to_string()
+                    }
+                    Ok(Some(Ok(_))) => continue,
+                    other => panic!("client did not receive the quote: {other:?}"),
+                }
+            }
+        }
+
+        let t1 = next_quote(&mut ws1).await;
+        let t2 = next_quote(&mut ws2).await;
+        assert_eq!(
+            t1, t2,
+            "serialize-once: all clients must receive byte-identical payloads"
+        );
+        assert!(t1.contains("ws_send_ts_ns"), "quote must carry ws_send_ts_ns");
 
         srv.abort();
     }

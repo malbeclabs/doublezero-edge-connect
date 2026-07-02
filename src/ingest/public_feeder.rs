@@ -18,6 +18,7 @@
 //! decode/socket error is logged and swallowed, so neither a reconnect storm nor a malformed frame
 //! can ever wedge the multicast hot path.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -149,7 +150,7 @@ where
 /// True if the `(venue, symbol)` instrument is already in the shared snapshot, so a price emitted for
 /// it carries known precision (precision before price).
 pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &str) -> bool {
-    crate::model::lock(instruments).contains_key(&(venue.to_string(), symbol.to_string()))
+    crate::model::lock(instruments).contains_key(&(Arc::from(venue), Arc::from(symbol)))
 }
 
 /// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`
