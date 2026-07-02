@@ -36,7 +36,8 @@ defaults to `warn,doublezero_edge_connect=info` (our crate at `info`, deps quiet
 ## Architecture
 
 A WS-server task plus **one receiver task per active feed** share a single
-`tokio::sync::broadcast` channel of `FeedMessage` (the fan-out backbone) and a `Mutex<HashMap>`
+`tokio::sync::broadcast` channel of `Arc<FeedMessage>` (the fan-out backbone — `Arc`-wrapped so a
+per-subscriber delivery is a refcount bump, not a deep clone of the message) and a `Mutex<HashMap>`
 instrument snapshot. `main.rs` selects the *candidate* feeds (`--feed`, or all of
 `ingest::feeds::FEEDS` by default), builds the shared `Arbiter` around the broadcast `Sender`, and
 hands everything to the **subscription reconciler** (`ingest::reconcile`), which is the single
@@ -133,8 +134,12 @@ Modules are grouped by role under `src/`:
   latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the BBO `f64`-bits, with the
   `Publisher` enum as the per-tick leader identity) and the `WindowedDedup` on `trade_id` for trades
   — and exposes one `emit(msg, publisher)` (quotes → floor, trades → window, everything else
-  passthrough). Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS
-  feeder share **one** floor per `(venue, symbol)` and race on it. The floor lived inside
+  passthrough); a surviving message is broadcast as `Arc<FeedMessage>`. `emit` increments **pre-resolved
+  per-venue metric children** (cached in the `Arbiter`, mirroring the receiver's `SeqEvents`) instead of
+  a per-message `with_label_values` label lookup. Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the
+  multicast receivers and the WS feeder share **one** floor per `(venue, symbol)` and race on it. The
+  wire `venue`/`symbol` are `Arc<str>` (venues interned via `model::venue_arc`), so building the dedup
+  key allocates nothing in steady state. The floor lived inside
   `TobProcessor` under PR #29; it was lifted here so a different transport (the WS feeder) can race in
   the same floor. `Status` routes straight to `sender()` (no business identity to dedup).
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
@@ -188,7 +193,12 @@ Modules are grouped by role under `src/`:
   the full set (an all-or-nothing gate could wedge the feed on a startup/reset race). Uses
   wraparound-safe u16 sequence comparison (`is_later`).
 - **`sinks/ws.rs`** — fans the broadcast out to clients (on by default; disable with an empty
-  `--ws-bind`). On connect it replays the instrument snapshot (precision first) **then the latest
+  `--ws-bind`). **Serializes each message once, not per client:** a single serializer task reads the
+  `Arc<FeedMessage>` backbone, stamps one shared `ws_send_ts_ns`, renders the JSON once, and
+  re-broadcasts a ready-to-write `Arc<PreparedFrame>`; each client task only filters and writes a cheap
+  `Utf8Bytes` clone (so N clients cost one serialization, and `ws_send_ts_ns` is one instant shared by
+  all consumers of a message — see PROTOCOL.md). With no clients connected the serializer skips the
+  work. On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose), app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits

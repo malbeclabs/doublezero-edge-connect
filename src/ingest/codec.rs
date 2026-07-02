@@ -5,6 +5,8 @@
 //! header, message header, little-endian readers and the generic frame-walker are shared with
 //! the sibling protocols in [`crate::ingest::codec_common`].
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::ingest::codec_common::{cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le};
@@ -68,7 +70,7 @@ pub struct Trade {
 #[derive(Debug, Clone)]
 pub struct InstrumentDefinition {
     pub instrument_id: u32,
-    pub symbol: String,
+    pub symbol: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
     pub manifest_seq: u16,
@@ -121,16 +123,6 @@ pub fn source_name(source_id: u16) -> Option<&'static str> {
     }
 }
 
-/// Map a `Trade.aggressor_side` wire byte to the side string used on the WebSocket
-/// (`"buy"`/`"sell"`/`"unknown"`), per the edge-feed-spec Trade layout (1=Buy, 2=Sell, 0=Unknown).
-pub fn aggressor_side(side: u8) -> &'static str {
-    match side {
-        1 => "buy",
-        2 => "sell",
-        _ => "unknown",
-    }
-}
-
 /// Decode one UDP datagram (one frame) into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
     decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
@@ -172,7 +164,7 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
         }),
         MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
             instrument_id: u32le(b, body)?,
-            symbol: cstr(b, body + 4, 16)?,
+            symbol: cstr(b, body + 4, 16)?.into(),
             price_exponent: u8le(b, body + 37)? as i8,
             qty_exponent: u8le(b, body + 38)? as i8,
             manifest_seq: u16le(b, body + 74)?,
@@ -312,7 +304,10 @@ mod tests {
                 assert_eq!(got.instrument_id, 42);
                 assert_eq!(got.source_id, 1);
                 assert_eq!(got.aggressor_side, 2);
-                assert_eq!(aggressor_side(got.aggressor_side), "sell");
+                assert_eq!(
+                    crate::model::Side::from_code(got.aggressor_side),
+                    crate::model::Side::Sell
+                );
                 assert_eq!(got.source_ts, 1_780_609_924_758_000_000);
                 assert_eq!(got.trade_price_raw, 6789);
                 assert_eq!(got.trade_qty_raw, 1500);

@@ -31,7 +31,7 @@ use crate::{
         public_feeder::{self, finite_non_negative, instrument_known, PublicVenue},
     },
     metrics::metrics,
-    model::{now_ns, FeedMessage, InstrumentSnapshot, NormalizedTrade},
+    model::{now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedTrade, Side},
 };
 
 /// Phoenix's public WebSocket endpoint.
@@ -168,8 +168,8 @@ impl PhoenixVenue {
         // available" sentinel rather than dropping the trade.
         let source_ts_ns = unix_seconds_to_ns(&fill.timestamp);
         let trade = NormalizedTrade {
-            venue: PHOENIX_VENUE.to_string(),
-            symbol: symbol.to_string(),
+            venue: venue_arc(PHOENIX_VENUE),
+            symbol: symbol.into(),
             price,
             // `baseAmount` is the fill's base-asset quantity in the *same real units* the edge emits
             // (edge `trade_qty_raw * 10^qty_exponent`) — verified equal on all 257 shared fills in the
@@ -177,11 +177,10 @@ impl PhoenixVenue {
             size: base,
             // Phoenix trade side: "bid" = aggressing buy, "ask" = aggressing sell (capture-confirmed).
             aggressor_side: match fill.side.as_str() {
-                "bid" => "buy",
-                "ask" => "sell",
-                _ => "unknown",
-            }
-            .to_string(),
+                "bid" => Side::Buy,
+                "ask" => Side::Sell,
+                _ => Side::Unknown,
+            },
             trade_id,
             cumulative_volume: 0.0, // not carried on the public trades feed
             source_ts_ns,
@@ -279,10 +278,10 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (PHOENIX_VENUE.to_string(), symbol.to_string()),
+            (PHOENIX_VENUE.into(), symbol.into()),
             NormalizedInstrument {
-                venue: PHOENIX_VENUE.to_string(),
-                symbol: symbol.to_string(),
+                venue: PHOENIX_VENUE.into(),
+                symbol: symbol.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
@@ -290,7 +289,7 @@ mod tests {
         map
     }
 
-    fn arbiter_with_rx() -> (SharedArbiter, broadcast::Receiver<FeedMessage>) {
+    fn arbiter_with_rx() -> (SharedArbiter, broadcast::Receiver<std::sync::Arc<FeedMessage>>) {
         let (tx, rx) = broadcast::channel(64);
         (Arc::new(Mutex::new(Arbiter::new(tx, 8))), rx)
     }
@@ -327,14 +326,14 @@ mod tests {
             &arbiter,
             &instruments,
         );
-        match rx.try_recv().expect("a trade was emitted") {
+        match &*rx.try_recv().expect("a trade was emitted") {
             FeedMessage::Trade(t) => {
-                assert_eq!(t.venue, "Phoenix");
-                assert_eq!(t.symbol, "SOL");
+                assert_eq!(t.venue, "Phoenix".into());
+                assert_eq!(t.symbol, "SOL".into());
                 assert_eq!(t.trade_id, 100);
                 assert_eq!(t.price, 150.0);
                 assert_eq!(t.size, 10.0);
-                assert_eq!(t.aggressor_side, "buy");
+                assert_eq!(t.aggressor_side, crate::model::Side::Buy);
                 assert_eq!(t.source_ts_ns, 1_775_578_550_000_000_000);
             }
             other => panic!("expected a trade, got {other:?}"),
@@ -434,11 +433,11 @@ mod tests {
         let v = venue(&["INTC"]);
         let real = r#"{"channel":"trades","symbol":"INTC","trades":[{"slot":"429901814","slotIndex":1304,"timestamp":"1782831977","symbol":"INTC","taker":"CrhWhzxEohhjooVdd8G9ZQnyWg9Kpuo2fmqWHhtZvEq2","tradeSequenceNumber":"20274","side":"ask","baseLotsFilled":"24","quoteLotsFilled":"3326640","feeInQuoteLots":"0","baseAmount":0.024,"quoteAmount":3.32664,"numFills":1}]}"#;
         v.handle_text(real, &arbiter, &instruments);
-        match rx.try_recv().expect("the real frame emitted a trade") {
+        match &*rx.try_recv().expect("the real frame emitted a trade") {
             FeedMessage::Trade(t) => {
-                assert_eq!(t.symbol, "INTC");
+                assert_eq!(t.symbol, "INTC".into());
                 assert_eq!(t.trade_id, 20274);
-                assert_eq!(t.aggressor_side, "sell"); // "ask" -> sell
+                assert_eq!(t.aggressor_side, crate::model::Side::Sell); // "ask" -> sell
                 assert_eq!(t.size, 0.024); // baseAmount verbatim
                 assert_eq!(t.price, 3.32664 / 0.024); // quoteAmount / baseAmount
                 assert_eq!(t.source_ts_ns, 1_782_831_977_000_000_000);
@@ -456,7 +455,7 @@ mod tests {
         let v = venue(&["SOL"]);
         let frame = r#"{"channel":"trades","symbol":"SOL","trades":[{"tradeSequenceNumber":"199","side":"bid","baseAmount":"not-a-number","quoteAmount":1.0,"timestamp":"1"},{"tradeSequenceNumber":"200","side":"bid","baseAmount":10.0,"quoteAmount":1500.0,"timestamp":"1775578550"}]}"#;
         v.handle_text(frame, &arbiter, &instruments);
-        match rx.try_recv().expect("the good fill still emitted") {
+        match &*rx.try_recv().expect("the good fill still emitted") {
             FeedMessage::Trade(t) => assert_eq!(t.trade_id, 200),
             other => panic!("expected the good fill, got {other:?}"),
         }

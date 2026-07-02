@@ -3,16 +3,51 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use serde::{Deserialize, Serialize};
 
+/// The aggressor (taker) side of a trade. Serializes as `"buy"`/`"sell"`/`"unknown"` (the PROTOCOL.md
+/// wire values) — a fixed enum rather than an owned `String`, so building a trade allocates nothing
+/// for the side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    Buy,
+    Sell,
+    Unknown,
+}
+
+impl Side {
+    /// Map the edge-feed-spec Trade `aggressor_side` wire byte (1=Buy, 2=Sell, 0/other=Unknown).
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => Side::Buy,
+            2 => Side::Sell,
+            _ => Side::Unknown,
+        }
+    }
+}
+
+/// Return the process-wide interned `Arc<str>` for a static venue name, so the ingest hot path
+/// clones a cached `Arc` (a refcount bump) instead of allocating a fresh `String`/`Arc` per message.
+/// Venues are a tiny fixed set (a handful of feeds), so the interner never grows meaningfully.
+pub fn venue_arc(venue: &'static str) -> Arc<str> {
+    static INTERN: OnceLock<Mutex<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
+    let map = INTERN.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = lock(map);
+    guard
+        .entry(venue)
+        .or_insert_with(|| Arc::from(venue))
+        .clone()
+}
+
 /// A normalized two-sided top-of-book update from any venue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedQuote {
-    pub venue: String,
-    pub symbol: String,
+    pub venue: Arc<str>,
+    pub symbol: Arc<str>,
     pub bid: f64,
     pub ask: f64,
     pub bid_size: f64,
@@ -47,12 +82,12 @@ pub struct NormalizedQuote {
 /// dropped trade is a missed print (not a stale book) and there is nothing to replay on connect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedTrade {
-    pub venue: String,
-    pub symbol: String,
+    pub venue: Arc<str>,
+    pub symbol: Arc<str>,
     pub price: f64,
     pub size: f64,
     /// `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.
-    pub aggressor_side: String,
+    pub aggressor_side: Side,
     /// Venue-assigned trade identifier.
     pub trade_id: u64,
     /// Session cumulative traded volume reported by the venue (decimal), 0 if not provided.
@@ -73,8 +108,8 @@ pub struct NormalizedTrade {
 /// quote it is full state per instrument (the latest mid), so it self-heals on the next message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedMidpoint {
-    pub venue: String,
-    pub symbol: String,
+    pub venue: Arc<str>,
+    pub symbol: Arc<str>,
     pub mid: f64,
     /// How the mid was computed (0 = the instrument's default method).
     pub method: u8,
@@ -100,8 +135,8 @@ pub struct NormalizedMidpoint {
 /// are `[price, size]` decimal pairs, best first (bids high->low, asks low->high).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedDepth {
-    pub venue: String,
-    pub symbol: String,
+    pub venue: Arc<str>,
+    pub symbol: Arc<str>,
     pub bids: Vec<[f64; 2]>,
     pub asks: Vec<[f64; 2]>,
     /// Timestamp of the latest applied book event (ns since epoch), 0 if unknown.
@@ -119,8 +154,8 @@ pub struct NormalizedDepth {
 /// A normalized instrument definition (so subscribers know precision/venue).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedInstrument {
-    pub venue: String,
-    pub symbol: String,
+    pub venue: Arc<str>,
+    pub symbol: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
 }
@@ -131,7 +166,7 @@ pub struct NormalizedInstrument {
 /// (it is about the whole venue feed); consumers ignoring unknown `type`s skip it harmlessly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedStatus {
-    pub venue: String,
+    pub venue: Arc<str>,
     /// `"down"` when the quote feed has gone silent, `"ok"` once quotes flow again.
     pub state: String,
     /// Milliseconds the quote feed has been silent (0 when `state == "ok"`).
@@ -158,12 +193,12 @@ impl FeedMessage {
     /// it by venue alone - see `ws_server`).
     pub fn venue_symbol(&self) -> (&str, &str) {
         match self {
-            FeedMessage::Instrument(i) => (i.venue.as_str(), i.symbol.as_str()),
-            FeedMessage::Quote(q) => (q.venue.as_str(), q.symbol.as_str()),
-            FeedMessage::Trade(t) => (t.venue.as_str(), t.symbol.as_str()),
-            FeedMessage::Midpoint(m) => (m.venue.as_str(), m.symbol.as_str()),
-            FeedMessage::Depth(d) => (d.venue.as_str(), d.symbol.as_str()),
-            FeedMessage::Status(s) => (s.venue.as_str(), ""),
+            FeedMessage::Instrument(i) => (i.venue.as_ref(), i.symbol.as_ref()),
+            FeedMessage::Quote(q) => (q.venue.as_ref(), q.symbol.as_ref()),
+            FeedMessage::Trade(t) => (t.venue.as_ref(), t.symbol.as_ref()),
+            FeedMessage::Midpoint(m) => (m.venue.as_ref(), m.symbol.as_ref()),
+            FeedMessage::Depth(d) => (d.venue.as_ref(), d.symbol.as_ref()),
+            FeedMessage::Status(s) => (s.venue.as_ref(), ""),
         }
     }
 }
@@ -178,13 +213,13 @@ impl FeedMessage {
 /// venue is served by multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same entry
 /// (last-writer-wins). Those feeds are expected to agree on precision; `upsert_instrument` in
 /// `processor.rs` warns if their exponents diverge.
-pub type InstrumentSnapshot = Arc<Mutex<HashMap<(String, String), NormalizedInstrument>>>;
+pub type InstrumentSnapshot = Arc<Mutex<HashMap<(Arc<str>, Arc<str>), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
 /// subscriber (depth is full state, so one replayed snapshot bootstraps the consumer immediately
 /// instead of making it wait for the next periodic one). Updated by the MBO receiver.
-pub type DepthSnapshot = Arc<Mutex<HashMap<(String, String), NormalizedDepth>>>;
+pub type DepthSnapshot = Arc<Mutex<HashMap<(Arc<str>, Arc<str>), NormalizedDepth>>>;
 
 /// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
 ///

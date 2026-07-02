@@ -249,7 +249,7 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 Message::InstrumentDefinition(d) => {
                     defs += 1;
                     has_refdata = true;
-                    symbol_to_id.insert(d.symbol.clone(), d.instrument_id);
+                    symbol_to_id.insert(d.symbol.to_string(), d.instrument_id);
                 }
                 Message::ManifestSummary(_) => {
                     manifests += 1;
@@ -380,7 +380,7 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 Message::InstrumentDefinition(d) => {
                     defs += 1;
                     fr.refdata = true;
-                    symbol_to_id.insert(d.symbol.clone(), d.instrument_id);
+                    symbol_to_id.insert(d.symbol.to_string(), d.instrument_id);
                 }
                 Message::ManifestSummary(_) => {
                     manifests += 1;
@@ -700,7 +700,7 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
         if let Ok((_h, msgs)) = codec::decode_frame(f) {
             for m in &msgs {
                 if let Message::InstrumentDefinition(d) = m {
-                    symbol_to_id.insert(d.symbol.clone(), d.instrument_id);
+                    symbol_to_id.insert(d.symbol.to_string(), d.instrument_id);
                 }
             }
         }

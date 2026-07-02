@@ -87,7 +87,7 @@ fn phoenix_refdata_fixture_is_a_complete_manifest_epoch() {
 
     // Phoenix edge `instrument_id` equals the public `assetId`, and the symbol is the same bare
     // ticker on both feeds (no namespace, no `-PERP`). Pin a few exact mappings.
-    let sym = |id: u32| defs.get(&id).map(|d| d.symbol.as_str());
+    let sym = |id: u32| defs.get(&id).map(|d| d.symbol.as_ref());
     assert_eq!(sym(0), Some("SOL"));
     assert_eq!(sym(1), Some("BTC"));
     assert_eq!(sym(2), Some("ETH"));
