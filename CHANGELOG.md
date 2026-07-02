@@ -148,7 +148,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately collapse to one. The WS-replay depth map is written by the arbiter on the admit
   decision (the leader's broadcast book), not pre-floor. New metrics
   `dz_depth_admitted_total{venue,publisher}` (who is winning the book race), `dz_depth_dropped_total`,
-  `dz_depth_future_rejected_total`. Fixture-backed two-publisher MBO depth test over
+  `dz_depth_future_rejected_total`, plus — mirroring the cross-source win metrics (#60) — the
+  head-to-head lead-time histogram `dz_depth_lead_ns{venue,winner,loser}` (how far the leading
+  publisher's book beat the follower's at a contested `source_ts` tick). Fixture-backed two-publisher MBO depth test over
   `mbo_btc_dual.combined.bin` (falsifiable: bypassing the floor re-emits the duplicate empty anchor).
 - Installer one-liner (`scripts/connect*.sh`) now runs a **pre-flight access-pass check before
   installing anything**. Right after reading the access secret — and before installing Docker,

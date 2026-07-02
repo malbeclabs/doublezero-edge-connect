@@ -134,10 +134,13 @@ Modules are grouped by role under `src/`:
   the `Publisher` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → window, everything else passthrough). Wrapped
-  `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share **one**
-  floor per `(venue, symbol)` and race on it. The quote floor lived inside `TobProcessor` under PR #29;
-  it was lifted here so a different transport (the WS feeder) can race in the same floor.
+  floor, depth → depth floor, trades → window, everything else passthrough). Every arm returns an
+  `Admit<Publisher>`: `Emitted` broadcasts and bumps the admitted/winner counter, `Contest{winner,
+  lead_ns}` drops the losing cross-source copy and records the head-to-head lead-time histogram
+  (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60), `Dropped` is a plain collapse.
+  Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share
+  **one** floor per `(venue, symbol)` and race on it. The quote floor lived inside `TobProcessor` under
+  PR #29; it was lifted here so a different transport (the WS feeder) can race in the same floor.
   **Depth diverges from quotes in one deliberate way: it has NO `source_ts == 0` bypass** (#28). For
   quotes 0 is the "not available" sentinel and is forwarded unlatched; for depth 0 is a *real* state —
   the initial synced-but-empty book each publisher emits right after its snapshot anchor — and the two

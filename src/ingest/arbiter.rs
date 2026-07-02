@@ -586,9 +586,19 @@ impl Arbiter {
                         }
                         let _ = self.tx.send(msg);
                     }
-                    // A cross-publisher follower lost this depth tick (its arrival order vs the
-                    // leader is delay-corrupted) — a plain collapse, same as a stale/repeat drop.
-                    Admit::Contest { .. } | Admit::Dropped => {
+                    // A cross-publisher follower lost this depth tick: record how far the winner led
+                    // (the depth mirror of `quote_lead_ns`), on top of the plain drop count.
+                    Admit::Contest { winner, lead_ns } => {
+                        m.depth_dropped.with_label_values(&[&d.venue]).inc();
+                        m.depth_lead_ns
+                            .with_label_values(&[
+                                d.venue.as_str(),
+                                winner.label(),
+                                publisher.label(),
+                            ])
+                            .observe(lead_ns as f64);
+                    }
+                    Admit::Dropped => {
                         m.depth_dropped.with_label_values(&[&d.venue]).inc();
                     }
                 }
@@ -1192,6 +1202,33 @@ mod tests {
             edge,
         );
         assert_eq!(drain_depths(&mut rx), vec![(now, 100.0)]);
+    }
+
+    /// End-to-end through `emit`: a cross-publisher depth contest reaches the depth lead-time
+    /// histogram and the drop counter (the depth mirror of the quote/trade contest tests). Keyed on a
+    /// venue unique to this test so its metric children start at 0 without `#[serial]`.
+    #[test]
+    fn arbiter_emit_records_depth_contest_into_lead_histogram() {
+        let venue = "ArbiterDepthContestMetricTest";
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let mk = |recv: u64, bid: f64| {
+            let mut d = depth(1000, vec![[bid, 1.0]], vec![]);
+            d.venue = venue.to_string();
+            d.recv_ts_ns = recv;
+            FeedMessage::Depth(d)
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        // A opens tick 1000 at t=200; B's copy of the same tick arrives at t=290 -> contest, A led 90.
+        a.emit(mk(200, 100.0), pub_a);
+        a.emit(mk(290, 100.5), pub_b);
+
+        let m = metrics();
+        let a_beats_b = m.depth_lead_ns.with_label_values(&[venue, "edge", "edge"]);
+        assert_eq!(a_beats_b.get_sample_count(), 1);
+        assert_eq!(a_beats_b.get_sample_sum() as u64, 90);
+        assert_eq!(m.depth_dropped.with_label_values(&[venue]).get(), 1);
     }
 
     /// The WS-replay map records the LEADER's admitted book, never a dropped non-leader's divergent

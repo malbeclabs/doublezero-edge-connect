@@ -99,6 +99,10 @@ pub struct Metrics {
     /// MBO `depth` snapshots dropped by the staleness floor (stale tick, non-leader publisher's
     /// redundant book, or the leader's exact content repeat — the cross-publisher collapse).
     pub depth_dropped: IntCounterVec,
+    /// Depth *cross-source* contest lead time (ns): when a second publisher's book snapshot arrives
+    /// at a `source_ts` tick the leader already opened, how far ahead the leader was, labelled by the
+    /// `winner` and `loser` — the depth mirror of [`quote_lead_ns`](Self::quote_lead_ns).
+    pub depth_lead_ns: HistogramVec,
     /// `depth` rejected for an implausibly-far-future `source_ts` before it could advance the floor.
     pub depth_future_rejected: IntCounterVec,
     /// Quotes rejected for an implausibly-far-future `source_ts` before they could advance the floor.
@@ -337,6 +341,15 @@ impl Metrics {
                 "MBO depth dropped by the staleness floor",
                 &["venue"],
             ),
+            depth_lead_ns: histogram_vec(
+                &registry,
+                "dz_depth_lead_ns",
+                "Nanoseconds the winning publisher led the losing duplicate by, per depth \
+                 cross-publisher contest, by winner and loser (edge/public). See dz_quote_lead_ns \
+                 for why both ends are labelled.",
+                &["venue", "winner", "loser"],
+                LEAD_NS_BUCKETS,
+            ),
             depth_future_rejected: counter_vec(
                 &registry,
                 "dz_depth_future_rejected_total",
@@ -557,6 +570,9 @@ mod tests {
         m.depth_admitted
             .with_label_values(&["Hyperliquid", "edge"])
             .inc();
+        m.depth_lead_ns
+            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .observe(123_456.0);
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -578,6 +594,7 @@ mod tests {
             "dz_quote_lead_ns",
             "dz_trade_lead_ns",
             "dz_depth_admitted_total",
+            "dz_depth_lead_ns",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {
