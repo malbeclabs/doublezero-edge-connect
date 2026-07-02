@@ -26,6 +26,12 @@
 //! - trades ([`WindowedDedup`]): a trade is a *point-in-time event*, not state, so a floor would lose
 //!   prints. It keeps the windowed `trade_id` identity instead: a competing publisher's copy or an
 //!   in-window reorder is dropped, but every distinct print is kept.
+//!
+//! MBO `depth` reuses the quote's [`StalenessFloor`] as a *third* arm (keyed on [`DepthId`], the
+//! full top-N book content): two publishers each reconstruct an independent book and emit full-state
+//! snapshots, and the floor collapses the redundant copy exactly as it does redundant BBOs. It
+//! diverges from the quote arm in one deliberate way — no `source_ts == 0` bypass; see the `Depth`
+//! arm of [`Arbiter::emit`].
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -38,7 +44,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     metrics::metrics,
-    model::{now_ns, FeedMessage, NormalizedQuote},
+    model::{self, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote},
 };
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
@@ -50,6 +56,12 @@ pub const TRADE_DEDUP_WINDOW: usize = 8192;
 /// per-block max (~hundreds of distinct BBOs share one HL block timestamp), so it never evicts in
 /// normal operation.
 pub const QUOTE_TICK_CAP: usize = 8192;
+
+/// Cap on distinct leader `depth` snapshots tracked per `source_ts` tick by the depth floor. A book
+/// can legitimately emit several full-state snapshots at one venue event timestamp (the `emit_depth`
+/// per-frame coalescing splits one `source_ts` across frames; see `MboProcessor::emit_depth`), so the
+/// cap sits well above that real per-tick count and never evicts in normal operation.
+pub const DEPTH_TICK_CAP: usize = 1024;
 
 /// Reject a quote whose `source_ts` is more than this far ahead of the host wall clock before it can
 /// advance the floor. A single bad or hostile public-feed timestamp years in the future would
@@ -125,6 +137,41 @@ impl QuoteId {
             ask_sz: canon(q.ask_size),
             bid_n: q.bid_n,
             ask_n: q.ask_n,
+        }
+    }
+}
+
+/// The canonical business identity of a `depth` snapshot at a `source_ts` tick — the full top-N book
+/// content, EXCLUDING `source_ts` (the floor tracks that separately). Mirrors [`QuoteId`]: each
+/// price/qty `f64` is rounded to a `10^-8` fixed-point integer so two publishers' encodings of the
+/// same level collapse to one identity (the same reason `QuoteId` canonicalizes — `raw * 10^exp` is
+/// not bit-identical to a parsed float). Two publishers that independently reconstruct the *same*
+/// book state at one `source_ts` share this identity; genuinely divergent states differ.
+///
+/// This matches the `no_business_duplicates` depth oracle, which keys on `venue + symbol +
+/// source_ts_ns + bids + asks` — content-inclusive by design.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct DepthId {
+    bids: Vec<(i64, i64)>,
+    asks: Vec<(i64, i64)>,
+}
+
+impl DepthId {
+    pub fn of(d: &NormalizedDepth) -> Self {
+        let canon = |levels: &[[f64; 2]]| -> Vec<(i64, i64)> {
+            levels
+                .iter()
+                .map(|l| {
+                    (
+                        (l[0] * 10f64.powi(CANONICAL_BBO_EXP)).round() as i64,
+                        (l[1] * 10f64.powi(CANONICAL_BBO_EXP)).round() as i64,
+                    )
+                })
+                .collect()
+        };
+        Self {
+            bids: canon(&d.bids),
+            asks: canon(&d.asks),
         }
     }
 }
@@ -342,14 +389,27 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 /// The shared emit stage: owns the broadcast `Sender` plus the dedup state, and exposes one
 /// `emit(msg, publisher)` entry point every ingest source funnels through. Quotes pass through the
 /// per-`(venue, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Publisher`),
-/// trades through the [`WindowedDedup`] on `trade_id`, and everything else
-/// (`Instrument`/`Midpoint`/`Depth`/`Status`) is broadcast unchanged. Wrapped in
+/// MBO `depth` through its own latch-to-leader floor (keyed on [`DepthId`] — but with no
+/// `source_ts == 0` bypass, see the `Depth` arm), trades through the [`WindowedDedup`] on `trade_id`,
+/// and everything else (`Instrument`/`Midpoint`/`Status`) is broadcast unchanged. Wrapped in
 /// [`SharedArbiter`] so the multicast receiver tasks and the WS feeder share one instance — hence one
 /// floor per `(venue, symbol)`, on which all sources race.
 pub struct Arbiter {
     tx: broadcast::Sender<FeedMessage>,
     quotes: StalenessFloor<(String, String), QuoteId, Publisher>,
     trades: WindowedDedup<(String, String), u64, Publisher>,
+    /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
+    /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
+    /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
+    /// collapses redundant BBOs — latch-to-leader per `(venue, symbol)` tick, keyed on [`DepthId`].
+    depths: StalenessFloor<(String, String), DepthId, Publisher>,
+    /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
+    /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
+    /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
+    /// the floor. `None` when no WS replay map is wired (e.g. unit tests that only inspect the
+    /// broadcast). The `MboProcessor` still purges this map on book eviction (bounding); it no longer
+    /// writes it (single writer = this admit branch).
+    depth_replay: Option<DepthSnapshot>,
 }
 
 impl Arbiter {
@@ -358,7 +418,16 @@ impl Arbiter {
             tx,
             quotes: StalenessFloor::new(QUOTE_TICK_CAP),
             trades: WindowedDedup::new(trade_window),
+            depths: StalenessFloor::new(DEPTH_TICK_CAP),
+            depth_replay: None,
         }
+    }
+
+    /// Wire the shared WS-replay `depth` map so the arbiter updates it on each admitted (leader)
+    /// depth. The bridge calls this once at startup; without it the depth floor still dedups the
+    /// broadcast but maintains no replay snapshot.
+    pub fn set_depth_replay(&mut self, depth: DepthSnapshot) {
+        self.depth_replay = Some(depth);
     }
 
     /// The broadcast sender, so output sinks can `subscribe()` and `Status` can be sent directly
@@ -473,8 +542,66 @@ impl Arbiter {
                 let _ = self.tx.send(msg);
             }
             FeedMessage::Depth(d) => {
-                m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
-                let _ = self.tx.send(msg);
+                // Reject an implausibly-far-future `source_ts` before it can advance the floor — the
+                // book event timestamp is venue/wire data and the source IP is spoofable, so one
+                // forged far-future depth would otherwise latch `high_water` ahead and wedge depth
+                // for that symbol until restart (mirrors the quote arm; see `MAX_FUTURE_SKEW_NS`).
+                if d.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
+                    m.depth_future_rejected.with_label_values(&[&d.venue]).inc();
+                    return;
+                }
+                // DELIBERATE divergence from the quote arm: depth is routed through the floor with
+                // **no `source_ts == 0` bypass**. For quotes 0 is the "not available" sentinel that
+                // must always forward; for depth 0 is a real state — the initial synced-but-empty
+                // book each publisher emits right after its snapshot anchor — and the two publishers'
+                // identical empty depths at `source_ts == 0` MUST collapse to one (the
+                // content-inclusive depth oracle would otherwise flag them as duplicates). Routing 0
+                // through `admit()` makes the non-leader's empty anchor a no-op. No wedge: a real
+                // later event has `source_ts > 0` and re-advances the floor; only a perpetually-empty
+                // book (no market data at all — nothing to serve) leaves the non-leader dropped, and
+                // depth is full-state self-healing so nothing is lost.
+                let key = (d.venue.clone(), d.symbol.clone());
+                match self.depths.admit(
+                    key,
+                    d.source_ts_ns,
+                    DepthId::of(d),
+                    publisher,
+                    d.recv_ts_ns,
+                ) {
+                    Admit::Emitted => {
+                        m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
+                        // Attribute the admitted depth to its winning publisher — the depth mirror of
+                        // `quotes_admitted`. A rise for a given source shows which publisher currently
+                        // leads the reconstructed book (and, were a public depth backstop ever added,
+                        // `publisher="public"` would flag it filling an edge gap).
+                        m.depth_admitted
+                            .with_label_values(&[d.venue.as_str(), publisher.label()])
+                            .inc();
+                        // Update the WS-replay snapshot with the leader's admitted book, so a client
+                        // connecting mid-stream replays exactly what was broadcast (not a dropped
+                        // non-leader's divergent copy).
+                        if let Some(replay) = &self.depth_replay {
+                            model::lock(replay)
+                                .insert((d.venue.clone(), d.symbol.clone()), d.clone());
+                        }
+                        let _ = self.tx.send(msg);
+                    }
+                    // A cross-publisher follower lost this depth tick: record how far the winner led
+                    // (the depth mirror of `quote_lead_ns`), on top of the plain drop count.
+                    Admit::Contest { winner, lead_ns } => {
+                        m.depth_dropped.with_label_values(&[&d.venue]).inc();
+                        m.depth_lead_ns
+                            .with_label_values(&[
+                                d.venue.as_str(),
+                                winner.label(),
+                                publisher.label(),
+                            ])
+                            .observe(lead_ns as f64);
+                    }
+                    Admit::Dropped => {
+                        m.depth_dropped.with_label_values(&[&d.venue]).inc();
+                    }
+                }
             }
             // `Status` is currently never routed through `emit` — receivers send it straight via
             // `sender()` (see `emit_status`), and no other source produces it — so `dz_emit_total
@@ -955,5 +1082,182 @@ mod tests {
         assert_eq!(edge_beats_public.get_sample_count(), 1);
         assert_eq!(edge_beats_public.get_sample_sum() as u64, 75);
         assert_eq!(m.trades_dropped.with_label_values(&[venue]).get(), 1);
+    }
+
+    use crate::model::NormalizedDepth;
+
+    fn depth(source_ts_ns: u64, bids: Vec<[f64; 2]>, asks: Vec<[f64; 2]>) -> NormalizedDepth {
+        NormalizedDepth {
+            venue: "Hyperliquid".to_string(),
+            symbol: "BTC".to_string(),
+            bids,
+            asks,
+            source_ts_ns,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// Drain every emitted depth's `(source_ts, top bid px)` from a receiver (0.0 if no bid).
+    fn drain_depths(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<(u64, f64)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Depth(d) = m {
+                out.push((d.source_ts_ns, d.bids.first().map(|l| l[0]).unwrap_or(0.0)));
+            }
+        }
+        out
+    }
+
+    /// The two initial synced-but-empty depths two publishers emit at `source_ts == 0` (the empty
+    /// book anchor) collapse to ONE. Unlike the quote arm, `source_ts == 0` is NOT bypassed: the
+    /// leader's empty anchor is emitted and the non-leader's identical empty anchor is dropped, so the
+    /// content-inclusive depth oracle never sees the duplicate `(0, [], [])`.
+    #[test]
+    fn arbiter_depth_empty_anchor_at_zero_collapses() {
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Depth(depth(0, vec![], vec![])), pub_a); // A opens tick 0 -> emit
+        a.emit(FeedMessage::Depth(depth(0, vec![], vec![])), pub_b); // B's identical anchor -> dropped
+                                                                     // A real later event re-advances the floor (no wedge from the latched 0 tick).
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
+            pub_b,
+        );
+        assert_eq!(drain_depths(&mut rx), vec![(0, 0.0), (1000, 100.0)]);
+    }
+
+    /// Latch-to-leader for depth: the leader (first publisher to open a tick) emits; a non-leader
+    /// publisher's depth at the same `source_ts` is dropped even when its book content differs
+    /// (independent reconstructions can diverge at one event ts — the leader's book is served, the
+    /// divergent copy is never both-emitted). A new tick re-latches.
+    #[test]
+    fn arbiter_depth_latches_to_leader_within_tick() {
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
+            pub_a,
+        ); // A leads tick 1000
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
+            pub_b,
+        ); // B mirror -> dropped
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[99.0, 1.0]], vec![])),
+            pub_b,
+        ); // B divergent same tick -> still dropped (non-leader)
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[101.0, 1.0]], vec![])),
+            pub_a,
+        ); // A's own new content same tick -> kept
+        a.emit(
+            FeedMessage::Depth(depth(1001, vec![[102.0, 1.0]], vec![])),
+            pub_b,
+        ); // B opens the next tick -> leads, kept
+        assert_eq!(
+            drain_depths(&mut rx),
+            vec![(1000, 100.0), (1000, 101.0), (1001, 102.0)]
+        );
+    }
+
+    /// A strictly-older depth tick is stale and dropped for any publisher (the floor's `source_ts`
+    /// never goes backwards on the wire).
+    #[test]
+    fn arbiter_depth_stale_tick_dropped() {
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(
+            FeedMessage::Depth(depth(2000, vec![[100.0, 1.0]], vec![])),
+            pub_a,
+        );
+        a.emit(
+            FeedMessage::Depth(depth(1999, vec![[99.0, 1.0]], vec![])),
+            pub_b,
+        ); // older tick -> stale, dropped
+        assert_eq!(drain_depths(&mut rx), vec![(2000, 100.0)]);
+    }
+
+    /// A single implausibly-far-future depth (a forged/hostile source_ts) must NOT advance the floor
+    /// and wedge the symbol: it is rejected, and a later real depth still emits.
+    #[test]
+    fn arbiter_depth_future_timestamp_does_not_wedge_the_floor() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let now = crate::model::now_ns();
+        a.emit(
+            FeedMessage::Depth(depth(now + 3_600_000_000_000, vec![[1.0, 1.0]], vec![])),
+            edge,
+        ); // 1h ahead -> rejected
+        a.emit(
+            FeedMessage::Depth(depth(now, vec![[100.0, 1.0]], vec![])),
+            edge,
+        );
+        assert_eq!(drain_depths(&mut rx), vec![(now, 100.0)]);
+    }
+
+    /// End-to-end through `emit`: a cross-publisher depth contest reaches the depth lead-time
+    /// histogram and the drop counter (the depth mirror of the quote/trade contest tests). Keyed on a
+    /// venue unique to this test so its metric children start at 0 without `#[serial]`.
+    #[test]
+    fn arbiter_emit_records_depth_contest_into_lead_histogram() {
+        let venue = "ArbiterDepthContestMetricTest";
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let mk = |recv: u64, bid: f64| {
+            let mut d = depth(1000, vec![[bid, 1.0]], vec![]);
+            d.venue = venue.to_string();
+            d.recv_ts_ns = recv;
+            FeedMessage::Depth(d)
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        // A opens tick 1000 at t=200; B's copy of the same tick arrives at t=290 -> contest, A led 90.
+        a.emit(mk(200, 100.0), pub_a);
+        a.emit(mk(290, 100.5), pub_b);
+
+        let m = metrics();
+        let a_beats_b = m.depth_lead_ns.with_label_values(&[venue, "edge", "edge"]);
+        assert_eq!(a_beats_b.get_sample_count(), 1);
+        assert_eq!(a_beats_b.get_sample_sum() as u64, 90);
+        assert_eq!(m.depth_dropped.with_label_values(&[venue]).get(), 1);
+    }
+
+    /// The WS-replay map records the LEADER's admitted book, never a dropped non-leader's divergent
+    /// copy. Pins the review fix: the replay snapshot must match what was broadcast, so a client
+    /// connecting mid-stream never bootstraps from a book that never crossed the floor.
+    #[test]
+    fn arbiter_depth_replay_records_leader_not_dropped_nonleader() {
+        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, _rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
+            pub_a,
+        ); // A leads tick 1000 -> admitted, recorded
+        a.emit(
+            FeedMessage::Depth(depth(1000, vec![[99.0, 2.0]], vec![])),
+            pub_b,
+        ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
+        let map = model::lock(&replay);
+        let entry = map
+            .get(&("Hyperliquid".to_string(), "BTC".to_string()))
+            .expect("leader depth recorded in replay map");
+        assert_eq!(
+            entry.bids,
+            vec![[100.0, 1.0]],
+            "replay map must hold the leader's book, not the dropped non-leader's"
+        );
     }
 }

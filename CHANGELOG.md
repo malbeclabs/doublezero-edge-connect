@@ -103,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     read or parse the keypair" warning instead of misattributing the failure to the ledger RPC.
   - The ledger RPC URL is asserted to be `http(s)://` before use, so a `DZ_LEDGER_RPC_URL` with a
     `file://` (or other) scheme can't be dereferenced.
+- **MBO depth was silently broken on the live feed.** The live HL publisher emits MBO
+  `ManifestSummary` with `Valid=0` (the same quirk `TobProcessor` already overrides); `MboProcessor`
+  honored it, which clears all instrument definitions, so precision never resolved and the feed emitted
+  zero `depth`. `MboProcessor` now overrides `Valid=0`→true like TOB (logged once, `REVISIT`).
+  Regression test: `mbo_manifest_valid_zero_is_overridden_so_depth_flows`. The e2e MBO test missed this
+  because its vendored golden carries `Valid=1`; the bug surfaced minting a real-capture MBO fixture.
 
 ### Changed
 - `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
@@ -130,6 +136,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get.doublezero.xyz/connect` one-liner.
 
 ### Added
+- **Multi-publisher dedup for Market-by-Order `depth`** (#28, the MBO half of #3 — TOB shipped
+  earlier). `MboProcessor` now reconstructs an **independent L3 book per `(publisher, instrument)`**
+  (keyed on the datagram source IP), since two publishers' instance-scoped per-instrument delta
+  sequences collide and cannot be merged into one book; `SnapshotOrder` (which carries only a
+  `snapshot_id`, no instrument id) routes only to the originating publisher's building book. The
+  resulting redundant `depth` is collapsed at the shared `Arbiter` by a **latch-to-leader staleness
+  floor** keyed on `(venue, symbol)` with a content-inclusive `DepthId` (top-N levels at canonical
+  `10^-8` fixed-point) — the same primitive as the quote floor, **but with no `source_ts == 0`
+  bypass**: the two identical synced-but-empty book anchors two publishers emit at `source_ts == 0`
+  deliberately collapse to one. The WS-replay depth map is written by the arbiter on the admit
+  decision (the leader's broadcast book), not pre-floor. New metrics
+  `dz_depth_admitted_total{venue,publisher}` (who is winning the book race), `dz_depth_dropped_total`,
+  `dz_depth_future_rejected_total`, plus — mirroring the cross-source win metrics (#60) — the
+  head-to-head lead-time histogram `dz_depth_lead_ns{venue,winner,loser}` (how far the leading
+  publisher's book beat the follower's at a contested `source_ts` tick). Fixture-backed two-publisher MBO depth test over
+  `mbo_btc_dual.combined.bin` (falsifiable: bypassing the floor re-emits the duplicate empty anchor).
 - Installer one-liner (`scripts/connect*.sh`) now runs a **pre-flight access-pass check before
   installing anything**. Right after reading the access secret — and before installing Docker,
   pulling the image, or touching the host network — it verifies onchain that the configured identity
@@ -177,6 +199,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   series for `dz_feed_up == 0` alerting. The `/metrics` HTTP server is GET-only with per-connection
   read/write timeouts and a concurrency cap. Labels are bounded (`venue`/`group`/`dest`/`publisher`
   and small fixed enums; no per-symbol labels).
+- Two-publisher **Market-by-Order** depth-dedup golden `tests/fixtures/mbo_btc_dual.combined.bin` plus
+  the tooling to mint it. `examples/pcap2frames.rs` `--combined-with` now supports `--protocol mbo`
+  (three port roles — refdata/snapshot/mktdata — vs TOB's two, with per-publisher `SnapshotOrder`
+  routing); it keeps refdata across the whole scan while windowing snapshot+deltas to `[--from,--to]`
+  (so the slow-round-robin instrument definition still resolves precision), reports a window-coherence
+  summary, and adds `--empty-anchor`, which synthesizes a per-publisher empty-book snapshot anchor
+  (real per-instrument snapshots ride a ~30 s, per-publisher-phased round-robin and can't be captured
+  coherently in a small window — see `tests/fixtures/PROVENANCE.md`).
 - Shred forwarder deduplication is now selected by a single mode flag, `--shred-dedup-mode`
   (`DZ_SHRED_DEDUP_MODE`), and **defaults to dedup-only** — the forwarder now forwards exactly one
   copy of each shred out of the box, collapsing the multicast-overlap duplicates DoubleZero delivers
