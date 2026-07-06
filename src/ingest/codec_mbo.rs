@@ -415,6 +415,22 @@ pub(crate) mod tests {
         b
     }
 
+    pub(crate) fn enc_instrument_reset(r: &InstrumentReset) -> Vec<u8> {
+        let mut b = vec![MSG_INSTRUMENT_RESET, sizes::INSTRUMENT_RESET, 0, 0];
+        b.extend_from_slice(&r.instrument_id.to_le_bytes());
+        b.push(r.reason);
+        b.extend_from_slice(&[0u8; 3]); // reserved -> new_anchor_seq @ body+8
+        b.extend_from_slice(&r.new_anchor_seq.to_le_bytes());
+        b.extend_from_slice(&r.ts.to_le_bytes());
+        b
+    }
+
+    pub(crate) fn enc_end_of_session(ts: u64) -> Vec<u8> {
+        let mut b = vec![MSG_END_OF_SESSION, 12, 0, 0]; // ts u64 @ body+0
+        b.extend_from_slice(&ts.to_le_bytes());
+        b
+    }
+
     #[test]
     fn order_add_round_trip() {
         let o = OrderAdd {

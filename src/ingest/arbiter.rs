@@ -115,12 +115,18 @@ const CANONICAL_BBO_EXP: i32 = 8;
 /// two sources would not share an identity — silently defeating cross-source dedup. Rounding each
 /// value to a fixed `10^-8` integer collapses both encodings to the same canonical key, matching
 /// `StableBBOHash`. A change in `bid_n`/`ask_n` (orders/sources at the top) is a distinct BBO.
+///
+/// The fixed-point integers are `i128`, not `i64`: a float→int cast **saturates**, so with `i64`
+/// any value above ~9.2e10 (at the `10^-8` scale) would clamp to `i64::MAX` and two genuinely
+/// distinct huge values would collapse to one identity — wrongly deduped. `i128` pushes the
+/// saturation bound past ~1.7e30, beyond any representable price/quantity of interest, while
+/// canonicalizing every in-range value to the same integer `i64` would.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct QuoteId {
-    bid_px: i64,
-    bid_sz: i64,
-    ask_px: i64,
-    ask_sz: i64,
+    bid_px: i128,
+    bid_sz: i128,
+    ask_px: i128,
+    ask_sz: i128,
     bid_n: u16,
     ask_n: u16,
 }
@@ -129,7 +135,7 @@ impl QuoteId {
     /// The canonical content identity of a normalized quote: each BBO `f64` rounded to a `10^-8`
     /// fixed-point integer (so two sources' encodings of the same price collapse), plus the counts.
     pub fn of(q: &NormalizedQuote) -> Self {
-        let canon = |x: f64| (x * 10f64.powi(CANONICAL_BBO_EXP)).round() as i64;
+        let canon = |x: f64| (x * 10f64.powi(CANONICAL_BBO_EXP)).round() as i128;
         Self {
             bid_px: canon(q.bid),
             bid_sz: canon(q.bid_size),
@@ -149,22 +155,23 @@ impl QuoteId {
 /// book state at one `source_ts` share this identity; genuinely divergent states differ.
 ///
 /// This matches the `no_business_duplicates` depth oracle, which keys on `venue + symbol +
-/// source_ts_ns + bids + asks` — content-inclusive by design.
+/// source_ts_ns + bids + asks` — content-inclusive by design. The levels are `i128` for the same
+/// saturation guard as [`QuoteId`] — an `i64` cast clamps any qty above ~9.2e10 to one value.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct DepthId {
-    bids: Vec<(i64, i64)>,
-    asks: Vec<(i64, i64)>,
+    bids: Vec<(i128, i128)>,
+    asks: Vec<(i128, i128)>,
 }
 
 impl DepthId {
     pub fn of(d: &NormalizedDepth) -> Self {
-        let canon = |levels: &[[f64; 2]]| -> Vec<(i64, i64)> {
+        let canon = |levels: &[[f64; 2]]| -> Vec<(i128, i128)> {
             levels
                 .iter()
                 .map(|l| {
                     (
-                        (l[0] * 10f64.powi(CANONICAL_BBO_EXP)).round() as i64,
-                        (l[1] * 10f64.powi(CANONICAL_BBO_EXP)).round() as i64,
+                        (l[0] * 10f64.powi(CANONICAL_BBO_EXP)).round() as i128,
+                        (l[1] * 10f64.powi(CANONICAL_BBO_EXP)).round() as i128,
                     )
                 })
                 .collect()
@@ -327,6 +334,16 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
             }
         }
     }
+
+    /// Drop the latched tick state for every key matching `pred`, returning how many entries were
+    /// cleared. The next sample for a cleared key behaves as first-seen: it re-opens the tick and
+    /// latches a fresh leader, so a legitimately *lower* `source_ts` (a venue that restarted its
+    /// event clock at a session boundary) is admitted instead of being dropped as stale forever.
+    pub fn reset_where(&mut self, mut pred: impl FnMut(&K) -> bool) -> usize {
+        let before = self.state.len();
+        self.state.retain(|k, _| !pred(k));
+        before - self.state.len()
+    }
 }
 
 /// Per-key bounded dedup of recently-seen identities. Keeps the most recent `capacity` values per
@@ -402,6 +419,13 @@ pub struct Arbiter {
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
     /// collapses redundant BBOs — latch-to-leader per `(venue, symbol)` tick, keyed on [`DepthId`].
+    ///
+    /// The floor assumes `source_ts_ns` is monotonic non-decreasing **within a session**; it does
+    /// NOT assume monotonicity across session boundaries. If a venue restarts its event clock below
+    /// the latched high-water, every later depth would be dropped as stale with no full-state
+    /// self-heal (the floor stays latched) — so the MBO processor clears the affected entries on
+    /// `EndOfSession` / `InstrumentReset` via [`Arbiter::reset_depth_floor_for_venue`] /
+    /// [`Arbiter::reset_depth_floor_for_symbol`], the session-reset escape hatch.
     depths: StalenessFloor<(String, String), DepthId, Publisher>,
     /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
     /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
@@ -434,6 +458,40 @@ impl Arbiter {
     /// (it carries no business identity to dedup).
     pub fn sender(&self) -> &broadcast::Sender<FeedMessage> {
         &self.tx
+    }
+
+    /// Clear every latched depth-floor entry for `venue` — the session-reset escape hatch, called
+    /// by the MBO processor on `EndOfSession` (which carries no instrument id, so the whole venue
+    /// resets). Without it a venue that restarts its event clock below the latched high-water
+    /// would have every post-session depth dropped as stale, permanently (see the `depths` docs).
+    /// Cleared entries are counted in `dz_depth_floor_resets_total{venue, reason}`.
+    ///
+    /// Worst case of a spurious reset (e.g. a forged `EndOfSession` — the source IP is spoofable):
+    /// a still-live publisher's next depth re-opens the tick, possibly re-admitting a snapshot at
+    /// an already-served `source_ts` — full-state, so consumers self-heal. Strictly better than
+    /// the permanent wedge the reset prevents.
+    pub fn reset_depth_floor_for_venue(&mut self, venue: &str, reason: &'static str) {
+        let cleared = self.depths.reset_where(|(v, _)| v == venue);
+        metrics()
+            .depth_floor_resets
+            .with_label_values(&[venue, reason])
+            .inc_by(cleared as u64);
+    }
+
+    /// Clear one `(venue, symbol)` latched depth-floor entry — the per-instrument variant of
+    /// [`Self::reset_depth_floor_for_venue`], called by the MBO processor on `InstrumentReset`
+    /// (the book re-snapshots, and the post-reset anchor may carry a lower `source_ts`).
+    pub fn reset_depth_floor_for_symbol(
+        &mut self,
+        venue: &str,
+        symbol: &str,
+        reason: &'static str,
+    ) {
+        let cleared = self.depths.reset_where(|(v, s)| v == venue && s == symbol);
+        metrics()
+            .depth_floor_resets
+            .with_label_values(&[venue, reason])
+            .inc_by(cleared as u64);
     }
 
     /// Apply the appropriate dedup and broadcast if the message survives it. `publisher` is the
@@ -587,9 +645,13 @@ impl Arbiter {
                         let _ = self.tx.send(msg);
                     }
                     // A cross-publisher follower lost this depth tick: record how far the winner led
-                    // (the depth mirror of `quote_lead_ns`), on top of the plain drop count.
+                    // (the depth mirror of `quote_lead_ns`), on top of the drop count attributed to
+                    // the losing publisher class (which source is *losing* the book race — the
+                    // symmetric counterpart of `depth_admitted`'s winner attribution).
                     Admit::Contest { winner, lead_ns } => {
-                        m.depth_dropped.with_label_values(&[&d.venue]).inc();
+                        m.depth_dropped
+                            .with_label_values(&[d.venue.as_str(), publisher.label()])
+                            .inc();
                         m.depth_lead_ns
                             .with_label_values(&[
                                 d.venue.as_str(),
@@ -599,7 +661,9 @@ impl Arbiter {
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
-                        m.depth_dropped.with_label_values(&[&d.venue]).inc();
+                        m.depth_dropped
+                            .with_label_values(&[d.venue.as_str(), publisher.label()])
+                            .inc();
                     }
                 }
             }
@@ -1228,7 +1292,9 @@ mod tests {
         let a_beats_b = m.depth_lead_ns.with_label_values(&[venue, "edge", "edge"]);
         assert_eq!(a_beats_b.get_sample_count(), 1);
         assert_eq!(a_beats_b.get_sample_sum() as u64, 90);
-        assert_eq!(m.depth_dropped.with_label_values(&[venue]).get(), 1);
+        // The drop is attributed to the losing publisher's class (here the losing mirror is also
+        // "edge") — who is *losing* the book race, the counterpart of depth_admitted's winner.
+        assert_eq!(m.depth_dropped.with_label_values(&[venue, "edge"]).get(), 1);
     }
 
     /// The WS-replay map records the LEADER's admitted book, never a dropped non-leader's divergent
@@ -1259,5 +1325,140 @@ mod tests {
             vec![[100.0, 1.0]],
             "replay map must hold the leader's book, not the dropped non-leader's"
         );
+    }
+
+    /// The session-reset escape hatch: a venue that restarts its event clock below the latched
+    /// high-water would have every later depth dropped as stale forever; clearing the venue's floor
+    /// entries (what the MBO processor does on `EndOfSession`) re-opens the tick so the lower
+    /// `source_ts` is admitted. Also pins the cleared-entry count reaching
+    /// `dz_depth_floor_resets_total{venue, reason}` (venue unique to this test).
+    #[test]
+    fn arbiter_depth_session_reset_readmits_lower_tick() {
+        let venue = "ArbiterDepthSessionResetTest";
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mk = |ts: u64, bid: f64| {
+            let mut d = depth(ts, vec![[bid, 1.0]], vec![]);
+            d.venue = venue.to_string();
+            FeedMessage::Depth(d)
+        };
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(mk(5000, 100.0), edge); // latches high_water at 5000
+        a.emit(mk(100, 99.0), edge); // post-restart lower tick -> stale, dropped (the wedge)
+        a.reset_depth_floor_for_venue(venue, "end_of_session");
+        a.emit(mk(100, 99.0), edge); // floor cleared -> re-opens the tick, admitted
+        let ts: Vec<u64> = {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let FeedMessage::Depth(d) = m {
+                    out.push(d.source_ts_ns);
+                }
+            }
+            out
+        };
+        assert_eq!(ts, vec![5000, 100]);
+        assert_eq!(
+            metrics()
+                .depth_floor_resets
+                .with_label_values(&[venue, "end_of_session"])
+                .get(),
+            1,
+            "one latched entry was cleared"
+        );
+    }
+
+    /// A venue-wide floor reset touches only that venue's entries: another venue's latched floor
+    /// still drops its stale ticks.
+    #[test]
+    fn arbiter_depth_session_reset_is_venue_scoped() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mk = |venue: &str, ts: u64| {
+            let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
+            d.venue = venue.to_string();
+            FeedMessage::Depth(d)
+        };
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(mk("VenueA", 5000), edge);
+        a.emit(mk("VenueB", 5000), edge);
+        a.reset_depth_floor_for_venue("VenueA", "end_of_session");
+        a.emit(mk("VenueA", 100), edge); // cleared -> admitted
+        a.emit(mk("VenueB", 100), edge); // untouched -> still stale, dropped
+        let seen: Vec<(String, u64)> = {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let FeedMessage::Depth(d) = m {
+                    out.push((d.venue, d.source_ts_ns));
+                }
+            }
+            out
+        };
+        assert_eq!(
+            seen,
+            vec![
+                ("VenueA".to_string(), 5000),
+                ("VenueB".to_string(), 5000),
+                ("VenueA".to_string(), 100),
+            ]
+        );
+    }
+
+    /// The per-symbol reset (what the MBO processor does on `InstrumentReset`) clears only that
+    /// `(venue, symbol)` entry: the resetting instrument's lower tick is re-admitted while a
+    /// sibling symbol's floor stays latched.
+    #[test]
+    fn arbiter_depth_symbol_reset_clears_only_that_symbol() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mk = |symbol: &str, ts: u64| {
+            let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
+            d.symbol = symbol.to_string();
+            FeedMessage::Depth(d)
+        };
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(mk("BTC", 5000), edge);
+        a.emit(mk("ETH", 5000), edge);
+        a.reset_depth_floor_for_symbol("Hyperliquid", "BTC", "instrument_reset");
+        a.emit(mk("BTC", 100), edge); // cleared -> admitted
+        a.emit(mk("ETH", 100), edge); // untouched -> still stale, dropped
+        let seen: Vec<(String, u64)> = {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let FeedMessage::Depth(d) = m {
+                    out.push((d.symbol, d.source_ts_ns));
+                }
+            }
+            out
+        };
+        assert_eq!(
+            seen,
+            vec![
+                ("BTC".to_string(), 5000),
+                ("ETH".to_string(), 5000),
+                ("BTC".to_string(), 100),
+            ]
+        );
+    }
+
+    /// The canonical fixed-point is `i128`: with `i64`, any qty above ~9.2e10 saturated the
+    /// float→int cast to `i64::MAX`, so two genuinely distinct huge quantities collapsed to one
+    /// identity and the second was wrongly deduped (issue #66 item 2).
+    #[test]
+    fn depth_id_distinguishes_quantities_beyond_i64_saturation() {
+        let a = DepthId::of(&depth(1000, vec![[100.0, 1.0e11]], vec![]));
+        let b = DepthId::of(&depth(1000, vec![[100.0, 2.0e11]], vec![]));
+        assert_ne!(a, b, "distinct huge quantities must not collapse");
+        // And equal content still shares one identity.
+        assert_eq!(a, DepthId::of(&depth(1000, vec![[100.0, 1.0e11]], vec![])));
+    }
+
+    /// Same guard for `QuoteId` (it shares the canonicalization convention).
+    #[test]
+    fn quote_id_distinguishes_sizes_beyond_i64_saturation() {
+        let mut qa = quote(1000, 100.0, 101.0);
+        qa.bid_size = 1.0e11;
+        let mut qb = qa.clone();
+        qb.bid_size = 2.0e11;
+        assert_ne!(QuoteId::of(&qa), QuoteId::of(&qb));
     }
 }

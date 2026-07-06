@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Depth-floor session-reset escape hatch** (#66): the MBO processor now clears the arbiter's
+  latched depth floor on `EndOfSession` (whole venue) and `InstrumentReset` (that symbol), so a
+  venue that restarts its event clock below the latched high-water no longer wedges depth
+  permanently. `InstrumentReset` also drops the book's event clock so the re-synced book can't
+  re-latch the floor with a pre-reset timestamp. Cleared entries are counted in
+  `dz_depth_floor_resets_total{venue, reason}`.
+
+### Changed
+- `dz_depth_dropped_total` now carries a `publisher` label (the dropped copy's source class),
+  symmetric with `dz_depth_admitted_total`, so a lagging publisher losing the book race is
+  directly visible (#66).
+- `QuoteId`/`DepthId` canonical fixed-point widened `i64` → `i128`: an `f64→i64` cast saturates at
+  ~9.2e10 (at the `10^-8` scale), which could collapse two distinct huge quantities into one
+  identity and wrongly dedup the second (#66).
+
+### Added
 - **Subscription-driven feed activation** — the bridge now activates only the feeds this host is
   actually subscribed to, and adds/removes them at runtime as subscriptions change:
   - A single detector (`src/ingest/subscriptions.rs`) reads the host's subscriptions from

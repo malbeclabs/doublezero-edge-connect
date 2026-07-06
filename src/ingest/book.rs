@@ -165,6 +165,11 @@ impl BookState {
         self.building = None;
         self.pending.retain(|d| d.mktdata_seq > new_anchor_seq);
         self.state = SyncState::Recovering;
+        // The dropped book's event clock goes with it: the re-synced book must not stamp its first
+        // depth with the pre-reset time, or (after a venue clock restart) that stale stamp would
+        // re-latch the arbiter's depth floor at the old high-water right after the escape-hatch
+        // reset cleared it — re-wedging the symbol the reset was meant to unwedge.
+        self.last_event_ts = 0;
     }
 
     /// Begin assembling a snapshot. A new begin supersedes any half-built one. When the book is
@@ -415,6 +420,23 @@ mod tests {
         assert!(b.on_snapshot_end(0, 1)); // anchor_seq=0, snapshot_id=1
         assert!(b.is_synced());
         b
+    }
+
+    /// `InstrumentReset` drops the book's event clock along with the book: the re-synced book's
+    /// first depth must not be stamped with the pre-reset time, or (after a venue clock restart)
+    /// that stale stamp would re-latch the arbiter's depth floor right after the escape-hatch
+    /// reset cleared it (#66).
+    #[test]
+    fn instrument_reset_drops_the_event_clock() {
+        let mut b = synced_book();
+        assert!(b.on_delta(add(1, 101, true, 18_405, 3)));
+        assert_eq!(b.last_event_ts(), 1);
+        b.on_instrument_reset(1);
+        assert_eq!(
+            b.last_event_ts(),
+            0,
+            "the pre-reset event time must not survive the reset"
+        );
     }
 
     #[test]

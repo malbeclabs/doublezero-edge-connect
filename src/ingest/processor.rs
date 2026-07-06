@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
+        arbiter::lock,
         book::{BookState, DeltaKind, DeltaOp, Level},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -669,7 +670,14 @@ impl FrameProcessor for MboProcessor {
                     self.state.on_instrument_definition(d);
                     ctx.emit(FeedMessage::Instrument(inst));
                 }
-                codec_mbo::Message::EndOfSession(ts) => info!(ts, "mbo end of session"),
+                codec_mbo::Message::EndOfSession(ts) => {
+                    info!(ts, "mbo end of session");
+                    // The venue may restart its event clock next session. Clear this venue's
+                    // latched depth-floor entries so a post-session `source_ts` below the old
+                    // high-water re-opens the tick instead of being dropped as stale forever
+                    // (the floor stays latched otherwise — no full-state self-heal rescues it).
+                    lock(ctx.arbiter).reset_depth_floor_for_venue(ctx.venue, "end_of_session");
+                }
                 codec_mbo::Message::OrderAdd(o) => {
                     let op = DeltaOp {
                         seq: o.per_instrument_seq,
@@ -775,6 +783,21 @@ impl FrameProcessor for MboProcessor {
                     // always published (and its timestamps are fresh), never suppressed against the
                     // pre-reset top-N. Per-publisher: only this publisher's book is resetting.
                     self.last_top.remove(&(ctx.publisher, r.instrument_id));
+                    // The re-snapshot may anchor at a `source_ts` below the latched floor (e.g. the
+                    // venue reset this instrument's clock); clear the `(venue, symbol)` floor entry
+                    // so the post-reset depth re-opens the tick. No definition → nothing was ever
+                    // emitted for this instrument, so there is no floor entry to clear.
+                    if let Some(symbol) = self
+                        .state
+                        .definition(r.instrument_id)
+                        .map(|d| d.symbol.clone())
+                    {
+                        lock(ctx.arbiter).reset_depth_floor_for_symbol(
+                            ctx.venue,
+                            &symbol,
+                            "instrument_reset",
+                        );
+                    }
                     if let Some(book) = self.book_for(r.instrument_id, ctx) {
                         book.on_instrument_reset(r.new_anchor_seq);
                     }
@@ -844,8 +867,11 @@ mod tests {
         ingest::{
             arbiter::{Arbiter, SharedArbiter},
             codec_mbo::{
-                tests::{enc_order_add, enc_snapshot_begin, enc_snapshot_end, frame},
-                OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
+                tests::{
+                    enc_end_of_session, enc_instrument_reset, enc_order_add, enc_snapshot_begin,
+                    enc_snapshot_end, frame,
+                },
+                InstrumentReset, OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
                 MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
             },
             receiver::{FrameCtx, FrameProcessor, PortRole},
@@ -1022,6 +1048,144 @@ mod tests {
         assert!(
             ids.contains(&0),
             "no BTC depth — a Valid=0 manifest blocked precision (the override is missing)"
+        );
+    }
+
+    /// Drain all available `Depth` messages and return their `source_ts_ns`.
+    fn drain_depth_ts(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Depth(d) = m {
+                out.push(d.source_ts_ns);
+            }
+        }
+        out
+    }
+
+    /// Set up an MBO processor with instrument 0 defined and synced via an empty-book anchor
+    /// snapshot (which emits the initial `depth(source_ts=0)`), for the floor-reset tests.
+    fn synced_mbo_proc(
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+    ) -> MboProcessor {
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 1),
+                enc_instrument_def(0, "INST-0", 1),
+            ]),
+            &make_ctx(arbiter, instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 1,
+                    last_instrument_seq: 0,
+                    ts: 1,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 1,
+                }),
+            ]),
+            &make_ctx(arbiter, instruments, PortRole::Snapshot),
+        );
+        proc
+    }
+
+    /// One bid `OrderAdd` for instrument 0 at per-instrument `seq`, stamped `ts`.
+    fn add(seq: u32, order_id: u64, ts: u64) -> Vec<u8> {
+        enc_order_add(&OrderAdd {
+            instrument_id: 0,
+            source_id: 0,
+            side: SIDE_BID,
+            order_flags: 0,
+            per_instrument_seq: seq,
+            order_id,
+            enter_ts: ts,
+            price_raw: 100,
+            qty_raw: 5,
+        })
+    }
+
+    /// `EndOfSession` clears the venue's latched depth-floor entries (the session-reset escape
+    /// hatch, #66): a post-session depth whose `source_ts` is BELOW the pre-session high-water is
+    /// re-admitted instead of being dropped as stale forever (there is no full-state self-heal
+    /// while the floor stays latched).
+    #[test]
+    fn mbo_end_of_session_unwedges_depth_floor() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+        proc.on_datagram(&frame(&[add(2, 101, 100)]), &mkt); // venue clock restarted -> stale, dropped
+        proc.on_datagram(&frame(&[enc_end_of_session(6000)]), &mkt); // clears the venue's floor
+        proc.on_datagram(&frame(&[add(3, 102, 50)]), &mkt); // lower tick re-opens -> admitted
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 50],
+            "the pre-reset lower tick (100) is dropped; after EndOfSession the floor re-opens"
+        );
+    }
+
+    /// `InstrumentReset` clears the `(venue, symbol)` depth-floor entry AND the book's event clock,
+    /// so the re-synced book's depth — stamped by the venue's restarted (lower) clock — is admitted.
+    /// Without the floor reset the post-resync depths are stale-dropped forever; without the
+    /// event-clock reset the first post-resync depth would carry the pre-reset time and re-latch
+    /// the floor at the old high-water, re-wedging what the reset just cleared.
+    #[test]
+    fn mbo_instrument_reset_unwedges_depth_floor() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+        proc.on_datagram(
+            &frame(&[enc_instrument_reset(&InstrumentReset {
+                instrument_id: 0,
+                reason: 1,
+                new_anchor_seq: 0,
+                ts: 5500,
+            })]),
+            &mkt,
+        );
+        // Re-sync via a fresh empty anchor: the post-resync depth is stamped source_ts=0 (the
+        // event clock was dropped with the book) and re-opens the cleared floor.
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 2,
+                    last_instrument_seq: 0,
+                    ts: 2,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 2,
+                }),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(&frame(&[add(1, 101, 100)]), &mkt); // new (restarted) clock -> admitted
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 0, 100],
+            "post-reset depths must flow at the restarted clock, not be stale-dropped"
         );
     }
 
