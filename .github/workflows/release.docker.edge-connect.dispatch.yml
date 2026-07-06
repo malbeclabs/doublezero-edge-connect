@@ -32,16 +32,21 @@ jobs:
     steps:
       - id: v
         shell: bash
+        # Pass the untrusted client_payload through env vars, never inline ${{ }}
+        # into the script — inline interpolation lets a crafted payload break out
+        # of the shell quoting (defense-in-depth; the dispatch is authenticated).
+        env:
+          PAYLOAD_ENV: ${{ github.event.client_payload.env }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
         run: |
-          env='${{ github.event.client_payload.env }}'
-          case "$env" in
+          case "$PAYLOAD_ENV" in
             testnet|mainnet-beta|devnet)
-              echo "env=$env" >> "$GITHUB_OUTPUT"
+              echo "env=$PAYLOAD_ENV" >> "$GITHUB_OUTPUT"
               echo "ok=true" >> "$GITHUB_OUTPUT"
-              echo "Rebuilding edge-connect variant: $env (doublezero '${{ github.event.client_payload.version }}')" ;;
+              echo "Rebuilding edge-connect variant: $PAYLOAD_ENV (doublezero '$PAYLOAD_VERSION')" ;;
             *)
               echo "ok=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::ignoring dispatch with unknown env '$env'" ;;
+              echo "::warning::ignoring dispatch with unknown env '$PAYLOAD_ENV'" ;;
           esac
 
   # Rebuild only the affected variant: moving tags + :sha- (no version), exactly
