@@ -555,8 +555,37 @@ echo
 if ws_disabled; then
   info "Done. The WebSocket sink is disabled (WS_BIND=\"\"); the bridge ingests DZ Edge and (if configured) forwards shreds, but serves no WebSocket."
 else
-  info "Done. The bridge is serving normalized quotes:"
-  echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+  # The WS sink and the shred forwarder are activated independently by the subscription reconciler
+  # (docs/output-sinks.md), each only once this host is actually subscribed -- so a shreds-only host
+  # serves no WebSocket, and a just-connected host may have neither yet. Rather than re-derive that
+  # dynamic, per-feature state (it also depends on DZ_SHRED_SOURCES / DZ_SHRED_DISABLE), observe the
+  # bridge's own decisions from its log (default warn,doublezero_edge_connect=info level):
+  #   "activating WebSocket sink"                      -> quotes are being served
+  #   "activating shred forwarder (subscribed groups)" -> shreds are being forwarded
+  # A direct WS-port probe backstops the log line if RUST_LOG was lowered. The reconciler runs its
+  # first post-connect pass within one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s),
+  # so wait up to that (capped) and stop as soon as either activates. The matching "inactive" log
+  # lines aren't emitted for a feature that was never up, so inactivity is inferred from a full wait.
+  refresh="${DZ_SUBSCRIPTION_REFRESH_SECS:-30}"; case "$refresh" in *[!0-9]*|'') refresh=30;; esac
+  max_wait=$((refresh + 5)); if [ "$max_wait" -gt 35 ]; then max_wait=35; fi
+  ws_up=""; shreds_up=""
+  for _ in $(seq 1 "$max_wait"); do
+    logs="$($SUDO docker logs "$DZ_NAME" 2>&1 || true)"
+    if printf '%s' "$logs" | grep -q "activating WebSocket sink" || port_in_use "$WS_PORT"; then ws_up=1; fi
+    if printf '%s' "$logs" | grep -q "activating shred forwarder"; then shreds_up=1; fi
+    if [ -n "$ws_up" ] || [ -n "$shreds_up" ]; then break; fi
+    sleep 1
+  done
+  if [ -n "$ws_up" ]; then
+    info "Done. The bridge is serving normalized quotes:"
+    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+  elif [ -n "$shreds_up" ]; then
+    info "Done. Forwarding shreds. The WebSocket quote sink is idle -- it activates once this host is subscribed to a market-data feed."
+    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # activates once >=1 market-data feed is subscribed"
+  else
+    info "Done. Connected. The WebSocket sink and shred forwarder each activate automatically once this host is subscribed to a group (a market-data feed for WS; an edge-solana-* group for shreds) -- allow up to one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s). Check: sudo docker logs $DZ_NAME"
+    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
+  fi
 fi
 echo
 info "Manage with:"
