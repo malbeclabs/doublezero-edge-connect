@@ -399,6 +399,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     read or parse the keypair" warning instead of misattributing the failure to the ledger RPC.
   - The ledger RPC URL is asserted to be `http(s)://` before use, so a `DZ_LEDGER_RPC_URL` with a
     `file://` (or other) scheme can't be dereferenced.
+- Installer no longer advertises a WebSocket URL the bridge won't serve (`scripts/connect*.sh`). The
+  final status print gated only on `WS_BIND=""`, so a shreds-only (or not-yet-subscribed) host was
+  still told `ws://<host>:8081` even though the subscription reconciler activates the WS sink only
+  when ≥1 market-data feed is subscribed — nothing was listening there. The installer now observes
+  the bridge's own decisions (its `activating WebSocket sink` / `activating shred forwarder` logs,
+  emitted at the default `warn,doublezero_edge_connect=info` level, plus a direct WS-port probe),
+  waiting up to one reconcile interval (`DZ_SUBSCRIPTION_REFRESH_SECS`, default 30s) and exiting as
+  soon as either activates, then reports serving-quotes / forwarding-shreds / nothing-subscribed-yet
+  accordingly rather than asserting an unbound socket.
 - **MBO depth was silently broken on the live feed.** The live HL publisher emits MBO
   `ManifestSummary` with `Valid=0` (the same quirk `TobProcessor` already overrides); `MboProcessor`
   honored it, which clears all instrument definitions, so precision never resolved and the feed emitted
