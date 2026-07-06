@@ -11,14 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Depth-floor session-reset escape hatch** (#66): the MBO processor now clears the arbiter's
   latched depth floor on `EndOfSession` (whole venue) and `InstrumentReset` (that symbol), so a
   venue that restarts its event clock below the latched high-water no longer wedges depth
-  permanently. `InstrumentReset` also drops the book's event clock so the re-synced book can't
-  re-latch the floor with a pre-reset timestamp. Cleared entries are counted in
-  `dz_depth_floor_resets_total{venue, reason}`.
+  permanently. `EndOfSession` is treated as a feed-level boundary: **every** publisher's book is
+  dropped to `Recovering` (sequences, buffered deltas and the event clock all discarded), so a
+  mirror publisher's old-session tail — or a boundary-loss resync stamping pre-session time —
+  can't re-latch the floor at the old high-water and undo the clear. `InstrumentReset` likewise
+  drops the resetting book's event clock, and falls back to a venue-wide floor clear when the
+  instrument's definition is transiently missing (refdata reset window). Cleared entries are
+  counted in `dz_depth_floor_resets_total{venue, reason}`. Note for consumers: the first `depth`
+  after a reset/resync may carry the `source_ts_ns = 0` sentinel (per PROTOCOL.md, fall back to
+  `kernel_rx_ts_ns`).
 
 ### Changed
 - `dz_depth_dropped_total` now carries a `publisher` label (the dropped copy's source class),
   symmetric with `dz_depth_admitted_total`, so a lagging publisher losing the book race is
-  directly visible (#66).
+  directly visible (#66). This changes the label set of an existing series — exact-label matchers
+  and recording rules on this metric need updating (`sum by (venue)` aggregations are unaffected).
 - `QuoteId`/`DepthId` canonical fixed-point widened `i64` → `i128`: an `f64→i64` cast saturates at
   ~9.2e10 (at the `10^-8` scale), which could collapse two distinct huge quantities into one
   identity and wrongly dedup the second (#66).

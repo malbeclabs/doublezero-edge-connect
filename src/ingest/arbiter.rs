@@ -119,8 +119,10 @@ const CANONICAL_BBO_EXP: i32 = 8;
 /// The fixed-point integers are `i128`, not `i64`: a float→int cast **saturates**, so with `i64`
 /// any value above ~9.2e10 (at the `10^-8` scale) would clamp to `i64::MAX` and two genuinely
 /// distinct huge values would collapse to one identity — wrongly deduped. `i128` pushes the
-/// saturation bound past ~1.7e30, beyond any representable price/quantity of interest, while
-/// canonicalizing every in-range value to the same integer `i64` would.
+/// saturation bound past ~1.7e30, beyond any representable price/quantity of interest, and agrees
+/// with the old `i64` canonicalization for every in-range value, so dedup semantics are otherwise
+/// unchanged. (Above ~9e7 the effective grid is the `f64` ULP rather than a true `10^-8` step —
+/// inherent to the `f64` inputs; distinct `f64` values still map to distinct integers.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct QuoteId {
     bid_px: i128,
@@ -413,6 +415,11 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 /// floor per `(venue, symbol)`, on which all sources race.
 pub struct Arbiter {
     tx: broadcast::Sender<FeedMessage>,
+    /// Cross-source dedup for quotes. Deliberately EXEMPT from the session-reset escape hatch the
+    /// depth floor gets (see `depths` below): the TOB `source_ts` is epoch block time, monotonic
+    /// across sessions by construction, so a session boundary cannot restart it below the latched
+    /// high-water — and 0, the "not available" sentinel, bypasses this floor entirely. Revisit if
+    /// a venue with a session-scoped quote clock is ever added.
     quotes: StalenessFloor<(String, String), QuoteId, Publisher>,
     trades: WindowedDedup<(String, String), u64, Publisher>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
@@ -481,6 +488,13 @@ impl Arbiter {
     /// Clear one `(venue, symbol)` latched depth-floor entry — the per-instrument variant of
     /// [`Self::reset_depth_floor_for_venue`], called by the MBO processor on `InstrumentReset`
     /// (the book re-snapshots, and the post-reset anchor may carry a lower `source_ts`).
+    ///
+    /// The floor entry is shared across publishers while `InstrumentReset` arrives per publisher,
+    /// so a one-publisher reset also clears a healthy mirror's latch: worst case the resetting
+    /// publisher's post-resync depth (stamped `source_ts = 0`, its event clock was dropped with
+    /// the book) transiently wins leadership and reaches the wire/replay map until the live
+    /// mirror's next event — full-state, self-healing, and strictly better than skipping the
+    /// clear (a venue clock restart would wedge the symbol permanently).
     pub fn reset_depth_floor_for_symbol(
         &mut self,
         venue: &str,

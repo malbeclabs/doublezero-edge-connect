@@ -151,9 +151,13 @@ Modules are grouped by role under `src/`:
   floor assumes `source_ts` monotonicity only **within** a session: the MBO processor clears it on
   `EndOfSession` (whole venue) / `InstrumentReset` (that symbol) via `reset_depth_floor_for_*` — the
   session-reset escape hatch (#66, counted in `dz_depth_floor_resets_total{venue,reason}`) — so a
-  venue that restarts its clock below the latched high-water doesn't wedge depth forever
-  (`book.rs::on_instrument_reset` also drops `last_event_ts` so the re-synced book can't re-latch
-  the old high-water). `Status` routes straight to `sender()` (no business identity to dedup).
+  venue that restarts its clock below the latched high-water doesn't wedge depth forever.
+  `EndOfSession` is feed-level: it also drops **every** publisher's book to `Recovering`
+  (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock discarded) so a mirror's
+  old-session tail can't re-latch the cleared floor; `on_instrument_reset` likewise drops
+  `last_event_ts`, and a missing definition falls back to a venue-wide clear. The *quote* floor is
+  deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
+  routes straight to `sender()` (no business identity to dedup).
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by

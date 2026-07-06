@@ -155,6 +155,28 @@ impl BookState {
         self.last_event_ts
     }
 
+    /// `EndOfSession`: the session's book, sequences and event clock are all over; drop everything
+    /// and await the next session's snapshot. Unlike [`Self::on_instrument_reset`] there is no
+    /// forward anchor — buffered deltas belong to the ended session and are discarded outright
+    /// (replaying them against a new-session snapshot whose `anchor_seq` restarted low would apply
+    /// stale data). Dropping to `Recovering` also skips the `Synced` "snapshot while ready"
+    /// staleness check, so a new-session snapshot with a restarted (small) `anchor_seq` — which a
+    /// still-`Synced` book would ignore as stale — re-bootstraps cleanly, and zeroing
+    /// `last_event_ts` keeps the resync from stamping its first depth with pre-session time (which
+    /// would re-latch the arbiter's depth floor at the old high-water right after the
+    /// session-reset escape hatch cleared it).
+    pub fn on_end_of_session(&mut self) {
+        self.orders.clear();
+        self.bids.clear();
+        self.asks.clear();
+        self.building = None;
+        self.pending.clear();
+        self.state = SyncState::Recovering;
+        self.last_instr_seq = 0;
+        self.last_applied_mktdata_seq = 0;
+        self.last_event_ts = 0;
+    }
+
     /// `InstrumentReset(new_anchor_seq = S')`: drop the book and any open snapshot and await a fresh
     /// snapshot anchored at `S'`. Buffered deltas at/below `S'` are discarded (the reset supersedes
     /// them); those past `S'` are retained for post-snapshot replay.
@@ -420,6 +442,33 @@ mod tests {
         assert!(b.on_snapshot_end(0, 1)); // anchor_seq=0, snapshot_id=1
         assert!(b.is_synced());
         b
+    }
+
+    /// `EndOfSession` drops everything — book, sequences, buffered deltas, event clock — so the
+    /// next session's snapshot re-bootstraps even with a restarted (small) `anchor_seq`, no
+    /// old-session buffered delta replays into it, and the resync depth can't be stamped with
+    /// pre-session time (#66).
+    #[test]
+    fn end_of_session_drops_book_sequences_and_event_clock() {
+        let mut b = synced_book();
+        assert!(b.on_delta(add(1, 101, true, 18_405, 3))); // applied: last_event_ts = 1
+        assert!(!b.on_delta(add(5, 102, true, 18_406, 1))); // gap -> Recovering, delta buffered
+        b.on_end_of_session();
+        assert!(!b.is_synced());
+        assert_eq!(b.last_event_ts(), 0);
+        // A new-session snapshot with a restarted (small) anchor re-bootstraps: a still-`Synced`
+        // book would have ignored it as "snapshot while ready".
+        b.on_snapshot_begin(2, 0, 1, 0);
+        b.on_snapshot_order(2, 300, true, 100, 1);
+        assert!(b.on_snapshot_end(0, 2));
+        assert!(b.is_synced());
+        // Old-session buffered deltas were discarded: the book holds exactly the new snapshot.
+        let (bids, asks) = b.top_levels(5);
+        assert_eq!(bids, vec![(100, 1)]);
+        assert_eq!(asks, vec![]);
+        // And the restarted per-instrument sequence applies from the new snapshot's seq.
+        assert!(b.on_delta(add(1, 301, true, 101, 2)));
+        assert_eq!(b.last_event_ts(), 1);
     }
 
     /// `InstrumentReset` drops the book's event clock along with the book: the re-synced book's
