@@ -15,6 +15,13 @@ an implementation detail; the *only* external contract is the WebSocket output, 
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
 consumer is not part of the protocol.
 
+## Commits & authorship
+
+- **Never attribute commits or code to Claude/Anthropic (or any AI).** No
+  `Co-Authored-By: Claude`, no "Generated with Claude Code" trailers in commit messages or
+  PR bodies, and no AI-attribution comments in source. Commits and code read as the human
+  author's own work.
+
 ## Commands
 
 ```bash
