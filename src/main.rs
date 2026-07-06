@@ -427,8 +427,7 @@ mod tests {
     #[test]
     fn repeated_name_selects_same_as_single() {
         let once = select_feeds(&["Hyperliquid".to_string()]).unwrap();
-        let twice =
-            select_feeds(&["Hyperliquid".to_string(), "Hyperliquid".to_string()]).unwrap();
+        let twice = select_feeds(&["Hyperliquid".to_string(), "Hyperliquid".to_string()]).unwrap();
         // Repeating a name must spawn the same receivers (same keys, same order) as passing it once.
         assert_eq!(keys(&once), keys(&twice));
         // Hyperliquid maps to >1 row (TOB + MBO), so this actually exercises multi-row dedup.
