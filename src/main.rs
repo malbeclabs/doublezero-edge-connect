@@ -208,6 +208,11 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
         return Ok(feeds::FEEDS.iter().collect());
     }
     let mut chosen = Vec::new();
+    // Dedup on `(venue, kind)` — the reconciler's own `FeedKey` and the identity that maps to one
+    // receiver. A repeated `--feed` name (e.g. `--feed Hyperliquid --feed Hyperliquid`) must spawn
+    // each receiver at most once, else the duplicated receivers contend for the same multicast
+    // group/port. `(venue, kind)` is unique across `FEEDS` (see `feeds::tests`).
+    let mut seen = std::collections::HashSet::new();
     for name in selection {
         let matches: Vec<&'static feeds::Feed> = feeds::FEEDS
             .iter()
@@ -217,7 +222,11 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
             let known: Vec<&str> = feeds::FEEDS.iter().map(|f| f.venue).collect();
             bail!("unknown feed '{name}'; known feeds: {}", known.join(", "));
         }
-        chosen.extend(matches);
+        for f in matches {
+            if seen.insert((f.venue, f.kind)) {
+                chosen.push(f);
+            }
+        }
     }
     Ok(chosen)
 }
@@ -398,4 +407,55 @@ async fn main() -> Result<()> {
         } } => r??,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_selection_is_all_feeds() {
+        let all = select_feeds(&[]).unwrap();
+        assert_eq!(all.len(), feeds::FEEDS.len());
+    }
+
+    // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`).
+    fn keys(sel: &[&feeds::Feed]) -> Vec<(&'static str, feeds::FeedKind)> {
+        sel.iter().map(|f| (f.venue, f.kind)).collect()
+    }
+
+    #[test]
+    fn repeated_name_selects_same_as_single() {
+        let once = select_feeds(&["Hyperliquid".to_string()]).unwrap();
+        let twice = select_feeds(&["Hyperliquid".to_string(), "Hyperliquid".to_string()]).unwrap();
+        // Repeating a name must spawn the same receivers (same keys, same order) as passing it once.
+        assert_eq!(keys(&once), keys(&twice));
+        // Hyperliquid maps to >1 row (TOB + MBO), so this actually exercises multi-row dedup.
+        assert!(once.len() > 1);
+    }
+
+    #[test]
+    fn distinct_names_union_without_dup() {
+        let sel = select_feeds(&[
+            "Hyperliquid".to_string(),
+            "Phoenix".to_string(),
+            "Hyperliquid".to_string(),
+        ])
+        .unwrap();
+        // Union of the two distinct venues' rows, each receiver once — no row spawned twice.
+        let k = keys(&sel);
+        let uniq: std::collections::HashSet<_> = k.iter().collect();
+        assert_eq!(uniq.len(), k.len());
+        // The repeated "Hyperliquid" added nothing beyond the first: selecting both venues equals
+        // selecting each once.
+        assert_eq!(
+            k,
+            keys(&select_feeds(&["Hyperliquid".to_string(), "Phoenix".to_string()]).unwrap())
+        );
+    }
+
+    #[test]
+    fn unknown_name_still_errors() {
+        assert!(select_feeds(&["Nope".to_string()]).is_err());
+    }
 }
