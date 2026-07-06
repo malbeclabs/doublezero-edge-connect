@@ -422,7 +422,7 @@ preflight_ws_port() {
   ws_disabled && return 0                       # sink off -> nothing to bind
   local p; p="$(ws_port)"
   case "$p" in *[!0-9]*|'') return 0;; esac      # not a plain numeric port -> let the bridge validate WS_BIND
-  port_in_use "$p"; local rc=$?
+  local rc=0; port_in_use "$p" || rc=$?
   if [ "$rc" -eq 2 ]; then
     warn "Can't check whether TCP port $p is free (no ss/netstat installed); if it's in use the WS sink won't bind (the tunnel is unaffected)."
     return 0
