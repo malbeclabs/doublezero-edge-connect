@@ -97,8 +97,16 @@ pub struct Metrics {
     /// leading the reconstructed book.
     pub depth_admitted: IntCounterVec,
     /// MBO `depth` snapshots dropped by the staleness floor (stale tick, non-leader publisher's
-    /// redundant book, or the leader's exact content repeat — the cross-publisher collapse).
+    /// redundant book, or the leader's exact content repeat — the cross-publisher collapse),
+    /// attributed to the `publisher` class whose copy was dropped — the symmetric counterpart of
+    /// [`depth_admitted`](Self::depth_admitted)'s winner attribution, so a lagging source (who is
+    /// *losing* the book race) is directly visible.
     pub depth_dropped: IntCounterVec,
+    /// Depth-floor entries cleared by the session-reset escape hatch, by `reason`
+    /// (`end_of_session` / `instrument_reset`). A venue restarting its event clock below the
+    /// latched high-water would otherwise wedge depth permanently; see
+    /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_venue`].
+    pub depth_floor_resets: IntCounterVec,
     /// Depth *cross-source* contest lead time (ns): when a second publisher's book snapshot arrives
     /// at a `source_ts` tick the leader already opened, how far ahead the leader was, labelled by the
     /// `winner` and `loser` — the depth mirror of [`quote_lead_ns`](Self::quote_lead_ns).
@@ -338,8 +346,14 @@ impl Metrics {
             depth_dropped: counter_vec(
                 &registry,
                 "dz_depth_dropped_total",
-                "MBO depth dropped by the staleness floor",
-                &["venue"],
+                "MBO depth dropped by the staleness floor, by the publisher whose copy was dropped",
+                &["venue", "publisher"],
+            ),
+            depth_floor_resets: counter_vec(
+                &registry,
+                "dz_depth_floor_resets_total",
+                "Depth-floor entries cleared by the session-reset escape hatch, by reason",
+                &["venue", "reason"],
             ),
             depth_lead_ns: histogram_vec(
                 &registry,
@@ -570,6 +584,12 @@ mod tests {
         m.depth_admitted
             .with_label_values(&["Hyperliquid", "edge"])
             .inc();
+        m.depth_dropped
+            .with_label_values(&["Hyperliquid", "edge"])
+            .inc();
+        m.depth_floor_resets
+            .with_label_values(&["Hyperliquid", "end_of_session"])
+            .inc();
         m.depth_lead_ns
             .with_label_values(&["Hyperliquid", "edge", "public"])
             .observe(123_456.0);
@@ -594,6 +614,8 @@ mod tests {
             "dz_quote_lead_ns",
             "dz_trade_lead_ns",
             "dz_depth_admitted_total",
+            "dz_depth_dropped_total",
+            "dz_depth_floor_resets_total",
             "dz_depth_lead_ns",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",

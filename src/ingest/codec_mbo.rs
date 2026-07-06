@@ -76,6 +76,7 @@ pub mod sizes {
     pub const ORDER_EXECUTE: u8 = 56;
     pub const BATCH_BOUNDARY: u8 = 16;
     pub const INSTRUMENT_RESET: u8 = 28;
+    pub const END_OF_SESSION: u8 = 12;
     pub const SNAPSHOT_BEGIN: u8 = 36;
     pub const SNAPSHOT_ORDER: u8 = 44;
     pub const SNAPSHOT_END: u8 = 20;
@@ -415,6 +416,22 @@ pub(crate) mod tests {
         b
     }
 
+    pub(crate) fn enc_instrument_reset(r: &InstrumentReset) -> Vec<u8> {
+        let mut b = vec![MSG_INSTRUMENT_RESET, sizes::INSTRUMENT_RESET, 0, 0];
+        b.extend_from_slice(&r.instrument_id.to_le_bytes());
+        b.push(r.reason);
+        b.extend_from_slice(&[0u8; 3]); // reserved -> new_anchor_seq @ body+8
+        b.extend_from_slice(&r.new_anchor_seq.to_le_bytes());
+        b.extend_from_slice(&r.ts.to_le_bytes());
+        b
+    }
+
+    pub(crate) fn enc_end_of_session(ts: u64) -> Vec<u8> {
+        let mut b = vec![MSG_END_OF_SESSION, sizes::END_OF_SESSION, 0, 0]; // ts u64 @ body+0
+        b.extend_from_slice(&ts.to_le_bytes());
+        b
+    }
+
     #[test]
     fn order_add_round_trip() {
         let o = OrderAdd {
@@ -565,7 +582,7 @@ pub(crate) mod tests {
     #[test]
     fn frame_header_offsets_match_authority() {
         let body = vec![0u8; 8]; // EndOfSession body (ts u64@0)
-        let mut f = frame_one(MSG_END_OF_SESSION, 12, &body);
+        let mut f = frame_one(MSG_END_OF_SESSION, sizes::END_OF_SESSION, &body);
         f[2] = 1; // schema_version
         f[3] = 0; // channel_id
         put(&mut f, 4, &0x1122u64.to_le_bytes()); // sequence
@@ -895,7 +912,7 @@ pub(crate) mod tests {
     fn end_of_session_offsets_match_authority() {
         let mut body = vec![0u8; 8];
         put(&mut body, 0, &1_780u64.to_le_bytes());
-        let f = frame_one(MSG_END_OF_SESSION, 12, &body);
+        let f = frame_one(MSG_END_OF_SESSION, sizes::END_OF_SESSION, &body);
         match &decode_frame(&f).unwrap().1[0] {
             Message::EndOfSession(ts) => assert_eq!(*ts, 1_780),
             other => panic!("expected EndOfSession, got {other:?}"),

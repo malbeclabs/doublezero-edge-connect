@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Depth-floor session-reset escape hatch** (#66): the MBO processor now clears the arbiter's
+  latched depth floor on `EndOfSession` (whole venue) and `InstrumentReset` (that symbol), so a
+  venue that restarts its event clock below the latched high-water no longer wedges depth
+  permanently. `EndOfSession` is treated as a feed-level boundary: **every** publisher's book is
+  dropped to `Recovering` (sequences, buffered deltas and the event clock all discarded), so a
+  mirror publisher's old-session tail — or a boundary-loss resync stamping pre-session time —
+  can't re-latch the floor at the old high-water and undo the clear. `InstrumentReset` likewise
+  drops the resetting book's event clock, scopes its clear by the symbol the depth was actually
+  emitted under (immune to an id→symbol remap across manifest epochs), and falls back to a
+  venue-wide floor clear when neither that nor a current definition resolves. Both resets also
+  purge the matching WS-replay `depth` entries, so a client connecting across the boundary is
+  never replayed the ended session's final book — including a delisted instrument's phantom book,
+  which nothing else would ever remove. Cleared entries are counted in
+  `dz_depth_floor_resets_total{venue, reason}`. Note for consumers: the first `depth`
+  after a reset/resync may carry the `source_ts_ns = 0` sentinel (per PROTOCOL.md, fall back to
+  `kernel_rx_ts_ns`).
 - **Subscription-driven feed activation** — the bridge now activates only the feeds this host is
   actually subscribed to, and adds/removes them at runtime as subscriptions change:
   - A single detector (`src/ingest/subscriptions.rs`) reads the host's subscriptions from
@@ -50,98 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a live edge+public capture (2026-06-30): Phoenix uses the same bare symbol on both feeds
   (edge `instrument_id == public assetId`) and `trade_id == tradeSequenceNumber` on shared fills. No
   `FEEDS` row depends on it.
-
-### Changed
-- Installer (`scripts/connect*.sh`) usability fixes after review:
-  - **WebSocket port preflight**: before starting the container the installer checks whether the WS
-    port is already bound on the host and, interactively, offers to pick another port, disable the
-    sink, or continue (non-interactively it warns and continues — the bridge then runs without the
-    sink, tunnel unaffected).
-  - **`WS_BIND=""` now works through the one-liner**: `WS_BIND` is forwarded whenever it is *set*,
-    including set-but-empty, so the WS sink can be disabled straight from the pipe (previously only
-    non-empty values were relayed, forcing a hand-written `docker run`).
-  - **Firewall guidance for default-deny-incoming hosts**: the ufw/firewalld hints now note that
-    allowing GRE + UDP 44880 admits only the *outer* encapsulated packets — the decapsulated inner
-    multicast re-traverses `INPUT` on the tunnel interface (`doublezero1`) and must be allowed too
-    (`sudo ufw allow in on doublezero1`). Mirrored in `README.md` / `scripts/README.md`.
-- Public-feeder transport scaffolding extracted into a venue-generic `ingest::public_feeder`
-  (a `PublicVenue` trait + one reconnecting run loop + shared decode helpers); Hyperliquid
-  (`ingest::ws_feeder`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
-  labelled by `venue` so a second venue's series don't collide.
-- Container logs can no longer fill the host disk, and the default is quieter:
-  - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with
-    `max-size=20m` + `max-file=3`, capping the long-lived container's on-disk log at ~60 MB
-    (previously unbounded — the default driver rotated nothing). Documented for by-hand runs in
-    `docs/self-hosting.md`.
-  - The default log filter (when `RUST_LOG` is unset) is now `warn,doublezero_edge_connect=info`
-    instead of a blanket `info`: the bridge's own startup/operational breadcrumbs stay at `info`
-    while noisy dependency chatter is held to `warn`. Set `RUST_LOG=debug` for verbose output.
-    Applied in both `src/main.rs` and the image `ENV`.
-
-### Fixed
-- Installer daemon head start bumped from 15s to 30s before `doublezero connect multicast`, so a
-  cold daemon finishes device probing and no longer races the connect on slower hosts
-  (`scripts/connect*.sh`).
-- `select_feeds` now dedups repeated `--feed` names on `(venue, kind)`, so `--feed Hyperliquid
-  --feed Hyperliquid` spawns the same receivers as `--feed Hyperliquid` (previously each match was
-  spawned twice, contending for the same multicast group/port) (`src/main.rs`, #9).
-- A taken WebSocket-sink port no longer takes the whole bridge down. A bind failure on `--ws-bind`
-  (e.g. the default `0.0.0.0:8081` colliding with a pre-existing `127.0.0.1:8081` listener) was
-  fatal: the process exited, the container's `--restart unless-stopped` restarted it, doublezerod
-  and the DoubleZero tunnel came down with it, and — since `doublezero connect multicast` runs only
-  once from the installer — the tunnel never re-established (status stuck `disconnected`, the real
-  cause buried in the restart loop). The listener is now bound eagerly (`sinks::ws::bind`, split
-  from `serve`) and a bind failure is logged and skipped: the bridge runs without the sink while
-  the tunnel and shred forwarding keep going (`src/main.rs`, `src/sinks/ws.rs`).
-- Installer pre-flight access-pass check (`scripts/connect*.sh`) hardened after review:
-  - A confirmed miss (an identity with no pass for the host IP or `0.0.0.0`) now only hard-aborts
-    when the public IP was **explicitly supplied** via `DZ_CLIENT_IP`; when the IP was only
-    **auto-detected** (best-effort egress lookup, which can differ from the bound IP behind
-    NAT/CGNAT/multi-homed hosts) it now **warns and continues** instead of aborting a
-    legitimately-provisioned operator, leaving `doublezero connect` as the real check.
-  - Reading the keypair file for the check no longer runs under `set -e`, so a root-owned `0600`
-    key (readable by the root Docker mount but not by the invoking user) degrades to a warning
-    instead of silently aborting the whole installer.
-  - The detected/supplied public IP is now strictly validated as a dotted quad (round-tripped
-    through `inet_ntoa(inet_aton(ip))`), rejecting lenient `inet_aton` forms (`1.2.3`, trailing
-    junk) that could yield a confident-but-wrong verdict; a malformed IP is treated as unknown.
-  - An unreadable/invalid keypair (not a 64-int JSON array) now produces a distinct "could not
-    read or parse the keypair" warning instead of misattributing the failure to the ledger RPC.
-  - The ledger RPC URL is asserted to be `http(s)://` before use, so a `DZ_LEDGER_RPC_URL` with a
-    `file://` (or other) scheme can't be dereferenced.
-- **MBO depth was silently broken on the live feed.** The live HL publisher emits MBO
-  `ManifestSummary` with `Valid=0` (the same quirk `TobProcessor` already overrides); `MboProcessor`
-  honored it, which clears all instrument definitions, so precision never resolved and the feed emitted
-  zero `depth`. `MboProcessor` now overrides `Valid=0`→true like TOB (logged once, `REVISIT`).
-  Regression test: `mbo_manifest_valid_zero_is_overridden_so_depth_flows`. The e2e MBO test missed this
-  because its vendored golden carries `Valid=1`; the bug surfaced minting a real-capture MBO fixture.
-
-### Changed
-- `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
-  with the per-type oracle strength documented honestly rather than claimed uniform:
-  - **Shared-with-TOB** layouts (frame/message headers, `InstrumentDefinition`, `Trade`,
-    `ManifestSummary`, type tags) reuse the byte-validated TOB `codec.rs`; a new cross-codec test
-    (`tob_shared_layouts_decode_identically`) decodes the same bytes through both codecs and asserts
-    equal fields, so the sharing is self-enforcing.
-  - **Real publisher capture** backs `Order{Add,Cancel,Execute}`, `BatchBoundary`, the full
-    `Snapshot{Begin,Order,End}` group, and the shared `InstrumentDefinition`/`ManifestSummary` via a
-    new real-frame decode test (`tests/codec_mbo_fixtures.rs`) over the two-sided TYO recorder
-    fixtures (#36). The snapshot is BTC's complete 44,598-order book, so `SnapshotOrder` is
-    well-covered, and the test asserts `total_orders == decoded order count` as a cross-field check.
-  - **Offset-test-only** (no committed fixture; pinned by the offset-independent unit tests, confirm
-    against a live frame before a live MBO feed): `InstrumentReset`, `Heartbeat`, `EndOfSession`.
-  No offset discrepancies found — the side-mapping bug fixed in #2 was the only one. The "size 20 vs
-  fields-to-24" `ManifestSummary` suspicion was a non-issue: the body is 20 bytes (on-wire 24),
-  identical to TOB, and no size-20 constant exists in code.
-- README refocused on the **operator**: it now leads with what the bridge does, the install
-  one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
-  variants), and how to configure/override it via environment variables before the pipe. The
-  detailed per-feature reference (self-hosting/from-source + Docker, output sinks, input sources,
-  Solana shred forwarding) moved into a new `docs/` directory the README links out to. Removed the
-  misleading `https://doublezero.xyz/install` command that contradicted the canonical
-  `get.doublezero.xyz/connect` one-liner.
-
-### Added
 - **Multi-publisher dedup for Market-by-Order `depth`** (#28, the MBO half of #3 — TOB shipped
   earlier). `MboProcessor` now reconstructs an **independent L3 book per `(publisher, instrument)`**
   (keyed on the datagram source IP), since two publishers' instance-scoped per-instrument delta
@@ -343,6 +267,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
+- `dz_depth_dropped_total` now carries a `publisher` label (the dropped copy's source class),
+  symmetric with `dz_depth_admitted_total`, so a lagging publisher losing the book race is
+  directly visible (#66). This changes the label set of an existing series — exact-label matchers
+  and recording rules on this metric need updating (`sum by (venue)` aggregations are unaffected).
+- `QuoteId`/`DepthId` canonical fixed-point widened `i64` → `i128`: an `f64→i64` cast saturates at
+  ~9.2e10 (at the `10^-8` scale), which could collapse two distinct huge quantities into one
+  identity and wrongly dedup the second (#66).
+- Installer (`scripts/connect*.sh`) usability fixes after review:
+  - **WebSocket port preflight**: before starting the container the installer checks whether the WS
+    port is already bound on the host and, interactively, offers to pick another port, disable the
+    sink, or continue (non-interactively it warns and continues — the bridge then runs without the
+    sink, tunnel unaffected).
+  - **`WS_BIND=""` now works through the one-liner**: `WS_BIND` is forwarded whenever it is *set*,
+    including set-but-empty, so the WS sink can be disabled straight from the pipe (previously only
+    non-empty values were relayed, forcing a hand-written `docker run`).
+  - **Firewall guidance for default-deny-incoming hosts**: the ufw/firewalld hints now note that
+    allowing GRE + UDP 44880 admits only the *outer* encapsulated packets — the decapsulated inner
+    multicast re-traverses `INPUT` on the tunnel interface (`doublezero1`) and must be allowed too
+    (`sudo ufw allow in on doublezero1`). Mirrored in `README.md` / `scripts/README.md`.
+- Public-feeder transport scaffolding extracted into a venue-generic `ingest::public_feeder`
+  (a `PublicVenue` trait + one reconnecting run loop + shared decode helpers); Hyperliquid
+  (`ingest::ws_feeder`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
+  labelled by `venue` so a second venue's series don't collide.
+- Container logs can no longer fill the host disk, and the default is quieter:
+  - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with
+    `max-size=20m` + `max-file=3`, capping the long-lived container's on-disk log at ~60 MB
+    (previously unbounded — the default driver rotated nothing). Documented for by-hand runs in
+    `docs/self-hosting.md`.
+  - The default log filter (when `RUST_LOG` is unset) is now `warn,doublezero_edge_connect=info`
+    instead of a blanket `info`: the bridge's own startup/operational breadcrumbs stay at `info`
+    while noisy dependency chatter is held to `warn`. Set `RUST_LOG=debug` for verbose output.
+    Applied in both `src/main.rs` and the image `ENV`.
+- `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
+  with the per-type oracle strength documented honestly rather than claimed uniform:
+  - **Shared-with-TOB** layouts (frame/message headers, `InstrumentDefinition`, `Trade`,
+    `ManifestSummary`, type tags) reuse the byte-validated TOB `codec.rs`; a new cross-codec test
+    (`tob_shared_layouts_decode_identically`) decodes the same bytes through both codecs and asserts
+    equal fields, so the sharing is self-enforcing.
+  - **Real publisher capture** backs `Order{Add,Cancel,Execute}`, `BatchBoundary`, the full
+    `Snapshot{Begin,Order,End}` group, and the shared `InstrumentDefinition`/`ManifestSummary` via a
+    new real-frame decode test (`tests/codec_mbo_fixtures.rs`) over the two-sided TYO recorder
+    fixtures (#36). The snapshot is BTC's complete 44,598-order book, so `SnapshotOrder` is
+    well-covered, and the test asserts `total_orders == decoded order count` as a cross-field check.
+  - **Offset-test-only** (no committed fixture; pinned by the offset-independent unit tests, confirm
+    against a live frame before a live MBO feed): `InstrumentReset`, `Heartbeat`, `EndOfSession`.
+  No offset discrepancies found — the side-mapping bug fixed in #2 was the only one. The "size 20 vs
+  fields-to-24" `ManifestSummary` suspicion was a non-issue: the body is 20 bytes (on-wire 24),
+  identical to TOB, and no size-20 constant exists in code.
+- README refocused on the **operator**: it now leads with what the bridge does, the install
+  one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
+  variants), and how to configure/override it via environment variables before the pipe. The
+  detailed per-feature reference (self-hosting/from-source + Docker, output sinks, input sources,
+  Solana shred forwarding) moved into a new `docs/` directory the README links out to. Removed the
+  misleading `https://doublezero.xyz/install` command that contradicted the canonical
+  `get.doublezero.xyz/connect` one-liner.
 - Shred sigverify mode (`--shred-dedup-mode sigverify`) now **prefetches the next epoch's leader
   schedule** and **fails closed** on an unknown leader. The leader cache holds two epochs (current + next), fetched
   by explicit slot so the result is independent of rollover timing, eliminating the routine
@@ -390,6 +369,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`src/main.rs`) is now a thin wrapper, so dev tooling and tests can reuse the codecs.
 
 ### Fixed
+- Installer daemon head start bumped from 15s to 30s before `doublezero connect multicast`, so a
+  cold daemon finishes device probing and no longer races the connect on slower hosts
+  (`scripts/connect*.sh`).
+- `select_feeds` now dedups repeated `--feed` names on `(venue, kind)`, so `--feed Hyperliquid
+  --feed Hyperliquid` spawns the same receivers as `--feed Hyperliquid` (previously each match was
+  spawned twice, contending for the same multicast group/port) (`src/main.rs`, #9).
+- A taken WebSocket-sink port no longer takes the whole bridge down. A bind failure on `--ws-bind`
+  (e.g. the default `0.0.0.0:8081` colliding with a pre-existing `127.0.0.1:8081` listener) was
+  fatal: the process exited, the container's `--restart unless-stopped` restarted it, doublezerod
+  and the DoubleZero tunnel came down with it, and — since `doublezero connect multicast` runs only
+  once from the installer — the tunnel never re-established (status stuck `disconnected`, the real
+  cause buried in the restart loop). The listener is now bound eagerly (`sinks::ws::bind`, split
+  from `serve`) and a bind failure is logged and skipped: the bridge runs without the sink while
+  the tunnel and shred forwarding keep going (`src/main.rs`, `src/sinks/ws.rs`).
+- Installer pre-flight access-pass check (`scripts/connect*.sh`) hardened after review:
+  - A confirmed miss (an identity with no pass for the host IP or `0.0.0.0`) now only hard-aborts
+    when the public IP was **explicitly supplied** via `DZ_CLIENT_IP`; when the IP was only
+    **auto-detected** (best-effort egress lookup, which can differ from the bound IP behind
+    NAT/CGNAT/multi-homed hosts) it now **warns and continues** instead of aborting a
+    legitimately-provisioned operator, leaving `doublezero connect` as the real check.
+  - Reading the keypair file for the check no longer runs under `set -e`, so a root-owned `0600`
+    key (readable by the root Docker mount but not by the invoking user) degrades to a warning
+    instead of silently aborting the whole installer.
+  - The detected/supplied public IP is now strictly validated as a dotted quad (round-tripped
+    through `inet_ntoa(inet_aton(ip))`), rejecting lenient `inet_aton` forms (`1.2.3`, trailing
+    junk) that could yield a confident-but-wrong verdict; a malformed IP is treated as unknown.
+  - An unreadable/invalid keypair (not a 64-int JSON array) now produces a distinct "could not
+    read or parse the keypair" warning instead of misattributing the failure to the ledger RPC.
+  - The ledger RPC URL is asserted to be `http(s)://` before use, so a `DZ_LEDGER_RPC_URL` with a
+    `file://` (or other) scheme can't be dereferenced.
+- **MBO depth was silently broken on the live feed.** The live HL publisher emits MBO
+  `ManifestSummary` with `Valid=0` (the same quirk `TobProcessor` already overrides); `MboProcessor`
+  honored it, which clears all instrument definitions, so precision never resolved and the feed emitted
+  zero `depth`. `MboProcessor` now overrides `Valid=0`→true like TOB (logged once, `REVISIT`).
+  Regression test: `mbo_manifest_valid_zero_is_overridden_so_depth_flows`. The e2e MBO test missed this
+  because its vendored golden carries `Valid=1`; the bug surfaced minting a real-capture MBO fixture.
 - Docker release workflow could not push to GHCR: the reusable
   `release.docker.edge-connect.build` workflow declared a top-level `permissions:
   contents: read` block, which intersects with (and so can only narrow) the caller's

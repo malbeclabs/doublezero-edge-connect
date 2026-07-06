@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
+        arbiter::lock,
         book::{BookState, DeltaKind, DeltaOp, Level},
         codec::{
             aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
@@ -494,6 +495,14 @@ pub struct MboProcessor {
     /// `depth`. Evicted in lockstep with `books` and cleared on `InstrumentReset`, so it can never
     /// outgrow the book map (its keys are always a subset of `books`' keys).
     last_top: HashMap<(IpAddr, u32), (Vec<Level>, Vec<Level>)>,
+    /// The symbol each `(publisher, instrument)` last emitted `depth` under — the symbol the
+    /// arbiter's depth floor actually LATCHED for that instrument. `InstrumentReset` clears the
+    /// floor by this memo rather than the *current* definition, which can differ: a manifest epoch
+    /// bump may reassign the id to another symbol, and clearing the new symbol would leave the
+    /// wedged old-symbol entry latched. Written in `emit_depth`, evicted in lockstep with `books`,
+    /// cleared on `EndOfSession` (the venue-wide clear covers everything), so its keys are always
+    /// a subset of `books`' keys.
+    emitted_symbol: HashMap<(IpAddr, u32), String>,
     warned_source_mismatch: bool,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
@@ -509,6 +518,7 @@ impl MboProcessor {
             books_order: VecDeque::new(),
             depth,
             last_top: HashMap::new(),
+            emitted_symbol: HashMap::new(),
             warned_source_mismatch: false,
             warned_invalid_manifest: false,
             emit_trades,
@@ -546,6 +556,7 @@ impl MboProcessor {
                         // for the same instrument (else that publisher's depth would be wrongly
                         // dropped from replay; it self-heals via full-state otherwise).
                         self.last_top.remove(&old);
+                        self.emitted_symbol.remove(&old);
                         let (_old_pub, old_id) = old;
                         let symbol_still_served = self.books.keys().any(|(_p, i)| *i == old_id);
                         if !symbol_still_served {
@@ -610,6 +621,12 @@ impl MboProcessor {
         // Record the published top-N, moving the raw vectors in (no clone), so the next identical
         // book state suppresses.
         self.last_top.insert(key, (bids_raw, asks_raw));
+        // Remember the symbol this key's depth latched the floor under (clone only when it
+        // actually changes — i.e. once, or on an id→symbol remap), for the InstrumentReset clear.
+        if self.emitted_symbol.get(&key) != Some(&def.symbol) {
+            let symbol = def.symbol.clone();
+            self.emitted_symbol.insert(key, symbol);
+        }
         // The shared WS-replay map is written by the arbiter on the floor's admit decision (so it
         // holds the leader's broadcast book, not a dropped non-leader's), NOT here — emitting
         // pre-floor would record a book that may never reach the wire. The processor still purges
@@ -669,7 +686,29 @@ impl FrameProcessor for MboProcessor {
                     self.state.on_instrument_definition(d);
                     ctx.emit(FeedMessage::Instrument(inst));
                 }
-                codec_mbo::Message::EndOfSession(ts) => info!(ts, "mbo end of session"),
+                codec_mbo::Message::EndOfSession(ts) => {
+                    info!(ts, "mbo end of session");
+                    // The venue may restart its event clock (and sequences) next session, so this
+                    // is a session boundary for the FEED, not just for the publisher whose copy of
+                    // the EndOfSession arrived first: reset EVERY publisher's book — a
+                    // still-`Synced` peer book would otherwise keep emitting old-session depth
+                    // (or, after a boundary-loss resync, stamp its first depth with pre-session
+                    // time) and immediately re-latch the floor at the old high-water, undoing the
+                    // clear below with no second chance if that peer's own EndOfSession datagram
+                    // is lost. Then clear the venue's latched depth-floor entries so a
+                    // post-session `source_ts` below the old high-water re-opens the tick instead
+                    // of being dropped as stale forever (the floor stays latched otherwise — no
+                    // full-state self-heal rescues it). Everything here is idempotent, so the
+                    // duplicate EndOfSession copies arriving on the other ports / from the mirror
+                    // publisher are harmless no-ops (deliberately not role-gated: extra clears
+                    // also back up a lost copy).
+                    for book in self.books.values_mut() {
+                        book.on_end_of_session();
+                    }
+                    self.last_top.clear();
+                    self.emitted_symbol.clear();
+                    lock(ctx.arbiter).reset_depth_floor_for_venue(ctx.venue, "end_of_session");
+                }
                 codec_mbo::Message::OrderAdd(o) => {
                     let op = DeltaOp {
                         seq: o.per_instrument_seq,
@@ -775,7 +814,45 @@ impl FrameProcessor for MboProcessor {
                     // always published (and its timestamps are fresh), never suppressed against the
                     // pre-reset top-N. Per-publisher: only this publisher's book is resetting.
                     self.last_top.remove(&(ctx.publisher, r.instrument_id));
-                    if let Some(book) = self.book_for(r.instrument_id, ctx) {
+                    // The re-snapshot may anchor at a `source_ts` below the latched floor (e.g. the
+                    // venue reset this instrument's clock); clear the `(venue, symbol)` floor entry
+                    // so the post-reset depth re-opens the tick. The symbol is resolved in
+                    // safest-first order:
+                    //   1. `emitted_symbol` — the symbol this publisher's depth actually LATCHED
+                    //      the floor under. The *current* definition can disagree: a manifest
+                    //      epoch bump may have remapped the id to another symbol, and clearing the
+                    //      new symbol would leave the wedged old-symbol entry latched.
+                    //   2. The current definition — right whenever ids are venue-stable (this
+                    //      publisher just never emitted depth for the id, e.g. the mirror latched
+                    //      the floor).
+                    //   3. Venue-wide — the definition can be transiently missing even for a
+                    //      symbol with a latched entry (RefDataState clears all defs on a channel
+                    //      reset / manifest bump), and a missing definition must not silently skip
+                    //      the clear: fall back to the safe over-approximation (a spurious clear
+                    //      self-heals; a skipped one can leave the exact permanent wedge this
+                    //      hatch exists to remove).
+                    let latched_symbol = self
+                        .emitted_symbol
+                        .get(&(ctx.publisher, r.instrument_id))
+                        .cloned()
+                        .or_else(|| {
+                            self.state
+                                .definition(r.instrument_id)
+                                .map(|d| d.symbol.clone())
+                        });
+                    let mut arb = lock(ctx.arbiter);
+                    match latched_symbol {
+                        Some(symbol) => {
+                            arb.reset_depth_floor_for_symbol(ctx.venue, &symbol, "instrument_reset")
+                        }
+                        None => arb.reset_depth_floor_for_venue(ctx.venue, "instrument_reset"),
+                    }
+                    drop(arb);
+                    // Reset the existing book directly — NOT via `book_for`, whose definition gate
+                    // would skip the reset in the same transient-no-definition window as above
+                    // (leaving a stale `Synced` book whose old sequences/event clock then reject
+                    // the post-reset re-snapshot). A reset for a book we never built needs nothing.
+                    if let Some(book) = self.books.get_mut(&(ctx.publisher, r.instrument_id)) {
                         book.on_instrument_reset(r.new_anchor_seq);
                     }
                 }
@@ -844,8 +921,11 @@ mod tests {
         ingest::{
             arbiter::{Arbiter, SharedArbiter},
             codec_mbo::{
-                tests::{enc_order_add, enc_snapshot_begin, enc_snapshot_end, frame},
-                OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
+                tests::{
+                    enc_end_of_session, enc_instrument_reset, enc_order_add, enc_snapshot_begin,
+                    enc_snapshot_end, frame,
+                },
+                InstrumentReset, OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
                 MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
             },
             receiver::{FrameCtx, FrameProcessor, PortRole},
@@ -1022,6 +1102,361 @@ mod tests {
         assert!(
             ids.contains(&0),
             "no BTC depth — a Valid=0 manifest blocked precision (the override is missing)"
+        );
+    }
+
+    /// Drain all available `Depth` messages and return their `source_ts_ns`.
+    fn drain_depth_ts(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Depth(d) = m {
+                out.push(d.source_ts_ns);
+            }
+        }
+        out
+    }
+
+    /// Set up an MBO processor with instrument 0 defined and synced via an empty-book anchor
+    /// snapshot (which emits the initial `depth(source_ts=0)`), for the floor-reset tests.
+    fn synced_mbo_proc(
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+    ) -> MboProcessor {
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 1),
+                enc_instrument_def(0, "INST-0", 1),
+            ]),
+            &make_ctx(arbiter, instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 1,
+                    last_instrument_seq: 0,
+                    ts: 1,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 1,
+                }),
+            ]),
+            &make_ctx(arbiter, instruments, PortRole::Snapshot),
+        );
+        proc
+    }
+
+    /// One bid `OrderAdd` for instrument 0 at per-instrument `seq`, stamped `ts`.
+    fn add(seq: u32, order_id: u64, ts: u64) -> Vec<u8> {
+        enc_order_add(&OrderAdd {
+            instrument_id: 0,
+            source_id: 0,
+            side: SIDE_BID,
+            order_flags: 0,
+            per_instrument_seq: seq,
+            order_id,
+            enter_ts: ts,
+            price_raw: 100,
+            qty_raw: 5,
+        })
+    }
+
+    /// `EndOfSession` clears the venue's latched depth-floor entries AND drops the books to
+    /// `Recovering` (the session-reset escape hatch, #66): after the next session's re-snapshot, a
+    /// depth whose `source_ts` is BELOW the pre-session high-water — the venue restarted its clock
+    /// (and its sequences: the post-boundary delta seq restarts at 1 too) — is re-admitted instead
+    /// of being dropped as stale forever (there is no full-state self-heal while the floor stays
+    /// latched).
+    #[test]
+    fn mbo_end_of_session_unwedges_depth_floor() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+        proc.on_datagram(&frame(&[add(2, 101, 100)]), &mkt); // stale-clock tick -> dropped (the wedge)
+        proc.on_datagram(&frame(&[enc_end_of_session(6000)]), &mkt); // floor cleared, book -> Recovering
+                                                                     // New session: re-snapshot (empty anchor; the fresh book's depth(0) re-opens the cleared
+                                                                     // floor), then a restarted-seq, restarted-clock delta.
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 2,
+                    last_instrument_seq: 0,
+                    ts: 2,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 2,
+                }),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(&frame(&[add(1, 102, 50)]), &mkt); // new-session tick below the old high-water
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 0, 50],
+            "the pre-reset lower tick (100) is dropped; after EndOfSession the floor re-opens"
+        );
+    }
+
+    /// `EndOfSession` is a FEED-level boundary even though it arrives per publisher: publisher A's
+    /// copy resets publisher B's book too, so B's still-in-flight old-session tail is buffered
+    /// (book `Recovering`), emits nothing, and cannot re-latch the just-cleared floor at the old
+    /// high-water — the failure mode where a lost EndOfSession from B would otherwise restore the
+    /// permanent wedge #66 removes.
+    #[test]
+    fn mbo_end_of_session_resets_peer_publisher_books() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        fn ctx_for<'a>(
+            publisher: IpAddr,
+            arbiter: &'a SharedArbiter,
+            instruments: &'a crate::model::InstrumentSnapshot,
+            role: PortRole,
+        ) -> FrameCtx<'a> {
+            let mut c = make_ctx(arbiter, instruments, role);
+            c.publisher = publisher;
+            c
+        }
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 1),
+                enc_instrument_def(0, "INST-0", 1),
+            ]),
+            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Combined),
+        );
+        let anchor = |sid: u32| {
+            frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: sid,
+                    last_instrument_seq: 0,
+                    ts: sid as u64,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: sid,
+                }),
+            ])
+        };
+        // Both publishers sync and mirror the same tick; A leads, B's copy collapses.
+        proc.on_datagram(
+            &anchor(1),
+            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &anchor(1),
+            &ctx_for(pub_b, &arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &frame(&[add(1, 100, 5000)]),
+            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        proc.on_datagram(
+            &frame(&[add(1, 100, 5000)]),
+            &ctx_for(pub_b, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        // A's EndOfSession resets BOTH books and clears the floor.
+        proc.on_datagram(
+            &frame(&[enc_end_of_session(6000)]),
+            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        // B's old-session tail (would be depth(5001), re-latching the old high-water) is buffered
+        // by B's now-Recovering book instead: nothing emits, the floor stays open.
+        proc.on_datagram(
+            &frame(&[add(2, 101, 5001)]),
+            &ctx_for(pub_b, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        // B re-syncs in the new session and its restarted-clock depth is admitted.
+        proc.on_datagram(
+            &anchor(2),
+            &ctx_for(pub_b, &arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &frame(&[add(1, 102, 50)]),
+            &ctx_for(pub_b, &arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 0, 50],
+            "B's old-session tail (5001) must not emit after A's EndOfSession; B's new-session \
+             depth (50) must be admitted"
+        );
+    }
+
+    /// An `InstrumentReset` whose id resolves to neither an emitted symbol (memo) nor a current
+    /// definition must NOT silently skip the floor clear: it falls back to the venue-wide reset,
+    /// so a wedged sibling entry is still re-opened.
+    #[test]
+    fn mbo_instrument_reset_for_unknown_id_falls_back_to_venue_clear() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+                                                              // Reset for an id with no definition, no emitted depth, no book -> venue-wide clear.
+        proc.on_datagram(
+            &frame(&[enc_instrument_reset(&InstrumentReset {
+                instrument_id: 99,
+                reason: 1,
+                new_anchor_seq: 0,
+                ts: 5500,
+            })]),
+            &mkt,
+        );
+        // Instrument 0's still-synced book emits at the restarted (lower) clock: admitted only if
+        // the venue-wide fallback cleared the floor.
+        proc.on_datagram(&frame(&[add(2, 101, 100)]), &mkt);
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 100],
+            "an unresolvable InstrumentReset id must still clear the floor (venue-wide fallback)"
+        );
+    }
+
+    /// If a manifest epoch bump remaps the instrument id to a DIFFERENT symbol between the last
+    /// latched depth and the reset, the floor entry is wedged under the symbol the depth was
+    /// EMITTED as — the `emitted_symbol` memo — not the current definition's. Clearing the current
+    /// definition's symbol would leave the old-symbol entry latched forever.
+    #[test]
+    fn mbo_instrument_reset_after_id_remap_clears_the_latched_symbol() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments); // id 0 -> "INST-0" (manifest 1)
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // floor latched under INST-0
+                                                              // Manifest bump remaps id 0 to another symbol; the reset must clear the LATCHED
+                                                              // symbol (INST-0), not the current definition's (INST-9).
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(2, 1),
+                enc_instrument_def(0, "INST-9", 2),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &frame(&[enc_instrument_reset(&InstrumentReset {
+                instrument_id: 0,
+                reason: 1,
+                new_anchor_seq: 0,
+                ts: 5500,
+            })]),
+            &mkt,
+        );
+        // The venue maps the id back to INST-0 and re-syncs; the restarted-clock depths under
+        // INST-0 flow only if the memo-scoped clear hit (venue, "INST-0").
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(3, 1),
+                enc_instrument_def(0, "INST-0", 3),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 2,
+                    last_instrument_seq: 0,
+                    ts: 2,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 2,
+                }),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(&frame(&[add(1, 101, 100)]), &mkt);
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 0, 100],
+            "the reset must clear the latched symbol (memo), not the remapped current definition"
+        );
+    }
+
+    /// `InstrumentReset` clears the `(venue, symbol)` depth-floor entry AND the book's event clock,
+    /// so the re-synced book's depth — stamped by the venue's restarted (lower) clock — is admitted.
+    /// Without the floor reset the post-resync depths are stale-dropped forever; without the
+    /// event-clock reset the first post-resync depth would carry the pre-reset time and re-latch
+    /// the floor at the old high-water, re-wedging what the reset just cleared.
+    #[test]
+    fn mbo_instrument_reset_unwedges_depth_floor() {
+        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+        proc.on_datagram(
+            &frame(&[enc_instrument_reset(&InstrumentReset {
+                instrument_id: 0,
+                reason: 1,
+                new_anchor_seq: 0,
+                ts: 5500,
+            })]),
+            &mkt,
+        );
+        // Re-sync via a fresh empty anchor: the post-resync depth is stamped source_ts=0 (the
+        // event clock was dropped with the book) and re-opens the cleared floor.
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 2,
+                    last_instrument_seq: 0,
+                    ts: 2,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 2,
+                }),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(&frame(&[add(1, 101, 100)]), &mkt); // new (restarted) clock -> admitted
+
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![0, 5000, 0, 100],
+            "post-reset depths must flow at the restarted clock, not be stale-dropped"
         );
     }
 

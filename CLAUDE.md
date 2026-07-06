@@ -132,7 +132,8 @@ Modules are grouped by role under `src/`:
   through. `Arbiter` owns the broadcast `Sender` plus the dedup state — the per-`(venue, symbol)`
   latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the canonical BBO fixed-point, with
   the `Publisher` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
-  (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point), and the
+  (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
+  so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
   floor, depth → depth floor, trades → window, everything else passthrough). Every arm returns an
   `Admit<Publisher>`: `Emitted` broadcasts and bumps the admitted/winner counter, `Contest{winner,
@@ -146,7 +147,19 @@ Modules are grouped by role under `src/`:
   the initial synced-but-empty book each publisher emits right after its snapshot anchor — and the two
   publishers' identical empty anchors at `source_ts == 0` are routed through the floor so the
   non-leader's collapses (the content-inclusive depth oracle would otherwise flag the pair as
-  duplicates). No wedge: a real later event has `source_ts > 0` and re-advances the floor. `Status`
+  duplicates). No wedge: a real later event has `source_ts > 0` and re-advances the floor. The depth
+  floor assumes `source_ts` monotonicity only **within** a session: the MBO processor clears it on
+  `EndOfSession` (whole venue) / `InstrumentReset` (that symbol) via `reset_depth_floor_for_*` — the
+  session-reset escape hatch (#66, counted in `dz_depth_floor_resets_total{venue,reason}`) — so a
+  venue that restarts its clock below the latched high-water doesn't wedge depth forever.
+  `EndOfSession` is feed-level: it also drops **every** publisher's book to `Recovering`
+  (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock discarded) so a mirror's
+  old-session tail can't re-latch the cleared floor; `on_instrument_reset` likewise drops
+  `last_event_ts`, scopes its clear by the symbol the depth was emitted under (the processor's
+  `emitted_symbol` memo — immune to an id→symbol remap), and falls back to a venue-wide clear when
+  nothing resolves. Both resets also purge the matching WS-replay `depth` entries (no ended-session
+  book replayed to a new client). The *quote* floor is
+  deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
