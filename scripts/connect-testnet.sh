@@ -555,8 +555,22 @@ echo
 if ws_disabled; then
   info "Done. The WebSocket sink is disabled (WS_BIND=\"\"); the bridge ingests DZ Edge and (if configured) forwards shreds, but serves no WebSocket."
 else
-  info "Done. The bridge is serving normalized quotes:"
-  echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+  # The bridge only *activates* the WS sink once >=1 market-data feed is subscribed (the
+  # subscription reconciler; see docs/output-sinks.md) -- a shreds-only host serves no WebSocket.
+  # Don't advertise a socket that isn't bound: confirm the bridge's own decision (its log line, or an
+  # actual listener on the port) before printing the URL; otherwise explain the gating.
+  ws_up=""
+  for _ in $(seq 1 12); do
+    if $SUDO docker logs "$DZ_NAME" 2>&1 | grep -q "activating WebSocket sink" || port_in_use "$WS_PORT"; then ws_up=1; break; fi
+    sleep 1
+  done
+  if [ -n "$ws_up" ]; then
+    info "Done. The bridge is serving normalized quotes:"
+    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # normalized quotes (see PROTOCOL.md)"
+  else
+    info "Done. Shreds are forwarded; the WebSocket quote sink is idle (no market-data feed subscribed yet)."
+    echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # activates automatically once >=1 market-data feed is subscribed"
+  fi
 fi
 echo
 info "Manage with:"
