@@ -529,7 +529,7 @@ fi
 # 7. connect (always `doublezero connect multicast`)
 # ----------------------------------------------------------------------------
 # Give a cold daemon a head start on device probing before connect (see spin_sleep).
-spin_sleep 15 "Letting the daemon finish bootstrapping"
+spin_sleep 30 "Letting the daemon finish bootstrapping"
 info "Connecting: doublezero connect multicast"
 # Allocate a pseudo-TTY when our stdout is a terminal so the CLI streams its
 # normal output to the screen (without -t, docker exec gives it no TTY and the
