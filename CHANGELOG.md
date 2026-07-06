@@ -79,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Applied in both `src/main.rs` and the image `ENV`.
 
 ### Fixed
+- Installer daemon head start bumped from 15s to 30s before `doublezero connect multicast`, so a
+  cold daemon finishes device probing and no longer races the connect on slower hosts
+  (`scripts/connect*.sh`).
 - `select_feeds` now dedups repeated `--feed` names on `(venue, kind)`, so `--feed Hyperliquid
   --feed Hyperliquid` spawns the same receivers as `--feed Hyperliquid` (previously each match was
   spawned twice, contending for the same multicast group/port) (`src/main.rs`, #9).
