@@ -155,7 +155,10 @@ Modules are grouped by role under `src/`:
   `EndOfSession` is feed-level: it also drops **every** publisher's book to `Recovering`
   (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock discarded) so a mirror's
   old-session tail can't re-latch the cleared floor; `on_instrument_reset` likewise drops
-  `last_event_ts`, and a missing definition falls back to a venue-wide clear. The *quote* floor is
+  `last_event_ts`, scopes its clear by the symbol the depth was emitted under (the processor's
+  `emitted_symbol` memo — immune to an id→symbol remap), and falls back to a venue-wide clear when
+  nothing resolves. Both resets also purge the matching WS-replay `depth` entries (no ended-session
+  book replayed to a new client). The *quote* floor is
   deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all

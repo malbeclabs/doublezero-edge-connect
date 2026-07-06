@@ -439,7 +439,9 @@ pub struct Arbiter {
     /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
     /// the floor. `None` when no WS replay map is wired (e.g. unit tests that only inspect the
     /// broadcast). The `MboProcessor` still purges this map on book eviction (bounding); it no longer
-    /// writes it (single writer = this admit branch).
+    /// writes it (single writer = this admit branch). Also purged by `reset_depth_floor_for_*`
+    /// (the session-reset escape hatch), so a client connecting across a session boundary is not
+    /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
 }
 
@@ -471,7 +473,12 @@ impl Arbiter {
     /// by the MBO processor on `EndOfSession` (which carries no instrument id, so the whole venue
     /// resets). Without it a venue that restarts its event clock below the latched high-water
     /// would have every post-session depth dropped as stale, permanently (see the `depths` docs).
-    /// Cleared entries are counted in `dz_depth_floor_resets_total{venue, reason}`.
+    /// The venue's WS-replay `depth` entries are purged in the same step: they hold the ended
+    /// session's final books, and (unlike the floor, which the next admitted depth re-opens) the
+    /// replay map has no other cleanup for an instrument the new session never re-lists — a client
+    /// connecting after the boundary would be served that phantom book indefinitely. Replay
+    /// repopulates from the first admitted new-session depth. Cleared floor entries are counted in
+    /// `dz_depth_floor_resets_total{venue, reason}`.
     ///
     /// Worst case of a spurious reset (e.g. a forged `EndOfSession` — the source IP is spoofable):
     /// a still-live publisher's next depth re-opens the tick, possibly re-admitting a snapshot at
@@ -479,15 +486,16 @@ impl Arbiter {
     /// the permanent wedge the reset prevents.
     pub fn reset_depth_floor_for_venue(&mut self, venue: &str, reason: &'static str) {
         let cleared = self.depths.reset_where(|(v, _)| v == venue);
-        metrics()
-            .depth_floor_resets
-            .with_label_values(&[venue, reason])
-            .inc_by(cleared as u64);
+        if let Some(replay) = &self.depth_replay {
+            model::lock(replay).retain(|(v, _), _| v != venue);
+        }
+        self.record_floor_resets(venue, reason, cleared);
     }
 
-    /// Clear one `(venue, symbol)` latched depth-floor entry — the per-instrument variant of
-    /// [`Self::reset_depth_floor_for_venue`], called by the MBO processor on `InstrumentReset`
-    /// (the book re-snapshots, and the post-reset anchor may carry a lower `source_ts`).
+    /// Clear one `(venue, symbol)` latched depth-floor entry (and its WS-replay entry, for the
+    /// same reason as [`Self::reset_depth_floor_for_venue`]) — the per-instrument variant, called
+    /// by the MBO processor on `InstrumentReset` (the book re-snapshots, and the post-reset anchor
+    /// may carry a lower `source_ts`).
     ///
     /// The floor entry is shared across publishers while `InstrumentReset` arrives per publisher,
     /// so a one-publisher reset also clears a healthy mirror's latch: worst case the resetting
@@ -502,6 +510,15 @@ impl Arbiter {
         reason: &'static str,
     ) {
         let cleared = self.depths.reset_where(|(v, s)| v == venue && s == symbol);
+        if let Some(replay) = &self.depth_replay {
+            model::lock(replay).remove(&(venue.to_string(), symbol.to_string()));
+        }
+        self.record_floor_resets(venue, reason, cleared);
+    }
+
+    /// Record cleared floor entries in `dz_depth_floor_resets_total{venue, reason}` (shared by
+    /// both reset variants so a future label-set change is edited once).
+    fn record_floor_resets(&self, venue: &str, reason: &'static str, cleared: usize) {
         metrics()
             .depth_floor_resets
             .with_label_values(&[venue, reason])
@@ -1339,6 +1356,51 @@ mod tests {
             vec![[100.0, 1.0]],
             "replay map must hold the leader's book, not the dropped non-leader's"
         );
+    }
+
+    /// The floor resets purge the matching WS-replay entries: a client connecting across a
+    /// session boundary must not be replayed the ended session's final book — and for an
+    /// instrument the new session never re-lists, nothing else would ever remove the entry. The
+    /// symbol reset purges exactly its key; the venue reset purges only that venue's entries.
+    #[test]
+    fn arbiter_depth_floor_reset_purges_replay_entries() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mk = |venue: &str, symbol: &str| {
+            let mut d = depth(1000, vec![[100.0, 1.0]], vec![]);
+            d.venue = venue.to_string();
+            d.symbol = symbol.to_string();
+            FeedMessage::Depth(d)
+        };
+        let key = |venue: &str, symbol: &str| (venue.to_string(), symbol.to_string());
+        let (tx, _rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
+        a.emit(mk("VenueA", "BTC"), edge);
+        a.emit(mk("VenueA", "ETH"), edge);
+        a.emit(mk("VenueB", "BTC"), edge);
+        assert_eq!(model::lock(&replay).len(), 3);
+
+        a.reset_depth_floor_for_symbol("VenueA", "BTC", "instrument_reset");
+        {
+            let map = model::lock(&replay);
+            assert!(!map.contains_key(&key("VenueA", "BTC")), "reset key purged");
+            assert!(
+                map.contains_key(&key("VenueA", "ETH")),
+                "sibling symbol kept"
+            );
+            assert!(map.contains_key(&key("VenueB", "BTC")), "other venue kept");
+        }
+
+        a.reset_depth_floor_for_venue("VenueA", "end_of_session");
+        {
+            let map = model::lock(&replay);
+            assert!(
+                !map.contains_key(&key("VenueA", "ETH")),
+                "venue's entries purged"
+            );
+            assert!(map.contains_key(&key("VenueB", "BTC")), "other venue kept");
+        }
     }
 
     /// The session-reset escape hatch: a venue that restarts its event clock below the latched

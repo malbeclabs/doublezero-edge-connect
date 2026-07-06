@@ -15,9 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped to `Recovering` (sequences, buffered deltas and the event clock all discarded), so a
   mirror publisher's old-session tail — or a boundary-loss resync stamping pre-session time —
   can't re-latch the floor at the old high-water and undo the clear. `InstrumentReset` likewise
-  drops the resetting book's event clock, and falls back to a venue-wide floor clear when the
-  instrument's definition is transiently missing (refdata reset window). Cleared entries are
-  counted in `dz_depth_floor_resets_total{venue, reason}`. Note for consumers: the first `depth`
+  drops the resetting book's event clock, scopes its clear by the symbol the depth was actually
+  emitted under (immune to an id→symbol remap across manifest epochs), and falls back to a
+  venue-wide floor clear when neither that nor a current definition resolves. Both resets also
+  purge the matching WS-replay `depth` entries, so a client connecting across the boundary is
+  never replayed the ended session's final book — including a delisted instrument's phantom book,
+  which nothing else would ever remove. Cleared entries are counted in
+  `dz_depth_floor_resets_total{venue, reason}`. Note for consumers: the first `depth`
   after a reset/resync may carry the `source_ts_ns = 0` sentinel (per PROTOCOL.md, fall back to
   `kernel_rx_ts_ns`).
 - **Subscription-driven feed activation** — the bridge now activates only the feeds this host is
