@@ -79,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Applied in both `src/main.rs` and the image `ENV`.
 
 ### Fixed
+- `select_feeds` now dedups repeated `--feed` names on `(venue, kind)`, so `--feed Hyperliquid
+  --feed Hyperliquid` spawns the same receivers as `--feed Hyperliquid` (previously each match was
+  spawned twice, contending for the same multicast group/port) (`src/main.rs`, #9).
 - A taken WebSocket-sink port no longer takes the whole bridge down. A bind failure on `--ws-bind`
   (e.g. the default `0.0.0.0:8081` colliding with a pre-existing `127.0.0.1:8081` listener) was
   fatal: the process exited, the container's `--restart unless-stopped` restarted it, doublezerod
