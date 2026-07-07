@@ -1,0 +1,86 @@
+name: release.docker.edge-connect.dispatch
+
+# Event-driven counterpart to release.docker.edge-connect.poll.yml. When the
+# upstream malbeclabs/doublezero repo (re)publishes a doublezero base image after
+# a release, it fires a repository_dispatch here so the matching edge-connect
+# variant rebuilds within a minute instead of waiting for the daily poll. The
+# poll stays in place as a safety net: it re-detects base-digest drift regardless
+# of cause, so it backstops both a missed dispatch and one whose rebuild fails.
+#
+# Payload (client_payload):
+#   env:     testnet | mainnet-beta | devnet  (which base moved)
+#   version: doublezero release version (informational; not tagged here — a base
+#            move is not an edge-connect release, so we publish moving + :sha- tags
+#            only, matching the poll)
+on:
+  repository_dispatch:
+    types: [doublezero-base-published]
+
+# Serialize rebuilds of the same variant so two dispatches for one env (or a
+# dispatch racing its own retry) can't push the same moving tag concurrently and
+# invert ordering. cancel-in-progress: false — let an in-flight build finish
+# rather than abort a push mid-flight. NOTE: only serializes dispatches with each
+# other; poll.yml/publish can still race a dispatch (they don't share this group
+# yet — benign today, all three build the same default-branch HEAD).
+concurrency:
+  group: edge-connect-publish-${{ github.event.client_payload.env }}
+  cancel-in-progress: false
+
+# Least-privilege default; the rebuild job (via the reusable builder) inherits the
+# packages:write it grants below.
+permissions:
+  contents: read
+
+jobs:
+  # Validate/normalize the payload env before spending a build. repository_dispatch
+  # is authenticated (only the cross-repo token can trigger it), but we still refuse
+  # anything that isn't one of the three known variants.
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.validate.outputs.env }}
+      ok: ${{ steps.validate.outputs.ok }}
+    steps:
+      - id: validate
+        shell: bash
+        # Pass the untrusted client_payload through env vars, never inline ${{ }}
+        # into the script — inline interpolation lets a crafted payload break out
+        # of the shell quoting (defense-in-depth; the dispatch is authenticated).
+        env:
+          PAYLOAD_ENV: ${{ github.event.client_payload.env }}
+          # Informational only: logged below, deliberately never validated, tagged,
+          # or passed to the builder (a base move is not an edge-connect release).
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          # Keep this variant list in sync with the sibling case blocks:
+          # poll.yml's scan `case` and build.yml's `cfg` case (the single source
+          # of truth — its default arm hard-fails). Adding a variant means all three.
+          case "$PAYLOAD_ENV" in
+            testnet|mainnet-beta|devnet)
+              echo "env=$PAYLOAD_ENV" >> "$GITHUB_OUTPUT"
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              echo "Rebuilding edge-connect variant: $PAYLOAD_ENV (doublezero '$PAYLOAD_VERSION')" ;;
+            *)
+              echo "ok=false" >> "$GITHUB_OUTPUT"
+              # Static warning text; log the untrusted raw value on a separate plain
+              # line so an embedded newline can't spoof a ::workflow-command::.
+              echo "::warning::ignoring dispatch with unrecognized env (see log line below)"
+              echo "unrecognized env: $PAYLOAD_ENV" ;;
+          esac
+
+  # Rebuild only the affected variant: moving tags + :sha- (no version), exactly
+  # like the poll's rebuild — a base move is not an edge-connect release.
+  rebuild:
+    needs: validate
+    if: needs.validate.outputs.ok == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release.docker.edge-connect.build.yml
+    with:
+      env: ${{ needs.validate.outputs.env }}
+      push: true
+      # repository_dispatch always runs on the default branch and the payload
+      # cannot override the ref, so this always builds main's HEAD (matches
+      # poll.yml). The payload never influences which ref is built/pushed.
+      ref: ${{ github.ref_name }}
