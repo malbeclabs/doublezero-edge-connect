@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a safety net. (Requires the upstream repo to fire the dispatch after publishing the base; see
   its `release.docker.client.yml`.) The dispatch's `client_payload` is passed through `env:` vars
   rather than inline `${{ }}` interpolation in the validate step, so a crafted payload can't break
-  out of the shell quoting (defense-in-depth; the dispatch is already authenticated).
+  out of the shell quoting (defense-in-depth; the dispatch is already authenticated). A
+  `concurrency` group (`edge-connect-publish-<env>`, `cancel-in-progress: false`) serializes
+  rebuilds of the same variant so two dispatches can't push the same moving tag concurrently and
+  invert ordering; the `::warning::` on an unrecognized env is kept static with the raw payload
+  value logged on a separate plain line (so an embedded newline can't spoof a workflow command).
 - **Depth-floor session-reset escape hatch** (#66): the MBO processor now clears the arbiter's
   latched depth floor on `EndOfSession` (whole venue) and `InstrumentReset` (that symbol), so a
   venue that restarts its event clock below the latched high-water no longer wedges depth
