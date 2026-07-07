@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a live edge+public capture (2026-06-30): Phoenix uses the same bare symbol on both feeds
   (edge `instrument_id == public assetId`) and `trade_id == tradeSequenceNumber` on shared fills. No
   `FEEDS` row depends on it.
+- Behavioral regression tests for the `scripts/connect*.sh` installers (`tests/scripts/`, bats-core),
+  run in CI by a new `shell-tests` workflow. The suite drives the **byte-identical shipped scripts**
+  end-to-end through a stub-first `PATH` (fake `docker`/`sudo`/`ss`/`curl`/...) and asserts on what
+  each installer tried to do — no source guard or refactor added to the files served over the CDN. It
+  iterates all three installers (so per-script drift is caught) and pins the #70 fix: with the WS port
+  free the installer must survive preflight and reach `docker run` (the pre-#70 code aborted here under
+  `set -e`); with the port busy, preflight must actually detect the conflict (warn) and, non-interactively,
+  continue to `docker run` anyway.
 - **Multi-publisher dedup for Market-by-Order `depth`** (#28, the MBO half of #3 — TOB shipped
   earlier). `MboProcessor` now reconstructs an **independent L3 book per `(publisher, instrument)`**
   (keyed on the datagram source IP), since two publishers' instance-scoped per-instrument delta
