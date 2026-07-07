@@ -301,7 +301,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **WebSocket port preflight**: before starting the container the installer checks whether the WS
     port is already bound on the host and, interactively, offers to pick another port, disable the
     sink, or continue (non-interactively it warns and continues — the bridge then runs without the
-    sink, tunnel unaffected).
+    sink, tunnel unaffected). The interactive prompt now explains what the WS sink is (an *optional*
+    local WebSocket a shred → jito-shredstream setup does not use), spells out each option's
+    consequence, and **defaults to disable** rather than continue — the port is already known taken,
+    so continuing was the one choice guaranteed to fail to bind.
   - **`WS_BIND=""` now works through the one-liner**: `WS_BIND` is forwarded whenever it is *set*,
     including set-but-empty, so the WS sink can be disabled straight from the pipe (previously only
     non-empty values were relayed, forcing a hand-written `docker run`).

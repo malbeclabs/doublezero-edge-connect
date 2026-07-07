@@ -437,8 +437,10 @@ preflight_ws_port() {
   local who=""
   command -v ss >/dev/null 2>&1 && who="$($SUDO ss -Hltnp 2>/dev/null | awk -v p=":${p}\$" '$4 ~ p {print $NF; exit}')"
   warn "TCP port $p is already in use${who:+ ($who)}; the WS market-data sink can't bind there."
+  info "The WS market-data sink is an OPTIONAL local WebSocket that re-serves ingested feed data to consumers on this host."
+  info "A shred -> jito-shredstream setup does NOT use it; if nothing on this host consumes it, disabling is safe (it does not affect shred forwarding or the DoubleZero tunnel)."
   if [ -r "$TTY" ] && [ "$DZ_ASSUME_YES" != 1 ]; then
-    local choice; choice="$(ask 'WS port in use — [p]ick another port, [d]isable the WS sink, or [c]ontinue anyway' 'c')"
+    local choice; choice="$(ask 'WS port in use — [p] pick another port, [d] disable the sink (clean: no sink, no bind error), [c] continue anyway (bridge starts but the sink fails to bind; fine only if you do not use it)' 'd')"
     case "$choice" in
       p|P) local np; np="$(ask 'New WS port' '8181')"; WS_BIND="0.0.0.0:${np}"; WS_PORT="$np"
            info "WS sink will use 0.0.0.0:${np}."; preflight_ws_port ;;   # re-check the new choice
