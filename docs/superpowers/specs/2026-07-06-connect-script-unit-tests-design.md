@@ -1,8 +1,21 @@
 # Unit tests for the `connect*.sh` installers — design
 
 **Date:** 2026-07-06
-**Status:** approved (design), pending implementation plan
+**Status:** SUPERSEDED — implemented as a black-box suite in PR #73, not as designed here.
 **Scope:** `scripts/connect.sh`, `scripts/connect-testnet.sh`, `scripts/connect-devnet.sh`
+
+> **Superseded (PR #73).** The shipped tests deliberately reject this design's two
+> central decisions. There is **no source guard and no function extraction**: editing a
+> file that users fetch via `curl | bash` to make it testable was judged too risky (a
+> misfiring guard aborts the installer for every user), so the installers stay
+> **byte-identical**. Instead each script is driven end-to-end through a stub-first
+> `PATH` and asserted on its observable behavior (argv handed to the `docker` stub, exit
+> status). The delivered suite is `tests/scripts/preflight_ws_port.bats` +
+> `tests/scripts/_helpers.bash` — the `set -e`/#70 regression net and the WS-port
+> preflight path — not the six files / four coverage buckets below. Treat the sections
+> that follow (source guard, `dz_token_to_json`/`build_env_args` extraction, `guard.bats`,
+> etc.) as a rejected earlier proposal kept for history; **do not** reintroduce the
+> CDN-served source guard.
 
 ## Motivation
 

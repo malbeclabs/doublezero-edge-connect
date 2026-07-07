@@ -87,7 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each installer tried to do — no source guard or refactor added to the files served over the CDN. It
   iterates all three installers (so per-script drift is caught) and pins the #70 fix: with the WS port
   free the installer must survive preflight and reach `docker run` (the pre-#70 code aborted here under
-  `set -e`).
+  `set -e`); with the port busy, preflight must actually detect the conflict (warn) and, non-interactively,
+  continue to `docker run` anyway.
 - **Multi-publisher dedup for Market-by-Order `depth`** (#28, the MBO half of #3 — TOB shipped
   earlier). `MboProcessor` now reconstructs an **independent L3 book per `(publisher, instrument)`**
   (keyed on the datagram source IP), since two publishers' instance-scoped per-instrument delta

@@ -104,12 +104,14 @@ EOF
   chmod +x "$1/ss"
 }
 
-# ss_reports_busy <bindir> <port>: `ss -ltn` lists <port> as already bound.
+# ss_reports_busy <bindir> <port>: `ss -ltn` lists <port> as already bound. The
+# heredoc is quoted so the stub body stays literal (nothing expands here even if
+# it grows); the port is supplied at stub runtime via the exported env var.
 ss_reports_busy() {
-  local port="$2"
-  cat >"$1/ss" <<EOF
+  export DZ_TEST_BUSY_PORT="$2"
+  cat >"$1/ss" <<'EOF'
 #!/usr/bin/env bash
-echo "LISTEN 0 128 0.0.0.0:${port} 0.0.0.0:*"
+echo "LISTEN 0 128 0.0.0.0:${DZ_TEST_BUSY_PORT} 0.0.0.0:*"
 EOF
   chmod +x "$1/ss"
 }
