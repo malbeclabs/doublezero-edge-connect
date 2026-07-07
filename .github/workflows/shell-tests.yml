@@ -1,0 +1,35 @@
+name: shell-tests
+
+# Behavioral (bats) tests for the scripts/connect*.sh installers. These drive the
+# byte-identical shipped files end-to-end through a stub-first PATH (fake docker/
+# sudo/ss/curl/...) and assert on what each installer *tried* to do — so a silent
+# regression like #70 (a bare `port_in_use` tripping `set -e` when the WS port is
+# free, aborting the whole installer) is caught before it ships over the CDN.
+#
+# Runs unconditionally on every PR rather than filtering on `paths:`. A
+# `paths`-filtered *required* check is skipped-not-reported on PRs that don't touch
+# the filtered paths, leaving the PR stuck on "Expected — Waiting for status to be
+# reported" (see .github/workflows/actionlint.yml for the same reasoning). bats is
+# fast, so mirror rust.yml and always run.
+on:
+  push:
+    branches: [main, 'hotfix/**']
+  pull_request:
+
+# Least-privilege default: this workflow only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # bats-core from apt; python3 is preinstalled on ubuntu-latest (the access-pass
+      # heredoc tests use it — the regression suite stubs it out).
+      - name: Install bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+      - name: Run installer regression tests
+        run: bats tests/scripts/
