@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Live install-and-connect QA for the published one-liner**: new
+  `tests/qa/connect_e2e.sh` runs the CDN-published `curl | bash` installer exactly as a user would
+  and asserts the client actually **installs** (bridge container up, `doublezerod ready`, no early
+  exit) and **connects** (`doublezero status --json` reports the tunnel session `BGP Session Up`)
+  on **testnet** and **mainnet**, then runs tiered **integrity** checks on the installed client:
+  Tier 1 (deterministic — no panics in logs, container not crash-looping, `doublezero1` up,
+  `status` fields populated, `doublezero latency` proves the tunnel carries traffic, the
+  `/healthz`+`/metrics` endpoint serves via a relayed `METRICS_BIND`, the image matches the env, a
+  token key is not on host disk); Tier 2 (opt-in `DZ_QA_EXPECT_FEED=1`, host must be subscribed to a
+  feed — the reconciler activated the WS sink, **inner multicast is flowing**
+  `dz_datagrams_received_total>0`/`dz_feed_up=1` which catches the silent decapsulated-multicast
+  firewall drop the installer can only *warn* about, data admitted, and a stdlib WS client
+  `tests/qa/ws_probe.py` reads a valid `instrument`+market-data frame off `ws://…:18081`); Tier 3
+  (error-counter ceilings; opt-in shred forwarding); and Tier 0 harness self-integrity — every
+  successful run verifies the host is left clean (no `dz-qa-*` container, no leaked `doublezero1`),
+  and an opt-in negative self-test (`DZ_QA_NEGATIVE=1` with an unprovisioned secret) asserts the
+  tunnel does **not** come up, proving A2 can tell a broken connection from a good one (no
+  false-green). This closes the gap left by the hermetic bats suite
+  (`tests/scripts/`, which stubs docker/network and only checks installer *logic*) and mirrors the
+  `../doublezero` client QA pattern (`qa.devnet.yml`). Driven by a new
+  `.github/workflows/qa.connect.yml` — `workflow_dispatch` (pick `both`/`testnet`/`mainnet-beta`) +
+  an (opt-in, commented) schedule — on a **dedicated** self-hosted runner (`edge-connect-qa`
+  label, declared in `.github/actionlint.yaml`); never a PR check. Because edge-connect runs
+  `--network host`, its in-container `doublezerod` shares the host's `doublezero1`/access-pass with
+  the `../doublezero` client QA, so the harness guards isolation: a host-level `flock`
+  (`/var/lock/dz-qa.lock`, the only cross-repo mutex), a `concurrency` group, and a preflight that
+  **skips cleanly** (no clobber) if the host already has a `doublezero1` tunnel or a running
+  `doublezero-qaagent`. Always tears down (disconnect + remove) on exit; uses a QA-only container
+  name (`dz-qa-<env>`) and WS port (`:18081`). WS-serving-quotes is intentionally out of scope
+  (subscription-gated, non-deterministic on a fresh host). See `tests/qa/README.md`.
 - **Event-driven image rebuilds on doublezero base publish**: new
   `.github/workflows/release.docker.edge-connect.dispatch.yml` listens for a
   `repository_dispatch` (`doublezero-base-published`) from the upstream `malbeclabs/doublezero`
