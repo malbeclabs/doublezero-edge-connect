@@ -1,4 +1,7 @@
-# actionlint config. The workflows here only run on the default GitHub-hosted
-# ubuntu-latest runner, so no self-hosted runner labels need declaring.
+# actionlint config. Most workflows run on the default GitHub-hosted ubuntu-latest
+# runner; qa.connect.yml runs the live install-and-connect QA on a dedicated
+# self-hosted runner, so its custom label is declared here (built-in labels like
+# self-hosted/linux/x64 are known to actionlint and need no declaration).
 self-hosted-runner:
-  labels: []
+  labels:
+    - edge-connect-qa

@@ -1,0 +1,103 @@
+name: qa.connect
+
+# Live end-to-end QA: run the CDN-published one-liner exactly as a user would and
+# assert the client installs and connects on testnet and mainnet (see
+# tests/qa/README.md). Unlike shell-tests.yml (hermetic bats), this needs a real
+# Linux/amd64 host with Docker + GRE + an onchain access pass, so it runs on a
+# self-hosted runner and is NEVER a PR check.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Which environment(s) to QA
+        type: choice
+        default: both
+        options: [both, testnet, mainnet-beta]
+      install_base_url:
+        description: Origin of the one-liner (blank = https://get.doublezero.xyz)
+        type: string
+        default: ""
+      expect_feed:
+        description: Also assert the market-data product path (Tier 2 — only if the runner host is subscribed to a feed)
+        type: boolean
+        default: false
+      negative:
+        description: Run ONLY the Tier 0 negative self-test (unprovisioned secret must NOT connect) instead of the normal QA
+        type: boolean
+        default: false
+  # Enable the schedule ONLY once a dedicated runner + secrets exist. Keep it in a
+  # different window than the doublezero QA cron (0 14 * * 1-5) so the two never
+  # overlap on a shared host (see tests/qa/README.md "Isolation").
+  # schedule:
+  #   - cron: "0 9 * * 1-5"
+
+# Least-privilege: this workflow only reads the repo.
+permissions:
+  contents: read
+
+# Intra-repo mutex so two edge-connect QA runs never overlap. The host-level
+# `flock` in the harness is the cross-repo backstop.
+concurrency:
+  group: qa-connect
+  cancel-in-progress: false
+
+jobs:
+  qa:
+    # A runner dedicated to edge-connect QA — NOT one of the doublezero QA hosts.
+    # Register a self-hosted runner with the `edge-connect-qa` label on the
+    # provisioned host (see tests/qa/README.md).
+    runs-on: [self-hosted, linux, x64, edge-connect-qa]
+    # Job-level so the failure step's `if` can see it (a step's own env is not
+    # visible to its own `if`).
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: QA testnet
+        if: >-
+          !inputs.negative
+          && (github.event_name != 'workflow_dispatch'
+              || inputs.env == 'both' || inputs.env == 'testnet')
+        env:
+          DZ_SECRET: ${{ secrets.DZ_QA_TESTNET_SECRET }}
+          DZ_QA_CLIENT_IP: ${{ secrets.DZ_QA_CLIENT_IP }}
+          DZ_INSTALL_BASE_URL: ${{ inputs.install_base_url }}
+          DZ_QA_EXPECT_FEED: ${{ inputs.expect_feed && '1' || '0' }}
+        run: |
+          [ -n "${DZ_INSTALL_BASE_URL:-}" ] || unset DZ_INSTALL_BASE_URL
+          bash tests/qa/connect_e2e.sh --env testnet
+
+      - name: QA mainnet-beta
+        if: >-
+          !inputs.negative
+          && (github.event_name != 'workflow_dispatch'
+              || inputs.env == 'both' || inputs.env == 'mainnet-beta')
+        env:
+          DZ_SECRET: ${{ secrets.DZ_QA_MAINNET_SECRET }}
+          DZ_QA_CLIENT_IP: ${{ secrets.DZ_QA_CLIENT_IP }}
+          DZ_INSTALL_BASE_URL: ${{ inputs.install_base_url }}
+          DZ_QA_EXPECT_FEED: ${{ inputs.expect_feed && '1' || '0' }}
+        run: |
+          [ -n "${DZ_INSTALL_BASE_URL:-}" ] || unset DZ_INSTALL_BASE_URL
+          bash tests/qa/connect_e2e.sh --env mainnet-beta
+
+      # Tier 0 harness self-test: an unprovisioned secret must NOT connect. Guards
+      # against a false-green A2. Needs a secret whose IP has no access pass on
+      # testnet (DZ_QA_NOACCESS_SECRET). Runs only when explicitly requested.
+      - name: QA negative self-test
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.negative }}
+        env:
+          DZ_SECRET: ${{ secrets.DZ_QA_NOACCESS_SECRET }}
+          DZ_INSTALL_BASE_URL: ${{ inputs.install_base_url }}
+          DZ_QA_NEGATIVE: "1"
+        run: |
+          [ -n "${DZ_INSTALL_BASE_URL:-}" ] || unset DZ_INSTALL_BASE_URL
+          bash tests/qa/connect_e2e.sh --env testnet
+
+      - name: Notify Slack on failure
+        if: ${{ failure() && env.SLACK_WEBHOOK != '' }}
+        run: |
+          curl -fsSL -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":x: edge-connect connect QA failed on ${GITHUB_REF_NAME} — ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$SLACK_WEBHOOK"
