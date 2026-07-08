@@ -97,8 +97,12 @@ DZ_SECRET=DZ_…  bash tests/qa/connect_e2e.sh --env testnet
 DZ_SECRET=DZ_…  bash tests/qa/connect_e2e.sh --env mainnet-beta
 ```
 
-The harness always tears down (disconnect + remove the container) on exit, so the
-host is left clean between environments and runs.
+Before installing, the harness **reclaims the host**: if the server carries a
+leftover doublezero connection from an earlier run, it runs `doublezero disconnect`
+(and removes any leftover `dz-qa-*` container) so the install starts from a clean
+slate. On exit it always tears down — `doublezero disconnect`, then removes the
+container **and the pulled image** (`DZ_QA_REMOVE_IMAGE=0` to keep it) — so the
+server is left ready for the next QA run.
 
 ### Inputs (env vars)
 
@@ -114,6 +118,7 @@ host is left clean between environments and runs.
 | `NEG_TUNNEL_TIMEOUT` | `90` | How long the negative test waits to confirm the tunnel stays down (s). |
 | `DZ_QA_STRICT` | `0` | `1` turns Tier 3 ceilings from warnings into failures. |
 | `DZ_QA_SKIP_LATENCY` | `0` | `1` skips T1.5. |
+| `DZ_QA_REMOVE_IMAGE` | `1` | `0` keeps the pulled image on teardown (faster iteration); default removes it to leave the server clean. |
 | `WS_QA_PORT` / `METRICS_QA_PORT` | `18081` / `19090` | QA-only ports (avoid clobbering a real edge-connect on `:8081`/`:9090`). |
 | `INSTALL_READY_TIMEOUT` / `TUNNEL_UP_TIMEOUT` / `LATENCY_TIMEOUT` / `FEED_TIMEOUT` | `90` / `120` / `45` / `90` | Per-phase timeouts (seconds). |
 | `DZ_QA_LOCKFILE` | `/var/lock/dz-qa.lock` | Host-level mutex (see Isolation). |
@@ -152,9 +157,13 @@ The harness guards against this:
      mutex on a shared box (GitHub Actions `concurrency` is intra-repo). If the
      lock is held, it **skips cleanly** (exit 0, loud SKIP) rather than clobber an
      in-flight run;
-   - **skips** if the host already has a `doublezero1` tunnel or a running
-     `doublezero-qaagent` (a real deployment or another QA);
-   - only removes a stale `dz-qa-*` container (which is its own).
+   - **skips** if a `doublezero-qaagent` is running — that signals the doublezero
+     *client* QA infra is active, and we won't tear its connection out from under
+     it (coordinate via the flock / a dedicated runner instead);
+   - otherwise **reclaims** the host: a leftover `doublezero1` (from an earlier run,
+     safe to disconnect since we hold the lock and there's no foreign qaagent) is
+     `doublezero disconnect`-ed — via a leftover `dz-qa-*` container or a
+     host-installed CLI — and, as a last resort, an orphaned interface is deleted.
 
    For full safety on a shared host, have the doublezero QA take the same
    `/var/lock/dz-qa.lock`, and schedule this workflow in a different window than

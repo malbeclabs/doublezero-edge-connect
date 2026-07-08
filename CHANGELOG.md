@@ -34,9 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--network host`, its in-container `doublezerod` shares the host's `doublezero1`/access-pass with
   the `../doublezero` client QA, so the harness guards isolation: a host-level `flock`
   (`/var/lock/dz-qa.lock`, the only cross-repo mutex), a `concurrency` group, and a preflight that
-  **skips cleanly** (no clobber) if the host already has a `doublezero1` tunnel or a running
-  `doublezero-qaagent`. Always tears down (disconnect + remove) on exit; uses a QA-only container
-  name (`dz-qa-<env>`) and WS port (`:18081`). WS-serving-quotes is intentionally out of scope
+  **skips cleanly** (no clobber) if a `doublezero-qaagent` is running, but otherwise **reclaims** the
+  host — `doublezero disconnect`-ing any leftover connection (leftover `dz-qa-*` container or a
+  host-installed CLI; orphaned interface deleted as a last resort) so the install starts clean.
+  Always tears down on exit — `doublezero disconnect`, then removes the container **and the pulled
+  image** (`DZ_QA_REMOVE_IMAGE=0` to keep it) — leaving the server ready for the next run; uses a
+  QA-only container name (`dz-qa-<env>`) and ports (`:18081`/`:19090`). WS-serving-quotes is intentionally out of scope
   (subscription-gated, non-deterministic on a fresh host). See `tests/qa/README.md`.
 - **Event-driven image rebuilds on doublezero base publish**: new
   `.github/workflows/release.docker.edge-connect.dispatch.yml` listens for a

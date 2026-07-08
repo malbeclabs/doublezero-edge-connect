@@ -53,6 +53,9 @@ DZ_QA_EXPECT_SHREDS="${DZ_QA_EXPECT_SHREDS:-0}"
 # assert the tunnel does NOT come up (proves A2 can tell a broken connection from a
 # good one — guards against a false-green harness).
 DZ_QA_NEGATIVE="${DZ_QA_NEGATIVE:-0}"
+# Teardown removes the pulled image too (default on) to leave the QA server clean
+# and make the next run re-exercise the pull. Set 0 to keep it (faster iteration).
+DZ_QA_REMOVE_IMAGE="${DZ_QA_REMOVE_IMAGE:-1}"
 
 # Isolation: a dedicated container name + non-default ports so this QA never
 # clobbers a real edge-connect on the host and never fights for :8081/:9090.
@@ -148,21 +151,50 @@ command -v docker >/dev/null 2>&1 || die "docker not found on host."
 command -v jq >/dev/null 2>&1 || warn "jq not found; assertions fall back to text matching."
 command -v curl >/dev/null 2>&1 || die "curl not found on host."
 
-# Never touch a host that already has a DoubleZero tunnel or a foreign QA agent up
-# — it may be a real deployment or another QA run. Skip (don't fail, don't clobber).
-if ip link show doublezero1 >/dev/null 2>&1; then
-  skip "host already has a doublezero1 tunnel — not clobbering an existing deployment/QA."
-fi
-# -f (match full cmdline): the process comm is truncated to 15 chars, so
-# "doublezero-qaagent" would never match `pgrep -x`.
+# A running doublezero-qaagent means the doublezero *client* QA infra is active on
+# this host — skip rather than tear its connection out from under it (we coordinate
+# with that QA via the flock / a dedicated runner, not by force). -f (match full
+# cmdline): the comm is truncated to 15 chars, so `pgrep -x` would never match.
 if pgrep -f doublezero-qaagent >/dev/null 2>&1; then
   skip "doublezero-qaagent is running on this host — the doublezero QA may be mid-run."
 fi
-# A stale container from our own previous run: remove it (it's ours) so we start clean.
-if $SUDO docker ps -aq --filter "name=^${DZ_NAME}$" | grep -q .; then
-  warn "removing a stale ${DZ_NAME} container from a previous run."
-  $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
-fi
+
+# Reclaim the host before installing: a QA server can carry a leftover doublezero
+# connection from a previous run, which would collide with our --network host
+# bridge. We hold the flock and there is no foreign qaagent, so anything here is a
+# leftover — disconnect it and start from a clean slate.
+reclaim_host() {
+  local c leftovers gone=""
+  # 1. Leftover edge-connect QA containers (ours): disconnect gracefully, then remove.
+  leftovers="$($SUDO docker ps -aq --filter "name=^dz-qa-" 2>/dev/null || true)"
+  if [ -n "$leftovers" ]; then
+    warn "reclaim: found leftover dz-qa-* container(s); 'doublezero disconnect' + remove."
+    for c in $leftovers; do
+      $SUDO docker exec "$c" doublezero disconnect >/dev/null 2>&1 || true
+      $SUDO docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+  fi
+  # 2. A host-installed doublezero client (not in a container): disconnect it too.
+  if command -v doublezero >/dev/null 2>&1; then
+    $SUDO doublezero disconnect >/dev/null 2>&1 || doublezero disconnect >/dev/null 2>&1 || true
+  fi
+  # 3. Confirm the tunnel is gone (give a graceful disconnect a moment to land).
+  ip link show doublezero1 >/dev/null 2>&1 || { info "reclaim: host has no doublezero connection."; return 0; }
+  warn "reclaim: doublezero1 still present; waiting for it to drop."
+  for _ in $(seq 1 "$TEARDOWN_VERIFY_TIMEOUT"); do
+    ip link show doublezero1 >/dev/null 2>&1 || { gone=1; break; }
+    sleep 1
+  done
+  # 4. Last resort: delete an orphaned tunnel interface (no owning daemon/container).
+  if [ -z "$gone" ]; then
+    warn "reclaim: deleting orphaned doublezero1 interface."
+    $SUDO ip link delete doublezero1 >/dev/null 2>&1 || true
+    ip link show doublezero1 >/dev/null 2>&1 \
+      && die "could not reclaim host: doublezero1 persists; refusing to install onto a connected host."
+  fi
+  info "reclaim: host disconnected from doublezero."
+}
+reclaim_host
 
 # ----------------------------------------------------------------------------
 # teardown (always: disconnect + remove so the host is clean for the next env/run)
@@ -170,9 +202,19 @@ fi
 SCRATCH=""
 SUCCESS=0   # set to 1 only when all requested checks passed (gates teardown verify)
 teardown() {
-  info "Teardown: disconnecting and removing ${DZ_NAME}."
+  info "Teardown: 'doublezero disconnect', then destroy the container (and image)."
+  local img=""
+  img="$($SUDO docker inspect -f '{{.Config.Image}}' "$DZ_NAME" 2>/dev/null || true)"
+  # Disconnect from the service FIRST so the tunnel is cleanly torn down before the
+  # container (which owns the daemon) goes away — leaves the host ready for the next
+  # QA run rather than leaking a doublezero1 the daemon never dropped.
   $SUDO docker exec "$DZ_NAME" doublezero disconnect >/dev/null 2>&1 || true
   $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
+  # Remove the image too (default on) so the next run re-pulls and exercises the
+  # real pull path, and the server is left clean. Override with DZ_QA_REMOVE_IMAGE=0.
+  if [ "${DZ_QA_REMOVE_IMAGE:-1}" = 1 ] && [ -n "$img" ]; then
+    $SUDO docker rmi "$img" >/dev/null 2>&1 || true
+  fi
   [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
 }
 # T0: after a successful run, prove the host is actually left clean — a leaked
