@@ -72,6 +72,15 @@ pub struct Metrics {
     /// Quotes admitted by the staleness floor, attributed to the winning `publisher` (edge/public).
     /// A rise in `publisher="public"` is the direct signal of the public backstop filling a gap.
     pub quotes_admitted: IntCounterVec,
+    /// Quote `source_ts` ticks *won*: the once-per-tick first delivery, attributed to the winning
+    /// `publisher` class. Every tick counts exactly once — a mirror's copy or the leader's later
+    /// in-tick contents never re-count it, and a tick the public feed never delivers still counts
+    /// for the edge (the walkover) — so `edge / sum` is the published DZ win rate. Contrast
+    /// [`quote_lead_ns`](Self::quote_lead_ns), which samples only in-tick head-to-head contests
+    /// (at most one per tick, consumed by whichever follower arrives first — a mirror's sub-ms
+    /// copy usually) and is a dedup diagnostic, not a win rate. `source_ts == 0` sentinel quotes
+    /// bypass the floor and are not counted.
+    pub quote_ticks_won: IntCounterVec,
     /// Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat — collapsed).
     pub quotes_dropped: IntCounterVec,
     /// Trades admitted by the windowed dedup, attributed to the winning `publisher` (edge/public) —
@@ -96,6 +105,10 @@ pub struct Metrics {
     /// per (venue, symbol); a rise here for a given publisher class shows which source is currently
     /// leading the reconstructed book.
     pub depth_admitted: IntCounterVec,
+    /// MBO `depth` `source_ts` ticks *won* — the depth mirror of
+    /// [`quote_ticks_won`](Self::quote_ticks_won) (for depth, the `source_ts == 0` empty-anchor
+    /// tick is real and counts).
+    pub depth_ticks_won: IntCounterVec,
     /// MBO `depth` snapshots dropped by the staleness floor (stale tick, non-leader publisher's
     /// redundant book, or the leader's exact content repeat — the cross-publisher collapse),
     /// attributed to the `publisher` class whose copy was dropped — the symmetric counterpart of
@@ -300,6 +313,14 @@ impl Metrics {
                 "Quotes admitted by the staleness floor, by winning publisher (edge/public)",
                 &["venue", "publisher"],
             ),
+            quote_ticks_won: counter_vec(
+                &registry,
+                "dz_quote_ticks_won_total",
+                "Quote source_ts ticks won (first delivery of each tick), by publisher class \
+                 (edge/public); every tick counts exactly once, so edge/sum is the published \
+                 win rate",
+                &["venue", "publisher"],
+            ),
             quotes_dropped: counter_vec(
                 &registry,
                 "dz_quotes_dropped_total",
@@ -341,6 +362,13 @@ impl Metrics {
                 &registry,
                 "dz_depth_admitted_total",
                 "MBO depth admitted by the staleness floor, by winning publisher (edge/public)",
+                &["venue", "publisher"],
+            ),
+            depth_ticks_won: counter_vec(
+                &registry,
+                "dz_depth_ticks_won_total",
+                "MBO depth source_ts ticks won (first delivery of each tick), by publisher class \
+                 (edge/public); the depth mirror of dz_quote_ticks_won_total",
                 &["venue", "publisher"],
             ),
             depth_dropped: counter_vec(
@@ -593,6 +621,12 @@ mod tests {
         m.depth_lead_ns
             .with_label_values(&["Hyperliquid", "edge", "public"])
             .observe(123_456.0);
+        m.quote_ticks_won
+            .with_label_values(&["Hyperliquid", "edge"])
+            .inc();
+        m.depth_ticks_won
+            .with_label_values(&["Hyperliquid", "edge"])
+            .inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -617,6 +651,8 @@ mod tests {
             "dz_depth_dropped_total",
             "dz_depth_floor_resets_total",
             "dz_depth_lead_ns",
+            "dz_quote_ticks_won_total",
+            "dz_depth_ticks_won_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {

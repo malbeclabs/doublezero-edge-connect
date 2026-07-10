@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Per-tick win counters** `dz_quote_ticks_won_total{venue, publisher}` /
+  `dz_depth_ticks_won_total{venue, publisher}` — the published win-rate primitive. Every
+  `source_ts` tick counts exactly once, for the publisher class whose copy arrived first: a
+  mirror's copy or the leader's later in-tick contents never re-count it, and a tick the public
+  feed never delivers still counts for the edge (the walkover). `edge / sum` is the DZ win rate.
+  The `dz_*_lead_ns` contest histograms are deliberately NOT a win rate — they sample only
+  in-tick head-to-heads (at most one contest per tick, consumed by whichever follower arrives
+  first, usually a mirror's sub-ms copy) and never count a loser that arrives after the floor
+  advanced, so ratios built on them systematically understate the edge (docs/metrics.md
+  "Published win rate" has the intended query). Quote `source_ts == 0` sentinels bypass the
+  floor and count nothing; depth's `0` empty-anchor tick is real and counts.
 - **Event-driven image rebuilds on doublezero base publish**: new
   `.github/workflows/release.docker.edge-connect.dispatch.yml` listens for a
   `repository_dispatch` (`doublezero-base-published`) from the upstream `malbeclabs/doublezero`

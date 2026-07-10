@@ -60,12 +60,32 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | `dz_emit_total` | counter | `venue`, `kind` | Messages broadcast after dedup, by `kind` (quote/trade/instrument/midpoint/depth). `status` is structurally possible but never routed through the arbiter today, so it is not recorded in practice. |
 | `dz_quotes_admitted_total` | counter | `venue`, `publisher` | Quotes admitted by the staleness floor, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the direct signal of the public backstop filling an edge gap. |
 | `dz_trades_admitted_total` | counter | `venue`, `publisher` | Trades admitted by the windowed dedup, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the trade-side signal of the public backstop filling an edge gap — the counterpart to `dz_quotes_admitted_total` for a trades-only backstop like Phoenix. |
+| `dz_quote_ticks_won_total` | counter | `venue`, `publisher` | Quote `source_ts` ticks **won** — the once-per-tick first delivery, attributed to the winning class. Every tick counts exactly once: a mirror's copy or the leader's later in-tick contents never re-count it, and a tick the public feed never delivers still counts for the edge (the walkover). `edge / sum` is the published DZ win rate (see below). `source_ts == 0` sentinel quotes bypass the floor and are not counted. |
+| `dz_depth_ticks_won_total` | counter | `venue`, `publisher` | The depth mirror of `dz_quote_ticks_won_total` (for depth the `source_ts == 0` empty-anchor tick is real and counts). |
 | `dz_quotes_dropped_total` | counter | `venue` | Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat). |
 | `dz_trades_dropped_total` | counter | `venue` | Trades dropped by the windowed dedup (duplicate `trade_id` still inside the window). |
 | `dz_quotes_future_rejected_total` | counter | `venue` | Quotes rejected for an implausibly-far-future `source_ts`. |
 | `dz_quotes_no_source_ts_total` | counter | `venue` | Quotes forwarded with the `source_ts == 0` sentinel (floor bypassed). |
 | `dz_quote_lead_ns` | histogram | `venue`, `winner`, `loser` | Nanoseconds the winning publisher led the losing duplicate by, per quote-tick cross-source contest (`winner`/`loser` each `edge`/`public`). `{winner="edge",loser="public"}` is "DZ beat the public feed"; `_count` is the head-to-head win count, the buckets the lead margin. |
 | `dz_trade_lead_ns` | histogram | `venue`, `winner`, `loser` | The trade-side counterpart of `dz_quote_lead_ns`, per `trade_id` cross-source contest. |
+
+### Published win rate
+
+The DZ win rate to publish is the tick-won share:
+
+```promql
+sum(rate(dz_quote_ticks_won_total{publisher="edge"}[5m]))
+/
+sum(rate(dz_quote_ticks_won_total[5m]))
+```
+
+Do **not** derive a win rate from `dz_quote_lead_ns_count`. Contests sample only in-tick
+head-to-heads — at most one per tick, consumed by whichever follower arrives first (on a
+dual-publisher feed usually the mirror's sub-ms copy, which swallows the edge-vs-public race) —
+and a losing copy that arrives after the floor has already advanced past its tick is a plain
+stale drop that never counts. Ratios built on the contest histograms therefore systematically
+understate the edge. The `dz_*_lead_ns` histograms remain the *margin* diagnostic: how far ahead
+the winner was when the losing duplicate arrived.
 
 ## WebSocket output
 
