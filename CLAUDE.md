@@ -143,9 +143,14 @@ Modules are grouped by role under `src/`:
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
   floor, depth → depth floor, trades → window, everything else passthrough). Every arm returns an
-  `Admit<Publisher>`: `Emitted` broadcasts and bumps the admitted/winner counter, `Contest{winner,
-  lead_ns}` drops the losing cross-source copy and records the head-to-head lead-time histogram
-  (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60), `Dropped` is a plain collapse.
+  `Admit<Publisher>`: `Emitted{opened_tick}` broadcasts and bumps the admitted/winner counter —
+  plus, when the sample *opened* its `source_ts` tick, the once-per-tick
+  `dz_quote_ticks_won_total`/`dz_depth_ticks_won_total` (the published win-rate primitive:
+  `edge/sum`; every tick scores exactly once, walkovers included — see docs/metrics.md) —
+  `Contest{winner, lead_ns}` drops the losing cross-source copy and records the head-to-head
+  lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
+  diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
+  plain collapse.
   Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share
   **one** floor per `(venue, symbol)` and race on it. The quote floor lived inside `TobProcessor` under
   PR #29; it was lifted here so a different transport (the WS feeder) can race in the same floor.

@@ -192,7 +192,12 @@ impl DepthId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admit<P> {
     /// Forwarded: opened a new tick / new content (floor), or a first-seen identity (window).
-    Emitted,
+    /// `opened_tick` is true iff this sample *opened* its identity — the floor's first delivery at
+    /// a new `source_ts` tick, as opposed to the leader's later distinct content within the
+    /// already-open tick. The window has no tick concept: every first-seen identity is its own
+    /// open. One `true` per tick is the once-per-tick win the `dz_*_ticks_won_total` counters
+    /// publish (see [`crate::metrics::Metrics::quote_ticks_won`]).
+    Emitted { opened_tick: bool },
     /// Dropped with no cross-source contest to report: stale tick, exact repeat, a same-publisher
     /// duplicate, or a subsequent follower at a tick whose contest was already counted.
     Dropped,
@@ -204,7 +209,7 @@ pub enum Admit<P> {
 impl<P> Admit<P> {
     /// Whether the message should be forwarded (true only for [`Admit::Emitted`]).
     pub fn emitted(&self) -> bool {
-        matches!(self, Admit::Emitted)
+        matches!(self, Admit::Emitted { .. })
     }
 }
 
@@ -293,7 +298,7 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
                     content: set,
                     order: VecDeque::from([content]),
                 });
-                Admit::Emitted
+                Admit::Emitted { opened_tick: true }
             }
             Entry::Occupied(mut o) => {
                 let st = o.get_mut();
@@ -308,7 +313,7 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
                     st.order.clear();
                     st.content.insert(content.clone());
                     st.order.push_back(content);
-                    Admit::Emitted
+                    Admit::Emitted { opened_tick: true }
                 } else if publisher != st.leader {
                     // A non-leader sample at this tick: its arrival order vs the leader is
                     // delay-corrupted so it is dropped, but the *first* one is a cross-source
@@ -329,7 +334,7 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
                             st.content.remove(&old);
                         }
                     }
-                    Admit::Emitted
+                    Admit::Emitted { opened_tick: false }
                 } else {
                     Admit::Dropped
                 }
@@ -401,7 +406,7 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
                 seen.remove(&old);
             }
         }
-        Admit::Emitted
+        Admit::Emitted { opened_tick: true }
     }
 }
 
@@ -562,7 +567,7 @@ impl Arbiter {
                     publisher,
                     q.recv_ts_ns,
                 ) {
-                    Admit::Emitted => {
+                    Admit::Emitted { opened_tick } => {
                         m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
                         // Attribute the admitted quote to its winning publisher. A rise in
                         // `publisher="public"` is the direct signal of the public backstop filling
@@ -570,6 +575,14 @@ impl Arbiter {
                         m.quotes_admitted
                             .with_label_values(&[q.venue.as_str(), publisher.label()])
                             .inc();
+                        // Once per tick: the class whose copy opened this `source_ts` won the
+                        // tick. Unlike the contest histogram (in-tick head-to-heads only), every
+                        // tick counts exactly once — this is the published win-rate primitive.
+                        if opened_tick {
+                            m.quote_ticks_won
+                                .with_label_values(&[q.venue.as_str(), publisher.label()])
+                                .inc();
+                        }
                         let _ = self.tx.send(msg);
                     }
                     // A cross-source follower lost this tick: record how far the winner led, on top
@@ -594,7 +607,7 @@ impl Arbiter {
             FeedMessage::Trade(t) => {
                 let key = (t.venue.clone(), t.symbol.clone());
                 match self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns) {
-                    Admit::Emitted => {
+                    Admit::Emitted { .. } => {
                         m.emit.with_label_values(&[t.venue.as_str(), "trade"]).inc();
                         m.trades_admitted
                             .with_label_values(&[t.venue.as_str(), publisher.label()])
@@ -657,7 +670,7 @@ impl Arbiter {
                     publisher,
                     d.recv_ts_ns,
                 ) {
-                    Admit::Emitted => {
+                    Admit::Emitted { opened_tick } => {
                         m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
                         // Attribute the admitted depth to its winning publisher — the depth mirror of
                         // `quotes_admitted`. A rise for a given source shows which publisher currently
@@ -666,6 +679,12 @@ impl Arbiter {
                         m.depth_admitted
                             .with_label_values(&[d.venue.as_str(), publisher.label()])
                             .inc();
+                        // Once per tick, mirroring the quote arm's win-rate primitive.
+                        if opened_tick {
+                            m.depth_ticks_won
+                                .with_label_values(&[d.venue.as_str(), publisher.label()])
+                                .inc();
+                        }
                         // Update the WS-replay snapshot with the leader's admitted book, so a client
                         // connecting mid-stream replays exactly what was broadcast (not a dropped
                         // non-leader's divergent copy).
@@ -1536,5 +1555,132 @@ mod tests {
         let mut qb = qa.clone();
         qb.bid_size = 2.0e11;
         assert_ne!(QuoteId::of(&qa), QuoteId::of(&qb));
+    }
+
+    /// The floor reports whether an emitted sample *opened* its `source_ts` tick — the
+    /// once-per-tick first-delivery signal the tick-won counters publish. The leader's later
+    /// in-tick contents emit without re-opening, and a follower's copy never opens a tick it lost.
+    #[test]
+    fn floor_reports_tick_open_once_per_tick() {
+        let (a, b) = (1u8, 2u8);
+        let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
+        assert_eq!(
+            f.admit("BTC", 1000, 5, a, 0),
+            Admit::Emitted { opened_tick: true } // first sample opens the tick
+        );
+        assert_eq!(
+            f.admit("BTC", 1000, 4, a, 10),
+            Admit::Emitted { opened_tick: false } // leader's in-tick content: same tick, no open
+        );
+        assert_eq!(
+            f.admit("BTC", 1000, 9, b, 20),
+            Admit::Contest {
+                winner: a,
+                lead_ns: 20
+            } // follower never opens a lost tick
+        );
+        assert_eq!(
+            f.admit("BTC", 2000, 9, b, 30),
+            Admit::Emitted { opened_tick: true } // next tick: first delivery wins it
+        );
+    }
+
+    /// The windowed dedup has no tick concept: every first-seen identity is its own open (each
+    /// admitted trade IS that event's first delivery), pinned so the shared `Admit` shape is
+    /// deliberate.
+    #[test]
+    fn window_first_seen_is_always_an_open() {
+        let mut d: WindowedDedup<&str, u64, u8> = WindowedDedup::new(8);
+        assert_eq!(
+            d.admit("BTC", 1, 1, 0),
+            Admit::Emitted { opened_tick: true }
+        );
+        assert_eq!(
+            d.admit("BTC", 2, 1, 0),
+            Admit::Emitted { opened_tick: true }
+        );
+    }
+
+    fn quote_at(venue: &str, source_ts_ns: u64, bid: f64) -> NormalizedQuote {
+        NormalizedQuote {
+            venue: venue.to_string(),
+            ..quote(source_ts_ns, bid, bid + 1.0)
+        }
+    }
+
+    /// Tick-won attribution (`dz_quote_ticks_won_total`): every quote tick counts exactly once,
+    /// for the publisher class whose copy arrived first. A mirror's copy and the leader's in-tick
+    /// contents don't re-count; a tick the public feed never delivers is still an edge win (the
+    /// walkover); a tick the public opens is a public win; the `source_ts == 0` sentinel bypasses
+    /// the floor and counts nothing. Venue is unique to this test — the metrics registry is
+    /// process-global (see `metrics()` docs).
+    #[test]
+    fn quote_tick_wins_count_once_per_tick_by_class() {
+        let venue = "TickWonQuotes";
+        let edge_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.0)), edge_a); // edge opens tick 1000
+        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.5)), edge_a); // in-tick content: no re-count
+        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.0)), edge_b); // mirror copy: no count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
+            Publisher::PublicWs,
+        ); // late public copy: no count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 2000, 101.0)),
+            Publisher::PublicWs,
+        ); // public opens tick 2000
+        a.emit(FeedMessage::Quote(quote_at(venue, 3000, 102.0)), edge_a); // walkover tick 3000
+        a.emit(FeedMessage::Quote(quote_at(venue, 0, 99.0)), edge_a); // sentinel: bypass, no count
+        let m = crate::metrics::metrics();
+        assert_eq!(
+            m.quote_ticks_won.with_label_values(&[venue, "edge"]).get(),
+            2
+        );
+        assert_eq!(
+            m.quote_ticks_won
+                .with_label_values(&[venue, "public"])
+                .get(),
+            1
+        );
+    }
+
+    /// The depth mirror (`dz_depth_ticks_won_total`): same once-per-tick attribution on the depth
+    /// floor, including the `source_ts == 0` empty-anchor tick (a real tick for depth — no
+    /// sentinel bypass), counted once for the class that anchored first.
+    #[test]
+    fn depth_tick_wins_count_once_per_tick_by_class() {
+        let venue = "TickWonDepth";
+        let depth_at = |source_ts_ns: u64, bids: Vec<[f64; 2]>| NormalizedDepth {
+            venue: venue.to_string(),
+            ..depth(source_ts_ns, bids, vec![])
+        };
+        let edge_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(FeedMessage::Depth(depth_at(0, vec![])), edge_a); // A's empty anchor opens tick 0
+        a.emit(FeedMessage::Depth(depth_at(0, vec![])), edge_b); // B's identical anchor: no re-count
+        a.emit(
+            FeedMessage::Depth(depth_at(1000, vec![[100.0, 1.0]])),
+            edge_b,
+        ); // B opens tick 1000
+        a.emit(
+            FeedMessage::Depth(depth_at(2000, vec![[100.0, 2.0]])),
+            Publisher::PublicWs,
+        ); // public opens tick 2000
+        let m = crate::metrics::metrics();
+        assert_eq!(
+            m.depth_ticks_won.with_label_values(&[venue, "edge"]).get(),
+            2
+        );
+        assert_eq!(
+            m.depth_ticks_won
+                .with_label_values(&[venue, "public"])
+                .get(),
+            1
+        );
     }
 }
