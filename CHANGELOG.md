@@ -290,6 +290,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the canonical BBO identity, so a count-only change at an unchanged price/size is a distinct quote.
 
 ### Changed
+- Installer (`scripts/connect*.sh`) now detects an **existing edge-connect instance** before
+  installing: if a container named `$DZ_NAME` (default `doublezero-edge-connect`) already exists on
+  the host, the installer warns that an instance is already present and prompts to **reinstall or
+  cancel** instead of silently colliding with the live tunnel/ports. On reinstall it prints
+  "Uninstalling existing instance...", runs `doublezero disconnect` inside the old container to drop
+  the tunnel cleanly, then removes the container before continuing; on cancel it aborts and leaves
+  the running instance untouched. Non-interactively (`DZ_ASSUME_YES=1`) it reinstalls. Applied
+  identically to all three installers.
 - `dz_depth_dropped_total` now carries a `publisher` label (the dropped copy's source class),
   symmetric with `dz_depth_admitted_total`, so a lagging publisher losing the book race is
   directly visible (#66). This changes the label set of an existing series — exact-label matchers

@@ -363,6 +363,28 @@ fi
 $SUDO docker info >/dev/null 2>&1 || die "Docker is installed but the daemon isn't reachable. Start it (e.g. 'sudo systemctl start docker') and re-run."
 
 # ----------------------------------------------------------------------------
+# 3b. existing instance? reinstall (disconnect + remove) or cancel
+# ----------------------------------------------------------------------------
+# A prior run leaves a long-lived container (--restart unless-stopped) that holds
+# the DoubleZero tunnel and the WS sink. Re-running the installer over a live
+# instance would collide (same container name, same tunnel, same host ports), so
+# detect one up front and tear it down cleanly first: `doublezero disconnect`
+# inside the container drops the tunnel, then we remove the container.
+if $SUDO docker ps -a -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q .; then
+  warn "An edge-connect instance ('$DZ_NAME') already exists on this host and may be running."
+  if confirm "Reinstall? This disconnects and removes the existing instance"; then
+    info "Uninstalling existing instance..."
+    # Drop the tunnel from inside the container first (best-effort; only if it's up).
+    if $SUDO docker ps -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q .; then
+      $SUDO docker exec "$DZ_NAME" doublezero disconnect >/dev/null 2>&1 || true
+    fi
+    $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
+  else
+    die "Cancelled: leaving the existing instance in place (manage it with 'sudo docker logs $DZ_NAME')."
+  fi
+fi
+
+# ----------------------------------------------------------------------------
 # 4. host kernel / network prep (host-side; safe to attempt)
 # ----------------------------------------------------------------------------
 info "Preparing host for DoubleZero Edge Connect"
