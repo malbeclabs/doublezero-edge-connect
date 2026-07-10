@@ -37,7 +37,17 @@ printf 'docker %s\n' "$*" >>"$DOCKER_LOG"
 case "$1" in
   info)    exit 0 ;;
   logs)    echo "doublezerod ready"; exit 0 ;;
-  inspect) exit 0 ;;                       # no env/image labels needed here
+  inspect)
+    # Model `docker inspect` failing mid-teardown (container removed between the
+    # `ps -a` detection and the inspect, or a daemon blip). Otherwise emit
+    # realistic, MULTI-line env so the DZ_ENV `sed | head -1` closes the pipe
+    # early -- the exact shape that, without `|| true`, trips `set -o pipefail`.
+    [ "${STUB_INSPECT_FAIL:-0}" = 1 ] && exit 1
+    case "$*" in
+      *Config.Env*)   printf 'PATH=/usr/bin\nDZ_ENV=%s\nRUST_LOG=info\nHOME=/root\n' "${STUB_ENV:-mainnet-beta}" ;;
+      *Config.Image*) echo "ghcr.io/malbeclabs/doublezero-edge-connect:${STUB_ENV:-mainnet-beta}" ;;
+    esac
+    exit 0 ;;
   run)     : >"$DOCKER_LOG.ran"; exit 0 ;; # remember the fresh container now exists
   ps)
     # After `docker run`, every ps refers to the new container -> it's up (so the
@@ -67,6 +77,10 @@ first_line() { grep -nF "$1" "$DOCKER_LOG" | head -1 | cut -d: -f1; }
     status=$?
     if [ "$status" -ne 0 ]; then echo "# $s.sh exited $status"; sed 's/^/#   /' "$err"; fails=1; continue; fi
     if ! grep -qi 'already exists' "$err"; then echo "# $s.sh never warned an instance already exists"; fails=1; continue; fi
+    # The warning must name the victim's env + image (network-aware prompt).
+    if ! grep -qi 'env=mainnet-beta' "$err" || ! grep -qi 'image=ghcr.io/malbeclabs' "$err"; then
+      echo "# $s.sh warning didn't identify the existing instance's env/image:"; sed 's/^/#   /' "$err"; fails=1; continue
+    fi
     local stop_l rm_l run_l
     stop_l="$(first_line 'docker stop ')"; rm_l="$(first_line 'docker rm -f ')"; run_l="$(first_line 'docker run ')"
     if [ -z "$stop_l" ]; then echo "# $s.sh did not 'docker stop' the running instance"; fails=1; continue; fi
@@ -89,6 +103,25 @@ first_line() { grep -nF "$1" "$DOCKER_LOG" | head -1 | cut -d: -f1; }
     # A stopped container can't be `docker stop`ped for a graceful disconnect.
     if grep -q '^docker stop ' "$DOCKER_LOG"; then echo "# $s.sh tried to stop a non-running instance"; fails=1; continue; fi
     if [ -z "$(first_line 'docker rm -f ')" ]; then echo "# $s.sh did not remove the stopped instance"; fails=1; continue; fi
+    if ! grep -q '^docker run ' "$DOCKER_LOG"; then echo "# $s.sh never reached docker run"; fails=1; continue; fi
+  done
+  [ "$fails" -eq 0 ]
+}
+
+@test "docker inspect failing mid-teardown does not abort the installer (all scripts)" {
+  # The env/image labels are best-effort: a `docker inspect` failure (container
+  # removed between the `ps -a` detection and the inspect, or a daemon blip) must
+  # NOT abort the installer under `set -euo pipefail` (regression: the DZ_ENV
+  # assignment's pipeline needs `|| true`, matching its DZ_IMAGE sibling). The
+  # instance is still detected, warned about, and reinstalled -- just unlabelled.
+  local fails=0
+  for s in "${SCRIPTS[@]}"; do
+    : >"$DOCKER_LOG"; rm -f "$DOCKER_LOG.ran"
+    local err="$BATS_TEST_TMPDIR/$s.err"
+    ( common_env; export STUB_EXISTS=1 STUB_RUNNING=1 STUB_INSPECT_FAIL=1; bash "$SCRIPTS_DIR/$s.sh" ) 2>"$err"
+    status=$?
+    if [ "$status" -ne 0 ]; then echo "# $s.sh exited $status when docker inspect failed"; sed 's/^/#   /' "$err"; fails=1; continue; fi
+    if ! grep -qi 'already exists' "$err"; then echo "# $s.sh aborted before the 'already exists' warning"; sed 's/^/#   /' "$err"; fails=1; continue; fi
     if ! grep -q '^docker run ' "$DOCKER_LOG"; then echo "# $s.sh never reached docker run"; fails=1; continue; fi
   done
   [ "$fails" -eq 0 ]

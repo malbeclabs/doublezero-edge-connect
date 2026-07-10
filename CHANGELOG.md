@@ -304,8 +304,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session). Interactively, declining aborts and leaves the instance untouched; non-interactively
   (`DZ_ASSUME_YES=1`, or no usable TTY) it reinstalls, preserving the previous silent-reinstall
   behaviour for automation. TTY detection probes an actual `/dev/tty` open rather than trusting
-  `-r`, so a headless run with no controlling terminal is classified correctly. Applied identically
-  to all three installers; covered by `tests/scripts/reinstall_existing.bats`.
+  `-r`, so a headless run with no controlling terminal is classified correctly. The env/image
+  labelling is best-effort — a `docker inspect` that fails mid-teardown (container removed between
+  detection and inspect, or a daemon blip) no longer aborts the installer under `set -o pipefail`.
+  Applied identically to all three installers; covered by `tests/scripts/reinstall_existing.bats`.
 - `dz_depth_dropped_total` now carries a `publisher` label (the dropped copy's source class),
   symmetric with `dz_depth_admitted_total`, so a lagging publisher losing the book race is
   directly visible (#66). This changes the label set of an existing series — exact-label matchers

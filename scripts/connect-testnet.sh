@@ -372,7 +372,7 @@ reinstall_existing_instance() {
   # Label the victim: all three installers share DZ_NAME, so e.g. the testnet
   # installer can find a live *mainnet* container -- name the network/image so the
   # operator isn't asked to destroy an unidentified instance.
-  existing_env="$($SUDO docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DZ_NAME" 2>/dev/null | sed -n 's/^DZ_ENV=//p' | head -1)"
+  existing_env="$($SUDO docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DZ_NAME" 2>/dev/null | sed -n 's/^DZ_ENV=//p' | head -1 || true)"
   existing_img="$($SUDO docker inspect -f '{{.Config.Image}}' "$DZ_NAME" 2>/dev/null || true)"
   warn "An edge-connect instance ('$DZ_NAME'${existing_env:+, env=$existing_env}${existing_img:+, image=$existing_img}) already exists on this host${running:+ and is running}."
 
