@@ -363,26 +363,70 @@ fi
 $SUDO docker info >/dev/null 2>&1 || die "Docker is installed but the daemon isn't reachable. Start it (e.g. 'sudo systemctl start docker') and re-run."
 
 # ----------------------------------------------------------------------------
-# 3b. existing instance? reinstall (disconnect + remove) or cancel
+# 3b. existing instance? reinstall (graceful teardown) or cancel
 # ----------------------------------------------------------------------------
 # A prior run leaves a long-lived container (--restart unless-stopped) that holds
 # the DoubleZero tunnel and the WS sink. Re-running the installer over a live
 # instance would collide (same container name, same tunnel, same host ports), so
-# detect one up front and tear it down cleanly first: `doublezero disconnect`
-# inside the container drops the tunnel, then we remove the container.
-if $SUDO docker ps -a -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q .; then
-  warn "An edge-connect instance ('$DZ_NAME') already exists on this host and may be running."
-  if confirm "Reinstall? This disconnects and removes the existing instance"; then
-    info "Uninstalling existing instance..."
-    # Drop the tunnel from inside the container first (best-effort; only if it's up).
-    if $SUDO docker ps -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q .; then
-      $SUDO docker exec "$DZ_NAME" doublezero disconnect >/dev/null 2>&1 || true
-    fi
-    $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
+# detect one up front and tear it down cleanly first.
+reinstall_existing_instance() {
+  $SUDO docker ps -a -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q . || return 0
+
+  local running="" existing_env="" existing_img=""
+  $SUDO docker ps -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q . && running=1
+  # Label the victim: all three installers share DZ_NAME, so e.g. the testnet
+  # installer can find a live *mainnet* container -- name the network/image so the
+  # operator isn't asked to destroy an unidentified instance.
+  existing_env="$($SUDO docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DZ_NAME" 2>/dev/null | sed -n 's/^DZ_ENV=//p' | head -1)"
+  existing_img="$($SUDO docker inspect -f '{{.Config.Image}}' "$DZ_NAME" 2>/dev/null || true)"
+  warn "An edge-connect instance ('$DZ_NAME'${existing_env:+, env=$existing_env}${existing_img:+, image=$existing_img}) already exists on this host${running:+ and is running}."
+
+  # Decide whether to reinstall, keeping the three cases distinct so we neither
+  # break headless automation nor mislabel a genuine decline:
+  #   DZ_ASSUME_YES=1     -> reinstall (skip the prompt)
+  #   interactive decline -> abort (the operator said no)
+  #   no usable TTY, !yes -> reinstall, but say so (pre-3b behaviour was a silent
+  #                          reinstall; keep automation working rather than abort)
+  # A readable /dev/tty inode (-r) can still fail to OPEN with no controlling
+  # terminal (cron/systemd/`curl|bash` without a tty), so probe an actual open
+  # rather than trusting -r (and skip confirm()'s own tty read in that case).
+  if [ "$DZ_ASSUME_YES" = 1 ]; then
+    :
+  elif { : <"$TTY"; } 2>/dev/null; then
+    confirm "Reinstall? This disconnects and removes the existing instance" \
+      || die "Cancelled: leaving the existing instance in place (manage it with 'sudo docker logs $DZ_NAME')."
   else
-    die "Cancelled: leaving the existing instance in place (manage it with 'sudo docker logs $DZ_NAME')."
+    warn "No terminal to prompt on and DZ_ASSUME_YES is unset; reinstalling to preserve non-interactive behaviour (set DZ_ASSUME_YES=1 to silence this, or run interactively to be asked first)."
   fi
-fi
+
+  info "Uninstalling existing instance..."
+  if [ -n "$running" ]; then
+    # Graceful: `docker stop` sends SIGTERM, which the container entrypoint traps to
+    # run a bounded `doublezero disconnect` (only if a tunnel is up) before tearing
+    # doublezerod down -- releasing the GRE tunnel/routes/on-chain session cleanly.
+    # The container's --stop-timeout (60s) bounds the stop; the outer `timeout`
+    # guards a wedged docker CLI / restarting container so we can never hang forever.
+    info "Stopping it gracefully (disconnecting the DoubleZero tunnel)..."
+    local stop_ok=1
+    if command -v timeout >/dev/null 2>&1; then
+      $SUDO timeout 90 docker stop "$DZ_NAME" >/dev/null 2>&1 || stop_ok=0
+    else
+      $SUDO docker stop "$DZ_NAME" >/dev/null 2>&1 || stop_ok=0
+    fi
+    [ "$stop_ok" = 1 ] || warn "Could not stop the existing container cleanly (timed out or errored); forcing removal. Its GRE tunnel/routes may be orphaned in the host network namespace -- check 'doublezero status' / 'ip link' and disconnect manually if connectivity is off."
+  fi
+  $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
+
+  # Version-independent confirmation that the tunnel actually came down: the
+  # container ran with --network host, so a failed disconnect leaves the doublezero1
+  # interface (and its routes/on-chain session) orphaned in the host netns. Warn
+  # loudly if it lingers -- the fresh connect below usually recreates it, but a
+  # leftover old tunnel means the previous session wasn't released.
+  if command -v ip >/dev/null 2>&1 && $SUDO ip link show doublezero1 >/dev/null 2>&1; then
+    warn "The DoubleZero tunnel interface (doublezero1) is still present after teardown; the previous instance may not have disconnected cleanly. Its on-chain session/routes could be orphaned -- verify with 'doublezero status'."
+  fi
+}
+reinstall_existing_instance
 
 # ----------------------------------------------------------------------------
 # 4. host kernel / network prep (host-side; safe to attempt)
