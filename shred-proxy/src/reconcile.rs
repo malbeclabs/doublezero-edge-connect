@@ -67,6 +67,12 @@ impl ReconcileConfig {
 /// polling). Otherwise it probes the routing table every `refresh` and restarts the forwarder when
 /// the set of active groups changes. Returns only if the forwarder (in explicit mode) exits.
 pub async fn run(cfg: ReconcileConfig) -> Result<()> {
+    // Created once, up front, and reused across every `select!` below. A fresh `Signal` per
+    // iteration would drop a SIGTERM that arrived while we were between `select!` points (e.g. mid
+    // routing probe), leaving `systemctl stop` to fall back to SIGKILL; one long-lived listener
+    // catches it on the next poll.
+    let mut shutdown = Shutdown::new()?;
+
     if !cfg.explicit_sources.is_empty() {
         let mut sources = cfg.explicit_sources.clone();
         sources.sort();
@@ -78,7 +84,7 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
         // with a log of the groups being left, rather than the process being killed silently.
         tokio::select! {
             res = shred::run(cfg.shred_config(sources.clone())) => return res,
-            sig = shutdown_signal() => {
+            sig = shutdown.recv() => {
                 info!(signal = %sig, groups = ?sources,
                       "received shutdown signal; leaving multicast groups and exiting");
                 return Ok(());
@@ -100,8 +106,6 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
     let mut logged_empty = false;
 
     loop {
-        let desired = detect_active_sources(&cfg).await;
-
         // If the live forwarder exited on its own (channel closed / fatal bind error), surface why
         // and clear it so it can be re-activated if still desired. Awaiting the finished handle
         // yields immediately and lets us log the actual error/panic instead of swallowing it (a
@@ -121,42 +125,47 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
             }
         }
 
-        let running: Option<&Vec<SocketAddrV4>> = current.as_ref().map(|(s, _)| s);
-        if running != Some(&desired) {
-            // Report the transition as a diff, not just the new set, so an operator sees which groups
-            // became active/inactive this tick. `old` is cloned out before the borrow of `current` is
-            // needed again below.
-            let old: Vec<SocketAddrV4> = running.cloned().unwrap_or_default();
-            let added: Vec<SocketAddrV4> = desired
-                .iter()
-                .copied()
-                .filter(|s| !old.contains(s))
-                .collect();
-            let removed: Vec<SocketAddrV4> = old
-                .iter()
-                .copied()
-                .filter(|s| !desired.contains(s))
-                .collect();
+        // Probe the routing table. `None` means detection itself failed this tick (transient `ip`
+        // error) — keep the current activation rather than tearing the forwarder down on a blank
+        // probe (fail-open, matching the bridge reconciler). Only reconcile against a real result.
+        if let Some(desired) = detect_active_sources(&cfg).await {
+            let running: Option<&Vec<SocketAddrV4>> = current.as_ref().map(|(s, _)| s);
+            if running != Some(&desired) {
+                // Report the transition as a diff, not just the new set, so an operator sees which
+                // groups became active/inactive this tick. `old` is cloned out before the borrow of
+                // `current` is needed again below.
+                let old: Vec<SocketAddrV4> = running.cloned().unwrap_or_default();
+                let added: Vec<SocketAddrV4> = desired
+                    .iter()
+                    .copied()
+                    .filter(|s| !old.contains(s))
+                    .collect();
+                let removed: Vec<SocketAddrV4> = old
+                    .iter()
+                    .copied()
+                    .filter(|s| !desired.contains(s))
+                    .collect();
 
-            // Abort the old forwarder (if any); its sockets close when the handle is dropped. The
-            // abort is abrupt, so the receivers can't log on their way out — log the groups we are
-            // leaving here, before aborting. Note the whole forwarder is restarted on any change, so
-            // this lists every currently-joined group, not only the ones in `removed`.
-            if let Some((old_sources, handle)) = current.take() {
-                info!(groups = ?old_sources, "leaving multicast groups; stopping shred forwarder");
-                handle.abort();
-            }
-            if desired.is_empty() {
-                if !logged_empty {
-                    logged_empty = true;
-                    info!("no candidate group active in the routing table; forwarder idle");
+                // Abort the old forwarder (if any); its sockets close when the handle is dropped. The
+                // abort is abrupt, so the receivers can't log on their way out — log the groups we are
+                // leaving here, before aborting. Note the whole forwarder is restarted on any change,
+                // so this lists every currently-joined group, not only the ones in `removed`.
+                if let Some((old_sources, handle)) = current.take() {
+                    info!(groups = ?old_sources, "leaving multicast groups; stopping shred forwarder");
+                    handle.abort();
                 }
-            } else {
-                logged_empty = false;
-                info!(added = ?added, removed = ?removed, active = ?desired,
-                      "active groups changed; activating shred forwarder");
-                let handle = tokio::spawn(shred::run(cfg.shred_config(desired.clone())));
-                current = Some((desired, handle));
+                if desired.is_empty() {
+                    if !logged_empty {
+                        logged_empty = true;
+                        info!("no candidate group active in the routing table; forwarder idle");
+                    }
+                } else {
+                    logged_empty = false;
+                    info!(added = ?added, removed = ?removed, active = ?desired,
+                          "active groups changed; activating shred forwarder");
+                    let handle = tokio::spawn(shred::run(cfg.shred_config(desired.clone())));
+                    current = Some((desired, handle));
+                }
             }
         }
 
@@ -165,7 +174,7 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
         // On signal we abort the live forwarder and return Ok so the process exits 0.
         tokio::select! {
             _ = tokio::time::sleep(cfg.refresh) => {}
-            sig = shutdown_signal() => {
+            sig = shutdown.recv() => {
                 let groups: Vec<SocketAddrV4> =
                     current.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
                 if let Some((_, handle)) = current.take() {
@@ -179,39 +188,70 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
     }
 }
 
-/// Resolve when the process should shut down: SIGTERM (what `systemctl stop` sends) or SIGINT
-/// (Ctrl-C in a foreground run). Returns the signal name for the shutdown log. On non-unix it falls
-/// back to Ctrl-C only.
-async fn shutdown_signal() -> &'static str {
+/// Long-lived shutdown listener: SIGTERM (what `systemctl stop` sends) or SIGINT (Ctrl-C in a
+/// foreground run). Built once and reused so a signal arriving between `select!` points isn't
+/// dropped — tokio only queues a signal against a live `Signal` stream. On non-unix it falls back to
+/// Ctrl-C only.
+struct Shutdown {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = int.recv() => "SIGINT",
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                int: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        "ctrl-c"
+
+    /// Resolve when a shutdown signal arrives, returning its name for the log.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.term.recv() => "SIGTERM",
+                _ = self.int.recv() => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "ctrl-c"
+        }
     }
 }
 
 /// Probe the routing table (on a blocking thread, since it shells out to `ip`) and return the active
-/// sources as sorted `SocketAddrV4`.
-async fn detect_active_sources(cfg: &ReconcileConfig) -> Vec<SocketAddrV4> {
+/// sources as sorted `SocketAddrV4`. Returns `None` when detection itself failed (a transient `ip`
+/// error or the blocking task dying) — the caller keeps the current activation rather than
+/// interpreting a failed probe as "no groups active".
+async fn detect_active_sources(cfg: &ReconcileConfig) -> Option<Vec<SocketAddrV4>> {
     let candidates = cfg.candidates.clone();
     let iface = cfg.iface.clone();
     let port = cfg.port;
-    let active = tokio::task::spawn_blocking(move || active_groups(&candidates, &iface))
-        .await
-        .unwrap_or_else(|e| {
-            warn!(%e, "routing detection task failed; assuming no active groups this tick");
-            Vec::new()
-        });
+    let active = match tokio::task::spawn_blocking(move || active_groups(&candidates, &iface)).await
+    {
+        Ok(Ok(active)) => active,
+        Ok(Err(e)) => {
+            warn!(%e, "routing detection failed this tick; keeping current activation");
+            return None;
+        }
+        Err(e) => {
+            warn!(%e, "routing detection task failed; keeping current activation");
+            return None;
+        }
+    };
     // Defensive dedupe in case the candidate list has repeats, and a stable order for the diff.
     let mut set: Vec<SocketAddrV4> = active
         .into_iter()
@@ -220,5 +260,5 @@ async fn detect_active_sources(cfg: &ReconcileConfig) -> Vec<SocketAddrV4> {
         .map(|ip| SocketAddrV4::new(ip, port))
         .collect();
     set.sort();
-    set
+    Some(set)
 }

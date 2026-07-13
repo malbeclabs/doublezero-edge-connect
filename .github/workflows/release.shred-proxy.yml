@@ -46,6 +46,11 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
+      # Gate the release on the test suite: never publish a binary the tests haven't passed for.
+      # Run on the host target (not musl) so the tests execute natively.
+      - name: Test
+        run: cargo test --locked -p shred-proxy
+
       - name: Build (static, release)
         run: cargo build --release --locked -p shred-proxy --target "${TARGET}"
 
@@ -55,8 +60,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp "target/${TARGET}/release/shred-proxy" "dist/${ASSET}"
-          # Confirm it really is static — a dynamic build would fail on hosts without the same libc.
+          # Assert (not just print) that it really is static — a dynamic build would fail on hosts
+          # without the same libc, so a non-static artifact must fail the release, not ship silently.
           file "dist/${ASSET}"
+          if ! file "dist/${ASSET}" | grep -q 'statically linked'; then
+            echo "error: ${ASSET} is not statically linked — refusing to publish" >&2
+            exit 1
+          fi
           ( cd dist && sha256sum "${ASSET}" > SHA256SUMS )
           cat dist/SHA256SUMS
 
@@ -75,11 +85,20 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
+          set -euo pipefail
           if [ "${EVENT_NAME}" = "push" ]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            tag="${GITHUB_REF_NAME}"
           else
-            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+            tag="${INPUT_TAG}"
           fi
+          # Validate the tag before it can drive a publish: the workflow_dispatch input is arbitrary,
+          # and `gh release create` would otherwise mint a non-namespaced tag pointing at this build's
+          # commit. A blank tag is allowed (build-only smoke run); a non-blank one must be namespaced.
+          if [ -n "${tag}" ] && ! printf '%s' "${tag}" | grep -Eq '^shred-proxy-v[0-9]'; then
+            echo "error: release tag '${tag}' must match 'shred-proxy-v<major>...'; refusing to publish" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Publish to GitHub Releases
         if: steps.tag.outputs.tag != ''

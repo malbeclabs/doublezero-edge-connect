@@ -23,12 +23,15 @@ starts on boot:
 curl -fsSL https://get.doublezero.xyz/shred-proxy | bash
 ```
 
-Configure straight from the one-liner — any `DZ_*` variable set before the pipe is recorded into
-`/etc/default/shred-proxy` on a fresh install:
+The privileged steps self-elevate with `sudo`, so a plain `| bash` works for any user with sudo
+(run as root and sudo is skipped). Configure straight from the one-liner — any `DZ_*` variable set
+**on the `bash` invocation** (after the pipe) is recorded into `/etc/default/shred-proxy` on a fresh
+install. Setting them before `curl` would scope them to `curl`, not the script, so they must go on
+the `bash` side of the pipe:
 
 ```bash
-DZ_FORWARD=127.0.0.1:20000 DZ_DEDUP_MODE=dedup \
-  curl -fsSL https://get.doublezero.xyz/shred-proxy | bash
+curl -fsSL https://get.doublezero.xyz/shred-proxy \
+  | DZ_FORWARD=127.0.0.1:20000 DZ_DEDUP_MODE=dedup bash
 ```
 
 Installer environment variables: `SHRED_PROXY_VERSION` (release tag, default `latest`),

@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary published by the new `release.shred-proxy.yml` workflow (tag `shred-proxy-v*`) and installs
   it as a systemd service. The repo is now a Cargo workspace; the bridge's Docker build is scoped to
   `-p doublezero-edge-connect` so the image is unchanged.
+  - Review hardening: PR CI (`rust.yml`) now builds/lints/tests the whole workspace (`--workspace`),
+    not just the root crate, so the member is actually compiled and tested on every PR. The
+    installer self-elevates with `sudo` (so a plain `curl … | bash` works for a non-root user) and
+    a re-run now `restart`s the running service onto the upgraded binary; `DZ_*` config is documented
+    to be set after the pipe (on the `bash` invocation), and the unit/env/sysctl files are fetched
+    from the resolved release tag rather than a moving `main`. The reconciler is fail-open: a
+    transient `ip route get` failure keeps the current activation instead of tearing forwarding down
+    (was fail-empty), and one long-lived signal listener avoids dropping a SIGTERM between polls. The
+    release workflow now runs the tests before publishing, asserts the artifact is statically linked,
+    and validates the (dispatch) tag is namespaced. The shipped `RUST_LOG` example no longer silences
+    the forwarder's `doublezero_edge_connect` info logs.
 - **Per-tick win counters** `dz_quote_ticks_won_total{venue, publisher}` /
   `dz_depth_ticks_won_total{venue, publisher}` — the published win-rate primitive. Every
   `source_ts` tick counts exactly once, for the publisher class whose copy arrived first: a
