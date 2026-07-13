@@ -165,6 +165,18 @@ Any engine that speaks WebSocket + JSON consumes it with a thin (~50-100 line) a
 wire contract is in **[PROTOCOL.md](PROTOCOL.md)** (see
 [Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine)).
 
+## Standalone shred-proxy
+
+Shreds-only host and don't need the market-data bridge? The **[`shred-proxy/`](shred-proxy/)**
+workspace member is a lightweight service that joins the `edge-solana-*` shred feeds, deduplicates,
+and forwards to a local UDP port — no Docker, no `doublezero` CLI. Install it with its own one-liner:
+
+```bash
+curl -fsSL https://get.doublezero.xyz/shred-proxy | bash
+```
+
+It reuses this crate's shred forwarder directly; see **[shred-proxy/README.md](shred-proxy/README.md)**.
+
 ## Documentation
 
 - **[docs/](docs/)** — operating reference:

@@ -1,3 +1,10 @@
+# The bridge crate is the workspace root; `shred-proxy/` is a lightweight member binary that reuses
+# this crate's library (the shred forwarder + multicast plumbing) as a path dependency. A single
+# workspace-level Cargo.lock keeps the `--locked` Docker build reproducible across both members.
+[workspace]
+members = [".", "shred-proxy"]
+resolver = "2"
+
 [package]
 name = "doublezero-edge-connect"
 version = "0.1.0"

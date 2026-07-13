@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Standalone `shred-proxy` binary** (new workspace member `shred-proxy/`): a lightweight service
+  that joins the DoubleZero `edge-solana-*` shred multicast feeds, deduplicates, and forwards a
+  single copy of each shred to a local UDP port — meant to run next to a validator without the full
+  bridge. It reuses the bridge library's shred forwarder directly (`doublezero_edge_connect::shred`:
+  receiver, dedup/sigverify, parser, multicast plumbing); the only new code is active-group
+  detection via the kernel routing table (`ip route get`, instead of the `doublezero` CLI), the
+  reconciler, and the CLI. Installs via a one-liner —
+  `curl -fsSL https://get.doublezero.xyz/shred-proxy | bash` — which downloads a prebuilt static
+  binary published by the new `release.shred-proxy.yml` workflow (tag `shred-proxy-v*`) and installs
+  it as a systemd service. The repo is now a Cargo workspace; the bridge's Docker build is scoped to
+  `-p doublezero-edge-connect` so the image is unchanged.
 - **Per-tick win counters** `dz_quote_ticks_won_total{venue, publisher}` /
   `dz_depth_ticks_won_total{venue, publisher}` — the published win-rate primitive. Every
   `source_ts` tick counts exactly once, for the publisher class whose copy arrived first: a

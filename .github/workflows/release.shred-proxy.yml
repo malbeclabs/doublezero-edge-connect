@@ -1,0 +1,92 @@
+name: release.shred-proxy
+
+# Builds the standalone `shred-proxy` binary as a static linux/amd64 (musl) executable and
+# publishes it to GitHub Releases. The install one-liner (scripts served at
+# https://get.doublezero.xyz/shred-proxy) downloads this asset.
+#
+# Triggered by a namespaced tag `shred-proxy-vX.Y.Z` (so it never collides with the bridge's
+# Docker release tags), or manually via workflow_dispatch for a smoke build.
+on:
+  push:
+    tags:
+      - "shred-proxy-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish to (e.g. shred-proxy-v0.1.0); blank = build-only"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  ASSET: shred-proxy-x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # `contents: write` is needed to create/upload the GitHub Release. The publish step itself is
+    # gated on a non-empty tag, so a plain workflow_dispatch smoke build grants the scope but never
+    # writes anything.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # musl-tools provides the `musl-gcc` linker driver used for the static target.
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build (static, release)
+        run: cargo build --release --locked -p shred-proxy --target "${TARGET}"
+
+      - name: Stage artifact + checksum
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${TARGET}/release/shred-proxy" "dist/${ASSET}"
+          # Confirm it really is static — a dynamic build would fail on hosts without the same libc.
+          file "dist/${ASSET}"
+          ( cd dist && sha256sum "${ASSET}" > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shred-proxy-${{ env.TARGET }}
+          path: dist/*
+
+      # Resolve the release tag: the pushed tag on a tag push, or the dispatch input otherwise.
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to GitHub Releases
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Create the release if it doesn't exist yet, then (re)upload the assets.
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --notes "Standalone shred-proxy binary (static linux/amd64). Install: curl -fsSL https://get.doublezero.xyz/shred-proxy | bash"
+          fi
+          gh release upload "${TAG}" "dist/${ASSET}" "dist/SHA256SUMS" --clobber
