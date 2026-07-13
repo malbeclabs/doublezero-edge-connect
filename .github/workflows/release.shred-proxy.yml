@@ -69,11 +69,16 @@ jobs:
       # Resolve the release tag: the pushed tag on a tag push, or the dispatch input otherwise.
       - name: Resolve tag
         id: tag
+        # The dispatch input is untrusted; pass it via env rather than interpolating `${{ }}` into
+        # the shell (avoids command injection), matching the repo's other workflows.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${EVENT_NAME}" = "push" ]; then
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Publish to GitHub Releases

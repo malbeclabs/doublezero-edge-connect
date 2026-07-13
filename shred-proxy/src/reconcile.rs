@@ -102,12 +102,22 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
     loop {
         let desired = detect_active_sources(&cfg).await;
 
-        // If the live forwarder exited on its own (channel closed / fatal bind error), clear it so it
-        // can be re-activated if still desired.
-        if let Some((_, handle)) = &current {
-            if handle.is_finished() {
-                warn!("shred forwarder task exited; will re-activate if still desired");
-                current = None;
+        // If the live forwarder exited on its own (channel closed / fatal bind error), surface why
+        // and clear it so it can be re-activated if still desired. Awaiting the finished handle
+        // yields immediately and lets us log the actual error/panic instead of swallowing it (a
+        // persistently-failing forwarder would otherwise silently respawn every tick).
+        if current.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            let (_, handle) = current.take().expect("checked is_some above");
+            match handle.await {
+                Ok(Ok(())) => {
+                    info!("shred forwarder exited cleanly; will re-activate if still desired")
+                }
+                Ok(Err(e)) => {
+                    warn!(%e, "shred forwarder exited with error; will re-activate if still desired")
+                }
+                Err(e) => {
+                    warn!(%e, "shred forwarder task panicked; will re-activate if still desired")
+                }
             }
         }
 

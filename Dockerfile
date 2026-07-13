@@ -32,11 +32,11 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # The repo is a Cargo workspace: `shred-proxy/` is a sibling member crate. Cargo needs every
-# member's manifest present to resolve the workspace, but this image only ships the bridge, so we
-# copy the member's manifest (a stub build with no sources would need its own layer) and scope the
-# build to `-p doublezero-edge-connect` — the shred-proxy binary is released separately.
+# member's manifest present to resolve the workspace, so we copy only the member's manifest — not
+# its sources, which the scoped `-p doublezero-edge-connect` build never compiles. Leaving the
+# sources out keeps edits to shred-proxy from busting this image's build cache; the shred-proxy
+# binary is released separately.
 COPY shred-proxy/Cargo.toml ./shred-proxy/Cargo.toml
-COPY shred-proxy/src ./shred-proxy/src
 # Cache the cargo registry and the target dir across builds (BuildKit cache mounts) for fast
 # rebuilds. The target dir lives in the cache mount (not in the image layer), so the binary
 # must be copied out within this same RUN before the mount goes away.

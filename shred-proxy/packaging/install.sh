@@ -43,7 +43,7 @@ if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
   exit 1
 fi
 
-for tool in curl install systemctl sysctl; do
+for tool in curl install systemctl sysctl ip; do
   command -v "$tool" >/dev/null 2>&1 || { echo "error: '$tool' not found in PATH" >&2; exit 1; }
 done
 
@@ -85,7 +85,10 @@ chmod 0755 "${TMP}/${BIN_NAME}"
 
 # --- Install ------------------------------------------------------------------------------------
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# When run via `curl | bash` there is no script file on disk, so BASH_SOURCE[0] is unset — and
+# under `set -u` referencing it would abort. Fall back so SCRIPT_DIR is simply empty in that case;
+# fetch_asset then pulls the packaging files from the repo instead of looking next to the script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || true)"
 
 echo "==> installing binary            -> ${PREFIX}/${BIN_NAME}"
 install -D -m 0755 "${TMP}/${BIN_NAME}" "${PREFIX}/${BIN_NAME}"

@@ -120,7 +120,21 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    info!(?args, "starting shred-proxy");
+    // Log the config, but redact `rpc_url`: paid Solana RPC endpoints embed their API key in the URL
+    // (e.g. `?api-key=…`), and `?args` would write it verbatim into the journal.
+    info!(
+        candidate_groups = ?args.candidate_groups,
+        port = args.port,
+        sources = ?args.sources,
+        forward = ?args.forward,
+        iface = %args.iface,
+        recv_buf = args.recv_buf,
+        dedup_mode = ?args.dedup_mode,
+        rpc_url = args.rpc_url.as_ref().map(|_| "<redacted>"),
+        dedup_window_slots = args.dedup_window_slots,
+        refresh_secs = args.refresh_secs,
+        "starting shred-proxy"
+    );
 
     // Validate/parse everything up front (pure parse, no I/O) so a bad flag fails fast.
     let forward = shred::parse_forwards(&args.forward)?;
