@@ -1,0 +1,22 @@
+[package]
+name = "shred-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Receives shreds from DoubleZero's edge-solana multicast feeds (active groups detected via the routing table) and forwards them deduplicated to a local UDP port"
+authors = ["Malbec Labs <dev@malbeclabs.com>"]
+license = "Apache-2.0"
+
+[[bin]]
+name = "shred-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# The whole shred forwarder — receive, dedup/sigverify, fan-out, multicast bind, interface
+# resolution — is reused verbatim from the bridge crate's library. This binary only adds
+# routing-table active-group detection, the reconciler, and the CLI.
+doublezero-edge-connect = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

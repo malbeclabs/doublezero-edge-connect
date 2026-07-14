@@ -16,6 +16,7 @@ on:
       - "scripts/connect.sh"
       - "scripts/connect-testnet.sh"
       - "scripts/connect-devnet.sh"
+      - "shred-proxy/packaging/install.sh"
       - ".github/workflows/release.install-script.yml"
   workflow_dispatch:
 
@@ -54,8 +55,17 @@ jobs:
               --cache-control "public,max-age=120"
           done
 
+      # The standalone shred-proxy installer is served under the same bucket at
+      # https://get.doublezero.xyz/shred-proxy. It downloads the prebuilt binary published by
+      # release.shred-proxy.yml, so it is decoupled from the Docker-image release cadence.
+      - name: Upload shred-proxy installer
+        run: |
+          aws s3 cp shred-proxy/packaging/install.sh "s3://${BUCKET}/shred-proxy" \
+            --content-type text/x-shellscript \
+            --cache-control "public,max-age=120"
+
       - name: Invalidate CloudFront cache
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "$DISTRIBUTION_ID" \
-            --paths '/connect' '/connect-testnet' '/connect-devnet'
+            --paths '/connect' '/connect-testnet' '/connect-devnet' '/shred-proxy'

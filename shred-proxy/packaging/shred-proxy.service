@@ -1,0 +1,54 @@
+[Unit]
+Description=DoubleZero shred proxy (multicast edge-solana shreds -> local UDP, deduplicated)
+Documentation=https://github.com/malbeclabs/doublezero-edge-connect/tree/main/shred-proxy
+# The multicast groups route over the DoubleZero tunnel; wait for the network to be up.
+After=network-online.target
+Wants=network-online.target
+# This service sits unattended next to a validator, so never latch `failed` permanently: disable the
+# start-rate limiter (this directive lives in [Unit] on systemd >= 230) so a burst of instant crashes
+# can't exhaust the default StartLimitBurst=5/10s and make systemd give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# All tuning is done via DZ_* environment variables (each CLI flag has a DZ_* equivalent), so the
+# unit itself never changes. Drop overrides in /etc/default/shred-proxy, e.g.:
+#   DZ_FORWARD=127.0.0.1:8001
+#   DZ_IFACE=doublezero1
+#   DZ_DEDUP_MODE=dedup
+#   RUST_LOG=warn,shred_proxy=info
+EnvironmentFile=-/etc/default/shred-proxy
+ExecStart=/usr/local/bin/shred-proxy
+
+# Graceful stop: the process handles SIGTERM (systemctl's default stop signal), logs the groups it
+# is leaving, and exits 0. Give it a short window before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Keep it running: restart on crash (rate limiter disabled in [Unit] above).
+Restart=on-failure
+RestartSec=5
+
+# Logs go to the journal (stdout/stderr). Colours are auto-disabled because stdout is not a TTY.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shred-proxy
+
+# --- Hardening ---
+# The proxy only needs to receive multicast, forward to a local UDP port, and shell out to `ip`
+# (routing-table detection). No privileged capabilities, no filesystem writes.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

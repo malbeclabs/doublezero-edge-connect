@@ -24,7 +24,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --release --verbose
+      # `--workspace` is required: this is a root-package workspace (root `Cargo.toml` has both
+      # `[package]` and `[workspace]`), so a bare `cargo build` selects only the root crate and would
+      # never compile the `shred-proxy` member. Same for clippy/test below.
+      - run: cargo build --workspace --release --verbose
 
   rust-lint:
     runs-on: ubuntu-latest
@@ -46,7 +49,7 @@ jobs:
       # The nightly toolchain above is now the default, but clippy is only installed on
       # stable — pin clippy to stable so it doesn't resolve to the (clippy-less) nightly.
       - name: clippy
-        run: cargo +stable clippy --all-targets -- -Dclippy::all -Dwarnings
+        run: cargo +stable clippy --workspace --all-targets -- -Dclippy::all -Dwarnings
 
   rust-test:
     runs-on: ubuntu-latest
@@ -56,4 +59,4 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --all-features --verbose
+      - run: cargo test --workspace --all-features --verbose
