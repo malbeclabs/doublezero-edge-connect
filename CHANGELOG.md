@@ -29,7 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (was fail-empty), and one long-lived signal listener avoids dropping a SIGTERM between polls. The
     release workflow now runs the tests before publishing, asserts the artifact is statically linked,
     and validates the (dispatch) tag is namespaced. The shipped `RUST_LOG` example no longer silences
-    the forwarder's `doublezero_edge_connect` info logs.
+    the forwarder's `doublezero_edge_connect` info logs. Additional hardening: the installer now
+    errors (rather than silently skipping) when `SHA256SUMS` is missing unless
+    `SHRED_PROXY_SKIP_CHECKSUM=1`; the systemd unit disables the start-rate limiter
+    (`StartLimitIntervalSec=0`, `RestartSec=5`) so an unattended service never latches `failed`; and
+    the binary bails at startup when `--iface` is an IP in detection mode (which would never match a
+    routing-table interface name).
 - **Per-tick win counters** `dz_quote_ticks_won_total{venue, publisher}` /
   `dz_depth_ticks_won_total{venue, publisher}` — the published win-rate primitive. Every
   `source_ts` tick counts exactly once, for the publisher class whose copy arrived first: a

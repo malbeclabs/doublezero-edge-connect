@@ -150,6 +150,13 @@ pub async fn run(cfg: ReconcileConfig) -> Result<()> {
                 // abort is abrupt, so the receivers can't log on their way out — log the groups we are
                 // leaving here, before aborting. Note the whole forwarder is restarted on any change,
                 // so this lists every currently-joined group, not only the ones in `removed`.
+                //
+                // Restarting the whole forwarder resets its `DedupWindow`, so for a brief moment after
+                // a membership change already-forwarded shreds can be re-forwarded (a small duplicate
+                // burst). This is acceptable for v0.1: membership changes are rare in steady state,
+                // and with fail-open detection above they no longer fire on transient probe blips.
+                // A follow-up could keep the forwarder task persistent and reconcile only its
+                // receiver set to avoid the reset entirely.
                 if let Some((old_sources, handle)) = current.take() {
                     info!(groups = ?old_sources, "leaving multicast groups; stopping shred forwarder");
                     handle.abort();

@@ -159,6 +159,18 @@ async fn main() -> Result<()> {
     if args.candidate_groups.is_empty() && explicit_sources.is_empty() {
         bail!("no candidate groups (--candidate-group) nor explicit sources (--source)");
     }
+    // Routing-table detection matches the egress interface by *name* (`ip route get … dev <name>`),
+    // so an IPv4 literal `--iface` never matches and detection would silently sit "forwarder idle"
+    // forever. Bail early with an actionable message rather than looking healthy but forwarding
+    // nothing. (An IP `--iface` is only meaningful alongside `--source`, which skips detection.)
+    if explicit_sources.is_empty() && args.iface.parse::<Ipv4Addr>().is_ok() {
+        bail!(
+            "--iface {} is an IP, but routing-table detection matches interface names only, so no \
+             group would ever be detected. Pass an interface name (e.g. doublezero1), or pin \
+             --source explicitly when using an IP.",
+            args.iface
+        );
+    }
 
     let cfg = reconcile::ReconcileConfig {
         candidates: dedup_preserving_order(args.candidate_groups),

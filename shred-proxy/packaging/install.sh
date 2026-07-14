@@ -20,6 +20,7 @@
 #   SHRED_PROXY_VERSION   release tag to install (default: latest)
 #   SHRED_PROXY_REPO      GitHub owner/repo to fetch from (default: malbeclabs/doublezero-edge-connect)
 #   SHRED_PROXY_NO_START  set to 1 to install without enabling/starting the service
+#   SHRED_PROXY_SKIP_CHECKSUM  set to 1 to skip SHA256SUMS verification (manual/mirror installs only)
 #   DZ_*                  any DZ_* var is written into /etc/default/shred-proxy on a fresh install
 set -euo pipefail
 
@@ -98,9 +99,13 @@ trap 'rm -rf "${TMP}"' EXIT
 echo "==> downloading ${ASSET} (${VERSION}) from ${REPO}"
 curl -fSL --proto '=https' --tlsv1.2 -o "${TMP}/${BIN_NAME}" "${BASE}/${ASSET}"
 
-# Verify the checksum against the published SHA256SUMS if it is available (it always is for our
-# releases; tolerate its absence so a manual/mirror install still works).
-if curl -fsSL --proto '=https' --tlsv1.2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS"; then
+# Verify the checksum against the published SHA256SUMS. Our releases always publish it, so a missing
+# SHA256SUMS is treated as an error (a mis-upload/CDN glitch must not silently disable verification of
+# a root-installed binary). Skipping is an explicit opt-out for manual/mirror installs only:
+# SHRED_PROXY_SKIP_CHECKSUM=1.
+if [[ "${SHRED_PROXY_SKIP_CHECKSUM:-0}" == "1" ]]; then
+  echo "   (warning: SHRED_PROXY_SKIP_CHECKSUM=1 set; skipping checksum verification)"
+elif curl -fsSL --proto '=https' --tlsv1.2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS"; then
   echo "==> verifying checksum"
   expected="$(awk -v a="${ASSET}" '$2 == a || $2 == "*"a {print $1}' "${TMP}/SHA256SUMS" | head -n1)"
   if [[ -z "${expected}" ]]; then
@@ -115,7 +120,9 @@ if curl -fsSL --proto '=https' --tlsv1.2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256S
     exit 1
   fi
 else
-  echo "   (warning: SHA256SUMS not found; skipping checksum verification)"
+  echo "error: SHA256SUMS not found at ${BASE}/SHA256SUMS — refusing to install an unverified" >&2
+  echo "       root binary. Set SHRED_PROXY_SKIP_CHECKSUM=1 to override (manual/mirror installs)." >&2
+  exit 1
 fi
 
 chmod 0755 "${TMP}/${BIN_NAME}"

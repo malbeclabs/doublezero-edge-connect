@@ -4,6 +4,10 @@ Documentation=https://github.com/malbeclabs/doublezero-edge-connect/tree/main/sh
 # The multicast groups route over the DoubleZero tunnel; wait for the network to be up.
 After=network-online.target
 Wants=network-online.target
+# This service sits unattended next to a validator, so never latch `failed` permanently: disable the
+# start-rate limiter (this directive lives in [Unit] on systemd >= 230) so a burst of instant crashes
+# can't exhaust the default StartLimitBurst=5/10s and make systemd give up restarting.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -22,9 +26,9 @@ ExecStart=/usr/local/bin/shred-proxy
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
-# Keep it running: restart on crash, throttle a crash loop.
+# Keep it running: restart on crash (rate limiter disabled in [Unit] above).
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 # Logs go to the journal (stdout/stderr). Colours are auto-disabled because stdout is not a TTY.
 StandardOutput=journal
