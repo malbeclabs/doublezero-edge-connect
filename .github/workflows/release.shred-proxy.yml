@@ -105,11 +105,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
+          BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Create the release if it doesn't exist yet, then (re)upload the assets.
+          # Create the release if it doesn't exist yet, then (re)upload the assets. `--target` pins a
+          # newly-minted tag (workflow_dispatch, where the tag doesn't exist yet) to the exact commit
+          # that was built, not default-branch HEAD; on a tag push the tag already resolves to its
+          # commit so --target is a no-op.
           if ! gh release view "${TAG}" >/dev/null 2>&1; then
             gh release create "${TAG}" \
+              --target "${BUILD_SHA}" \
               --title "${TAG}" \
               --notes "Standalone shred-proxy binary (static linux/amd64). Install: curl -fsSL https://get.doublezero.xyz/shred-proxy | bash"
           fi

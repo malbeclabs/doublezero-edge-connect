@@ -36,7 +36,8 @@ curl -fsSL https://get.doublezero.xyz/shred-proxy \
 
 Installer environment variables: `SHRED_PROXY_VERSION` (release tag, default `latest`),
 `SHRED_PROXY_REPO` (default `malbeclabs/doublezero-edge-connect`), `SHRED_PROXY_NO_START=1` (install
-without starting). Requires **Linux/amd64** and **iproute2** (`ip`) for routing-table detection.
+without starting), `SHRED_PROXY_SKIP_CHECKSUM=1` (skip SHA256SUMS verification — manual/mirror
+installs only). Requires **Linux/amd64** and **iproute2** (`ip`) for routing-table detection.
 
 Manage the service:
 

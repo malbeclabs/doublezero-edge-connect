@@ -34,7 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `SHRED_PROXY_SKIP_CHECKSUM=1`; the systemd unit disables the start-rate limiter
     (`StartLimitIntervalSec=0`, `RestartSec=5`) so an unattended service never latches `failed`; and
     the binary bails at startup when `--iface` is an IP in detection mode (which would never match a
-    routing-table interface name).
+    routing-table interface name). Detection distinguishes a candidate the kernel has no route to (a
+    clean `ip route get` non-zero exit → treated as inactive) from a genuine probe failure
+    (spawn/decode error → keep current), so a routeless unsubscribed candidate on a host with no
+    default route can't stall activation. Release publishes pin a dispatch-created tag to the built
+    commit (`--target`), and the shipped env example documents `sigverify`/`DZ_RPC_URL`.
 - **Per-tick win counters** `dz_quote_ticks_won_total{venue, publisher}` /
   `dz_depth_ticks_won_total{venue, publisher}` — the published win-rate primitive. Every
   `source_ts` tick counts exactly once, for the publisher class whose copy arrived first: a

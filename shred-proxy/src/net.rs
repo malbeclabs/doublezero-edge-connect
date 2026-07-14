@@ -25,19 +25,20 @@ fn parse_dev(route_line: &str) -> Option<&str> {
 
 /// Egress interface (`dev`) the kernel would use to reach `ip`, per `ip route get`.
 ///
-/// Distinguishes "ran, no `dev` token" (`Ok(None)`) from "could not probe" (`Err`): a failure to
-/// spawn `ip` or a non-zero exit is a *transient* error, not evidence the group is inactive, so it
-/// must not be silently collapsed to `None` (that would tear down live forwarding — see
-/// [`active_groups`]).
+/// Distinguishes "this group is not routed here" (`Ok(None)`) from "could not probe" (`Err`):
+/// - **Spawn failure** (`ip` missing, fork error) and **undecodable output** are `Err` — genuinely
+///   transient/environmental, so the reconciler keeps the current activation rather than mistaking
+///   them for "inactive" (that would tear down live forwarding — see [`active_groups`]).
+/// - A **clean non-zero exit** is `ip`'s own answer that there is no route to the group (e.g.
+///   "Network is unreachable" on a host with no default route). That is a real "not active here",
+///   so it maps to `Ok(None)` — otherwise, starting from nothing, an unsubscribed candidate with no
+///   route would poison every tick as unavailable and the forwarder would never activate.
 fn route_egress_iface(ip: Ipv4Addr) -> io::Result<Option<String>> {
     let out = std::process::Command::new("ip")
         .args(["route", "get", &ip.to_string()])
         .output()?;
     if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "`ip route get {ip}` exited with {}",
-            out.status
-        )));
+        return Ok(None);
     }
     let s = std::str::from_utf8(&out.stdout)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -49,10 +50,11 @@ fn route_egress_iface(ip: Ipv4Addr) -> io::Result<Option<String>> {
 /// (`doublezero1`), while an unsubscribed one falls back to the default multicast route (a different
 /// interface), so the egress interface is the "active group" discriminator.
 ///
-/// Returns `Err` if **any** candidate probe could not run: a transient `ip` failure is
-/// indistinguishable from "not routed here", so rather than fail-empty (which would blank the active
-/// set and tear the forwarder down) we surface the error and let the reconciler keep the current
-/// activation (fail-open, matching the bridge reconciler).
+/// Returns `Err` if **any** candidate probe could not run (spawn/decode failure — see
+/// [`route_egress_iface`]): those are transient, so rather than fail-empty (which would blank the
+/// active set and tear the forwarder down) we surface the error and let the reconciler keep the
+/// current activation (fail-open, matching the bridge reconciler). A candidate the kernel simply has
+/// no route to is `Ok`-not-active, so a routeless unsubscribed candidate does not poison the tick.
 ///
 /// `dz_iface` must be an interface **name** (e.g. `doublezero1`), not an IP: `ip route get` reports
 /// the interface by name. When `--iface` is passed as an IP (tests), this detection won't match and
