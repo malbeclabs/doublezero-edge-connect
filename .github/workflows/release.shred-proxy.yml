@@ -62,8 +62,11 @@ jobs:
           cp "target/${TARGET}/release/shred-proxy" "dist/${ASSET}"
           # Assert (not just print) that it really is static — a dynamic build would fail on hosts
           # without the same libc, so a non-static artifact must fail the release, not ship silently.
+          # A musl release build links as a PIE by default, which `file` reports as "static-pie
+          # linked" (still no interpreter / no shared-lib deps) rather than "statically linked";
+          # accept both so a genuinely static binary isn't rejected.
           file "dist/${ASSET}"
-          if ! file "dist/${ASSET}" | grep -q 'statically linked'; then
+          if ! file "dist/${ASSET}" | grep -Eq 'statically linked|static-pie linked'; then
             echo "error: ${ASSET} is not statically linked — refusing to publish" >&2
             exit 1
           fi

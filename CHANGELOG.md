@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     clean `ip route get` non-zero exit → treated as inactive) from a genuine probe failure
     (spawn/decode error → keep current), so a routeless unsubscribed candidate on a host with no
     default route can't stall activation. Release publishes pin a dispatch-created tag to the built
-    commit (`--target`), and the shipped env example documents `sigverify`/`DZ_RPC_URL`.
+    commit (`--target`), and the shipped env example documents `sigverify`/`DZ_RPC_URL`. The
+    static-linkage assertion now also accepts `file`'s `static-pie linked` wording (a musl release
+    build links as a PIE by default), so a genuinely static binary is no longer rejected at publish.
 - **Per-tick win counters** `dz_quote_ticks_won_total{venue, publisher}` /
   `dz_depth_ticks_won_total{venue, publisher}` — the published win-rate primitive. Every
   `source_ts` tick counts exactly once, for the publisher class whose copy arrived first: a
