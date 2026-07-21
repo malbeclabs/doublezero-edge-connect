@@ -143,7 +143,7 @@ fn symbol_by_id(recs: &[(IpAddr, u8, Vec<u8>)]) -> HashMap<u32, String> {
         if let Ok((_h, msgs)) = codec::decode_frame(frame) {
             for m in &msgs {
                 if let codec::Message::InstrumentDefinition(d) = m {
-                    map.insert(d.instrument_id, d.symbol.clone());
+                    map.insert(d.instrument_id, d.symbol.to_string());
                 }
             }
         }

@@ -69,7 +69,7 @@ pub struct ShredParams {
 /// Everything the reconciler needs: the shared pipeline handles (cloned into each spawned task) and
 /// the static config. Built in `main`.
 pub struct ReconcilerConfig {
-    pub tx: broadcast::Sender<FeedMessage>,
+    pub tx: broadcast::Sender<std::sync::Arc<FeedMessage>>,
     pub arbiter: SharedArbiter,
     pub instruments: InstrumentSnapshot,
     pub depth: DepthSnapshot,

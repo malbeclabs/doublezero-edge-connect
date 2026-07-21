@@ -40,6 +40,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use prometheus::{Histogram, IntCounter};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -419,14 +420,17 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 /// [`SharedArbiter`] so the multicast receiver tasks and the WS feeder share one instance — hence one
 /// floor per `(venue, symbol)`, on which all sources race.
 pub struct Arbiter {
-    tx: broadcast::Sender<FeedMessage>,
+    /// The backbone carries `Arc<FeedMessage>` so a per-subscriber delivery is a refcount bump, not
+    /// a deep clone of the message's `String`/`Vec`s.
+    tx: broadcast::Sender<Arc<FeedMessage>>,
     /// Cross-source dedup for quotes. Deliberately EXEMPT from the session-reset escape hatch the
     /// depth floor gets (see `depths` below): the TOB `source_ts` is epoch block time, monotonic
     /// across sessions by construction, so a session boundary cannot restart it below the latched
     /// high-water — and 0, the "not available" sentinel, bypasses this floor entirely. Revisit if
-    /// a venue with a session-scoped quote clock is ever added.
-    quotes: StalenessFloor<(String, String), QuoteId, Publisher>,
-    trades: WindowedDedup<(String, String), u64, Publisher>,
+    /// a venue with a session-scoped quote clock is ever added. The key `(venue, symbol)` is
+    /// `Arc<str>` (venues interned via `model::venue_arc`), so building it allocates nothing.
+    quotes: StalenessFloor<(Arc<str>, Arc<str>), QuoteId, Publisher>,
+    trades: WindowedDedup<(Arc<str>, Arc<str>), u64, Publisher>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
@@ -438,7 +442,7 @@ pub struct Arbiter {
     /// self-heal (the floor stays latched) — so the MBO processor clears the affected entries on
     /// `EndOfSession` / `InstrumentReset` via [`Arbiter::reset_depth_floor_for_venue`] /
     /// [`Arbiter::reset_depth_floor_for_symbol`], the session-reset escape hatch.
-    depths: StalenessFloor<(String, String), DepthId, Publisher>,
+    depths: StalenessFloor<(Arc<str>, Arc<str>), DepthId, Publisher>,
     /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
     /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
     /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
@@ -448,16 +452,110 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
+    /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
+    /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
+    /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
+    venue_metrics: HashMap<Arc<str>, VenueMetrics>,
 }
 
+/// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
+fn pub_idx(p: Publisher) -> usize {
+    match p {
+        Publisher::Edge(_) => 0,
+        Publisher::PublicWs => 1,
+    }
+}
+
+/// Pre-resolved `dz_*` metric children for one venue. Built once per venue via [`VenueMetrics::new`];
+/// every field is a cheap-to-`inc()` handle, so the per-message emit path pays no label lookup.
+struct VenueMetrics {
+    /// `dz_emit_total{kind}` indexed by kind: quote/trade/instrument/midpoint/depth/status.
+    emit: [IntCounter; 6],
+    /// `dz_quotes_admitted_total{publisher}` / `dz_trades_admitted_total{publisher}`, `[edge, public]`.
+    quotes_admitted: [IntCounter; 2],
+    trades_admitted: [IntCounter; 2],
+    /// `dz_quote_ticks_won_total{publisher}` / `dz_depth_ticks_won_total{publisher}`, `[edge, public]`.
+    quote_ticks_won: [IntCounter; 2],
+    depth_ticks_won: [IntCounter; 2],
+    quotes_dropped: IntCounter,
+    trades_dropped: IntCounter,
+    quotes_future_rejected: IntCounter,
+    quotes_no_source_ts: IntCounter,
+    /// `dz_depth_admitted_total{publisher}` / `dz_depth_dropped_total{publisher}`, `[edge, public]`.
+    depth_admitted: [IntCounter; 2],
+    depth_dropped: [IntCounter; 2],
+    depth_future_rejected: IntCounter,
+    /// `dz_quote_lead_ns{winner,loser}` / `dz_trade_lead_ns{winner,loser}` / `dz_depth_lead_ns
+    /// {winner,loser}` indexed `winner_idx * 2 + loser_idx` over `[edge, public]`.
+    quote_lead: [Histogram; 4],
+    trade_lead: [Histogram; 4],
+    depth_lead: [Histogram; 4],
+}
+
+impl VenueMetrics {
+    fn new(venue: &str) -> Self {
+        let m = metrics();
+        let emit_kind = |k: &str| m.emit.with_label_values(&[venue, k]);
+        // Pre-resolve the `[edge, public]` children of a `{venue, publisher}` counter, in `pub_idx`
+        // order (edge=0, public=1) so the emit path indexes with `pub_idx(publisher)`.
+        let by_pub = |c: &prometheus::IntCounterVec| {
+            [
+                c.with_label_values(&[venue, "edge"]),
+                c.with_label_values(&[venue, "public"]),
+            ]
+        };
+        let lead = |h: &prometheus::HistogramVec| {
+            [
+                h.with_label_values(&[venue, "edge", "edge"]),
+                h.with_label_values(&[venue, "edge", "public"]),
+                h.with_label_values(&[venue, "public", "edge"]),
+                h.with_label_values(&[venue, "public", "public"]),
+            ]
+        };
+        Self {
+            emit: [
+                emit_kind("quote"),
+                emit_kind("trade"),
+                emit_kind("instrument"),
+                emit_kind("midpoint"),
+                emit_kind("depth"),
+                emit_kind("status"),
+            ],
+            quotes_admitted: by_pub(&m.quotes_admitted),
+            trades_admitted: by_pub(&m.trades_admitted),
+            quote_ticks_won: by_pub(&m.quote_ticks_won),
+            depth_ticks_won: by_pub(&m.depth_ticks_won),
+            quotes_dropped: m.quotes_dropped.with_label_values(&[venue]),
+            trades_dropped: m.trades_dropped.with_label_values(&[venue]),
+            quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
+            quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
+            depth_admitted: by_pub(&m.depth_admitted),
+            depth_dropped: by_pub(&m.depth_dropped),
+            depth_future_rejected: m.depth_future_rejected.with_label_values(&[venue]),
+            quote_lead: lead(&m.quote_lead_ns),
+            trade_lead: lead(&m.trade_lead_ns),
+            depth_lead: lead(&m.depth_lead_ns),
+        }
+    }
+}
+
+/// Kind index into [`VenueMetrics::emit`].
+const EMIT_QUOTE: usize = 0;
+const EMIT_TRADE: usize = 1;
+const EMIT_INSTRUMENT: usize = 2;
+const EMIT_MIDPOINT: usize = 3;
+const EMIT_DEPTH: usize = 4;
+const EMIT_STATUS: usize = 5;
+
 impl Arbiter {
-    pub fn new(tx: broadcast::Sender<FeedMessage>, trade_window: usize) -> Self {
+    pub fn new(tx: broadcast::Sender<Arc<FeedMessage>>, trade_window: usize) -> Self {
         Self {
             tx,
             quotes: StalenessFloor::new(QUOTE_TICK_CAP),
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
+            venue_metrics: HashMap::new(),
         }
     }
 
@@ -468,9 +566,17 @@ impl Arbiter {
         self.depth_replay = Some(depth);
     }
 
+    /// The pre-resolved metric children for `venue`, created on first use.
+    fn vm(&mut self, venue: &Arc<str>) -> &VenueMetrics {
+        self.venue_metrics
+            .entry(venue.clone())
+            .or_insert_with(|| VenueMetrics::new(venue))
+    }
+
     /// The broadcast sender, so output sinks can `subscribe()` and `Status` can be sent directly
-    /// (it carries no business identity to dedup).
-    pub fn sender(&self) -> &broadcast::Sender<FeedMessage> {
+    /// (it carries no business identity to dedup). The backbone carries `Arc<FeedMessage>` so a
+    /// per-receiver delivery is a refcount bump, not a deep clone of the message's `String`/`Vec`s.
+    pub fn sender(&self) -> &broadcast::Sender<Arc<FeedMessage>> {
         &self.tx
     }
 
@@ -490,9 +596,9 @@ impl Arbiter {
     /// an already-served `source_ts` — full-state, so consumers self-heal. Strictly better than
     /// the permanent wedge the reset prevents.
     pub fn reset_depth_floor_for_venue(&mut self, venue: &str, reason: &'static str) {
-        let cleared = self.depths.reset_where(|(v, _)| v == venue);
+        let cleared = self.depths.reset_where(|(v, _)| v.as_ref() == venue);
         if let Some(replay) = &self.depth_replay {
-            model::lock(replay).retain(|(v, _), _| v != venue);
+            model::lock(replay).retain(|(v, _), _| v.as_ref() != venue);
         }
         self.record_floor_resets(venue, reason, cleared);
     }
@@ -514,9 +620,11 @@ impl Arbiter {
         symbol: &str,
         reason: &'static str,
     ) {
-        let cleared = self.depths.reset_where(|(v, s)| v == venue && s == symbol);
+        let cleared = self
+            .depths
+            .reset_where(|(v, s)| v.as_ref() == venue && s.as_ref() == symbol);
         if let Some(replay) = &self.depth_replay {
-            model::lock(replay).remove(&(venue.to_string(), symbol.to_string()));
+            model::lock(replay).remove(&(Arc::from(venue), Arc::from(symbol)));
         }
         self.record_floor_resets(venue, reason, cleared);
     }
@@ -534,114 +642,104 @@ impl Arbiter {
     /// source racing for the quote floor's per-tick leadership; it is ignored for non-quote
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
+    ///
+    /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
+    /// increments a cached handle rather than doing a label-map lookup for each counter.
     pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
-        let m = metrics();
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
                 // time): forward it but never let it touch the floor — as a tick it would pin
                 // `high_water` at 0 and drop every later quote as stale.
                 if q.source_ts_ns == 0 {
-                    m.quotes_no_source_ts.with_label_values(&[&q.venue]).inc();
-                    m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
-                    let _ = self.tx.send(msg);
+                    let vm = self.vm(&q.venue);
+                    vm.quotes_no_source_ts.inc();
+                    vm.emit[EMIT_QUOTE].inc();
+                    let _ = self.tx.send(Arc::new(msg));
                     return;
                 }
                 // Reject an implausibly-far-future `source_ts` before it can advance the floor.
                 // The floor is shared by the trusted edge and the untrusted public WS; one bad/
                 // hostile public timestamp years ahead would otherwise latch `high_water` and drop
                 // every real edge quote as stale until restart (see `MAX_FUTURE_SKEW_NS`).
-                if q.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
-                    m.quotes_future_rejected
-                        .with_label_values(&[&q.venue])
-                        .inc();
+                //
+                // Compare against the quote's own arrival wall clock (`recv_ts_ns`, sampled at
+                // receive) rather than sampling `now_ns()` again here — one fewer clock read per
+                // quote on the hot path. Fall back to a fresh sample only if it was never stamped.
+                let now = if q.recv_ts_ns != 0 {
+                    q.recv_ts_ns
+                } else {
+                    now_ns()
+                };
+                if q.source_ts_ns > now.saturating_add(MAX_FUTURE_SKEW_NS) {
+                    self.vm(&q.venue).quotes_future_rejected.inc();
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
                 // `recv_ts_ns` is the cross-source-comparable arrival clock (host wall clock,
                 // sampled for both the edge receiver and the public WS feeder).
-                match self.quotes.admit(
-                    key,
-                    q.source_ts_ns,
-                    QuoteId::of(q),
-                    publisher,
-                    q.recv_ts_ns,
-                ) {
+                let decision =
+                    self.quotes
+                        .admit(key, q.source_ts_ns, QuoteId::of(q), publisher, q.recv_ts_ns);
+                let vm = self.vm(&q.venue);
+                match decision {
                     Admit::Emitted { opened_tick } => {
-                        m.emit.with_label_values(&[q.venue.as_str(), "quote"]).inc();
+                        vm.emit[EMIT_QUOTE].inc();
                         // Attribute the admitted quote to its winning publisher. A rise in
                         // `publisher="public"` is the direct signal of the public backstop filling
                         // an edge gap (in steady state the edge publisher leads every tick).
-                        m.quotes_admitted
-                            .with_label_values(&[q.venue.as_str(), publisher.label()])
-                            .inc();
+                        vm.quotes_admitted[pub_idx(publisher)].inc();
                         // Once per tick: the class whose copy opened this `source_ts` won the
                         // tick. Unlike the contest histogram (in-tick head-to-heads only), every
                         // tick counts exactly once — this is the published win-rate primitive.
                         if opened_tick {
-                            m.quote_ticks_won
-                                .with_label_values(&[q.venue.as_str(), publisher.label()])
-                                .inc();
+                            vm.quote_ticks_won[pub_idx(publisher)].inc();
                         }
-                        let _ = self.tx.send(msg);
+                        let _ = self.tx.send(Arc::new(msg));
                     }
                     // A cross-source follower lost this tick: record how far the winner led, on top
                     // of the plain drop count. The losing copy is `publisher` (the non-leader at
                     // this tick) — labelling both ends keeps an edge-vs-edge mirror race out of the
                     // headline edge-vs-public margin (see `quote_lead_ns` docs).
                     Admit::Contest { winner, lead_ns } => {
-                        m.quotes_dropped.with_label_values(&[&q.venue]).inc();
-                        m.quote_lead_ns
-                            .with_label_values(&[
-                                q.venue.as_str(),
-                                winner.label(),
-                                publisher.label(),
-                            ])
+                        vm.quotes_dropped.inc();
+                        vm.quote_lead[pub_idx(winner) * 2 + pub_idx(publisher)]
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
-                        m.quotes_dropped.with_label_values(&[&q.venue]).inc();
+                        vm.quotes_dropped.inc();
                     }
                 }
             }
             FeedMessage::Trade(t) => {
                 let key = (t.venue.clone(), t.symbol.clone());
-                match self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns) {
+                let decision = self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns);
+                let vm = self.vm(&t.venue);
+                match decision {
                     Admit::Emitted { .. } => {
-                        m.emit.with_label_values(&[t.venue.as_str(), "trade"]).inc();
-                        m.trades_admitted
-                            .with_label_values(&[t.venue.as_str(), publisher.label()])
-                            .inc();
-                        let _ = self.tx.send(msg);
+                        vm.emit[EMIT_TRADE].inc();
+                        vm.trades_admitted[pub_idx(publisher)].inc();
+                        let _ = self.tx.send(Arc::new(msg));
                     }
                     Admit::Contest { winner, lead_ns } => {
-                        m.trades_dropped.with_label_values(&[&t.venue]).inc();
-                        m.trade_lead_ns
-                            .with_label_values(&[
-                                t.venue.as_str(),
-                                winner.label(),
-                                publisher.label(),
-                            ])
+                        vm.trades_dropped.inc();
+                        vm.trade_lead[pub_idx(winner) * 2 + pub_idx(publisher)]
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
-                        m.trades_dropped.with_label_values(&[&t.venue]).inc();
+                        vm.trades_dropped.inc();
                     }
                 }
             }
             // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
             // future `FeedMessage` variant is a compile error here, not a silent miss / runtime panic.
             FeedMessage::Instrument(i) => {
-                m.emit
-                    .with_label_values(&[i.venue.as_str(), "instrument"])
-                    .inc();
-                let _ = self.tx.send(msg);
+                self.vm(&i.venue).emit[EMIT_INSTRUMENT].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
-                m.emit
-                    .with_label_values(&[mp.venue.as_str(), "midpoint"])
-                    .inc();
-                let _ = self.tx.send(msg);
+                self.vm(&mp.venue).emit[EMIT_MIDPOINT].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Depth(d) => {
                 // Reject an implausibly-far-future `source_ts` before it can advance the floor — the
@@ -649,7 +747,7 @@ impl Arbiter {
                 // forged far-future depth would otherwise latch `high_water` ahead and wedge depth
                 // for that symbol until restart (mirrors the quote arm; see `MAX_FUTURE_SKEW_NS`).
                 if d.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
-                    m.depth_future_rejected.with_label_values(&[&d.venue]).inc();
+                    self.vm(&d.venue).depth_future_rejected.inc();
                     return;
                 }
                 // DELIBERATE divergence from the quote arm: depth is routed through the floor with
@@ -663,27 +761,21 @@ impl Arbiter {
                 // book (no market data at all — nothing to serve) leaves the non-leader dropped, and
                 // depth is full-state self-healing so nothing is lost.
                 let key = (d.venue.clone(), d.symbol.clone());
-                match self.depths.admit(
-                    key,
-                    d.source_ts_ns,
-                    DepthId::of(d),
-                    publisher,
-                    d.recv_ts_ns,
-                ) {
+                let decision =
+                    self.depths
+                        .admit(key, d.source_ts_ns, DepthId::of(d), publisher, d.recv_ts_ns);
+                match decision {
                     Admit::Emitted { opened_tick } => {
-                        m.emit.with_label_values(&[d.venue.as_str(), "depth"]).inc();
+                        let vm = self.vm(&d.venue);
+                        vm.emit[EMIT_DEPTH].inc();
                         // Attribute the admitted depth to its winning publisher — the depth mirror of
                         // `quotes_admitted`. A rise for a given source shows which publisher currently
                         // leads the reconstructed book (and, were a public depth backstop ever added,
                         // `publisher="public"` would flag it filling an edge gap).
-                        m.depth_admitted
-                            .with_label_values(&[d.venue.as_str(), publisher.label()])
-                            .inc();
+                        vm.depth_admitted[pub_idx(publisher)].inc();
                         // Once per tick, mirroring the quote arm's win-rate primitive.
                         if opened_tick {
-                            m.depth_ticks_won
-                                .with_label_values(&[d.venue.as_str(), publisher.label()])
-                                .inc();
+                            vm.depth_ticks_won[pub_idx(publisher)].inc();
                         }
                         // Update the WS-replay snapshot with the leader's admitted book, so a client
                         // connecting mid-stream replays exactly what was broadcast (not a dropped
@@ -692,28 +784,20 @@ impl Arbiter {
                             model::lock(replay)
                                 .insert((d.venue.clone(), d.symbol.clone()), d.clone());
                         }
-                        let _ = self.tx.send(msg);
+                        let _ = self.tx.send(Arc::new(msg));
                     }
                     // A cross-publisher follower lost this depth tick: record how far the winner led
                     // (the depth mirror of `quote_lead_ns`), on top of the drop count attributed to
                     // the losing publisher class (which source is *losing* the book race — the
                     // symmetric counterpart of `depth_admitted`'s winner attribution).
                     Admit::Contest { winner, lead_ns } => {
-                        m.depth_dropped
-                            .with_label_values(&[d.venue.as_str(), publisher.label()])
-                            .inc();
-                        m.depth_lead_ns
-                            .with_label_values(&[
-                                d.venue.as_str(),
-                                winner.label(),
-                                publisher.label(),
-                            ])
+                        let vm = self.vm(&d.venue);
+                        vm.depth_dropped[pub_idx(publisher)].inc();
+                        vm.depth_lead[pub_idx(winner) * 2 + pub_idx(publisher)]
                             .observe(lead_ns as f64);
                     }
                     Admit::Dropped => {
-                        m.depth_dropped
-                            .with_label_values(&[d.venue.as_str(), publisher.label()])
-                            .inc();
+                        self.vm(&d.venue).depth_dropped[pub_idx(publisher)].inc();
                     }
                 }
             }
@@ -722,10 +806,8 @@ impl Arbiter {
             // {kind="status"}` is unreachable in practice today. The arm is kept for match
             // exhaustiveness and stays correct if a future source ever emits status through here.
             FeedMessage::Status(s) => {
-                m.emit
-                    .with_label_values(&[s.venue.as_str(), "status"])
-                    .inc();
-                let _ = self.tx.send(msg);
+                self.vm(&s.venue).emit[EMIT_STATUS].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
         }
     }
@@ -864,12 +946,12 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::NormalizedQuote;
+    use crate::model::{NormalizedQuote, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
-            venue: "Hyperliquid".to_string(),
-            symbol: "BTC".to_string(),
+            venue: "Hyperliquid".into(),
+            symbol: "BTC".into(),
             bid,
             ask,
             bid_size: 1.0,
@@ -884,10 +966,10 @@ mod tests {
     }
 
     /// Drain every emitted quote's `(source_ts, bid)` from a receiver.
-    fn drain_quotes(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<(u64, f64)> {
+    fn drain_quotes(rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>) -> Vec<(u64, f64)> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Quote(q) = m {
+            if let FeedMessage::Quote(q) = &*m {
                 out.push((q.source_ts_ns, q.bid));
             }
         }
@@ -938,11 +1020,11 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |id: u64| {
             FeedMessage::Trade(NormalizedTrade {
-                venue: "Hyperliquid".to_string(),
-                symbol: "BTC".to_string(),
+                venue: "Hyperliquid".into(),
+                symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
-                aggressor_side: "buy".to_string(),
+                aggressor_side: Side::Buy,
                 trade_id: id,
                 cumulative_volume: 0.0,
                 source_ts_ns: 1,
@@ -958,7 +1040,7 @@ mod tests {
         a.emit(trade(8), Publisher::PublicWs);
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Trade(t) = m {
+            if let FeedMessage::Trade(t) = &*m {
                 ids.push(t.trade_id);
             }
         }
@@ -1000,11 +1082,11 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = || {
             FeedMessage::Trade(NormalizedTrade {
-                venue: "Hyperliquid".to_string(),
-                symbol: "BTC".to_string(),
+                venue: "Hyperliquid".into(),
+                symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
-                aggressor_side: "buy".to_string(),
+                aggressor_side: Side::Buy,
                 trade_id: 42,
                 cumulative_volume: 0.0,
                 source_ts_ns: 1,
@@ -1019,7 +1101,7 @@ mod tests {
         a.emit(trade(), edge); // identical duplicate -> dropped
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Trade(t) = m {
+            if let FeedMessage::Trade(t) = &*m {
                 ids.push(t.trade_id);
             }
         }
@@ -1092,7 +1174,7 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |source_ts: u64, recv: u64, bid: f64| {
             let mut q = quote(source_ts, bid, 101.0);
-            q.venue = venue.to_string();
+            q.venue = venue.into();
             q.recv_ts_ns = recv;
             FeedMessage::Quote(q)
         };
@@ -1140,7 +1222,7 @@ mod tests {
         let mirror_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let mk = |recv: u64, bid: f64| {
             let mut q = quote(1000, bid, 101.0);
-            q.venue = venue.to_string();
+            q.venue = venue.into();
             q.recv_ts_ns = recv;
             FeedMessage::Quote(q)
         };
@@ -1171,11 +1253,11 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |recv: u64| {
             FeedMessage::Trade(NormalizedTrade {
-                venue: venue.to_string(),
-                symbol: "BTC".to_string(),
+                venue: venue.into(),
+                symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
-                aggressor_side: "buy".to_string(),
+                aggressor_side: Side::Buy,
                 trade_id: 7,
                 cumulative_volume: 0.0,
                 source_ts_ns: 1,
@@ -1202,8 +1284,8 @@ mod tests {
 
     fn depth(source_ts_ns: u64, bids: Vec<[f64; 2]>, asks: Vec<[f64; 2]>) -> NormalizedDepth {
         NormalizedDepth {
-            venue: "Hyperliquid".to_string(),
-            symbol: "BTC".to_string(),
+            venue: "Hyperliquid".into(),
+            symbol: "BTC".into(),
             bids,
             asks,
             source_ts_ns,
@@ -1214,10 +1296,10 @@ mod tests {
     }
 
     /// Drain every emitted depth's `(source_ts, top bid px)` from a receiver (0.0 if no bid).
-    fn drain_depths(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<(u64, f64)> {
+    fn drain_depths(rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>) -> Vec<(u64, f64)> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Depth(d) = m {
+            if let FeedMessage::Depth(d) = &*m {
                 out.push((d.source_ts_ns, d.bids.first().map(|l| l[0]).unwrap_or(0.0)));
             }
         }
@@ -1328,7 +1410,7 @@ mod tests {
         let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let mk = |recv: u64, bid: f64| {
             let mut d = depth(1000, vec![[bid, 1.0]], vec![]);
-            d.venue = venue.to_string();
+            d.venue = venue.into();
             d.recv_ts_ns = recv;
             FeedMessage::Depth(d)
         };
@@ -1368,7 +1450,7 @@ mod tests {
         ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
         let map = model::lock(&replay);
         let entry = map
-            .get(&("Hyperliquid".to_string(), "BTC".to_string()))
+            .get(&("Hyperliquid".into(), "BTC".into()))
             .expect("leader depth recorded in replay map");
         assert_eq!(
             entry.bids,
@@ -1386,11 +1468,12 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |venue: &str, symbol: &str| {
             let mut d = depth(1000, vec![[100.0, 1.0]], vec![]);
-            d.venue = venue.to_string();
-            d.symbol = symbol.to_string();
+            d.venue = venue.into();
+            d.symbol = symbol.into();
             FeedMessage::Depth(d)
         };
-        let key = |venue: &str, symbol: &str| (venue.to_string(), symbol.to_string());
+        let key =
+            |venue: &str, symbol: &str| -> (Arc<str>, Arc<str>) { (venue.into(), symbol.into()) };
         let (tx, _rx) = broadcast::channel(64);
         let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);
@@ -1433,7 +1516,7 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |ts: u64, bid: f64| {
             let mut d = depth(ts, vec![[bid, 1.0]], vec![]);
-            d.venue = venue.to_string();
+            d.venue = venue.into();
             FeedMessage::Depth(d)
         };
         let (tx, mut rx) = broadcast::channel(64);
@@ -1445,7 +1528,7 @@ mod tests {
         let ts: Vec<u64> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
-                if let FeedMessage::Depth(d) = m {
+                if let FeedMessage::Depth(d) = &*m {
                     out.push(d.source_ts_ns);
                 }
             }
@@ -1469,7 +1552,7 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |venue: &str, ts: u64| {
             let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
-            d.venue = venue.to_string();
+            d.venue = venue.into();
             FeedMessage::Depth(d)
         };
         let (tx, mut rx) = broadcast::channel(64);
@@ -1482,8 +1565,8 @@ mod tests {
         let seen: Vec<(String, u64)> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
-                if let FeedMessage::Depth(d) = m {
-                    out.push((d.venue, d.source_ts_ns));
+                if let FeedMessage::Depth(d) = &*m {
+                    out.push((d.venue.to_string(), d.source_ts_ns));
                 }
             }
             out
@@ -1506,7 +1589,7 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |symbol: &str, ts: u64| {
             let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
-            d.symbol = symbol.to_string();
+            d.symbol = symbol.into();
             FeedMessage::Depth(d)
         };
         let (tx, mut rx) = broadcast::channel(64);
@@ -1519,8 +1602,8 @@ mod tests {
         let seen: Vec<(String, u64)> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
-                if let FeedMessage::Depth(d) = m {
-                    out.push((d.symbol, d.source_ts_ns));
+                if let FeedMessage::Depth(d) = &*m {
+                    out.push((d.symbol.to_string(), d.source_ts_ns));
                 }
             }
             out
@@ -1603,7 +1686,7 @@ mod tests {
 
     fn quote_at(venue: &str, source_ts_ns: u64, bid: f64) -> NormalizedQuote {
         NormalizedQuote {
-            venue: venue.to_string(),
+            venue: venue.into(),
             ..quote(source_ts_ns, bid, bid + 1.0)
         }
     }
@@ -1654,7 +1737,7 @@ mod tests {
     fn depth_tick_wins_count_once_per_tick_by_class() {
         let venue = "TickWonDepth";
         let depth_at = |source_ts_ns: u64, bids: Vec<[f64; 2]>| NormalizedDepth {
-            venue: venue.to_string(),
+            venue: venue.into(),
             ..depth(source_ts_ns, bids, vec![])
         };
         let edge_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -1682,5 +1765,38 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    /// Pins the hand-computed `pub_idx(winner) * 2 + pub_idx(loser)` offset (used to index the
+    /// `quote_lead`/`trade_lead` `[Histogram; 4]` arrays on the emit path) to the exact
+    /// `(winner, loser)` label pair `VenueMetrics::new` builds each slot from. A wrong offset would
+    /// silently mislabel a contest metric, so the two orderings must stay locked together here.
+    #[test]
+    fn lead_histogram_offset_maps_to_expected_label_pair() {
+        // Mirrors the label order the `lead` closure in `VenueMetrics::new` constructs the array in.
+        let expected = [
+            ("edge", "edge"),
+            ("edge", "public"),
+            ("public", "edge"),
+            ("public", "public"),
+        ];
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let public = Publisher::PublicWs;
+        let label = |p: Publisher| match p {
+            Publisher::Edge(_) => "edge",
+            Publisher::PublicWs => "public",
+        };
+        for winner in [edge, public] {
+            for loser in [edge, public] {
+                let idx = pub_idx(winner) * 2 + pub_idx(loser);
+                assert_eq!(
+                    expected[idx],
+                    (label(winner), label(loser)),
+                    "offset {idx} mislabels winner={:?} loser={:?}",
+                    label(winner),
+                    label(loser),
+                );
+            }
+        }
     }
 }

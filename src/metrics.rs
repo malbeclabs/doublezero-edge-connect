@@ -142,6 +142,10 @@ pub struct Metrics {
     pub ws_bytes_sent: IntCounterVec,
     /// Times a client fell behind and the broadcast dropped messages for it (`Lagged`).
     pub ws_client_lagged: IntCounter,
+    /// Times the single serializer task fell behind the backbone and dropped messages (`Lagged`).
+    /// Distinct from [`Self::ws_client_lagged`]: this is a global stall (every client misses those
+    /// messages), not one slow consumer, so it must not hide behind the per-client counter.
+    pub ws_serializer_lagged: IntCounter,
     /// Inbound control messages, by `kind` (ping/subscribe/unsubscribe/error).
     pub ws_inbound: IntCounterVec,
     /// Clients disconnected for exceeding the inbound rate limit.
@@ -437,6 +441,11 @@ impl Metrics {
                 &registry,
                 "dz_ws_client_lagged_total",
                 "Times a slow client fell behind and the broadcast dropped messages for it",
+            ),
+            ws_serializer_lagged: counter(
+                &registry,
+                "dz_ws_serializer_lagged_total",
+                "Times the serializer task fell behind the backbone and dropped messages (global)",
             ),
             ws_inbound: counter_vec(
                 &registry,

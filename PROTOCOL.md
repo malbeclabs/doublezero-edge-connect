@@ -95,7 +95,7 @@ to rescale integers.
 | `source_ts_ns`    | uint64  | Venue/source timestamp, ns since Unix epoch. `0` if unknown.            |
 | `recv_ts_ns`      | uint64  | Producer user-space receive time (after decode), ns since epoch.        |
 | `kernel_rx_ts_ns` | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`, `CLOCK_REALTIME`) captured in the driver softirq, before user space. `0` if unavailable. |
-| `ws_send_ts_ns`   | uint64  | Wall clock sampled the instant before this quote is serialized to the consumer. `0` if not stamped. |
+| `ws_send_ts_ns`   | uint64  | Wall clock sampled the instant this quote is serialized for the consumers. A single value shared by all consumers of this message (the producer serializes once and fans the identical frame out), not a per-connection send time. `0` if not stamped. |
 
 All timestamps are **nanoseconds since the Unix epoch** (wall clock), and **`0` is the sentinel
 for "not available."** Consumers must treat `0` as missing, not as 1970.
@@ -141,7 +141,7 @@ venue precision, same convention as `quote`).
 | `source_ts_ns`      | uint64  | Venue/source timestamp, ns since epoch. `0` if unknown.              |
 | `recv_ts_ns`        | uint64  | Producer user-space receive time (after decode), ns since epoch.     |
 | `kernel_rx_ts_ns`   | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable.          |
-| `ws_send_ts_ns`     | uint64  | Wall clock the instant before this trade is serialized; `0` if unset.|
+| `ws_send_ts_ns`     | uint64  | Wall clock the instant this trade is serialized; shared by all consumers of this message (serialized once, not per-connection). `0` if unset.|
 
 The same four timestamps as `quote` ride every trade (see *Why four timestamps*). Unlike a quote,
 a trade is a **point-in-time event, not full state**: it is not replayed on connect, and a trade
@@ -174,7 +174,7 @@ a consumer that connects mid-stream sees the matching `instrument` (for precisio
 | `compute_ts_ns`  | uint64 | When the publisher computed the mid; `0` if unknown.                   |
 | `recv_ts_ns`     | uint64 | Producer user-space receive time (after decode), ns since epoch.       |
 | `kernel_rx_ts_ns`| uint64 | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable.            |
-| `ws_send_ts_ns`  | uint64 | Wall clock the instant before this midpoint is serialized; `0` if unset.|
+| `ws_send_ts_ns`  | uint64 | Wall clock the instant this midpoint is serialized; shared by all consumers of this message (serialized once, not per-connection). `0` if unset.|
 
 The Midpoint feed carries **no sizes**, so its `instrument` reports `qty_exponent: 0` (ignore it
 for mids). A consumer that only wants quotes/trades may ignore `midpoint` per forward-compat.
@@ -202,7 +202,7 @@ first** (bids high→low, asks low→high).
 | `source_ts_ns`   | uint64   | Timestamp of the latest applied book event; `0` if unknown.          |
 | `recv_ts_ns`     | uint64   | When the producer built this snapshot, ns since epoch.               |
 | `kernel_rx_ts_ns`| uint64   | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable.          |
-| `ws_send_ts_ns`  | uint64   | Wall clock the instant before this snapshot is serialized; `0` if unset.|
+| `ws_send_ts_ns`  | uint64   | Wall clock the instant this snapshot is serialized; shared by all consumers of this message (serialized once, not per-connection). `0` if unset.|
 
 **Each `depth` message is full state** (the complete top *N*, not a delta), so - like `quote` - it
 **self-heals**: a consumer that drops one under backpressure recovers on the next snapshot, and a

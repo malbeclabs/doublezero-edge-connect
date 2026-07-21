@@ -255,7 +255,9 @@ async fn main() -> Result<()> {
     // the scrape endpoint below is enabled.
     metrics::metrics();
 
-    let (tx, _rx) = broadcast::channel::<model::FeedMessage>(args.ws_broadcast_capacity);
+    // The backbone carries `Arc<FeedMessage>`: a per-subscriber delivery is a refcount bump, not a
+    // deep clone of the message's owned `String`/`Vec` fields (see `arbiter`/`sinks::ws`).
+    let (tx, _rx) = broadcast::channel::<Arc<model::FeedMessage>>(args.ws_broadcast_capacity);
     // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
     // feeder) emits through this one instance, so cross-source duplicates collapse on one
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
@@ -282,6 +284,7 @@ async fn main() -> Result<()> {
         max_clients: args.ws_max_clients,
         max_subs: args.ws_max_subs,
         max_inbound_per_min: args.ws_max_inbound_per_min,
+        broadcast_capacity: args.ws_broadcast_capacity,
     };
 
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always

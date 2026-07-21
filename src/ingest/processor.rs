@@ -10,6 +10,7 @@
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     net::IpAddr,
+    sync::Arc,
 };
 
 use tracing::{debug, info, warn};
@@ -18,18 +19,15 @@ use crate::{
     ingest::{
         arbiter::lock,
         book::{BookState, DeltaKind, DeltaOp, Level},
-        codec::{
-            aggressor_side, apply_exponent, decode_frame, source_name, InstrumentDefinition,
-            Message,
-        },
+        codec::{apply_exponent, decode_frame, source_name, InstrumentDefinition, Message},
         codec_mbo, codec_midpoint,
         receiver::{FrameCtx, FrameProcessor, SeqCheck, SeqTracker},
         subscriber::RefDataState,
     },
     metrics::metrics,
     model::{
-        DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedInstrument, NormalizedMidpoint,
-        NormalizedQuote, NormalizedTrade,
+        venue_arc, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedInstrument,
+        NormalizedMidpoint, NormalizedQuote, NormalizedTrade, Side,
     },
 };
 
@@ -89,8 +87,8 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
     if let Some(prev) = map.get(&key) {
         if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
             warn!(
-                venue = inst.venue,
-                symbol = inst.symbol,
+                venue = %inst.venue,
+                symbol = %inst.symbol,
                 prev_price_exp = prev.price_exponent,
                 new_price_exp = inst.price_exponent,
                 prev_qty_exp = prev.qty_exponent,
@@ -241,7 +239,7 @@ impl FrameProcessor for TobProcessor {
                 }
                 Message::InstrumentDefinition(d) if handle_refdata => {
                     let inst = NormalizedInstrument {
-                        venue: ctx.venue.to_string(),
+                        venue: venue_arc(ctx.venue),
                         symbol: d.symbol.clone(),
                         price_exponent: d.price_exponent,
                         qty_exponent: d.qty_exponent,
@@ -296,7 +294,7 @@ impl FrameProcessor for TobProcessor {
                     // publisher-independent (mirrors share a venue) so they dedup against each other.
                     let venue: &'static str = source_name(q.source_id).unwrap_or(ctx.venue);
                     let quote = NormalizedQuote {
-                        venue: venue.to_string(),
+                        venue: venue_arc(venue),
                         symbol: def.symbol.clone(),
                         bid: apply_exponent(q.bid_price_raw, def.price_exponent),
                         ask: apply_exponent(q.ask_price_raw, def.price_exponent),
@@ -325,11 +323,11 @@ impl FrameProcessor for TobProcessor {
                     };
                     let venue: &'static str = source_name(t.source_id).unwrap_or(ctx.venue);
                     let trade = NormalizedTrade {
-                        venue: venue.to_string(),
+                        venue: venue_arc(venue),
                         symbol: def.symbol.clone(),
                         price: apply_exponent(t.trade_price_raw, def.price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, def.qty_exponent),
-                        aggressor_side: aggressor_side(t.aggressor_side).to_string(),
+                        aggressor_side: Side::from_code(t.aggressor_side),
                         trade_id: t.trade_id,
                         cumulative_volume: apply_exponent(
                             t.cumulative_volume_raw as i64,
@@ -421,7 +419,7 @@ impl FrameProcessor for MidpointProcessor {
                     // A mid price has no size, so there is no qty exponent on the Midpoint feed;
                     // report qty_exponent = 0 in the shared snapshot (consumers ignore it for mids).
                     let inst = NormalizedInstrument {
-                        venue: ctx.venue.to_string(),
+                        venue: venue_arc(ctx.venue),
                         symbol: d.symbol.clone(),
                         price_exponent: d.price_exponent,
                         qty_exponent: 0,
@@ -447,7 +445,7 @@ impl FrameProcessor for MidpointProcessor {
                         }
                     }
                     let midpoint = NormalizedMidpoint {
-                        venue: source_name(mp.source_id).unwrap_or(ctx.venue).to_string(),
+                        venue: venue_arc(source_name(mp.source_id).unwrap_or(ctx.venue)),
                         symbol: def.symbol.clone(),
                         mid: apply_exponent(mp.mid_price_raw, def.price_exponent),
                         method: mp.method,
@@ -502,7 +500,7 @@ pub struct MboProcessor {
     /// wedged old-symbol entry latched. Written in `emit_depth`, evicted in lockstep with `books`,
     /// cleared on `EndOfSession` (the venue-wide clear covers everything), so its keys are always
     /// a subset of `books`' keys.
-    emitted_symbol: HashMap<(IpAddr, u32), String>,
+    emitted_symbol: HashMap<(IpAddr, u32), Arc<str>>,
     warned_source_mismatch: bool,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
@@ -562,7 +560,7 @@ impl MboProcessor {
                         if !symbol_still_served {
                             if let Some(def) = self.state.definition(old_id) {
                                 crate::model::lock(&self.depth)
-                                    .remove(&(ctx.venue.to_string(), def.symbol.clone()));
+                                    .remove(&(venue_arc(ctx.venue), def.symbol.clone()));
                             }
                         }
                     }
@@ -609,7 +607,7 @@ impl MboProcessor {
                 .collect()
         };
         let depth = NormalizedDepth {
-            venue: ctx.venue.to_string(),
+            venue: venue_arc(ctx.venue),
             symbol: def.symbol.clone(),
             bids: scale(&bids_raw),
             asks: scale(&asks_raw),
@@ -677,7 +675,7 @@ impl FrameProcessor for MboProcessor {
                 }
                 codec_mbo::Message::InstrumentDefinition(d) => {
                     let inst = NormalizedInstrument {
-                        venue: ctx.venue.to_string(),
+                        venue: venue_arc(ctx.venue),
                         symbol: d.symbol.clone(),
                         price_exponent: d.price_exponent,
                         qty_exponent: d.qty_exponent,
@@ -761,11 +759,11 @@ impl FrameProcessor for MboProcessor {
                     // An execution is also a public trade print; emit it like a Top-of-Book trade.
                     if let Some(def) = self.state.definition(o.instrument_id) {
                         let trade = NormalizedTrade {
-                            venue: ctx.venue.to_string(),
+                            venue: venue_arc(ctx.venue),
                             symbol: def.symbol.clone(),
                             price: apply_exponent(o.exec_price_raw, def.price_exponent),
                             size: apply_exponent(o.exec_qty_raw as i64, def.qty_exponent),
-                            aggressor_side: aggressor_side(o.aggressor_side).to_string(),
+                            aggressor_side: Side::from_code(o.aggressor_side),
                             trade_id: o.trade_id,
                             cumulative_volume: 0.0,
                             source_ts_ns: o.ts,
@@ -783,11 +781,11 @@ impl FrameProcessor for MboProcessor {
                         continue;
                     };
                     let trade = NormalizedTrade {
-                        venue: source_name(t.source_id).unwrap_or(ctx.venue).to_string(),
+                        venue: venue_arc(source_name(t.source_id).unwrap_or(ctx.venue)),
                         symbol: def.symbol.clone(),
                         price: apply_exponent(t.trade_price_raw, def.price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, def.qty_exponent),
-                        aggressor_side: aggressor_side(t.aggressor_side).to_string(),
+                        aggressor_side: Side::from_code(t.aggressor_side),
                         trade_id: t.trade_id,
                         cumulative_volume: apply_exponent(
                             t.cumulative_volume_raw as i64,
@@ -1028,15 +1026,11 @@ mod tests {
 
     /// Drain all available `Depth` messages and return the numeric instrument ids
     /// encoded in their symbol field (`"INST-{id}"`).
-    fn drain_depth_ids(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<u32> {
+    fn drain_depth_ids(rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>) -> Vec<u32> {
         let mut ids = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(FeedMessage::Depth(d)) => {
-                    ids.push(d.symbol.trim_start_matches("INST-").parse::<u32>().unwrap());
-                }
-                Ok(_) => {}
-                Err(_) => break,
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Depth(d) = &*m {
+                ids.push(d.symbol.trim_start_matches("INST-").parse::<u32>().unwrap());
             }
         }
         ids
@@ -1050,7 +1044,7 @@ mod tests {
     /// Valid=1 goldens the other MBO tests use never exercised this path (that's why it shipped).
     #[test]
     fn mbo_manifest_valid_zero_is_overridden_so_depth_flows() {
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -1106,10 +1100,10 @@ mod tests {
     }
 
     /// Drain all available `Depth` messages and return their `source_ts_ns`.
-    fn drain_depth_ts(rx: &mut broadcast::Receiver<FeedMessage>) -> Vec<u64> {
+    fn drain_depth_ts(rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>) -> Vec<u64> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
-            if let FeedMessage::Depth(d) = m {
+            if let FeedMessage::Depth(d) = &*m {
                 out.push(d.source_ts_ns);
             }
         }
@@ -1175,7 +1169,7 @@ mod tests {
     /// latched).
     #[test]
     fn mbo_end_of_session_unwedges_depth_floor() {
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
@@ -1233,7 +1227,7 @@ mod tests {
             c.publisher = publisher;
             c
         }
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -1313,7 +1307,7 @@ mod tests {
     /// so a wedged sibling entry is still re-opened.
     #[test]
     fn mbo_instrument_reset_for_unknown_id_falls_back_to_venue_clear() {
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
@@ -1347,7 +1341,7 @@ mod tests {
     /// definition's symbol would leave the old-symbol entry latched forever.
     #[test]
     fn mbo_instrument_reset_after_id_remap_clears_the_latched_symbol() {
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments); // id 0 -> "INST-0" (manifest 1)
@@ -1415,7 +1409,7 @@ mod tests {
     /// the floor at the old high-water, re-wedging what the reset just cleared.
     #[test]
     fn mbo_instrument_reset_unwedges_depth_floor() {
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
@@ -1465,7 +1459,7 @@ mod tests {
     /// guaranteed by draining a `BTreeSet<u32>` rather than a `HashSet`.
     #[test]
     fn mbo_depth_emit_order_is_ascending_instrument_id() {
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -1591,8 +1585,8 @@ mod tests {
         let instruments: crate::model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
 
         let base = NormalizedInstrument {
-            venue: "TestVenue".to_string(),
-            symbol: "BTC".to_string(),
+            venue: "TestVenue".into(),
+            symbol: "BTC".into(),
             price_exponent: -2,
             qty_exponent: -4,
         };
@@ -1602,9 +1596,7 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1);
-            let entry = map
-                .get(&("TestVenue".to_string(), "BTC".to_string()))
-                .unwrap();
+            let entry = map.get(&("TestVenue".into(), "BTC".into())).unwrap();
             assert_eq!(entry.price_exponent, -2);
             assert_eq!(entry.qty_exponent, -4);
         }
@@ -1624,9 +1616,7 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1, "still one entry after conflicting write");
-            let entry = map
-                .get(&("TestVenue".to_string(), "BTC".to_string()))
-                .unwrap();
+            let entry = map.get(&("TestVenue".into(), "BTC".into())).unwrap();
             assert_eq!(
                 entry.price_exponent, -3,
                 "last writer's price_exponent wins"
@@ -1639,7 +1629,7 @@ mod tests {
     /// undefined instrument can never emit usable `depth`, and the wire `instrument_id` is spoofable.
     #[test]
     fn mbo_undefined_instrument_creates_no_book() {
-        let (tx, _rx) = broadcast::channel::<FeedMessage>(64);
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -1671,7 +1661,7 @@ mod tests {
     #[test]
     fn mbo_books_map_is_bounded_under_instrument_flood() {
         use super::MAX_BOOKS;
-        let (tx, _rx) = broadcast::channel::<FeedMessage>(256);
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         // Wire the shared replay map so the arbiter populates it on admit (the processor only purges
@@ -1757,11 +1747,11 @@ mod tests {
             depth_map.len()
         );
         assert!(
-            depth_map.contains_key(&("TV".to_string(), format!("INST-{}", flood - 1))),
+            depth_map.contains_key(&("TV".into(), format!("INST-{}", flood - 1).into())),
             "newest instrument's depth replay entry retained"
         );
         assert!(
-            !depth_map.contains_key(&("TV".to_string(), "INST-0".to_string())),
+            !depth_map.contains_key(&("TV".into(), "INST-0".into())),
             "oldest instrument's depth replay entry evicted too"
         );
     }
@@ -1773,7 +1763,7 @@ mod tests {
     #[test]
     fn mbo_depth_suppressed_when_top_n_unchanged() {
         use super::DEPTH_LEVELS;
-        let (tx, mut rx) = broadcast::channel::<FeedMessage>(256);
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));

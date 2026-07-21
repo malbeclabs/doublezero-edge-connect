@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **HFT hot-path optimization** — the ingest→broadcast→WebSocket path now does far less per-message
+  work, with no change to the wire JSON field names or values:
+  - **Broadcast backbone carries `Arc<FeedMessage>`** (`src/ingest/arbiter.rs`, `src/main.rs`): a
+    per-subscriber delivery is now a reference-count bump instead of a deep clone of the message's
+    owned `String`/`Vec` fields.
+  - **WebSocket output serializes each message once**, not once per client
+    (`src/sinks/ws.rs`): a single serializer task renders the JSON and re-broadcasts a shared,
+    ready-to-write frame (`Arc<PreparedFrame>`); each client task only filters and writes a cheap
+    `Utf8Bytes` clone. With no clients connected the serializer skips the work entirely. As a
+    consequence, **`ws_send_ts_ns` is now a single serialization instant shared by all consumers of a
+    message** (documented in PROTOCOL.md) rather than a per-connection send time — the accepted
+    trade-off that enables serializing once.
+  - **Allocation-free steady-state quote/trade path** (`src/model.rs`, `src/ingest/processor.rs`,
+    `src/ingest/codec*.rs`, `src/ingest/arbiter.rs`): the wire `venue`/`symbol` are now `Arc<str>`
+    (venues interned via `model::venue_arc`, symbols carried as `Arc<str>` on instrument definitions),
+    and `NormalizedTrade.aggressor_side` is now the `Side` enum instead of an owned `String`, so
+    building and dedup-keying a quote/trade no longer allocates.
+  - **Pre-resolved arbiter metrics** (`src/ingest/arbiter.rs`): the emit path increments cached
+    per-venue Prometheus counter/histogram handles instead of doing a label-map lookup per message,
+    and the quote future-skew guard reuses the quote's own arrival timestamp instead of sampling the
+    wall clock again.
+  - **Zero-allocation receive loop** (`src/ingest/receiver.rs`): `recv_any` races a feed's 1–3
+    sockets with a biased `select!` over the fixed port set instead of allocating a
+    `Vec<Box<dyn Future>>` per datagram.
+  - **Trimmed dependencies** (`Cargo.toml`): narrowed `tokio` from `features = ["full"]` to the used
+    set; `serde` gains the `rc` feature for `Arc<str>` (de)serialization.
+  - **Review follow-ups**: `venue_arc` (`src/model.rs`) is now backed by an `RwLock` so the
+    steady-state hot path takes only a shared read lock (the write lock fires once per venue at
+    warmup, not per message); the serializer task's broadcast-lag now increments a distinct
+    `dz_ws_serializer_lagged_total` metric (`src/metrics.rs`) instead of sharing the per-client
+    `dz_ws_client_lagged_total`, so a global serializer stall is no longer hidden behind a
+    single-slow-client signal; and the arbiter's `(winner, loser)` lead-histogram index formula is
+    now pinned by a unit test.
+
 ### Added
 - **Standalone `shred-proxy` binary** (new workspace member `shred-proxy/`): a lightweight service
   that joins the DoubleZero `edge-solana-*` shred multicast feeds, deduplicates, and forwards a

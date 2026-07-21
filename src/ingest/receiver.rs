@@ -19,7 +19,6 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use futures_util::future::select_all;
 use nix::sys::socket::{
     recvmsg, setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned, MsgFlags,
     SockaddrStorage,
@@ -150,13 +149,17 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64)
         .feed_stale_ms
         .with_label_values(&[venue])
         .set(stale_ms as i64);
-    // Status carries no business identity to dedup, so it goes straight to the broadcast sender.
-    let _ = lock(arbiter).sender().send(FeedMessage::Status(FeedStatus {
-        venue: venue.to_string(),
-        state: state.to_string(),
-        stale_ms,
-        ts_ns: now_ns(),
-    }));
+    // Status carries no business identity to dedup, so it goes straight to the broadcast sender
+    // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the `Arc`/`Arc<str>`
+    // allocation here is off the per-message hot path.
+    let _ = lock(arbiter)
+        .sender()
+        .send(std::sync::Arc::new(FeedMessage::Status(FeedStatus {
+            venue: std::sync::Arc::from(venue),
+            state: state.to_string(),
+            stale_ms,
+            ts_ns: now_ns(),
+        })));
 }
 
 /// Receive one datagram, returning `(len, kernel_rx_ns, user_recv_ns)`.
@@ -376,23 +379,31 @@ struct Channel {
 /// the kernel/user-space RX timestamps. All in-flight borrows on `channels` are released by the
 /// time this returns, so the caller can index `channels[idx].buf`.
 async fn recv_any(channels: &mut [Channel]) -> Result<(PortRole, usize, usize, u64, u64, IpAddr)> {
-    let futs: Vec<_> = channels
-        .iter_mut()
-        .enumerate()
-        .map(|(i, ch)| {
-            let role = ch.role;
-            let sock = &ch.sock;
-            let buf = &mut ch.buf;
-            Box::pin(async move {
-                let (n, kernel_ns, recv_ns, src) = recv_with_ts(sock, buf).await?;
-                Ok::<_, anyhow::Error>((role, i, n, kernel_ns, recv_ns, src))
-            })
-        })
-        .collect();
-    // `select_all` resolves on the first ready socket; dropping the rest here cancels their
-    // (cancellation-safe) readability waits without consuming any datagram, releasing the borrows.
-    let (res, _idx, _rest) = select_all(futs).await;
-    res
+    // A feed binds 1, 2 or 3 ports (see `FeedPorts`). Match on that fixed shape and race the sockets
+    // with a biased `select!` over disjoint slice bindings — no per-datagram `Box`/`Vec` allocation on
+    // the hot receive loop (the old `select_all` collected a fresh `Vec<Box<dyn Future>>` every call).
+    // Each `recv_with_ts` future is cancellation-safe, so the losers are dropped without consuming a
+    // datagram. Fields of one `&mut Channel` are borrowed disjointly (`&sock` + `&mut buf`).
+    match channels {
+        [c0] => {
+            let (n, k, r, s) = recv_with_ts(&c0.sock, &mut c0.buf).await?;
+            Ok((c0.role, 0, n, k, r, s))
+        }
+        [c0, c1] => {
+            tokio::select! {
+                res = recv_with_ts(&c0.sock, &mut c0.buf) => { let (n, k, r, s) = res?; Ok((c0.role, 0, n, k, r, s)) }
+                res = recv_with_ts(&c1.sock, &mut c1.buf) => { let (n, k, r, s) = res?; Ok((c1.role, 1, n, k, r, s)) }
+            }
+        }
+        [c0, c1, c2] => {
+            tokio::select! {
+                res = recv_with_ts(&c0.sock, &mut c0.buf) => { let (n, k, r, s) = res?; Ok((c0.role, 0, n, k, r, s)) }
+                res = recv_with_ts(&c1.sock, &mut c1.buf) => { let (n, k, r, s) = res?; Ok((c1.role, 1, n, k, r, s)) }
+                res = recv_with_ts(&c2.sock, &mut c2.buf) => { let (n, k, r, s) = res?; Ok((c2.role, 2, n, k, r, s)) }
+            }
+        }
+        _ => unreachable!("a feed binds 1..=3 ports"),
+    }
 }
 
 /// The shared receive loop for one feed, generic over its [`FrameProcessor`]. Binds every port in

@@ -62,7 +62,7 @@ fn tob_shared_layouts_decode_identically() {
             assert_eq!(t.price_exponent, m.price_exponent);
             assert_eq!(t.qty_exponent, m.qty_exponent);
             assert_eq!(t.manifest_seq, m.manifest_seq);
-            assert_eq!(m.symbol, "BTC");
+            assert_eq!(m.symbol.as_ref(), "BTC");
         }
         other => panic!("expected InstrumentDefinition from both, got {other:?}"),
     }
@@ -280,7 +280,11 @@ fn refdata_fixture_matches_btc_definition() {
         }
     }
     let def = def.expect("BTC definition present in mbo_refdata.bin");
-    assert_eq!(def.symbol, "BTC", "symbol@4 (16B cstr) decoded wrong");
+    assert_eq!(
+        def.symbol.as_ref(),
+        "BTC",
+        "symbol@4 (16B cstr) decoded wrong"
+    );
     assert_eq!(def.price_exponent, -8, "price_exponent@37 decoded wrong");
     assert_eq!(def.qty_exponent, -5, "qty_exponent@38 decoded wrong");
 
