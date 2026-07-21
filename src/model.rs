@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -32,12 +32,21 @@ impl Side {
 
 /// Return the process-wide interned `Arc<str>` for a static venue name, so the ingest hot path
 /// clones a cached `Arc` (a refcount bump) instead of allocating a fresh `String`/`Arc` per message.
-/// Venues are a tiny fixed set (a handful of feeds), so the interner never grows meaningfully.
+/// Venues are a tiny fixed set (a handful of feeds), so the interner is populated during warmup and
+/// then read-only. Backed by an `RwLock` so the steady-state path takes only a *shared* read lock
+/// (uncontended across the ingest tasks) — the exclusive write lock is taken once per venue, the
+/// first time it is seen, not per message.
 pub fn venue_arc(venue: &'static str) -> Arc<str> {
-    static INTERN: OnceLock<Mutex<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
-    let map = INTERN.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = lock(map);
-    guard
+    static INTERN: OnceLock<RwLock<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
+    let map = INTERN.get_or_init(|| RwLock::new(HashMap::new()));
+    // Steady state: the venue is already interned -> shared read lock, clone the cached `Arc`.
+    if let Some(arc) = map.read().unwrap_or_else(|e| e.into_inner()).get(venue) {
+        return arc.clone();
+    }
+    // First sighting of this venue: take the write lock and insert (re-checking under the lock in
+    // case another task interned it in the race window).
+    map.write()
+        .unwrap_or_else(|e| e.into_inner())
         .entry(venue)
         .or_insert_with(|| Arc::from(venue))
         .clone()

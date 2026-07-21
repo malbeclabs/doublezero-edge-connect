@@ -556,8 +556,7 @@ impl MboProcessor {
                         self.last_top.remove(&old);
                         self.emitted_symbol.remove(&old);
                         let (_old_pub, old_id) = old;
-                        let symbol_still_served =
-                            self.books.keys().any(|(_p, i)| *i == old_id);
+                        let symbol_still_served = self.books.keys().any(|(_p, i)| *i == old_id);
                         if !symbol_still_served {
                             if let Some(def) = self.state.definition(old_id) {
                                 crate::model::lock(&self.depth)
@@ -1597,9 +1596,7 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1);
-            let entry = map
-                .get(&("TestVenue".into(), "BTC".into()))
-                .unwrap();
+            let entry = map.get(&("TestVenue".into(), "BTC".into())).unwrap();
             assert_eq!(entry.price_exponent, -2);
             assert_eq!(entry.qty_exponent, -4);
         }
@@ -1619,9 +1616,7 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1, "still one entry after conflicting write");
-            let entry = map
-                .get(&("TestVenue".into(), "BTC".into()))
-                .unwrap();
+            let entry = map.get(&("TestVenue".into(), "BTC".into())).unwrap();
             assert_eq!(
                 entry.price_exponent, -3,
                 "last writer's price_exponent wins"

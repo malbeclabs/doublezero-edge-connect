@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Vec<Box<dyn Future>>` per datagram.
   - **Trimmed dependencies** (`Cargo.toml`): narrowed `tokio` from `features = ["full"]` to the used
     set; `serde` gains the `rc` feature for `Arc<str>` (de)serialization.
+  - **Review follow-ups**: `venue_arc` (`src/model.rs`) is now backed by an `RwLock` so the
+    steady-state hot path takes only a shared read lock (the write lock fires once per venue at
+    warmup, not per message); the serializer task's broadcast-lag now increments a distinct
+    `dz_ws_serializer_lagged_total` metric (`src/metrics.rs`) instead of sharing the per-client
+    `dz_ws_client_lagged_total`, so a global serializer stall is no longer hidden behind a
+    single-slow-client signal; and the arbiter's `(winner, loser)` lead-histogram index formula is
+    now pinned by a unit test.
 
 ### Added
 - **Standalone `shred-proxy` binary** (new workspace member `shred-proxy/`): a lightweight service

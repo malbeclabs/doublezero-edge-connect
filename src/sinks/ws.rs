@@ -182,7 +182,14 @@ pub async fn serve(
             loop {
                 match backbone.recv().await {
                     Ok(m) => {
-                        // No connected clients → don't spend CPU serializing.
+                        // No connected clients → don't spend CPU serializing. Correctness of this
+                        // skip rests on connect-time replay (the instrument snapshot, then the
+                        // latest `depth` per symbol, sent directly — not via prepare()) plus quote
+                        // full-state semantics: a client that connects while the serializer is
+                        // skipping is caught up from the snapshot, then every subsequent quote/depth
+                        // is full state, so nothing skipped here is lost. (Trades in the
+                        // accept→subscribe gap are point-in-time and not replayed — matches prior
+                        // behavior.)
                         if prepared_tx.receiver_count() == 0 {
                             continue;
                         }
@@ -191,7 +198,7 @@ pub async fn serve(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        metrics().ws_client_lagged.inc();
+                        metrics().ws_serializer_lagged.inc();
                         warn!("ws serializer lagged, dropped {n}");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -565,8 +572,9 @@ mod tests {
         // Read the first `quote` frame each client receives (skipping any empty-snapshot replay).
         async fn next_quote<S>(ws: &mut S) -> String
         where
-            S: futures_util::StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-                + Unpin,
+            S: futures_util::StreamExt<
+                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
+                > + Unpin,
         {
             loop {
                 match timeout(Duration::from_secs(2), ws.next()).await {
@@ -585,7 +593,10 @@ mod tests {
             t1, t2,
             "serialize-once: all clients must receive byte-identical payloads"
         );
-        assert!(t1.contains("ws_send_ts_ns"), "quote must carry ws_send_ts_ns");
+        assert!(
+            t1.contains("ws_send_ts_ns"),
+            "quote must carry ws_send_ts_ns"
+        );
 
         srv.abort();
     }

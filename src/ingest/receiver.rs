@@ -152,12 +152,14 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64)
     // Status carries no business identity to dedup, so it goes straight to the broadcast sender
     // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the `Arc`/`Arc<str>`
     // allocation here is off the per-message hot path.
-    let _ = lock(arbiter).sender().send(std::sync::Arc::new(FeedMessage::Status(FeedStatus {
-        venue: std::sync::Arc::from(venue),
-        state: state.to_string(),
-        stale_ms,
-        ts_ns: now_ns(),
-    })));
+    let _ = lock(arbiter)
+        .sender()
+        .send(std::sync::Arc::new(FeedMessage::Status(FeedStatus {
+            venue: std::sync::Arc::from(venue),
+            state: state.to_string(),
+            stale_ms,
+            ts_ns: now_ns(),
+        })));
 }
 
 /// Receive one datagram, returning `(len, kernel_rx_ns, user_recv_ns)`.

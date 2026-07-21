@@ -18,8 +18,10 @@
 //! decode/socket error is logged and swallowed, so neither a reconnect storm nor a malformed frame
 //! can ever wedge the multicast hot path.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};

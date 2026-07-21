@@ -289,7 +289,10 @@ mod tests {
         map
     }
 
-    fn arbiter_with_rx() -> (SharedArbiter, broadcast::Receiver<std::sync::Arc<FeedMessage>>) {
+    fn arbiter_with_rx() -> (
+        SharedArbiter,
+        broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) {
         let (tx, rx) = broadcast::channel(64);
         (Arc::new(Mutex::new(Arbiter::new(tx, 8))), rx)
     }

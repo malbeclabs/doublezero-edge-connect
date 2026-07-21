@@ -202,7 +202,7 @@ first** (bids high→low, asks low→high).
 | `source_ts_ns`   | uint64   | Timestamp of the latest applied book event; `0` if unknown.          |
 | `recv_ts_ns`     | uint64   | When the producer built this snapshot, ns since epoch.               |
 | `kernel_rx_ts_ns`| uint64   | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable.          |
-| `ws_send_ts_ns`  | uint64   | Wall clock the instant before this snapshot is serialized; `0` if unset.|
+| `ws_send_ts_ns`  | uint64   | Wall clock the instant this snapshot is serialized; shared by all consumers of this message (serialized once, not per-connection). `0` if unset.|
 
 **Each `depth` message is full state** (the complete top *N*, not a delta), so - like `quote` - it
 **self-heals**: a consumer that drops one under backpressure recovers on the next snapshot, and a

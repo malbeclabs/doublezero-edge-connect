@@ -1472,7 +1472,8 @@ mod tests {
             d.symbol = symbol.into();
             FeedMessage::Depth(d)
         };
-        let key = |venue: &str, symbol: &str| -> (Arc<str>, Arc<str>) { (venue.into(), symbol.into()) };
+        let key =
+            |venue: &str, symbol: &str| -> (Arc<str>, Arc<str>) { (venue.into(), symbol.into()) };
         let (tx, _rx) = broadcast::channel(64);
         let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);
@@ -1764,5 +1765,38 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    /// Pins the hand-computed `pub_idx(winner) * 2 + pub_idx(loser)` offset (used to index the
+    /// `quote_lead`/`trade_lead` `[Histogram; 4]` arrays on the emit path) to the exact
+    /// `(winner, loser)` label pair `VenueMetrics::new` builds each slot from. A wrong offset would
+    /// silently mislabel a contest metric, so the two orderings must stay locked together here.
+    #[test]
+    fn lead_histogram_offset_maps_to_expected_label_pair() {
+        // Mirrors the label order the `lead` closure in `VenueMetrics::new` constructs the array in.
+        let expected = [
+            ("edge", "edge"),
+            ("edge", "public"),
+            ("public", "edge"),
+            ("public", "public"),
+        ];
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let public = Publisher::PublicWs;
+        let label = |p: Publisher| match p {
+            Publisher::Edge(_) => "edge",
+            Publisher::PublicWs => "public",
+        };
+        for winner in [edge, public] {
+            for loser in [edge, public] {
+                let idx = pub_idx(winner) * 2 + pub_idx(loser);
+                assert_eq!(
+                    expected[idx],
+                    (label(winner), label(loser)),
+                    "offset {idx} mislabels winner={:?} loser={:?}",
+                    label(winner),
+                    label(loser),
+                );
+            }
+        }
     }
 }
