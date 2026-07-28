@@ -22,3 +22,14 @@ Reference docs for operating and extending `doublezero-edge-connect`. Start at t
   reference.
 - **[edge-feed-spec](https://github.com/malbeclabs/edge-feed-spec)** — the upstream binary feed
   format.
+
+## Design specs
+
+Proposals and their outcomes, under [`superpowers/specs/`](superpowers/specs/). A spec's `Status`
+header says whether it reflects shipped code.
+
+- **[Venue-compatible WebSockets](superpowers/specs/2026-07-28-venue-compatible-websockets-design.md)**
+  (PROPOSED) — Hyperliquid- and Kalshi-compatible output sinks, and the L3 channel that makes full
+  protocol fidelity possible.
+- **[Unit tests for the `connect*.sh` installers](superpowers/specs/2026-07-06-connect-script-unit-tests-design.md)**
+  (SUPERSEDED) — kept for history; the shipped suite deliberately rejects its central decisions.

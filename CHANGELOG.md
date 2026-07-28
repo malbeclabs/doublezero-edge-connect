@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     now pinned by a unit test.
 
 ### Added
+- **Design spec: venue-compatible WebSockets** (`docs/superpowers/specs/2026-07-28-venue-compatible-websockets-design.md`,
+  linked from a new "Design specs" section in `docs/README.md`) — a proposal, no code yet, for two
+  drop-in output sinks that let an existing venue client consume the edge feed with only a URL change:
+  a **Hyperliquid-compatible** server (`l2Book` with full `nSigFigs`/`nLevels` support, `trades`,
+  `l4Book`, `bbo`) and a **Kalshi-margin-compatible** server (`orderbook_delta`, `ticker`, `trade`,
+  the `{id,cmd,params}` envelope), plus a scaffolded `Kalshi` ingest feed. The central decision is a
+  new internal **L3 channel** carrying the full untruncated ladder and its order-level events to the
+  compat sinks: translating the top-N `depth` message can never produce a faithful `orderbook_delta`
+  or a 100-level `l2Book`, and the L3 channel also makes `bbo` byte-consistent with `l2Book`. Sequenced
+  as six PRs and marked `Status: PROPOSED` — the spec names the three fields the edge feed does not
+  carry (and their sentinels) and the three details needing a live capture before parity can be
+  claimed.
 - **Standalone `shred-proxy` binary** (new workspace member `shred-proxy/`): a lightweight service
   that joins the DoubleZero `edge-solana-*` shred multicast feeds, deduplicates, and forwards a
   single copy of each shred to a local UDP port — meant to run next to a validator without the full
