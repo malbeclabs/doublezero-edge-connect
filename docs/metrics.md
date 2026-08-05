@@ -40,7 +40,9 @@ bandwidth can be tracked independently for each transport (UDP shred fan-out and
 ## Ingest reception (per publisher)
 
 Recorded by the multicast receivers (`src/ingest/receiver.rs`), one per `(venue, kind, publisher)` —
-a venue mirrored by six publishers runs six receivers per protocol.
+a venue mirrored by six publishers runs six receivers per protocol. The `publisher` label value is
+the publisher's **base port** (the market-data port of its block, e.g. `9201`), which is what
+`--publisher-port` selects.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
@@ -51,7 +53,7 @@ a venue mirrored by six publishers runs six receivers per protocol.
 | `dz_receiver_up` | gauge | `venue`, `kind`, `publisher` | `1` while this publisher's market-data stream is up, `0` while down. The per-publisher counterpart of `dz_feed_up`. |
 | `dz_feed_up` | gauge | `venue` | `1` while *any* publisher of the venue is up, `0` once every one has gone silent. |
 | `dz_feed_stale_ms` | gauge | `venue` | Staleness in milliseconds: `0` while up; the staleness at the last venue-level `down` transition (reset to `0` on recovery). |
-| `dz_seq_events_total` | counter | `venue`, `kind` | Frame-sequence classifications (`first`/`ok`/`reset`/`stale`). Incremented in the processor, which demultiplexes publishers by source IP and so has no configured publisher name — hence no `publisher` label. |
+| `dz_seq_events_total` | counter | `venue`, `kind` | Frame-sequence classifications (`first`/`ok`/`reset`/`stale`). Incremented in the processor, which demultiplexes publishers by source IP and so has no configured base port — hence no `publisher` label. |
 
 > **Label change (multi-publisher):** the four receiver counters gained `kind` and `publisher` when
 > a feed became N publishers rather than one port block. Aggregating queries (`sum by (venue)`,

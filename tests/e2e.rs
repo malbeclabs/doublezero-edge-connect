@@ -294,9 +294,9 @@ fn two_publisher_port_blocks_are_both_ingested() {
     let body = scrape_until(
         &metrics_bind,
         Duration::from_secs(20),
-        |b| publisher_datagrams(b, "aws-tyo-1") > 0 && publisher_datagrams(b, "aws-tyo-2") > 0,
+        |b| publisher_datagrams(b, 9101) > 0 && publisher_datagrams(b, 9201) > 0,
         || {
-            // Refdata before mktdata on each block (definitions gate emission), aws-tyo-1's first.
+            // Refdata before mktdata on each block (definitions gate emission), 9101's first.
             replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
             replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
             replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
@@ -304,20 +304,20 @@ fn two_publisher_port_blocks_are_both_ingested() {
         },
     );
     assert!(
-        publisher_datagrams(&body, "aws-tyo-1") > 0,
-        "publisher aws-tyo-1 (9101/9102) received nothing:\n{body}"
+        publisher_datagrams(&body, 9101) > 0,
+        "publisher 9101 (9101/9102) received nothing:\n{body}"
     );
     assert!(
-        publisher_datagrams(&body, "aws-tyo-2") > 0,
-        "publisher aws-tyo-2 (9201/9202) received nothing:\n{body}"
+        publisher_datagrams(&body, 9201) > 0,
+        "publisher 9201 (9201/9202) received nothing:\n{body}"
     );
 }
 
-/// Sum of the `dz_datagrams_received_total` samples whose labels name `publisher`.
-fn publisher_datagrams(body: &str, publisher: &str) -> u64 {
+/// Sum of the `dz_datagrams_received_total` samples labelled with this publisher's base port.
+fn publisher_datagrams(body: &str, base_port: u16) -> u64 {
     body.lines()
         .filter(|l| l.starts_with("dz_datagrams_received_total{"))
-        .filter(|l| l.contains(&format!("publisher=\"{publisher}\"")))
+        .filter(|l| l.contains(&format!("publisher=\"{base_port}\"")))
         .filter_map(|l| l.rsplit(' ').next())
         .filter_map(|v| v.trim().parse::<f64>().ok())
         .map(|v| v as u64)

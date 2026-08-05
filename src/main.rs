@@ -34,13 +34,19 @@ struct Args {
     #[arg(long = "feed", env = "DZ_FEEDS", value_delimiter = ',')]
     feeds: Vec<String>,
 
-    /// Publisher(s) to ingest within each selected feed, by name, repeatable (e.g.
-    /// `--publisher aws-tyo-2`). Each name must be a known publisher of some selected feed (see
-    /// `feeds.rs`). Omit to ingest EVERY publisher of every selected feed. Use this to cap ingest
-    /// cost (each publisher is a full receiver, and for MBO a full independent book) or to bisect
-    /// a misbehaving publisher.
-    #[arg(long = "publisher", env = "DZ_PUBLISHERS", value_delimiter = ',')]
-    publishers: Vec<String>,
+    /// Publisher(s) to ingest within each selected feed, by **base port** — the market-data port of
+    /// the publisher's block, repeatable (e.g. `--publisher-port 9201`). Each port must be the base
+    /// port of some selected feed's publisher (see `feeds.rs`). Omit to ingest EVERY publisher of
+    /// every selected feed. Use this to cap ingest cost (each publisher is a full receiver, and for
+    /// MBO a full independent book) or to exclude a misbehaving publisher. Base ports are unique
+    /// within a feed but **not across feeds** (two venues can both publish on 9201), so pair this
+    /// with `--feed` to scope the narrowing to one venue.
+    #[arg(
+        long = "publisher-port",
+        env = "DZ_PUBLISHER_PORTS",
+        value_delimiter = ','
+    )]
+    publisher_ports: Vec<u16>,
 
     /// Interface to join the groups on - a name (e.g. "doublezero1") or an IPv4 address.
     /// Names are resolved to their IPv4 (as in edge-multicast-ref).
@@ -239,18 +245,17 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
     Ok(chosen)
 }
 
-/// Narrow each feed's publisher list to `selection`, dropping feeds left with no publisher. An
-/// empty selection keeps every publisher of every feed. Errors if a name matches no publisher of
-/// any selected feed, so a typo fails fast rather than silently ingesting nothing.
+/// Narrow each feed's publisher list to the `selection` of base ports, dropping feeds left with no
+/// publisher. An empty selection keeps every publisher of every feed. Errors if a port matches no
+/// publisher of any selected feed, so a typo fails fast rather than silently ingesting nothing.
 fn filter_publishers(
     feeds: Vec<&'static feeds::Feed>,
-    selection: &[String],
+    selection: &[u16],
 ) -> Result<Vec<feeds::Feed>> {
     if selection.is_empty() {
         return Ok(feeds.into_iter().copied().collect());
     }
-    let mut unmatched: std::collections::HashSet<&str> =
-        selection.iter().map(|s| s.as_str()).collect();
+    let mut unmatched: std::collections::HashSet<u16> = selection.iter().copied().collect();
     let mut out = Vec::new();
     for f in feeds {
         // `publishers` is a `&'static` slice, so the narrowed set has to be leaked to keep the
@@ -260,15 +265,11 @@ fn filter_publishers(
             .publishers
             .iter()
             .filter(|p| {
-                // Discharge the *selection* entry, not `p.name`: the match is case-insensitive, so
-                // `--publisher AWS-TYO-2` would otherwise stay "unmatched" and abort startup.
-                match selection.iter().find(|s| s.eq_ignore_ascii_case(p.name)) {
-                    Some(s) => {
-                        unmatched.remove(s.as_str());
-                        true
-                    }
-                    None => false,
+                let hit = selection.contains(&p.base_port());
+                if hit {
+                    unmatched.remove(&p.base_port());
                 }
+                hit
             })
             .copied()
             .collect();
@@ -281,21 +282,29 @@ fn filter_publishers(
         });
     }
     if !unmatched.is_empty() {
-        let mut known: Vec<&str> = feeds::FEEDS
+        let mut known: Vec<u16> = feeds::FEEDS
             .iter()
-            .flat_map(|f| f.publishers.iter().map(|p| p.name))
+            .flat_map(|f| f.publishers.iter().map(|p| p.base_port()))
             .collect();
         known.sort_unstable();
         known.dedup();
-        let mut missing: Vec<&str> = unmatched.into_iter().collect();
-        missing.sort();
+        let mut missing: Vec<u16> = unmatched.into_iter().collect();
+        missing.sort_unstable();
         bail!(
-            "unknown publisher(s) {}; known publishers: {}",
-            missing.join(", "),
-            known.join(", ")
+            "unknown publisher base port(s) {}; known base ports: {}",
+            join_ports(&missing),
+            join_ports(&known)
         );
     }
     Ok(out)
+}
+
+fn join_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[tokio::main]
@@ -314,7 +323,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!(?args, "starting doublezero-edge-connect");
 
-    let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publishers)?;
+    let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publisher_ports)?;
     info!(
         feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
         "ingesting feeds"
@@ -543,37 +552,45 @@ mod tests {
     }
 
     #[test]
-    fn publisher_selection_narrows_and_keeps_other_feeds_intact() {
-        let sel = filter_publishers(
-            select_feeds(&[]).unwrap(),
-            &["aws-tyo-2".to_string(), "lat-tyo-1".to_string()],
-        )
-        .unwrap();
+    fn publisher_selection_narrows_by_base_port() {
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
         let hl_tob = sel
             .iter()
             .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
-        let names: Vec<&str> = hl_tob.publishers.iter().map(|p| p.name).collect();
-        assert_eq!(names, vec!["aws-tyo-2", "lat-tyo-1"]);
-        // Phoenix has no publisher by those names, so it drops out entirely rather than running
-        // with zero publishers.
-        assert!(!sel.iter().any(|f| f.venue == "Phoenix"));
+        let ports: Vec<u16> = hl_tob.publishers.iter().map(|p| p.base_port()).collect();
+        assert_eq!(ports, vec![9201, 9401]);
     }
 
-    /// The name match is case-insensitive, so a differently-cased selection must both narrow the
-    /// feed and count as matched (not abort startup as an unknown publisher).
+    /// A feed left with no matching publisher drops out entirely rather than running with zero
+    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201).
     #[test]
-    fn publisher_selection_is_case_insensitive() {
-        let sel =
-            filter_publishers(select_feeds(&[]).unwrap(), &["AWS-TYO-2".to_string()]).unwrap();
-        assert!(!sel.is_empty());
+    fn feeds_without_a_matching_base_port_drop_out() {
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
+        assert!(!sel.iter().any(|f| f.venue == "Phoenix"));
+        assert!(sel.iter().any(|f| f.venue == "Hyperliquid"));
+    }
+
+    /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
+    /// block and Phoenix's only block, so selecting it keeps a publisher on each. Scoping to one
+    /// venue is `--feed`'s job.
+    #[test]
+    fn base_ports_are_not_unique_across_feeds() {
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
+        let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
+        assert!(venues.contains("Hyperliquid"));
+        assert!(venues.contains("Phoenix"));
         assert!(sel
             .iter()
-            .all(|f| f.publishers.iter().all(|p| p.name == "aws-tyo-2")));
+            .all(|f| f.publishers.iter().all(|p| p.base_port() == 9201)));
+
+        let scoped =
+            filter_publishers(select_feeds(&["Phoenix".to_string()]).unwrap(), &[9201]).unwrap();
+        assert!(scoped.iter().all(|f| f.venue == "Phoenix"));
     }
 
     #[test]
-    fn unknown_publisher_is_an_error() {
-        assert!(filter_publishers(select_feeds(&[]).unwrap(), &["nope".to_string()]).is_err());
+    fn unknown_publisher_base_port_is_an_error() {
+        assert!(filter_publishers(select_feeds(&[]).unwrap(), &[1234]).is_err());
     }
 }

@@ -43,13 +43,15 @@ use crate::{
 
 /// Identity of a market-data **receiver** in the active-task map: one per publisher of a feed.
 /// `(venue, kind)` identifies the feed row (unique across `FEEDS`, asserted by
-/// `feeds::tests::venue_kind_pairs_are_unique`) and `publisher` the port block within it (unique
-/// per feed, asserted by `feeds::tests::publisher_names_unique_within_a_feed`).
-type FeedKey = (&'static str, FeedKind, &'static str);
+/// `feeds::tests::venue_kind_pairs_are_unique`) and the base port the block within it (unique per
+/// feed, asserted by `feeds::tests::publisher_base_ports_unique_within_a_feed`).
+type FeedKey = (&'static str, FeedKind, u16);
 
 /// Every receiver key a feed contributes - one per publisher.
 fn feed_keys(f: &Feed) -> impl Iterator<Item = FeedKey> + '_ {
-    f.publishers.iter().map(|p| (f.venue, f.kind, p.name))
+    f.publishers
+        .iter()
+        .map(|p| (f.venue, f.kind, p.base_port()))
 }
 
 /// Static shred-forwarder parameters (everything except the source set, which the reconciler
@@ -77,8 +79,8 @@ pub struct ReconcilerConfig {
     pub arbiter: SharedArbiter,
     pub instruments: InstrumentSnapshot,
     pub depth: DepthSnapshot,
-    /// The `--feed`/`--publisher`-selected market-data feeds this process may run (subject to
-    /// subscription). Owned rather than `&'static` because `--publisher` narrows each row's
+    /// The `--feed`/`--publisher-port`-selected market-data feeds this process may run (subject to
+    /// subscription). Owned rather than `&'static` because `--publisher-port` narrows each row's
     /// publisher list.
     pub enabled: Vec<Feed>,
     pub iface: String,
@@ -274,7 +276,7 @@ impl Reconciler {
                 .find_map(|f| {
                     f.publishers
                         .iter()
-                        .find(|p| (f.venue, f.kind, p.name) == key)
+                        .find(|p| (f.venue, f.kind, p.base_port()) == key)
                         .map(|p| (*f, *p))
                 })
                 .expect("desired feed key came from enabled");
@@ -433,14 +435,12 @@ mod tests {
     fn feed_keys_are_per_publisher() {
         static PUBS: &[FeedPublisher] = &[
             FeedPublisher {
-                name: "p1",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9101,
                     refdata: 9102,
                 },
             },
             FeedPublisher {
-                name: "p2",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9201,
                     refdata: 9202,
@@ -452,8 +452,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                ("TestVenue", FeedKind::TopOfBook, "p1"),
-                ("TestVenue", FeedKind::TopOfBook, "p2"),
+                ("TestVenue", FeedKind::TopOfBook, 9101),
+                ("TestVenue", FeedKind::TopOfBook, 9201),
             ]
         );
     }
@@ -461,15 +461,15 @@ mod tests {
     /// Distinct publishers of the same feed must not collide in the active-task map.
     #[test]
     fn plan_treats_publishers_as_independent() {
-        let current: HashSet<FeedKey> = [("V", FeedKind::TopOfBook, "p1")].into_iter().collect();
+        let current: HashSet<FeedKey> = [("V", FeedKind::TopOfBook, 9101)].into_iter().collect();
         let desired: HashSet<FeedKey> = [
-            ("V", FeedKind::TopOfBook, "p1"),
-            ("V", FeedKind::TopOfBook, "p2"),
+            ("V", FeedKind::TopOfBook, 9101),
+            ("V", FeedKind::TopOfBook, 9201),
         ]
         .into_iter()
         .collect();
         let (to_spawn, to_abort) = plan(&current, &desired);
-        assert_eq!(to_spawn, vec![("V", FeedKind::TopOfBook, "p2")]);
+        assert_eq!(to_spawn, vec![("V", FeedKind::TopOfBook, 9201)]);
         assert!(to_abort.is_empty());
     }
 }

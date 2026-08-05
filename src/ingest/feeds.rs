@@ -75,28 +75,34 @@ impl FeedPorts {
     }
 }
 
-/// One publisher mirroring a feed: the port block it publishes on, plus a stable name.
+/// One publisher mirroring a feed: the port block it publishes on.
 ///
 /// Independent publishers mirror one venue's stream so subscribers can race them (see
 /// `ingest::arbiter`). Two deployment models exist and both are supported:
 ///
-/// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does — host index N
-///   publishes on base + N*100): one `FeedPublisher` row per publisher, one receiver task each,
-///   and each task sees exactly one source IP.
+/// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does — the Nth
+///   publisher's block is base + N*100): one `FeedPublisher` row per publisher, one receiver task
+///   each, and each task sees exactly one source IP.
 /// - **Shared port block** (all publishers to one `(group, port)`): a single `FeedPublisher` row,
 ///   one receiver task, and that task sees N source IPs.
 ///
 /// Either way the *publisher identity* the arbiter races on is the datagram source IP, never the
-/// port — so the dedup path is identical. `name` exists only for metric labels, log fields and the
-/// reconciler's task key; it is operator-facing configuration, never read from the wire.
+/// port — so the dedup path is identical. The operator-facing identity is the
+/// [`base port`](FeedPublisher::base_port): what `--publisher-port` selects and what the
+/// `publisher` metric label carries. Deliberately a port and not a host name — the port block is
+/// the publisher property this protocol actually defines.
 #[derive(Debug, Clone, Copy)]
 pub struct FeedPublisher {
-    /// Stable, low-cardinality name for the `publisher` metric label and log fields. Unique within
-    /// a feed. Mirrors the ansible host that publishes the block, shortened (`aws-tyo-2` ==
-    /// `aws-tyo-hl-mainnet2`) so an operator can correlate a metric back to a host.
-    pub name: &'static str,
     /// The port block this publisher sends on.
     pub ports: FeedPorts,
+}
+
+impl FeedPublisher {
+    /// This publisher's stable identity within its feed: the market-data (base) port of its block.
+    /// Used for the `publisher` metric label, log fields and the reconciler's task key.
+    pub fn base_port(&self) -> u16 {
+        self.ports.mktdata()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,19 +132,17 @@ pub struct Feed {
 /// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue, each mirrored by
 /// one or more publishers ([`FeedPublisher`]).
 ///
-/// Group, ports **and publisher count** all vary per venue. Hyperliquid runs a six-host fleet on
-/// one group with a distinct port block per host (base + host_index*100); Phoenix runs a single
-/// publisher. Don't assume any of it - confirm against the venue's ansible inventory.
+/// Group, ports **and publisher count** all vary per venue. Hyperliquid mirrors one group across six
+/// publishers, each with its own port block (base + N*100); Phoenix runs a single publisher. Don't
+/// assume any of it - confirm against the venue's deployment.
 ///
 /// Sibling-protocol feeds (Midpoint) are added here once their live multicast groups/ports are
 /// known; until then they are absent rather than carrying guessed endpoints.
 pub const FEEDS: &[Feed] = &[
-    // Confirmed on-wire (group-bound capture) plus the publisher fleet from
-    // hyperliquid/infra/ansible/inventory/{hosts.ini,host_vars/*/main.yml}:
+    // Confirmed on-wire (group-bound capture) plus the publisher fleet's port blocks:
     //
-    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid, six publishers, TOB on 9x01/9x02 and MBO on
-    //     10x01/10x02/10x03 where x is the host index (mainnet4=0, mainnet1=1, mainnet2=2,
-    //     mainnet3=3, lat=4, gcp=6).
+    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid, six publishers, TOB on 9N01/9N02 and MBO on
+    //     10N01/10N02/10N03, where N is the publisher index (0..4 and 6 - the fleet skips 5).
     //   - `scottsdale` 233.84.178.18 -> Phoenix, a single publisher on 9201/9202.
     //
     // The venue is still resolved per message from the wire SourceID (see processor.rs), so the
@@ -151,42 +155,36 @@ pub const FEEDS: &[Feed] = &[
         group: Ipv4Addr::new(233, 84, 178, 15),
         publishers: &[
             FeedPublisher {
-                name: "aws-tyo-4",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9001,
                     refdata: 9002,
                 },
             },
             FeedPublisher {
-                name: "aws-tyo-1",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9101,
                     refdata: 9102,
                 },
             },
             FeedPublisher {
-                name: "aws-tyo-2",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9201,
                     refdata: 9202,
                 },
             },
             FeedPublisher {
-                name: "aws-tyo-3",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9301,
                     refdata: 9302,
                 },
             },
             FeedPublisher {
-                name: "lat-tyo-1",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9401,
                     refdata: 9402,
                 },
             },
             FeedPublisher {
-                name: "gcp-tyo-1",
                 ports: FeedPorts::TwoPort {
                     mktdata: 9601,
                     refdata: 9602,
@@ -196,10 +194,10 @@ pub const FEEDS: &[Feed] = &[
         emit_trades: true,
     },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
-    // (paired with the TOB row above). The `aws-tyo-2` block (10201/10202/10203) is confirmed
-    // against edge-multicast-ref/docs/hyperliquid.md (mainnet-beta); the other five are the same
-    // +100-per-host scheme from the ansible inventory, so a block that turns out to be wrong shows
-    // up as a permanent `dz_receiver_up == 0` for that publisher rather than as an error.
+    // (paired with the TOB row above). The 10201/10202/10203 block is confirmed against
+    // edge-multicast-ref/docs/hyperliquid.md (mainnet-beta); the other five follow the same
+    // +100-per-publisher scheme, so a block that turns out to be wrong shows up as a permanent
+    // `dz_receiver_up == 0` for that publisher rather than as an error.
     // Depth-only: TOB owns this venue's trades.
     Feed {
         venue: "Hyperliquid",
@@ -208,7 +206,6 @@ pub const FEEDS: &[Feed] = &[
         group: Ipv4Addr::new(233, 84, 178, 15),
         publishers: &[
             FeedPublisher {
-                name: "aws-tyo-4",
                 ports: FeedPorts::ThreePort {
                     mktdata: 10001,
                     refdata: 10002,
@@ -216,7 +213,6 @@ pub const FEEDS: &[Feed] = &[
                 },
             },
             FeedPublisher {
-                name: "aws-tyo-1",
                 ports: FeedPorts::ThreePort {
                     mktdata: 10101,
                     refdata: 10102,
@@ -224,7 +220,6 @@ pub const FEEDS: &[Feed] = &[
                 },
             },
             FeedPublisher {
-                name: "aws-tyo-2",
                 ports: FeedPorts::ThreePort {
                     mktdata: 10201,
                     refdata: 10202,
@@ -232,7 +227,6 @@ pub const FEEDS: &[Feed] = &[
                 },
             },
             FeedPublisher {
-                name: "aws-tyo-3",
                 ports: FeedPorts::ThreePort {
                     mktdata: 10301,
                     refdata: 10302,
@@ -240,7 +234,6 @@ pub const FEEDS: &[Feed] = &[
                 },
             },
             FeedPublisher {
-                name: "lat-tyo-1",
                 ports: FeedPorts::ThreePort {
                     mktdata: 10401,
                     refdata: 10402,
@@ -248,7 +241,6 @@ pub const FEEDS: &[Feed] = &[
                 },
             },
             FeedPublisher {
-                name: "gcp-tyo-1",
                 ports: FeedPorts::ThreePort {
                     mktdata: 10601,
                     refdata: 10602,
@@ -264,9 +256,6 @@ pub const FEEDS: &[Feed] = &[
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
         publishers: &[FeedPublisher {
-            // Single publisher; the name is not host-derived (the Phoenix inventory lists no
-            // per-host port block to mirror), so it stays generic.
-            name: "primary",
             ports: FeedPorts::TwoPort {
                 mktdata: 9201,
                 refdata: 9202,
@@ -364,26 +353,20 @@ mod tests {
         }
     }
 
-    /// Publisher names are the `publisher` metric label and the reconciler's task-key component,
-    /// so they must be unique within a feed (a duplicate would collapse two receivers into one
-    /// task key and merge their metrics).
+    /// Base ports are the `publisher` metric label and the reconciler's task-key component, so they
+    /// must be unique within a feed (a duplicate would collapse two receivers into one task key and
+    /// merge their metrics).
     #[test]
-    fn publisher_names_unique_within_a_feed() {
+    fn publisher_base_ports_unique_within_a_feed() {
         for f in FEEDS {
             let mut seen = std::collections::HashSet::new();
             for p in f.publishers {
                 assert!(
-                    seen.insert(p.name),
-                    "{} {:?} has duplicate publisher name {}",
+                    seen.insert(p.base_port()),
+                    "{} {:?} has duplicate publisher base port {}",
                     f.venue,
                     f.kind,
-                    p.name
-                );
-                assert!(
-                    !p.name.is_empty(),
-                    "{} {:?} has an empty publisher name",
-                    f.venue,
-                    f.kind
+                    p.base_port()
                 );
             }
         }
@@ -409,7 +392,7 @@ mod tests {
                         "{} {:?} publisher {} reuses (group {}, port {})",
                         f.venue,
                         f.kind,
-                        p.name,
+                        p.base_port(),
                         f.group,
                         port
                     );
@@ -418,8 +401,8 @@ mod tests {
         }
     }
 
-    /// The Hyperliquid fleet mirrors one venue across six hosts on the +100-per-host port scheme.
-    /// Pins the count so a dropped row is caught, and pins one known block end-to-end.
+    /// The Hyperliquid fleet mirrors one venue across six publishers on the +100-per-publisher port
+    /// scheme. Pins the count so a dropped row is caught, and pins one known block end-to-end.
     #[test]
     fn hyperliquid_lists_the_whole_publisher_fleet() {
         for kind in [FeedKind::TopOfBook, FeedKind::MarketByOrder] {
@@ -436,9 +419,8 @@ mod tests {
         let p = tob
             .publishers
             .iter()
-            .find(|p| p.name == "aws-tyo-2")
+            .find(|p| p.base_port() == 9201)
             .unwrap();
-        assert_eq!(p.ports.mktdata(), 9201);
         assert_eq!(p.ports.refdata(), 9202);
     }
 

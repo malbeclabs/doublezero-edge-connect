@@ -10,13 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All six live Hyperliquid publishers are ingested
-  (previously only `aws-tyo-hl-mainnet2`'s block), so the arbiter's cross-publisher race, lead-time
+  (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
   histograms and win-rate counters finally have a field of more than one. Publishers that share a
   single port block still work unchanged. (#88)
-- `--publisher <name>` (`DZ_PUBLISHERS`) narrows the publisher set per feed — each publisher is a
-  full receiver, and for Market-by-Order a full independent book, so a six-host venue is ~6x the
-  ingest cost of one. (#88)
-- `dz_receiver_up{venue,kind,publisher}` — per-publisher receiver health. (#88)
+- `--publisher-port <port>` (`DZ_PUBLISHER_PORTS`) narrows the publisher set per feed by **base
+  port** (the market-data port of a publisher's block) — each publisher is a full receiver, and for
+  Market-by-Order a full independent book, so a six-publisher venue is ~6x the ingest cost of one.
+  Base ports are unique within a feed but not across feeds; pair with `--feed` to scope to one
+  venue. (#88)
+- `dz_receiver_up{venue,kind,publisher}` — per-publisher receiver health, where the `publisher`
+  label value is the base port. (#88)
 
 ### Changed
 - `dz_datagrams_received_total`, `dz_datagram_bytes_total`, `dz_socket_errors_total` and

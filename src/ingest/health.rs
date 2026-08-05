@@ -23,8 +23,8 @@ use std::{
 
 use crate::ingest::feeds::FeedKind;
 
-/// Identity of one receiver: `(venue, kind, publisher)`. Same shape as `reconcile::FeedKey`.
-pub type ReceiverKey = (&'static str, FeedKind, &'static str);
+/// Identity of one receiver: `(venue, kind, base port)`. Same shape as `reconcile::FeedKey`.
+pub type ReceiverKey = (&'static str, FeedKind, u16);
 
 /// Whether a receiver of this protocol counts toward the venue-level `status` / `dz_feed_up`.
 ///
@@ -157,8 +157,8 @@ mod tests {
     use std::cell::Cell;
 
     const V: &str = "TestVenue";
-    fn key(pubname: &'static str) -> ReceiverKey {
-        (V, FeedKind::TopOfBook, pubname)
+    fn key(base_port: u16) -> ReceiverKey {
+        (V, FeedKind::TopOfBook, base_port)
     }
 
     /// `Some(venue_up)` if the mutation flipped the venue aggregate, else `None` — the shape the
@@ -183,25 +183,25 @@ mod tests {
     fn first_registration_makes_the_venue_up() {
         let h = FeedHealth::new();
         assert!(!h.venue_up(V), "unknown venue is not up");
-        assert_eq!(register(&h, key("p1")), Some(true), "venue edge to up");
+        assert_eq!(register(&h, key(9101)), Some(true), "venue edge to up");
         assert!(h.venue_up(V));
-        assert_eq!(register(&h, key("p2")), None, "already up: no second edge");
+        assert_eq!(register(&h, key(9201)), None, "already up: no second edge");
     }
 
     /// The whole point: one wedged publisher must NOT take the venue down while a peer streams.
     #[test]
     fn venue_stays_up_while_any_publisher_is_up() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        register(&h, key("p2"));
+        register(&h, key(9101));
+        register(&h, key(9201));
         assert_eq!(
-            set(&h, key("p1"), false),
+            set(&h, key(9101), false),
             None,
-            "no venue edge: p2 still up"
+            "no venue edge: 9201 still up"
         );
         assert!(h.venue_up(V));
         assert_eq!(
-            set(&h, key("p2"), false),
+            set(&h, key(9201), false),
             Some(false),
             "last publisher down -> venue edge to down"
         );
@@ -211,25 +211,25 @@ mod tests {
     #[test]
     fn recovery_of_any_publisher_raises_the_venue_once() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        register(&h, key("p2"));
-        set(&h, key("p1"), false);
-        set(&h, key("p2"), false);
+        register(&h, key(9101));
+        register(&h, key(9201));
+        set(&h, key(9101), false);
+        set(&h, key(9201), false);
         assert_eq!(
-            set(&h, key("p1"), true),
+            set(&h, key(9101), true),
             Some(true),
             "venue edge back to up"
         );
-        assert_eq!(set(&h, key("p2"), true), None, "already up: no second edge");
+        assert_eq!(set(&h, key(9201), true), None, "already up: no second edge");
     }
 
     #[test]
     fn repeated_same_state_reports_no_edge() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        assert_eq!(set(&h, key("p1"), true), None);
-        assert_eq!(set(&h, key("p1"), false), Some(false));
-        assert_eq!(set(&h, key("p1"), false), None);
+        register(&h, key(9101));
+        assert_eq!(set(&h, key(9101), true), None);
+        assert_eq!(set(&h, key(9101), false), Some(false));
+        assert_eq!(set(&h, key(9101), false), None);
     }
 
     /// A respawned receiver raises the venue, and it does so **on the edge** — otherwise the peer's
@@ -237,15 +237,15 @@ mod tests {
     #[test]
     fn respawn_into_a_down_venue_publishes_the_up_edge() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        set(&h, key("p1"), false);
+        register(&h, key(9101));
+        set(&h, key(9101), false);
         assert!(!h.venue_up(V));
         assert_eq!(
-            register(&h, key("p2")),
+            register(&h, key(9201)),
             Some(true),
             "respawn raises the venue"
         );
-        assert_eq!(set(&h, key("p1"), true), None, "peer recovery: already up");
+        assert_eq!(set(&h, key(9101), true), None, "peer recovery: already up");
     }
 
     /// A deregistered (aborted/exited) receiver must not hold its venue down forever, and losing
@@ -253,22 +253,22 @@ mod tests {
     #[test]
     fn deregister_drops_a_down_receiver_from_the_aggregate() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        register(&h, key("p2"));
-        set(&h, key("p1"), false);
-        assert_eq!(deregister(&h, key("p1")), None, "p2 still up: no edge");
+        register(&h, key(9101));
+        register(&h, key(9201));
+        set(&h, key(9101), false);
+        assert_eq!(deregister(&h, key(9101)), None, "9201 still up: no edge");
         assert!(h.venue_up(V), "only the live, up receiver counts");
-        assert_eq!(set(&h, key("p2"), false), Some(false));
+        assert_eq!(set(&h, key(9201), false), Some(false));
         // Deregistering the last receiver leaves no receivers: the venue is not "up".
-        assert_eq!(deregister(&h, key("p2")), None, "already down: no edge");
+        assert_eq!(deregister(&h, key(9201)), None, "already down: no edge");
         assert!(!h.venue_up(V));
     }
 
     #[test]
     fn deregistering_the_last_up_receiver_is_a_down_edge() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        assert_eq!(deregister(&h, key("p1")), Some(false));
+        register(&h, key(9101));
+        assert_eq!(deregister(&h, key(9101)), Some(false));
         assert!(!h.venue_up(V));
     }
 
@@ -276,9 +276,9 @@ mod tests {
     #[test]
     fn venues_are_isolated() {
         let h = FeedHealth::new();
-        register(&h, key("p1"));
-        register(&h, ("Other", FeedKind::TopOfBook, "p1"));
-        assert_eq!(set(&h, key("p1"), false), Some(false));
+        register(&h, key(9101));
+        register(&h, ("Other", FeedKind::TopOfBook, 9101));
+        assert_eq!(set(&h, key(9101), false), Some(false));
         assert!(h.venue_up("Other"), "other venue unaffected");
     }
 
@@ -286,9 +286,9 @@ mod tests {
     /// down on its own nor mask a total outage of the venue's quote publishers.
     #[test]
     fn depth_only_receivers_are_excluded_from_the_venue_aggregate() {
-        let mbo = (V, FeedKind::MarketByOrder, "p1");
+        let mbo = (V, FeedKind::MarketByOrder, 10101);
         let h = FeedHealth::new();
-        register(&h, key("p1"));
+        register(&h, key(9101));
         assert_eq!(
             register(&h, mbo),
             None,
@@ -302,7 +302,7 @@ mod tests {
         // ...and a live MBO must not mask the quote feed going fully silent.
         set(&h, mbo, true);
         assert_eq!(
-            set(&h, key("p1"), false),
+            set(&h, key(9101), false),
             Some(false),
             "all quote publishers down -> venue down even though MBO is up"
         );
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn a_depth_only_venue_falls_back_to_its_registered_receivers() {
         let h = FeedHealth::new();
-        let mbo = ("DepthOnly", FeedKind::MarketByOrder, "p1");
+        let mbo = ("DepthOnly", FeedKind::MarketByOrder, 10101);
         assert_eq!(register(&h, mbo), Some(true));
         assert!(h.venue_up("DepthOnly"));
         assert_eq!(set(&h, mbo, false), Some(false));

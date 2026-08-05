@@ -486,7 +486,7 @@ async fn drive<P: FrameProcessor>(
     recv_buf: usize,
     venue: &'static str,
     kind: FeedKind,
-    publisher_name: &'static str,
+    publisher_port: u16,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     health: SharedFeedHealth,
@@ -501,6 +501,9 @@ async fn drive<P: FrameProcessor>(
     // is resolved per role at bind time below.
     let m = metrics();
     let kind_label = kind.label();
+    // The `publisher` label/log value is the base port, rendered once here - never per datagram.
+    let publisher_port_str = publisher_port.to_string();
+    let publisher_name: &str = &publisher_port_str;
     let bytes_ctr = m
         .datagram_bytes
         .with_label_values(&[venue, kind_label, publisher_name]);
@@ -515,7 +518,7 @@ async fn drive<P: FrameProcessor>(
     let reg = ReceiverRegistration::new(
         health.clone(),
         arbiter.clone(),
-        (venue, kind, publisher_name),
+        (venue, kind, publisher_port),
         m.receiver_up
             .with_label_values(&[venue, kind_label, publisher_name]),
     );
@@ -653,7 +656,7 @@ pub async fn run_feed(
                 recv_buf,
                 venue,
                 feed.kind,
-                publisher.name,
+                publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
@@ -670,7 +673,7 @@ pub async fn run_feed(
                 recv_buf,
                 venue,
                 feed.kind,
-                publisher.name,
+                publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
@@ -688,7 +691,7 @@ pub async fn run_feed(
                 bail!(
                     "Market-by-Order feed '{venue}' publisher '{}' must use FeedPorts::ThreePort \
                      (mktdata/refdata/snapshot)",
-                    publisher.name
+                    publisher.base_port()
                 );
             };
             let ports = vec![
@@ -703,7 +706,7 @@ pub async fn run_feed(
                 recv_buf,
                 venue,
                 feed.kind,
-                publisher.name,
+                publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
@@ -728,7 +731,7 @@ mod tests {
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
         let health = FeedHealth::new();
-        health.register((venue, FeedKind::TopOfBook, "p1"), |_| {});
+        health.register((venue, FeedKind::TopOfBook, 9101), |_| {});
         init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.

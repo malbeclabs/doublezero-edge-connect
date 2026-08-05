@@ -48,7 +48,8 @@ pub struct Metrics {
     registry: Registry,
 
     // --- Ingest receivers (labelled by `venue`, `kind`, `publisher` — one receiver per publisher
-    // of a feed; `feed_up`/`feed_stale_ms` are deliberately venue-level aggregates) ---
+    // of a feed, where `publisher` is its base port (`FeedPublisher::base_port`);
+    // `feed_up`/`feed_stale_ms` are deliberately venue-level aggregates) ---
     /// Datagrams received per publisher, split by port `role` (mktdata/refdata/snapshot/combined).
     pub datagrams_received: IntCounterVec,
     /// Total bytes received per publisher (sum of datagram lengths).
@@ -627,7 +628,7 @@ mod tests {
         // Touch a few families so they appear in the text output (a zero CounterVec child only
         // materializes once a label set is observed).
         m.datagrams_received
-            .with_label_values(&["Hyperliquid", "tob", "aws-tyo-2", "mktdata"])
+            .with_label_values(&["Hyperliquid", "tob", "9201", "mktdata"])
             .inc();
         m.emit.with_label_values(&["Hyperliquid", "quote"]).inc();
         m.ws_clients.set(0);
@@ -700,40 +701,40 @@ mod tests {
         let m = metrics();
         let venue = "PerPublisherLabelTest";
         m.datagrams_received
-            .with_label_values(&[venue, "tob", "aws-tyo-1", "mktdata"])
+            .with_label_values(&[venue, "tob", "9101", "mktdata"])
             .inc();
         m.datagrams_received
-            .with_label_values(&[venue, "tob", "aws-tyo-2", "mktdata"])
+            .with_label_values(&[venue, "tob", "9201", "mktdata"])
             .inc_by(3);
         m.datagram_bytes
-            .with_label_values(&[venue, "tob", "aws-tyo-1"])
+            .with_label_values(&[venue, "tob", "9101"])
             .inc_by(100);
         m.socket_errors
-            .with_label_values(&[venue, "tob", "aws-tyo-1"])
+            .with_label_values(&[venue, "tob", "9101"])
             .inc();
         m.idle_rejoin
-            .with_label_values(&[venue, "mbo", "gcp-tyo-1"])
+            .with_label_values(&[venue, "mbo", "10601"])
             .inc();
         m.receiver_up
-            .with_label_values(&[venue, "mbo", "gcp-tyo-1"])
+            .with_label_values(&[venue, "mbo", "10601"])
             .set(0);
 
         // Distinct publishers are distinct series, not a merged total.
         assert_eq!(
             m.datagrams_received
-                .with_label_values(&[venue, "tob", "aws-tyo-1", "mktdata"])
+                .with_label_values(&[venue, "tob", "9101", "mktdata"])
                 .get(),
             1
         );
         assert_eq!(
             m.datagrams_received
-                .with_label_values(&[venue, "tob", "aws-tyo-2", "mktdata"])
+                .with_label_values(&[venue, "tob", "9201", "mktdata"])
                 .get(),
             3
         );
         assert_eq!(
             m.receiver_up
-                .with_label_values(&[venue, "mbo", "gcp-tyo-1"])
+                .with_label_values(&[venue, "mbo", "10601"])
                 .get(),
             0
         );
