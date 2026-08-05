@@ -514,14 +514,11 @@ async fn drive<P: FrameProcessor>(
         .idle_rejoin
         .with_label_values(&[venue, kind_label, publisher_name]);
     // Registers this receiver in the shared health map and owns its `dz_receiver_up`; deregisters
-    // both when this task ends for any reason (see `ReceiverRegistration`).
-    let reg = ReceiverRegistration::new(
-        health.clone(),
-        arbiter.clone(),
-        (venue, kind, publisher_port),
-        m.receiver_up
-            .with_label_values(&[venue, kind_label, publisher_name]),
-    );
+    // both when this task ends for any reason (see `ReceiverRegistration`). Deferred until the
+    // sockets actually bind: a receiver that can never bind (taken port, bad interface) would
+    // otherwise register-then-drop on every reconciler respawn, publishing a `status` down/ok pair
+    // per tick. A bind error is a known failure, not silence, so it stays out of the aggregate.
+    let mut registration: Option<ReceiverRegistration> = None;
     // Create the feed-health gauge series up front, so a feed that never goes down still exposes
     // `dz_feed_up{venue}` (the venue-level down/ok edges flip it).
     init_feed_health(&health, venue);
@@ -546,6 +543,15 @@ async fn drive<P: FrameProcessor>(
                 ]),
             });
         }
+        let reg = registration.get_or_insert_with(|| {
+            ReceiverRegistration::new(
+                health.clone(),
+                arbiter.clone(),
+                (venue, kind, publisher_port),
+                m.receiver_up
+                    .with_label_values(&[venue, kind_label, publisher_name]),
+            )
+        });
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, venue, kind = kind_label,
               publisher = publisher_name, "DZ Edge multicast receiver bound");
 
@@ -564,8 +570,6 @@ async fn drive<P: FrameProcessor>(
                     down = true;
                     // Only when the venue's LAST up quote receiver goes down is the venue down.
                     reg.set(false, last_mkt.elapsed().as_millis() as u64);
-                } else {
-                    reg.set(false, 0);
                 }
                 continue 'rejoin;
             }
@@ -586,8 +590,6 @@ async fn drive<P: FrameProcessor>(
                         if !down {
                             down = true;
                             reg.set(false, last_mkt.elapsed().as_millis() as u64);
-                        } else {
-                            reg.set(false, 0);
                         }
                         continue 'rejoin;
                     }

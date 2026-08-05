@@ -62,7 +62,9 @@ the publisher's **base port** (the market-data port of its block, e.g. `9201`), 
 > protocol instead of one. `dz_feed_up` / `dz_feed_stale_ms` are deliberately still venue-level
 > **aggregates**: a venue reads down only once every one of its **quote-bearing** publishers (the
 > Top-of-Book/Midpoint receivers — `status` is the quote feed's health, so a depth-only
-> Market-by-Order mirror neither declares an outage nor masks one) has gone silent. A venue with
+> Market-by-Order mirror neither declares an outage nor masks one) has gone silent. A quote receiver
+> that *stops* (aborted, exited, bind error) leaves the aggregate down rather than handing it to a
+> depth-only peer, so a venue whose Top-of-Book receivers all died reads `0`, not `1`. A venue with
 > `dz_feed_up == 1` and some `dz_receiver_up == 0` has a wedged mirror — worth its own alert.
 >
 > **Arbiter-side semantics drift under unchanged names.** Ingesting N mirrors instead of one changes

@@ -349,6 +349,8 @@ fn scrape_until(
         if std::time::Instant::now() >= deadline {
             return last;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // 500ms, not 100ms: `send` re-replays the whole fixture each round, so a tighter loop just
+        // multiplies replay volume (and CI log noise) for the same signal.
+        std::thread::sleep(Duration::from_millis(500));
     }
 }

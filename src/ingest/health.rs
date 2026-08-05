@@ -17,7 +17,7 @@
 //!   the wire `status` at the negation of the real state.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -44,30 +44,44 @@ fn carries_venue_status(kind: FeedKind) -> bool {
 /// [`SharedFeedHealth`]; every mutation is off the hot path (only watchdog edges touch it).
 #[derive(Default)]
 pub struct FeedHealth {
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
     /// Registered receivers -> whether each is currently up. A receiver absent from this map is
     /// not running and does not count toward its venue's aggregate.
-    up: Mutex<HashMap<ReceiverKey, bool>>,
+    up: HashMap<ReceiverKey, bool>,
+    /// Venues that have had a quote-bearing receiver registered at some point in this process's
+    /// life. **Sticky on purpose**: carriers leave `up` when their task stops (abort, exit, bind
+    /// error), and without this a venue whose every quote receiver had exited would fall back to
+    /// its depth-only receivers and publish `status: ok` with zero quotes flowing - the masking
+    /// this module's contract forbids. Never removed, so bounded by the venue count.
+    carrier_venues: HashSet<&'static str>,
 }
 
 /// Handle cloned into each receiver task and held by the reconciler.
 pub type SharedFeedHealth = Arc<FeedHealth>;
 
 /// Whether any registered **quote-bearing** receiver for `venue` is up, falling back to any
-/// registered receiver when the venue has no quote-bearing row at all (a hypothetical depth-only
-/// venue would otherwise read permanently down and fire the headline alert forever).
-fn venue_up_in(map: &HashMap<ReceiverKey, bool>, venue: &str) -> bool {
-    let (mut has_carrier, mut carrier_up, mut any_up) = (false, false, false);
-    for ((v, kind, _), up) in map.iter() {
+/// registered receiver when this process has never run a quote-bearing one for the venue (a
+/// depth-only venue, or an MBO-only `--publisher-port` selection, would otherwise read permanently
+/// down and fire the headline alert forever).
+///
+/// The fallback is gated on `carrier_venues`, not on what is in `up` right now: a carrier that
+/// *stopped* must keep the venue honest rather than hand the aggregate to a depth-only peer.
+fn venue_up_in(state: &State, venue: &str) -> bool {
+    let (mut carrier_up, mut any_up) = (false, false);
+    for ((v, kind, _), up) in state.up.iter() {
         if *v != venue {
             continue;
         }
         any_up |= *up;
         if carries_venue_status(*kind) {
-            has_carrier = true;
             carrier_up |= *up;
         }
     }
-    if has_carrier {
+    if state.carrier_venues.contains(venue) {
         carrier_up
     } else {
         any_up
@@ -83,23 +97,18 @@ impl FeedHealth {
     /// caller's `on_edge` (a metric write and a broadcast send — no `.await`, no syscall), so the
     /// map is always left consistent; recovering keeps an unrelated panic in one receiver from
     /// cascading into every other venue's health reporting (the same reasoning as `arbiter::lock`).
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ReceiverKey, bool>> {
-        self.up.lock().unwrap_or_else(|p| p.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Apply `mutate` to the map and invoke `on_edge(venue_up)` — still holding the lock — iff the
     /// venue aggregate flipped. The single place the edge is decided, so publication can never be
     /// reordered against the transition that caused it.
-    fn with_edge(
-        &self,
-        venue: &str,
-        mutate: impl FnOnce(&mut HashMap<ReceiverKey, bool>),
-        on_edge: impl FnOnce(bool),
-    ) {
-        let mut map = self.lock();
-        let was = venue_up_in(&map, venue);
-        mutate(&mut map);
-        let now = venue_up_in(&map, venue);
+    fn with_edge(&self, venue: &str, mutate: impl FnOnce(&mut State), on_edge: impl FnOnce(bool)) {
+        let mut state = self.lock();
+        let was = venue_up_in(&state, venue);
+        mutate(&mut state);
+        let now = venue_up_in(&state, venue);
         if was != now {
             on_edge(now);
         }
@@ -112,8 +121,11 @@ impl FeedHealth {
     pub fn register(&self, key: ReceiverKey, on_edge: impl FnOnce(bool)) {
         self.with_edge(
             key.0,
-            |m| {
-                m.insert(key, true);
+            |s| {
+                s.up.insert(key, true);
+                if carries_venue_status(key.1) {
+                    s.carrier_venues.insert(key.0);
+                }
             },
             on_edge,
         );
@@ -125,8 +137,8 @@ impl FeedHealth {
     pub fn deregister(&self, key: ReceiverKey, on_edge: impl FnOnce(bool)) {
         self.with_edge(
             key.0,
-            |m| {
-                m.remove(&key);
+            |s| {
+                s.up.remove(&key);
             },
             on_edge,
         );
@@ -143,8 +155,8 @@ impl FeedHealth {
     pub fn set(&self, key: ReceiverKey, up: bool, on_edge: impl FnOnce(bool)) {
         self.with_edge(
             key.0,
-            |m| {
-                m.insert(key, up);
+            |s| {
+                s.up.insert(key, up);
             },
             on_edge,
         );
@@ -307,6 +319,29 @@ mod tests {
             "all quote publishers down -> venue down even though MBO is up"
         );
         assert!(!h.venue_up(V));
+    }
+
+    /// A **stopped** quote carrier must not hand the venue aggregate to a depth-only peer. All the
+    /// quote receivers wedging and then exiting (abort, panic, bind error) used to erase the venue's
+    /// carrier status, letting the live MBO receiver satisfy the fallback and publish `status: ok`
+    /// with zero quotes flowing.
+    #[test]
+    fn a_deregistered_carrier_does_not_let_depth_mask_a_quote_outage() {
+        let mbo = (V, FeedKind::MarketByOrder, 10101);
+        let h = FeedHealth::new();
+        register(&h, key(9101));
+        register(&h, mbo);
+
+        assert_eq!(set(&h, key(9101), false), Some(false), "quotes silent");
+        assert_eq!(
+            deregister(&h, key(9101)),
+            None,
+            "the carrier exiting is not a recovery"
+        );
+        assert!(
+            !h.venue_up(V),
+            "depth-only receivers left: venue stays down"
+        );
     }
 
     /// A venue with only depth-only receivers falls back to counting them, so it doesn't read

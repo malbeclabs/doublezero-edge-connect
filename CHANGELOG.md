@@ -28,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dz_feed_up` / `dz_feed_stale_ms` and the wire `status` message are venue-level **aggregates**: a
   venue reads down only when every one of its quote-bearing publishers has gone silent. Previously
   any single receiver could declare its whole venue down — including a depth-only Market-by-Order
-  receiver, which no longer participates in the venue's quote health at all. (#88)
+  receiver, which no longer participates in the venue's quote health at all. A quote receiver that
+  *stops* keeps the venue honest rather than letting a depth-only peer satisfy the aggregate. (#88)
+- Multicast decode-error warnings are rate-limited to one line per 30s per receiver, carrying the
+  suppressed count. Several port blocks are inferred rather than confirmed on-wire, and one that
+  turns out to carry another protocol's traffic would otherwise log per datagram. (#88)
 - Duplicate instrument definitions from mirrored publishers are collapsed before broadcast
   (`dz_instruments_dropped_total`), so reference-data traffic no longer scales with publisher count.
   The collapse is a rate limit, not a latch: unchanged content is re-announced every 15s, so a

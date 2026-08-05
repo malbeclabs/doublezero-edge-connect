@@ -291,7 +291,8 @@ fn filter_publishers(
         let mut missing: Vec<u16> = unmatched.into_iter().collect();
         missing.sort_unstable();
         bail!(
-            "unknown publisher base port(s) {}; known base ports: {}",
+            "base port(s) {} are not publishers of the selected feed(s); base ports across all \
+             feeds: {}",
             join_ports(&missing),
             join_ports(&known)
         );
