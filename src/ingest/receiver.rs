@@ -192,8 +192,9 @@ impl Drop for ReceiverRegistration {
     fn drop(&mut self) {
         self.up_gauge.set(0);
         let (venue, arbiter) = (self.key.0, &self.arbiter);
-        self.health
-            .deregister(self.key, |venue_up| emit_status(arbiter, venue, venue_up, 0));
+        self.health.deregister(self.key, |venue_up| {
+            emit_status(arbiter, venue, venue_up, 0)
+        });
     }
 }
 
@@ -630,6 +631,7 @@ fn two_port_roles(ports: FeedPorts) -> Vec<(PortRole, u16)> {
 /// Run the receiver for **one publisher** of one feed: pick the protocol's [`FrameProcessor`] and
 /// port roles from the feed's [`FeedKind`], then drive the shared receive loop over that
 /// publisher's port block. Returns only on a fatal bind error (it otherwise runs forever).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_feed(
     feed: Feed,
     publisher: FeedPublisher,

@@ -194,7 +194,11 @@ mod tests {
         let h = FeedHealth::new();
         register(&h, key("p1"));
         register(&h, key("p2"));
-        assert_eq!(set(&h, key("p1"), false), None, "no venue edge: p2 still up");
+        assert_eq!(
+            set(&h, key("p1"), false),
+            None,
+            "no venue edge: p2 still up"
+        );
         assert!(h.venue_up(V));
         assert_eq!(
             set(&h, key("p2"), false),
@@ -211,7 +215,11 @@ mod tests {
         register(&h, key("p2"));
         set(&h, key("p1"), false);
         set(&h, key("p2"), false);
-        assert_eq!(set(&h, key("p1"), true), Some(true), "venue edge back to up");
+        assert_eq!(
+            set(&h, key("p1"), true),
+            Some(true),
+            "venue edge back to up"
+        );
         assert_eq!(set(&h, key("p2"), true), None, "already up: no second edge");
     }
 

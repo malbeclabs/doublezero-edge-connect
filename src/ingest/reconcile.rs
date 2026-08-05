@@ -200,12 +200,7 @@ impl Reconciler {
     /// Fail-open / gating-disabled desired state: every enabled feed on, WS on if configured, shreds
     /// only via explicit sources (no CLI → no discovery).
     fn static_desired(&self) -> Desired {
-        let feeds: HashSet<FeedKey> = self
-            .cfg
-            .enabled
-            .iter()
-            .flat_map(feed_keys)
-            .collect();
+        let feeds: HashSet<FeedKey> = self.cfg.enabled.iter().flat_map(feed_keys).collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
             shred_sources: self.desired_shred_sources(None),
