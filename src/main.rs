@@ -34,6 +34,14 @@ struct Args {
     #[arg(long = "feed", env = "DZ_FEEDS", value_delimiter = ',')]
     feeds: Vec<String>,
 
+    /// Publisher(s) to ingest within each selected feed, by name, repeatable (e.g.
+    /// `--publisher aws-tyo-2`). Each name must be a known publisher of some selected feed (see
+    /// `feeds.rs`). Omit to ingest EVERY publisher of every selected feed. Use this to cap ingest
+    /// cost (each publisher is a full receiver, and for MBO a full independent book) or to bisect
+    /// a misbehaving publisher.
+    #[arg(long = "publisher", env = "DZ_PUBLISHERS", value_delimiter = ',')]
+    publishers: Vec<String>,
+
     /// Interface to join the groups on - a name (e.g. "doublezero1") or an IPv4 address.
     /// Names are resolved to their IPv4 (as in edge-multicast-ref).
     #[arg(long, env = "DZ_IFACE", default_value = "doublezero1")]
@@ -208,10 +216,10 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
         return Ok(feeds::FEEDS.iter().collect());
     }
     let mut chosen = Vec::new();
-    // Dedup on `(venue, kind)` — the reconciler's own `FeedKey` and the identity that maps to one
-    // receiver. A repeated `--feed` name (e.g. `--feed Hyperliquid --feed Hyperliquid`) must spawn
-    // each receiver at most once, else the duplicated receivers contend for the same multicast
-    // group/port. `(venue, kind)` is unique across `FEEDS` (see `feeds::tests`).
+    // Dedup on `(venue, kind)` — the identity of a FEED ROW, unique across `FEEDS` (see
+    // `feeds::tests::venue_kind_pairs_are_unique`), so a repeated `--feed` name selects each row
+    // once. The reconciler's own key is finer (`(venue, kind, publisher)`); narrowing the
+    // publisher set is `filter_publishers`'s job, not this function's.
     let mut seen = std::collections::HashSet::new();
     for name in selection {
         let matches: Vec<&'static feeds::Feed> = feeds::FEEDS
@@ -231,6 +239,65 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
     Ok(chosen)
 }
 
+/// Narrow each feed's publisher list to `selection`, dropping feeds left with no publisher. An
+/// empty selection keeps every publisher of every feed. Errors if a name matches no publisher of
+/// any selected feed, so a typo fails fast rather than silently ingesting nothing.
+fn filter_publishers(
+    feeds: Vec<&'static feeds::Feed>,
+    selection: &[String],
+) -> Result<Vec<feeds::Feed>> {
+    if selection.is_empty() {
+        return Ok(feeds.into_iter().copied().collect());
+    }
+    let mut unmatched: std::collections::HashSet<&str> =
+        selection.iter().map(|s| s.as_str()).collect();
+    let mut out = Vec::new();
+    for f in feeds {
+        // `publishers` is a `&'static` slice, so the narrowed set has to be leaked to keep the
+        // `Feed`'s `&'static [FeedPublisher]` shape. This runs once at startup over a handful of
+        // rows, never on the hot path.
+        let kept: Vec<feeds::FeedPublisher> = f
+            .publishers
+            .iter()
+            .filter(|p| {
+                // Discharge the *selection* entry, not `p.name`: the match is case-insensitive, so
+                // `--publisher AWS-TYO-2` would otherwise stay "unmatched" and abort startup.
+                match selection.iter().find(|s| s.eq_ignore_ascii_case(p.name)) {
+                    Some(s) => {
+                        unmatched.remove(s.as_str());
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .copied()
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        out.push(feeds::Feed {
+            publishers: Box::leak(kept.into_boxed_slice()),
+            ..*f
+        });
+    }
+    if !unmatched.is_empty() {
+        let mut known: Vec<&str> = feeds::FEEDS
+            .iter()
+            .flat_map(|f| f.publishers.iter().map(|p| p.name))
+            .collect();
+        known.sort_unstable();
+        known.dedup();
+        let mut missing: Vec<&str> = unmatched.into_iter().collect();
+        missing.sort();
+        bail!(
+            "unknown publisher(s) {}; known publishers: {}",
+            missing.join(", "),
+            known.join(", ")
+        );
+    }
+    Ok(out)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // RUST_LOG, when set, is honored verbatim. Unset, we default to a quiet base of `warn`
@@ -247,8 +314,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!(?args, "starting doublezero-edge-connect");
 
-    let enabled = select_feeds(&args.feeds)?;
-    info!(feeds = ?enabled.iter().map(|f| f.venue).collect::<Vec<_>>(), "ingesting feeds");
+    let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publishers)?;
+    info!(
+        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
+        "ingesting feeds"
+    );
 
     // Force the metrics registry to initialize up front (registering the process collector and all
     // metric families) so the very first recorded sample lands in a ready registry, whether or not
@@ -460,5 +530,50 @@ mod tests {
     #[test]
     fn unknown_name_still_errors() {
         assert!(select_feeds(&["Nope".to_string()]).is_err());
+    }
+
+    #[test]
+    fn empty_publisher_selection_keeps_every_publisher() {
+        let all = filter_publishers(select_feeds(&[]).unwrap(), &[]).unwrap();
+        let hl_tob = all
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .unwrap();
+        assert_eq!(hl_tob.publishers.len(), 6);
+    }
+
+    #[test]
+    fn publisher_selection_narrows_and_keeps_other_feeds_intact() {
+        let sel = filter_publishers(
+            select_feeds(&[]).unwrap(),
+            &["aws-tyo-2".to_string(), "lat-tyo-1".to_string()],
+        )
+        .unwrap();
+        let hl_tob = sel
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .unwrap();
+        let names: Vec<&str> = hl_tob.publishers.iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["aws-tyo-2", "lat-tyo-1"]);
+        // Phoenix has no publisher by those names, so it drops out entirely rather than running
+        // with zero publishers.
+        assert!(!sel.iter().any(|f| f.venue == "Phoenix"));
+    }
+
+    /// The name match is case-insensitive, so a differently-cased selection must both narrow the
+    /// feed and count as matched (not abort startup as an unknown publisher).
+    #[test]
+    fn publisher_selection_is_case_insensitive() {
+        let sel =
+            filter_publishers(select_feeds(&[]).unwrap(), &["AWS-TYO-2".to_string()]).unwrap();
+        assert!(!sel.is_empty());
+        assert!(sel
+            .iter()
+            .all(|f| f.publishers.iter().all(|p| p.name == "aws-tyo-2")));
+    }
+
+    #[test]
+    fn unknown_publisher_is_an_error() {
+        assert!(filter_publishers(select_feeds(&[]).unwrap(), &["nope".to_string()]).is_err());
     }
 }

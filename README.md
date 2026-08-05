@@ -84,6 +84,7 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_IMAGE` | per script | Override the container image. |
 | `DZ_NAME` | `doublezero-edge-connect` | Container name. |
 | `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion. Does **not** affect Solana shred forwarding. |
+| `DZ_PUBLISHERS` | *(all)* | Comma-separated publisher names to narrow which mirrors of each selected feed are ingested. One receiver runs per publisher, so this caps ingest cost on a multi-publisher venue. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
 | `DZ_CLIENT_IP` | *(auto-detected)* | Override the host public IP used by the access-pass pre-check (set if auto-detection is wrong). |
