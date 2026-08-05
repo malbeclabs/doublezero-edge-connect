@@ -33,6 +33,7 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         feeds::{Feed, FeedKind},
+        health::{FeedHealth, SharedFeedHealth},
         receiver,
         subscriptions::{self, Detected, HostSubs},
     },
@@ -107,6 +108,10 @@ pub struct Reconciler {
     /// The running shred forwarder plus the (sorted) source set it was started with, so a changed
     /// set triggers a restart.
     shred_task: Option<(Vec<SocketAddrV4>, JoinHandle<Result<()>>)>,
+    /// Shared receiver liveness, cloned into each receiver task. Venue-level `status` /
+    /// `dz_feed_up` are derived from this aggregate, so one wedged publisher never declares its
+    /// whole venue down.
+    health: SharedFeedHealth,
     cli_missing_logged: bool,
 }
 
@@ -117,6 +122,7 @@ impl Reconciler {
             active: HashMap::new(),
             ws_task: None,
             shred_task: None,
+            health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
         }
     }
@@ -223,18 +229,24 @@ impl Reconciler {
     /// Drop handles for tasks that exited on their own so a later tick can respawn them if still
     /// desired (self-healing — replaces the old "process exits if any receiver returns").
     fn reap_finished(&mut self) {
-        self.active.retain(|k, h| {
-            let done = h.is_finished();
-            if done {
-                warn!(
-                    venue = k.0,
-                    kind = k.1.label(),
-                    publisher = k.2,
-                    "market-data receiver exited; will respawn if still subscribed"
-                );
-            }
-            !done
-        });
+        // Collected first: `retain`'s closure can't borrow `self.health` while `self.active` is
+        // mutably borrowed.
+        let finished: Vec<FeedKey> = self
+            .active
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(k, _)| *k)
+            .collect();
+        for k in finished {
+            warn!(
+                venue = k.0,
+                kind = k.1.label(),
+                publisher = k.2,
+                "market-data receiver exited; will respawn if still subscribed"
+            );
+            self.active.remove(&k);
+            self.health.deregister(k);
+        }
         if self.ws_task.as_ref().is_some_and(|h| h.is_finished()) {
             warn!("WebSocket sink task exited; will re-activate if still desired");
             self.ws_task = None;
@@ -255,6 +267,7 @@ impl Reconciler {
         for key in to_abort {
             if let Some(h) = self.active.remove(&key) {
                 h.abort();
+                self.health.deregister(key);
                 info!(
                     venue = key.0,
                     kind = key.1.label(),
@@ -291,6 +304,7 @@ impl Reconciler {
                 self.cfg.arbiter.clone(),
                 self.cfg.instruments.clone(),
                 self.cfg.depth.clone(),
+                self.health.clone(),
             ));
             self.active.insert(key, h);
         }

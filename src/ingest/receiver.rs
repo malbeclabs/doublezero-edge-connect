@@ -40,6 +40,7 @@ use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
         feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
+        health::{FeedHealth, ReceiverKey, SharedFeedHealth},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
     metrics::metrics,
@@ -126,13 +127,16 @@ pub trait FrameProcessor {
     fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx);
 }
 
-/// Materialize the feed-health gauges for `venue` in their healthy at-rest state (`feed_up=1`,
-/// `feed_stale_ms=0`) at task setup. Without this the gauges' per-venue children are created only on
-/// the first down/ok edge (see [`emit_status`]), so a feed healthy from boot would have no
-/// `dz_feed_up{venue}` series at all — making the headline `dz_feed_up == 0` alert un-fireable.
-fn init_feed_health(venue: &str) {
+/// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
+/// venue healthy from boot still exposes a `dz_feed_up{venue}` series (without this the children
+/// are created only on the first down/ok edge, making the headline `dz_feed_up == 0` alert
+/// un-fireable). Reads the shared aggregate rather than asserting 1, so a receiver starting while
+/// a sibling publisher is down does not paper over the venue's state.
+fn init_feed_health(health: &FeedHealth, venue: &str) {
     let m = metrics();
-    m.feed_up.with_label_values(&[venue]).set(1);
+    m.feed_up
+        .with_label_values(&[venue])
+        .set(i64::from(health.venue_up(venue)));
     m.feed_stale_ms.with_label_values(&[venue]).set(0);
 }
 
@@ -422,10 +426,12 @@ async fn drive<P: FrameProcessor>(
     publisher_name: &'static str,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
+    health: SharedFeedHealth,
     mut processor: P,
 ) -> Result<()> {
-    // Feed-health transition tracking: true while the market-data multicast is considered down
-    // (silent past IDLE_REJOIN). Persists across rejoins so we emit `down`/`ok` only on the edge.
+    // This receiver's own liveness: true while its market-data multicast is considered down (silent
+    // past IDLE_REJOIN). Persists across rejoins so the gauge/aggregate is touched only on the edge;
+    // the venue-level `status` fires only when `health` reports the VENUE aggregate flipped.
     let mut down = false;
 
     // Per-feed metric handles resolved once (venue is `&'static`); the per-channel datagram counter
@@ -444,10 +450,12 @@ async fn drive<P: FrameProcessor>(
     let receiver_up = m
         .receiver_up
         .with_label_values(&[venue, kind_label, publisher_name]);
+    let rx_key: ReceiverKey = (venue, kind, publisher_name);
+    health.register(rx_key);
     receiver_up.set(1);
-    // Create the feed-health gauge series up front in their healthy state, so a feed that never
-    // goes down still exposes `dz_feed_up{venue}=1` (the down/ok edges in `emit_status` flip it).
-    init_feed_health(venue);
+    // Create the feed-health gauge series up front, so a feed that never goes down still exposes
+    // `dz_feed_up{venue}` (the venue-level down/ok edges in `emit_status` flip it).
+    init_feed_health(&health, venue);
 
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
@@ -479,18 +487,18 @@ async fn drive<P: FrameProcessor>(
         loop {
             let remaining = IDLE_REJOIN.saturating_sub(last_mkt.elapsed());
             if remaining.is_zero() {
-                warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
+                warn!(%group, venue, kind = kind_label, publisher = publisher_name,
+                      idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 idle_rejoin.inc();
                 receiver_up.set(0);
                 if !down {
-                    emit_status(
-                        &arbiter,
-                        venue,
-                        "down",
-                        last_mkt.elapsed().as_millis() as u64,
-                    );
                     down = true;
+                    let stale_ms = last_mkt.elapsed().as_millis() as u64;
+                    // Only when the LAST up receiver for this venue goes down is the venue down.
+                    if health.set(rx_key, false) == Some(false) {
+                        emit_status(&arbiter, venue, "down", stale_ms);
+                    }
                 }
                 continue 'rejoin;
             }
@@ -504,18 +512,17 @@ async fn drive<P: FrameProcessor>(
                         continue 'rejoin;
                     }
                     Err(_) => {
-                        warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
+                        warn!(%group, venue, kind = kind_label, publisher = publisher_name,
+                              idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         idle_rejoin.inc();
                         receiver_up.set(0);
                         if !down {
-                            emit_status(
-                                &arbiter,
-                                venue,
-                                "down",
-                                last_mkt.elapsed().as_millis() as u64,
-                            );
                             down = true;
+                            let stale_ms = last_mkt.elapsed().as_millis() as u64;
+                            if health.set(rx_key, false) == Some(false) {
+                                emit_status(&arbiter, venue, "down", stale_ms);
+                            }
                         }
                         continue 'rejoin;
                     }
@@ -528,9 +535,11 @@ async fn drive<P: FrameProcessor>(
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
                 if down {
-                    receiver_up.set(1);
-                    emit_status(&arbiter, venue, "ok", 0);
                     down = false;
+                    receiver_up.set(1);
+                    if health.set(rx_key, true) == Some(true) {
+                        emit_status(&arbiter, venue, "ok", 0);
+                    }
                 }
             }
 
@@ -571,6 +580,7 @@ pub async fn run_feed(
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
+    health: SharedFeedHealth,
 ) -> Result<()> {
     let venue: &'static str = feed.venue;
     match feed.kind {
@@ -586,6 +596,7 @@ pub async fn run_feed(
                 publisher.name,
                 arbiter,
                 instruments,
+                health,
                 TobProcessor::new(feed.emit_trades),
             )
             .await
@@ -602,6 +613,7 @@ pub async fn run_feed(
                 publisher.name,
                 arbiter,
                 instruments,
+                health,
                 MidpointProcessor::new(),
             )
             .await
@@ -634,6 +646,7 @@ pub async fn run_feed(
                 publisher.name,
                 arbiter,
                 instruments,
+                health,
                 MboProcessor::new(depth, feed.emit_trades),
             )
             .await
@@ -650,10 +663,13 @@ mod tests {
 
     #[test]
     fn feed_health_gauges_materialize_up_at_setup() {
+        use crate::ingest::{feeds::FeedKind, health::FeedHealth};
         // A unique venue label keeps this independent of any other test touching the shared,
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
-        init_feed_health(venue);
+        let health = FeedHealth::new();
+        health.register((venue, FeedKind::TopOfBook, "p1"));
+        init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
         assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);
