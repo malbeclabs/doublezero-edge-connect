@@ -166,6 +166,23 @@ pub struct DepthId {
     asks: Vec<(i128, i128)>,
 }
 
+/// The content identity of an instrument definition: the precision pair. EXCLUDES `venue`/`symbol`
+/// (they are the map key). N publishers mirroring a feed each republish identical definitions on
+/// every reference-data burst (~every 8s on the live feed), so without this every WS client
+/// receives one copy per publisher of content it already has.
+///
+/// Unlike quotes and depth this needs no `source_ts` floor: a definition carries no timestamp and
+/// is idempotent full state, so "same content as the last one broadcast" is the whole identity. A
+/// genuine precision change differs and re-emits immediately - the precision-before-price
+/// guarantee is unaffected, since the shared `InstrumentSnapshot` (written in
+/// `processor::upsert_instrument`, replayed to new clients by `sinks::ws`) is a separate map this
+/// never suppresses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct InstrumentId {
+    price_exponent: i8,
+    qty_exponent: i8,
+}
+
 impl DepthId {
     pub fn of(d: &NormalizedDepth) -> Self {
         let canon = |levels: &[[f64; 2]]| -> Vec<(i128, i128)> {
@@ -452,6 +469,11 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
+    /// Last broadcast content per `(venue, symbol)`, so mirrored publishers' identical definition
+    /// bursts collapse to one wire message. Keyed identically to the `InstrumentSnapshot` that
+    /// `processor::upsert_instrument` already maintains, so this adds no new unbounded-growth
+    /// surface beyond the one that map already has.
+    instrument_defs: HashMap<(Arc<str>, Arc<str>), InstrumentId>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -479,6 +501,7 @@ struct VenueMetrics {
     depth_ticks_won: [IntCounter; 2],
     quotes_dropped: IntCounter,
     trades_dropped: IntCounter,
+    instruments_dropped: IntCounter,
     quotes_future_rejected: IntCounter,
     quotes_no_source_ts: IntCounter,
     /// `dz_depth_admitted_total{publisher}` / `dz_depth_dropped_total{publisher}`, `[edge, public]`.
@@ -527,6 +550,7 @@ impl VenueMetrics {
             depth_ticks_won: by_pub(&m.depth_ticks_won),
             quotes_dropped: m.quotes_dropped.with_label_values(&[venue]),
             trades_dropped: m.trades_dropped.with_label_values(&[venue]),
+            instruments_dropped: m.instruments_dropped.with_label_values(&[venue]),
             quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
             quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
             depth_admitted: by_pub(&m.depth_admitted),
@@ -555,6 +579,7 @@ impl Arbiter {
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
+            instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
         }
     }
@@ -734,7 +759,26 @@ impl Arbiter {
             // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
             // future `FeedMessage` variant is a compile error here, not a silent miss / runtime panic.
             FeedMessage::Instrument(i) => {
-                self.vm(&i.venue).emit[EMIT_INSTRUMENT].inc();
+                // Mirrored publishers republish identical definitions every refdata burst; only a
+                // change in content reaches the wire. See `InstrumentId`.
+                let id = InstrumentId {
+                    price_exponent: i.price_exponent,
+                    qty_exponent: i.qty_exponent,
+                };
+                let key = (i.venue.clone(), i.symbol.clone());
+                let changed = match self.instrument_defs.get(&key) {
+                    Some(prev) if *prev == id => false,
+                    _ => {
+                        self.instrument_defs.insert(key, id);
+                        true
+                    }
+                };
+                let vm = self.vm(&i.venue);
+                if !changed {
+                    vm.instruments_dropped.inc();
+                    return;
+                }
+                vm.emit[EMIT_INSTRUMENT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
@@ -1798,5 +1842,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn instrument(symbol: &str, price_exponent: i8, qty_exponent: i8) -> FeedMessage {
+        FeedMessage::Instrument(crate::model::NormalizedInstrument {
+            venue: "Hyperliquid".into(),
+            symbol: symbol.into(),
+            price_exponent,
+            qty_exponent,
+        })
+    }
+
+    fn drain_instruments(
+        rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) -> Vec<(String, i8, i8)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Instrument(i) = &*m {
+                out.push((i.symbol.to_string(), i.price_exponent, i.qty_exponent));
+            }
+        }
+        out
+    }
+
+    /// Mirrored publishers republish identical definitions every refdata burst. Only the first
+    /// copy of a given content reaches the wire; a genuine exponent change re-emits.
+    #[test]
+    fn arbiter_collapses_duplicate_instrument_definitions() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let peer = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(instrument("BTC", -2, -4), edge);
+        a.emit(instrument("BTC", -2, -4), edge); // same publisher's next burst -> dropped
+        a.emit(instrument("BTC", -2, -4), peer); // mirror's copy -> dropped
+        a.emit(instrument("ETH", -2, -4), edge); // different symbol -> kept
+        a.emit(instrument("BTC", -3, -4), peer); // real precision change -> kept
+        a.emit(instrument("BTC", -3, -4), edge); // ...then deduped at the new content
+        assert_eq!(
+            drain_instruments(&mut rx),
+            vec![
+                ("BTC".to_string(), -2, -4),
+                ("ETH".to_string(), -2, -4),
+                ("BTC".to_string(), -3, -4),
+            ]
+        );
     }
 }

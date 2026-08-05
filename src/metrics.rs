@@ -96,6 +96,9 @@ pub struct Metrics {
     pub trades_admitted: IntCounterVec,
     /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
     pub trades_dropped: IntCounterVec,
+    /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
+    /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
+    pub instruments_dropped: IntCounterVec,
     /// Quote-tick *cross-source* contest lead time (ns): on a `source_ts` tick another publisher
     /// already led, how far ahead the leader was when this publisher's first copy arrived, labelled
     /// by the `winner` **and** `loser` (edge/public). Its `_count` is the head-to-head contest
@@ -355,6 +358,12 @@ impl Metrics {
                 &registry,
                 "dz_trades_dropped_total",
                 "Trades dropped by the windowed dedup",
+                &["venue"],
+            ),
+            instruments_dropped: counter_vec(
+                &registry,
+                "dz_instruments_dropped_total",
+                "Instrument definitions dropped as an exact repeat of the last broadcast content",
                 &["venue"],
             ),
             quote_lead_ns: histogram_vec(

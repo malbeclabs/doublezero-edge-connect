@@ -74,6 +74,7 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | `dz_depth_ticks_won_total` | counter | `venue`, `publisher` | The depth mirror of `dz_quote_ticks_won_total` (for depth the `source_ts == 0` empty-anchor tick is real and counts). |
 | `dz_quotes_dropped_total` | counter | `venue` | Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat). |
 | `dz_trades_dropped_total` | counter | `venue` | Trades dropped by the windowed dedup (duplicate `trade_id` still inside the window). |
+| `dz_instruments_dropped_total` | counter | `venue` | Instrument definitions dropped as an exact repeat of the last content broadcast for that `(venue, symbol)` — the mirrored publishers' identical reference-data bursts collapsing. Expect this to be roughly `(publishers - 1)/publishers` of all definition frames in steady state. |
 | `dz_quotes_future_rejected_total` | counter | `venue` | Quotes rejected for an implausibly-far-future `source_ts`. |
 | `dz_quotes_no_source_ts_total` | counter | `venue` | Quotes forwarded with the `source_ts == 0` sentinel (floor bypassed). |
 | `dz_quote_lead_ns` | histogram | `venue`, `winner`, `loser` | Nanoseconds the winning publisher led the losing duplicate by, per quote-tick cross-source contest (`winner`/`loser` each `edge`/`public`). `{winner="edge",loser="public"}` is "DZ beat the public feed"; `_count` is the head-to-head win count, the buckets the lead margin. |
