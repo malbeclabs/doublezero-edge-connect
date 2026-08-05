@@ -264,3 +264,78 @@ async fn mbo_single_publisher_depth_contract() {
         "MBO feed emitted trades despite emit_trades=false"
     );
 }
+
+/// Two Hyperliquid TOB publishers on distinct port blocks (9101/9102 and 9201/9202 of the same
+/// group) are BOTH ingested: each gets its own `dz_datagrams_received_total{publisher=...}`
+/// series. Before multi-publisher support the bridge bound only one block and the other
+/// publisher's datagrams were never received at all.
+///
+/// Both senders share one source IP (see `tests/common/replay.rs` TODO(#3)), so the arbiter
+/// correctly collapses their identical content on the wire — deliberately NOT asserted here. This
+/// test is about ingest reach; per-source-IP dedup is covered by `tests/dedup.rs`.
+#[test]
+#[serial]
+fn two_publisher_port_blocks_are_both_ingested() {
+    let metrics_bind = "127.0.0.1:19231".to_string();
+    let _bridge = Bridge::spawn_with_args("Hyperliquid", 18231, &["--metrics-bind", &metrics_bind]);
+
+    let refdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
+        replay::TOB_MAGIC,
+    );
+    let mktdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
+        replay::TOB_MAGIC,
+    );
+    // Refdata before mktdata on each block (definitions gate emission), aws-tyo-1's block first.
+    replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
+    replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
+    replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+    replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+
+    let body = scrape_until(&metrics_bind, Duration::from_secs(10), |b| {
+        publisher_datagrams(b, "aws-tyo-1") > 0 && publisher_datagrams(b, "aws-tyo-2") > 0
+    });
+    assert!(
+        publisher_datagrams(&body, "aws-tyo-1") > 0,
+        "publisher aws-tyo-1 (9101/9102) received nothing:\n{body}"
+    );
+    assert!(
+        publisher_datagrams(&body, "aws-tyo-2") > 0,
+        "publisher aws-tyo-2 (9201/9202) received nothing:\n{body}"
+    );
+}
+
+/// Sum of the `dz_datagrams_received_total` samples whose labels name `publisher`.
+fn publisher_datagrams(body: &str, publisher: &str) -> u64 {
+    body.lines()
+        .filter(|l| l.starts_with("dz_datagrams_received_total{"))
+        .filter(|l| l.contains(&format!("publisher=\"{publisher}\"")))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v as u64)
+        .sum()
+}
+
+/// Poll `GET /metrics` until `done` or the deadline; returns the last body scraped (so a failing
+/// assertion can print it).
+fn scrape_until(addr: &str, timeout: Duration, done: impl Fn(&str) -> bool) -> String {
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = String::new();
+    loop {
+        if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+            let _ = s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n");
+            let mut body = String::new();
+            let _ = s.read_to_string(&mut body);
+            last = body;
+            if done(&last) {
+                return last;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

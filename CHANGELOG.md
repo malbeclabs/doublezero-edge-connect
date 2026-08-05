@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
+  one receiver per `(venue, protocol, publisher)`. All six live Hyperliquid publishers are ingested
+  (previously only `aws-tyo-hl-mainnet2`'s block), so the arbiter's cross-publisher race, lead-time
+  histograms and win-rate counters finally have a field of more than one. Publishers that share a
+  single port block still work unchanged. (#88)
+- `--publisher <name>` (`DZ_PUBLISHERS`) narrows the publisher set per feed — each publisher is a
+  full receiver, and for Market-by-Order a full independent book, so a six-host venue is ~6x the
+  ingest cost of one. (#88)
+- `dz_receiver_up{venue,kind,publisher}` — per-publisher receiver health. (#88)
+
 ### Changed
+- `dz_datagrams_received_total`, `dz_datagram_bytes_total`, `dz_socket_errors_total` and
+  `dz_idle_rejoin_total` gained `kind` and `publisher` labels. Aggregating queries are unaffected;
+  exact-match selectors on the old label set now match one series per publisher. (#88)
+- `dz_feed_up` / `dz_feed_stale_ms` and the wire `status` message are venue-level **aggregates**: a
+  venue reads down only when every publisher mirroring it has gone silent. Previously any single
+  receiver could declare its whole venue down. (#88)
+- Duplicate instrument definitions from mirrored publishers are collapsed before broadcast
+  (`dz_instruments_dropped_total`), so reference-data traffic no longer scales with publisher
+  count. (#88)
 - **HFT hot-path optimization** — the ingest→broadcast→WebSocket path now does far less per-message
   work, with no change to the wire JSON field names or values:
   - **Broadcast backbone carries `Arc<FeedMessage>`** (`src/ingest/arbiter.rs`, `src/main.rs`): a
