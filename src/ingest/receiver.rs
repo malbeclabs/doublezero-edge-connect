@@ -418,6 +418,8 @@ async fn drive<P: FrameProcessor>(
     iface: String,
     recv_buf: usize,
     venue: &'static str,
+    kind: FeedKind,
+    publisher_name: &'static str,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     mut processor: P,
@@ -429,9 +431,20 @@ async fn drive<P: FrameProcessor>(
     // Per-feed metric handles resolved once (venue is `&'static`); the per-channel datagram counter
     // is resolved per role at bind time below.
     let m = metrics();
-    let bytes_ctr = m.datagram_bytes.with_label_values(&[venue]);
-    let socket_errors = m.socket_errors.with_label_values(&[venue]);
-    let idle_rejoin = m.idle_rejoin.with_label_values(&[venue]);
+    let kind_label = kind.label();
+    let bytes_ctr = m
+        .datagram_bytes
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    let socket_errors = m
+        .socket_errors
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    let idle_rejoin = m
+        .idle_rejoin
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    let receiver_up = m
+        .receiver_up
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    receiver_up.set(1);
     // Create the feed-health gauge series up front in their healthy state, so a feed that never
     // goes down still exposes `dz_feed_up{venue}=1` (the down/ok edges in `emit_status` flip it).
     init_feed_health(venue);
@@ -448,12 +461,16 @@ async fn drive<P: FrameProcessor>(
                 role,
                 sock,
                 buf: vec![0u8; 2048],
-                dgrams: m
-                    .datagrams_received
-                    .with_label_values(&[venue, role.label()]),
+                dgrams: m.datagrams_received.with_label_values(&[
+                    venue,
+                    kind_label,
+                    publisher_name,
+                    role.label(),
+                ]),
             });
         }
-        info!(%group, ?ports, %iface, %iface_ip, recv_buf, "DZ Edge multicast receiver bound");
+        info!(%group, ?ports, %iface, %iface_ip, recv_buf, venue, kind = kind_label,
+              publisher = publisher_name, "DZ Edge multicast receiver bound");
 
         // Watchdog on the market-data stream specifically: rejoin when no market-data datagram has
         // arrived for IDLE_REJOIN, regardless of refdata/snapshot (which keep ticking even when
@@ -465,6 +482,7 @@ async fn drive<P: FrameProcessor>(
                 warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 idle_rejoin.inc();
+                receiver_up.set(0);
                 if !down {
                     emit_status(
                         &arbiter,
@@ -489,6 +507,7 @@ async fn drive<P: FrameProcessor>(
                         warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         idle_rejoin.inc();
+                        receiver_up.set(0);
                         if !down {
                             emit_status(
                                 &arbiter,
@@ -509,6 +528,7 @@ async fn drive<P: FrameProcessor>(
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
                 if down {
+                    receiver_up.set(1);
                     emit_status(&arbiter, venue, "ok", 0);
                     down = false;
                 }
@@ -562,6 +582,8 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.kind,
+                publisher.name,
                 arbiter,
                 instruments,
                 TobProcessor::new(feed.emit_trades),
@@ -576,6 +598,8 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.kind,
+                publisher.name,
                 arbiter,
                 instruments,
                 MidpointProcessor::new(),
@@ -606,6 +630,8 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.kind,
+                publisher.name,
                 arbiter,
                 instruments,
                 MboProcessor::new(depth, feed.emit_trades),
