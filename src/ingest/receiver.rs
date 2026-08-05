@@ -167,7 +167,7 @@ impl ReceiverRegistration {
     ) -> Self {
         up_gauge.set(1);
         let venue = key.0;
-        health.register(key, |venue_up| emit_health_edge(&arbiter, venue, venue_up, 0));
+        health.register(key, |venue_up| emit_status(&arbiter, venue, venue_up, 0));
         Self {
             health,
             arbiter,
@@ -183,7 +183,7 @@ impl ReceiverRegistration {
         self.up_gauge.set(i64::from(up));
         let (venue, arbiter) = (self.key.0, &self.arbiter);
         self.health.set(self.key, up, |venue_up| {
-            emit_health_edge(arbiter, venue, venue_up, stale_ms)
+            emit_status(arbiter, venue, venue_up, stale_ms)
         });
     }
 }
@@ -193,30 +193,24 @@ impl Drop for ReceiverRegistration {
         self.up_gauge.set(0);
         let (venue, arbiter) = (self.key.0, &self.arbiter);
         self.health
-            .deregister(self.key, |venue_up| {
-                emit_health_edge(arbiter, venue, venue_up, 0)
-            });
+            .deregister(self.key, |venue_up| emit_status(arbiter, venue, venue_up, 0));
     }
 }
 
-/// Publish one venue-level health edge. `stale_ms` is only meaningful on a `down` edge.
-fn emit_health_edge(arbiter: &SharedArbiter, venue: &str, venue_up: bool, stale_ms: u64) {
-    if venue_up {
-        emit_status(arbiter, venue, "ok", 0);
-    } else {
-        emit_status(arbiter, venue, "down", stale_ms);
-    }
-}
-
-/// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when the
-/// market-data multicast has gone silent past [`IDLE_REJOIN`], `"ok"` when it recovers. Consumers
-/// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
-fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
+/// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when every one of
+/// the venue's quote publishers has gone silent past [`IDLE_REJOIN`], `"ok"` when one recovers.
+/// Consumers gray out / restore the source on these. Best-effort (ignored if no subscriber is
+/// connected). Called only from `FeedHealth`'s `on_edge`, i.e. only on a venue-level edge, and with
+/// that lock held — so two receivers can't publish contradictory states out of order. `stale_ms` is
+/// only meaningful on a `down` edge.
+fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
+    let state = if up { "ok" } else { "down" };
+    let stale_ms = if up { 0 } else { stale_ms };
     // Mirror the transition into the feed-health gauges (cheap; only fires on a down/ok edge).
     metrics()
         .feed_up
         .with_label_values(&[venue])
-        .set(i64::from(state == "ok"));
+        .set(i64::from(up));
     metrics()
         .feed_stale_ms
         .with_label_values(&[venue])
