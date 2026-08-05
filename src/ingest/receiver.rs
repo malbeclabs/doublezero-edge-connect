@@ -130,14 +130,82 @@ pub trait FrameProcessor {
 /// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
 /// venue healthy from boot still exposes a `dz_feed_up{venue}` series (without this the children
 /// are created only on the first down/ok edge, making the headline `dz_feed_up == 0` alert
-/// un-fireable). Reads the shared aggregate rather than asserting 1, so a receiver starting while
-/// a sibling publisher is down does not paper over the venue's state.
+/// un-fireable). Reads the shared aggregate rather than asserting 1, so a depth-only receiver
+/// starting while the venue's quote publishers are all down does not paper over that. `stale_ms` is
+/// left alone in that case — zeroing it would publish the contradictory pair `feed_up=0,
+/// stale_ms=0`.
 fn init_feed_health(health: &FeedHealth, venue: &str) {
+    let up = health.venue_up(venue);
     let m = metrics();
-    m.feed_up
-        .with_label_values(&[venue])
-        .set(i64::from(health.venue_up(venue)));
-    m.feed_stale_ms.with_label_values(&[venue]).set(0);
+    m.feed_up.with_label_values(&[venue]).set(i64::from(up));
+    if up {
+        m.feed_stale_ms.with_label_values(&[venue]).set(0);
+    }
+}
+
+/// Ties one receiver's [`FeedHealth`] entry and its `dz_receiver_up` gauge to the task's lifetime.
+///
+/// Dropped on **every** exit path — a reconciler `abort()` (which drops the future only after the
+/// in-flight poll returns, so this cannot race a late [`Self::set`]), a panic, or a bind error — so
+/// a stopped receiver never pins its venue up with nothing serving it, and never leaves a dead
+/// publisher reading `dz_receiver_up == 1`. Doing it here rather than in the reconciler is what
+/// makes the ordering safe: an external `abort()` + `deregister()` pair can be overtaken by the
+/// still-running task's own liveness write.
+struct ReceiverRegistration {
+    health: SharedFeedHealth,
+    arbiter: SharedArbiter,
+    key: ReceiverKey,
+    up_gauge: prometheus::IntGauge,
+}
+
+impl ReceiverRegistration {
+    fn new(
+        health: SharedFeedHealth,
+        arbiter: SharedArbiter,
+        key: ReceiverKey,
+        up_gauge: prometheus::IntGauge,
+    ) -> Self {
+        up_gauge.set(1);
+        let venue = key.0;
+        health.register(key, |venue_up| emit_health_edge(&arbiter, venue, venue_up, 0));
+        Self {
+            health,
+            arbiter,
+            key,
+            up_gauge,
+        }
+    }
+
+    /// Record this receiver's liveness. The venue-level `status` fires only when the **venue**
+    /// aggregate flips, and is published inside `FeedHealth`'s lock so two receivers crossing
+    /// opposite edges concurrently can't publish out of order.
+    fn set(&self, up: bool, stale_ms: u64) {
+        self.up_gauge.set(i64::from(up));
+        let (venue, arbiter) = (self.key.0, &self.arbiter);
+        self.health.set(self.key, up, |venue_up| {
+            emit_health_edge(arbiter, venue, venue_up, stale_ms)
+        });
+    }
+}
+
+impl Drop for ReceiverRegistration {
+    fn drop(&mut self) {
+        self.up_gauge.set(0);
+        let (venue, arbiter) = (self.key.0, &self.arbiter);
+        self.health
+            .deregister(self.key, |venue_up| {
+                emit_health_edge(arbiter, venue, venue_up, 0)
+            });
+    }
+}
+
+/// Publish one venue-level health edge. `stale_ms` is only meaningful on a `down` edge.
+fn emit_health_edge(arbiter: &SharedArbiter, venue: &str, venue_up: bool, stale_ms: u64) {
+    if venue_up {
+        emit_status(arbiter, venue, "ok", 0);
+    } else {
+        emit_status(arbiter, venue, "down", stale_ms);
+    }
 }
 
 /// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when the
@@ -447,14 +515,17 @@ async fn drive<P: FrameProcessor>(
     let idle_rejoin = m
         .idle_rejoin
         .with_label_values(&[venue, kind_label, publisher_name]);
-    let receiver_up = m
-        .receiver_up
-        .with_label_values(&[venue, kind_label, publisher_name]);
-    let rx_key: ReceiverKey = (venue, kind, publisher_name);
-    health.register(rx_key);
-    receiver_up.set(1);
+    // Registers this receiver in the shared health map and owns its `dz_receiver_up`; deregisters
+    // both when this task ends for any reason (see `ReceiverRegistration`).
+    let reg = ReceiverRegistration::new(
+        health.clone(),
+        arbiter.clone(),
+        (venue, kind, publisher_name),
+        m.receiver_up
+            .with_label_values(&[venue, kind_label, publisher_name]),
+    );
     // Create the feed-health gauge series up front, so a feed that never goes down still exposes
-    // `dz_feed_up{venue}` (the venue-level down/ok edges in `emit_status` flip it).
+    // `dz_feed_up{venue}` (the venue-level down/ok edges flip it).
     init_feed_health(&health, venue);
 
     'rejoin: loop {
@@ -491,14 +562,12 @@ async fn drive<P: FrameProcessor>(
                       idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 idle_rejoin.inc();
-                receiver_up.set(0);
                 if !down {
                     down = true;
-                    let stale_ms = last_mkt.elapsed().as_millis() as u64;
-                    // Only when the LAST up receiver for this venue goes down is the venue down.
-                    if health.set(rx_key, false) == Some(false) {
-                        emit_status(&arbiter, venue, "down", stale_ms);
-                    }
+                    // Only when the venue's LAST up quote receiver goes down is the venue down.
+                    reg.set(false, last_mkt.elapsed().as_millis() as u64);
+                } else {
+                    reg.set(false, 0);
                 }
                 continue 'rejoin;
             }
@@ -516,13 +585,11 @@ async fn drive<P: FrameProcessor>(
                               idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         idle_rejoin.inc();
-                        receiver_up.set(0);
                         if !down {
                             down = true;
-                            let stale_ms = last_mkt.elapsed().as_millis() as u64;
-                            if health.set(rx_key, false) == Some(false) {
-                                emit_status(&arbiter, venue, "down", stale_ms);
-                            }
+                            reg.set(false, last_mkt.elapsed().as_millis() as u64);
+                        } else {
+                            reg.set(false, 0);
                         }
                         continue 'rejoin;
                     }
@@ -536,10 +603,7 @@ async fn drive<P: FrameProcessor>(
                 last_mkt = std::time::Instant::now();
                 if down {
                     down = false;
-                    receiver_up.set(1);
-                    if health.set(rx_key, true) == Some(true) {
-                        emit_status(&arbiter, venue, "ok", 0);
-                    }
+                    reg.set(true, 0);
                 }
             }
 
@@ -668,7 +732,7 @@ mod tests {
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
         let health = FeedHealth::new();
-        health.register((venue, FeedKind::TopOfBook, "p1"));
+        health.register((venue, FeedKind::TopOfBook, "p1"), |_| {});
         init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.

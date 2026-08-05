@@ -22,6 +22,14 @@ receivers per protocol. Each is a full receiver — and for Market-by-Order a fu
 so `--publisher` (`DZ_PUBLISHERS`) is the release valve for capping ingest cost or bisecting a
 misbehaving publisher.
 
+> **Size `--recv-buf` against the socket count, not one socket.** Every port of every publisher is
+> its own socket requesting `--recv-buf` (default 8 MiB): the six-publisher Hyperliquid fleet binds
+> 30 sockets (6 × 2 Top-of-Book + 6 × 3 Market-by-Order) where it previously bound 5, so the
+> requested `SO_RCVBUF` total goes from ~40 MiB to ~240 MiB. `net.core.rmem_max` clamps each socket
+> individually and will not catch the aggregate — lower `DZ_RECV_BUF` or narrow `--publisher` if that
+> exceeds the host's or container's memory budget. Market-by-Order additionally holds one independent
+> L3 book set per publisher.
+
 ```bash
 # From source — run the edge multicast feed with the public WS backstop for BTC and ETH:
 ./target/release/doublezero-edge-connect --feed Hyperliquid --ws-input-coins BTC,ETH

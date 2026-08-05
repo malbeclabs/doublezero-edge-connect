@@ -196,7 +196,11 @@ pub const FEEDS: &[Feed] = &[
         emit_trades: true,
     },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
-    // (paired with the TOB row above). Depth-only: TOB owns this venue's trades.
+    // (paired with the TOB row above). The `aws-tyo-2` block (10201/10202/10203) is confirmed
+    // against edge-multicast-ref/docs/hyperliquid.md (mainnet-beta); the other five are the same
+    // +100-per-host scheme from the ansible inventory, so a block that turns out to be wrong shows
+    // up as a permanent `dz_receiver_up == 0` for that publisher rather than as an error.
+    // Depth-only: TOB owns this venue's trades.
     Feed {
         venue: "Hyperliquid",
         code: "tiredsolid",
@@ -260,7 +264,9 @@ pub const FEEDS: &[Feed] = &[
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
         publishers: &[FeedPublisher {
-            name: "lon-1",
+            // Single publisher; the name is not host-derived (the Phoenix inventory lists no
+            // per-host port block to mirror), so it stays generic.
+            name: "primary",
             ports: FeedPorts::TwoPort {
                 mktdata: 9201,
                 refdata: 9202,

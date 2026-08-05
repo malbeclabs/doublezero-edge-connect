@@ -143,9 +143,10 @@ Modules are grouped by role under `src/`:
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → window, `Instrument` → a content dedup on the precision pair
-  per `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse
-  (`dz_instruments_dropped_total`); `Midpoint`/`Status` are the only passthroughs); a surviving message is
+  floor, depth → depth floor, trades → window, `Instrument` → a rate limit on the precision pair per
+  `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
+  is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
+  `Midpoint`/`Status` are the only passthroughs); a surviving message is
   broadcast as `Arc<FeedMessage>` (a per-subscriber delivery is a refcount bump, not a deep clone).
   Every arm returns an
   `Admit<Publisher>`: `Emitted{opened_tick}` broadcasts and bumps the admitted/winner counter —

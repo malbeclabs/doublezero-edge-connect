@@ -287,15 +287,22 @@ fn two_publisher_port_blocks_are_both_ingested() {
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    // Refdata before mktdata on each block (definitions gate emission), aws-tyo-1's block first.
-    replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
-    replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
-    replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
-    replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
-
-    let body = scrape_until(&metrics_bind, Duration::from_secs(10), |b| {
-        publisher_datagrams(b, "aws-tyo-1") > 0 && publisher_datagrams(b, "aws-tyo-2") > 0
-    });
+    // `Bridge::spawn` returns on the FIRST receiver-bound marker, but `--feed Hyperliquid` now
+    // binds twelve receivers, so a one-shot send can land before these two have joined — an
+    // un-joined group silently discards the datagram. Re-send each round until both publishers
+    // register traffic (idempotent: the assertion is `> 0`, and duplicate frames are deduped).
+    let body = scrape_until(
+        &metrics_bind,
+        Duration::from_secs(20),
+        |b| publisher_datagrams(b, "aws-tyo-1") > 0 && publisher_datagrams(b, "aws-tyo-2") > 0,
+        || {
+            // Refdata before mktdata on each block (definitions gate emission), aws-tyo-1's first.
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+        },
+    );
     assert!(
         publisher_datagrams(&body, "aws-tyo-1") > 0,
         "publisher aws-tyo-1 (9101/9102) received nothing:\n{body}"
@@ -317,13 +324,19 @@ fn publisher_datagrams(body: &str, publisher: &str) -> u64 {
         .sum()
 }
 
-/// Poll `GET /metrics` until `done` or the deadline; returns the last body scraped (so a failing
-/// assertion can print it).
-fn scrape_until(addr: &str, timeout: Duration, done: impl Fn(&str) -> bool) -> String {
+/// Run `send` then poll `GET /metrics` until `done` or the deadline, re-running `send` each round;
+/// returns the last body scraped (so a failing assertion can print it).
+fn scrape_until(
+    addr: &str,
+    timeout: Duration,
+    done: impl Fn(&str) -> bool,
+    send: impl Fn(),
+) -> String {
     use std::io::{Read, Write};
     let deadline = std::time::Instant::now() + timeout;
     let mut last = String::new();
     loop {
+        send();
         if let Ok(mut s) = std::net::TcpStream::connect(addr) {
             let _ = s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n");
             let mut body = String::new();
