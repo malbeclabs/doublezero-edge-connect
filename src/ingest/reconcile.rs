@@ -254,6 +254,7 @@ impl Reconciler {
             info!(venue = key.0, kind = ?key.1, group = %feed.group, "activating market-data receiver (subscribed)");
             let h = tokio::spawn(receiver::run_feed(
                 feed,
+                feed.publishers[0],
                 self.cfg.iface.clone(),
                 self.cfg.recv_buf,
                 self.cfg.arbiter.clone(),

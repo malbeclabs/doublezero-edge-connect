@@ -39,7 +39,7 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        feeds::{Feed, FeedKind, FeedPorts},
+        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
     metrics::metrics,
@@ -540,11 +540,12 @@ fn two_port_roles(ports: FeedPorts) -> Vec<(PortRole, u16)> {
     }
 }
 
-/// Run the receiver for one feed: pick the protocol's [`FrameProcessor`] and port roles from the
-/// feed's [`FeedKind`], then drive the shared receive loop. Returns only on a fatal bind error
-/// (it otherwise runs forever).
+/// Run the receiver for **one publisher** of one feed: pick the protocol's [`FrameProcessor`] and
+/// port roles from the feed's [`FeedKind`], then drive the shared receive loop over that
+/// publisher's port block. Returns only on a fatal bind error (it otherwise runs forever).
 pub async fn run_feed(
     feed: Feed,
+    publisher: FeedPublisher,
     iface: String,
     recv_buf: usize,
     arbiter: SharedArbiter,
@@ -554,7 +555,7 @@ pub async fn run_feed(
     let venue: &'static str = feed.venue;
     match feed.kind {
         FeedKind::TopOfBook => {
-            let ports = two_port_roles(feed.ports);
+            let ports = two_port_roles(publisher.ports);
             drive(
                 feed.group,
                 ports,
@@ -568,7 +569,7 @@ pub async fn run_feed(
             .await
         }
         FeedKind::Midpoint => {
-            let ports = two_port_roles(feed.ports);
+            let ports = two_port_roles(publisher.ports);
             drive(
                 feed.group,
                 ports,
@@ -586,9 +587,13 @@ pub async fn run_feed(
                 mktdata,
                 refdata,
                 snapshot,
-            } = feed.ports
+            } = publisher.ports
             else {
-                bail!("Market-by-Order feed '{venue}' must use FeedPorts::ThreePort (mktdata/refdata/snapshot)");
+                bail!(
+                    "Market-by-Order feed '{venue}' publisher '{}' must use FeedPorts::ThreePort \
+                     (mktdata/refdata/snapshot)",
+                    publisher.name
+                );
             };
             let ports = vec![
                 (PortRole::Mktdata, mktdata),
