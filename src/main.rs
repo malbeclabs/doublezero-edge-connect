@@ -34,6 +34,20 @@ struct Args {
     #[arg(long = "feed", env = "DZ_FEEDS", value_delimiter = ',')]
     feeds: Vec<String>,
 
+    /// Publisher(s) to ingest within each selected feed, by **base port** — the market-data port of
+    /// the publisher's block, repeatable (e.g. `--publisher-port 9201`). Each port must be the base
+    /// port of some selected feed's publisher (see `feeds.rs`). Omit to ingest EVERY publisher of
+    /// every selected feed. Use this to cap ingest cost (each publisher is a full receiver, and for
+    /// MBO a full independent book) or to exclude a misbehaving publisher. Base ports are unique
+    /// within a feed but **not across feeds** (two venues can both publish on 9201), so pair this
+    /// with `--feed` to scope the narrowing to one venue.
+    #[arg(
+        long = "publisher-port",
+        env = "DZ_PUBLISHER_PORTS",
+        value_delimiter = ','
+    )]
+    publisher_ports: Vec<u16>,
+
     /// Interface to join the groups on - a name (e.g. "doublezero1") or an IPv4 address.
     /// Names are resolved to their IPv4 (as in edge-multicast-ref).
     #[arg(long, env = "DZ_IFACE", default_value = "doublezero1")]
@@ -208,10 +222,10 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
         return Ok(feeds::FEEDS.iter().collect());
     }
     let mut chosen = Vec::new();
-    // Dedup on `(venue, kind)` — the reconciler's own `FeedKey` and the identity that maps to one
-    // receiver. A repeated `--feed` name (e.g. `--feed Hyperliquid --feed Hyperliquid`) must spawn
-    // each receiver at most once, else the duplicated receivers contend for the same multicast
-    // group/port. `(venue, kind)` is unique across `FEEDS` (see `feeds::tests`).
+    // Dedup on `(venue, kind)` — the identity of a FEED ROW, unique across `FEEDS` (see
+    // `feeds::tests::venue_kind_pairs_are_unique`), so a repeated `--feed` name selects each row
+    // once. The reconciler's own key is finer (`(venue, kind, publisher)`); narrowing the
+    // publisher set is `filter_publishers`'s job, not this function's.
     let mut seen = std::collections::HashSet::new();
     for name in selection {
         let matches: Vec<&'static feeds::Feed> = feeds::FEEDS
@@ -231,6 +245,69 @@ fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
     Ok(chosen)
 }
 
+/// Narrow each feed's publisher list to the `selection` of base ports, dropping feeds left with no
+/// publisher. An empty selection keeps every publisher of every feed. Errors if a port matches no
+/// publisher of any selected feed, so a typo fails fast rather than silently ingesting nothing.
+fn filter_publishers(
+    feeds: Vec<&'static feeds::Feed>,
+    selection: &[u16],
+) -> Result<Vec<feeds::Feed>> {
+    if selection.is_empty() {
+        return Ok(feeds.into_iter().copied().collect());
+    }
+    let mut unmatched: std::collections::HashSet<u16> = selection.iter().copied().collect();
+    let mut out = Vec::new();
+    for f in feeds {
+        // `publishers` is a `&'static` slice, so the narrowed set has to be leaked to keep the
+        // `Feed`'s `&'static [FeedPublisher]` shape. This runs once at startup over a handful of
+        // rows, never on the hot path.
+        let kept: Vec<feeds::FeedPublisher> = f
+            .publishers
+            .iter()
+            .filter(|p| {
+                let hit = selection.contains(&p.base_port());
+                if hit {
+                    unmatched.remove(&p.base_port());
+                }
+                hit
+            })
+            .copied()
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        out.push(feeds::Feed {
+            publishers: Box::leak(kept.into_boxed_slice()),
+            ..*f
+        });
+    }
+    if !unmatched.is_empty() {
+        let mut known: Vec<u16> = feeds::FEEDS
+            .iter()
+            .flat_map(|f| f.publishers.iter().map(|p| p.base_port()))
+            .collect();
+        known.sort_unstable();
+        known.dedup();
+        let mut missing: Vec<u16> = unmatched.into_iter().collect();
+        missing.sort_unstable();
+        bail!(
+            "base port(s) {} are not publishers of the selected feed(s); base ports across all \
+             feeds: {}",
+            join_ports(&missing),
+            join_ports(&known)
+        );
+    }
+    Ok(out)
+}
+
+fn join_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // RUST_LOG, when set, is honored verbatim. Unset, we default to a quiet base of `warn`
@@ -247,8 +324,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!(?args, "starting doublezero-edge-connect");
 
-    let enabled = select_feeds(&args.feeds)?;
-    info!(feeds = ?enabled.iter().map(|f| f.venue).collect::<Vec<_>>(), "ingesting feeds");
+    let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publisher_ports)?;
+    info!(
+        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
+        "ingesting feeds"
+    );
 
     // Force the metrics registry to initialize up front (registering the process collector and all
     // metric families) so the very first recorded sample lands in a ready registry, whether or not
@@ -460,5 +540,58 @@ mod tests {
     #[test]
     fn unknown_name_still_errors() {
         assert!(select_feeds(&["Nope".to_string()]).is_err());
+    }
+
+    #[test]
+    fn empty_publisher_selection_keeps_every_publisher() {
+        let all = filter_publishers(select_feeds(&[]).unwrap(), &[]).unwrap();
+        let hl_tob = all
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .unwrap();
+        assert_eq!(hl_tob.publishers.len(), 6);
+    }
+
+    #[test]
+    fn publisher_selection_narrows_by_base_port() {
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
+        let hl_tob = sel
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .unwrap();
+        let ports: Vec<u16> = hl_tob.publishers.iter().map(|p| p.base_port()).collect();
+        assert_eq!(ports, vec![9201, 9401]);
+    }
+
+    /// A feed left with no matching publisher drops out entirely rather than running with zero
+    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201).
+    #[test]
+    fn feeds_without_a_matching_base_port_drop_out() {
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
+        assert!(!sel.iter().any(|f| f.venue == "Phoenix"));
+        assert!(sel.iter().any(|f| f.venue == "Hyperliquid"));
+    }
+
+    /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
+    /// block and Phoenix's only block, so selecting it keeps a publisher on each. Scoping to one
+    /// venue is `--feed`'s job.
+    #[test]
+    fn base_ports_are_not_unique_across_feeds() {
+        let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
+        let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
+        assert!(venues.contains("Hyperliquid"));
+        assert!(venues.contains("Phoenix"));
+        assert!(sel
+            .iter()
+            .all(|f| f.publishers.iter().all(|p| p.base_port() == 9201)));
+
+        let scoped =
+            filter_publishers(select_feeds(&["Phoenix".to_string()]).unwrap(), &[9201]).unwrap();
+        assert!(scoped.iter().all(|f| f.venue == "Phoenix"));
+    }
+
+    #[test]
+    fn unknown_publisher_base_port_is_an_error() {
+        assert!(filter_publishers(select_feeds(&[]).unwrap(), &[1234]).is_err());
     }
 }

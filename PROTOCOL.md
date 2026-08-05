@@ -229,6 +229,12 @@ consumer can gray out / restore that source. Unlike `quote`/`instrument` it carr
 - it is about the whole venue feed - so the server matches it against a subscription **by venue
 alone** (a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status).
 
+A venue is reported `down` only when **every** publisher mirroring its quote feed has gone silent
+past the idle window; a single wedged publisher does not produce a `status` transition, because the
+remaining publishers still deliver full-state updates for that venue. `status` stays what it has
+always been — the health of the venue's *quote* stream — so a depth-only (Market-by-Order) publisher
+going silent is not reported here, and a healthy one does not suppress a quote outage.
+
 | Field      | Type   | Meaning                                                         |
 |------------|--------|-----------------------------------------------------------------|
 | `type`     | string | `"status"`.                                                     |

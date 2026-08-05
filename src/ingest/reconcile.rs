@@ -33,6 +33,7 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         feeds::{Feed, FeedKind},
+        health::{FeedHealth, SharedFeedHealth},
         receiver,
         subscriptions::{self, Detected, HostSubs},
     },
@@ -40,12 +41,17 @@ use crate::{
     shred::{self, DedupMode, ShredConfig},
 };
 
-/// Identity of a market-data feed in the active-task map. `(venue, kind)` is unique across `FEEDS`
-/// (asserted by `feeds::tests::venue_kind_pairs_are_unique`).
-type FeedKey = (&'static str, FeedKind);
+/// Identity of a market-data **receiver** in the active-task map: one per publisher of a feed.
+/// `(venue, kind)` identifies the feed row (unique across `FEEDS`, asserted by
+/// `feeds::tests::venue_kind_pairs_are_unique`) and the base port the block within it (unique per
+/// feed, asserted by `feeds::tests::publisher_base_ports_unique_within_a_feed`).
+type FeedKey = (&'static str, FeedKind, u16);
 
-fn feed_key(f: &Feed) -> FeedKey {
-    (f.venue, f.kind)
+/// Every receiver key a feed contributes - one per publisher.
+fn feed_keys(f: &Feed) -> impl Iterator<Item = FeedKey> + '_ {
+    f.publishers
+        .iter()
+        .map(|p| (f.venue, f.kind, p.base_port()))
 }
 
 /// Static shred-forwarder parameters (everything except the source set, which the reconciler
@@ -73,8 +79,10 @@ pub struct ReconcilerConfig {
     pub arbiter: SharedArbiter,
     pub instruments: InstrumentSnapshot,
     pub depth: DepthSnapshot,
-    /// The `--feed`-selected market-data feeds this process may run (subject to subscription).
-    pub enabled: Vec<&'static Feed>,
+    /// The `--feed`/`--publisher-port`-selected market-data feeds this process may run (subject to
+    /// subscription). Owned rather than `&'static` because `--publisher-port` narrows each row's
+    /// publisher list.
+    pub enabled: Vec<Feed>,
     pub iface: String,
     pub recv_buf: usize,
     pub refresh: Duration,
@@ -102,6 +110,12 @@ pub struct Reconciler {
     /// The running shred forwarder plus the (sorted) source set it was started with, so a changed
     /// set triggers a restart.
     shred_task: Option<(Vec<SocketAddrV4>, JoinHandle<Result<()>>)>,
+    /// Shared receiver liveness, cloned into each receiver task. Venue-level `status` /
+    /// `dz_feed_up` are derived from this aggregate, so one wedged publisher never declares its
+    /// whole venue down. Each receiver registers and deregisters *itself*
+    /// (`receiver::ReceiverRegistration`) — an `abort()` here can be overtaken by the still-running
+    /// task's own liveness write, so the reconciler must not deregister on its behalf.
+    health: SharedFeedHealth,
     cli_missing_logged: bool,
 }
 
@@ -112,6 +126,7 @@ impl Reconciler {
             active: HashMap::new(),
             ws_task: None,
             shred_task: None,
+            health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
         }
     }
@@ -122,7 +137,7 @@ impl Reconciler {
         info!(
             refresh_secs = self.cfg.refresh.as_secs(),
             gating_disabled = self.cfg.gating_disabled,
-            feeds = ?self.cfg.enabled.iter().map(|f| f.venue).collect::<Vec<_>>(),
+            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
             "subscription reconciler started"
         );
         loop {
@@ -174,8 +189,8 @@ impl Reconciler {
     fn desired_from_subs(&self, subs: &HostSubs) -> Desired {
         let feeds: HashSet<FeedKey> = subs
             .market_data_feeds(&self.cfg.enabled)
-            .iter()
-            .map(|f| feed_key(f))
+            .into_iter()
+            .flat_map(feed_keys)
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
@@ -187,7 +202,7 @@ impl Reconciler {
     /// Fail-open / gating-disabled desired state: every enabled feed on, WS on if configured, shreds
     /// only via explicit sources (no CLI → no discovery).
     fn static_desired(&self) -> Desired {
-        let feeds: HashSet<FeedKey> = self.cfg.enabled.iter().map(|f| feed_key(f)).collect();
+        let feeds: HashSet<FeedKey> = self.cfg.enabled.iter().flat_map(feed_keys).collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
             shred_sources: self.desired_shred_sources(None),
@@ -216,7 +231,12 @@ impl Reconciler {
         self.active.retain(|k, h| {
             let done = h.is_finished();
             if done {
-                warn!(venue = k.0, kind = ?k.1, "market-data receiver exited; will respawn if still subscribed");
+                warn!(
+                    venue = k.0,
+                    kind = k.1.label(),
+                    publisher = k.2,
+                    "market-data receiver exited; will respawn if still subscribed"
+                );
             }
             !done
         });
@@ -240,25 +260,43 @@ impl Reconciler {
         for key in to_abort {
             if let Some(h) = self.active.remove(&key) {
                 h.abort();
-                info!(venue = key.0, kind = ?key.1, "deactivating market-data receiver (no longer subscribed)");
+                info!(
+                    venue = key.0,
+                    kind = key.1.label(),
+                    publisher = key.2,
+                    "deactivating market-data receiver (no longer subscribed)"
+                );
             }
         }
         for key in to_spawn {
-            let feed = *self
+            let (feed, publisher) = self
                 .cfg
                 .enabled
                 .iter()
-                .copied()
-                .find(|f| feed_key(f) == key)
+                .find_map(|f| {
+                    f.publishers
+                        .iter()
+                        .find(|p| (f.venue, f.kind, p.base_port()) == key)
+                        .map(|p| (*f, *p))
+                })
                 .expect("desired feed key came from enabled");
-            info!(venue = key.0, kind = ?key.1, group = %feed.group, "activating market-data receiver (subscribed)");
+            info!(
+                venue = key.0,
+                kind = key.1.label(),
+                publisher = key.2,
+                group = %feed.group,
+                mktdata = publisher.ports.mktdata(),
+                "activating market-data receiver (subscribed)"
+            );
             let h = tokio::spawn(receiver::run_feed(
                 feed,
+                publisher,
                 self.cfg.iface.clone(),
                 self.cfg.recv_buf,
                 self.cfg.arbiter.clone(),
                 self.cfg.instruments.clone(),
                 self.cfg.depth.clone(),
+                self.health.clone(),
             ));
             self.active.insert(key, h);
         }
@@ -375,5 +413,63 @@ mod tests {
         let (to_spawn, to_abort) = plan(&set(&["a", "b"]), &HashSet::new());
         assert!(to_spawn.is_empty());
         assert_eq!(to_abort.len(), 2);
+    }
+
+    use crate::ingest::feeds::{FeedPorts, FeedPublisher};
+
+    fn test_feed(publishers: &'static [FeedPublisher]) -> Feed {
+        Feed {
+            venue: "TestVenue",
+            code: "testcode",
+            kind: FeedKind::TopOfBook,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 15),
+            publishers,
+            emit_trades: true,
+        }
+    }
+
+    /// One task key per publisher, so N mirrored publishers produce N receivers rather than
+    /// collapsing into one (the pre-multi-publisher behaviour, which silently ingested only the
+    /// first port block).
+    #[test]
+    fn feed_keys_are_per_publisher() {
+        static PUBS: &[FeedPublisher] = &[
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9101,
+                    refdata: 9102,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9201,
+                    refdata: 9202,
+                },
+            },
+        ];
+        let feed = test_feed(PUBS);
+        let keys: Vec<FeedKey> = feed_keys(&feed).collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("TestVenue", FeedKind::TopOfBook, 9101),
+                ("TestVenue", FeedKind::TopOfBook, 9201),
+            ]
+        );
+    }
+
+    /// Distinct publishers of the same feed must not collide in the active-task map.
+    #[test]
+    fn plan_treats_publishers_as_independent() {
+        let current: HashSet<FeedKey> = [("V", FeedKind::TopOfBook, 9101)].into_iter().collect();
+        let desired: HashSet<FeedKey> = [
+            ("V", FeedKind::TopOfBook, 9101),
+            ("V", FeedKind::TopOfBook, 9201),
+        ]
+        .into_iter()
+        .collect();
+        let (to_spawn, to_abort) = plan(&current, &desired);
+        assert_eq!(to_spawn, vec![("V", FeedKind::TopOfBook, 9201)]);
+        assert!(to_abort.is_empty());
     }
 }

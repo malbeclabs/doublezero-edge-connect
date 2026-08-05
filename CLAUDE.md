@@ -42,7 +42,7 @@ defaults to `warn,doublezero_edge_connect=info` (our crate at `info`, deps quiet
 
 ## Architecture
 
-A WS-server task plus **one receiver task per active feed** share a single
+A WS-server task plus **one receiver task per publisher of each active feed** share a single
 `tokio::sync::broadcast` channel of `Arc<FeedMessage>` (the fan-out backbone — `Arc`-wrapped so a
 per-subscriber delivery is a refcount bump, not a deep clone of the message) and a `Mutex<HashMap>`
 instrument snapshot. `main.rs` selects the *candidate* feeds (`--feed`, or all of
@@ -73,6 +73,7 @@ cross-source duplicates collapse and the public copy fills in only when the edge
 
 Modules are grouped by role under `src/`:
 - **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
+  `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
   `subscriber`, `arbiter`, the **`subscriptions`** detector + **`reconcile`** activation loop (which
   decide what runs — see Architecture above), the optional public feeders (`public_feeder`
   scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
@@ -112,10 +113,16 @@ Modules are grouped by role under `src/`:
 
 - **`ingest/feeds.rs`** — the hardcoded feed registry: each `Feed` is one multicast group mapped to one
   venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
-  matched by the reconciler), a `FeedKind` (which protocol) and `FeedPorts` (`TwoPort` for
-  TOB/Midpoint, or `ThreePort` adding a snapshot port for MBO). `FEEDS` is the built-in list; add a
-  row to ingest another venue (sibling-protocol rows are added once their live endpoints are known).
-  `--feed <venue>` selects a subset; consumers then filter by venue over the WS.
+  matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
+  publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
+  `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
+  identity is its **base port** (`FeedPublisher::base_port()`, the block's mktdata port) — the
+  `publisher` metric label, the log field and the reconciler/health task-key component; there are
+  deliberately no host names in the registry. `FEEDS` is the built-in list; add a row to ingest
+  another venue (sibling-protocol rows are added once their live endpoints are known). `--feed
+  <venue>` selects a subset of venues and `--publisher-port <port>` narrows the publishers within
+  each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
+  the WS.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
@@ -133,9 +140,21 @@ Modules are grouped by role under `src/`:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
   (1/2/3) that hands each datagram to a `FrameProcessor` via a `FrameCtx`; `run_feed()` picks the
-  processor + port roles from the feed's `FeedKind`. The watchdog tracks the **mktdata** port only
-  (refdata/snapshot keep ticking when market data is wedged). `FrameCtx` carries the shared
-  `arbiter` (not a raw `tx`); `ctx.emit(msg)` routes through it tagged `Publisher::Edge(src_ip)`.
+  processor + port roles from the feed's `FeedKind`. One `drive()` task serves **one publisher** —
+  its own port block, its own processor state (and so its own MBO books) — and reports liveness under
+  its base port via `ReceiverRegistration`, which registers only after the sockets bind (a
+  never-binding receiver would otherwise flap `status` on every reconciler respawn) and deregisters
+  on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
+  ticking when market data is wedged). `FrameCtx` carries the shared `arbiter` (not a raw `tx`);
+  `ctx.emit(msg)` routes through it tagged `Publisher::Edge(src_ip)`.
+- **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, kind, base port)`,
+  aggregated to the **venue**-level `status`/`dz_feed_up` PROTOCOL.md promises, so one wedged
+  publisher never takes a venue down while a peer streams. Only quote-bearing kinds count
+  (`carries_venue_status`; MBO is depth-only and must neither declare an outage nor mask one), with a
+  fallback to any registered receiver for a venue this process runs **no** quote-bearing receiver for
+  — gated on a sticky per-venue carrier set, since a carrier that *stopped* leaves the liveness map
+  and must not hand the aggregate to a depth-only peer. The venue edge is computed and published
+  inside the lock (`with_edge`), so two receivers crossing opposite edges can't publish out of order.
 - **`ingest/arbiter.rs`** — the shared **pre-broadcast emit stage** every ingest source funnels
   through. `Arbiter` owns the broadcast `Sender` plus the dedup state — the per-`(venue, symbol)`
   latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the canonical BBO fixed-point, with
@@ -143,7 +162,10 @@ Modules are grouped by role under `src/`:
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → window, everything else passthrough); a surviving message is
+  floor, depth → depth floor, trades → window, `Instrument` → a rate limit on the precision pair per
+  `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
+  is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
+  `Midpoint`/`Status` are the only passthroughs); a surviving message is
   broadcast as `Arc<FeedMessage>` (a per-subscriber delivery is a refcount bump, not a deep clone).
   Every arm returns an
   `Admit<Publisher>`: `Emitted{opened_tick}` broadcasts and bumps the admitted/winner counter —
@@ -171,9 +193,13 @@ Modules are grouped by role under `src/`:
   `EndOfSession` (whole venue) / `InstrumentReset` (that symbol) via `reset_depth_floor_for_*` — the
   session-reset escape hatch (#66, counted in `dz_depth_floor_resets_total{venue,reason}`) — so a
   venue that restarts its clock below the latched high-water doesn't wedge depth forever.
-  `EndOfSession` is feed-level: it also drops **every** publisher's book to `Recovering`
-  (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock discarded) so a mirror's
-  old-session tail can't re-latch the cleared floor; `on_instrument_reset` likewise drops
+  `EndOfSession` also drops the **receiving publisher's** books to `Recovering`
+  (`book.rs::on_end_of_session` — sequences, buffered deltas and event clock discarded). ⚠️ That
+  reset is per-publisher while the floor it clears is venue-wide: one processor per receiver task
+  means a mirror that loses its own `EndOfSession` datagram keeps a `Synced` book and can re-latch
+  the cleared floor at the old high-water, wedging the venue's depth until it resets on its own.
+  Closing that needs a per-venue session epoch shared across the tasks (not built).
+  `on_instrument_reset` likewise drops
   `last_event_ts`, scopes its clear by the symbol the depth was emitted under (the processor's
   `emitted_symbol` memo — immune to an id→symbol remap), and falls back to a venue-wide clear when
   nothing resolves. Both resets also purge the matching WS-replay `depth` entries (no ended-session

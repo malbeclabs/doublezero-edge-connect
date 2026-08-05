@@ -264,3 +264,93 @@ async fn mbo_single_publisher_depth_contract() {
         "MBO feed emitted trades despite emit_trades=false"
     );
 }
+
+/// Two Hyperliquid TOB publishers on distinct port blocks (9101/9102 and 9201/9202 of the same
+/// group) are BOTH ingested: each gets its own `dz_datagrams_received_total{publisher=...}`
+/// series. Before multi-publisher support the bridge bound only one block and the other
+/// publisher's datagrams were never received at all.
+///
+/// Both senders share one source IP (see `tests/common/replay.rs` TODO(#3)), so the arbiter
+/// correctly collapses their identical content on the wire — deliberately NOT asserted here. This
+/// test is about ingest reach; per-source-IP dedup is covered by `tests/dedup.rs`.
+#[test]
+#[serial]
+fn two_publisher_port_blocks_are_both_ingested() {
+    let metrics_bind = "127.0.0.1:19231".to_string();
+    let _bridge = Bridge::spawn_with_args("Hyperliquid", 18231, &["--metrics-bind", &metrics_bind]);
+
+    let refdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
+        replay::TOB_MAGIC,
+    );
+    let mktdata = replay::split_frames(
+        &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
+        replay::TOB_MAGIC,
+    );
+    // `Bridge::spawn` returns on the FIRST receiver-bound marker, but `--feed Hyperliquid` now
+    // binds twelve receivers, so a one-shot send can land before these two have joined — an
+    // un-joined group silently discards the datagram. Re-send each round until both publishers
+    // register traffic (idempotent: the assertion is `> 0`, and duplicate frames are deduped).
+    let body = scrape_until(
+        &metrics_bind,
+        Duration::from_secs(20),
+        |b| publisher_datagrams(b, 9101) > 0 && publisher_datagrams(b, 9201) > 0,
+        || {
+            // Refdata before mktdata on each block (definitions gate emission), 9101's first.
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+            replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+        },
+    );
+    assert!(
+        publisher_datagrams(&body, 9101) > 0,
+        "publisher 9101 (9101/9102) received nothing:\n{body}"
+    );
+    assert!(
+        publisher_datagrams(&body, 9201) > 0,
+        "publisher 9201 (9201/9202) received nothing:\n{body}"
+    );
+}
+
+/// Sum of the `dz_datagrams_received_total` samples labelled with this publisher's base port.
+fn publisher_datagrams(body: &str, base_port: u16) -> u64 {
+    body.lines()
+        .filter(|l| l.starts_with("dz_datagrams_received_total{"))
+        .filter(|l| l.contains(&format!("publisher=\"{base_port}\"")))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v as u64)
+        .sum()
+}
+
+/// Run `send` then poll `GET /metrics` until `done` or the deadline, re-running `send` each round;
+/// returns the last body scraped (so a failing assertion can print it).
+fn scrape_until(
+    addr: &str,
+    timeout: Duration,
+    done: impl Fn(&str) -> bool,
+    send: impl Fn(),
+) -> String {
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = String::new();
+    loop {
+        send();
+        if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+            let _ = s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n");
+            let mut body = String::new();
+            let _ = s.read_to_string(&mut body);
+            last = body;
+            if done(&last) {
+                return last;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return last;
+        }
+        // 500ms, not 100ms: `send` re-replays the whole fixture each round, so a tighter loop just
+        // multiplies replay volume (and CI log noise) for the same signal.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}

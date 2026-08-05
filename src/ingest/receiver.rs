@@ -39,7 +39,8 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        feeds::{Feed, FeedKind, FeedPorts},
+        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
+        health::{FeedHealth, ReceiverKey, SharedFeedHealth},
         processor::{MboProcessor, MidpointProcessor, TobProcessor},
     },
     metrics::metrics,
@@ -126,25 +127,91 @@ pub trait FrameProcessor {
     fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx);
 }
 
-/// Materialize the feed-health gauges for `venue` in their healthy at-rest state (`feed_up=1`,
-/// `feed_stale_ms=0`) at task setup. Without this the gauges' per-venue children are created only on
-/// the first down/ok edge (see [`emit_status`]), so a feed healthy from boot would have no
-/// `dz_feed_up{venue}` series at all — making the headline `dz_feed_up == 0` alert un-fireable.
-fn init_feed_health(venue: &str) {
+/// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
+/// venue healthy from boot still exposes a `dz_feed_up{venue}` series (without this the children
+/// are created only on the first down/ok edge, making the headline `dz_feed_up == 0` alert
+/// un-fireable). Reads the shared aggregate rather than asserting 1, so a depth-only receiver
+/// starting while the venue's quote publishers are all down does not paper over that. `stale_ms` is
+/// left alone in that case — zeroing it would publish the contradictory pair `feed_up=0,
+/// stale_ms=0`.
+fn init_feed_health(health: &FeedHealth, venue: &str) {
+    let up = health.venue_up(venue);
     let m = metrics();
-    m.feed_up.with_label_values(&[venue]).set(1);
-    m.feed_stale_ms.with_label_values(&[venue]).set(0);
+    m.feed_up.with_label_values(&[venue]).set(i64::from(up));
+    if up {
+        m.feed_stale_ms.with_label_values(&[venue]).set(0);
+    }
 }
 
-/// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when the
-/// market-data multicast has gone silent past [`IDLE_REJOIN`], `"ok"` when it recovers. Consumers
-/// gray out / restore the source on these. Best-effort (ignored if no subscriber is connected).
-fn emit_status(arbiter: &SharedArbiter, venue: &str, state: &str, stale_ms: u64) {
+/// Ties one receiver's [`FeedHealth`] entry and its `dz_receiver_up` gauge to the task's lifetime.
+///
+/// Dropped on **every** exit path — a reconciler `abort()` (which drops the future only after the
+/// in-flight poll returns, so this cannot race a late [`Self::set`]), a panic, or a bind error — so
+/// a stopped receiver never pins its venue up with nothing serving it, and never leaves a dead
+/// publisher reading `dz_receiver_up == 1`. Doing it here rather than in the reconciler is what
+/// makes the ordering safe: an external `abort()` + `deregister()` pair can be overtaken by the
+/// still-running task's own liveness write.
+struct ReceiverRegistration {
+    health: SharedFeedHealth,
+    arbiter: SharedArbiter,
+    key: ReceiverKey,
+    up_gauge: prometheus::IntGauge,
+}
+
+impl ReceiverRegistration {
+    fn new(
+        health: SharedFeedHealth,
+        arbiter: SharedArbiter,
+        key: ReceiverKey,
+        up_gauge: prometheus::IntGauge,
+    ) -> Self {
+        up_gauge.set(1);
+        let venue = key.0;
+        health.register(key, |venue_up| emit_status(&arbiter, venue, venue_up, 0));
+        Self {
+            health,
+            arbiter,
+            key,
+            up_gauge,
+        }
+    }
+
+    /// Record this receiver's liveness. The venue-level `status` fires only when the **venue**
+    /// aggregate flips, and is published inside `FeedHealth`'s lock so two receivers crossing
+    /// opposite edges concurrently can't publish out of order.
+    fn set(&self, up: bool, stale_ms: u64) {
+        self.up_gauge.set(i64::from(up));
+        let (venue, arbiter) = (self.key.0, &self.arbiter);
+        self.health.set(self.key, up, |venue_up| {
+            emit_status(arbiter, venue, venue_up, stale_ms)
+        });
+    }
+}
+
+impl Drop for ReceiverRegistration {
+    fn drop(&mut self) {
+        self.up_gauge.set(0);
+        let (venue, arbiter) = (self.key.0, &self.arbiter);
+        self.health.deregister(self.key, |venue_up| {
+            emit_status(arbiter, venue, venue_up, 0)
+        });
+    }
+}
+
+/// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when every one of
+/// the venue's quote publishers has gone silent past [`IDLE_REJOIN`], `"ok"` when one recovers.
+/// Consumers gray out / restore the source on these. Best-effort (ignored if no subscriber is
+/// connected). Called only from `FeedHealth`'s `on_edge`, i.e. only on a venue-level edge, and with
+/// that lock held — so two receivers can't publish contradictory states out of order. `stale_ms` is
+/// only meaningful on a `down` edge.
+fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
+    let state = if up { "ok" } else { "down" };
+    let stale_ms = if up { 0 } else { stale_ms };
     // Mirror the transition into the feed-health gauges (cheap; only fires on a down/ok edge).
     metrics()
         .feed_up
         .with_label_values(&[venue])
-        .set(i64::from(state == "ok"));
+        .set(i64::from(up));
     metrics()
         .feed_stale_ms
         .with_label_values(&[venue])
@@ -418,23 +485,43 @@ async fn drive<P: FrameProcessor>(
     iface: String,
     recv_buf: usize,
     venue: &'static str,
+    kind: FeedKind,
+    publisher_port: u16,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
+    health: SharedFeedHealth,
     mut processor: P,
 ) -> Result<()> {
-    // Feed-health transition tracking: true while the market-data multicast is considered down
-    // (silent past IDLE_REJOIN). Persists across rejoins so we emit `down`/`ok` only on the edge.
+    // This receiver's own liveness: true while its market-data multicast is considered down (silent
+    // past IDLE_REJOIN). Persists across rejoins so the gauge/aggregate is touched only on the edge;
+    // the venue-level `status` fires only when `health` reports the VENUE aggregate flipped.
     let mut down = false;
 
     // Per-feed metric handles resolved once (venue is `&'static`); the per-channel datagram counter
     // is resolved per role at bind time below.
     let m = metrics();
-    let bytes_ctr = m.datagram_bytes.with_label_values(&[venue]);
-    let socket_errors = m.socket_errors.with_label_values(&[venue]);
-    let idle_rejoin = m.idle_rejoin.with_label_values(&[venue]);
-    // Create the feed-health gauge series up front in their healthy state, so a feed that never
-    // goes down still exposes `dz_feed_up{venue}=1` (the down/ok edges in `emit_status` flip it).
-    init_feed_health(venue);
+    let kind_label = kind.label();
+    // The `publisher` label/log value is the base port, rendered once here - never per datagram.
+    let publisher_port_str = publisher_port.to_string();
+    let publisher_name: &str = &publisher_port_str;
+    let bytes_ctr = m
+        .datagram_bytes
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    let socket_errors = m
+        .socket_errors
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    let idle_rejoin = m
+        .idle_rejoin
+        .with_label_values(&[venue, kind_label, publisher_name]);
+    // Registers this receiver in the shared health map and owns its `dz_receiver_up`; deregisters
+    // both when this task ends for any reason (see `ReceiverRegistration`). Deferred until the
+    // sockets actually bind: a receiver that can never bind (taken port, bad interface) would
+    // otherwise register-then-drop on every reconciler respawn, publishing a `status` down/ok pair
+    // per tick. A bind error is a known failure, not silence, so it stays out of the aggregate.
+    let mut registration: Option<ReceiverRegistration> = None;
+    // Create the feed-health gauge series up front, so a feed that never goes down still exposes
+    // `dz_feed_up{venue}` (the venue-level down/ok edges flip it).
+    init_feed_health(&health, venue);
 
     'rejoin: loop {
         // Wait for the interface to acquire an IPv4 before joining, so we don't race the tunnel
@@ -448,12 +535,25 @@ async fn drive<P: FrameProcessor>(
                 role,
                 sock,
                 buf: vec![0u8; 2048],
-                dgrams: m
-                    .datagrams_received
-                    .with_label_values(&[venue, role.label()]),
+                dgrams: m.datagrams_received.with_label_values(&[
+                    venue,
+                    kind_label,
+                    publisher_name,
+                    role.label(),
+                ]),
             });
         }
-        info!(%group, ?ports, %iface, %iface_ip, recv_buf, "DZ Edge multicast receiver bound");
+        let reg = registration.get_or_insert_with(|| {
+            ReceiverRegistration::new(
+                health.clone(),
+                arbiter.clone(),
+                (venue, kind, publisher_port),
+                m.receiver_up
+                    .with_label_values(&[venue, kind_label, publisher_name]),
+            )
+        });
+        info!(%group, ?ports, %iface, %iface_ip, recv_buf, venue, kind = kind_label,
+              publisher = publisher_name, "DZ Edge multicast receiver bound");
 
         // Watchdog on the market-data stream specifically: rejoin when no market-data datagram has
         // arrived for IDLE_REJOIN, regardless of refdata/snapshot (which keep ticking even when
@@ -462,17 +562,14 @@ async fn drive<P: FrameProcessor>(
         loop {
             let remaining = IDLE_REJOIN.saturating_sub(last_mkt.elapsed());
             if remaining.is_zero() {
-                warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
+                warn!(%group, venue, kind = kind_label, publisher = publisher_name,
+                      idle_s = IDLE_REJOIN.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 idle_rejoin.inc();
                 if !down {
-                    emit_status(
-                        &arbiter,
-                        venue,
-                        "down",
-                        last_mkt.elapsed().as_millis() as u64,
-                    );
                     down = true;
+                    // Only when the venue's LAST up quote receiver goes down is the venue down.
+                    reg.set(false, last_mkt.elapsed().as_millis() as u64);
                 }
                 continue 'rejoin;
             }
@@ -486,17 +583,13 @@ async fn drive<P: FrameProcessor>(
                         continue 'rejoin;
                     }
                     Err(_) => {
-                        warn!(%group, idle_s = IDLE_REJOIN.as_secs(),
+                        warn!(%group, venue, kind = kind_label, publisher = publisher_name,
+                              idle_s = IDLE_REJOIN.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         idle_rejoin.inc();
                         if !down {
-                            emit_status(
-                                &arbiter,
-                                venue,
-                                "down",
-                                last_mkt.elapsed().as_millis() as u64,
-                            );
                             down = true;
+                            reg.set(false, last_mkt.elapsed().as_millis() as u64);
                         }
                         continue 'rejoin;
                     }
@@ -509,8 +602,8 @@ async fn drive<P: FrameProcessor>(
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
                 if down {
-                    emit_status(&arbiter, venue, "ok", 0);
                     down = false;
+                    reg.set(true, 0);
                 }
             }
 
@@ -540,43 +633,52 @@ fn two_port_roles(ports: FeedPorts) -> Vec<(PortRole, u16)> {
     }
 }
 
-/// Run the receiver for one feed: pick the protocol's [`FrameProcessor`] and port roles from the
-/// feed's [`FeedKind`], then drive the shared receive loop. Returns only on a fatal bind error
-/// (it otherwise runs forever).
+/// Run the receiver for **one publisher** of one feed: pick the protocol's [`FrameProcessor`] and
+/// port roles from the feed's [`FeedKind`], then drive the shared receive loop over that
+/// publisher's port block. Returns only on a fatal bind error (it otherwise runs forever).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_feed(
     feed: Feed,
+    publisher: FeedPublisher,
     iface: String,
     recv_buf: usize,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
+    health: SharedFeedHealth,
 ) -> Result<()> {
     let venue: &'static str = feed.venue;
     match feed.kind {
         FeedKind::TopOfBook => {
-            let ports = two_port_roles(feed.ports);
+            let ports = two_port_roles(publisher.ports);
             drive(
                 feed.group,
                 ports,
                 iface,
                 recv_buf,
                 venue,
+                feed.kind,
+                publisher.base_port(),
                 arbiter,
                 instruments,
+                health,
                 TobProcessor::new(feed.emit_trades),
             )
             .await
         }
         FeedKind::Midpoint => {
-            let ports = two_port_roles(feed.ports);
+            let ports = two_port_roles(publisher.ports);
             drive(
                 feed.group,
                 ports,
                 iface,
                 recv_buf,
                 venue,
+                feed.kind,
+                publisher.base_port(),
                 arbiter,
                 instruments,
+                health,
                 MidpointProcessor::new(),
             )
             .await
@@ -586,9 +688,13 @@ pub async fn run_feed(
                 mktdata,
                 refdata,
                 snapshot,
-            } = feed.ports
+            } = publisher.ports
             else {
-                bail!("Market-by-Order feed '{venue}' must use FeedPorts::ThreePort (mktdata/refdata/snapshot)");
+                bail!(
+                    "Market-by-Order feed '{venue}' publisher '{}' must use FeedPorts::ThreePort \
+                     (mktdata/refdata/snapshot)",
+                    publisher.base_port()
+                );
             };
             let ports = vec![
                 (PortRole::Mktdata, mktdata),
@@ -601,8 +707,11 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.kind,
+                publisher.base_port(),
                 arbiter,
                 instruments,
+                health,
                 MboProcessor::new(depth, feed.emit_trades),
             )
             .await
@@ -619,10 +728,13 @@ mod tests {
 
     #[test]
     fn feed_health_gauges_materialize_up_at_setup() {
+        use crate::ingest::{feeds::FeedKind, health::FeedHealth};
         // A unique venue label keeps this independent of any other test touching the shared,
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
-        init_feed_health(venue);
+        let health = FeedHealth::new();
+        health.register((venue, FeedKind::TopOfBook, 9101), |_| {});
+        init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
         assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);

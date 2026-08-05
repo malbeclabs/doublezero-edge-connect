@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     net::IpAddr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use tracing::{debug, info, warn};
@@ -33,6 +34,34 @@ use crate::{
 
 /// How many price levels per side a `depth` snapshot carries.
 const DEPTH_LEVELS: usize = 10;
+
+/// Minimum gap between two decode-error log lines from one processor.
+const DECODE_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Rate limit for a warning that can fire **per datagram**. A decode error is per-frame, so a
+/// `(group, port)` block that turns out to carry another protocol's traffic (several of the MBO/TOB
+/// port blocks are inferred, not confirmed on-wire) would otherwise warn at full market-data rate.
+#[derive(Default)]
+struct WarnRateLimit {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarnRateLimit {
+    /// `Some(suppressed_since_the_last_line)` when the caller should log, `None` to stay quiet.
+    fn allow(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < DECODE_WARN_INTERVAL)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
 
 /// Pre-resolved `dz_seq_events_total{venue, kind}` children (one per [`SeqCheck`] outcome) for a
 /// single feed, so the per-frame hot path increments a cached counter instead of doing a label-map
@@ -117,6 +146,8 @@ pub struct TobProcessor {
     warned_invalid_manifest: bool,
     /// Log an unregistered quote SourceID once, not on every quote.
     warned_source_mismatch: bool,
+    /// Rate limit for the per-datagram decode-error warning.
+    decode_warn: WarnRateLimit,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
     /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
@@ -131,6 +162,7 @@ impl TobProcessor {
             seq_order: VecDeque::new(),
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
+            decode_warn: WarnRateLimit::default(),
             emit_trades,
             seq_events: SeqEvents::default(),
         }
@@ -163,7 +195,9 @@ impl FrameProcessor for TobProcessor {
         let (header, messages) = match decode_frame(buf) {
             Ok(v) => v,
             Err(e) => {
-                warn!(role = ?ctx.role, "decode error: {e}");
+                if let Some(suppressed) = self.decode_warn.allow() {
+                    warn!(role = ?ctx.role, suppressed, "decode error: {e}");
+                }
                 return;
             }
         };
@@ -357,6 +391,8 @@ pub struct MidpointProcessor {
     state: RefDataState<codec_midpoint::InstrumentDefinition>,
     seq: SeqTracker,
     warned_source_mismatch: bool,
+    /// Rate limit for the per-datagram decode-error warning.
+    decode_warn: WarnRateLimit,
     /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
     seq_events: SeqEvents,
 }
@@ -373,6 +409,7 @@ impl MidpointProcessor {
             state: RefDataState::new(),
             seq: SeqTracker::default(),
             warned_source_mismatch: false,
+            decode_warn: WarnRateLimit::default(),
             seq_events: SeqEvents::default(),
         }
     }
@@ -383,7 +420,9 @@ impl FrameProcessor for MidpointProcessor {
         let (header, messages) = match codec_midpoint::decode_frame(buf) {
             Ok(v) => v,
             Err(e) => {
-                warn!(role = ?ctx.role, "midpoint decode error: {e}");
+                if let Some(suppressed) = self.decode_warn.allow() {
+                    warn!(role = ?ctx.role, suppressed, "midpoint decode error: {e}");
+                }
                 return;
             }
         };
@@ -504,6 +543,8 @@ pub struct MboProcessor {
     warned_source_mismatch: bool,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
+    /// Rate limit for the per-datagram decode-error warning.
+    decode_warn: WarnRateLimit,
     /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
     emit_trades: bool,
 }
@@ -519,6 +560,7 @@ impl MboProcessor {
             emitted_symbol: HashMap::new(),
             warned_source_mismatch: false,
             warned_invalid_manifest: false,
+            decode_warn: WarnRateLimit::default(),
             emit_trades,
         }
     }
@@ -638,7 +680,9 @@ impl FrameProcessor for MboProcessor {
         let (header, messages) = match codec_mbo::decode_frame(buf) {
             Ok(v) => v,
             Err(e) => {
-                warn!(role = ?ctx.role, "mbo decode error: {e}");
+                if let Some(suppressed) = self.decode_warn.allow() {
+                    warn!(role = ?ctx.role, suppressed, "mbo decode error: {e}");
+                }
                 return;
             }
         };
@@ -686,20 +730,20 @@ impl FrameProcessor for MboProcessor {
                 }
                 codec_mbo::Message::EndOfSession(ts) => {
                     info!(ts, "mbo end of session");
-                    // The venue may restart its event clock (and sequences) next session, so this
-                    // is a session boundary for the FEED, not just for the publisher whose copy of
-                    // the EndOfSession arrived first: reset EVERY publisher's book — a
-                    // still-`Synced` peer book would otherwise keep emitting old-session depth
-                    // (or, after a boundary-loss resync, stamp its first depth with pre-session
-                    // time) and immediately re-latch the floor at the old high-water, undoing the
-                    // clear below with no second chance if that peer's own EndOfSession datagram
-                    // is lost. Then clear the venue's latched depth-floor entries so a
-                    // post-session `source_ts` below the old high-water re-opens the tick instead
-                    // of being dropped as stale forever (the floor stays latched otherwise — no
-                    // full-state self-heal rescues it). Everything here is idempotent, so the
-                    // duplicate EndOfSession copies arriving on the other ports / from the mirror
-                    // publisher are harmless no-ops (deliberately not role-gated: extra clears
-                    // also back up a lost copy).
+                    // Session boundary: the venue may restart its event clock and sequences, so
+                    // drop this publisher's books to `Recovering` and clear the venue's latched
+                    // depth-floor entries — a post-session `source_ts` below the old high-water
+                    // would otherwise be dropped as stale forever (no full-state self-heal
+                    // rescues a latched floor). Idempotent, so the duplicate copies arriving on
+                    // the other ports are harmless no-ops (deliberately not role-gated: an extra
+                    // clear also backs up a lost copy).
+                    //
+                    // SCOPE TRAP: `books` holds only THIS publisher's books (one processor per
+                    // receiver task) while the floor cleared below is venue-wide and shared. A
+                    // mirror that loses its own EndOfSession datagram keeps a `Synced` book and
+                    // can re-latch the cleared floor at the old high-water, wedging the venue's
+                    // depth until that mirror resets on its own. Closing it needs a per-venue
+                    // session epoch shared across the receiver tasks.
                     for book in self.books.values_mut() {
                         book.on_end_of_session();
                     }
@@ -914,7 +958,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor, TobProcessor};
+    use super::{upsert_instrument, MboProcessor, TobProcessor, WarnRateLimit};
     use crate::{
         ingest::{
             arbiter::{Arbiter, SharedArbiter},
@@ -936,6 +980,21 @@ mod tests {
     // converge on one floor per (venue, symbol)). Their unit coverage — leader latch, non-leader
     // drop, stale-tick drop, capacity bound, source_ts==0 bypass, the bbo_hash identity incl.
     // bid_n/ask_n, and the public-loses-to-edge backstop — lives in `arbiter::tests`.
+
+    /// A decode error is per-datagram, so the warning must collapse to one line per interval and
+    /// report how many it swallowed - a mis-inferred port block carrying another protocol's traffic
+    /// would otherwise log at market-data rate.
+    #[test]
+    fn decode_warn_rate_limit_collapses_a_burst_and_counts_it() {
+        let mut w = WarnRateLimit::default();
+        assert_eq!(w.allow(), Some(0), "first error logs immediately");
+        assert_eq!(w.allow(), None, "second within the interval is suppressed");
+        assert_eq!(w.allow(), None);
+        // Simulate the interval elapsing; the next line carries the suppressed count.
+        w.last = None;
+        assert_eq!(w.allow(), Some(2));
+        assert_eq!(w.allow(), None, "count resets after being reported");
+    }
 
     /// The per-publisher sequence map must stay bounded under a flood of distinct (spoofable) source
     /// IPs, evicting the oldest first — otherwise a forged-source flood grows it without limit.

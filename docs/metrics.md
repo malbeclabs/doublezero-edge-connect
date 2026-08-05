@@ -37,19 +37,45 @@ network. See also [Output sinks](output-sinks.md).
 Both the ingest and client-output paths expose **message and byte** counters, so volume and
 bandwidth can be tracked independently for each transport (UDP shred fan-out and WebSocket).
 
-## Ingest reception (per feed)
+## Ingest reception (per publisher)
 
-Recorded by the multicast receivers (`src/ingest/receiver.rs`). Labelled by `venue`.
+Recorded by the multicast receivers (`src/ingest/receiver.rs`), one per `(venue, kind, publisher)` —
+a venue mirrored by six publishers runs six receivers per protocol. The `publisher` label value is
+the publisher's **base port** (the market-data port of its block, e.g. `9201`), which is what
+`--publisher-port` selects.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `dz_datagrams_received_total` | counter | `venue`, `role` | Datagrams received, split by port `role` (mktdata/refdata/snapshot/combined). |
-| `dz_datagram_bytes_total` | counter | `venue` | Total bytes received (sum of datagram lengths). |
-| `dz_socket_errors_total` | counter | `venue` | Socket/transport receive errors (each triggers a rejoin). |
-| `dz_idle_rejoin_total` | counter | `venue` | Idle-rejoin watchdog firings (market data went silent past the idle window). |
-| `dz_feed_up` | gauge | `venue` | `1` while the market-data multicast is up, `0` while down. |
-| `dz_feed_stale_ms` | gauge | `venue` | Staleness in milliseconds: `0` while up; the staleness at the last `down` transition (reset to `0` on recovery). |
-| `dz_seq_events_total` | counter | `venue`, `kind` | Frame-sequence classifications (`first`/`ok`/`reset`/`stale`). |
+| `dz_datagrams_received_total` | counter | `venue`, `kind`, `publisher`, `role` | Datagrams received per publisher, split by port `role` (mktdata/refdata/snapshot/combined). |
+| `dz_datagram_bytes_total` | counter | `venue`, `kind`, `publisher` | Total bytes received per publisher. |
+| `dz_socket_errors_total` | counter | `venue`, `kind`, `publisher` | Socket/transport receive errors per publisher (each triggers a rejoin). |
+| `dz_idle_rejoin_total` | counter | `venue`, `kind`, `publisher` | Idle-rejoin watchdog firings per publisher. |
+| `dz_receiver_up` | gauge | `venue`, `kind`, `publisher` | `1` while this publisher's market-data stream is up, `0` while down. The per-publisher counterpart of `dz_feed_up`. |
+| `dz_feed_up` | gauge | `venue` | `1` while *any* publisher of the venue is up, `0` once every one has gone silent. |
+| `dz_feed_stale_ms` | gauge | `venue` | Staleness in milliseconds: `0` while up; the staleness at the last venue-level `down` transition (reset to `0` on recovery). |
+| `dz_seq_events_total` | counter | `venue`, `kind` | Frame-sequence classifications (`first`/`ok`/`reset`/`stale`). Incremented in the processor, which demultiplexes publishers by source IP and so has no configured base port — hence no `publisher` label. |
+
+> **Label change (multi-publisher):** the four receiver counters gained `kind` and `publisher` when
+> a feed became N publishers rather than one port block. Aggregating queries (`sum by (venue)`,
+> `rate(...)` summed over labels) are unaffected; queries that match the old exact label set
+> (`dz_datagram_bytes_total{venue="Hyperliquid"}` as an instant selector) now match six series per
+> protocol instead of one. `dz_feed_up` / `dz_feed_stale_ms` are deliberately still venue-level
+> **aggregates**: a venue reads down only once every one of its **quote-bearing** publishers (the
+> Top-of-Book/Midpoint receivers — `status` is the quote feed's health, so a depth-only
+> Market-by-Order mirror neither declares an outage nor masks one) has gone silent. A quote receiver
+> that *stops* (aborted, exited, bind error) leaves the aggregate down rather than handing it to a
+> depth-only peer, so a venue whose Top-of-Book receivers all died reads `0`, not `1`. A venue with
+> `dz_feed_up == 1` and some `dz_receiver_up == 0` has a wedged mirror — worth its own alert.
+>
+> **Arbiter-side semantics drift under unchanged names.** Ingesting N mirrors instead of one changes
+> what two existing series *mean*, without renaming them — re-baseline any dashboard or alert built
+> on them:
+> - `dz_quotes_dropped_total` / `dz_depth_dropped_total` go from ≈0 to ≈`(N-1)/N` of all samples.
+>   That is the cross-publisher collapse working as designed, not loss; alert on the *ratio changing*
+>   rather than on an absolute rate.
+> - `dz_quote_lead_ns{winner="edge",loser="edge"}` — previously empty — becomes the dominant series
+>   and measures **inter-mirror skew**. The headline "DZ beats the public feed" margin remains
+>   `{winner="edge",loser="public"}` only.
 
 ## Arbiter emit stage (per feed)
 
@@ -64,6 +90,7 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | `dz_depth_ticks_won_total` | counter | `venue`, `publisher` | The depth mirror of `dz_quote_ticks_won_total` (for depth the `source_ts == 0` empty-anchor tick is real and counts). |
 | `dz_quotes_dropped_total` | counter | `venue` | Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat). |
 | `dz_trades_dropped_total` | counter | `venue` | Trades dropped by the windowed dedup (duplicate `trade_id` still inside the window). |
+| `dz_instruments_dropped_total` | counter | `venue` | Instrument definitions dropped as an unchanged repeat of the last content broadcast for that `(venue, symbol)`, within the re-announce interval (`INSTRUMENT_REANNOUNCE_NS`, 15s) — the mirrored publishers' identical reference-data bursts collapsing. Expect nearly all definition frames in steady state: the dedup is a rate limit, not a latch, so unchanged content is still re-broadcast on the first burst past the interval (that periodic re-announce is what heals a client which lost an `instrument` to drop-oldest backpressure). A precision *change* is never suppressed. |
 | `dz_quotes_future_rejected_total` | counter | `venue` | Quotes rejected for an implausibly-far-future `source_ts`. |
 | `dz_quotes_no_source_ts_total` | counter | `venue` | Quotes forwarded with the `source_ts == 0` sentinel (floor bypassed). |
 | `dz_quote_lead_ns` | histogram | `venue`, `winner`, `loser` | Nanoseconds the winning publisher led the losing duplicate by, per quote-tick cross-source contest (`winner`/`loser` each `edge`/`public`). `{winner="edge",loser="public"}` is "DZ beat the public feed"; `_count` is the head-to-head win count, the buckets the lead margin. |

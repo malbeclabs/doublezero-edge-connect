@@ -45,7 +45,9 @@ use tokio::sync::broadcast;
 
 use crate::{
     metrics::metrics,
-    model::{self, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote},
+    model::{
+        self, now_mono_ns, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote,
+    },
 };
 
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
@@ -165,6 +167,33 @@ pub struct DepthId {
     bids: Vec<(i128, i128)>,
     asks: Vec<(i128, i128)>,
 }
+
+/// The content identity of an instrument definition: the precision pair. EXCLUDES `venue`/`symbol`
+/// (they are the map key). N publishers mirroring a feed each republish identical definitions on
+/// every reference-data burst (~every 8s on the live feed), so un-deduped every WS client receives
+/// one copy per publisher of content it already has.
+///
+/// Unlike quotes and depth this needs no `source_ts` floor: a definition carries no timestamp and
+/// is idempotent full state, so content plus a re-announce clock is the whole identity. A genuine
+/// precision change differs and re-emits immediately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct InstrumentId {
+    price_exponent: i8,
+    qty_exponent: i8,
+}
+
+/// How long unchanged instrument content is suppressed before it is re-broadcast.
+///
+/// Collapsing the mirrored publishers' bursts must NOT make a definition a once-per-process event.
+/// A streamed `instrument` can be lost — the WS broadcast is drop-oldest under backpressure
+/// (`sinks::ws`) — and the periodic refdata burst is the only thing that heals an established
+/// client, since the `InstrumentSnapshot` replay happens on connect only. So the dedup is a rate
+/// limit, not a latch: the first copy of a burst wins, its five mirrors collapse, and the content
+/// is re-announced on the first burst after this interval. Above the live ~8s burst period so a
+/// burst always collapses to one message, but close enough to it that the worst-case repair delay
+/// stays the same order as the un-deduped feed's (~16s vs ~8s) — that is the trade this const
+/// prices, and lowering the mirror traffic further would buy a slower heal.
+const INSTRUMENT_REANNOUNCE_NS: u64 = 15_000_000_000; // 15s
 
 impl DepthId {
     pub fn of(d: &NormalizedDepth) -> Self {
@@ -452,6 +481,12 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
+    /// Last broadcast content per `(venue, symbol)` plus the monotonic time it went out, so
+    /// mirrored publishers' identical definition bursts collapse to one wire message while the
+    /// content is still re-announced every [`INSTRUMENT_REANNOUNCE_NS`]. Keyed identically to the
+    /// `InstrumentSnapshot` that `processor::upsert_instrument` already maintains, so this adds no
+    /// new unbounded-growth surface beyond the one that map already has.
+    instrument_defs: HashMap<(Arc<str>, Arc<str>), (InstrumentId, u64)>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -479,6 +514,7 @@ struct VenueMetrics {
     depth_ticks_won: [IntCounter; 2],
     quotes_dropped: IntCounter,
     trades_dropped: IntCounter,
+    instruments_dropped: IntCounter,
     quotes_future_rejected: IntCounter,
     quotes_no_source_ts: IntCounter,
     /// `dz_depth_admitted_total{publisher}` / `dz_depth_dropped_total{publisher}`, `[edge, public]`.
@@ -527,6 +563,7 @@ impl VenueMetrics {
             depth_ticks_won: by_pub(&m.depth_ticks_won),
             quotes_dropped: m.quotes_dropped.with_label_values(&[venue]),
             trades_dropped: m.trades_dropped.with_label_values(&[venue]),
+            instruments_dropped: m.instruments_dropped.with_label_values(&[venue]),
             quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
             quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
             depth_admitted: by_pub(&m.depth_admitted),
@@ -555,6 +592,7 @@ impl Arbiter {
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
+            instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
         }
     }
@@ -734,7 +772,31 @@ impl Arbiter {
             // Passthrough kinds (no dedup). Enumerated explicitly rather than via a catch-all so a
             // future `FeedMessage` variant is a compile error here, not a silent miss / runtime panic.
             FeedMessage::Instrument(i) => {
-                self.vm(&i.venue).emit[EMIT_INSTRUMENT].inc();
+                // Mirrored publishers republish identical definitions every refdata burst: the
+                // burst's first copy goes out, its mirrors collapse, and unchanged content is
+                // re-announced once `INSTRUMENT_REANNOUNCE_NS` has elapsed (a rate limit, not a
+                // latch — see that const). A precision change always goes out immediately.
+                let id = InstrumentId {
+                    price_exponent: i.price_exponent,
+                    qty_exponent: i.qty_exponent,
+                };
+                let now = now_mono_ns();
+                let key = (i.venue.clone(), i.symbol.clone());
+                let forward = match self.instrument_defs.get(&key) {
+                    Some((prev, last)) => {
+                        *prev != id || now.saturating_sub(*last) >= INSTRUMENT_REANNOUNCE_NS
+                    }
+                    None => true,
+                };
+                if forward {
+                    self.instrument_defs.insert(key, (id, now));
+                }
+                let vm = self.vm(&i.venue);
+                if !forward {
+                    vm.instruments_dropped.inc();
+                    return;
+                }
+                vm.emit[EMIT_INSTRUMENT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
@@ -1798,5 +1860,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn instrument(symbol: &str, price_exponent: i8, qty_exponent: i8) -> FeedMessage {
+        FeedMessage::Instrument(crate::model::NormalizedInstrument {
+            venue: "Hyperliquid".into(),
+            symbol: symbol.into(),
+            price_exponent,
+            qty_exponent,
+        })
+    }
+
+    fn drain_instruments(
+        rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) -> Vec<(String, i8, i8)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Instrument(i) = &*m {
+                out.push((i.symbol.to_string(), i.price_exponent, i.qty_exponent));
+            }
+        }
+        out
+    }
+
+    /// Mirrored publishers republish identical definitions every refdata burst. Within one
+    /// re-announce interval only the burst's first copy reaches the wire; a genuine exponent change
+    /// re-emits at once.
+    #[test]
+    fn arbiter_collapses_duplicate_instrument_definitions() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let peer = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(instrument("BTC", -2, -4), edge);
+        a.emit(instrument("BTC", -2, -4), edge); // same publisher's next burst -> dropped
+        a.emit(instrument("BTC", -2, -4), peer); // mirror's copy -> dropped
+        a.emit(instrument("ETH", -2, -4), edge); // different symbol -> kept
+        a.emit(instrument("BTC", -3, -4), peer); // real precision change -> kept
+        a.emit(instrument("BTC", -3, -4), edge); // ...then deduped at the new content
+        assert_eq!(
+            drain_instruments(&mut rx),
+            vec![
+                ("BTC".to_string(), -2, -4),
+                ("ETH".to_string(), -2, -4),
+                ("BTC".to_string(), -3, -4),
+            ]
+        );
+    }
+
+    /// The collapse is a rate limit, not a once-per-process latch: after the re-announce interval
+    /// the same unchanged content goes out again. That periodic burst is the only thing that heals
+    /// an established WS client which lost an `instrument` to drop-oldest backpressure — the
+    /// `InstrumentSnapshot` replay only covers clients at connect time.
+    #[test]
+    fn arbiter_reannounces_unchanged_instrument_after_the_interval() {
+        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(instrument("BTC", -2, -4), edge);
+        a.emit(instrument("BTC", -2, -4), edge); // inside the interval -> collapsed
+        assert_eq!(drain_instruments(&mut rx).len(), 1);
+
+        // Backdate the last-broadcast stamp past the interval rather than sleeping 30s.
+        for (_, last) in a.instrument_defs.values_mut() {
+            *last = last.saturating_sub(INSTRUMENT_REANNOUNCE_NS);
+        }
+        a.emit(instrument("BTC", -2, -4), edge);
+        assert_eq!(
+            drain_instruments(&mut rx),
+            vec![("BTC".to_string(), -2, -4)],
+            "unchanged content must be re-announced once the interval elapses"
+        );
+        // ...and the clock restarts, so the next mirror copy collapses again.
+        a.emit(instrument("BTC", -2, -4), edge);
+        assert!(drain_instruments(&mut rx).is_empty());
     }
 }

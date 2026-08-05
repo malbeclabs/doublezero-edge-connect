@@ -1,10 +1,10 @@
 //! Hardcoded registry of DoubleZero Edge feeds the bridge ingests.
 //!
 //! Each feed is one multicast group mapped to exactly one venue, plus the **protocol** it speaks
-//! ([`FeedKind`]) and the **ports** it splits its messages across ([`FeedPorts`]). The bridge
-//! spawns one receiver per selected feed; consumers then filter by `venue` over the WebSocket
-//! (see PROTOCOL.md subscriptions). To ingest another venue's feed, add a `Feed` row below - no
-//! other code changes are needed.
+//! ([`FeedKind`]) and the **publishers** mirroring it ([`FeedPublisher`]), each with its own port
+//! block. The bridge spawns one receiver per `(venue, kind, publisher)`; consumers then filter by
+//! `venue` over the WebSocket (see PROTOCOL.md subscriptions). To ingest another venue's feed, add
+//! a `Feed` row below - no other code changes are needed.
 
 use std::net::Ipv4Addr;
 
@@ -21,6 +21,17 @@ pub enum FeedKind {
     Midpoint,
     /// Market-by-Order (frame magic `0x4444`): full L3 order book with snapshot+delta recovery.
     MarketByOrder,
+}
+
+impl FeedKind {
+    /// Stable, low-cardinality label for the metrics `kind` dimension and log fields.
+    pub fn label(self) -> &'static str {
+        match self {
+            FeedKind::TopOfBook => "tob",
+            FeedKind::Midpoint => "midpoint",
+            FeedKind::MarketByOrder => "mbo",
+        }
+    }
 }
 
 /// The multicast ports a feed splits its messages across. Every protocol uses a `mktdata` port
@@ -64,6 +75,36 @@ impl FeedPorts {
     }
 }
 
+/// One publisher mirroring a feed: the port block it publishes on.
+///
+/// Independent publishers mirror one venue's stream so subscribers can race them (see
+/// `ingest::arbiter`). Two deployment models exist and both are supported:
+///
+/// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does — the Nth
+///   publisher's block is base + N*100): one `FeedPublisher` row per publisher, one receiver task
+///   each, and each task sees exactly one source IP.
+/// - **Shared port block** (all publishers to one `(group, port)`): a single `FeedPublisher` row,
+///   one receiver task, and that task sees N source IPs.
+///
+/// Either way the *publisher identity* the arbiter races on is the datagram source IP, never the
+/// port — so the dedup path is identical. The operator-facing identity is the
+/// [`base port`](FeedPublisher::base_port): what `--publisher-port` selects and what the
+/// `publisher` metric label carries. Deliberately a port and not a host name — the port block is
+/// the publisher property this protocol actually defines.
+#[derive(Debug, Clone, Copy)]
+pub struct FeedPublisher {
+    /// The port block this publisher sends on.
+    pub ports: FeedPorts,
+}
+
+impl FeedPublisher {
+    /// This publisher's stable identity within its feed: the market-data (base) port of its block.
+    /// Used for the `publisher` metric label, log fields and the reconciler's task key.
+    pub fn base_port(&self) -> u16 {
+        self.ports.mktdata()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Feed {
     /// Venue name stamped on every instrument and message from this feed. Matches the
@@ -79,54 +120,134 @@ pub struct Feed {
     pub kind: FeedKind,
     /// Multicast group for the feed.
     pub group: Ipv4Addr,
-    /// The ports the feed splits its messages across.
-    pub ports: FeedPorts,
+    /// The publishers mirroring this feed, each with its own port block. One receiver task is
+    /// spawned per entry. A feed whose publishers all share one port block lists exactly one
+    /// entry (see [`FeedPublisher`]).
+    pub publishers: &'static [FeedPublisher],
     /// Whether this feed emits `trade` messages. A venue carried by both TOB and MBO would
     /// otherwise double-emit the same trades; TOB owns trades, MBO is depth-only.
     pub emit_trades: bool,
 }
 
-/// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue. Both the group
-/// *and* the ports vary per venue: Hyperliquid publishes on the 93xx family, Phoenix on 92xx.
-/// Don't assume ports are shared - confirm them against the live publisher.
+/// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue, each mirrored by
+/// one or more publishers ([`FeedPublisher`]).
 ///
-/// Sibling-protocol feeds (Midpoint / Market-by-Order) are added here once their live multicast
-/// groups/ports are known; until then they are absent rather than carrying guessed endpoints.
+/// Group, ports **and publisher count** all vary per venue. Hyperliquid mirrors one group across six
+/// publishers, each with its own port block (base + N*100); Phoenix runs a single publisher. Don't
+/// assume any of it - confirm against the venue's deployment.
+///
+/// Sibling-protocol feeds (Midpoint) are added here once their live multicast groups/ports are
+/// known; until then they are absent rather than carrying guessed endpoints.
 pub const FEEDS: &[Feed] = &[
-    // Confirmed on-wire (group-bound capture). The two subscribed DZ multicast groups each carry
-    // one venue's Top-of-Book on mktdata 9201 / refdata 9202:
+    // Confirmed on-wire (group-bound capture) plus the publisher fleet's port blocks:
     //
-    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid. SourceID 3 (the Hyperliquid superset: core
-    //     perps + HIP-3 builder DEXs, builder kept in the symbol) plus SourceID 1.
-    //   - `scottsdale` 233.84.178.18 -> Phoenix. SourceID 2.
+    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid, six publishers, TOB on 9N01/9N02 and MBO on
+    //     10N01/10N02/10N03, where N is the publisher index (0..4 and 6 - the fleet skips 5).
+    //   - `scottsdale` 233.84.178.18 -> Phoenix, a single publisher on 9201/9202.
     //
     // The venue is still resolved per message from the wire SourceID (see processor.rs), so the
-    // `venue` below is only the default for unregistered SourceIDs (the SourceID-3 superset on
-    // tiredsolid). Each feed gets its own receiver + reference-data state, keyed by group address.
+    // `venue` below is only the default for unregistered SourceIDs (the SourceID-3 Hyperliquid
+    // superset on tiredsolid). Each publisher gets its own receiver + reference-data state.
     Feed {
         venue: "Hyperliquid",
         code: "tiredsolid",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 15),
-        ports: FeedPorts::TwoPort {
-            mktdata: 9201,
-            refdata: 9202,
-        },
+        publishers: &[
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9001,
+                    refdata: 9002,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9101,
+                    refdata: 9102,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9201,
+                    refdata: 9202,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9301,
+                    refdata: 9302,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9401,
+                    refdata: 9402,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9601,
+                    refdata: 9602,
+                },
+            },
+        ],
         emit_trades: true,
     },
-    // Hyperliquid Market-by-Order on the same `tiredsolid` group, host2 ports (paired with
-    // the TOB row above). Confirmed against edge-multicast-ref/docs/hyperliquid.md (mainnet-beta).
+    // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
+    // (paired with the TOB row above). The 10201/10202/10203 block is confirmed against
+    // edge-multicast-ref/docs/hyperliquid.md (mainnet-beta); the other five follow the same
+    // +100-per-publisher scheme, so a block that turns out to be wrong shows up as a permanent
+    // `dz_receiver_up == 0` for that publisher rather than as an error.
     // Depth-only: TOB owns this venue's trades.
     Feed {
         venue: "Hyperliquid",
         code: "tiredsolid",
         kind: FeedKind::MarketByOrder,
         group: Ipv4Addr::new(233, 84, 178, 15),
-        ports: FeedPorts::ThreePort {
-            mktdata: 10201,
-            refdata: 10202,
-            snapshot: 10203,
-        },
+        publishers: &[
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10001,
+                    refdata: 10002,
+                    snapshot: 10003,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10101,
+                    refdata: 10102,
+                    snapshot: 10103,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10201,
+                    refdata: 10202,
+                    snapshot: 10203,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10301,
+                    refdata: 10302,
+                    snapshot: 10303,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10401,
+                    refdata: 10402,
+                    snapshot: 10403,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10601,
+                    refdata: 10602,
+                    snapshot: 10603,
+                },
+            },
+        ],
         emit_trades: false,
     },
     Feed {
@@ -134,10 +255,12 @@ pub const FEEDS: &[Feed] = &[
         code: "scottsdale",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
-        ports: FeedPorts::TwoPort {
-            mktdata: 9201,
-            refdata: 9202,
-        },
+        publishers: &[FeedPublisher {
+            ports: FeedPorts::TwoPort {
+                mktdata: 9201,
+                refdata: 9202,
+            },
+        }],
         emit_trades: true,
     },
 ];
@@ -214,5 +337,97 @@ mod tests {
         assert_eq!(three.mktdata(), 1);
         assert_eq!(three.refdata(), 2);
         assert_eq!(three.snapshot(), Some(3));
+    }
+
+    /// Every feed must list at least one publisher, else it would bind nothing and silently
+    /// contribute no data.
+    #[test]
+    fn every_feed_has_at_least_one_publisher() {
+        for f in FEEDS {
+            assert!(
+                !f.publishers.is_empty(),
+                "{} {:?} lists no publishers",
+                f.venue,
+                f.kind
+            );
+        }
+    }
+
+    /// Base ports are the `publisher` metric label and the reconciler's task-key component, so they
+    /// must be unique within a feed (a duplicate would collapse two receivers into one task key and
+    /// merge their metrics).
+    #[test]
+    fn publisher_base_ports_unique_within_a_feed() {
+        for f in FEEDS {
+            let mut seen = std::collections::HashSet::new();
+            for p in f.publishers {
+                assert!(
+                    seen.insert(p.base_port()),
+                    "{} {:?} has duplicate publisher base port {}",
+                    f.venue,
+                    f.kind,
+                    p.base_port()
+                );
+            }
+        }
+    }
+
+    /// No two receivers may bind the same `(group, port)`. Two sockets on one `(group, port)` land
+    /// in the same `SO_REUSEPORT` set, so the kernel splits that group's datagrams arbitrarily
+    /// between them — each receiver then sees a random subset of publishers, duplicating reference
+    /// data and scrambling per-publisher metrics. This is the invariant `bind_multicast`'s
+    /// bind-to-GROUP comment protects at the group level, extended to ports.
+    #[test]
+    fn group_port_pairs_are_globally_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for f in FEEDS {
+            for p in f.publishers {
+                let mut ports = vec![p.ports.mktdata(), p.ports.refdata()];
+                if let Some(s) = p.ports.snapshot() {
+                    ports.push(s);
+                }
+                for port in ports {
+                    assert!(
+                        seen.insert((f.group, port)),
+                        "{} {:?} publisher {} reuses (group {}, port {})",
+                        f.venue,
+                        f.kind,
+                        p.base_port(),
+                        f.group,
+                        port
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Hyperliquid fleet mirrors one venue across six publishers on the +100-per-publisher port
+    /// scheme. Pins the count so a dropped row is caught, and pins one known block end-to-end.
+    #[test]
+    fn hyperliquid_lists_the_whole_publisher_fleet() {
+        for kind in [FeedKind::TopOfBook, FeedKind::MarketByOrder] {
+            let f = FEEDS
+                .iter()
+                .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
+                .unwrap();
+            assert_eq!(f.publishers.len(), 6, "{kind:?} publisher count");
+        }
+        let tob = FEEDS
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::TopOfBook)
+            .unwrap();
+        let p = tob
+            .publishers
+            .iter()
+            .find(|p| p.base_port() == 9201)
+            .unwrap();
+        assert_eq!(p.ports.refdata(), 9202);
+    }
+
+    #[test]
+    fn feed_kind_labels_are_stable() {
+        assert_eq!(FeedKind::TopOfBook.label(), "tob");
+        assert_eq!(FeedKind::Midpoint.label(), "midpoint");
+        assert_eq!(FeedKind::MarketByOrder.label(), "mbo");
     }
 }

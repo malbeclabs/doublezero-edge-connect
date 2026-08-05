@@ -85,10 +85,10 @@ Hyperliquid TOB feed**, for the multi-publisher dedup work (issue #3). They are 
 independent — disjoint frame-sequence spaces (≈70.8M vs ≈53.7M) and distinct wire `source_id`
 (3 vs 1) — and time-aligned (each spans the same ~40s window, `source_ts` 1781705333..1781705373).
 
-| File | Publisher | Source IP | Infra id | mktdata port |
-|------|-----------|-----------|----------|--------------|
-| tob_btc_pubA.{refdata,mktdata}.bin | A | 148.51.120.79 | tob_aws_tyo_hl_mainnet2 | 9201 |
-| tob_btc_pubB.{refdata,mktdata}.bin | B | 148.51.123.3  | tob_gcp_tyo_hl_mainnet1 | 9601 |
+| File | Publisher | Source IP | mktdata port |
+|------|-----------|-----------|--------------|
+| tob_btc_pubA.{refdata,mktdata}.bin | A | 148.51.120.79 | 9201 |
+| tob_btc_pubB.{refdata,mktdata}.bin | B | 148.51.123.3  | 9601 |
 
 **What these fixtures are — and are not.** The two publishers do NOT republish the same venue
 updates: each independently samples/coalesces the BBO, so within the shared window pub A emits 4109

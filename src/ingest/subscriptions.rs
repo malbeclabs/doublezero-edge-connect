@@ -126,10 +126,9 @@ pub fn detect(need_group_ips: bool) -> Detected {
 
 impl HostSubs {
     /// The subset of `enabled` feeds whose group `code` this host is subscribed to.
-    pub fn market_data_feeds<'a>(&self, enabled: &[&'a Feed]) -> Vec<&'a Feed> {
+    pub fn market_data_feeds<'a>(&self, enabled: &'a [Feed]) -> Vec<&'a Feed> {
         enabled
             .iter()
-            .copied()
             .filter(|f| self.subscribed_codes.contains(f.code))
             .collect()
     }
@@ -270,23 +269,23 @@ mod tests {
 
     #[test]
     fn market_data_feeds_match_by_code() {
-        let enabled: Vec<&Feed> = FEEDS.iter().collect();
+        let enabled: &[Feed] = FEEDS;
 
         // Subscribed to Hyperliquid's group only -> both HL rows (TOB + MBO), not Phoenix.
         let hl = subs(&["tiredsolid", "edge-solana-shreds"], &[]);
-        let got = hl.market_data_feeds(&enabled);
+        let got = hl.market_data_feeds(enabled);
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|f| f.venue == "Hyperliquid"));
 
         // Subscribed to Phoenix only.
         let px = subs(&["scottsdale"], &[]);
-        let got = px.market_data_feeds(&enabled);
+        let got = px.market_data_feeds(enabled);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].venue, "Phoenix");
 
         // Shreds-only host -> no market-data feeds.
         let shreds_only = subs(&["edge-solana-shreds", "edge-solana-root"], &[]);
-        assert!(shreds_only.market_data_feeds(&enabled).is_empty());
+        assert!(shreds_only.market_data_feeds(enabled).is_empty());
     }
 
     #[test]

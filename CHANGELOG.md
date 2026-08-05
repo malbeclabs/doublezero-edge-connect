@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
+  one receiver per `(venue, protocol, publisher)`. All six live Hyperliquid publishers are ingested
+  (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
+  histograms and win-rate counters finally have a field of more than one. Publishers that share a
+  single port block still work unchanged. (#88)
+- `--publisher-port <port>` (`DZ_PUBLISHER_PORTS`) narrows the publisher set per feed by **base
+  port** (the market-data port of a publisher's block) — each publisher is a full receiver, and for
+  Market-by-Order a full independent book, so a six-publisher venue is ~6x the ingest cost of one.
+  Base ports are unique within a feed but not across feeds; pair with `--feed` to scope to one
+  venue. (#88)
+- `dz_receiver_up{venue,kind,publisher}` — per-publisher receiver health, where the `publisher`
+  label value is the base port. (#88)
+
 ### Changed
+- `dz_datagrams_received_total`, `dz_datagram_bytes_total`, `dz_socket_errors_total` and
+  `dz_idle_rejoin_total` gained `kind` and `publisher` labels. Aggregating queries are unaffected;
+  exact-match selectors on the old label set now match one series per publisher. (#88)
+- `dz_feed_up` / `dz_feed_stale_ms` and the wire `status` message are venue-level **aggregates**: a
+  venue reads down only when every one of its quote-bearing publishers has gone silent. Previously
+  any single receiver could declare its whole venue down — including a depth-only Market-by-Order
+  receiver, which no longer participates in the venue's quote health at all. A quote receiver that
+  *stops* keeps the venue honest rather than letting a depth-only peer satisfy the aggregate. (#88)
+- Multicast decode-error warnings are rate-limited to one line per 30s per receiver, carrying the
+  suppressed count. Several port blocks are inferred rather than confirmed on-wire, and one that
+  turns out to carry another protocol's traffic would otherwise log per datagram. (#88)
+- Duplicate instrument definitions from mirrored publishers are collapsed before broadcast
+  (`dz_instruments_dropped_total`), so reference-data traffic no longer scales with publisher count.
+  The collapse is a rate limit, not a latch: unchanged content is re-announced every 15s, so a
+  client that lost an `instrument` to backpressure still recovers it. (#88)
+- Ingesting N mirrors re-baselines two existing series without renaming them:
+  `dz_quotes_dropped_total`/`dz_depth_dropped_total` rise to ≈`(N-1)/N` of all samples (the
+  cross-publisher collapse, not loss), and `dz_quote_lead_ns{winner="edge",loser="edge"}` becomes
+  the dominant series and measures inter-mirror skew. See `docs/metrics.md`. (#88)
 - **HFT hot-path optimization** — the ingest→broadcast→WebSocket path now does far less per-message
   work, with no change to the wire JSON field names or values:
   - **Broadcast backbone carries `Arc<FeedMessage>`** (`src/ingest/arbiter.rs`, `src/main.rs`): a
