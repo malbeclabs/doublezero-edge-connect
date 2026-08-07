@@ -99,6 +99,10 @@ pub struct Metrics {
     pub trades_dropped: IntCounterVec,
     /// Trades forwarded with the `trade_id == 0` sentinel, bypassing the dedup window.
     pub trades_no_id: IntCounterVec,
+    /// Zero-id trades forwarded from a second publisher for a `(venue, symbol)` another publisher
+    /// already owns — the tape is double-printing, since a bypassed sentinel has no window to
+    /// collapse against.
+    pub trades_no_id_conflict: IntCounterVec,
     /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
     /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
     pub instruments_dropped: IntCounterVec,
@@ -444,6 +448,13 @@ impl Metrics {
                 &registry,
                 "dz_trades_no_id_total",
                 "Trades forwarded with the trade_id==0 sentinel (dedup window bypassed)",
+                &["venue"],
+            ),
+            trades_no_id_conflict: counter_vec(
+                &registry,
+                "dz_trades_no_id_conflict_total",
+                "Zero-id trades from a second publisher for a (venue, symbol) another owns \
+                 (the tape is double-printing)",
                 &["venue"],
             ),
             ws_clients: gauge(
