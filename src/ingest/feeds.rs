@@ -80,8 +80,8 @@ impl FeedPorts {
 /// Independent publishers mirror one venue's stream so subscribers can race them (see
 /// `ingest::arbiter`). Two deployment models exist and both are supported:
 ///
-/// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does — the Nth
-///   publisher's block is base + N*100): one `FeedPublisher` row per publisher, one receiver task
+/// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does, on arbitrary
+///   base ports — see the `FEEDS` docs): one `FeedPublisher` row per publisher, one receiver task
 ///   each, and each task sees exactly one source IP.
 /// - **Shared port block** (all publishers to one `(group, port)`): a single `FeedPublisher` row,
 ///   one receiver task, and that task sees N source IPs.
@@ -132,18 +132,28 @@ pub struct Feed {
 /// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue, each mirrored by
 /// one or more publishers ([`FeedPublisher`]).
 ///
-/// Group, ports **and publisher count** all vary per venue. Hyperliquid mirrors one group across six
-/// publishers, each with its own port block (base + N*100); Phoenix runs a single publisher. Don't
-/// assume any of it - confirm against the venue's deployment.
+/// Group, ports **and publisher count** all vary per venue. Hyperliquid mirrors one group across
+/// eleven publishers, each with its own port block; Phoenix runs a single publisher. Don't assume
+/// any of it - confirm against the venue's deployment.
+///
+/// **Base ports follow no arithmetic rule.** The v0.7 publisher takes an arbitrary `mkt_port` per
+/// channel, so a block can sit anywhere (9011 is base+10, not base+N*100). The one guarantee is the
+/// layout *within* a block - `refdata = mktdata + 1`, `snapshot = mktdata + 2` - which the
+/// publisher role enforces fleet-wide and `publisher_blocks_use_the_canonical_layout` pins here.
+/// Derive a block from its market-data port; never derive the market-data port from an index.
 ///
 /// Sibling-protocol feeds (Midpoint) are added here once their live multicast groups/ports are
 /// known; until then they are absent rather than carrying guessed endpoints.
 pub const FEEDS: &[Feed] = &[
     // Confirmed on-wire (group-bound capture) plus the publisher fleet's port blocks:
     //
-    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid, six publishers, TOB on 9N01/9N02 and MBO on
-    //     10N01/10N02/10N03, where N is the publisher index (0..4 and 6 - the fleet skips 5).
+    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid, eleven publishers.
     //   - `scottsdale` 233.84.178.18 -> Phoenix, a single publisher on 9201/9202.
+    //
+    // The authoritative fleet list is the feed-capture recorder inventory in the private infra
+    // repo, NOT the publisher deployment inventory - the latter covers only a subset of the hosts
+    // on the group. Sourcing this table from the deployment inventory alone is what left five
+    // blocks unbound and the bridge ingesting about a third of the group's datagrams.
     //
     // The venue is still resolved per message from the wire SourceID (see processor.rs), so the
     // `venue` below is only the default for unregistered SourceIDs (the SourceID-3 Hyperliquid
@@ -158,6 +168,14 @@ pub const FEEDS: &[Feed] = &[
                 ports: FeedPorts::TwoPort {
                     mktdata: 9001,
                     refdata: 9002,
+                },
+            },
+            // On the wire but in no inventory; its MBO peer is the group's highest-volume
+            // depth publisher. Owner still to be established - do not drop the row.
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9011,
+                    refdata: 9012,
                 },
             },
             FeedPublisher {
@@ -186,18 +204,43 @@ pub const FEEDS: &[Feed] = &[
             },
             FeedPublisher {
                 ports: FeedPorts::TwoPort {
+                    mktdata: 9501,
+                    refdata: 9502,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
                     mktdata: 9601,
                     refdata: 9602,
+                },
+            },
+            // Registry-only: silent across every capture taken so far.
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9701,
+                    refdata: 9702,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9801,
+                    refdata: 9802,
+                },
+            },
+            FeedPublisher {
+                ports: FeedPorts::TwoPort {
+                    mktdata: 9901,
+                    refdata: 9902,
                 },
             },
         ],
         emit_trades: true,
     },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
-    // (paired with the TOB row above). The 10201/10202/10203 block is confirmed against
-    // edge-multicast-ref/docs/hyperliquid.md (mainnet-beta); the other five follow the same
-    // +100-per-publisher scheme, so a block that turns out to be wrong shows up as a permanent
-    // `dz_receiver_up == 0` for that publisher rather than as an error.
+    // (paired with the TOB row above). 10011/10501/10801 were decoded off a live capture;
+    // 10901 is derived from its refdata port (10902 was on the wire) via the canonical layout;
+    // the rest come from the recorder registry. A block that turns out to be wrong shows up as a
+    // permanent `dz_receiver_up == 0` for that publisher rather than as an error.
     // Depth-only: TOB owns this venue's trades.
     Feed {
         venue: "Hyperliquid",
@@ -210,6 +253,14 @@ pub const FEEDS: &[Feed] = &[
                     mktdata: 10001,
                     refdata: 10002,
                     snapshot: 10003,
+                },
+            },
+            // Wire-confirmed. Peer of TOB 9011 (owner still to be established).
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10011,
+                    refdata: 10012,
+                    snapshot: 10013,
                 },
             },
             FeedPublisher {
@@ -240,11 +291,43 @@ pub const FEEDS: &[Feed] = &[
                     snapshot: 10403,
                 },
             },
+            // Wire-confirmed.
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10501,
+                    refdata: 10502,
+                    snapshot: 10503,
+                },
+            },
             FeedPublisher {
                 ports: FeedPorts::ThreePort {
                     mktdata: 10601,
                     refdata: 10602,
                     snapshot: 10603,
+                },
+            },
+            // Registry-only: not yet seen on the wire.
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10701,
+                    refdata: 10702,
+                    snapshot: 10703,
+                },
+            },
+            // Wire-confirmed.
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10801,
+                    refdata: 10802,
+                    snapshot: 10803,
+                },
+            },
+            // Only the refdata port was seen; mktdata/snapshot derived from the block layout.
+            FeedPublisher {
+                ports: FeedPorts::ThreePort {
+                    mktdata: 10901,
+                    refdata: 10902,
+                    snapshot: 10903,
                 },
             },
         ],
@@ -401,27 +484,85 @@ mod tests {
         }
     }
 
-    /// The Hyperliquid fleet mirrors one venue across six publishers on the +100-per-publisher port
-    /// scheme. Pins the count so a dropped row is caught, and pins one known block end-to-end.
+    /// The Hyperliquid fleet mirrors one venue across eleven publishers - six DoubleZero hosts,
+    /// four partners and one unattributed. Pins the count so a dropped row is caught, and pins the
+    /// exact base-port set: the registry previously held only the six in-house hosts, which is the
+    /// bug this list fixes, so "some publishers present" is not a strong enough assertion.
     #[test]
     fn hyperliquid_lists_the_whole_publisher_fleet() {
-        for kind in [FeedKind::TopOfBook, FeedKind::MarketByOrder] {
+        let base_ports = |kind: FeedKind| -> Vec<u16> {
             let f = FEEDS
                 .iter()
                 .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
                 .unwrap();
-            assert_eq!(f.publishers.len(), 6, "{kind:?} publisher count");
+            let mut v: Vec<u16> = f.publishers.iter().map(|p| p.base_port()).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            base_ports(FeedKind::TopOfBook),
+            vec![9001, 9011, 9101, 9201, 9301, 9401, 9501, 9601, 9701, 9801, 9901]
+        );
+        assert_eq!(
+            base_ports(FeedKind::MarketByOrder),
+            vec![10001, 10011, 10101, 10201, 10301, 10401, 10501, 10601, 10701, 10801, 10901]
+        );
+    }
+
+    /// Within a publisher's block the layout is fixed - `refdata = mktdata + 1` and (for
+    /// Market-by-Order) `snapshot = mktdata + 2`. The publisher role enforces this fleet-wide and
+    /// it is the ONLY structural rule left after v0.7 made the base port free-form, so it is what
+    /// an unseen block may be derived from (10901/10903 were derived this way from 10902). A row
+    /// that breaks it is a transcription error, not a new layout.
+    #[test]
+    fn publisher_blocks_use_the_canonical_layout() {
+        for f in FEEDS {
+            for p in f.publishers {
+                let mkt = p.ports.mktdata();
+                assert_eq!(
+                    p.ports.refdata(),
+                    mkt + 1,
+                    "{} {:?} block {mkt}: refdata must be mktdata + 1",
+                    f.venue,
+                    f.kind
+                );
+                if let Some(snap) = p.ports.snapshot() {
+                    assert_eq!(
+                        snap,
+                        mkt + 2,
+                        "{} {:?} block {mkt}: snapshot must be mktdata + 2",
+                        f.venue,
+                        f.kind
+                    );
+                }
+            }
         }
-        let tob = FEEDS
-            .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::TopOfBook)
-            .unwrap();
-        let p = tob
-            .publishers
-            .iter()
-            .find(|p| p.base_port() == 9201)
-            .unwrap();
-        assert_eq!(p.ports.refdata(), 9202);
+    }
+
+    /// Every Top-of-Book publisher has a Market-by-Order peer at the same index offset, so a
+    /// partner onboarded to one feed but forgotten on the other is caught here rather than showing
+    /// up as missing depth in production.
+    #[test]
+    fn every_tob_publisher_has_an_mbo_peer() {
+        let ports = |kind: FeedKind| -> std::collections::HashSet<u16> {
+            FEEDS
+                .iter()
+                .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
+                .unwrap()
+                .publishers
+                .iter()
+                .map(|p| p.base_port())
+                .collect()
+        };
+        // The MBO block sits 1000 above its TOB peer across the whole fleet (9501 -> 10501).
+        let mbo = ports(FeedKind::MarketByOrder);
+        for tob in ports(FeedKind::TopOfBook) {
+            assert!(
+                mbo.contains(&(tob + 1000)),
+                "TOB publisher {tob} has no MBO peer at {}",
+                tob + 1000
+            );
+        }
     }
 
     #[test]
