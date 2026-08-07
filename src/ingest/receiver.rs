@@ -33,6 +33,22 @@ use tracing::{info, warn};
 /// re-resolves the interface and rebinds, so the feed self-heals without an operator restart.
 const IDLE_REJOIN: Duration = Duration::from_secs(30);
 
+/// Ceiling for the escalated idle-rejoin interval (see [`escalate_idle`]).
+const IDLE_REJOIN_MAX: Duration = Duration::from_secs(300);
+
+/// The next idle interval after a rejoin that produced no market data: double, capped at
+/// [`IDLE_REJOIN_MAX`].
+///
+/// A permanently-silent port block - a publisher that retired, or a registry row whose endpoint
+/// never went live - otherwise rebinds its sockets and logs a warn+info pair every 30s for the
+/// life of the process. Escalating cuts that to ~12 rejoins/hour. The socket stays bound while we
+/// wait, so a publisher that comes back is picked up on its first datagram regardless of the
+/// current interval; only the pointless rebind is deferred. The cap keeps a genuinely wedged
+/// socket (a join that landed on the wrong interface) self-healing within a few minutes.
+fn escalate_idle(idle: Duration) -> Duration {
+    idle.saturating_mul(2).min(IDLE_REJOIN_MAX)
+}
+
 /// While waiting for the configured interface to acquire an IPv4, retry this often.
 const IFACE_POLL: Duration = Duration::from_millis(500);
 
@@ -496,6 +512,10 @@ async fn drive<P: FrameProcessor>(
     // past IDLE_REJOIN). Persists across rejoins so the gauge/aggregate is touched only on the edge;
     // the venue-level `status` fires only when `health` reports the VENUE aggregate flipped.
     let mut down = false;
+    // Escalating idle-rejoin interval. Lives outside the rejoin loop so it survives a rebind, and is
+    // reset ONLY by market data actually arriving - resetting it on a successful bind would be a
+    // no-op guard, since binding a dead port succeeds every time.
+    let mut idle = IDLE_REJOIN;
 
     // Per-feed metric handles resolved once (venue is `&'static`); the per-channel datagram counter
     // is resolved per role at bind time below.
@@ -560,10 +580,10 @@ async fn drive<P: FrameProcessor>(
         // market data is wedged - the exact symptom of a join on the wrong interface).
         let mut last_mkt = std::time::Instant::now();
         loop {
-            let remaining = IDLE_REJOIN.saturating_sub(last_mkt.elapsed());
+            let remaining = idle.saturating_sub(last_mkt.elapsed());
             if remaining.is_zero() {
                 warn!(%group, venue, kind = kind_label, publisher = publisher_name,
-                      idle_s = IDLE_REJOIN.as_secs(),
+                      idle_s = idle.as_secs(),
                       "no market data; re-resolving interface and rejoining");
                 idle_rejoin.inc();
                 if !down {
@@ -571,6 +591,7 @@ async fn drive<P: FrameProcessor>(
                     // Only when the venue's LAST up quote receiver goes down is the venue down.
                     reg.set(false, last_mkt.elapsed().as_millis() as u64);
                 }
+                idle = escalate_idle(idle);
                 continue 'rejoin;
             }
 
@@ -584,13 +605,14 @@ async fn drive<P: FrameProcessor>(
                     }
                     Err(_) => {
                         warn!(%group, venue, kind = kind_label, publisher = publisher_name,
-                              idle_s = IDLE_REJOIN.as_secs(),
+                              idle_s = idle.as_secs(),
                               "no market data; re-resolving interface and rejoining");
                         idle_rejoin.inc();
                         if !down {
                             down = true;
                             reg.set(false, last_mkt.elapsed().as_millis() as u64);
                         }
+                        idle = escalate_idle(idle);
                         continue 'rejoin;
                     }
                 };
@@ -598,9 +620,12 @@ async fn drive<P: FrameProcessor>(
             channels[idx].dgrams.inc();
             bytes_ctr.inc_by(n as u64);
 
-            // Reset the liveness watchdog only on the market-data stream; recovery clears `down`.
+            // Reset the liveness watchdog only on the market-data stream; recovery clears `down`
+            // and un-escalates the rejoin interval (this is the only thing that proves the block is
+            // live, so it is the only thing that may reset it).
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
                 last_mkt = std::time::Instant::now();
+                idle = IDLE_REJOIN;
                 if down {
                     down = false;
                     reg.set(true, 0);
@@ -739,6 +764,32 @@ mod tests {
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
         assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);
         assert_eq!(metrics().feed_stale_ms.with_label_values(&[venue]).get(), 0);
+    }
+
+    /// The idle interval doubles per fruitless rejoin and stops at the cap, so a permanently-silent
+    /// block settles at one rejoin per `IDLE_REJOIN_MAX` instead of one per 30s forever. The first
+    /// escalation happens only *after* the first timeout, so a publisher going silent is still
+    /// declared down at the usual 30s.
+    #[test]
+    fn idle_rejoin_escalates_then_caps() {
+        use super::{escalate_idle, Duration, IDLE_REJOIN, IDLE_REJOIN_MAX};
+        let mut idle = IDLE_REJOIN;
+        let mut seen = vec![idle];
+        for _ in 0..8 {
+            idle = escalate_idle(idle);
+            seen.push(idle);
+        }
+        assert_eq!(seen[0], Duration::from_secs(30));
+        assert_eq!(seen[1], Duration::from_secs(60));
+        assert_eq!(seen[2], Duration::from_secs(120));
+        assert_eq!(seen[3], Duration::from_secs(240));
+        // Doubling 240 would overshoot the cap, so it clamps and stays there.
+        assert_eq!(seen[4], IDLE_REJOIN_MAX);
+        assert_eq!(*seen.last().unwrap(), IDLE_REJOIN_MAX);
+        assert!(
+            IDLE_REJOIN_MAX > IDLE_REJOIN,
+            "cap must escalate, not shrink"
+        );
     }
 
     #[test]
