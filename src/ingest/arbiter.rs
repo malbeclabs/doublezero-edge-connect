@@ -514,6 +514,7 @@ struct VenueMetrics {
     depth_ticks_won: [IntCounter; 2],
     quotes_dropped: IntCounter,
     trades_dropped: IntCounter,
+    trades_no_id: IntCounter,
     instruments_dropped: IntCounter,
     quotes_future_rejected: IntCounter,
     quotes_no_source_ts: IntCounter,
@@ -563,6 +564,7 @@ impl VenueMetrics {
             depth_ticks_won: by_pub(&m.depth_ticks_won),
             quotes_dropped: m.quotes_dropped.with_label_values(&[venue]),
             trades_dropped: m.trades_dropped.with_label_values(&[venue]),
+            trades_no_id: m.trades_no_id.with_label_values(&[venue]),
             instruments_dropped: m.instruments_dropped.with_label_values(&[venue]),
             quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
             quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
@@ -750,6 +752,20 @@ impl Arbiter {
                 }
             }
             FeedMessage::Trade(t) => {
+                // `trade_id == 0` is the "no venue trade id" sentinel (a FIX-sourced print has
+                // none). Keying the window on it drops every later print for the key: `0` is
+                // inserted once and never ages out (eviction is by insertion order), so every
+                // subsequent `0` reads as a same-publisher duplicate. Forwarding unkeyed is safe
+                // only while at most one tape emitter runs per venue — a bypassed `0` has no
+                // window to collapse a second copy against.
+                if t.trade_id == 0 {
+                    let vm = self.vm(&t.venue);
+                    vm.trades_no_id.inc();
+                    vm.emit[EMIT_TRADE].inc();
+                    vm.trades_admitted[pub_idx(publisher)].inc();
+                    let _ = self.tx.send(Arc::new(msg));
+                    return;
+                }
                 let key = (t.venue.clone(), t.symbol.clone());
                 let decision = self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns);
                 let vm = self.vm(&t.venue);
@@ -1008,7 +1024,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::{NormalizedQuote, Side};
+    use crate::model::{NormalizedQuote, NormalizedTrade, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
@@ -1107,6 +1123,56 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![7, 8]);
+    }
+
+    fn trade(trade_id: u64) -> NormalizedTrade {
+        NormalizedTrade {
+            venue: "Lashay".into(),
+            symbol: "KXBTCPERP".into(),
+            price: 0.62,
+            size: 100.0,
+            aggressor_side: Side::Buy,
+            trade_id,
+            cumulative_volume: 0.0,
+            source_ts_ns: 1_000,
+            recv_ts_ns: 2_000,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// A FIX-sourced publisher has no venue trade id and stamps every print `trade_id == 0`.
+    /// Keying the window on `0` collapses the tape to a single print forever (`0` is inserted
+    /// once and never evicted), so `0` must mean "no identity" and bypass the window entirely.
+    #[test]
+    fn zero_trade_id_bypasses_the_window() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        for _ in 0..5 {
+            a.emit(FeedMessage::Trade(trade(0)), p);
+        }
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 5, "every zero-id print must be emitted");
+    }
+
+    /// The bypass must not weaken dedup for prints that DO carry an id.
+    #[test]
+    fn nonzero_trade_id_still_dedupes() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        for _ in 0..5 {
+            a.emit(FeedMessage::Trade(trade(77)), p);
+        }
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 1, "a repeated id is still a duplicate");
     }
 
     /// Two byte-for-byte identical quote packets from the *same* multicast publisher collapse to a
