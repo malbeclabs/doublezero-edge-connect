@@ -30,6 +30,8 @@ The wire is full-depth and incremental, so the output is too. Re-serving full st
 
 **Scope: the WebSocket output only.** Multicast decode is untouched on both feeds — same `0x445A`/`0x4444`/`0x4442` codecs, same `book.rs`, same recovery. What changes is what we hand a consumer. Full-state `depth` is deleted and both feeds re-serve as the incremental message in §5, because two output models would mean two shapes, two dedup identities, and a PROTOCOL.md documenting both.
 
+**That is a claim about the *canonical* model, not a cap on how many wire shapes we ever serve.** One normalized product leaves the pipeline; a venue-compatible sink (PR 8) re-renders that stream downstream of it, adding no ingest state, no second dedup identity, and nothing further for `PROTOCOL.md` to specify. Keeping the canonical shape singular is precisely what makes a compatibility sink a rendering rather than a fork.
+
 **The output shape is dictated by what Nautilus takes as input** — see §5 for the message and §6 for the mapping. Both feeds land on `OrderBookDeltas` and differ only in whether a change carries an `order_id`, which is exactly the axis Nautilus uses to distinguish `L2_MBP` from `L3_MBO`.
 
 **MBP outputs `L2_MBP`; MBO outputs `L3_MBO`, never aggregated to L2.** MBP's wire is price-aggregated, so there is no order identity to pass on. MBO's wire is order-level and always has been — `book.rs` already holds `orders: HashMap<u64, RestingOrder>` — and we currently **flatten it on the way out**, aggregating to top-10 price levels before emitting. That throws away precisely what a market-by-order feed exists to deliver. Passing the real `order_id`s through costs nothing at decode time.
@@ -185,6 +187,12 @@ v2 renamed this surface (`subscribe_order_book_deltas` → `subscribe_book_delta
 5. **Incremental output** — `clear` + full set, batch-end discipline; `PROTOCOL.md` v2.
 6. **Lashay feed rows** — the perps TOB group (a `FEEDS` row plus extending the venue→code match in `feeds.rs`'s `every_feed_has_a_group_code`, which panics on an unknown venue) and the perps MBP group. Both group codes come from the deployment config; this doc does not restate them.
 7. **MBO migration** — Hyperliquid onto the incremental output as a true `L3_MBO` book; delete `depth` and `DEPTH_LEVELS`. Needs its own design doc first (§2.2).
+8. **Venue-compatible output sinks** — one `sinks/` module per venue, re-rendering the canonical stream into that venue's own WebSocket API, so a trading system already speaking a venue's API moves onto the edge feed by **changing a URL rather than writing an adapter**. Purely additive: no change to the canonical surface in §5, no new ingest state, no second dedup identity. Needs its own design doc first, and deliberately does **not** land as one PR — its pieces unblock at different times, and sequencing them by dependency is the point:
+   - **The sink framework** — several sinks bound on distinct ports, one serializer per sink, a `sink` metric label rather than forked metric families. Depends on nothing in this stack; can start immediately.
+   - **Lashay-compatible** (`orderbook_delta`, `ticker`, `trade`) — depends on **PR 5** only, so it is reachable on this stack's runway.
+   - **Hyperliquid-compatible** — `bbo` and `trades` map against today's output; `l2Book` with real `nSigFigs`/`mantissa`/`nLevels` support, and `l4Book`, are full-depth and order-level respectively, so both depend on **PR 7**.
+
+   The dependency worth stating plainly: **every "URL change, not an adapter" promise for Hyperliquid order-level data resolves to PR 7.** It is the same gate a consumer asking for full depth today runs into, not a second piece of work.
 
 1 and 2 are the prerequisites and depend on nothing shipping upstream.
 
