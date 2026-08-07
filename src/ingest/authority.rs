@@ -3,87 +3,129 @@
 //! `Coordinated` arbitration (`arbiter::StalenessFloor`) buckets two copies on a venue-assigned
 //! coordinate and re-latches the leader every tick. That needs a coordinate the arms share. A
 //! FIX-sourced arm and a WS-sourced arm of one venue have none, and a content hash cannot
-//! substitute: the cross-arm-common fields of a level update reduce to `(side, price, quantity)`,
+//! substitute: the cross-arm-common fields of a *level update* reduce to `(side, price, quantity)`,
 //! which recurs constantly on a coarse bounded price grid.
 //!
-//! So: per market, exactly one arm is authoritative and its stream is published verbatim; the other
-//! is ingested and discarded. Authority transfers on a health verdict, on silence, or on a
-//! sustained speed margin — never on a single faster message, because flapping authority
-//! re-baselines every consumer's book.
+//! So: exactly one arm is authoritative and its stream is published verbatim; the other is ingested
+//! and discarded. **Authority is per instrument on the wire, never per level** — interleaving two
+//! arms' deltas corrupts the book while every per-arm sequence check still passes.
 //!
-//! **Authority is per instrument, never per level.** Interleaving two arms' deltas corrupts the
-//! book while every per-arm sequence check still passes.
+//! # What is scoped where
+//!
+//! Latency is a property of an *arm*, not of a market: every message from a source IP is evidence
+//! about that arm, whatever market carried it. The three transfer triggers therefore sit at two
+//! grains, and confusing them produces the two failures this module is shaped to avoid.
+//!
+//! * **Speed** — per arm, venue-wide. Pooled evidence, one verdict per venue per window
+//!   ([`StickyAuthority::close_window`]). Splitting it per market splits the evidence as finely as it
+//!   can be split, and across 1,200 sleepy markets that is no evidence at all.
+//! * **Silence** — per arm, venue-wide. An arm is live or it is not. Scoping silence per market is a
+//!   *bug*: a market quieter than `leader_timeout` makes every challenger message read as leader
+//!   silence, so authority ping-pongs on every update and re-baselines the consumer's book each time.
+//! * **Health** — per market, and it has to stay there. An arm can be `Synced` on 1,200 markets and
+//!   `Gap` on one. A venue-wide health rule would either hand the whole venue over for one bad book
+//!   or keep serving that book, and under incremental output a lost level does not self-heal until
+//!   the next snapshot.
+//!
+//! Health is an **override**, computed from health and the venue leader rather than stored: a market
+//! whose venue leader is unhealthy is served by a healthy arm, and reverts on its own when the
+//! leader's book recovers. Nothing to unwind, and no second authority to keep in sync.
+//!
+//! # Bounding
+//!
+//! The multicast source is unauthenticated and a [`Publisher`] is a spoofable source IP, so **only
+//! arms holding a metric ordinal are eligible**: past [`MAX_LABELLED_ARMS`] a publisher is neither
+//! recorded nor ever authoritative. The cap that existed to bound the metric label set bounds
+//! admission too, which keeps the per-arm state from growing under a forged flood. Real deployments
+//! run two arms.
+//!
+//! What stays keyed on wire-supplied `(channel_id, instrument_id)` is per-market health and the
+//! last-admitted arm. The caller must only [`StickyAuthority::admit`] an instrument that already
+//! resolves to a definition and a book, which bounds those transitively by the processor's own book
+//! cap — a precondition the caller owns, not one this module can enforce.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::ingest::arbiter::{Admit, Publisher};
 
-/// The published market key: venue plus the wire identity pair. Deliberately excludes the arm, so
-/// both arms resolve to one entry and arbitrate against each other.
+/// The published market key: venue plus the wire identity pair.
 pub type MarketKey = (Arc<str>, u32, u32);
 
-/// Cap on distinct arms given a stable metric ordinal per venue. The source IP is unauthenticated
-/// and spoofable, so ordinals are handed out first-come and anything past the cap collapses to
-/// `"other"` — unrecorded, so a forged-source flood grows neither the label set nor the map. Real
-/// deployments run two arms.
+/// Cap on distinct arms per venue. Doubles as the admission bound — see the module doc.
 const MAX_LABELLED_ARMS: usize = 8;
 
 const ARM_LABELS: [&str; MAX_LABELLED_ARMS] = [
     "arm0", "arm1", "arm2", "arm3", "arm4", "arm5", "arm6", "arm7",
 ];
 
-/// Tunables for [`StickyAuthority`], all CLI-settable (`--arb-*`). Read the two transfer conditions
-/// off `dz_arm_lead_ns` and `dz_arm_authority_transfers_total`: a sustained transfer rate means they
-/// are too loose; a leader whose `dz_arm_lead_ns{winner="challenger"}` sits persistently past the
-/// margin with no transfer means they are too tight.
+/// Returned for an arm past [`MAX_LABELLED_ARMS`]: unlabelled, unrecorded, never authoritative.
+pub const OTHER_ARM: &str = "other";
+
+/// Cap on matched-lead samples retained per arm per window. Overflow is head-biased — an arm busy
+/// enough to hit it decides on the window's first 4096 matches — so the cap sits well above what the
+/// margin test needs rather than being a tight bound.
+const MAX_WINDOW_SAMPLES: usize = 4096;
+
+/// Tunables for [`StickyAuthority`], all CLI-settable (`--arb-*`).
 #[derive(Debug, Clone, Copy)]
 pub struct AuthorityConfig {
     pub leader_timeout_ns: u64,
     pub sample_interval_ns: u64,
     /// The challenger must beat the leader by at least this much on median to transfer.
     pub transfer_margin_ns: u64,
-    /// ...and lead in at least this fraction of the window's contested samples.
+    /// ...and lead in at least this fraction of its own matched samples.
     pub transfer_win_rate: f64,
+    /// Matched samples an arm needs before its window is judged at all. Without a floor a single
+    /// match transfers a venue, which is the opposite of sticky.
+    pub min_window_samples: usize,
 }
 
-/// Cap on samples retained per market per window. Overflow is head-biased — a market busy enough to
-/// hit it decides on the window's first 4096 contests — which is why the cap is two orders above
-/// what the margin test needs rather than a tight bound.
-const MAX_WINDOW_SAMPLES: usize = 4096;
+/// Per-arm state within a venue.
+#[derive(Default)]
+struct Arm {
+    /// Arrival of this arm's most recent message anywhere in the venue — the silence clock.
+    last_seen_ns: u64,
+    /// Signed matched leads for the open window: negative when this arm beat the leader.
+    samples: Vec<i64>,
+}
 
-/// Per-market authority state.
-struct Held {
+/// Per-venue authority.
+struct VenueState {
     leader: Publisher,
-    /// Arrival of the leader's most recent admitted message — the baseline a challenger's arrival
-    /// is measured against, and the silence clock.
-    leader_arrival_ns: u64,
-    /// Set once a challenger has been reported since the leader's last message, so a challenger
-    /// burst yields one contest sample rather than inflating the histogram.
-    contest_recorded: bool,
-    /// Signed leads for the open window: positive when the leader was ahead of the challenger's
-    /// copy, negative when the challenger was.
-    samples: Vec<(Publisher, i64)>,
+    arms: HashMap<Publisher, Arm>,
     window_opened_ns: u64,
 }
 
-impl Held {
-    /// Hand the market to `leader`. Every sample in the open window was measured against the
-    /// outgoing leader's clock, so a new leader always starts a new window — judging it on the
-    /// predecessor's evidence is how a health transfer gets undone at the next close.
+impl VenueState {
+    /// Hand the venue to `leader`. Every sample in the open window was measured against the outgoing
+    /// leader, so a handover always starts a new window — judging a new leader on its predecessor's
+    /// evidence is how a transfer gets undone at the next close.
     fn take_authority(&mut self, leader: Publisher, arrival_ns: u64) {
         self.leader = leader;
-        self.leader_arrival_ns = arrival_ns;
-        self.contest_recorded = false;
-        self.samples.clear();
         self.window_opened_ns = arrival_ns;
+        for arm in self.arms.values_mut() {
+            arm.samples.clear();
+        }
     }
 }
 
+/// Per-market state. Health and the last-admitted arm only; authority itself is venue-wide.
+#[derive(Default)]
+struct MarketState {
+    /// Arms known unhealthy here (`gap`/`awaiting-snapshot`). Absent means healthy, so a market whose
+    /// processor does not report health still gets served.
+    unhealthy: HashSet<Publisher>,
+    /// Who was last admitted here, so `opened_tick` marks a real change of served arm rather than
+    /// every leader message.
+    last_admitted: Option<Publisher>,
+}
+
 pub struct StickyAuthority {
-    held: HashMap<MarketKey, Held>,
-    /// Per `(market, arm)` health. Absent means healthy: an arm that has never reported is presumed
-    /// usable, so a market whose processor does not track health still elects a leader.
-    health: HashMap<(MarketKey, Publisher), bool>,
+    venues: HashMap<Arc<str>, VenueState>,
+    markets: HashMap<MarketKey, MarketState>,
     ordinals: HashMap<(String, Publisher), &'static str>,
     ordinal_counts: HashMap<String, usize>,
     cfg: AuthorityConfig,
@@ -92,94 +134,93 @@ pub struct StickyAuthority {
 impl StickyAuthority {
     pub fn new(cfg: AuthorityConfig) -> Self {
         Self {
-            held: HashMap::new(),
-            health: HashMap::new(),
+            venues: HashMap::new(),
+            markets: HashMap::new(),
             ordinals: HashMap::new(),
             ordinal_counts: HashMap::new(),
             cfg,
         }
     }
 
-    fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
-        self.health
-            .get(&(key.clone(), publisher))
-            .copied()
-            .unwrap_or(true)
-    }
-
     /// Record an arm's book health for one market. `false` means `gap`/`awaiting-snapshot`; the
     /// processor calls this on every state transition.
     pub fn set_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
-        self.health.insert((key.clone(), publisher), healthy);
+        let m = self.markets.entry(key.clone()).or_default();
+        if healthy {
+            m.unhealthy.remove(&publisher);
+        } else {
+            m.unhealthy.insert(publisher);
+        }
+    }
+
+    fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
+        self.markets
+            .get(key)
+            .is_none_or(|m| !m.unhealthy.contains(&publisher))
     }
 
     /// The admission decision for one message from `publisher` on `key`.
     ///
     /// `arrival_ns` is the host receive clock (`recv_ts_ns`) and must be the same clock
-    /// [`Self::close_window`] is driven on — it is both the silence baseline and the sampling
-    /// coordinate. Never pass the `kernel_rx_ts_ns` sentinel: a `0` leader baseline reads as
-    /// `now - 0` of silence and hands the market to the next challenger.
+    /// [`Self::close_window`] is driven on — it is the silence baseline. Never pass the
+    /// `kernel_rx_ts_ns` sentinel: a `0` baseline reads as unbounded silence.
     pub fn admit(
         &mut self,
         key: MarketKey,
         publisher: Publisher,
         arrival_ns: u64,
     ) -> Admit<Publisher> {
-        let challenger_healthy = self.healthy(&key, publisher);
-        // Computed before the match: `healthy()` borrows `self` immutably, the match arm below
-        // holds a mutable borrow.
-        let leader_unhealthy = self
-            .held
-            .get(&key)
-            .is_some_and(|h| !self.healthy(&key, h.leader));
-        let leader_timeout_ns = self.cfg.leader_timeout_ns;
-        match self.held.get_mut(&key) {
-            None => {
-                // No dark start: the first arm to deliver is provisionally authoritative even
-                // before it has reported health.
-                self.held.insert(
-                    key,
-                    Held {
-                        leader: publisher,
-                        leader_arrival_ns: arrival_ns,
-                        contest_recorded: false,
-                        samples: Vec::new(),
-                        window_opened_ns: arrival_ns,
-                    },
-                );
-                Admit::Emitted { opened_tick: true }
-            }
-            Some(h) if h.leader == publisher => {
-                h.leader_arrival_ns = arrival_ns;
-                h.contest_recorded = false;
-                Admit::Emitted { opened_tick: false }
-            }
-            Some(h) => {
-                let leader = h.leader;
-                let silent = arrival_ns.saturating_sub(h.leader_arrival_ns) > leader_timeout_ns;
-                if challenger_healthy && (leader_unhealthy || silent) {
-                    h.take_authority(publisher, arrival_ns);
-                    return Admit::Emitted { opened_tick: true };
-                }
-                if h.contest_recorded {
-                    Admit::Dropped
-                } else {
-                    h.contest_recorded = true;
-                    Admit::Contest {
-                        winner: leader,
-                        lead_ns: arrival_ns.saturating_sub(h.leader_arrival_ns),
-                    }
-                }
-            }
+        // Ineligible arms enter no map and are never authoritative (see the module doc).
+        if self.arm_ordinal(&key.0, publisher) == OTHER_ARM {
+            return Admit::Dropped;
         }
+        let timeout = self.cfg.leader_timeout_ns;
+
+        let Some(venue) = self.venues.get_mut(&key.0) else {
+            // No dark start: the first eligible arm to deliver is provisionally authoritative.
+            let arms = HashMap::from([(
+                publisher,
+                Arm {
+                    last_seen_ns: arrival_ns,
+                    samples: Vec::new(),
+                },
+            )]);
+            self.venues.insert(
+                key.0.clone(),
+                VenueState {
+                    leader: publisher,
+                    arms,
+                    window_opened_ns: arrival_ns,
+                },
+            );
+            self.markets.entry(key).or_default().last_admitted = Some(publisher);
+            return Admit::Emitted { opened_tick: true };
+        };
+        venue.arms.entry(publisher).or_default().last_seen_ns = arrival_ns;
+        // Silence is measured against the leader's last message ANYWHERE in the venue, not against
+        // this market's: a quiet market is not a dead arm.
+        let leader_last = venue.arms.get(&venue.leader).map_or(0, |a| a.last_seen_ns);
+        if venue.leader != publisher && arrival_ns.saturating_sub(leader_last) > timeout {
+            venue.take_authority(publisher, arrival_ns);
+        }
+        // Then the per-market health override. One definition of "who serves this market", shared
+        // with `leader_of` and the gauge — computing it a second time here is how the unhealthy
+        // leader ends up re-authorising itself when it is the arm sending.
+        if self.serving(&key) != Some(publisher) {
+            return Admit::Dropped;
+        }
+        let m = self.markets.entry(key).or_default();
+        let opened_tick = m.last_admitted != Some(publisher);
+        m.last_admitted = Some(publisher);
+        Admit::Emitted { opened_tick }
     }
 
-    /// Force authority for one market, returning whether it moved. Task 5's margin path; health and
-    /// silence transfers go through [`Self::admit`].
-    pub fn transfer_to(&mut self, key: &MarketKey, publisher: Publisher, arrival_ns: u64) -> bool {
-        match self.held.get_mut(key) {
-            Some(h) if h.leader != publisher => {
-                h.take_authority(publisher, arrival_ns);
+    /// Force venue authority, returning whether it moved. The margin path; silence goes through
+    /// [`Self::admit`] and health is an override rather than a transfer.
+    pub fn transfer_venue_to(&mut self, venue: &str, to: Publisher, at_ns: u64) -> bool {
+        match self.venues.get_mut(venue) {
+            Some(v) if v.leader != to => {
+                v.take_authority(to, at_ns);
                 true
             }
             _ => false,
@@ -187,16 +228,15 @@ impl StickyAuthority {
     }
 
     /// A stable, bounded metric label for an arm within a venue, so a spoofable source IP never
-    /// becomes a label value. The ordinal-to-IP mapping is logged once, on first sight.
+    /// becomes a label value. Past the cap returns [`OTHER_ARM`] and records nothing — which is also
+    /// what makes that arm ineligible. The mapping is logged once, on first sight.
     pub fn arm_ordinal(&mut self, venue: &str, publisher: Publisher) -> &'static str {
         if let Some(&label) = self.ordinals.get(&(venue.to_string(), publisher)) {
             return label;
         }
         let n = self.ordinal_counts.entry(venue.to_string()).or_insert(0);
-        // Past the cap nothing is recorded: a forged-source flood must not grow the map behind the
-        // label set it already cannot grow.
         let Some(&label) = ARM_LABELS.get(*n) else {
-            return "other";
+            return OTHER_ARM;
         };
         *n += 1;
         self.ordinals.insert((venue.to_string(), publisher), label);
@@ -204,78 +244,122 @@ impl StickyAuthority {
         label
     }
 
-    /// How many of `venue`'s markets `publisher` holds — the gauge an operator reads to see which
-    /// arm is live and whether the venue is split.
+    /// The venue-wide leader, before any per-market health override.
+    pub fn venue_leader(&self, venue: &str) -> Option<Publisher> {
+        self.venues.get(venue).map(|v| v.leader)
+    }
+
+    /// The arm actually serving one market: the venue leader, or a healthy arm overriding it when the
+    /// leader's book here is not. `None` only when the venue has no leader yet.
+    ///
+    /// The alternative is chosen by most-recently-live rather than by map order, so two arms cannot
+    /// be picked differently on two calls with the same state.
+    fn serving(&self, key: &MarketKey) -> Option<Publisher> {
+        let leader = self.venue_leader(&key.0)?;
+        if self.healthy(key, leader) {
+            return Some(leader);
+        }
+        let arms = &self.venues.get(&key.0)?.arms;
+        Some(
+            arms.iter()
+                .filter(|(a, _)| **a != leader && self.healthy(key, **a))
+                .max_by_key(|(_, arm)| arm.last_seen_ns)
+                .map_or(leader, |(a, _)| *a),
+        )
+    }
+
+    /// The arm actually serving one market — the venue leader, or a healthy arm overriding it.
+    pub fn leader_of(&self, key: &MarketKey) -> Option<Publisher> {
+        self.serving(key)
+    }
+
+    /// How many of `venue`'s markets `publisher` currently serves — the gauge showing which arm is
+    /// live and whether health overrides have fragmented the venue. **O(markets)**: call it on a
+    /// metrics tick, never per message.
     pub fn markets_held(&self, venue: &str, publisher: Publisher) -> usize {
-        self.held
-            .iter()
-            .filter(|((v, _, _), h)| v.as_ref() == venue && h.leader == publisher)
+        self.markets
+            .keys()
+            .filter(|k| k.0.as_ref() == venue)
+            .filter(|k| self.leader_of(k) == Some(publisher))
             .count()
     }
 
-    /// Record a challenger's arrival against the leader's most recent message. The arbiter calls
-    /// this on every `Contest`, so the sampler sees exactly the head-to-heads the histogram reports.
-    /// `arrival_ns` is on [`Self::admit`]'s clock.
-    pub fn observe_challenger(&mut self, key: &MarketKey, challenger: Publisher, arrival_ns: u64) {
-        if let Some(h) = self.held.get_mut(key) {
-            if h.samples.len() < MAX_WINDOW_SAMPLES {
-                let lead = arrival_ns as i64 - h.leader_arrival_ns as i64;
-                h.samples.push((challenger, lead));
-            }
+    /// Record one matched cross-arm lead for `arm` on `venue`: **negative** when `arm` beat the
+    /// authoritative arm's copy of the same event. Pooled per arm across every market, because
+    /// latency is an arm property.
+    ///
+    /// The caller pairs the two arms' copies of the same **trade** and diffs its own receive clock.
+    /// Never derive this from `Admit::Contest`'s `lead_ns`: that is inter-arm *phase* — the interval
+    /// to the leader's previous, unrelated message — and is structurally non-negative, so a
+    /// challenger could never win.
+    pub fn observe_matched_lead(&mut self, venue: &str, arm: Publisher, lead_ns: i64) {
+        // Eligibility first, so an entry created here is bounded exactly as `admit`'s is.
+        if self.arm_ordinal(venue, arm) == OTHER_ARM {
+            return;
+        }
+        let Some(v) = self.venues.get_mut(venue) else {
+            return;
+        };
+        if arm == v.leader {
+            return; // the leader does not compete with itself
+        }
+        // `or_default`, not `get_mut`: a matched lead is evidence about an arm whether or not
+        // `admit` has seen it yet, and silently discarding it would leave the sampler dependent on
+        // the order the two paths happen to fire in.
+        let a = v.arms.entry(arm).or_default();
+        if a.samples.len() < MAX_WINDOW_SAMPLES {
+            a.samples.push(lead_ns);
         }
     }
 
-    /// Close every elapsed sampling window, transferring authority where a challenger cleared BOTH
-    /// conditions and is healthy. Returns the markets that moved, so the caller counts
+    /// Close every elapsed sampling window, transferring venue authority where a challenger cleared
+    /// every condition. Returns the venues that moved, so the caller counts
     /// `dz_arm_authority_transfers_total{reason="margin"}`. `now_ns` is on [`Self::admit`]'s clock.
-    pub fn close_window(&mut self, now_ns: u64) -> Vec<(MarketKey, Publisher)> {
+    pub fn close_window(&mut self, now_ns: u64) -> Vec<(Arc<str>, Publisher)> {
         // Saturate rather than cast: a `transfer_margin_ns` past `i64::MAX` would wrap negative and
         // invert both conditions, making every window transfer.
         let margin = i64::try_from(self.cfg.transfer_margin_ns).unwrap_or(i64::MAX);
-        let (rate, interval) = (self.cfg.transfer_win_rate, self.cfg.sample_interval_ns);
+        let cfg = self.cfg;
         let mut moved = Vec::new();
-        for (key, h) in self.held.iter_mut() {
-            if now_ns.saturating_sub(h.window_opened_ns) < interval {
+        for (venue, v) in self.venues.iter_mut() {
+            if now_ns.saturating_sub(v.window_opened_ns) < cfg.sample_interval_ns {
                 continue;
             }
-            let winner = best_challenger(&h.samples, margin, rate);
-            h.samples.clear();
-            h.window_opened_ns = now_ns;
+            let winner = best_challenger(&v.arms, v.leader, margin, &cfg);
+            for arm in v.arms.values_mut() {
+                arm.samples.clear();
+            }
+            v.window_opened_ns = now_ns;
             if let Some(c) = winner {
-                if c != h.leader {
-                    moved.push((key.clone(), c));
-                }
+                moved.push((venue.clone(), c));
             }
         }
-        // Same health gate `admit` applies: a faster arm sitting in `gap`/`awaiting-snapshot` must
-        // not win the market back, or the margin path undoes the health transfer that saved it.
-        moved.retain(|(key, c)| self.healthy(key, *c));
-        for (key, c) in &moved {
-            self.transfer_to(key, *c, now_ns);
+        for (venue, c) in &moved {
+            self.transfer_venue_to(venue, *c, now_ns);
         }
         moved
     }
-
-    /// The current leader for a market, or `None` if none has been elected.
-    pub fn leader_of(&self, key: &MarketKey) -> Option<Publisher> {
-        self.held.get(key).map(|h| h.leader)
-    }
 }
 
-/// The challenger that beat the leader by at least `margin` on median AND led at least `rate` of
-/// its own samples. `None` when none cleared both — the ordinary case, and why authority is sticky
-/// rather than raced.
-fn best_challenger(samples: &[(Publisher, i64)], margin: i64, rate: f64) -> Option<Publisher> {
-    let mut by_arm: HashMap<Publisher, Vec<i64>> = HashMap::new();
-    for &(p, lead) in samples {
-        by_arm.entry(p).or_default().push(lead);
-    }
+/// The challenger that beat the leader by at least `margin` on median AND led at least
+/// `transfer_win_rate` of its own samples AND supplied at least `min_window_samples` of them.
+/// `None` when none cleared all three — the ordinary case, and why authority is sticky.
+fn best_challenger(
+    arms: &HashMap<Publisher, Arm>,
+    leader: Publisher,
+    margin: i64,
+    cfg: &AuthorityConfig,
+) -> Option<Publisher> {
     let mut best: Option<(Publisher, i64)> = None;
-    for (p, mut leads) in by_arm {
-        let wins = leads.iter().filter(|&&l| l < -margin).count();
-        if leads.is_empty() || (wins as f64) / (leads.len() as f64) < rate {
+    for (&p, arm) in arms {
+        if p == leader || arm.samples.len() < cfg.min_window_samples.max(1) {
             continue;
         }
+        let wins = arm.samples.iter().filter(|&&l| l < -margin).count();
+        if (wins as f64) / (arm.samples.len() as f64) < cfg.transfer_win_rate {
+            continue;
+        }
+        let mut leads = arm.samples.clone();
         leads.sort_unstable();
         let median = leads[leads.len() / 2];
         if median > -margin {
@@ -297,34 +381,39 @@ mod tests {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
-    fn key() -> MarketKey {
-        ("Lashay".into(), 2, 41)
-    }
-
+    const VENUE: &str = "Lashay";
     const TIMEOUT: u64 = 2_000_000_000; // 2s
 
-    /// Health and silence rules only: `u64::MAX` keeps every sampling window open, so no margin
-    /// transfer can fire mid-test.
+    fn key() -> MarketKey {
+        (VENUE.into(), 2, 41)
+    }
+
+    fn other_market() -> MarketKey {
+        (VENUE.into(), 2, 42)
+    }
+
+    /// Silence and health rules only: `u64::MAX` holds every window open so no margin transfer can
+    /// fire mid-test.
     fn no_window_cfg() -> AuthorityConfig {
         AuthorityConfig {
             leader_timeout_ns: TIMEOUT,
             sample_interval_ns: u64::MAX,
-            transfer_margin_ns: 1_000,
+            transfer_margin_ns: 1_000, // 1us
             transfer_win_rate: 0.8,
+            min_window_samples: 5,
         }
     }
 
     fn cfg() -> AuthorityConfig {
         AuthorityConfig {
-            leader_timeout_ns: TIMEOUT,
             sample_interval_ns: 1_000_000, // 1ms window keeps the tests fast
-            transfer_margin_ns: 1_000,     // 1us
-            transfer_win_rate: 0.8,
+            ..no_window_cfg()
         }
     }
 
-    /// The first arm to deliver a usable book is provisionally authoritative, so there is no dark
-    /// start while the election window is open.
+    // ---- venue-wide election ----
+
+    /// The first eligible arm to deliver is provisionally authoritative, so there is no dark start.
     #[test]
     fn first_arm_takes_authority() {
         let mut a = StickyAuthority::new(no_window_cfg());
@@ -332,10 +421,11 @@ mod tests {
             a.admit(key(), arm(1), 1_000),
             Admit::Emitted { opened_tick: true }
         );
+        assert_eq!(a.venue_leader(VENUE), Some(arm(1)));
     }
 
-    /// `opened_tick` marks an authority TRANSFER, not every leader message — so the
-    /// `*_ticks_won_total` family keeps meaning "took the key" in both modes.
+    /// `opened_tick` marks a change of served arm, not every leader message, so the
+    /// `*_ticks_won_total` family keeps meaning "took the key".
     #[test]
     fn leader_keeps_emitting_without_reopening() {
         let mut a = StickyAuthority::new(no_window_cfg());
@@ -346,59 +436,25 @@ mod tests {
         );
     }
 
-    /// The non-authoritative arm is dropped, and the first drop after each leader message reports
-    /// the head-to-head lead, so Task 5's sampler has one sample per leader message rather than one
-    /// per challenger burst.
     #[test]
-    fn challenger_is_dropped_and_reports_the_lead_once() {
+    fn the_non_authoritative_arm_is_dropped() {
         let mut a = StickyAuthority::new(no_window_cfg());
         a.admit(key(), arm(1), 1_000);
-        assert_eq!(
-            a.admit(key(), arm(2), 1_400),
-            Admit::Contest {
-                winner: arm(1),
-                lead_ns: 400
-            }
-        );
+        assert_eq!(a.admit(key(), arm(2), 1_400), Admit::Dropped);
         assert_eq!(a.admit(key(), arm(2), 1_500), Admit::Dropped);
-        a.admit(key(), arm(1), 2_000);
-        assert_eq!(
-            a.admit(key(), arm(2), 2_300),
-            Admit::Contest {
-                winner: arm(1),
-                lead_ns: 300
-            }
-        );
     }
 
-    /// A leader in `gap`/`awaiting-snapshot` yields to a healthy challenger: under incremental
-    /// output a lost level does not self-heal until the next snapshot, so holding authority through
-    /// a gap serves a knowingly-wrong book.
+    /// Authority is venue-wide: winning it serves every market, including one the leader has never
+    /// sent for.
     #[test]
-    fn unhealthy_leader_yields_to_a_healthy_challenger() {
+    fn authority_is_venue_wide_not_per_market() {
         let mut a = StickyAuthority::new(no_window_cfg());
         a.admit(key(), arm(1), 1_000);
-        a.set_health(&key(), arm(1), false);
-        assert_eq!(
-            a.admit(key(), arm(2), 1_100),
-            Admit::Emitted { opened_tick: true }
-        );
-        assert!(
-            !a.admit(key(), arm(1), 1_200).emitted(),
-            "authority actually moved"
-        );
+        assert_eq!(a.admit(other_market(), arm(2), 1_100), Admit::Dropped);
+        assert!(a.admit(other_market(), arm(1), 1_200).emitted());
     }
 
-    /// An unhealthy challenger must not take over from an unhealthy leader — that flaps between two
-    /// broken arms, re-baselining every consumer on each flip and fixing nothing.
-    #[test]
-    fn unhealthy_challenger_does_not_take_over() {
-        let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.set_health(&key(), arm(1), false);
-        a.set_health(&key(), arm(2), false);
-        assert!(!a.admit(key(), arm(2), 1_100).emitted());
-    }
+    // ---- silence: venue-wide, and the idle-market bug it fixes ----
 
     #[test]
     fn silent_leader_times_out() {
@@ -408,172 +464,258 @@ mod tests {
             !a.admit(key(), arm(2), 1_000 + TIMEOUT).emitted(),
             "not yet past"
         );
-        assert_eq!(
-            a.admit(key(), arm(2), 1_001 + TIMEOUT),
-            Admit::Emitted { opened_tick: true }
-        );
+        assert!(a.admit(key(), arm(2), 1_001 + TIMEOUT).emitted());
+        assert_eq!(a.venue_leader(VENUE), Some(arm(2)));
     }
 
+    /// **The bug venue-wide silence exists to fix.** With the clock scoped per market it only
+    /// advanced when the leader sent *for that market*, so any market quieter than `leader_timeout`
+    /// handed authority back and forth on every update. On the live sports feed 93 of 1,239
+    /// instruments saw any update at all in 39s, so nearly every update would have been a transfer,
+    /// each one re-baselining the consumer's book. The leader staying busy elsewhere in the venue is
+    /// what makes it not silent.
     #[test]
-    fn authority_is_per_market() {
+    fn an_idle_market_does_not_flap_while_the_leader_is_busy_elsewhere() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        let other: MarketKey = ("Lashay".into(), 2, 42);
+        let idle = other_market();
         a.admit(key(), arm(1), 1_000);
-        a.admit(other.clone(), arm(2), 1_000);
-        assert!(!a.admit(key(), arm(2), 1_100).emitted());
-        assert!(a.admit(other, arm(2), 1_100).emitted());
+        let mut transfers = 0;
+        // Ten updates on the idle market an hour apart, while arm(1) streams the busy one.
+        for i in 1..=10u64 {
+            let t = 1_000 + i * 3_600_000_000_000;
+            a.admit(key(), arm(1), t - 1); // the leader is alive, on another market
+            if a.admit(idle.clone(), arm(2), t).emitted() {
+                transfers += 1;
+            }
+        }
+        assert_eq!(transfers, 0, "a quiet market must not transfer authority");
+        assert_eq!(a.venue_leader(VENUE), Some(arm(1)));
     }
 
-    /// Arm ordinals are stable per venue, bounded, and never expose a spoofable source IP as a
-    /// metric label.
+    /// ...but a leader that goes quiet across the whole venue still yields.
+    #[test]
+    fn a_leader_silent_venue_wide_still_yields() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), arm(1), 1_000);
+        assert!(a
+            .admit(other_market(), arm(2), 1_000 + TIMEOUT * 2)
+            .emitted());
+        assert_eq!(a.venue_leader(VENUE), Some(arm(2)));
+    }
+
+    // ---- health: per market, an override rather than a transfer ----
+
+    /// A market whose venue leader is gapped is served by a healthy arm — that market only. Under
+    /// incremental output a lost level does not self-heal until the next snapshot, so holding it
+    /// would serve a knowingly-wrong book.
+    #[test]
+    fn an_unhealthy_leader_yields_one_market_not_the_venue() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), arm(1), 1_000);
+        a.admit(other_market(), arm(1), 1_000);
+        a.set_health(&key(), arm(1), false);
+
+        assert!(
+            a.admit(key(), arm(2), 1_100).emitted(),
+            "the bad market moves"
+        );
+        assert_eq!(a.admit(key(), arm(1), 1_200), Admit::Dropped);
+        // The venue, and every other market, is untouched.
+        assert_eq!(a.venue_leader(VENUE), Some(arm(1)));
+        assert!(a.admit(other_market(), arm(1), 1_300).emitted());
+        assert_eq!(a.admit(other_market(), arm(2), 1_350), Admit::Dropped);
+    }
+
+    /// The override reverts on its own when the leader's book recovers — it is computed, not stored.
+    #[test]
+    fn the_override_reverts_when_the_leaders_book_recovers() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), arm(1), 1_000);
+        a.set_health(&key(), arm(1), false);
+        assert!(a.admit(key(), arm(2), 1_100).emitted());
+        a.set_health(&key(), arm(1), true);
+        assert!(
+            a.admit(key(), arm(1), 1_200).emitted(),
+            "back to the leader"
+        );
+        assert_eq!(a.admit(key(), arm(2), 1_250), Admit::Dropped);
+    }
+
+    /// An unhealthy challenger must not take over from an unhealthy leader — that flaps between two
+    /// broken books, re-baselining the consumer on each flip and fixing nothing.
+    #[test]
+    fn an_unhealthy_challenger_does_not_get_the_override() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), arm(1), 1_000);
+        a.set_health(&key(), arm(1), false);
+        a.set_health(&key(), arm(2), false);
+        assert_eq!(a.admit(key(), arm(2), 1_100), Admit::Dropped);
+    }
+
+    // ---- arm eligibility and labelling ----
+
+    /// Ordinals are stable per venue, bounded, and never expose a spoofable source IP as a label.
     #[test]
     fn arm_ordinals_are_stable_and_bounded() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        assert_eq!(a.arm_ordinal("Lashay", arm(1)), "arm0");
-        assert_eq!(a.arm_ordinal("Lashay", arm(2)), "arm1");
-        assert_eq!(a.arm_ordinal("Lashay", arm(1)), "arm0", "stable");
+        assert_eq!(a.arm_ordinal(VENUE, arm(1)), "arm0");
+        assert_eq!(a.arm_ordinal(VENUE, arm(2)), "arm1");
+        assert_eq!(a.arm_ordinal(VENUE, arm(1)), "arm0", "stable");
         assert_eq!(a.arm_ordinal("Other", arm(9)), "arm0", "per venue");
         for n in 3..=8 {
-            a.arm_ordinal("Lashay", arm(n));
+            a.arm_ordinal(VENUE, arm(n));
         }
-        assert_eq!(a.arm_ordinal("Lashay", arm(200)), "other", "cap holds");
+        assert_eq!(a.arm_ordinal(VENUE, arm(200)), OTHER_ARM, "cap holds");
+    }
+
+    /// Past the cap an arm is not merely unlabelled — it is never authoritative and enters no map, so
+    /// a forged-source flood can neither displace a real arm nor grow the per-arm state.
+    #[test]
+    fn an_arm_past_the_cap_is_never_authoritative() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        for n in 1..=8 {
+            a.arm_ordinal(VENUE, arm(n));
+        }
+        assert_eq!(a.admit(key(), arm(200), 1_000), Admit::Dropped);
+        assert_eq!(a.venue_leader(VENUE), None, "no venue was created");
     }
 
     #[test]
-    fn markets_held_counts_per_arm() {
+    fn markets_held_counts_the_arm_actually_serving() {
         let mut a = StickyAuthority::new(no_window_cfg());
         a.admit(key(), arm(1), 1_000);
-        a.admit(("Lashay".into(), 2, 42), arm(1), 1_000);
-        a.admit(("Lashay".into(), 2, 43), arm(2), 1_000);
-        assert_eq!(a.markets_held("Lashay", arm(1)), 2);
-        assert_eq!(a.markets_held("Lashay", arm(2)), 1);
+        a.admit(other_market(), arm(1), 1_000);
+        assert_eq!(a.markets_held(VENUE, arm(1)), 2);
+        assert_eq!(a.markets_held(VENUE, arm(2)), 0);
+        // A health override moves one market's count without moving the venue.
+        a.set_health(&key(), arm(1), false);
+        a.admit(key(), arm(2), 1_100);
+        assert_eq!(a.markets_held(VENUE, arm(1)), 1);
+        assert_eq!(a.markets_held(VENUE, arm(2)), 1);
     }
 
-    /// A challenger consistently faster than the margin takes authority when the window closes —
-    /// not on its first fast sample.
+    // ---- pooled matched-lead re-election ----
+
+    /// Samples pool across markets, because latency is an arm property. Matches spread over three
+    /// markets elect at the venue level.
     #[test]
-    fn sustained_margin_transfers_at_window_close() {
+    fn pooled_samples_across_markets_transfer_the_venue() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        for i in 1..=10u64 {
-            let t = i * 100_000;
-            a.admit(key(), arm(1), t);
-            a.observe_challenger(&key(), arm(2), t.saturating_sub(10_000)); // 10us ahead
+        a.admit(key(), arm(1), 1_000);
+        for i in 0..10 {
+            let m: MarketKey = (VENUE.into(), 2, 40 + i % 3);
+            a.admit(m, arm(1), 1_000);
+            a.observe_matched_lead(VENUE, arm(2), -50_000);
         }
-        assert_eq!(a.leader_of(&key()), Some(arm(1)), "window still open");
-        let moved = a.close_window(1_000_001);
-        assert_eq!(moved.len(), 1);
-        assert_eq!(a.leader_of(&key()), Some(arm(2)));
+        assert_eq!(
+            a.close_window(2_000_000),
+            vec![(Arc::from(VENUE), arm(2))],
+            "a sustained pooled margin transfers"
+        );
+        assert_eq!(a.venue_leader(VENUE), Some(arm(2)));
     }
 
-    /// One fast sample among slow ones must not transfer — that is the flap the sustained margin
-    /// exists to prevent.
+    /// The floor is the difference between sticky and raced: a lone fast match is noise.
     #[test]
     fn one_fast_sample_does_not_transfer() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        for i in 1..=10u64 {
-            let t = i * 100_000;
-            a.admit(key(), arm(1), t);
-            let challenger = if i == 5 { t - 10_000 } else { t + 10_000 };
-            a.observe_challenger(&key(), arm(2), challenger);
-        }
-        assert!(a.close_window(1_000_001).is_empty());
-        assert_eq!(a.leader_of(&key()), Some(arm(1)));
+        a.admit(key(), arm(1), 1_000);
+        a.observe_matched_lead(VENUE, arm(2), -5_000_000);
+        assert!(a.close_window(2_000_000).is_empty());
+        assert_eq!(a.venue_leader(VENUE), Some(arm(1)));
     }
 
-    /// Winning often but only by noise must not transfer either: margin and win rate are
-    /// independent conditions and both must hold.
+    /// Both conditions are independent and both must hold: a heavy tail cannot carry a transfer.
+    #[test]
+    fn a_minority_of_wins_does_not_transfer_however_large() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 1_000);
+        for i in 0..10 {
+            a.observe_matched_lead(VENUE, arm(2), if i < 5 { -9_000_000 } else { 9_000_000 });
+        }
+        assert!(a.close_window(2_000_000).is_empty(), "50% < 0.8 win rate");
+    }
+
+    /// ...nor can a high win count built on sub-margin noise.
     #[test]
     fn winning_within_the_margin_does_not_transfer() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        for i in 1..=10u64 {
-            let t = i * 100_000;
-            a.admit(key(), arm(1), t);
-            a.observe_challenger(&key(), arm(2), t - 100); // 100ns < 1us margin
+        a.admit(key(), arm(1), 1_000);
+        for _ in 0..10 {
+            a.observe_matched_lead(VENUE, arm(2), -500); // inside the 1_000ns margin
         }
-        assert!(a.close_window(1_000_001).is_empty());
-        assert_eq!(a.leader_of(&key()), Some(arm(1)));
+        assert!(a.close_window(2_000_000).is_empty());
     }
 
-    /// Closing a window clears its samples, so the next window judges only its own evidence.
-    #[test]
-    fn window_close_resets_the_sample_set() {
-        let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        for i in 1..=10u64 {
-            let t = i * 100_000;
-            a.admit(key(), arm(1), t);
-            a.observe_challenger(&key(), arm(2), t - 10_000);
-        }
-        a.close_window(1_000_001);
-        assert_eq!(a.leader_of(&key()), Some(arm(2)));
-        for i in 11..=20u64 {
-            let t = i * 100_000;
-            a.admit(key(), arm(2), t);
-            a.observe_challenger(&key(), arm(1), t - 10_000);
-        }
-        a.close_window(2_000_002);
-        assert_eq!(a.leader_of(&key()), Some(arm(1)));
-    }
-
-    /// The margin path applies the same health gate `admit` does: winning the speed test must not
-    /// hand a market back to an arm serving a knowingly-wrong book.
-    #[test]
-    fn margin_does_not_transfer_to_an_unhealthy_arm() {
-        let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        a.set_health(&key(), arm(2), false);
-        for i in 1..=10u64 {
-            let t = i * 100_000;
-            a.admit(key(), arm(1), t);
-            a.observe_challenger(&key(), arm(2), t - 10_000);
-        }
-        assert!(a.close_window(1_000_001).is_empty());
-        assert_eq!(a.leader_of(&key()), Some(arm(1)));
-    }
-
-    /// A health transfer starts a new window: the samples it inherits were measured against the
-    /// arm it just took the market from, and would otherwise hand it straight back.
-    #[test]
-    fn health_transfer_restarts_the_sampling_window() {
-        let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        for i in 1..=10u64 {
-            let t = i * 10_000;
-            a.admit(key(), arm(1), t);
-            a.observe_challenger(&key(), arm(2), t - 5_000);
-        }
-        a.set_health(&key(), arm(1), false);
-        a.admit(key(), arm(2), 200_000);
-        assert_eq!(a.leader_of(&key()), Some(arm(2)));
-        assert!(
-            a.close_window(1_000_001).is_empty(),
-            "window reopened at the transfer, so nothing has elapsed"
-        );
-        assert_eq!(a.leader_of(&key()), Some(arm(2)));
-    }
-
-    /// A window that has not elapsed is left open, samples intact.
     #[test]
     fn window_does_not_close_early() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 0);
-        for i in 1..=10u64 {
-            let t = i * 10_000;
-            a.admit(key(), arm(1), t);
-            a.observe_challenger(&key(), arm(2), t - 10_000);
+        a.admit(key(), arm(1), 1_000);
+        for _ in 0..10 {
+            a.observe_matched_lead(VENUE, arm(2), -50_000);
         }
+        assert!(a.close_window(1_500).is_empty(), "interval has not elapsed");
+        assert!(!a.close_window(2_000_000).is_empty());
+    }
+
+    /// A close clears the evidence, so the next verdict is judged on its own window.
+    #[test]
+    fn window_close_resets_the_sample_set() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 1_000);
+        for _ in 0..10 {
+            a.observe_matched_lead(VENUE, arm(2), -50_000);
+        }
+        assert!(!a.close_window(2_000_000).is_empty());
+        // arm(2) leads now; arm(1) needs its own fresh evidence to win it back.
+        assert!(a.close_window(4_000_000).is_empty());
+    }
+
+    /// A handover restarts the window, so a silence transfer is not undone at the next close on the
+    /// displaced arm's evidence.
+    #[test]
+    fn a_silence_transfer_restarts_the_sampling_window() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 1_000);
+        for _ in 0..10 {
+            a.observe_matched_lead(VENUE, arm(2), 9_000_000); // arm(1) is faster
+        }
+        a.admit(key(), arm(2), 1_001 + TIMEOUT); // arm(1) went silent
+        assert_eq!(a.venue_leader(VENUE), Some(arm(2)));
         assert!(
-            a.close_window(500_000).is_empty(),
-            "half the interval elapsed"
+            a.close_window(TIMEOUT * 3).is_empty(),
+            "pre-handover samples must not hand it straight back"
         );
-        assert_eq!(a.leader_of(&key()), Some(arm(1)));
-        assert_eq!(
-            a.close_window(1_000_001).len(),
-            1,
-            "samples survived the early call"
-        );
+    }
+
+    /// A margin transfer must not vouch for the new leader's liveness. The silence clock is each
+    /// arm's own `last_seen_ns`, advanced only by real messages, so winning on samples does not make
+    /// a quiet arm look live — it is still displaced by the next message from an arm that is.
+    #[test]
+    fn a_margin_transfer_does_not_fake_the_new_leaders_liveness() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 1_000);
+        for _ in 0..10 {
+            a.observe_matched_lead(VENUE, arm(2), -50_000);
+        }
+        // arm(2) wins the window on a ticker far past its own last message (it never sent one).
+        assert!(!a.close_window(TIMEOUT * 5).is_empty());
+        assert_eq!(a.venue_leader(VENUE), Some(arm(2)));
+        // arm(1) is live, arm(2) has said nothing: authority comes straight back on silence.
+        assert!(a.admit(key(), arm(1), TIMEOUT * 5 + 1).emitted());
+        assert_eq!(a.venue_leader(VENUE), Some(arm(1)));
+    }
+
+    /// The leader's own samples are never collected: it does not compete with itself, and counting
+    /// them would let evidence measured against a displaced arm outvote the challenger.
+    #[test]
+    fn the_leader_does_not_sample_against_itself() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 1_000);
+        for _ in 0..10 {
+            a.observe_matched_lead(VENUE, arm(1), -9_000_000);
+        }
+        assert!(a.close_window(2_000_000).is_empty());
+        assert_eq!(a.venue_leader(VENUE), Some(arm(1)));
     }
 }
