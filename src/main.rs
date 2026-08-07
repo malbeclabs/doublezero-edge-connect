@@ -402,6 +402,15 @@ async fn main() -> Result<()> {
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    // Single-arm authority tunables for `Sticky` venues, validated here at startup and handed to the
+    // arbiter so the market-by-price processor's per-market health reports have somewhere to land.
+    let authority_cfg = ingest::authority::AuthorityConfig {
+        leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
+        sample_interval_ns: args.arb_sample_interval_secs.saturating_mul(1_000_000_000),
+        transfer_margin_ns: args.arb_transfer_margin_us.saturating_mul(1_000),
+        transfer_win_rate: args.arb_transfer_win_rate,
+        min_window_samples: args.arb_min_window_samples as usize,
+    };
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
         // Every registry venue, not just the selected ones: a message's venue comes from the wire
@@ -412,19 +421,9 @@ async fn main() -> Result<()> {
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
         a.set_depth_replay(depth.clone());
+        a.set_authority(authority_cfg);
         Arc::new(Mutex::new(a))
     };
-
-    // Single-arm authority tunables for `Sticky` venues. Built here so the flags are validated at
-    // startup; the arbiter consumes it once the incremental book path lands.
-    let authority_cfg = ingest::authority::AuthorityConfig {
-        leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
-        sample_interval_ns: args.arb_sample_interval_secs.saturating_mul(1_000_000_000),
-        transfer_margin_ns: args.arb_transfer_margin_us.saturating_mul(1_000),
-        transfer_win_rate: args.arb_transfer_win_rate,
-        min_window_samples: args.arb_min_window_samples as usize,
-    };
-    let _ = &authority_cfg;
 
     // WebSocket sink config. The sink itself is activated by the subscription reconciler (below),
     // not here: it comes up only when a market-data feed is actually subscribed, and its listener is

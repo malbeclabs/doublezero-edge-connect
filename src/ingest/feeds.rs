@@ -10,8 +10,8 @@ use std::net::Ipv4Addr;
 
 /// Which edge-feed-spec protocol a feed speaks. Selects the frame magic + decoder + receiver
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
-// `Midpoint`/`MarketByOrder` are matched on by the receiver but only *constructed* by FEEDS rows,
-// which are added once their live multicast endpoints are known - hence the dead_code allow.
+// `Midpoint`/`MarketByOrder`/`MarketByPrice` are matched on by the receiver but only *constructed*
+// by FEEDS rows, added once their live multicast endpoints are known - hence the dead_code allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FeedKind {
@@ -21,6 +21,9 @@ pub enum FeedKind {
     Midpoint,
     /// Market-by-Order (frame magic `0x4444`): full L3 order book with snapshot+delta recovery.
     MarketByOrder,
+    /// Market-by-Price (frame magic `0x4442`): the price-aggregated book with snapshot+delta
+    /// recovery, re-served as the incremental `book` product.
+    MarketByPrice,
 }
 
 impl FeedKind {
@@ -30,6 +33,7 @@ impl FeedKind {
             FeedKind::TopOfBook => "tob",
             FeedKind::Midpoint => "midpoint",
             FeedKind::MarketByOrder => "mbo",
+            FeedKind::MarketByPrice => "mbp",
         }
     }
 }
@@ -660,5 +664,6 @@ mod tests {
         assert_eq!(FeedKind::TopOfBook.label(), "tob");
         assert_eq!(FeedKind::Midpoint.label(), "midpoint");
         assert_eq!(FeedKind::MarketByOrder.label(), "mbo");
+        assert_eq!(FeedKind::MarketByPrice.label(), "mbp");
     }
 }

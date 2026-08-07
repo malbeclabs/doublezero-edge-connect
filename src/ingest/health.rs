@@ -29,14 +29,14 @@ pub type ReceiverKey = (&'static str, FeedKind, u16);
 /// Whether a receiver of this protocol counts toward the venue-level `status` / `dz_feed_up`.
 ///
 /// PROTOCOL.md's `status` is the health of the venue's **quote** stream (`stale_ms` is documented as
-/// "milliseconds the quote feed had been silent"), which Top-of-Book carries and Market-by-Order
-/// does not — MBO is re-served as `depth`. Counting MBO would break the contract in both
-/// directions: a wedged depth mirror would report a venue outage while quotes flow, and a live one
-/// would mask a total quote outage.
+/// "milliseconds the quote feed had been silent"), which Top-of-Book carries and the two book
+/// protocols do not — Market-by-Order is re-served as `depth`, Market-by-Price as `book`. Counting
+/// either would break the contract in both directions: a wedged book mirror would report a venue
+/// outage while quotes flow, and a live one would mask a total quote outage.
 fn carries_venue_status(kind: FeedKind) -> bool {
     match kind {
         FeedKind::TopOfBook | FeedKind::Midpoint => true,
-        FeedKind::MarketByOrder => false,
+        FeedKind::MarketByOrder | FeedKind::MarketByPrice => false,
     }
 }
 
