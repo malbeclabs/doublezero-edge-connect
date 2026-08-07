@@ -659,12 +659,12 @@ impl MboProcessor {
                         // dropped from replay; it self-heals via full-state otherwise).
                         self.last_top.remove(&old);
                         self.emitted_symbol.remove(&old);
-                        let (_old_pub, old_id) = old;
+                        let (old_pub, old_id) = old;
                         let symbol_still_served = self.books.keys().any(|(_p, i)| *i == old_id);
                         if !symbol_still_served {
-                            // Resolved against the receiving publisher, not the evicted one: a
-                            // disagreement costs one stale replay entry the next depth overwrites.
-                            if let Some(def) = self.state.def(ctx.publisher, old_id) {
+                            // Resolved against the evicted book's OWN publisher: reference data is
+                            // per publisher, so two arms can map one id to different symbols.
+                            if let Some(def) = self.state.def(old_pub, old_id) {
                                 crate::model::lock(&self.depth)
                                     .remove(&(venue_arc(ctx.venue), def.symbol.clone()));
                             }
