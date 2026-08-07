@@ -56,11 +56,13 @@ Two rules make it one module rather than two:
 - **"Unhealthy" includes the leader sitting in `gap`/`awaiting-snapshot`, in both modes.** Under full-state depth a lost level self-heals on the next message; under incremental output it does not heal until the next snapshot.
 - **`Sticky` authority is per `(venue, market)` — per instrument, never per level.** Per-level leadership interleaves the arms, which is what corrupts state.
 
-**Initial election: a bounded sampling window.** On feed activation both arms are ingested and their per-market arrival skew measured briefly; the faster becomes authoritative. The first arm delivering a usable book is provisionally authoritative so there is no dark start, and the window closes with at most **one** re-election — one extra re-baseline during warm-up. A CLI flag pins a preferred source and skips sampling, which is also the escape hatch for a known-degraded arm. After the window authority moves only on a health verdict; flapping authority re-baselines every consumer's book.
+**Election and re-election: a bounded sampling window, re-run on an interval.** On feed activation both arms are ingested and their per-market arrival skew measured briefly; the faster becomes authoritative. The first arm delivering a usable book is provisionally authoritative so there is no dark start, and the window closes with at most **one** re-election — one extra re-baseline during warm-up. Sampling then repeats on an interval, so a persistently slower leader is demoted rather than held indefinitely; between samples authority still moves immediately on a health verdict. Transfer requires a **sustained margin**, never a single faster sample — flapping authority re-baselines every consumer's book.
+
+**Default: sampling on, mode `Sticky`, with the re-sampling interval and the win-by margin both TBD (§10 Q2).** No flag is required to run. A CLI flag pins a preferred source and skips sampling, which is the escape hatch for a known-degraded arm.
 
 **Rejected: state-convergence dedup** (emit only when an arm's delta changes a shared published book) — it dedups but does not *order*, so a lagging arm's copy of an older transition rewinds the book and then flaps through that arm's replay of the leader's history.
 
-A content hash *does* belong in **metrics**: the non-authoritative arm later reporting the same `(side, price, quantity)` is a content-matched skew sample, where false matches only add histogram noise. That yields the FIX-vs-WS lead time and an arm-divergence counter for free.
+A content hash *does* belong in **metrics**: the non-authoritative arm later reporting the same `(side, price, quantity)` is a content-matched skew sample, where false matches only add histogram noise. That yields the FIX-vs-WS lead time and an arm-divergence counter for free. **The metric set that drives and observes re-election is owed alongside the numbers (§10 Q2)**, since the interval and the margin are read off those series: at minimum the per-arm lead-time histogram the sampler consumes, an authority-transfer counter labelled by reason (health vs. margin), and a gauge naming the authoritative arm per market so an operator can see which arm is live and why it last moved.
 
 ### 2.4 The arm axis is the source IP. `channel_id` names the instrument set.
 
@@ -81,6 +83,8 @@ That rule is normative on the wire, per #83: *"Sequence and reset counters are s
 
 **`channel` is a client filter key.** Arm identity is *not* client-selectable: `Sticky` publishes the authoritative arm and drops the other, so there is exactly one coherent book per market to hand a client. Handling failover for the consumer is the point; the cost is that the non-authoritative arm's ingest bandwidth is spent and discarded.
 
+**How a client discovers the channel set is open.** Filtering by `channel` presupposes knowing which channels exist. The mechanism available for free is that `instrument` messages carry `channel` and `instrument_id` (§5) and are replayed on connect ahead of the stream, so the live set is learnable with no new message type — but that only ever names channels currently flowing, and hands a client no catalogue up front. Tracked upstream rather than settled here.
+
 Note the arms do **not** share a `channel_id` yet — perps is deployed as `channel_id` 1 and 2 pending
 #83's renumbering to a single `id`. Keying on source IP is correct before and after that migration,
 so nothing here waits on it.
@@ -100,9 +104,14 @@ The spec requires it: *"Subscribers consuming multiple channels MUST key their i
 
 Keying on the tuple makes us correct regardless, and `symbol` becomes a display label.
 
-### 2.6 MBP emits no trades.
+### 2.6 MBP carries the trade tape.
 
-Trades are not required to reconstruct book state, and `FEEDS` already carries `emit_trades` so one feed owns a venue's tape. Lashay TOB owns trades. This also sidesteps the one case with no sound dedup: WS trades carry a venue trade id, FIX carries none.
+The publisher already emits `Trade 0x04` on the MBP mktdata port, byte-identical to the TOB feed's and pinned by a test whose stated purpose is to let a consumer dedupe or cross-check a trade seen on both. The spec carries it deliberately, "as a convenience for consumers who want a trade tape alongside the book." Someone buying depth without TOB must still get a tape, so we emit it: `FEEDS.emit_trades` is already the per-feed switch and the processors already gate on it, so this is a row value, not new machinery.
+
+Two dedup obligations follow, and neither is satisfied today:
+
+- **A FIX-sourced trade carries no venue trade id and reaches us as `trade_id == 0`** (`trade_from_print` falls back to `0` when the source has none). `WindowedDedup` (`arbiter.rs:391-411`) keys `(venue, symbol)` on a window of `trade_id`s and returns `Dropped` when a publisher repeats a value already in its window, so every FIX print after the first is discarded as a same-publisher duplicate. `0` also never ages out — eviction is by insertion order and `0` is inserted once, so it is the window's only entry forever. The tape collapses to **one trade per `(venue, symbol)`, permanently**: silent loss, not duplication. Note this is **within one arm**, so electing a winner (next bullet) does not touch it. **Nor is it MBP-specific** — the same FIX source feeds the TOB lane (`tob_feed.rs`'s `map_trade_print_fix_sourced_has_no_venue_id_falls_back_to_zero`), so it lands with the first FIX-sourced `FEEDS` row we bind, which is the TOB row, whether or not MBP ever carries a tape. The fix moves to PR 1 (§7): treat `0` as "no identity" and bypass the window instead of keying on it.
+- **Trades follow book authority**, which is what licenses that bypass. Only the authoritative arm's tape is published, so the arms never race on a field one of them does not carry and a bypassed `0` has no second copy to leak. Where TOB and MBP both carry the same venue trade id, the existing window collapses them as it does now.
 
 ## 3. Modules
 
@@ -141,7 +150,7 @@ One message type replaces `depth`: a batch of level changes, each carrying an ex
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
 ```
 
-**`(venue, channel, instrument_id)` is the identity; `symbol` is a label.** This is new — the wire carries only `venue` + `symbol` today, and `NormalizedInstrument` has no id field. It has to change, because `symbol` is a truncated 16-byte tail that collides across markets (§2.5), so a consumer keying on it merges two books. A consumer that wants a stable key uses the triple; `symbol` is for display and for the convenience of venues where it happens to be unique (all of perps). `instrument_id` appears on `instrument` messages too, so the mapping is learnable on connect.
+**`(venue, channel, instrument_id)` is the identity; `symbol` is a label.** This is new — the wire carries only `venue` + `symbol` today, and `NormalizedInstrument` has no id field. It has to change, because `symbol` is a truncated 16-byte tail that collides across markets (§2.5), so a consumer keying on it merges two books. A consumer that wants a stable key uses the triple; `symbol` is for display and for the convenience of venues where it happens to be unique (all of perps). `instrument_id` appears on `instrument` messages too, so the mapping is learnable on connect. The triple is only worth as much as the ids agreeing across arms; making that agreement a property the publisher provides rather than an accident is lashay#84, and §2.5 records exactly what we depend on.
 
 - **`last`** marks the final batch of a logical book event. Mandatory — a buffering consumer wedges permanently without it, including on a re-baseline that is only a `clear`.
 - **`snapshot`** is advisory, for consumers distinguishing a rebuild from ordinary activity. It is deliberately **not** what re-baselines: `changes[0].action == "clear"` is.
@@ -164,17 +173,12 @@ Verified against `nautechsystems/nautilus_trader` @ `05b709b` (v2.0.0rc3). The L
 
 v2 renamed this surface (`subscribe_order_book_deltas` → `subscribe_book_deltas`) and the June demo pins v1. The wire is unaffected, but v2 has no Python data client and no generic JSON client, so a native consumer is a Rust crate.
 
-### 6.1 Optional second emitter: the tardis-machine shape
-
-Nautilus's Tardis adapter connects to `{base_url}/ws-stream-normalized?options=<json>` (`machine/mod.rs:114`, `data.rs:123`) with `base_url` configurable and a `TARDIS_MACHINE_WS_URL` env fallback (`common/urls.rs:31`, `config.rs:112`), so emitting its normalized `book_snapshot` shape makes this feed consumable by an adapter that already ships. Blocker: `TardisExchange` (`common/enums.rs:180`) is a closed enum with no `#[serde(other)]` — `Hyperliquid` is a variant (`:222`), **Lashay is not**. Works today for the existing HL feed; needs a one-line upstream PR for Lashay.
-
-Optional, not the contract: a vendor shape we do not control, its exchange list gates which venues can use it, and `interval: 0` is a full-state model §2.1 rejects.
-
 ## 7. PR stack
 
 1. **Per-publisher state + arbitration module.** Two changes that are one idea — scope per-publisher state correctly, then arbitrate on top of it.
    - `RefDataState` becomes `HashMap<IpAddr, RefDataState<D>>`, matching what `TobProcessor` already does for `SeqTracker`. Today it is one shared instance clearing all definitions on any `reset_count` change, which is per-port state and incorrect under #83's rule. Not currently reachable (see §7 note) but a hard prerequisite for consuming two arms.
    - `StalenessFloor` → `Coordinated`/`Sticky` with the shared unhealthy-leader transfer; `FEEDS` declares its arbitration mode. No protocol change.
+   - `WindowedDedup` treats `trade_id == 0` as "no identity" and bypasses the window rather than keying on it (§2.6). This one is a prerequisite for **PR 6**, not for MBP: the first FIX-sourced row we bind is the TOB one, and without this its tape collapses to a single print per symbol.
 2. **Filter dimensions** — `channel` + `type` on `SubFilter`, both match paths, replay scoping.
 3. **`codec_mbp.rs`** — validated against `marketbyprice-parser`.
 4. **`PriceBook` + `MbpProcessor`** — §4 in full, bounded delta buffer.
@@ -210,8 +214,8 @@ Sports L2 is the same `0x4442` protocol on a different group, so everything in �
 ## 10. Open questions
 
 1. **Do FIX and WS observe the same per-level transition sequence?** The spec notes a feed inherits its upstream's conflation, and FIX `35=X` is an incremental refresh that characteristically conflates. The question is whether the `orderbook_delta` WS provides is on the same snapshot as the FIX order book. Agreed method: record ~60 s of one very liquid market from each side and compare; capture access is being arranged. **Nothing here blocks on the answer** — `Sticky` needs none, which is why it is the default; a match would only make per-level counting available as an optimization behind the §2.3 seam.
-2. **The transfer threshold.** §2.3 settles how authority moves; the number is owed. Too tight and jitter flaps authority, re-baselining every consumer; too loose and a dead arm holds authority through the outage the second arm exists to cover. Derivable from §1's measured rate plus observed skew.
-3. **`edge-feed-spec` still contradicts #83, and that is the one piece not yet in flight.** #83 makes `(source_ip, group, port)` scoping normative for Lashay, but MBP §Channel Reset still tells a subscriber to discard *all* channel state on a `Reset Count` change, and `marketbyprice-parser` still tracks sequence per port. A third party implementing the spec has no path to #83's rule, and our own reference parser disagrees with it. The fix is a small alignment PR against MBP **and** MBO — both carry the same three sentences (`Reset Count` at `market-by-order/spec.md:88`, `Snapshot ID` at `:480`, Channel Reset at `:643`) — citing #83 rather than re-arguing it.
+2. **The re-sampling interval, the transfer threshold, and the metric set behind them.** §2.3 settles how authority moves; all three are owed. Too tight a threshold and jitter flaps authority, re-baselining every consumer; too loose and a dead arm holds authority through the outage the second arm exists to cover. The two numbers are derivable from §1's measured rate plus observed skew, but only once the series they are read off are named — so specifying the metrics (§2.3) comes first, not last.
+3. **`edge-feed-spec` still contradicts #83; the alignment PR against it is open.** #83 makes `(source_ip, group, port)` scoping normative for Lashay, but MBP §Channel Reset still tells a subscriber to discard *all* channel state on a `Reset Count` change, and `marketbyprice-parser` still tracks sequence per port. A third party implementing the spec has no path to #83's rule, and our own reference parser disagrees with it. The fix is a small alignment PR against MBP **and** MBO — both carry the same three sentences (`Reset Count` at `market-by-order/spec.md:88`, `Snapshot ID` at `:480`, Channel Reset at `:643`) — citing #83 rather than re-arguing it. That PR is open on `edge-feed-spec` and awaiting review; nothing further is owed here.
 
    Two things to settle in that PR. **Vocabulary:** #83 uses "channel" for `(group, dst_port)` and `channel_id` for the instrument set, where the spec uses "channel" for the `channel_id`-scoped state machine. Pick #83's, since it is the reviewed one. **Scope:** the spec puts transport and addressing out of scope, so naming the source address normatively reaches outside it — the honest form is to require state be scoped per publisher instance and leave *identifying* instances to the deployment, as concrete port assignments already are.
 
