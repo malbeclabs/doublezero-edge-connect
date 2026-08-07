@@ -347,9 +347,11 @@ mod tests {
     /// the `trade_id == 0` bypass in `arbiter::emit` there is no window to collapse the duplicate
     /// for a FIX-sourced publisher — which carries no venue trade id at all.
     ///
-    /// NOTE: this static form holds until a venue carries a tape on two separately-gated feeds,
-    /// at which point ownership becomes a runtime decision and the same invariant — **at most one
-    /// tape emitter per venue at any moment** — has to be enforced where it actually lives.
+    /// This covers *configured rows* only, which is less than the invariant the bypass wants. A row
+    /// carries N publishers, and a message's venue is the wire SourceID's (`codec::source_name`),
+    /// not the row's — so neither two arms of one row nor a remapped SourceID is visible here. The
+    /// runtime half is `dz_trades_no_id_conflict_total`, which reports a second tape owner instead
+    /// of asserting there isn't one.
     #[test]
     fn at_most_one_trade_emitting_row_per_venue() {
         let mut emitters = std::collections::HashMap::new();
