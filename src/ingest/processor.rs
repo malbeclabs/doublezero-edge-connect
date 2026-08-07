@@ -1044,12 +1044,14 @@ const MAX_PRICE_BOOKS: usize = 4096;
 const MAX_CHANNEL_KEYS: usize = 256;
 
 /// Deltas [`MbpProcessor`] holds buffered **across every book** before the overflow policy fires —
-/// distinct from `pricebook`'s per-book `MAX_BUFFERED_DELTAS` (2^18), which with [`MAX_PRICE_BOOKS`]
-/// books (2^12 × 2^18 = 2^30) can never bind first. The spec's own cold-start worst case is ~30 M
-/// buffered messages / ~1.4 GB, so an unbounded total is a documented way to lose the process. On
-/// overflow the instrument holding the most buffered data is dropped and marked `Gap`, recovering on
-/// its next snapshot like any other `Gap` instrument; sustained overflow means the publisher's
-/// snapshot period is too long for this host's memory budget, which is why it is counted.
+/// distinct from `pricebook`'s per-book `MAX_BUFFERED_DELTAS` (2^18), which bounds nothing useful in
+/// aggregate: [`MAX_PRICE_BOOKS`] books at that cap is 2^30 deltas. This is the bound that holds, and
+/// it binds only once several instruments buffer heavily, since one alone clamps at 2^18. The spec's
+/// own cold-start worst case is ~30 M buffered messages / ~1.4 GB, so an unbounded total is a
+/// documented way to lose the process. On overflow the instrument holding the most buffered data is
+/// dropped and marked `Gap`, recovering on its next snapshot like any other `Gap` instrument;
+/// sustained overflow means the publisher's snapshot period is too long for this host's memory
+/// budget, which is why it is counted.
 const MAX_BUFFERED_DELTAS_ACROSS_BOOKS: usize = 1 << 20;
 
 /// One reconstructed book's identity within a receiver: `(publisher, channel, instrument)`.
@@ -1288,17 +1290,6 @@ impl MbpProcessor {
                 .inc(),
             _ => {}
         }
-    }
-
-    /// Emit one instrument's accumulated changes as a single `book` batch. Gated on a `Ready` book
-    /// and a resolved definition (precision before price). `last: true` because one frame is one
-    /// logical event per instrument — cross-instrument atomicity is not promised, so per-frame
-    /// batching is correct.
-    fn emit_book(&self, ctx: &FrameCtx, channel: u8, instrument_id: u32, changes: Vec<BookChange>) {
-        if changes.is_empty() {
-            return;
-        }
-        self.send_book(ctx, channel, instrument_id, changes, false);
     }
 
     /// Emit a full re-baseline for one instrument: `Clear{Both}` then every level it now holds.
@@ -1749,8 +1740,13 @@ impl FrameProcessor for MbpProcessor {
         cleared.clear();
         self.cleared = cleared;
         self.enforce_buffer_budget(ctx);
+        // One batch per instrument, `last: true`: a frame is one logical event per instrument, since
+        // cross-instrument atomicity is not promised. A clear that removed nothing has no changes to
+        // publish.
         for (instrument_id, changes) in accum {
-            self.emit_book(ctx, channel, instrument_id, changes);
+            if !changes.is_empty() {
+                self.send_book(ctx, channel, instrument_id, changes, false);
+            }
         }
         for id in touched {
             let key = (ctx.publisher, channel, id);
