@@ -144,11 +144,11 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ingest::codec_common::{apply_exponent, FRAME_HEADER_SIZE};
 
-    fn frame(body: Vec<u8>, msg_count: u8) -> Vec<u8> {
+    pub(crate) fn frame(body: Vec<u8>, msg_count: u8) -> Vec<u8> {
         let frame_len = (FRAME_HEADER_SIZE + body.len()) as u16;
         let mut f = Vec::new();
         f.extend_from_slice(&MAGIC.to_le_bytes());
@@ -163,7 +163,22 @@ mod tests {
         f
     }
 
-    fn encode_midpoint(m: &Midpoint) -> Vec<u8> {
+    /// Encode a valid ManifestSummary wire message (24 bytes total): 4-byte message header + a
+    /// 20-byte body matching the `decode_body` offsets — +0 channel_id, +1 valid, +4 manifest_seq
+    /// (u16le), +8 instrument_count (u32le), +12 ts (u64le).
+    pub(crate) fn encode_manifest(manifest_seq: u16, instrument_count: u32) -> Vec<u8> {
+        let mut b = vec![MSG_MANIFEST_SUMMARY, 24, 0, 0];
+        b.push(0); // channel_id
+        b.push(1); // valid
+        b.extend_from_slice(&[0u8; 2]); // pad
+        b.extend_from_slice(&manifest_seq.to_le_bytes());
+        b.extend_from_slice(&[0u8; 2]); // pad
+        b.extend_from_slice(&instrument_count.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // ts
+        b
+    }
+
+    pub(crate) fn encode_midpoint(m: &Midpoint) -> Vec<u8> {
         let mut b = vec![MSG_MIDPOINT, MIDPOINT_SIZE, 0, 0]; // header: type, len, flags
         b.extend_from_slice(&m.instrument_id.to_le_bytes());
         b.extend_from_slice(&m.source_id.to_le_bytes());
@@ -176,7 +191,7 @@ mod tests {
         b
     }
 
-    fn encode_instrument(d: &InstrumentDefinition) -> Vec<u8> {
+    pub(crate) fn encode_instrument(d: &InstrumentDefinition) -> Vec<u8> {
         let mut b = vec![MSG_INSTRUMENT_DEFINITION, INSTRUMENT_DEFINITION_SIZE, 0, 0];
         b.extend_from_slice(&d.instrument_id.to_le_bytes()); // @4
         let mut sym = [0u8; 16];
