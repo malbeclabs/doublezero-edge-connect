@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peers, and pins the exact base-port set in a test so a future omission fails the build. **This
   roughly doubles ingest cost: 23 receivers over 57 sockets, ~456 MiB of requested `SO_RCVBUF` at
   the default `--recv-buf` — see the sizing note in `docs/input-sources.md`.** (#93)
+- The idle-rejoin interval now escalates (30s doubling to a 5-minute cap) when a rejoin produces no
+  market data, instead of rebinding the whole port block and logging a warn+info pair every 30s
+  forever. A permanently-silent block — a retired publisher, or a registry row whose endpoint never
+  went live — settles at ~12 rejoins/hour. Detection is unchanged: the socket stays bound, so a
+  returning publisher is picked up on its first datagram, and the first `status: down` still fires
+  at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
 
 ### Added
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
