@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(to_abort.len(), 2);
     }
 
-    use crate::ingest::feeds::{FeedPorts, FeedPublisher};
+    use crate::ingest::feeds::{ArbitrationMode, FeedPorts, FeedPublisher};
 
     fn test_feed(publishers: &'static [FeedPublisher]) -> Feed {
         Feed {
@@ -425,6 +425,7 @@ mod tests {
             group: std::net::Ipv4Addr::new(233, 84, 178, 15),
             publishers,
             emit_trades: true,
+            arbitration: ArbitrationMode::Coordinated,
         }
     }
 

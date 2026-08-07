@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
 
 ### Added
+- Each `Feed` now declares an `ArbitrationMode` (`Coordinated`/`Sticky`), carried into the arbiter as a per-venue map. Behaviour-neutral: every existing venue is `Coordinated` — today's latch-to-leader staleness floor — and an unregistered venue defaults to it. The seam exists for venues whose redundant publishers stamp no comparable venue clock, which cannot be arbitrated by a per-tick floor. (#94)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All eleven live Hyperliquid publishers are
   ingested (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time

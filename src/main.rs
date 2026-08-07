@@ -345,6 +345,9 @@ async fn main() -> Result<()> {
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
+        for f in &enabled {
+            a.set_mode(f.venue, f.arbitration);
+        }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
         a.set_depth_replay(depth.clone());
