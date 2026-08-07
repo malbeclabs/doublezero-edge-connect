@@ -40,7 +40,7 @@ bandwidth can be tracked independently for each transport (UDP shred fan-out and
 ## Ingest reception (per publisher)
 
 Recorded by the multicast receivers (`src/ingest/receiver.rs`), one per `(venue, kind, publisher)` —
-a venue mirrored by six publishers runs six receivers per protocol. The `publisher` label value is
+a venue mirrored by eleven publishers runs eleven receivers per protocol. The `publisher` label is
 the publisher's **base port** (the market-data port of its block, e.g. `9201`), which is what
 `--publisher-port` selects.
 

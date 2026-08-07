@@ -549,7 +549,14 @@ mod tests {
             .iter()
             .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
-        assert_eq!(hl_tob.publishers.len(), 6);
+        // Compare against the registry, not a literal: this test is about the empty selection
+        // being a no-op, and a hardcoded count silently turns it into a fleet-size assertion that
+        // has to be edited every time a publisher is onboarded (`feeds.rs` already pins the set).
+        let registry = feeds::FEEDS
+            .iter()
+            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .unwrap();
+        assert_eq!(hl_tob.publishers.len(), registry.publishers.len());
     }
 
     #[test]
