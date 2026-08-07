@@ -571,7 +571,12 @@ fn mbo_prints_carry_no_venue_trade_id() {
         "golden carried no prints — the fact is unpinned"
     );
 
-    for f in FEEDS.iter().filter(|f| f.kind == FeedKind::MarketByOrder) {
+    // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
+    // real trade ids, and that is its own row's call.
+    for f in FEEDS
+        .iter()
+        .filter(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::MarketByOrder)
+    {
         assert!(!f.emit_trades, "{} would publish zero-id prints", f.venue);
     }
 }

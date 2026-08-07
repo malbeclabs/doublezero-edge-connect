@@ -526,7 +526,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`src/main.rs`) is now a thin wrapper, so dev tooling and tests can reuse the codecs.
 
 ### Fixed
-- Trades stamped `trade_id == 0` (the "no venue trade id" sentinel, emitted by FIX-sourced publishers) now bypass the cross-source dedup window instead of being keyed on it. Previously the second and every later such print was discarded as a same-publisher duplicate and `0` never aged out of the window, collapsing the tape to a single print per `(venue, symbol)` for the process's lifetime. New counter `dz_trades_no_id_total{venue}` (#94)
+- Trades stamped `trade_id == 0` (the "no venue trade id" sentinel, emitted by FIX-sourced publishers) now bypass the cross-source dedup window instead of being keyed on it. Previously the second and every later such print was discarded as a same-publisher duplicate and `0` never aged out of the window, collapsing the tape to a single print per `(venue, symbol)` for the process's lifetime. A bypassed sentinel has no window to collapse against, so the bypass holds only while one publisher owns a venue's tape: `dz_trades_no_id_total{venue}` counts the sentinel prints and `dz_trades_no_id_conflict_total{venue}` reports a second publisher emitting one (a double-printed tape), which no feed does today. (#94)
 - Installer daemon head start bumped from 15s to 30s before `doublezero connect multicast`, so a
   cold daemon finishes device probing and no longer races the connect on slower hosts
   (`scripts/connect*.sh`).
