@@ -299,7 +299,8 @@ Modules are grouped by role under `src/`:
   flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
-  the full level set on demand. Nothing emits `book` yet (no processor, no `FEEDS` row); the arbiter's
+  the full level set on demand. It commits per *logical event* (buffering until `last`), since
+  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book. Nothing emits `book` yet (no processor, no `FEEDS` row); the arbiter's
   `Book` arm is a **temporary** undeduped passthrough, replaced by the authority gate.
 
 ## Conventions and gotchas
