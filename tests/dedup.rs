@@ -14,7 +14,8 @@ mod common;
 use common::{assertions, replay as replay_helper};
 use doublezero_edge_connect::ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
-    codec,
+    codec, codec_mbo,
+    feeds::{FeedKind, FEEDS},
     processor::{MboProcessor, TobProcessor},
     receiver::{FrameCtx, FrameProcessor, PortRole},
 };
@@ -47,7 +48,9 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
     let depth = Arc::new(Mutex::new(HashMap::new()));
-    let mut p = MboProcessor::new(depth, true);
+    // Trades off, as the live MBO row is (`feeds::FEEDS`): its `OrderExecute` prints carry no venue
+    // trade id, so they bypass the arbiter's dedup window — see `mbo_prints_carry_no_venue_trade_id`.
+    let mut p = MboProcessor::new(depth, false);
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "Hyperliquid",
@@ -536,6 +539,41 @@ fn mbo_depth_mirror_from_second_publisher_collapses() {
         depth_identities(&mirror_msgs),
         "mirroring every packet from a second publisher changed the emitted depth set"
     );
+}
+
+/// Every print in the live Market-by-Order golden carries `trade_id == 0` — the venue stamps no
+/// trade id on `OrderExecute`. That is why the arbiter treats `0` as "no identity" rather than a
+/// dedup key, and why the Market-by-Order rows must stay `emit_trades: false`: two mirrored
+/// publishers' zero-id prints have no window to collapse against.
+#[test]
+fn mbo_prints_carry_no_venue_trade_id() {
+    let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
+    let mut prints = 0;
+    for (_ip, _role, frame) in &recs {
+        let Ok((_h, msgs)) = codec_mbo::decode_frame(frame) else {
+            continue;
+        };
+        for m in &msgs {
+            let id = match m {
+                codec_mbo::Message::OrderExecute(o) => o.trade_id,
+                codec_mbo::Message::Trade(t) => t.trade_id,
+                _ => continue,
+            };
+            prints += 1;
+            assert_eq!(
+                id, 0,
+                "golden carries a venue trade id — revisit the bypass"
+            );
+        }
+    }
+    assert!(
+        prints > 0,
+        "golden carried no prints — the fact is unpinned"
+    );
+
+    for f in FEEDS.iter().filter(|f| f.kind == FeedKind::MarketByOrder) {
+        assert!(!f.emit_trades, "{} would publish zero-id prints", f.venue);
+    }
 }
 
 /// The content-inclusive identity set of emitted depths (`venue|symbol|source_ts|bids|asks`), the

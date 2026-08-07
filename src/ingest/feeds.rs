@@ -409,6 +409,28 @@ mod tests {
         assert!(hl.emit_trades);
     }
 
+    /// At most one row per venue may emit trades. Two would double-publish every print, and with
+    /// the `trade_id == 0` bypass in `arbiter::emit` there is no window to collapse the duplicate
+    /// for a FIX-sourced publisher — which carries no venue trade id at all.
+    ///
+    /// NOTE: this static form holds until a venue carries a tape on two separately-gated feeds,
+    /// at which point ownership becomes a runtime decision and the same invariant — **at most one
+    /// tape emitter per venue at any moment** — has to be enforced where it actually lives.
+    #[test]
+    fn at_most_one_trade_emitting_row_per_venue() {
+        let mut emitters = std::collections::HashMap::new();
+        for f in FEEDS.iter().filter(|f| f.emit_trades) {
+            let prev = emitters.insert(f.venue, f.kind);
+            assert!(
+                prev.is_none(),
+                "{} emits trades on both {:?} and {:?}",
+                f.venue,
+                prev.unwrap(),
+                f.kind
+            );
+        }
+    }
+
     #[test]
     fn port_accessors_cover_both_shapes() {
         let two = FeedPorts::TwoPort {
