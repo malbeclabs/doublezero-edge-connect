@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that and the publisher deviations the captures contain. (#95)
 - `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
   with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
+- `PriceBook` (`src/ingest/pricebook.rs`): the price-keyed L2 book and its snapshot+delta recovery
+  state machine for the market-by-price feed — a sibling of the order-keyed `book.rs`, since the
+  wire already carries absolute per-level quantities and has nothing to aggregate. Deltas apply only
+  in unbroken per-instrument sequence, a gap buffers until a snapshot re-anchors, and buffered
+  deltas past the snapshot's `anchor_seq` replay afterwards. Both the buffer and the level map are
+  capped, so an unauthenticated forged stream cannot grow them without limit. Internal only — no
+  codec, feed row or wire change yet, so no observable behaviour differs. (#96)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All eleven live Hyperliquid publishers are
   ingested (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
