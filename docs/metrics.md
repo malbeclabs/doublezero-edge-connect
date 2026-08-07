@@ -97,6 +97,19 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | `dz_quotes_no_source_ts_total` | counter | `venue` | Quotes forwarded with the `source_ts == 0` sentinel (floor bypassed). |
 | `dz_quote_lead_ns` | histogram | `venue`, `winner`, `loser` | Nanoseconds the winning publisher led the losing duplicate by, per quote-tick cross-source contest (`winner`/`loser` each `edge`/`public`). `{winner="edge",loser="public"}` is "DZ beat the public feed"; `_count` is the head-to-head win count, the buckets the lead margin. |
 | `dz_trade_lead_ns` | histogram | `venue`, `winner`, `loser` | The trade-side counterpart of `dz_quote_lead_ns`, per `trade_id` cross-source contest. |
+| `dz_arm_lead_ns` | histogram | `venue`, `winner` | Nanoseconds the authoritative arm led the challenger's copy by, per contested message on a single-arm (`Sticky`) venue. `winner` is `leader`/`challenger` — relative, so the label set stays two-valued whatever the arm count. Read the two transfer thresholds off this: `{winner="challenger"}` sitting persistently past `--arb-transfer-margin-us` with no transfer means the conditions are too tight. |
+| `dz_arm_authority_transfers_total` | counter | `venue`, `reason` | Authority handovers, by `reason` (`initial`/`health`/`silence`/`margin`). Every transfer re-baselines each consumer's book, so a sustained rate means the thresholds are too loose; a `health`/`silence` rate means an arm is actually broken. |
+| `dz_arm_markets_held` | gauge | `venue`, `arm` | Markets each arm is currently authoritative for. `arm` is a stable per-venue ordinal (`arm0`…`arm7`, then `other`), never the spoofable source IP. All markets on one arm is the steady state; a persistent split means the venue's arms are trading authority market by market. |
+
+### Tuning arm re-election
+
+Four flags govern the single-arm election (all also env vars, `DZ_ARB_*`):
+`--arb-sample-interval-secs` (300) is how long a window collects head-to-head samples before it can transfer, and so the ceiling on how long a persistently slower arm keeps authority;
+`--arb-transfer-margin-us` (1000) is the median lead a challenger must show;
+`--arb-transfer-win-rate` (0.8) is the fraction of the window's samples it must also lead;
+`--arb-leader-timeout-secs` (2) is the silence after which a healthy challenger takes over.
+
+The margin and the win rate are **independent conditions and both must hold** — a heavy tail alone cannot carry a transfer, and neither can a high win count built on sub-margin noise. Health and silence transfers ignore both: a leader in `gap`/`awaiting-snapshot` yields immediately to a healthy challenger, because under incremental output a lost level does not self-heal until the next snapshot.
 
 ### Published win rate
 
