@@ -214,6 +214,40 @@ struct Args {
         default_value_t = false
     )]
     subscription_gating_disable: bool,
+
+    /// Seconds between arm re-election samples for `Sticky` venues. Longer holds a slower arm
+    /// longer; shorter risks flapping authority, which re-baselines every consumer's book.
+    #[arg(
+        long = "arb-sample-interval-secs",
+        env = "DZ_ARB_SAMPLE_INTERVAL_SECS",
+        default_value_t = 300
+    )]
+    arb_sample_interval_secs: u64,
+
+    /// Microseconds a challenger must beat the authoritative arm by, on median, to take authority.
+    #[arg(
+        long = "arb-transfer-margin-us",
+        env = "DZ_ARB_TRANSFER_MARGIN_US",
+        default_value_t = 1000
+    )]
+    arb_transfer_margin_us: u64,
+
+    /// Fraction of a window's contested samples the challenger must also lead (meaningful range
+    /// 0.0-1.0). Independent of the margin, so a heavy tail alone cannot carry a transfer.
+    #[arg(
+        long = "arb-transfer-win-rate",
+        env = "DZ_ARB_TRANSFER_WIN_RATE",
+        default_value_t = 0.8
+    )]
+    arb_transfer_win_rate: f64,
+
+    /// Seconds of leader silence after which a healthy challenger takes authority.
+    #[arg(
+        long = "arb-leader-timeout-secs",
+        env = "DZ_ARB_LEADER_TIMEOUT_SECS",
+        default_value_t = 2
+    )]
+    arb_leader_timeout_secs: u64,
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -355,6 +389,16 @@ async fn main() -> Result<()> {
         a.set_depth_replay(depth.clone());
         Arc::new(Mutex::new(a))
     };
+
+    // Single-arm authority tunables for `Sticky` venues. Built here so the flags are validated at
+    // startup; the arbiter consumes it once the incremental book path lands.
+    let authority_cfg = ingest::authority::AuthorityConfig {
+        leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
+        sample_interval_ns: args.arb_sample_interval_secs.saturating_mul(1_000_000_000),
+        transfer_margin_ns: args.arb_transfer_margin_us.saturating_mul(1_000),
+        transfer_win_rate: args.arb_transfer_win_rate,
+    };
+    let _ = &authority_cfg;
 
     // WebSocket sink config. The sink itself is activated by the subscription reconciler (below),
     // not here: it comes up only when a market-data feed is actually subscribed, and its listener is
