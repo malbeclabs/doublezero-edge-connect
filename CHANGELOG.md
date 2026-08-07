@@ -25,6 +25,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
 
 ### Added
+- WebSocket subscription filters gain a `channel` dimension (the publisher's channel id) and a message-`type` dimension, so a consumer can take `book` without `quote`, or one channel's books without the rest. A message that carries no channel is excluded by an explicit `channel` filter — except `instrument`, since a client that cannot see a definition cannot scale the book it subscribed to. Both match paths (symbol-bearing and venue-level `status`) now route through the one `SubFilter::matches`, so a future dimension cannot silently exempt half the stream. Replay is also scoped: state is replayed on connect as before, and again on each `subscribe` for the filter just added, instead of only ever replaying every market at connect time. (#99)
+- Each `Feed` now declares an `ArbitrationMode` (`Coordinated`/`Sticky`), carried into the arbiter as a per-venue map. Behaviour-neutral: every existing venue is `Coordinated` — today's latch-to-leader staleness floor — and an unregistered venue defaults to it. The seam exists for venues whose redundant publishers stamp no comparable venue clock, which cannot be arbitrated by a per-tick floor. (#94)
+- `ingest::codec_mbp` — pure decoder for the Market-by-Price feed (frame magic `0x4442`): the frame
+  walk, the five message types inherited from the byte-validated Top-of-Book layout, the three
+  price-keyed payloads this feed defines (`LevelUpdate`, `BookClear`, `SnapshotLevel`), and the four
+  it shares byte-for-byte with Market-by-Order (`Snapshot{Begin,End}`, `BatchBoundary`,
+  `InstrumentReset`). Nothing ingests it yet — no `FEEDS` row, no processor. Two rules make it
+  stricter than the sibling codecs, and they depend on each other: a frame declaring an
+  unimplemented schema version is rejected whole, and within v1 a body length must equal the type's
+  declared size exactly. `SnapshotBegin` is a prefix-superset of Market-by-Order's, so a lenient
+  decode would read `depth_bound` from whatever follows the body — and the version gate is what
+  keeps the length rule from silently rejecting a v2 frame whose bodies legally grew. Offsets are
+  validated field-for-field against the Go reference decoder and against two committed real captures
+  of the live publisher — a sharded multi-channel set and a dense single-channel set. Four message
+  types appear in neither capture and stay offset-test-only; `tests/fixtures/PROVENANCE.md` records
+  that and the publisher deviations the captures contain. (#95)
+- `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
+  with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
+- `PriceBook` (`src/ingest/pricebook.rs`): the price-keyed L2 book and its snapshot+delta recovery
+  state machine for the market-by-price feed — a sibling of the order-keyed `book.rs`, since the
+  wire already carries absolute per-level quantities and has nothing to aggregate. Deltas apply only
+  in unbroken per-instrument sequence, a gap buffers until a snapshot re-anchors, and buffered
+  deltas past the snapshot's `anchor_seq` replay afterwards. Both the buffer and the level map are
+  capped, so an unauthenticated forged stream cannot grow them without limit. Internal only — no
+  codec, feed row or wire change yet, so no observable behaviour differs. (#96)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All eleven live Hyperliquid publishers are
   ingested (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time

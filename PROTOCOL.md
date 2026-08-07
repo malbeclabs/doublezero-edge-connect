@@ -253,9 +253,11 @@ A consumer may send control messages (JSON text frames) to filter the stream. **
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "venue"?: string, "symbol"?: string }` - an **omitted field matches
-any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue). `venue` is matched
-**case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol` is matched exactly.
+A subscription filter is `{ "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue` is matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+
+`channel` is the publisher's channel id — the instrument set a feed carries. A message type that carries no channel (everything except `book`) is **excluded** by an explicit `channel` filter, so `{"channel":2}` selects book updates on channel 2 and nothing else. `instrument` is the one carve-out: reference data is infrastructure, and a consumer that cannot see a definition cannot scale the book it just subscribed to, so definitions pass a `channel` filter. Note that a channel-filtered client currently receives the venue's whole instrument set rather than that channel's, because `instrument` carries no channel yet (see *Identity* under [`book`](#book)); it still narrows normally on `venue` and `symbol`.
+
+A venue-level message (`status`) carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status. A `{"type":"quote"}` subscriber does not, having asked for quotes only.
 
 **Client -> server:**
 
@@ -274,8 +276,9 @@ any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue). `ve
 ```
 
 Unknown/malformed control messages get `{"channel":"error","error":"unrecognized message"}` and
-are otherwise ignored. Instrument definitions are always replayed on connect regardless of
-subscriptions.
+are otherwise ignored.
+
+Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
 
 ## Heartbeat & liveness
 
