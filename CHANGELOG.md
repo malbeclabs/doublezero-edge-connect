@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Market-by-Order books were keyed `(publisher, instrument_id)`, dropping the `channel_id` that the
+  edge-feed-spec makes part of an instrument's unique key — `instrument_id` is scoped to its channel
+  and need not be unique across channels. Two channels on one group both carrying instrument id 7
+  had their books merged, applying each channel's deltas to the other's state; every per-publisher
+  sequence check still passed, so it surfaced only as a silently corrupt book. The book key and the
+  `SnapshotOrder` routing filter now both carry `channel_id`, taken from the frame header. Latent —
+  the live publishers put everything on channel 0. Reference data remains channel-flat, so such a
+  pair would still resolve one definition and publish under one symbol. (#110)
 - Five Hyperliquid publishers that had been live on `tiredsolid` since mid-June were missing from
   the feed registry, so the bridge bound 6 of 11 port blocks and ingested roughly a third of the
   group's datagrams — including none of the three highest-volume Top-of-Book blocks or the

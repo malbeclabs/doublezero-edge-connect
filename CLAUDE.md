@@ -234,10 +234,15 @@ Modules are grouped by role under `src/`:
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
   + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
-  `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
-  datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
-  sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
-  instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
+  `MboProcessor` reconstructs an **independent book per `BookKey` = `(publisher, channel_id,
+  instrument_id)`**. *Publisher* (the datagram source IP): two publishers mirror one feed but their
+  instance-scoped per-instrument delta sequences collide, so the books can't be merged. *Channel*
+  (from the **frame header**, never a message body): the edge-feed-spec scopes `instrument_id` to its
+  channel, so two channels reusing an id would otherwise share one book and cross-apply deltas —
+  silent corruption no sequence check catches. ⚠️ `RefDataState` is **not** channel-scoped, so such a
+  pair still resolves one definition/symbol; moot while publishers stay on channel 0. `SnapshotOrder`
+  carries only a `snapshot_id` (no instrument id) and routes **only to the originating
+  `(publisher, channel)`'s** building book. `emit_depth` stamps
   `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *frame*, so two
   frames in one tick can emit two depths with the same `source_ts`; this is **benign** under the
   content-inclusive depth floor (same tick + same leader + new content → both admitted, distinct
