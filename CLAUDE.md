@@ -290,9 +290,16 @@ Modules are grouped by role under `src/`:
   `Utf8Bytes` clone (so N clients cost one serialization, and `ws_send_ts_ns` is one instant shared by
   all consumers of a message — see PROTOCOL.md). With no clients connected the serializer skips the
   work. On connect it replays the instrument snapshot (precision first) **then the latest
-  `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Implements the
+  `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Replay is one
+  `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
+  scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
+  replaying every market. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
-  firehose), app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
+  firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
+  `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
+  (`status`) paths call, so a new dimension can't silently exempt half the stream; a channelless
+  message is excluded by an explicit `channel` filter, `instrument` excepted (precision must reach a
+  channel-scoped client). Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
