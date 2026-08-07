@@ -11,9 +11,11 @@
 //!
 //! * **Exact body-length equality per type, not `>=`, paired with a `SCHEMA_VERSION` gate.** The
 //!   forward-compatibility rule that a decoder ignores trailing bytes applies across a Schema
-//!   Version bump; within v1 an unexpected length is malformed. The two rules are one decision: the
-//!   version gate is what keeps the length rule from silently rejecting a v2 frame whose bodies
-//!   legally grew. The length rule is load-bearing because `SnapshotBegin` is a prefix-superset of
+//!   Version bump; within v1 an unexpected length is malformed. The two rules are one decision: a v2
+//!   frame whose bodies legally grew fails the length rule for every message, and the version gate is
+//!   what turns that from a silent feed of `Other` into a decode error. Either way a bumped schema
+//!   goes dark — the gate is what makes it visible. The length rule is load-bearing because
+//!   `SnapshotBegin` is a prefix-superset of
 //!   the market-by-order feed's — the first 36 message bytes are identical and `Depth Bound` is
 //!   appended at message offset 36 — so a sibling-shaped body would otherwise decode with
 //!   `depth_bound` read from whatever follows the body: the next message's header bytes, or trailing
@@ -261,7 +263,17 @@ pub enum Message {
 /// module doc's `Depth Bound` case). Without the version gate the length rule would apply v1 sizes
 /// to a v2 frame whose bodies legally grew, and the whole feed would decode to `Other` in silence.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    let (header, messages) = decode_frame_with(buf, MAGIC, |ty, _flags, b, off| {
+    // Ahead of the walk, not after it: under a bumped schema every message is rejected anyway, so
+    // decoding the frame first is pure waste at exactly the moment it is 100% of datagrams. Gated on
+    // the magic so a sibling protocol's frame still reports its magic rather than a version it does
+    // not use; `buf[2]` is in bounds because the read above returned `Some`.
+    if u16le(buf, 0) == Some(MAGIC) && u8le(buf, 2).is_some_and(|v| v != SCHEMA_VERSION) {
+        bail!(
+            "unsupported mbp schema version {} (expected {SCHEMA_VERSION})",
+            buf[2]
+        );
+    }
+    decode_frame_with(buf, MAGIC, |ty, _flags, b, off| {
         // In bounds: the walker breaks before calling this unless `off + MSG_HEADER_SIZE` fits.
         let msg_len = b[off + 1] as usize;
         let body = off + MSG_HEADER_SIZE;
@@ -305,14 +317,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
             // `MSG_LIQUIDATION` carries nothing this bridge re-serves. Both fall through here.
             _ => Message::Other(ty),
         }
-    })?;
-    if header.schema_version != SCHEMA_VERSION {
-        bail!(
-            "unsupported mbp schema version {} (expected {SCHEMA_VERSION})",
-            header.schema_version
-        );
-    }
-    Ok((header, messages))
+    })
 }
 
 fn decode_heartbeat(b: &[u8], o: usize) -> Option<Message> {
