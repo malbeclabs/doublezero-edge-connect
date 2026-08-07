@@ -14,31 +14,41 @@
 
 ## Progress
 
-**Status: not started.** Nothing below has been implemented.
+**Status: Tasks 1, 2, 3, 7, 8, 9 are done.** They are the whole bottom of the stack bar arbitration: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, the market-by-price decoder and the price book. Nothing they add is reachable from a running process yet — no `FeedKind`, no `FEEDS` row, no processor — so the branch is behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes.
 
 | Task | State |
 |---|---|
-| 1 — `trade_id == 0` bypass | not started |
-| 2 — per-publisher `RefDataState` | not started |
-| 3 — arbitration mode plumbing | not started |
+| 1 — `trade_id == 0` bypass | **done** (`aafc871`, `2eeb93b`; review fixes `b2e9264`, `4d19da6`) |
+| 2 — per-publisher `RefDataState` | **done** (`a459c36`, `4f59d78`; review fix `23304c6`) |
+| 3 — arbitration mode plumbing | **done** (`8ad3377`; review fix `4d19da6`) |
 | 4 — `StickyAuthority` | not started |
 | 5 — re-election sampling | not started |
 | 6 — `channel`/`type` filters | not started |
-| 7 — `codec_mbp` frame walk | not started |
-| 8 — `codec_mbp` price types | not started |
-| 9 — `PriceBook` | not started |
+| 7 — `codec_mbp` frame walk | **done** (`d12ff44`, `f89e68b`; review fix `75ce041`) |
+| 8 — `codec_mbp` price types | **done** (`1b003a3`, `f89e68b`) — **except Step 9, the real-frame fixture capture**, which needs tunnel access nobody executing this had |
+| 9 — `PriceBook` | **done** (`0f018cb`, `cc69ea6`, `e6bccee`; review fixes `503b6a6`, `3bf9a09`) |
 | 10 — `book` wire message | not started |
 | 11 — `MbpProcessor` | not started |
 | 12 — book authority gate | not started |
 | 13 — runtime tape ownership | not started |
 | 14 — Lashay feed rows | **blocked** (see *Blocking open question*) |
 
+**Where the work lives.** All of it is on the single long-lived branch **`bdz/lashay-mbp`**, not one branch per task — see the amended bullet below. It was first built as four stacked-in-name-only PRs (#100–#103, all off `main`), reviewed as a set, then combined and closed in favour of this branch.
+
+**What the set review changed, and what a later task inherits from it.** Six fixes landed on top of the six tasks. Three matter to whoever picks this up:
+
+- `pricebook` no longer restates the wire enums — it imports `SIDE_*`/`CLEAR_SIDE_*`/`SCOPE_*` from `codec_mbp`. Task 11 passes a decoded `side` byte straight through, and two copies that drifted would swap bids and asks with every sequence check still passing. **Do not reintroduce a local copy.**
+- `PriceBook`'s level-cap overflow returns `DeltaOutcome::Overflow`, not `Gap`; the two leave different `status` behind. Task 11's metrics must not merge them.
+- Task 1's zero-id tape owner hands over after 5s of silence rather than latching forever, so `dz_trades_no_id_conflict_total` still means *concurrent* double-printing once Tasks 4 and 13 start moving tape ownership at runtime.
+
+Two tests are correct now and are **meant** to fail later; both say so in their doc comments. `feeds::tests::at_most_one_trade_emitting_row_per_venue` is superseded by Task 13's runtime assertion, and `existing_venues_are_coordinated` excludes `Lashay` so Task 14's `Sticky` rows don't read as a regression.
+
 **How to hand this off, and how to pick it up.** This file is the working record, so keep it current as you go rather than at the end:
 
 - Tick each `- [ ]` to `- [x]` as its step lands, and update the row above (`not started` → `in progress` → `done`, with the commit SHA once a task's final commit exists).
 - Commit the plan update **with** the code it describes, in the same commit. A ticked box with no commit behind it is worse than an unticked one.
 - If you stop mid-task, add a line under that task's row saying which step you stopped at and anything you learned that the plan does not already say — especially a step that turned out wrong.
-- Tasks are sequential: each branches off its predecessor's tip (Task 1 off `main`). Picking up means checking out the last completed branch and starting the next task from it.
+- ~~Tasks are sequential: each branches off its predecessor's tip (Task 1 off `main`).~~ **Amended after Tasks 1–3/7–9 shipped:** the whole feature is built on **`bdz/lashay-mbp`**, so there is no PR gate between tasks. Start the next task from that branch's tip; a delegated build takes its own branch off it and merges back. The task *order* is still a dependency order — a later task will not compile without its predecessors — and Tasks 4–6 are unbuilt, so anything depending on `authority` (Task 12, and the `Sticky` half of the arbiter) is still blocked on them.
 - Task 14 is the only blocked one and it is last, so a pickup never has to wait on it.
 
 ---
@@ -49,7 +59,7 @@ Every task's requirements implicitly include this section.
 
 - **The venue is `Lashay`** — in source, comments, tests, fixture names, file names, branch names, commit messages, and PR titles and bodies. `Lashay` names the venue this bridge ingests; it is never part of an *identifier* that belongs to something else. Refer to external packages, crates, services and multicast group codes by their own names, and describe them rather than renaming them. (In prose, `Lashay-shaped` and the like are ordinary English — the rule is about identifiers.)
 - **Never credit Claude or any AI.** No `Co-Authored-By`, no "Generated with Claude Code", no AI-attribution comments.
-- **One branch per task, each off its predecessor's tip** (Task 1 off `main`). The order is a dependency order, not a preference — a later task will not compile without its predecessors.
+- **Everything lands on `bdz/lashay-mbp`**, the long-lived feature branch, so the feature is reviewed once when it is whole rather than task by task. Work on that branch directly, or on a short-lived branch off its tip that merges back. (This replaces the original "one branch per task off its predecessor's tip" rule; the four task branches that produced Tasks 1–3/7–9 were combined into it.) The task order is still a dependency order, not a preference — a later task will not compile without its predecessors.
 - **This software targets Linux and is never validated on a macOS or Windows host.** CI runs on Linux and host runs diverge (rustfmt nightly availability, workspace feature unification, target-specific `cfg` gates), so run `cargo test` / `clippy` / `fmt` in whatever Linux environment you build in.
 - **Two sibling checkouts are referenced below** as `<edge-feed-spec>` (`malbeclabs/edge-feed-spec` — the wire spec) and `<edge-multicast-ref>` (`malbeclabs/edge-multicast-ref` — the reference Go decoders this plan validates against). Substitute wherever they sit locally.
 - **PROTOCOL.md is the contract.** Any wire change must keep the forward-compat rule (consumers ignore unknown types and fields) and be reflected there in the same commit.
@@ -172,11 +182,11 @@ Task 14 assumes **(1)** and takes both neutral codes and the group address as pa
 - Consumes: nothing from earlier tasks.
 - Produces: `Metrics::trades_no_id: IntCounterVec` (`dz_trades_no_id_total{venue}`); the `FEEDS` invariant "at most one `emit_trades: true` row per venue" — true for the tree this ships into, and generalized to **at most one tape emitter per venue at any moment** by Task 13, which is the form the bypass actually depends on.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off `main`.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to the `mod tests` block at the bottom of `src/ingest/arbiter.rs`. It drives the real `Arbiter::emit`, not `WindowedDedup` directly, because the bypass lives in the `emit` arm.
 
@@ -234,7 +244,7 @@ Add to the `mod tests` block at the bottom of `src/ingest/arbiter.rs`. It drives
 
 `NormalizedTrade` and `Side` need importing in the test module — the existing `use crate::model::{NormalizedQuote, Side};` at `arbiter.rs:1011` becomes `use crate::model::{NormalizedQuote, NormalizedTrade, Side};`.
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 ```bash
 cargo test --lib zero_trade_id_bypasses_the_window
@@ -242,7 +252,7 @@ cargo test --lib zero_trade_id_bypasses_the_window
 
 Expected: FAIL — `assertion \`left == right\` failed: every zero-id print must be emitted; left: 1, right: 5`.
 
-- [ ] **Step 4: Add the metric**
+- [x] **Step 4: Add the metric**
 
 In `src/metrics.rs`, add the field next to `trades_dropped` (`:99`):
 
@@ -261,7 +271,7 @@ and the registration next to `quotes_no_source_ts` (`:435-440`):
             ),
 ```
 
-- [ ] **Step 5: Pre-resolve the metric child**
+- [x] **Step 5: Pre-resolve the metric child**
 
 In `src/ingest/arbiter.rs`, add to `struct VenueMetrics` next to `trades_dropped` (`:516`):
 
@@ -275,7 +285,7 @@ and to `VenueMetrics::new` next to `trades_dropped` (`:565`):
             trades_no_id: m.trades_no_id.with_label_values(&[venue]),
 ```
 
-- [ ] **Step 6: Implement the bypass**
+- [x] **Step 6: Implement the bypass**
 
 Replace the head of the `FeedMessage::Trade(t)` arm (`arbiter.rs:752-754`) so the sentinel short-circuits before the window:
 
@@ -302,7 +312,7 @@ Replace the head of the `FeedMessage::Trade(t)` arm (`arbiter.rs:752-754`) so th
 
 The rest of the arm is unchanged.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib trade
@@ -310,7 +320,7 @@ cargo test --lib trade
 
 Expected: PASS, including the pre-existing `trade_new_admitted_repeat_dropped` and `trade_keys_independent_and_window_evicts`.
 
-- [ ] **Step 8: Pin the invariant the bypass depends on**
+- [x] **Step 8: Pin the invariant the bypass depends on**
 
 Add to `mod tests` in `src/ingest/feeds.rs`:
 
@@ -338,7 +348,7 @@ Add to `mod tests` in `src/ingest/feeds.rs`:
     }
 ```
 
-- [ ] **Step 9: Run the full suite and clippy**
+- [x] **Step 9: Run the full suite and clippy**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -346,7 +356,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 10: Document**
+- [x] **Step 10: Document**
 
 Add to `docs/metrics.md` alongside the other arbiter counters:
 
@@ -360,7 +370,7 @@ Add to `CHANGELOG.md` under Unreleased → Fixed:
 - Trades stamped `trade_id == 0` (the "no venue trade id" sentinel, emitted by FIX-sourced publishers) now bypass the cross-source dedup window instead of being keyed on it. Previously the second and every later such print was discarded as a same-publisher duplicate and `0` never aged out of the window, collapsing the tape to a single print per `(venue, symbol)` for the process's lifetime.
 ```
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add -A
@@ -383,11 +393,11 @@ Not currently reachable — one receiver task binds one port block, so each `Ref
 - Consumes: nothing.
 - Produces: the private helper pattern `fn state_for(&mut self, publisher: IpAddr) -> &mut RefDataState<D>` on each processor, plus `MAX_PUBLISHERS`-bounded eviction. `MbpProcessor` (Task 10) copies this shape.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 1's final commit.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to `mod tests` in `src/ingest/processor.rs`. It drives `TobProcessor` with two source IPs and bumps only one's `reset_count`.
 
@@ -430,7 +440,7 @@ Add to `mod tests` in `src/ingest/processor.rs`. It drives `TobProcessor` with t
 
 `state_for` must be visible to the test module — declare it `pub(crate)` or leave it private (the test module is a child of `processor`, so private is fine). `InstrumentDefinition` is `crate::ingest::codec::InstrumentDefinition`; check the existing test-module imports and extend them.
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 ```bash
 cargo test --lib refdata_reset_is_scoped
@@ -438,7 +448,7 @@ cargo test --lib refdata_reset_is_scoped
 
 Expected: FAIL to compile — `no method named 'state_for' found for struct 'TobProcessor'`.
 
-- [ ] **Step 4: Add the shared per-publisher map helper**
+- [x] **Step 4: Add the shared per-publisher map helper**
 
 Add near `MAX_PUBLISHERS` (`processor.rs:106`) — one generic helper all three processors use, so the eviction rule is written once:
 
@@ -476,7 +486,7 @@ impl<D: crate::ingest::subscriber::InstrumentDef> PerPublisher<D> {
 }
 ```
 
-- [ ] **Step 5: Convert `TobProcessor`**
+- [x] **Step 5: Convert `TobProcessor`**
 
 Change the field at `processor.rs:136`:
 
@@ -506,7 +516,7 @@ Then rewrite every `self.state.<method>` call in `TobProcessor::on_datagram` to 
   ```
 - `on_instrument_definition(d)` consumes `d`, so build the `NormalizedInstrument` from `d` first, then hand `d` to the state, then emit.
 
-- [ ] **Step 6: Convert `MidpointProcessor` and `MboProcessor` the same way**
+- [x] **Step 6: Convert `MidpointProcessor` and `MboProcessor` the same way**
 
 `MidpointProcessor.state` (`:391`) and `MboProcessor.state` (`:519`) both become `PerPublisher<...>`, each gaining a `state_for(publisher)` accessor and the same call-site rewrite. `MboProcessor` has more sites — `book_for`'s gate 1 (`self.state.definition(instrument_id)?`), the `book_for` eviction's `self.state.definition(old_id)`, `emit_depth`'s definition lookup, and the `ManifestSummary` / `InstrumentDefinition` / `Trade` / `OrderExecute` handlers.
 
@@ -522,7 +532,7 @@ Then rewrite every `self.state.<method>` call in `TobProcessor::on_datagram` to 
 
 Do **not** change `MidpointProcessor`'s un-keyed `SeqTracker` (`:392`) — out of scope, and the 2026-08-05 plan deliberately left it.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -530,7 +540,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass, including the existing `tests/codec_mbo_fixtures.rs` and `tests/e2e.rs`.
 
-- [ ] **Step 8: Document and commit**
+- [x] **Step 8: Document and commit**
 
 `CHANGELOG.md` under Unreleased → Fixed:
 
@@ -560,11 +570,11 @@ git commit -m "fix(ingest): scope reference-data state per publisher, not per re
 - Consumes: nothing.
 - Produces: `pub enum ArbitrationMode { Coordinated, Sticky }` in `ingest::feeds` (`Copy + PartialEq + Eq + Debug`); `Feed.arbitration: ArbitrationMode`; `Arbiter::set_mode(&mut self, venue: &'static str, mode: ArbitrationMode)`; `Arbiter::mode_for(&self, venue: &str) -> ArbitrationMode` defaulting to `Coordinated`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 2's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/feeds.rs`:
 
@@ -592,7 +602,7 @@ Add to `mod tests` in `src/ingest/feeds.rs`:
     }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test --lib arbitration_mode_agrees
@@ -600,7 +610,7 @@ cargo test --lib arbitration_mode_agrees
 
 Expected: FAIL to compile — `no field 'arbitration' on type '&Feed'`.
 
-- [ ] **Step 4: Add the enum and the field**
+- [x] **Step 4: Add the enum and the field**
 
 In `src/ingest/feeds.rs`, above `struct Feed`:
 
@@ -626,7 +636,7 @@ pub enum ArbitrationMode {
 
 Add `pub arbitration: ArbitrationMode,` to `struct Feed` with a one-line doc, and `arbitration: ArbitrationMode::Coordinated,` to all three existing `FEEDS` rows.
 
-- [ ] **Step 5: Carry the mode into the arbiter**
+- [x] **Step 5: Carry the mode into the arbiter**
 
 In `src/ingest/arbiter.rs`, add to `struct Arbiter`:
 
@@ -655,7 +665,7 @@ Initialize it to `HashMap::new()` in `Arbiter::new`, and add:
     }
 ```
 
-- [ ] **Step 6: Populate the map in `main.rs`**
+- [x] **Step 6: Populate the map in `main.rs`**
 
 Immediately after `Arbiter::new(...)` and before the arbiter is wrapped in the `SharedArbiter`, register every selected feed's mode, using whatever local binding holds the selected feed list at that point (the value handed to `ReconcilerConfig.enabled`):
 
@@ -665,7 +675,7 @@ Immediately after `Arbiter::new(...)` and before the arbiter is wrapped in the `
     }
 ```
 
-- [ ] **Step 7: Run everything, then commit**
+- [x] **Step 7: Run everything, then commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -1676,7 +1686,7 @@ git commit -m "feat(ws): add channel and type subscription filters, scope replay
   pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)>
   ```
 
-- [ ] **Step 1: Branch, and confirm the oracle is current**
+- [x] **Step 1: Branch, and confirm the oracle is current**
 
 Branch off Task 6's final commit. Then check the reference decoder checkout is up to date, since this task validates against it:
 
@@ -1687,7 +1697,7 @@ git -C <edge-multicast-ref> log --oneline -1 origin/main
 
 The local checkout is one commit behind `origin/main` (`b2a5b48`, merged PR #34, which adds `go/marketbyprice-bot` — the *state-machine* oracle Task 9 wants). `go/marketbyprice-parser/marketbyprice_wire.go` is the codec oracle for this task and is already present.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `src/ingest/codec_mbp.rs`. Every test builds a frame from literal offsets transcribed from the spec, so it is offset-independent of the decoder.
 
@@ -1865,7 +1875,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Add `pub mod codec_mbp;` to `src/ingest/mod.rs`, then:
 
@@ -1875,7 +1885,7 @@ cargo test --lib codec_mbp
 
 Expected: FAIL to compile — `cannot find value 'MAGIC' in this scope`.
 
-- [ ] **Step 4: Write the module head, constants and inherited types**
+- [x] **Step 4: Write the module head, constants and inherited types**
 
 Prepend to `src/ingest/codec_mbp.rs`:
 
@@ -1992,7 +2002,7 @@ pub enum Message {
 }
 ```
 
-- [ ] **Step 5: Write the frame walk and the body decoders**
+- [x] **Step 5: Write the frame walk and the body decoders**
 
 ```rust
 /// Decode one datagram. `msg_len` is checked for exact equality with the type's declared size
@@ -2063,7 +2073,7 @@ fn decode_manifest_summary(b: &[u8], o: usize) -> Option<Message> {
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib codec_mbp
@@ -2071,7 +2081,7 @@ cargo test --lib codec_mbp
 
 Expected: all eleven PASS.
 
-- [ ] **Step 7: Cross-check every offset against the Go oracle**
+- [x] **Step 7: Cross-check every offset against the Go oracle**
 
 Open `<edge-multicast-ref>/go/marketbyprice-parser/marketbyprice_wire.go` and confirm each struct's slice bounds against the decoder above. The Go offsets are **body-relative**; ours are body-relative too (`o` already points past the 4-byte header), so they compare directly:
 
@@ -2085,7 +2095,7 @@ Open `<edge-multicast-ref>/go/marketbyprice-parser/marketbyprice_wire.go` and co
 
 Any disagreement is a decoder bug, not an oracle bug — fix ours.
 
-- [ ] **Step 8: Pin the sharing with the byte-validated top-of-book codec**
+- [x] **Step 8: Pin the sharing with the byte-validated top-of-book codec**
 
 Add a test asserting the shared layouts really are shared, so the claim is self-enforcing rather than eyeballed (this mirrors `codec_mbo_fixtures.rs`'s `tob_shared_layouts_decode_identically`):
 
@@ -2122,7 +2132,7 @@ Add a test asserting the shared layouts really are shared, so the claim is self-
 
 `codec::MAGIC` and `codec::Message` may need `pub` visibility — check `src/ingest/codec.rs` and widen if so.
 
-- [ ] **Step 9: Full suite, clippy, commit**
+- [x] **Step 9: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -2160,11 +2170,11 @@ git commit -m "feat(codec): add the market-by-price frame walk and inherited mes
   ```
   New `Message` variants for each. `depth_bound` stays a plain `u32` here — the wire always carries it — and the *unknown* state (`Option<u32>`) belongs to `PriceBook` in Task 9, which is where "no publisher has claimed a bound yet" is a real state.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 7's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/codec_mbp.rs`. Offsets are transcribed from `market-by-price/spec.md`'s field tables and are **message-relative minus 4** (body-relative), matching the Go oracle's slices.
 
@@ -2421,7 +2431,7 @@ Add to `mod tests` in `src/ingest/codec_mbp.rs`. Offsets are transcribed from `m
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib codec_mbp
@@ -2429,7 +2439,7 @@ cargo test --lib codec_mbp
 
 Expected: FAIL to compile — `cannot find value 'MSG_LEVEL_UPDATE'`.
 
-- [ ] **Step 4: Add the constants, sizes and structs**
+- [x] **Step 4: Add the constants, sizes and structs**
 
 Append to the constants block in `src/ingest/codec_mbp.rs`:
 
@@ -2486,7 +2496,7 @@ Then the seven structs, exactly as listed in **Interfaces** above. Doc lines wor
 - `SnapshotBegin.depth_bound`: "`0` is a positive publisher claim that this snapshot carries the complete book. Non-zero is levels-per-side, beyond which state is **unknown, not empty**."
 - `InstrumentReset`: "Carries no per-instrument seq — processed regardless of sequence state."
 
-- [ ] **Step 5: Add the `Message` variants and the decoders**
+- [x] **Step 5: Add the `Message` variants and the decoders**
 
 Extend `enum Message` with `LevelUpdate(LevelUpdate)`, `BookClear(BookClear)`, `SnapshotLevel(SnapshotLevel)`, `SnapshotBegin(SnapshotBegin)`, `SnapshotEnd(SnapshotEnd)`, `BatchBoundary(BatchBoundary)`, `InstrumentReset(InstrumentReset)`, then add the arms to `decode_frame`'s match (each `if exact(sizes::X)`) and the body decoders:
 
@@ -2581,7 +2591,7 @@ fn decode_instrument_reset(b: &[u8], o: usize) -> Option<Message> {
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib codec_mbp
@@ -2589,7 +2599,7 @@ cargo test --lib codec_mbp
 
 Expected: all twenty-six PASS.
 
-- [ ] **Step 7: Cross-check every offset against the Go oracle**
+- [x] **Step 7: Cross-check every offset against the Go oracle**
 
 Against `marketbyprice_wire.go`, body-relative:
 
@@ -2605,11 +2615,11 @@ Against `marketbyprice_wire.go`, body-relative:
 
 Signedness to mirror: `i64` for every `*price*` field, `i8` for the two exponents, unsigned everywhere else. A disagreement is our bug.
 
-- [ ] **Step 8: Add the fixture test harness**
+- [x] **Step 8: Add the fixture test harness** — done as the cross-codec pinning half only; the real-frame decode test is not there, because Step 9 produced no fixture to point it at.
 
 Create `tests/codec_mbp_fixtures.rs` with the cross-codec equality test moved out of the unit module (so the integration suite also pins it) plus a real-frame decode test over `tests/fixtures/mbp_{mktdata,refdata,snapshot}.bin`, using `tests/common/replay.rs`'s `split_frames` reader exactly as `tests/codec_mbo_fixtures.rs` does — read that file first and mirror its structure. The real-frame test asserts, at minimum: zero decode errors across every frame; `total_levels` equals the decoded `SnapshotLevel` count between a `SnapshotBegin`/`SnapshotEnd` pair; every `LevelUpdate.per_instrument_seq` for one instrument is dense; and at least one `depth_bound == 0` is observed (the live perps publisher carries the complete book).
 
-- [ ] **Step 9: Capture the fixtures**
+- [ ] **Step 9: Capture the fixtures** — **NOT DONE, and the only step in Tasks 1–3/7–9 that isn't.** The escape hatch below was taken: no host available had the tunnel up and subscribed to the market-by-price group, and no fixture was synthesized. The `pcap2frames --protocol mbp` half *is* built, so this is one command on a host with access. The gap is stated in `codec_mbp.rs`'s module doc ("Oracle strength: no real-frame fixture exists yet"), in `tests/fixtures/PROVENANCE.md`, in `tests/codec_mbp_fixtures.rs`'s module doc, and in CHANGELOG. Do this before any `FEEDS` row goes live on this protocol.
 
 `examples/pcap2frames.rs` needs an `Mbp` variant: add it to `enum Protocol` (`:44`) with magic `[0x42, 0x44]` (`0x4442` LE) and a `process_mbp` arm mirroring `process_mbo` (`:1089`, `:1105`). Then, on a host with the DoubleZero tunnel up and subscribed to the perps MBP group:
 
@@ -2623,7 +2633,7 @@ Record the source IP, capture date, frame counts and observed `depth_bound` in `
 
 **If tunnel access is unavailable to whoever executes this task, stop here and say so rather than synthesizing a fixture and calling it a capture.** Ship Steps 1–8 with the module doc recording MBP's oracle strength honestly: offset tests plus field-for-field Go-oracle parity, **no real-frame fixture yet**. That is strictly stronger than `codec_midpoint` (self-consistency only) and weaker than `codec_mbo` (real capture), and the difference must be stated, not papered over. Add the missing fixture to the PR body's "what was not verified".
 
-- [ ] **Step 10: Full suite, clippy, commit**
+- [x] **Step 10: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -2677,11 +2687,11 @@ This task implements four of the design's §4 conformance items, each with a nam
   }
   ```
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 8's final commit.
 
-- [ ] **Step 2: Fetch the state-machine oracle**
+- [x] **Step 2: Fetch the state-machine oracle**
 
 ```bash
 git -C <edge-multicast-ref> pull --ff-only origin main
@@ -2690,7 +2700,7 @@ ls <edge-multicast-ref>/go/marketbyprice-bot
 
 `marketbyprice-bot` (merged PR #34) is the reference book engine. Read `instrument.go` — `SnapshotAcceptable`, `BeginSnapshot`/`AddSnapshotLevel`/`EndSnapshot`, `ApplyLevelUpdate`, `ApplyBookClear`, `Crossed` — and mirror its decisions. **Two places to deliberately diverge:** its `reorderWindow = 16` (treating deltas up to 16 ahead as reordering rather than a gap) has no basis in the spec, which says `> last + 1` is a gap, full stop — do not port it. Its shard-level `maxBufferedDeltasPerShard` is a cross-instrument bound; that is Task 10's.
 
-- [ ] **Step 3: Write the failing tests**
+- [x] **Step 3: Write the failing tests**
 
 Create `src/ingest/pricebook.rs` with the test module only.
 
@@ -3113,7 +3123,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run to verify failure**
+- [x] **Step 4: Run to verify failure**
 
 Add `pub mod pricebook;` to `src/ingest/mod.rs`, then:
 
@@ -3123,7 +3133,7 @@ cargo test --lib pricebook
 
 Expected: FAIL to compile — `cannot find type 'PriceBook' in this scope`.
 
-- [ ] **Step 5: Implement `PriceBook`**
+- [x] **Step 5: Implement `PriceBook`**
 
 Write the implementation against the tests. Every public item and rule is fixed by **Interfaces** and the tests above; these are the decisions the tests do not spell out in code:
 
@@ -3139,7 +3149,7 @@ Write the implementation against the tests. Every public item and rule is fixed 
 
 Mark `MAX_BUFFERED_DELTAS` `pub(crate)` so the test module and Task 10 both see it.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib pricebook
@@ -3147,7 +3157,7 @@ cargo test --lib pricebook
 
 Expected: all twenty-four PASS.
 
-- [ ] **Step 7: Full suite, clippy, commit**
+- [x] **Step 7: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
