@@ -44,6 +44,7 @@ use prometheus::{Histogram, IntCounter};
 use tokio::sync::broadcast;
 
 use crate::{
+    ingest::feeds::ArbitrationMode,
     metrics::metrics,
     model::{
         self, now_mono_ns, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote,
@@ -491,6 +492,10 @@ pub struct Arbiter {
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
     venue_metrics: HashMap<Arc<str>, VenueMetrics>,
+    /// Per-venue arbitration mode, populated at startup from the selected `FEEDS` rows. A venue
+    /// absent from the map arbitrates as `Coordinated` — what every venue did before modes existed,
+    /// so an unregistered venue can never silently change semantics.
+    modes: HashMap<&'static str, ArbitrationMode>,
 }
 
 /// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
@@ -596,7 +601,22 @@ impl Arbiter {
             depth_replay: None,
             instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
+            modes: HashMap::new(),
         }
+    }
+
+    /// Declare a venue's arbitration mode. Called once per selected feed at startup; a venue's rows
+    /// are pinned to one mode by `feeds::tests::arbitration_mode_agrees_across_a_venues_rows`.
+    pub fn set_mode(&mut self, venue: &'static str, mode: ArbitrationMode) {
+        self.modes.insert(venue, mode);
+    }
+
+    #[allow(dead_code)] // consumed by the `Sticky` dispatch once that arbitration arm lands
+    fn mode_for(&self, venue: &str) -> ArbitrationMode {
+        self.modes
+            .get(venue)
+            .copied()
+            .unwrap_or(ArbitrationMode::Coordinated)
     }
 
     /// Wire the shared WS-replay `depth` map so the arbiter updates it on each admitted (leader)
