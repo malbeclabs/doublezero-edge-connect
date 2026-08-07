@@ -9,13 +9,15 @@
 //! PR #29), so this ships offset-validated rather than draft-only — the trap `codec_midpoint` is
 //! still in. Two things the oracle does that the sibling codecs here do not, both deliberate:
 //!
-//! * **Exact body-length equality per type, not `>=`.** The forward-compatibility rule that a
-//!   decoder ignores trailing bytes applies across a Schema Version bump; within v1 an unexpected
-//!   length is malformed. This is load-bearing, not pedantry: `SnapshotBegin` is a prefix-superset
-//!   of the market-by-order feed's — the first 36 message bytes are identical and `Depth Bound` is
+//! * **Exact body-length equality per type, not `>=`, paired with a `SCHEMA_VERSION` gate.** The
+//!   forward-compatibility rule that a decoder ignores trailing bytes applies across a Schema
+//!   Version bump; within v1 an unexpected length is malformed. The two rules are one decision: the
+//!   version gate is what keeps the length rule from silently rejecting a v2 frame whose bodies
+//!   legally grew. The length rule is load-bearing because `SnapshotBegin` is a prefix-superset of
+//!   the market-by-order feed's — the first 36 message bytes are identical and `Depth Bound` is
 //!   appended at message offset 36 — so a sibling-shaped body would otherwise decode with
-//!   `depth_bound` reading whatever follows, and a `0` there is a positive publisher claim of a
-//!   complete book that no publisher made.
+//!   `depth_bound` read from whatever follows the body: the next message's header bytes, or trailing
+//!   padding, where a `0` is a positive publisher claim of a complete book that no publisher made.
 //! * **Enums decode permissively**: any `u8` is accepted and unknown values mean Unknown, per the
 //!   spec's "receivers MUST accept any `u8`". The opposite of the top-of-book codec's strict decode.
 //!
@@ -28,19 +30,25 @@
 //! `tests/codec_mbp_fixtures.rs`. That is stronger than `codec_midpoint` (self-consistency only)
 //! and weaker than `codec_mbo` (real capture) — capture a live frame before enabling a `FEEDS` row.
 //!
-//! Frame-header validation is the shared walker's, which is looser than the oracle's: it does not
-//! reject a schema version other than 1, a `frame_length` disagreeing with the datagram, or a zero
-//! message count. That gap is pre-existing and shared by all four codecs.
+//! Oracle parity is per-*body*. The shared frame walker stays looser than the oracle on two header
+//! checks it does not make — a `frame_length` disagreeing with the datagram (the walker clamps) and
+//! a zero message count (an empty message list) — which is pre-existing and shared by all four
+//! codecs. The third, schema version, is checked here rather than left to the walker, because only
+//! this codec's body rule depends on it.
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::ingest::codec_common::{
     cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader, MSG_HEADER_SIZE,
 };
 
 pub const MAGIC: u16 = 0x4442; // "BD"
+
+/// The only schema this decoder implements. A frame declaring anything else is discarded whole —
+/// see [`decode_frame`] for why that is load-bearing here and nowhere else.
+pub const SCHEMA_VERSION: u8 = 1;
 
 // Shared with the top-of-book feed (byte-identical layouts).
 pub const MSG_HEARTBEAT: u8 = 0x01;
@@ -92,7 +100,6 @@ pub mod sizes {
     pub const TRADE: usize = 52;
     pub const END_OF_SESSION: usize = 12;
     pub const MANIFEST_SUMMARY: usize = 24;
-    pub const LIQUIDATION: usize = 48;
     pub const BATCH_BOUNDARY: usize = 16;
     pub const INSTRUMENT_RESET: usize = 28;
     pub const SNAPSHOT_BEGIN: usize = 40;
@@ -241,58 +248,71 @@ pub enum Message {
     SnapshotEnd(SnapshotEnd),
     BatchBoundary(BatchBoundary),
     InstrumentReset(InstrumentReset),
-    /// Reserved (`0x03`/`0x05`), unknown, or malformed-length: skipped by declared length.
-    Other,
+    /// Reserved (`0x03`/`0x05`), unknown, or malformed-length: skipped by its declared length.
+    /// Carries the type byte, so a caller can tell "this decoder rejects the feed's core message"
+    /// from "a reserved type went by".
+    Other(u8),
 }
 
-/// Decode one datagram. `msg_len` is checked for exact equality with the type's declared size
-/// before any field is read, so a mis-sized body becomes [`Message::Other`] rather than decoding
-/// garbage into a field that has semantics (see the module doc's `Depth Bound` case).
+/// Decode one datagram. Two rules make this stricter than the sibling codecs, and they depend on
+/// each other: a frame declaring an unimplemented [`SCHEMA_VERSION`] is rejected whole, and within
+/// v1 `msg_len` must equal the type's declared size exactly before any field is read, so a mis-sized
+/// body becomes [`Message::Other`] rather than decoding garbage into a field that has semantics (the
+/// module doc's `Depth Bound` case). Without the version gate the length rule would apply v1 sizes
+/// to a v2 frame whose bodies legally grew, and the whole feed would decode to `Other` in silence.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |ty, _flags, b, off| {
+    let (header, messages) = decode_frame_with(buf, MAGIC, |ty, _flags, b, off| {
+        // In bounds: the walker breaks before calling this unless `off + MSG_HEADER_SIZE` fits.
         let msg_len = b[off + 1] as usize;
         let body = off + MSG_HEADER_SIZE;
         let exact = |n: usize| msg_len == n;
         match ty {
             MSG_HEARTBEAT if exact(sizes::HEARTBEAT) => {
-                decode_heartbeat(b, body).unwrap_or(Message::Other)
+                decode_heartbeat(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_INSTRUMENT_DEFINITION if exact(sizes::INSTRUMENT_DEFINITION) => {
-                decode_instrument_definition(b, body).unwrap_or(Message::Other)
+                decode_instrument_definition(b, body).unwrap_or(Message::Other(ty))
             }
-            MSG_TRADE if exact(sizes::TRADE) => decode_trade(b, body).unwrap_or(Message::Other),
+            MSG_TRADE if exact(sizes::TRADE) => decode_trade(b, body).unwrap_or(Message::Other(ty)),
             MSG_END_OF_SESSION if exact(sizes::END_OF_SESSION) => u64le(b, body)
                 .map(Message::EndOfSession)
-                .unwrap_or(Message::Other),
+                .unwrap_or(Message::Other(ty)),
             MSG_MANIFEST_SUMMARY if exact(sizes::MANIFEST_SUMMARY) => {
-                decode_manifest_summary(b, body).unwrap_or(Message::Other)
+                decode_manifest_summary(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_LEVEL_UPDATE if exact(sizes::LEVEL_UPDATE) => {
-                decode_level_update(b, body).unwrap_or(Message::Other)
+                decode_level_update(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_BOOK_CLEAR if exact(sizes::BOOK_CLEAR) => {
-                decode_book_clear(b, body).unwrap_or(Message::Other)
+                decode_book_clear(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_SNAPSHOT_LEVEL if exact(sizes::SNAPSHOT_LEVEL) => {
-                decode_snapshot_level(b, body).unwrap_or(Message::Other)
+                decode_snapshot_level(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_SNAPSHOT_BEGIN if exact(sizes::SNAPSHOT_BEGIN) => {
-                decode_snapshot_begin(b, body).unwrap_or(Message::Other)
+                decode_snapshot_begin(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_SNAPSHOT_END if exact(sizes::SNAPSHOT_END) => {
-                decode_snapshot_end(b, body).unwrap_or(Message::Other)
+                decode_snapshot_end(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_BATCH_BOUNDARY if exact(sizes::BATCH_BOUNDARY) => {
-                decode_batch_boundary(b, body).unwrap_or(Message::Other)
+                decode_batch_boundary(b, body).unwrap_or(Message::Other(ty))
             }
             MSG_INSTRUMENT_RESET if exact(sizes::INSTRUMENT_RESET) => {
-                decode_instrument_reset(b, body).unwrap_or(Message::Other)
+                decode_instrument_reset(b, body).unwrap_or(Message::Other(ty))
             }
             // `0x03`/`0x05` are reserved to stop a misrouted sibling frame cross-decoding, and
             // `MSG_LIQUIDATION` carries nothing this bridge re-serves. Both fall through here.
-            _ => Message::Other,
+            _ => Message::Other(ty),
         }
-    })
+    })?;
+    if header.schema_version != SCHEMA_VERSION {
+        bail!(
+            "unsupported mbp schema version {} (expected {SCHEMA_VERSION})",
+            header.schema_version
+        );
+    }
+    Ok((header, messages))
 }
 
 fn decode_heartbeat(b: &[u8], o: usize) -> Option<Message> {
@@ -462,6 +482,16 @@ mod tests {
         assert!(decode_frame(&f).is_err());
     }
 
+    /// A frame declaring a schema this decoder does not implement is discarded whole. Without this
+    /// the exact-length rule would apply v1 sizes to a v2 frame whose bodies legally grew, and the
+    /// whole feed would decode to `Other` with no error to see.
+    #[test]
+    fn rejects_an_unimplemented_schema_version() {
+        let mut f = one(MSG_HEARTBEAT, 0, &[0u8; 12]);
+        f[2] = SCHEMA_VERSION + 1;
+        assert!(decode_frame(&f).is_err());
+    }
+
     #[test]
     fn frame_header_fields_decode() {
         let (h, _) = decode_frame(&one(MSG_HEARTBEAT, 0, &[0u8; 12])).unwrap();
@@ -569,7 +599,10 @@ mod tests {
     fn reserved_types_do_not_decode() {
         for ty in [0x03u8, 0x05] {
             let (_, m) = decode_frame(&one(ty, 0, &[0u8; 20])).unwrap();
-            assert!(matches!(m[0], Message::Other), "type {ty:#04x} decoded");
+            assert!(
+                matches!(m[0], Message::Other(t) if t == ty),
+                "type {ty:#04x} decoded"
+            );
         }
     }
 
@@ -587,7 +620,7 @@ mod tests {
         f.extend_from_slice(&unknown);
         f.extend_from_slice(&hb);
         let (_, m) = decode_frame(&f).unwrap();
-        assert!(matches!(m[0], Message::Other));
+        assert!(matches!(m[0], Message::Other(0x7F)));
         assert!(matches!(m[1], Message::Heartbeat(77)));
     }
 
@@ -606,7 +639,7 @@ mod tests {
             for len in [correct - 1, correct + 1] {
                 let (_, m) = decode_frame(&one(ty, 0, &vec![0u8; len])).unwrap();
                 assert!(
-                    matches!(m[0], Message::Other),
+                    matches!(m[0], Message::Other(t) if t == ty),
                     "type {ty:#04x} len {len} decoded"
                 );
             }
@@ -730,7 +763,10 @@ mod tests {
         b[6] = CLEAR_SIDE_BOTH;
         b[7] = SCOPE_FROM_PRICE;
         let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
-        assert!(matches!(m[0], Message::Other), "must not decode as a clear");
+        assert!(
+            matches!(m[0], Message::Other(MSG_BOOK_CLEAR)),
+            "must not decode as a clear"
+        );
     }
 
     /// ...but `Clear Side = 2` with `Scope = 0` (clear both sides entirely) is the normal case.
@@ -765,6 +801,14 @@ mod tests {
         assert_eq!(l.order_count, Some(2));
         assert_eq!(l.side, SIDE_BID);
         assert_eq!(l.level_flags, 1);
+
+        // Same `0xFFFF` sentinel rule as LevelUpdate: never a count of 65535.
+        b[20..22].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_LEVEL, 1, &b)).unwrap();
+        let Message::SnapshotLevel(l) = &m[0] else {
+            panic!()
+        };
+        assert_eq!(l.order_count, None);
     }
 
     /// spec: SnapshotBegin 0x20, 40 bytes. Body: id @0, anchor_seq @4, total_levels @12,
@@ -801,7 +845,7 @@ mod tests {
     #[test]
     fn snapshot_begin_rejects_the_short_sibling_layout() {
         let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &[0u8; 32])).unwrap();
-        assert!(matches!(m[0], Message::Other));
+        assert!(matches!(m[0], Message::Other(MSG_SNAPSHOT_BEGIN)));
     }
 
     #[test]
@@ -878,7 +922,7 @@ mod tests {
             for len in [correct - 1, correct + 1] {
                 let (_, m) = decode_frame(&one(ty, 0, &vec![0u8; len])).unwrap();
                 assert!(
-                    matches!(m[0], Message::Other),
+                    matches!(m[0], Message::Other(t) if t == ty),
                     "type {ty:#04x} len {len} decoded"
                 );
             }
@@ -891,7 +935,10 @@ mod tests {
     fn index_addressing_range_is_skipped() {
         for ty in 0x50u8..=0x5F {
             let (_, m) = decode_frame(&one(ty, 0, &[0u8; 20])).unwrap();
-            assert!(matches!(m[0], Message::Other), "type {ty:#04x} decoded");
+            assert!(
+                matches!(m[0], Message::Other(t) if t == ty),
+                "type {ty:#04x} decoded"
+            );
         }
     }
 }

@@ -24,7 +24,7 @@
 //! the multicast UDP we care about and avoids an Ethernet-only parser.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{BufWriter, Write},
     net::Ipv4Addr,
@@ -512,14 +512,21 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
 }
 
 /// MBP: split into refdata (definitions/manifest), snapshot (begin/level/end), and mktdata (level
-/// updates, clears, resets, trades). Mirrors [`process_mbo`], including the snapshot routing:
-/// `SnapshotLevel` carries only a `snapshot_id`, so the levels kept are those whose id belongs to a
-/// `SnapshotBegin` for a target instrument.
+/// updates, clears, resets, trades, and the channel-wide batch/session boundaries). Mirrors
+/// [`process_mbo`] except for snapshot routing: a `SnapshotLevel` carries only a `snapshot_id`,
+/// which the spec scopes per `(channel, instrument)`, so two instruments can share one. Levels are
+/// attributed to the currently-open `SnapshotBegin` instead — well-defined, because a channel never
+/// interleaves snapshot groups.
 fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec_mbp::Message;
-    let (mut levels, mut clears, mut resets, mut trades) = (0u64, 0u64, 0u64, 0u64);
-    let (mut defs, mut manifests, mut snaps, mut hb, mut other, mut errors) =
+    let (mut levels, mut clears, mut resets, mut trades, mut batches) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut defs, mut manifests, mut snaps, mut hb, mut eos, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    // Unrouted types tallied by type byte: a capture where the decoder rejects every LevelUpdate
+    // (a length drift) must not read like one that merely carried reserved types.
+    let mut other: BTreeMap<u8, u64> = BTreeMap::new();
+    let mut orphan_levels = 0u64;
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
 
     // Per-frame summaries (so the symbol filter can be applied after the full scan).
@@ -527,12 +534,13 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         payload: Vec<u8>,
         refdata: bool,
         snapshot: bool,
-        begins: Vec<(u32, u32)>, // (instrument_id, snapshot_id)
-        end_insts: Vec<u32>,
-        level_sids: Vec<u32>,
-        md_ids: Vec<u32>, // level-update/clear/reset/trade instrument ids
+        channel_wide: bool, // BatchBoundary / EndOfSession: no instrument id, kept unfiltered
+        snap_insts: Vec<u32>, // instruments this frame's begins/levels/ends belong to
+        md_ids: Vec<u32>,   // level-update/clear/reset/trade instrument ids
     }
     let mut summaries: Vec<Frame> = Vec::new();
+    // The open snapshot group, in capture order: (instrument_id, snapshot_id).
+    let mut open_group: Option<(u32, u32)> = None;
 
     for f in frames {
         let Ok((_hdr, msgs)) = codec_mbp::decode_frame(f) else {
@@ -543,9 +551,8 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
             payload: f.clone(),
             refdata: false,
             snapshot: false,
-            begins: Vec::new(),
-            end_insts: Vec::new(),
-            level_sids: Vec::new(),
+            channel_wide: false,
+            snap_insts: Vec::new(),
             md_ids: Vec::new(),
         };
         for m in &msgs {
@@ -568,6 +575,12 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                     trades += 1;
                     fr.md_ids.push(t.instrument_id);
                 }
+                // Channel-wide, no instrument id: kept regardless of the symbol filter so a
+                // filtered fixture still carries the batch boundaries its updates sit inside.
+                Message::BatchBoundary(_) => {
+                    batches += 1;
+                    fr.channel_wide = true;
+                }
                 Message::InstrumentDefinition(d) => {
                     defs += 1;
                     fr.refdata = true;
@@ -580,35 +593,38 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 Message::SnapshotBegin(s) => {
                     snaps += 1;
                     fr.snapshot = true;
-                    fr.begins.push((s.instrument_id, s.snapshot_id));
+                    open_group = Some((s.instrument_id, s.snapshot_id));
+                    fr.snap_insts.push(s.instrument_id);
                 }
                 Message::SnapshotLevel(s) => {
                     snaps += 1;
                     fr.snapshot = true;
-                    fr.level_sids.push(s.snapshot_id);
+                    match open_group {
+                        // A level whose id disagrees with the open group is discarded by the spec;
+                        // one arriving before any begin is a capture that started mid-group.
+                        Some((inst, sid)) if sid == s.snapshot_id => fr.snap_insts.push(inst),
+                        _ => orphan_levels += 1,
+                    }
                 }
                 Message::SnapshotEnd(s) => {
                     snaps += 1;
                     fr.snapshot = true;
-                    fr.end_insts.push(s.instrument_id);
+                    fr.snap_insts.push(s.instrument_id);
+                    open_group = None;
+                }
+                // Channel-wide like BatchBoundary, and the strongest reset signal there is.
+                Message::EndOfSession(_) => {
+                    eos += 1;
+                    fr.channel_wide = true;
                 }
                 Message::Heartbeat(_) => hb += 1,
-                _ => other += 1,
+                Message::Other(ty) => *other.entry(*ty).or_default() += 1,
             }
         }
         summaries.push(fr);
     }
 
     let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
-    let target_sids: HashSet<u32> = match &target {
-        Some(t) => summaries
-            .iter()
-            .flat_map(|fr| fr.begins.iter())
-            .filter(|(inst, _)| t.contains(inst))
-            .map(|(_, sid)| *sid)
-            .collect(),
-        None => HashSet::new(),
-    };
 
     let mut refdata = Vec::new();
     let mut snapshot = Vec::new();
@@ -617,23 +633,16 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         if fr.refdata {
             refdata.push(fr.payload.clone());
         }
-        if fr.snapshot {
-            let keep = match &target {
-                None => true,
-                Some(t) => {
-                    fr.begins.iter().any(|(inst, _)| t.contains(inst))
-                        || fr.end_insts.iter().any(|inst| t.contains(inst))
-                        || fr.level_sids.iter().any(|sid| target_sids.contains(sid))
-                }
-            };
-            if keep {
-                snapshot.push(fr.payload.clone());
-            }
+        let keep_snap = target
+            .as_ref()
+            .is_none_or(|t| fr.snap_insts.iter().any(|id| t.contains(id)));
+        if fr.snapshot && keep_snap {
+            snapshot.push(fr.payload.clone());
         }
         let keep_md = target
             .as_ref()
             .is_none_or(|t| fr.md_ids.iter().any(|id| t.contains(id)));
-        if !fr.md_ids.is_empty() && keep_md {
+        if (!fr.md_ids.is_empty() && keep_md) || fr.channel_wide {
             mktdata.push(fr.payload.clone());
         }
     }
@@ -649,11 +658,18 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         args,
         symbol_to_id.len(),
         errors,
-        &format!("decode: level_update={levels} book_clear={clears} instrument_reset={resets} trades={trades} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} other={other} errors={errors}"),
+        &format!("decode: level_update={levels} book_clear={clears} instrument_reset={resets} trades={trades} batch_boundary={batches} end_of_session={eos} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} errors={errors}"),
     );
+    if !other.is_empty() {
+        let by_type: Vec<String> = other.iter().map(|(t, n)| format!("{t:#04x}={n}")).collect();
+        eprintln!("  unrouted messages by type byte: {}", by_type.join(" "));
+    }
+    if orphan_levels > 0 {
+        eprintln!("  {orphan_levels} snapshot levels outside an open snapshot group (dropped from the instrument routing)");
+    }
     if !args.symbol.is_empty() {
         eprintln!(
-            "  filter symbols {:?} -> instrument_ids {target:?} (snapshot ids {target_sids:?})",
+            "  filter symbols {:?} -> instrument_ids {target:?}",
             args.symbol
         );
     }

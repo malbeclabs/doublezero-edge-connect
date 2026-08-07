@@ -314,8 +314,9 @@ the perps market-by-price group, which no CI or dev environment here has.
 
 What backs the decoder instead: the offset-independent unit tests in `src/ingest/codec_mbp.rs`
 (every test frame is built from literal spec offsets, so it cannot agree with the decoder by
-sharing them), field-for-field parity with the Go reference decoder
-(`go/marketbyprice-parser/marketbyprice_wire.go` in `malbeclabs/edge-multicast-ref`), and
+sharing them), field-for-field parity with the **message bodies** of the Go reference decoder
+(`go/marketbyprice-parser/marketbyprice_wire.go` in `malbeclabs/edge-multicast-ref` — the shared
+frame walker is still looser than the Go on two header checks, see the module doc), and
 `tests/codec_mbp_fixtures.rs`, which pins the three types inherited from top-of-book to that
 byte-validated codec. That is stronger than `codec_midpoint` (self-consistency only) and weaker
 than the MBO trio above (real capture).
