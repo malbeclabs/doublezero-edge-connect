@@ -288,8 +288,8 @@ fn two_publisher_port_blocks_are_both_ingested() {
         replay::TOB_MAGIC,
     );
     // `Bridge::spawn` returns on the FIRST receiver-bound marker, but `--feed Hyperliquid` now
-    // binds twelve receivers, so a one-shot send can land before these two have joined — an
-    // un-joined group silently discards the datagram. Re-send each round until both publishers
+    // binds 22 receivers over 55 sockets, so a one-shot send can land before these two have joined
+    // — an un-joined group silently discards the datagram. Re-send each round until both publishers
     // register traffic (idempotent: the assertion is `> 0`, and duplicate frames are deduped).
     let body = scrape_until(
         &metrics_bind,

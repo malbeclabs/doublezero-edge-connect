@@ -237,11 +237,18 @@ pub const FEEDS: &[Feed] = &[
         emit_trades: true,
     },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
-    // (paired with the TOB row above). 10011/10501/10801 were decoded off a live capture;
-    // 10901 is derived from its refdata port (10902 was on the wire) via the canonical layout;
-    // the rest come from the recorder registry. A block that turns out to be wrong shows up as a
-    // permanent `dz_receiver_up == 0` for that publisher rather than as an error.
-    // Depth-only: TOB owns this venue's trades.
+    // (paired with the TOB row above). Depth-only: TOB owns this venue's trades.
+    //
+    // Unconfirmed ports and how each one fails, since the failure is NOT uniform: `dz_receiver_up`
+    // is driven by the idle watchdog, which tracks the **mktdata** port only.
+    //   - wrong mktdata  -> no datagrams -> `dz_receiver_up == 0`. Visible.
+    //   - wrong refdata  -> `RefDataState` never resolves a definition and every processor gates
+    //                       emission on one, so the receiver reads healthy and emits nothing.
+    //   - wrong snapshot -> books stay `Recovering` forever, so the publisher contributes no depth
+    //                       while still reading healthy.
+    // The only signal for the latter two is `dz_datagrams_received_total{role}` pinned at 0.
+    // Silently-failing ports here: 10903 (derived from an observed 10902) and the whole 10701
+    // block (registry-only, never seen on the wire). Everything else was decoded from a capture.
     Feed {
         venue: "Hyperliquid",
         code: "tiredsolid",
@@ -539,30 +546,31 @@ mod tests {
         }
     }
 
-    /// Every Top-of-Book publisher has a Market-by-Order peer at the same index offset, so a
-    /// partner onboarded to one feed but forgotten on the other is caught here rather than showing
-    /// up as missing depth in production.
+    /// Hyperliquid's publishers each serve both feeds, so the two rows must list the same number of
+    /// blocks - a publisher onboarded to one feed and forgotten on the other is the failure this
+    /// catches, and it shows up in production as a venue missing depth for one mirror.
+    ///
+    /// Deliberately a count and not a port relation. Today every MBO block happens to sit 1000
+    /// above its TOB peer, but base ports are allocated per channel and that relation is not
+    /// guaranteed (see the `FEEDS` docs); asserting it would fail the build for a legitimately
+    /// arbitrary block and invite inventing a `10N01` row that isn't on the wire - the exact error
+    /// this registry exists to avoid. Pairing a block to its peer needs operator identity, which
+    /// the registry deliberately does not record.
     #[test]
-    fn every_tob_publisher_has_an_mbo_peer() {
-        let ports = |kind: FeedKind| -> std::collections::HashSet<u16> {
+    fn both_hyperliquid_feeds_list_every_publisher() {
+        let count = |kind: FeedKind| -> usize {
             FEEDS
                 .iter()
                 .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
                 .unwrap()
                 .publishers
-                .iter()
-                .map(|p| p.base_port())
-                .collect()
+                .len()
         };
-        // The MBO block sits 1000 above its TOB peer across the whole fleet (9501 -> 10501).
-        let mbo = ports(FeedKind::MarketByOrder);
-        for tob in ports(FeedKind::TopOfBook) {
-            assert!(
-                mbo.contains(&(tob + 1000)),
-                "TOB publisher {tob} has no MBO peer at {}",
-                tob + 1000
-            );
-        }
+        assert_eq!(
+            count(FeedKind::TopOfBook),
+            count(FeedKind::MarketByOrder),
+            "Hyperliquid TOB and MBO must list the same publishers"
+        );
     }
 
     #[test]
