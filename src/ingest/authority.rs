@@ -24,7 +24,8 @@ pub type MarketKey = (Arc<str>, u32, u32);
 
 /// Cap on distinct arms given a stable metric ordinal per venue. The source IP is unauthenticated
 /// and spoofable, so ordinals are handed out first-come and anything past the cap collapses to
-/// `"other"` rather than growing the label set. Real deployments run two arms.
+/// `"other"` — unrecorded, so a forged-source flood grows neither the label set nor the map. Real
+/// deployments run two arms.
 const MAX_LABELLED_ARMS: usize = 8;
 
 const ARM_LABELS: [&str; MAX_LABELLED_ARMS] = [
@@ -45,8 +46,9 @@ pub struct AuthorityConfig {
     pub transfer_win_rate: f64,
 }
 
-/// Cap on samples retained per market per window. Already two orders more than the margin test
-/// needs, so overflow costs precision on a pathological market, never memory.
+/// Cap on samples retained per market per window. Overflow is head-biased — a market busy enough to
+/// hit it decides on the window's first 4096 contests — which is why the cap is two orders above
+/// what the margin test needs rather than a tight bound.
 const MAX_WINDOW_SAMPLES: usize = 4096;
 
 /// Per-market authority state.
@@ -62,6 +64,19 @@ struct Held {
     /// copy, negative when the challenger was.
     samples: Vec<(Publisher, i64)>,
     window_opened_ns: u64,
+}
+
+impl Held {
+    /// Hand the market to `leader`. Every sample in the open window was measured against the
+    /// outgoing leader's clock, so a new leader always starts a new window — judging it on the
+    /// predecessor's evidence is how a health transfer gets undone at the next close.
+    fn take_authority(&mut self, leader: Publisher, arrival_ns: u64) {
+        self.leader = leader;
+        self.leader_arrival_ns = arrival_ns;
+        self.contest_recorded = false;
+        self.samples.clear();
+        self.window_opened_ns = arrival_ns;
+    }
 }
 
 pub struct StickyAuthority {
@@ -99,6 +114,11 @@ impl StickyAuthority {
     }
 
     /// The admission decision for one message from `publisher` on `key`.
+    ///
+    /// `arrival_ns` is the host receive clock (`recv_ts_ns`) and must be the same clock
+    /// [`Self::close_window`] is driven on — it is both the silence baseline and the sampling
+    /// coordinate. Never pass the `kernel_rx_ts_ns` sentinel: a `0` leader baseline reads as
+    /// `now - 0` of silence and hands the market to the next challenger.
     pub fn admit(
         &mut self,
         key: MarketKey,
@@ -138,9 +158,7 @@ impl StickyAuthority {
                 let leader = h.leader;
                 let silent = arrival_ns.saturating_sub(h.leader_arrival_ns) > leader_timeout_ns;
                 if challenger_healthy && (leader_unhealthy || silent) {
-                    h.leader = publisher;
-                    h.leader_arrival_ns = arrival_ns;
-                    h.contest_recorded = false;
+                    h.take_authority(publisher, arrival_ns);
                     return Admit::Emitted { opened_tick: true };
                 }
                 if h.contest_recorded {
@@ -161,9 +179,7 @@ impl StickyAuthority {
     pub fn transfer_to(&mut self, key: &MarketKey, publisher: Publisher, arrival_ns: u64) -> bool {
         match self.held.get_mut(key) {
             Some(h) if h.leader != publisher => {
-                h.leader = publisher;
-                h.leader_arrival_ns = arrival_ns;
-                h.contest_recorded = false;
+                h.take_authority(publisher, arrival_ns);
                 true
             }
             _ => false,
@@ -177,10 +193,12 @@ impl StickyAuthority {
             return label;
         }
         let n = self.ordinal_counts.entry(venue.to_string()).or_insert(0);
-        let label = ARM_LABELS.get(*n).copied().unwrap_or("other");
-        if *n < MAX_LABELLED_ARMS {
-            *n += 1;
-        }
+        // Past the cap nothing is recorded: a forged-source flood must not grow the map behind the
+        // label set it already cannot grow.
+        let Some(&label) = ARM_LABELS.get(*n) else {
+            return "other";
+        };
+        *n += 1;
         self.ordinals.insert((venue.to_string(), publisher), label);
         tracing::info!(venue, arm = label, ?publisher, "arbitration arm registered");
         label
@@ -197,6 +215,7 @@ impl StickyAuthority {
 
     /// Record a challenger's arrival against the leader's most recent message. The arbiter calls
     /// this on every `Contest`, so the sampler sees exactly the head-to-heads the histogram reports.
+    /// `arrival_ns` is on [`Self::admit`]'s clock.
     pub fn observe_challenger(&mut self, key: &MarketKey, challenger: Publisher, arrival_ns: u64) {
         if let Some(h) = self.held.get_mut(key) {
             if h.samples.len() < MAX_WINDOW_SAMPLES {
@@ -207,14 +226,13 @@ impl StickyAuthority {
     }
 
     /// Close every elapsed sampling window, transferring authority where a challenger cleared BOTH
-    /// conditions. Returns the markets that moved, so the caller counts
-    /// `dz_arm_authority_transfers_total{reason="margin"}`.
+    /// conditions and is healthy. Returns the markets that moved, so the caller counts
+    /// `dz_arm_authority_transfers_total{reason="margin"}`. `now_ns` is on [`Self::admit`]'s clock.
     pub fn close_window(&mut self, now_ns: u64) -> Vec<(MarketKey, Publisher)> {
-        let (margin, rate, interval) = (
-            self.cfg.transfer_margin_ns as i64,
-            self.cfg.transfer_win_rate,
-            self.cfg.sample_interval_ns,
-        );
+        // Saturate rather than cast: a `transfer_margin_ns` past `i64::MAX` would wrap negative and
+        // invert both conditions, making every window transfer.
+        let margin = i64::try_from(self.cfg.transfer_margin_ns).unwrap_or(i64::MAX);
+        let (rate, interval) = (self.cfg.transfer_win_rate, self.cfg.sample_interval_ns);
         let mut moved = Vec::new();
         for (key, h) in self.held.iter_mut() {
             if now_ns.saturating_sub(h.window_opened_ns) < interval {
@@ -225,12 +243,15 @@ impl StickyAuthority {
             h.window_opened_ns = now_ns;
             if let Some(c) = winner {
                 if c != h.leader {
-                    h.leader = c;
-                    h.leader_arrival_ns = now_ns;
-                    h.contest_recorded = false;
                     moved.push((key.clone(), c));
                 }
             }
+        }
+        // Same health gate `admit` applies: a faster arm sitting in `gap`/`awaiting-snapshot` must
+        // not win the market back, or the margin path undoes the health transfer that saved it.
+        moved.retain(|(key, c)| self.healthy(key, *c));
+        for (key, c) in &moved {
+            self.transfer_to(key, *c, now_ns);
         }
         moved
     }
@@ -495,6 +516,43 @@ mod tests {
         }
         a.close_window(2_000_002);
         assert_eq!(a.leader_of(&key()), Some(arm(1)));
+    }
+
+    /// The margin path applies the same health gate `admit` does: winning the speed test must not
+    /// hand a market back to an arm serving a knowingly-wrong book.
+    #[test]
+    fn margin_does_not_transfer_to_an_unhealthy_arm() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 0);
+        a.set_health(&key(), arm(2), false);
+        for i in 1..=10u64 {
+            let t = i * 100_000;
+            a.admit(key(), arm(1), t);
+            a.observe_challenger(&key(), arm(2), t - 10_000);
+        }
+        assert!(a.close_window(1_000_001).is_empty());
+        assert_eq!(a.leader_of(&key()), Some(arm(1)));
+    }
+
+    /// A health transfer starts a new window: the samples it inherits were measured against the
+    /// arm it just took the market from, and would otherwise hand it straight back.
+    #[test]
+    fn health_transfer_restarts_the_sampling_window() {
+        let mut a = StickyAuthority::new(cfg());
+        a.admit(key(), arm(1), 0);
+        for i in 1..=10u64 {
+            let t = i * 10_000;
+            a.admit(key(), arm(1), t);
+            a.observe_challenger(&key(), arm(2), t - 5_000);
+        }
+        a.set_health(&key(), arm(1), false);
+        a.admit(key(), arm(2), 200_000);
+        assert_eq!(a.leader_of(&key()), Some(arm(2)));
+        assert!(
+            a.close_window(1_000_001).is_empty(),
+            "window reopened at the transfer, so nothing has elapsed"
+        );
+        assert_eq!(a.leader_of(&key()), Some(arm(2)));
     }
 
     /// A window that has not elapsed is left open, samples intact.
