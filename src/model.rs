@@ -326,6 +326,9 @@ pub struct BookAccumulator {
     symbol: Arc<str>,
     bids: std::collections::BTreeMap<i128, (f64, f64)>,
     asks: std::collections::BTreeMap<i128, (f64, f64)>,
+    /// Changes of a logical event still awaiting its `last` batch — see [`BookAccumulator::apply`].
+    pending: Vec<BookChange>,
+    pending_ts_ns: u64,
     source_ts_ns: u64,
 }
 
@@ -335,15 +338,38 @@ impl BookAccumulator {
             symbol,
             bids: std::collections::BTreeMap::new(),
             asks: std::collections::BTreeMap::new(),
+            pending: Vec::new(),
+            pending_ts_ns: 0,
             source_ts_ns: 0,
         }
     }
 
-    /// Apply one broadcast batch, in wire order.
+    /// Buffer one broadcast batch, and fold the whole logical event into the book on its `last`
+    /// batch.
+    ///
+    /// Honoring `last` is what keeps [`BookAccumulator::to_book`] honest: it stamps its output
+    /// `last: true`, so if the levels could be half of a multi-batch rebuild a replayed client would
+    /// publish a torn book (one side missing, or a crossed inside market) as complete. Buffering is
+    /// also exactly what PROTOCOL.md asks a consumer to do, so the bound on this buffer is the
+    /// producer's event size — the same one the consumer already pays.
     pub fn apply(&mut self, b: &NormalizedBook) {
         self.symbol = b.symbol.clone();
-        self.source_ts_ns = b.source_ts_ns;
-        for c in &b.changes {
+        // 0 is the "unknown" sentinel, never a real time: a batch without one must not blank the
+        // last known event time on every subsequent replay.
+        if b.source_ts_ns != 0 {
+            self.pending_ts_ns = b.source_ts_ns;
+        }
+        // A non-finite price would saturate the fixed-point key (NaN to 0, inf to i128::MIN/MAX),
+        // silently merging unrelated levels into one entry that then lives in the replay map forever.
+        self.pending.extend(
+            b.changes
+                .iter()
+                .filter(|c| c.price.is_finite() && c.size.is_finite()),
+        );
+        if !b.last {
+            return;
+        }
+        for c in std::mem::take(&mut self.pending) {
             let key = (c.price * 10f64.powi(8)).round() as i128;
             match (c.action, c.side) {
                 (BookAction::Clear, BookSide::Bid) => self.bids.clear(),
@@ -369,6 +395,7 @@ impl BookAccumulator {
                 (_, BookSide::Both) => {}
             }
         }
+        self.source_ts_ns = self.pending_ts_ns;
     }
 
     /// Materialize the current state as a re-baseline: `clear` first, then every level best-first.
@@ -416,6 +443,10 @@ impl BookAccumulator {
 /// Accumulated book state per `(venue, channel, instrument_id)`, replayed on connect and on each
 /// subscribe. Written by the arbiter on the authority gate's admit decision, so it always holds the
 /// authoritative arm's book rather than a discarded arm's copy.
+///
+/// The writer owns two obligations the `depth` replay map already discharges (`arbiter.rs`): purge a
+/// market's entry on session reset, or an ended session's book is replayed to a new client as an
+/// authoritative re-baseline; and bound the entry count, since the key is wire-supplied.
 pub type BookSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), BookAccumulator>>>;
 
 /// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
@@ -685,6 +716,145 @@ mod tests {
                 },
             ],
             "the deleted ask must not be replayed"
+        );
+    }
+
+    /// A multi-batch logical event must not be materialized half-applied: `to_book` stamps its
+    /// output `last: true`, so a torn level set would be published to a replayed client as complete.
+    #[test]
+    fn a_batch_awaiting_its_last_is_not_materialized() {
+        let venue: Arc<str> = "Lashay".into();
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        let bid = |price, size| BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price,
+            size,
+        };
+
+        acc.apply(&book(vec![bid(0.61, 10.0)], false, true));
+        assert_eq!(acc.to_book(&venue, 2, 41).changes.len(), 2); // clear + one bid
+
+        // First half of a rebuild: buffered, not applied.
+        acc.apply(&book(
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                },
+                bid(0.70, 1.0),
+            ],
+            true,
+            false,
+        ));
+        let mid = acc.to_book(&venue, 2, 41);
+        assert_eq!(
+            mid.changes,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0
+                },
+                bid(0.61, 10.0),
+            ],
+            "the pre-event state, not the half-cleared one"
+        );
+
+        // The closing batch commits the whole event at once.
+        acc.apply(&book(vec![bid(0.71, 2.0)], true, true));
+        assert_eq!(
+            acc.to_book(&venue, 2, 41).changes,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0
+                },
+                bid(0.71, 2.0),
+                bid(0.70, 1.0),
+            ]
+        );
+    }
+
+    /// A non-finite price saturates the fixed-point level key, so unrelated levels would merge into
+    /// one entry that then lives in the replay map forever. Drop the change instead.
+    #[test]
+    fn non_finite_prices_and_sizes_are_dropped() {
+        let venue: Arc<str> = "Lashay".into();
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        acc.apply(&book(
+            vec![
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: f64::NAN,
+                    size: 1.0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: f64::INFINITY,
+                    size: 1.0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Ask,
+                    price: 0.63,
+                    size: f64::NAN,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Ask,
+                    price: 0.64,
+                    size: 5.0,
+                },
+            ],
+            false,
+            true,
+        ));
+        let out = acc.to_book(&venue, 2, 41);
+        assert_eq!(
+            out.changes,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Ask,
+                    price: 0.64,
+                    size: 5.0
+                },
+            ]
+        );
+    }
+
+    /// `0` is the "unknown" sentinel for every timestamp on the wire, so a batch without one must not
+    /// blank the last known event time on every later replay.
+    #[test]
+    fn a_zero_source_ts_does_not_blank_the_replayed_event_time() {
+        let venue: Arc<str> = "Lashay".into();
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        acc.apply(&book(vec![], false, true));
+        assert_eq!(
+            acc.to_book(&venue, 2, 41).source_ts_ns,
+            1_781_019_263_715_344_015
+        );
+
+        let mut unknown = book(vec![], false, true);
+        unknown.source_ts_ns = 0;
+        acc.apply(&unknown);
+        assert_eq!(
+            acc.to_book(&venue, 2, 41).source_ts_ns,
+            1_781_019_263_715_344_015
         );
     }
 }

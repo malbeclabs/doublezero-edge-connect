@@ -81,21 +81,21 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         FeedMessage::Status(_) => "status",
     };
     let payload: Utf8Bytes = serde_json::to_string(&m).ok()?.into();
-    let (venue, symbol, channel) = match &m {
-        FeedMessage::Instrument(i) => (i.venue.clone(), Some(i.symbol.clone()), None),
-        FeedMessage::Quote(q) => (q.venue.clone(), Some(q.symbol.clone()), None),
-        FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone()), None),
-        FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone()), None),
-        FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone()), None),
-        FeedMessage::Book(b) => (b.venue.clone(), Some(b.symbol.clone()), Some(b.channel)),
-        FeedMessage::Status(s) => (s.venue.clone(), None, None),
+    let (venue, symbol) = match &m {
+        FeedMessage::Instrument(i) => (i.venue.clone(), Some(i.symbol.clone())),
+        FeedMessage::Quote(q) => (q.venue.clone(), Some(q.symbol.clone())),
+        FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone())),
+        FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone())),
+        FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone())),
+        FeedMessage::Book(b) => (b.venue.clone(), Some(b.symbol.clone())),
+        FeedMessage::Status(s) => (s.venue.clone(), None),
     };
     Some(Arc::new(PreparedFrame {
         payload,
         kind,
         venue,
         symbol,
-        channel,
+        channel: m.channel(),
     }))
 }
 
@@ -141,6 +141,10 @@ impl SubFilter {
         self.venue
             .as_deref()
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
+            // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
+            // one type asked for that type. Filters are a union, so wanting books plus definitions is
+            // two subscriptions. `venue`/`symbol`/`channel` below are *scope* selectors — which
+            // markets — and those do carve out messages that aren't about one market.
             && self.msg_type.as_deref().is_none_or(|t| t == kind)
             && match symbol {
                 None => true,
@@ -149,8 +153,8 @@ impl SubFilter {
             && match channel {
                 // `instrument` is infrastructure, not market data: precision must arrive before
                 // price, so it passes an explicit channel filter the way a venue-level message
-                // does. The carve-out is deliberately just this one kind — widening it to every
-                // channelless message would make `{"channel":2}` a firehose of quotes.
+                // does. The carve-out is deliberately just this one kind on this one dimension —
+                // widening it would make `{"channel":2}` a firehose of quotes.
                 None => self.channel.is_none() || symbol.is_none() || kind == "instrument",
                 Some(c) => self.channel.is_none_or(|f| f == c),
             }
@@ -296,6 +300,8 @@ where
     W: SinkExt<WsMessage> + Unpin,
     <W as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
 {
+    // `channel: None` is correct for every kind replayed here; a channel-bearing kind (`book`) must
+    // pass its own channel or a `{"channel":N}` client silently gets no bootstrap.
     let pass = |venue: &str, symbol: &str, kind: &str| {
         subs.is_empty()
             || subs
@@ -380,16 +386,23 @@ async fn serve_client(
                             if subs.len() >= cfg.max_subs {
                                 write.send(text(json!({"channel": "error", "error": "max subscriptions reached"}))).await?;
                             } else {
-                                if !subs.contains(&subscription) {
+                                let added = !subs.contains(&subscription);
+                                if added {
                                     subs.push(subscription.clone());
                                 }
                                 write.send(text(json!({
                                     "channel": "subscription_response", "method": "subscribe",
                                     "subscription": subscription,
                                 }))).await?;
-                                // Bootstrap the newly-added scope only, not all of `subs` — else a
-                                // client subscribing to ten symbols replays the first one ten times.
-                                replay_scoped(&mut write, &instruments, &depth, std::slice::from_ref(&subscription)).await?;
+                                // Bootstrap the newly-added scope only: not all of `subs` (else a
+                                // client subscribing to ten symbols replays the first one ten times),
+                                // and nothing at all for a duplicate — a re-subscribe adds no scope,
+                                // and replaying anyway would let a client loop O(state) snapshot work
+                                // (taken under the mutex the ingest emit path shares) at the inbound
+                                // rate limit without ever reaching `max_subs`.
+                                if added {
+                                    replay_scoped(&mut write, &instruments, &depth, std::slice::from_ref(&subscription)).await?;
+                                }
                             }
                         }
                         Ok(ClientMsg::Unsubscribe { subscription }) => {
@@ -872,6 +885,23 @@ mod tests {
             next_text(&mut ws, Duration::from_millis(200)).await,
             None,
             "BTC must not be replayed for a SOL subscription"
+        );
+
+        // A duplicate subscribe adds no scope, so it is acked and replays nothing — otherwise a
+        // client could loop full-state replays at the inbound rate limit without reaching max_subs.
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"SOL"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "a re-subscribe must not replay again"
         );
 
         srv.abort();
