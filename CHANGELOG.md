@@ -76,6 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     single-slow-client signal; and the arbiter's `(winner, loser)` lead-histogram index formula is
     now pinned by a unit test.
 
+### Fixed
+- Reference-data state is now tracked per publisher (source IP) rather than once per receiver,
+  matching how sequence state is already keyed. `reset_count` is scoped to `(source_ip, group,
+  port)`, so under a shared port block one publisher's restart previously cleared every publisher's
+  instrument definitions — blanking the whole feed until the next reference-data burst, since all
+  emission gates on a known definition. (#97)
+
 ### Added
 - **Standalone `shred-proxy` binary** (new workspace member `shred-proxy/`): a lightweight service
   that joins the DoubleZero `edge-solana-*` shred multicast feeds, deduplicates, and forwards a
