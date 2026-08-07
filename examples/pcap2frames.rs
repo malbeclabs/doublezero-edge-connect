@@ -6,8 +6,8 @@
 //! (`split_frames`) replays. One UDP datagram == one edge-feed frame, so a "frame" is the UDP
 //! payload.
 //!
-//! Frames are decoded through the real `ingest::codec` / `ingest::codec_mbo`, which does double
-//! duty:
+//! Frames are decoded through the real `ingest::codec` / `ingest::codec_mbo` /
+//! `ingest::codec_mbp`, which does double duty:
 //!   1. **Filtering** — with `--symbol BTC`, keep every refdata frame (definitions + manifest,
 //!      needed so the bridge resolves precision) but only the mktdata (and, for MBO, snapshot)
 //!      frames for that symbol, yielding a small self-contained fixture.
@@ -18,6 +18,7 @@
 //! Output is split by content into per-role files matching the harness's separate replay streams:
 //!   TOB -> `<prefix>.refdata.bin`, `<prefix>.mktdata.bin`
 //!   MBO -> `<prefix>.refdata.bin`, `<prefix>.snapshot.bin`, `<prefix>.mktdata.bin`
+//!   MBP -> `<prefix>.refdata.bin`, `<prefix>.snapshot.bin`, `<prefix>.mktdata.bin`
 //!
 //! The capture is Linux SLL (cooked) — we hand-parse SLL(16) -> IPv4 -> UDP, which is trivial for
 //! the multicast UDP we care about and avoids an Ethernet-only parser.
@@ -34,7 +35,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use pcap_file::{pcap::PcapReader, DataLink};
 
-use doublezero_edge_connect::ingest::{codec, codec_mbo};
+use doublezero_edge_connect::ingest::{codec, codec_mbo, codec_mbp};
 
 /// One replay stream: a list of complete frames (UDP payloads), each written as a length-prefixed
 /// record by [`write_log`].
@@ -44,14 +45,16 @@ type FrameLog = Vec<Vec<u8>>;
 enum Protocol {
     Tob,
     Mbo,
+    Mbp,
 }
 
 impl Protocol {
-    /// Little-endian frame magic: TOB `0x445A`, MBO `0x4444`.
+    /// Little-endian frame magic: TOB `0x445A`, MBO `0x4444`, MBP `0x4442`.
     fn magic(self) -> [u8; 2] {
         match self {
             Protocol::Tob => [0x5A, 0x44],
             Protocol::Mbo => [0x44, 0x44],
+            Protocol::Mbp => [0x42, 0x44],
         }
     }
 }
@@ -100,7 +103,7 @@ struct Args {
     /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata, 2=snapshot][frame]`. This preserves the
     /// real inter-publisher interleaving the multi-publisher dedup must collapse (separate
     /// per-publisher files, replayed back-to-back, would not). Works for `--protocol tob` and
-    /// `--protocol mbo`.
+    /// `--protocol mbo`; not implemented for `--protocol mbp`.
     #[arg(long)]
     combined_with: Option<Ipv4Addr>,
     /// MBO combined only: instead of keeping real snapshot frames, synthesize a per-publisher
@@ -486,6 +489,167 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         symbol_to_id.len(),
         errors,
         &format!("decode: order_add={adds} order_cancel={cancels} order_execute={execs} trades={trades} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} other={other} errors={errors}"),
+    );
+    if !args.symbol.is_empty() {
+        eprintln!(
+            "  filter symbols {:?} -> instrument_ids {target:?} (snapshot ids {target_sids:?})",
+            args.symbol
+        );
+    }
+    eprintln!(
+        "  wrote {} refdata frames -> {refdata_path:?}",
+        refdata.len()
+    );
+    eprintln!(
+        "  wrote {} snapshot frames -> {snapshot_path:?}",
+        snapshot.len()
+    );
+    eprintln!(
+        "  wrote {} mktdata frames -> {mktdata_path:?}",
+        mktdata.len()
+    );
+    Ok(())
+}
+
+/// MBP: split into refdata (definitions/manifest), snapshot (begin/level/end), and mktdata (level
+/// updates, clears, resets, trades). Mirrors [`process_mbo`], including the snapshot routing:
+/// `SnapshotLevel` carries only a `snapshot_id`, so the levels kept are those whose id belongs to a
+/// `SnapshotBegin` for a target instrument.
+fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
+    use codec_mbp::Message;
+    let (mut levels, mut clears, mut resets, mut trades) = (0u64, 0u64, 0u64, 0u64);
+    let (mut defs, mut manifests, mut snaps, mut hb, mut other, mut errors) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
+
+    // Per-frame summaries (so the symbol filter can be applied after the full scan).
+    struct Frame {
+        payload: Vec<u8>,
+        refdata: bool,
+        snapshot: bool,
+        begins: Vec<(u32, u32)>, // (instrument_id, snapshot_id)
+        end_insts: Vec<u32>,
+        level_sids: Vec<u32>,
+        md_ids: Vec<u32>, // level-update/clear/reset/trade instrument ids
+    }
+    let mut summaries: Vec<Frame> = Vec::new();
+
+    for f in frames {
+        let Ok((_hdr, msgs)) = codec_mbp::decode_frame(f) else {
+            errors += 1;
+            continue;
+        };
+        let mut fr = Frame {
+            payload: f.clone(),
+            refdata: false,
+            snapshot: false,
+            begins: Vec::new(),
+            end_insts: Vec::new(),
+            level_sids: Vec::new(),
+            md_ids: Vec::new(),
+        };
+        for m in &msgs {
+            match m {
+                Message::LevelUpdate(u) => {
+                    levels += 1;
+                    fr.md_ids.push(u.instrument_id);
+                }
+                Message::BookClear(c) => {
+                    clears += 1;
+                    fr.md_ids.push(c.instrument_id);
+                }
+                // Instrument-keyed and load-bearing for recovery, so it rides the symbol filter
+                // rather than being dropped as an unrouted control message.
+                Message::InstrumentReset(r) => {
+                    resets += 1;
+                    fr.md_ids.push(r.instrument_id);
+                }
+                Message::Trade(t) => {
+                    trades += 1;
+                    fr.md_ids.push(t.instrument_id);
+                }
+                Message::InstrumentDefinition(d) => {
+                    defs += 1;
+                    fr.refdata = true;
+                    symbol_to_id.insert(d.symbol.to_string(), d.instrument_id);
+                }
+                Message::ManifestSummary(_) => {
+                    manifests += 1;
+                    fr.refdata = true;
+                }
+                Message::SnapshotBegin(s) => {
+                    snaps += 1;
+                    fr.snapshot = true;
+                    fr.begins.push((s.instrument_id, s.snapshot_id));
+                }
+                Message::SnapshotLevel(s) => {
+                    snaps += 1;
+                    fr.snapshot = true;
+                    fr.level_sids.push(s.snapshot_id);
+                }
+                Message::SnapshotEnd(s) => {
+                    snaps += 1;
+                    fr.snapshot = true;
+                    fr.end_insts.push(s.instrument_id);
+                }
+                Message::Heartbeat(_) => hb += 1,
+                _ => other += 1,
+            }
+        }
+        summaries.push(fr);
+    }
+
+    let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
+    let target_sids: HashSet<u32> = match &target {
+        Some(t) => summaries
+            .iter()
+            .flat_map(|fr| fr.begins.iter())
+            .filter(|(inst, _)| t.contains(inst))
+            .map(|(_, sid)| *sid)
+            .collect(),
+        None => HashSet::new(),
+    };
+
+    let mut refdata = Vec::new();
+    let mut snapshot = Vec::new();
+    let mut mktdata = Vec::new();
+    for fr in &summaries {
+        if fr.refdata {
+            refdata.push(fr.payload.clone());
+        }
+        if fr.snapshot {
+            let keep = match &target {
+                None => true,
+                Some(t) => {
+                    fr.begins.iter().any(|(inst, _)| t.contains(inst))
+                        || fr.end_insts.iter().any(|inst| t.contains(inst))
+                        || fr.level_sids.iter().any(|sid| target_sids.contains(sid))
+                }
+            };
+            if keep {
+                snapshot.push(fr.payload.clone());
+            }
+        }
+        let keep_md = target
+            .as_ref()
+            .is_none_or(|t| fr.md_ids.iter().any(|id| t.contains(id)));
+        if !fr.md_ids.is_empty() && keep_md {
+            mktdata.push(fr.payload.clone());
+        }
+    }
+
+    let refdata_path = out_path(&args.out, "refdata");
+    let snapshot_path = out_path(&args.out, "snapshot");
+    let mktdata_path = out_path(&args.out, "mktdata");
+    write_log(&refdata_path, &refdata)?;
+    write_log(&snapshot_path, &snapshot)?;
+    write_log(&mktdata_path, &mktdata)?;
+    report_decode(
+        "mbp",
+        args,
+        symbol_to_id.len(),
+        errors,
+        &format!("decode: level_update={levels} book_clear={clears} instrument_reset={resets} trades={trades} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} other={other} errors={errors}"),
     );
     if !args.symbol.is_empty() {
         eprintln!(
@@ -1096,6 +1260,10 @@ fn main() -> Result<()> {
                 );
                 process_mbo_combined(&tagged, &args)
             }
+            Protocol::Mbp => bail!(
+                "--combined-with is not implemented for --protocol mbp: a combined two-publisher \
+                 market-by-price capture has no consumer yet. Run one publisher at a time."
+            ),
         };
     }
     let frames = collect_frames(&args)?;
@@ -1103,5 +1271,6 @@ fn main() -> Result<()> {
     match args.protocol {
         Protocol::Tob => process_tob(&frames, &args),
         Protocol::Mbo => process_mbo(&frames, &args),
+        Protocol::Mbp => process_mbp(&frames, &args),
     }
 }
