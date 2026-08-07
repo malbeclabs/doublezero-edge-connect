@@ -10,28 +10,20 @@
 //! and each `Level` carries the **absolute** resulting quantity of one level, so there is nothing to
 //! aggregate and the `Add`/`Cancel`/`Execute` vocabulary does not apply.
 //!
-//! Like `book.rs` the type is deliberately **codec-agnostic** (raw integers, not wire structs), so
-//! the recovery logic unit-tests in isolation and the side/scope constants below are the book's own
-//! rather than a codec dependency.
+//! Like `book.rs` the type takes **raw integers, not wire structs**, so the recovery logic
+//! unit-tests in isolation. It is not value-space-agnostic, though: `side`, `clear_side` and `scope`
+//! arrive as the bytes [`crate::ingest::codec_mbp`] decoded, so the constants come from there rather
+//! than being restated here. A second copy that drifted would swap bids and asks while every
+//! sequence check still passed.
 
 use std::collections::BTreeMap;
 
-/// Side of the book a level belongs to, as encoded on the wire. Only `SIDE_ASK` is branched on —
-/// the book treats every other byte as a bid, since the decoder rejects the rest.
-#[allow(dead_code)]
-pub(crate) const SIDE_BID: u8 = 0;
-pub(crate) const SIDE_ASK: u8 = 1;
+use crate::ingest::codec_mbp::{
+    CLEAR_SIDE_ASK, CLEAR_SIDE_BID, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, SCOPE_FROM_PRICE, SIDE_ASK,
+};
 
-/// Which side(s) a `BookClear` empties.
-pub(crate) const CLEAR_SIDE_BID: u8 = 0;
-pub(crate) const CLEAR_SIDE_ASK: u8 = 1;
-pub(crate) const CLEAR_SIDE_BOTH: u8 = 2;
-
-/// How far a `BookClear` reaches: the whole side, or from `from_price_raw` outward.
-pub(crate) const SCOPE_ENTIRE_SIDE: u8 = 0;
-pub(crate) const SCOPE_FROM_PRICE: u8 = 1;
-
-/// `Action` values from the spec's enum. Observability only — see [`PriceBook::on_delta`].
+/// `Action` values from the spec's enum — the one wire enum the decoder does not name, since it
+/// passes the byte through untouched. Observability only, see [`PriceBook::on_delta`].
 const ACTION_NEW: u8 = 1;
 const ACTION_CHANGE: u8 = 2;
 const ACTION_DELETE: u8 = 3;
@@ -542,6 +534,8 @@ fn clear_side_levels(levels: &mut BTreeMap<i64, LevelState>, is_bid: bool, scope
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The impl only ever branches on `SIDE_ASK`; the tests need both sides named.
+    use crate::ingest::codec_mbp::SIDE_BID;
 
     /// Action values from the spec's enum: 1=New, 2=Change, 3=Delete, 0=Unknown.
     const NEW: u8 = 1;
