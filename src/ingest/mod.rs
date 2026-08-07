@@ -15,6 +15,7 @@ pub mod codec_midpoint;
 pub mod feeds;
 pub mod health;
 pub mod phoenix_feeder;
+pub mod pricebook;
 pub mod processor;
 pub mod public_feeder;
 pub mod receiver;
