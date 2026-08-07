@@ -656,6 +656,12 @@ impl Arbiter {
         self.authority = Some(StickyAuthority::new(cfg));
     }
 
+    /// The configured authority, so a test can assert a processor's health reports landed.
+    #[cfg(test)]
+    pub(crate) fn authority(&self) -> Option<&StickyAuthority> {
+        self.authority.as_ref()
+    }
+
     /// Report one arm's book health for a market, so authority transfers away from an arm whose book
     /// is gapped or awaiting a snapshot. Called by the market-by-price processor on every `Ready`
     /// transition; a no-op until [`Self::set_authority`] has run.
