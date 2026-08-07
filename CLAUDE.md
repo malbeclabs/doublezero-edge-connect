@@ -258,8 +258,11 @@ Modules are grouped by role under `src/`:
   (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder but
   has **no committed fixture** — nothing decodes it in production yet (no `FeedKind`, no `FEEDS`
   row). It is the one codec that enforces **exact** body-length equality per type rather than
-  bounds-checked reads: `SnapshotBegin` is a prefix-superset of MBO's, so a lenient decode would
-  read `depth_bound` (whose `0` claims a *complete* book) out of trailing bytes.
+  bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's, so a lenient decode would
+  read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
+  therefore also the one that rejects an unimplemented `SCHEMA_VERSION` itself rather than leaving
+  it to the shared walker: without that gate the length rule would silently reject a v2 frame whose
+  bodies legally grew, and the whole feed would decode to `Other`.
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
   Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
