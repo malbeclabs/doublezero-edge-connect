@@ -14,7 +14,14 @@
 
 ## Progress
 
-**Status: Tasks 1, 2, 3, 7, 8, 9 are done.** They are the whole bottom of the stack bar arbitration: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, the market-by-price decoder and the price book. Nothing they add is reachable from a running process yet — no `FeedKind`, no `FEEDS` row, no processor — so the branch is behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes.
+**Status: Tasks 1, 2, 3, 7, 8, 9 are done, every step.** They are the whole bottom of the stack bar arbitration: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, the market-by-price decoder and the price book. Nothing they add is reachable from a running process yet — no `FeedKind`, no `FEEDS` row, no processor — so the branch is behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes.
+
+**Wire facts the fixture capture settled, which later tasks need.** Read `tests/fixtures/PROVENANCE.md` for the full record; these are the ones that change a decision:
+
+- **The market-by-price deployment is `Channel ID`-sharded** — the live sports feed runs three channels on one group (10/63/120), each an independent state machine with its own snapshot cycle, with zero instrument-id overlap between them. Anything tracking an open snapshot group, or a per-instrument sequence, must key **per channel**; a port-wide slot mis-attributes every level of an interleaved channel (spec §"Scoped to the channel, not to the port"). Task 11's `MbpProcessor` inherits this directly.
+- **But the older perps feed's two arms stamp *different* `Channel ID`s (1 and 2) for an identical instrument set.** Task 4's `MarketKey = (venue, channel_id, instrument_id)` deliberately excludes the arm so both arms contest one key — with per-arm channel ids they never would. Treated as a defect of a publisher being retired (raised with its author 2026-08-07), so **Task 4's key stands as planned**; re-check against the next capture before building Task 12 on it.
+- **Symbols overflow the 16-byte wire field on the sharded feed**, and one truncation collides across two instrument ids. `InstrumentSnapshot`/`DepthSnapshot` are keyed `(venue, symbol)`, so this is a live collision risk for Tasks 11–12, not a cosmetic one.
+- **Group addresses, ports and `source_id`,** which the *Blocking open question* below was missing half of: market-by-price `233.84.178.4` (perps) / `233.84.178.20` (sports), top-of-book `233.84.178.3` (perps) / `233.84.178.17` (sports). Perps ports `31000`/`41000`/`51000` mktdata/refdata/snapshot and top-of-book `7576`/`7577`; sports encodes the channel in the port (`33010`/`43010`/`53010` for channel 10, etc.). Every frame carries `source_id = 3`, which `codec::source_name` does not map — Task 14 adds it. **Still missing: the DoubleZero group *codes* for `Feed.code`**, which is the other half of that question and the part that actually blocks Task 14.
 
 | Task | State |
 |---|---|
@@ -25,7 +32,7 @@
 | 5 — re-election sampling | not started |
 | 6 — `channel`/`type` filters | not started |
 | 7 — `codec_mbp` frame walk | **done** (`d12ff44`, `f89e68b`; review fix `75ce041`) |
-| 8 — `codec_mbp` price types | **done** (`1b003a3`, `f89e68b`) — **except Step 9, the real-frame fixture capture**, which needs tunnel access nobody executing this had |
+| 8 — `codec_mbp` price types | **done**, all steps (`1b003a3`, `f89e68b`; fixtures + real-frame tests in the Step 9 commit) |
 | 9 — `PriceBook` | **done** (`0f018cb`, `cc69ea6`, `e6bccee`; review fixes `503b6a6`, `3bf9a09`) |
 | 10 — `book` wire message | not started |
 | 11 — `MbpProcessor` | not started |
@@ -2615,11 +2622,11 @@ Against `marketbyprice_wire.go`, body-relative:
 
 Signedness to mirror: `i64` for every `*price*` field, `i8` for the two exponents, unsigned everywhere else. A disagreement is our bug.
 
-- [x] **Step 8: Add the fixture test harness** — done as the cross-codec pinning half only; the real-frame decode test is not there, because Step 9 produced no fixture to point it at.
+- [x] **Step 8: Add the fixture test harness** — both halves: the cross-codec pinning plus the real-frame decode tests over the captures Step 9 produced.
 
 Create `tests/codec_mbp_fixtures.rs` with the cross-codec equality test moved out of the unit module (so the integration suite also pins it) plus a real-frame decode test over `tests/fixtures/mbp_{mktdata,refdata,snapshot}.bin`, using `tests/common/replay.rs`'s `split_frames` reader exactly as `tests/codec_mbo_fixtures.rs` does — read that file first and mirror its structure. The real-frame test asserts, at minimum: zero decode errors across every frame; `total_levels` equals the decoded `SnapshotLevel` count between a `SnapshotBegin`/`SnapshotEnd` pair; every `LevelUpdate.per_instrument_seq` for one instrument is dense; and at least one `depth_bound == 0` is observed (the live perps publisher carries the complete book).
 
-- [ ] **Step 9: Capture the fixtures** — **NOT DONE, and the only step in Tasks 1–3/7–9 that isn't.** The escape hatch below was taken: no host available had the tunnel up and subscribed to the market-by-price group, and no fixture was synthesized. The `pcap2frames --protocol mbp` half *is* built, so this is one command on a host with access. The gap is stated in `codec_mbp.rs`'s module doc ("Oracle strength: no real-frame fixture exists yet"), in `tests/fixtures/PROVENANCE.md`, in `tests/codec_mbp_fixtures.rs`'s module doc, and in CHANGELOG. Do this before any `FEEDS` row goes live on this protocol.
+- [x] **Step 9: Capture the fixtures** — done from wire captures taken 2026-08-07, but **read `tests/fixtures/PROVENANCE.md` before trusting them as normative.** Two sets are committed rather than one, because the deployment turned out to have two shapes and each covers what the other cannot: `mbp_*` is the **sharded** feed (three `Channel ID`s on one group — the only fixture that exercises per-channel snapshot grouping) and `mbp_perps_*` is the **dense** feed (one channel, thousands of contiguous deltas — what pins sequence handling). The captures also surfaced three publisher-side deviations, all recorded in PROVENANCE: per-arm `Channel ID`s on the older feed (which would break a channel-keyed market key — relevant to Task 4), 16-byte symbol truncation with one real collision on a `(venue, symbol)`-keyed map, and no `BookClear`/`InstrumentReset`/`BatchBoundary`/`EndOfSession` in either window. A longer capture with publisher fixes is expected; the fixture tests assert invariants, not recorded counts, so it drops in without editing a number.
 
 `examples/pcap2frames.rs` needs an `Mbp` variant: add it to `enum Protocol` (`:44`) with magic `[0x42, 0x44]` (`0x4442` LE) and a `process_mbp` arm mirroring `process_mbo` (`:1089`, `:1105`). Then, on a host with the DoubleZero tunnel up and subscribed to the perps MBP group:
 

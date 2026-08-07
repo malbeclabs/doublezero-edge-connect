@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared size exactly. `SnapshotBegin` is a prefix-superset of Market-by-Order's, so a lenient
   decode would read `depth_bound` from whatever follows the body — and the version gate is what
   keeps the length rule from silently rejecting a v2 frame whose bodies legally grew. Offsets are
-  validated field-for-field against the Go reference decoder; **no real-frame fixture exists yet**
-  (see `tests/fixtures/PROVENANCE.md`). (#95)
+  validated field-for-field against the Go reference decoder and against two committed real captures
+  of the live publisher — a sharded multi-channel set and a dense single-channel set. Four message
+  types appear in neither capture and stay offset-test-only; `tests/fixtures/PROVENANCE.md` records
+  that and the publisher deviations the captures contain. (#95)
 - `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
   with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
 - `PriceBook` (`src/ingest/pricebook.rs`): the price-keyed L2 book and its snapshot+delta recovery
