@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   went live — settles at ~12 rejoins/hour. Detection is unchanged: the socket stays bound, so a
   returning publisher is picked up on its first datagram, and the first `status: down` still fires
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
+- `MidpointProcessor` held a single bare `SeqTracker` instead of one per publisher. Frame sequence
+  is scoped to `(source_ip, group, port)`, so under a shared port block two mirrored publishers'
+  independent sequence spaces interleaved onto one anchor and whichever ran lower read as stale on
+  every frame: its mids were dropped outright while `dz_seq_events_total{kind="stale"}` climbed on a
+  perfectly healthy feed. Now keyed by source IP and bounded by `MAX_PUBLISHERS` exactly as
+  `TobProcessor`'s already was. Latent — no `FEEDS` row uses `FeedKind::Midpoint` yet. (#109)
 
 ### Added
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
