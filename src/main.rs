@@ -242,13 +242,25 @@ struct Args {
     )]
     arb_transfer_win_rate: f64,
 
-    /// Seconds of leader silence after which a healthy challenger takes authority.
+    /// Seconds of leader silence after which a healthy challenger takes authority. Measured
+    /// venue-wide, against the leader's last message on any market — not per market, or a market
+    /// quieter than this would hand authority back and forth on every update.
     #[arg(
         long = "arb-leader-timeout-secs",
         env = "DZ_ARB_LEADER_TIMEOUT_SECS",
         default_value_t = 2
     )]
     arb_leader_timeout_secs: u64,
+
+    /// Matched cross-arm samples an arm needs in a window before its speed is judged at all. Below
+    /// this the window is ignored, so a handful of lucky matches cannot move a venue.
+    #[arg(
+        long = "arb-min-window-samples",
+        env = "DZ_ARB_MIN_WINDOW_SAMPLES",
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_min_window_samples: u64,
 }
 
 /// A win rate outside `0.0..=1.0` silently disables one of the two transfer conditions (above 1.0
@@ -410,6 +422,7 @@ async fn main() -> Result<()> {
         sample_interval_ns: args.arb_sample_interval_secs.saturating_mul(1_000_000_000),
         transfer_margin_ns: args.arb_transfer_margin_us.saturating_mul(1_000),
         transfer_win_rate: args.arb_transfer_win_rate,
+        min_window_samples: args.arb_min_window_samples as usize,
     };
     let _ = &authority_cfg;
 
