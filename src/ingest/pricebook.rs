@@ -149,8 +149,6 @@ pub struct PriceBook {
     bids: BTreeMap<i64, LevelState>,
     asks: BTreeMap<i64, LevelState>,
     status: Status,
-    /// `mktdata`-port sequence of the last applied delta / installed snapshot anchor.
-    last_applied_mktdata_seq: u64,
     /// Last applied per-instrument delta sequence. This — never `anchor_seq` — is the
     /// snapshot-while-`Ready` discriminator.
     last_applied_instrument_seq: u32,
@@ -177,7 +175,6 @@ impl PriceBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             status: Status::AwaitingSnapshot,
-            last_applied_mktdata_seq: 0,
             last_applied_instrument_seq: 0,
             depth_bound: None,
             required_anchor_seq: None,
@@ -231,7 +228,9 @@ impl PriceBook {
         self.asks.iter().map(|(p, l)| (*p, l))
     }
 
-    /// Apply a delta, or buffer it when the book is not `Ready`.
+    /// Apply a delta, or buffer it when the book is not `Ready`. A sustained run of `Duplicate` is
+    /// the one symptom of a baseline above the publisher's real counter — see
+    /// [`Self::on_end_of_session`] for the escape — so a caller should count it.
     pub fn on_delta(&mut self, op: DeltaOp) -> DeltaOutcome {
         if self.status != Status::Ready {
             self.buffer(op);
@@ -269,7 +268,8 @@ impl PriceBook {
                 && last_instrument_seq <= self.last_applied_instrument_seq)
             || total_levels as usize > MAX_LEVELS_PER_BOOK
         {
-            self.open = None;
+            // A begin we refuse says nothing about a group already under assembly, so leave it —
+            // discarding it would strand `status` at `BuildingSnapshot` with no group to end.
             return false;
         }
         self.open = Some(Building {
@@ -306,22 +306,29 @@ impl PriceBook {
         } else {
             &mut b.bids
         };
-        levels.insert(
-            price_raw,
-            LevelState {
-                qty_raw,
-                order_count,
-                level_flags,
-            },
-        );
-        b.received_levels += 1;
+        // Count distinct prices, not messages: a duplicated datagram would otherwise make up for a
+        // lost one and let a group short of `total_levels` install as complete.
+        if levels
+            .insert(
+                price_raw,
+                LevelState {
+                    qty_raw,
+                    order_count,
+                    level_flags,
+                },
+            )
+            .is_none()
+        {
+            b.received_levels += 1;
+        }
     }
 
     /// Install the assembled group, returning whether it did. A mismatched `snapshot_id`/`anchor_seq`
     /// or a level count short of `total_levels` discards the shadow **and the live levels** and
     /// leaves the book `AwaitingSnapshot`: a group only ever opens from `Ready` once we know we are
     /// behind, so a failure there means the stale book we meant to replace must stop being served.
-    /// A snapshot that was never accepted (no open group) leaves everything untouched.
+    /// A snapshot that was never accepted (no open group) leaves everything untouched. `true` means
+    /// the levels installed, not that the book is usable — the replay it triggers can gap.
     pub fn on_snapshot_end(&mut self, anchor_seq: u64, snapshot_id: u32) -> bool {
         let Some(b) = self.open.take() else {
             return false;
@@ -332,12 +339,12 @@ impl PriceBook {
         {
             self.bids.clear();
             self.asks.clear();
+            self.depth_bound = None;
             self.status = Status::AwaitingSnapshot;
             return false;
         }
         self.bids = b.bids;
         self.asks = b.asks;
-        self.last_applied_mktdata_seq = b.anchor_seq;
         self.last_applied_instrument_seq = b.last_instrument_seq;
         self.depth_bound = Some(b.depth_bound);
         self.required_anchor_seq = None;
@@ -357,7 +364,6 @@ impl PriceBook {
         self.open = None;
         self.pending.retain(|d| d.mktdata_seq > new_anchor_seq);
         self.status = Status::AwaitingSnapshot;
-        self.last_applied_mktdata_seq = 0;
         self.last_applied_instrument_seq = 0;
         self.depth_bound = None;
         self.required_anchor_seq = Some(new_anchor_seq);
@@ -368,13 +374,17 @@ impl PriceBook {
     /// there is no forward anchor, so buffered deltas belong to the ended session and are discarded
     /// outright. Zeroing the event clock keeps the resync from stamping its first output with
     /// pre-session time.
+    ///
+    /// This is also the **only** escape from a per-instrument sequence that restarted (a publisher
+    /// crash, or a garbage `last_instrument_seq` installed by a snapshot): every delta below the
+    /// baseline reads as a duplicate and every snapshot as current, so the frame header's changed
+    /// `Reset Count` must route here for every book of that publisher.
     pub fn on_end_of_session(&mut self) {
         self.bids.clear();
         self.asks.clear();
         self.open = None;
         self.pending.clear();
         self.status = Status::AwaitingSnapshot;
-        self.last_applied_mktdata_seq = 0;
         self.last_applied_instrument_seq = 0;
         self.depth_bound = None;
         self.required_anchor_seq = None;
@@ -406,7 +416,7 @@ impl PriceBook {
                 break;
             }
             if self.apply(op) == DeltaOutcome::Gap {
-                break; // level cap: the book was discarded, and so was the buffer
+                return; // level cap: the book and the buffer are gone, and the rest goes with them
             }
         }
         for op in ops {
@@ -417,9 +427,6 @@ impl PriceBook {
     /// Apply an in-sequence delta, advancing the trackers. Only reachable once the sequence has been
     /// classified.
     fn apply(&mut self, op: DeltaOp) -> DeltaOutcome {
-        self.last_applied_instrument_seq = op.seq;
-        self.last_applied_mktdata_seq = op.mktdata_seq;
-        self.last_event_ts = op.ts;
         match op.delta {
             BookDelta::Level {
                 side,
@@ -439,9 +446,11 @@ impl PriceBook {
                     && qty_raw != 0
                     && self.bids.len() + self.asks.len() >= MAX_LEVELS_PER_BOOK
                 {
+                    // Refused before the trackers move: nothing was applied, so nothing advances.
                     self.overflow();
                     return DeltaOutcome::Gap;
                 }
+                self.advance(op.seq, op.ts);
                 let levels = if is_ask {
                     &mut self.asks
                 } else {
@@ -470,11 +479,12 @@ impl PriceBook {
                 scope,
                 from_price_raw,
             } => {
-                // One price cannot bound both sides; the decoder drops this before it reaches here.
-                debug_assert!(
-                    !(clear_side == CLEAR_SIDE_BOTH && scope == SCOPE_FROM_PRICE),
-                    "malformed BookClear: scope=from_price with clear_side=both"
-                );
+                self.advance(op.seq, op.ts);
+                if clear_side == CLEAR_SIDE_BOTH && scope == SCOPE_FROM_PRICE {
+                    // Malformed: one price cannot bound both sides. Consume the sequence, clear
+                    // nothing — a guess at what was meant would silently empty a live book.
+                    return DeltaOutcome::Applied { divergence: None };
+                }
                 if clear_side == CLEAR_SIDE_BID || clear_side == CLEAR_SIDE_BOTH {
                     clear_side_levels(&mut self.bids, true, scope, from_price_raw);
                 }
@@ -484,6 +494,11 @@ impl PriceBook {
                 DeltaOutcome::Applied { divergence: None }
             }
         }
+    }
+
+    fn advance(&mut self, seq: u32, ts: u64) {
+        self.last_applied_instrument_seq = seq;
+        self.last_event_ts = ts;
     }
 
     /// The level cap was reached. Discard the book *and* the buffer — leaving the buffer would just
@@ -763,7 +778,7 @@ mod tests {
     }
 
     /// **The trap this test exists for.** `Anchor Seq` is a channel-wide mktdata sequence while
-    /// `last_applied_mktdata_seq` advances only on this instrument's own deltas — every frame for
+    /// our own baseline advances only on this instrument's own deltas — every frame for
     /// every other instrument, and every heartbeat, moves one and not the other. Comparing them
     /// makes "we are behind" true for nearly every instrument on nearly every rotation, so a
     /// subscriber would discard and rebuild a perfectly good book every cycle.
@@ -823,6 +838,68 @@ mod tests {
         assert_eq!(b.status(), Status::AwaitingSnapshot);
         assert!(bids_of(&b).is_empty(), "the known-stale book is gone");
         assert!(asks_of(&b).is_empty());
+        assert_eq!(b.depth_bound(), None, "and so is its completeness claim");
+    }
+
+    /// A duplicated `SnapshotLevel` must not make up for a lost one: the count guards against
+    /// truncation, so it counts distinct prices rather than datagrams.
+    #[test]
+    fn a_duplicated_snapshot_level_does_not_satisfy_the_count() {
+        let mut b = PriceBook::new();
+        assert!(b.on_snapshot_begin(1, 100, 3, 0, 0));
+        b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0);
+        b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0); // duplicate of the same price
+        b.on_snapshot_level(1, SIDE_BID, 6100, 20, Some(1), 0); // the third level is lost
+        assert!(!b.on_snapshot_end(100, 1));
+        assert_eq!(b.status(), Status::AwaitingSnapshot);
+    }
+
+    /// A begin we decline says nothing about a group already under assembly. Discarding it would
+    /// strand the book in `BuildingSnapshot` with no group to end, so the real `SnapshotEnd` would
+    /// find nothing and the stale levels would keep being served under a status that denies them.
+    #[test]
+    fn a_declined_snapshot_begin_leaves_the_open_group_alone() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0));
+        assert!(
+            !b.on_snapshot_begin(3, 500, MAX_LEVELS_PER_BOOK as u32 + 1, 9, 0),
+            "oversized -> declined"
+        );
+        b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
+        assert!(
+            b.on_snapshot_end(500, 2),
+            "the accepted group still installs"
+        );
+        assert_eq!(asks_of(&b), vec![(6300, 77)]);
+    }
+
+    /// The rotation path this module exists for: a `Ready` book rebuilds while deltas keep arriving.
+    /// They must buffer rather than mutate the book being replaced, then replay onto the new one.
+    #[test]
+    fn a_rebuild_from_ready_buffers_deltas_and_replays_them() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(
+            b.on_snapshot_begin(2, 500, 1, 9, 0),
+            "K=9 > 5, we are behind"
+        );
+        assert!(matches!(
+            b.on_delta(level(10, 501, SIDE_BID, 6100, 20, NEW)),
+            DeltaOutcome::Buffered
+        ));
+        assert_eq!(
+            bids_of(&b),
+            vec![(6200, 150)],
+            "the book under replacement is untouched"
+        );
+        b.on_snapshot_level(2, SIDE_BID, 6000, 5, Some(1), 0);
+        assert!(b.on_snapshot_end(500, 2));
+        assert_eq!(b.status(), Status::Ready);
+        assert_eq!(
+            bids_of(&b),
+            vec![(6100, 20), (6000, 5)],
+            "the buffered delta replayed onto the installed snapshot"
+        );
+        assert_eq!(b.buffered_len(), 0);
     }
 
     /// Publishers SHOULD emit levels best-to-worst, but subscribers MUST NOT depend on it: the
@@ -931,6 +1008,26 @@ mod tests {
         assert_eq!(asks_of(&b), vec![(6300, 40)], "6400 and 6500 gone");
     }
 
+    /// One price cannot bound both sides. Guessing at what was meant would silently empty a live
+    /// book, so the malformed clear consumes its sequence and changes nothing.
+    #[test]
+    fn clear_from_price_on_both_sides_is_malformed_and_clears_nothing() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10), (SIDE_ASK, 6300, 30)]);
+        assert!(matches!(
+            b.on_delta(clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_FROM_PRICE, 6250)),
+            DeltaOutcome::Applied { .. }
+        ));
+        assert_eq!(bids_of(&b), vec![(6200, 10)]);
+        assert_eq!(asks_of(&b), vec![(6300, 30)]);
+        assert!(
+            matches!(
+                b.on_delta(level(7, 102, SIDE_BID, 6100, 20, NEW)),
+                DeltaOutcome::Applied { .. }
+            ),
+            "the malformed clear still consumed seq 6"
+        );
+    }
+
     /// A clear shares the delta sequence with level updates — both mutate the book and their
     /// relative order is significant — so it is classified identically.
     #[test]
@@ -984,6 +1081,26 @@ mod tests {
         assert!(
             !b.on_snapshot_begin(3, 600, 0, 9, 0),
             "K == ours -> ignored, not anchor-blocked"
+        );
+        // Below the old requirement and behind on K: accepted only because the anchor no longer gates.
+        assert!(b.on_snapshot_begin(4, 400, 0, 99, 0));
+    }
+
+    /// Deltas past `S'` survive the reset and replay onto the recovery snapshot; only those the reset
+    /// supersedes are dropped.
+    #[test]
+    fn instrument_reset_keeps_post_anchor_buffered_deltas() {
+        let mut b = PriceBook::new();
+        b.on_delta(level(6, 500, SIDE_BID, 6000, 1, NEW)); // at S', superseded
+        b.on_delta(level(7, 501, SIDE_BID, 6100, 20, NEW)); // past S', kept
+        b.on_instrument_reset(500);
+        assert_eq!(b.buffered_len(), 1);
+        assert!(b.on_snapshot_begin(2, 500, 0, 6, 0));
+        assert!(b.on_snapshot_end(500, 2));
+        assert_eq!(
+            bids_of(&b),
+            vec![(6100, 20)],
+            "only the kept delta replayed"
         );
     }
 
