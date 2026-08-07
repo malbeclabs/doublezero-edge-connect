@@ -451,8 +451,159 @@ fn decode_instrument_reset(b: &[u8], o: usize) -> Option<Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Build a whole frame around `messages`, exposing the header fields a subscriber keys state on.
+    pub(crate) fn frame(
+        channel_id: u8,
+        reset_count: u8,
+        sequence: u64,
+        messages: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let body: Vec<u8> = messages.concat();
+        let mut f = vec![0u8; 24];
+        f[0..2].copy_from_slice(&MAGIC.to_le_bytes());
+        f[2] = SCHEMA_VERSION;
+        f[3] = channel_id;
+        f[4..12].copy_from_slice(&sequence.to_le_bytes());
+        f[12..20].copy_from_slice(&1_700_000_000_000_000_000u64.to_le_bytes());
+        f[20] = messages.len() as u8;
+        f[21] = reset_count;
+        f[22..24].copy_from_slice(&((24 + body.len()) as u16).to_le_bytes());
+        f.extend_from_slice(&body);
+        f
+    }
+
+    /// Inverse of [`u16_opt`]: `None` is the unavailable sentinel, never a magnitude.
+    fn u16_wire(v: Option<u16>) -> u16 {
+        v.unwrap_or(U16_UNAVAILABLE)
+    }
+
+    pub(crate) fn enc_instrument_definition(d: &InstrumentDefinition) -> Vec<u8> {
+        let mut b = vec![0u8; sizes::INSTRUMENT_DEFINITION - MSG_HEADER_SIZE];
+        b[0..4].copy_from_slice(&d.instrument_id.to_le_bytes());
+        let sym = &d.symbol.as_bytes()[..d.symbol.len().min(16)];
+        b[4..4 + sym.len()].copy_from_slice(sym); // 16B NUL-padded field
+        b[37] = d.price_exponent as u8;
+        b[38] = d.qty_exponent as u8;
+        b[74..76].copy_from_slice(&d.manifest_seq.to_le_bytes());
+        msg(MSG_INSTRUMENT_DEFINITION, 0, &b)
+    }
+
+    pub(crate) fn enc_manifest_summary(m: &ManifestSummary) -> Vec<u8> {
+        let mut b = vec![m.channel_id, m.valid as u8, 0, 0]; // pad -> manifest_seq @4
+        b.extend_from_slice(&m.manifest_seq.to_le_bytes());
+        b.extend_from_slice(&[0u8; 2]); // pad -> instrument_count @8
+        b.extend_from_slice(&m.instrument_count.to_le_bytes());
+        b.extend_from_slice(&m.ts.to_le_bytes());
+        msg(MSG_MANIFEST_SUMMARY, 0, &b)
+    }
+
+    pub(crate) fn enc_trade(t: &Trade) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&t.instrument_id.to_le_bytes());
+        b.extend_from_slice(&t.source_id.to_le_bytes());
+        b.push(t.aggressor_side);
+        b.push(t.trade_flags);
+        b.extend_from_slice(&t.source_ts.to_le_bytes());
+        b.extend_from_slice(&t.trade_price_raw.to_le_bytes());
+        b.extend_from_slice(&t.trade_qty_raw.to_le_bytes());
+        b.extend_from_slice(&t.trade_id.to_le_bytes());
+        b.extend_from_slice(&t.cumulative_volume_raw.to_le_bytes());
+        msg(MSG_TRADE, 0, &b)
+    }
+
+    pub(crate) fn enc_level_update(u: &LevelUpdate) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&u.instrument_id.to_le_bytes());
+        b.extend_from_slice(&u.source_id.to_le_bytes());
+        b.push(u.side);
+        b.push(u.action);
+        b.extend_from_slice(&u.per_instrument_seq.to_le_bytes());
+        b.extend_from_slice(&u.price_raw.to_le_bytes());
+        b.extend_from_slice(&u.qty_raw.to_le_bytes());
+        b.extend_from_slice(&u.ts.to_le_bytes());
+        b.extend_from_slice(&u16_wire(u.order_count).to_le_bytes());
+        b.extend_from_slice(&u16_wire(u.level_index).to_le_bytes());
+        b.push(u.update_reason);
+        b.push(u.level_flags);
+        b.extend_from_slice(&[0u8; 2]); // trailing pad -> 44
+        msg(MSG_LEVEL_UPDATE, 0, &b)
+    }
+
+    pub(crate) fn enc_book_clear(c: &BookClear) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&c.instrument_id.to_le_bytes());
+        b.extend_from_slice(&c.source_id.to_le_bytes());
+        b.push(c.clear_side);
+        b.push(c.scope);
+        b.extend_from_slice(&c.per_instrument_seq.to_le_bytes());
+        b.extend_from_slice(&c.from_price_raw.to_le_bytes());
+        b.extend_from_slice(&c.ts.to_le_bytes());
+        b.push(c.clear_reason);
+        b.extend_from_slice(&[0u8; 3]); // trailing pad -> 32
+        msg(MSG_BOOK_CLEAR, 0, &b)
+    }
+
+    pub(crate) fn enc_snapshot_level(l: &SnapshotLevel) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&l.snapshot_id.to_le_bytes());
+        b.extend_from_slice(&l.price_raw.to_le_bytes());
+        b.extend_from_slice(&l.qty_raw.to_le_bytes());
+        b.extend_from_slice(&u16_wire(l.order_count).to_le_bytes());
+        b.push(l.side);
+        b.push(l.level_flags);
+        b.extend_from_slice(&[0u8; 4]); // trailing pad -> 28
+        msg(MSG_SNAPSHOT_LEVEL, 0, &b)
+    }
+
+    pub(crate) fn enc_snapshot_begin(s: &SnapshotBegin) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&s.instrument_id.to_le_bytes());
+        b.extend_from_slice(&s.anchor_seq.to_le_bytes());
+        b.extend_from_slice(&s.total_levels.to_le_bytes());
+        b.extend_from_slice(&s.snapshot_id.to_le_bytes());
+        b.extend_from_slice(&s.last_instrument_seq.to_le_bytes());
+        b.extend_from_slice(&s.ts.to_le_bytes());
+        b.extend_from_slice(&s.depth_bound.to_le_bytes());
+        msg(MSG_SNAPSHOT_BEGIN, 0, &b)
+    }
+
+    pub(crate) fn enc_snapshot_end(e: &SnapshotEnd) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&e.instrument_id.to_le_bytes());
+        b.extend_from_slice(&e.anchor_seq.to_le_bytes());
+        b.extend_from_slice(&e.snapshot_id.to_le_bytes());
+        msg(MSG_SNAPSHOT_END, 0, &b)
+    }
+
+    pub(crate) fn enc_batch_boundary(bb: &BatchBoundary) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&bb.batch_id.to_le_bytes());
+        b.extend_from_slice(&bb.batch_time.to_le_bytes());
+        msg(MSG_BATCH_BOUNDARY, 0, &b)
+    }
+
+    pub(crate) fn enc_instrument_reset(r: &InstrumentReset) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&r.instrument_id.to_le_bytes());
+        b.push(r.reason);
+        b.extend_from_slice(&[0u8; 3]); // reserved -> new_anchor_seq @8
+        b.extend_from_slice(&r.new_anchor_seq.to_le_bytes());
+        b.extend_from_slice(&r.ts.to_le_bytes());
+        msg(MSG_INSTRUMENT_RESET, 0, &b)
+    }
+
+    pub(crate) fn enc_heartbeat(ts: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 4]; // channel_id + pad -> ts @4
+        b.extend_from_slice(&ts.to_le_bytes());
+        msg(MSG_HEARTBEAT, 0, &b)
+    }
+
+    pub(crate) fn enc_end_of_session(ts: u64) -> Vec<u8> {
+        msg(MSG_END_OF_SESSION, 0, &ts.to_le_bytes())
+    }
 
     /// Build a 24-byte MBP frame header carrying `msg_count` messages and `body_len` body bytes.
     fn frame_header(msg_count: u8, reset_count: u8, body_len: usize) -> Vec<u8> {
@@ -935,6 +1086,253 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every `enc_*` builder decoded back by the real decoder. These builders feed the processor's
+    /// tests, where a body off by one byte decodes as `Other` and greens a test that drove nothing.
+    #[test]
+    fn builders_round_trip_through_the_decoder() {
+        let def = InstrumentDefinition {
+            instrument_id: 41,
+            symbol: Arc::from("KXBTCPERP"),
+            price_exponent: -4,
+            qty_exponent: -2,
+            manifest_seq: 3,
+        };
+        let manifest = ManifestSummary {
+            channel_id: 2,
+            valid: true,
+            manifest_seq: 3,
+            instrument_count: 13,
+            ts: 111,
+        };
+        let trade = Trade {
+            instrument_id: 41,
+            source_id: 3,
+            aggressor_side: AGGRESSOR_SELL,
+            trade_flags: 1,
+            source_ts: 222,
+            trade_price_raw: -6200,
+            trade_qty_raw: 150,
+            trade_id: 9876,
+            cumulative_volume_raw: 4242,
+        };
+        let update = LevelUpdate {
+            instrument_id: 41,
+            source_id: 3,
+            side: SIDE_ASK,
+            action: 2,
+            per_instrument_seq: 17,
+            price_raw: -6300,
+            qty_raw: 150,
+            ts: 333,
+            order_count: Some(4),
+            level_index: None,
+            update_reason: 1,
+            level_flags: 0b10,
+        };
+        let clear = BookClear {
+            instrument_id: 41,
+            source_id: 3,
+            clear_side: CLEAR_SIDE_BID,
+            scope: SCOPE_FROM_PRICE,
+            per_instrument_seq: 18,
+            from_price_raw: 6100,
+            ts: 444,
+            clear_reason: 1,
+        };
+        let begin = SnapshotBegin {
+            instrument_id: 41,
+            anchor_seq: 900,
+            total_levels: 2,
+            snapshot_id: 5,
+            last_instrument_seq: 16,
+            ts: 555,
+            depth_bound: 25,
+        };
+        let level = SnapshotLevel {
+            snapshot_id: 5,
+            price_raw: 6200,
+            qty_raw: 150,
+            order_count: None,
+            side: SIDE_BID,
+            level_flags: 1,
+        };
+        let end = SnapshotEnd {
+            instrument_id: 41,
+            anchor_seq: 900,
+            snapshot_id: 5,
+        };
+        let batch = BatchBoundary {
+            batch_id: 123,
+            batch_time: 666,
+        };
+        let reset = InstrumentReset {
+            instrument_id: 41,
+            reason: 3,
+            new_anchor_seq: 1_000,
+            ts: 777,
+        };
+
+        let built: Vec<Vec<u8>> = vec![
+            enc_instrument_definition(&def),
+            enc_manifest_summary(&manifest),
+            enc_trade(&trade),
+            enc_level_update(&update),
+            enc_book_clear(&clear),
+            enc_snapshot_begin(&begin),
+            enc_snapshot_level(&level),
+            enc_snapshot_end(&end),
+            enc_batch_boundary(&batch),
+            enc_instrument_reset(&reset),
+            enc_heartbeat(888),
+            enc_end_of_session(999),
+        ];
+        for (m, want) in built.iter().zip([
+            sizes::INSTRUMENT_DEFINITION,
+            sizes::MANIFEST_SUMMARY,
+            sizes::TRADE,
+            sizes::LEVEL_UPDATE,
+            sizes::BOOK_CLEAR,
+            sizes::SNAPSHOT_BEGIN,
+            sizes::SNAPSHOT_LEVEL,
+            sizes::SNAPSHOT_END,
+            sizes::BATCH_BOUNDARY,
+            sizes::INSTRUMENT_RESET,
+            sizes::HEARTBEAT,
+            sizes::END_OF_SESSION,
+        ]) {
+            assert_eq!(m.len(), want, "type {:#04x} wrong length", m[0]);
+        }
+
+        let (h, m) = decode_frame(&frame(4, 9, 12_345, &built)).unwrap();
+        assert_eq!((h.channel_id, h.reset_count, h.sequence), (4, 9, 12_345));
+        assert_eq!(m.len(), 12);
+
+        let Message::InstrumentDefinition(d) = &m[0] else {
+            panic!("{:?}", m[0])
+        };
+        assert_eq!(
+            (
+                d.instrument_id,
+                &*d.symbol,
+                d.price_exponent,
+                d.qty_exponent,
+                d.manifest_seq
+            ),
+            (41, "KXBTCPERP", -4, -2, 3)
+        );
+        let Message::ManifestSummary(s) = &m[1] else {
+            panic!("{:?}", m[1])
+        };
+        assert_eq!(
+            (
+                s.channel_id,
+                s.valid,
+                s.manifest_seq,
+                s.instrument_count,
+                s.ts
+            ),
+            (2, true, 3, 13, 111)
+        );
+        let Message::Trade(t) = &m[2] else {
+            panic!("{:?}", m[2])
+        };
+        assert_eq!(
+            (
+                t.instrument_id,
+                t.aggressor_side,
+                t.source_ts,
+                t.trade_price_raw,
+                t.trade_qty_raw,
+                t.trade_id,
+                t.cumulative_volume_raw
+            ),
+            (41, AGGRESSOR_SELL, 222, -6200, 150, 9876, 4242)
+        );
+        let Message::LevelUpdate(u) = &m[3] else {
+            panic!("{:?}", m[3])
+        };
+        assert_eq!(
+            (
+                u.instrument_id,
+                u.side,
+                u.action,
+                u.per_instrument_seq,
+                u.price_raw,
+                u.qty_raw,
+                u.ts,
+                u.order_count,
+                u.level_index,
+                u.update_reason,
+                u.level_flags
+            ),
+            (41, SIDE_ASK, 2, 17, -6300, 150, 333, Some(4), None, 1, 0b10)
+        );
+        let Message::BookClear(c) = &m[4] else {
+            panic!("{:?}", m[4])
+        };
+        assert_eq!(
+            (
+                c.instrument_id,
+                c.clear_side,
+                c.scope,
+                c.per_instrument_seq,
+                c.from_price_raw,
+                c.ts,
+                c.clear_reason
+            ),
+            (41, CLEAR_SIDE_BID, SCOPE_FROM_PRICE, 18, 6100, 444, 1)
+        );
+        let Message::SnapshotBegin(sb) = &m[5] else {
+            panic!("{:?}", m[5])
+        };
+        assert_eq!(
+            (
+                sb.instrument_id,
+                sb.anchor_seq,
+                sb.total_levels,
+                sb.snapshot_id,
+                sb.last_instrument_seq,
+                sb.ts,
+                sb.depth_bound
+            ),
+            (41, 900, 2, 5, 16, 555, 25)
+        );
+        let Message::SnapshotLevel(sl) = &m[6] else {
+            panic!("{:?}", m[6])
+        };
+        assert_eq!(
+            (
+                sl.snapshot_id,
+                sl.price_raw,
+                sl.qty_raw,
+                sl.order_count,
+                sl.side,
+                sl.level_flags
+            ),
+            (5, 6200, 150, None, SIDE_BID, 1)
+        );
+        let Message::SnapshotEnd(se) = &m[7] else {
+            panic!("{:?}", m[7])
+        };
+        assert_eq!(
+            (se.instrument_id, se.anchor_seq, se.snapshot_id),
+            (41, 900, 5)
+        );
+        let Message::BatchBoundary(bb) = &m[8] else {
+            panic!("{:?}", m[8])
+        };
+        assert_eq!((bb.batch_id, bb.batch_time), (123, 666));
+        let Message::InstrumentReset(r) = &m[9] else {
+            panic!("{:?}", m[9])
+        };
+        assert_eq!(
+            (r.instrument_id, r.reason, r.new_anchor_seq, r.ts),
+            (41, 3, 1_000, 777)
+        );
+        assert!(matches!(m[10], Message::Heartbeat(888)));
+        assert!(matches!(m[11], Message::EndOfSession(999)));
     }
 
     /// The `0x50`-`0x5F` range is reserved for a future positional-index addressing mode. There is

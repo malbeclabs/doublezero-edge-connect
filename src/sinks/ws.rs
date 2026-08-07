@@ -812,6 +812,8 @@ mod tests {
                 NormalizedInstrument {
                     venue: "Hyperliquid".into(),
                     symbol: arc,
+                    channel: 0,
+                    instrument_id: 1,
                     price_exponent: -2,
                     qty_exponent: -2,
                 },

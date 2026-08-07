@@ -153,7 +153,7 @@ impl StickyAuthority {
         }
     }
 
-    fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
+    pub(crate) fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
         self.markets
             .get(key)
             .is_none_or(|m| !m.unhealthy.contains(&publisher))

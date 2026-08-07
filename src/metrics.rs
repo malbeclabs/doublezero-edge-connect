@@ -159,6 +159,29 @@ pub struct Metrics {
     /// authority is fragmented; all on one arm is the steady state.
     pub arm_markets_held: IntGaugeVec,
 
+    // --- Market-by-price processor (per `venue`) ---
+    /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
+    pub mbp_channel_resets: IntCounterVec,
+    /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
+    /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
+    pub mbp_buffer_overflows: IntCounterVec,
+    /// A book discarded because its per-book price-level cap was hit — a malformed or forged stream,
+    /// never packet loss. Deliberately not counted as a sequence gap: the cause and the resulting
+    /// status differ, and merging them would read a hostile book as a lossy network.
+    pub mbp_level_overflows: IntCounterVec,
+    /// `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups,
+    /// or a lost `SnapshotBegin`.
+    pub mbp_orphan_snapshot_levels: IntCounterVec,
+    /// Deltas discarded as duplicates (`seq` at or below the applied baseline). A `Ready` book
+    /// emitting nothing but duplicates is the signature of a baseline installed above the
+    /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
+    /// series that surfaces that wedge.
+    pub mbp_duplicate_deltas: IntCounterVec,
+    /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
+    pub mbp_crossed: IntCounterVec,
+    /// Publisher `Action`-vs-quantity disagreements by `kind`. Never changes the applied result.
+    pub mbp_divergence: IntCounterVec,
+
     // --- WebSocket sink ---
     /// Currently-connected WebSocket clients.
     pub ws_clients: IntGauge,
@@ -475,6 +498,53 @@ impl Metrics {
                 "Markets each arm is currently authoritative for.",
                 &["venue", "arm"],
             ),
+            mbp_channel_resets: counter_vec(
+                &registry,
+                "dz_mbp_channel_resets_total",
+                "Publisher-and-channel book state discarded on a frame-header Reset Count change",
+                &["venue"],
+            ),
+            mbp_buffer_overflows: counter_vec(
+                &registry,
+                "dz_mbp_buffer_overflows_total",
+                "Cross-instrument delta-buffer budget overflows; the largest instrument's buffer \
+                 was dropped. Sustained means the snapshot period is too long for this host.",
+                &["venue"],
+            ),
+            mbp_level_overflows: counter_vec(
+                &registry,
+                "dz_mbp_level_overflows_total",
+                "Books discarded on hitting the per-book price-level cap (malformed or forged \
+                 stream, never packet loss — distinct from a sequence gap)",
+                &["venue"],
+            ),
+            mbp_orphan_snapshot_levels: counter_vec(
+                &registry,
+                "dz_mbp_orphan_snapshot_levels_total",
+                "SnapshotLevel with no open group to route it to (interleaved groups, or a lost \
+                 SnapshotBegin)",
+                &["venue"],
+            ),
+            mbp_duplicate_deltas: counter_vec(
+                &registry,
+                "dz_mbp_duplicate_deltas_total",
+                "Deltas discarded as duplicates. A Ready book emitting only these is a baseline \
+                 above the publisher's real counter, which only a Reset Count clears.",
+                &["venue"],
+            ),
+            mbp_crossed: counter_vec(
+                &registry,
+                "dz_mbp_crossed_total",
+                "Crossed inside markets observed at a BatchBoundary (observability only)",
+                &["venue"],
+            ),
+            mbp_divergence: counter_vec(
+                &registry,
+                "dz_mbp_divergence_total",
+                "Publisher Action-vs-quantity disagreements by kind; never changes the applied \
+                 result",
+                &["venue", "kind"],
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -719,6 +789,17 @@ mod tests {
         m.arm_markets_held
             .with_label_values(&["Lashay", "arm0"])
             .set(1);
+        m.mbp_channel_resets.with_label_values(&["Lashay"]).inc();
+        m.mbp_buffer_overflows.with_label_values(&["Lashay"]).inc();
+        m.mbp_level_overflows.with_label_values(&["Lashay"]).inc();
+        m.mbp_orphan_snapshot_levels
+            .with_label_values(&["Lashay"])
+            .inc();
+        m.mbp_duplicate_deltas.with_label_values(&["Lashay"]).inc();
+        m.mbp_crossed.with_label_values(&["Lashay"]).inc();
+        m.mbp_divergence
+            .with_label_values(&["Lashay", "delete_with_quantity"])
+            .inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -748,6 +829,13 @@ mod tests {
             "dz_arm_lead_ns",
             "dz_arm_authority_transfers_total",
             "dz_arm_markets_held",
+            "dz_mbp_channel_resets_total",
+            "dz_mbp_buffer_overflows_total",
+            "dz_mbp_level_overflows_total",
+            "dz_mbp_orphan_snapshot_levels_total",
+            "dz_mbp_duplicate_deltas_total",
+            "dz_mbp_crossed_total",
+            "dz_mbp_divergence_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {
