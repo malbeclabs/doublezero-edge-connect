@@ -57,6 +57,12 @@ use crate::{
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
 pub const TRADE_DEDUP_WINDOW: usize = 8192;
 
+/// How long a zero-id tape's owning publisher may go silent before a challenger takes the tape over
+/// without being reported as a double-print (see `Arbiter::no_id_owner`). Well past any inter-print
+/// gap on a live tape, and well under how long an operator would tolerate a stalled one, so a
+/// genuine failover reads as a handover and two concurrent emitters still read as a conflict.
+const NO_ID_TAPE_HANDOVER_NS: u64 = 5_000_000_000; // 5s
+
 /// Cap on distinct leader BBOs tracked per `source_ts` tick by the quote floor — a safety bound so a
 /// stalled/repeated `source_ts` can't grow the per-tick set without limit. Far above the real
 /// per-block max (~hundreds of distinct BBOs share one HL block timestamp), so it never evicts in
@@ -501,12 +507,20 @@ pub struct Arbiter {
     /// the registry's `&'static str` rather than the `Arc<str>` the dedup keys use; lookups borrow
     /// as `&str`, so this needs no `venue_arc` interning.
     modes: HashMap<&'static str, ArbitrationMode>,
-    /// The publisher that owns each `(venue, symbol)` zero-id tape — first one seen. A bypassed
-    /// `trade_id == 0` has no window to collapse against, so a second publisher's zero-id prints
-    /// are pure duplicates; they are still forwarded (dropping is an authority decision, not a
-    /// dedup one) but counted and logged. Bounded like `instrument_defs`: one entry per
-    /// `(venue, symbol)` that ever carries a zero-id print, which no live feed does today.
-    no_id_owner: HashMap<(Arc<str>, Arc<str>), Publisher>,
+    /// Who owns each `(venue, symbol)` zero-id tape, and when they last printed. A bypassed
+    /// `trade_id == 0` has no window to collapse against, so a *concurrent* second publisher's
+    /// zero-id prints are pure duplicates; they are still forwarded (dropping is an authority
+    /// decision, not a dedup one) but counted and logged.
+    ///
+    /// Ownership is not a permanent latch: a challenger takes it over once the incumbent has been
+    /// silent for [`NO_ID_TAPE_HANDOVER_NS`]. Tape ownership moves at runtime — a failed arm, an
+    /// authority transfer, a reconciler handing the tape from one feed row to another — and latching
+    /// the first publisher forever would report every legitimate failover as a double-print for the
+    /// life of the process, which is exactly the alert nobody would then trust.
+    ///
+    /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
+    /// print, which no live feed does today.
+    no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
 }
@@ -793,13 +807,31 @@ impl Arbiter {
                 // none). Keying the window on it drops every later print for the key: `0` is
                 // inserted once and never ages out (eviction is by insertion order), so every
                 // subsequent `0` reads as a same-publisher duplicate. Forward unkeyed instead —
-                // correct only while one publisher owns the venue's tape, so a second one's
-                // zero-id prints (pure duplicates, nothing collapses them) are counted and logged
-                // rather than silently doubling the tape. Not counted as *admitted*: nothing was,
-                // mirroring the `source_ts == 0` quote bypass above.
+                // correct only while one publisher owns the venue's tape, so a *concurrent* second
+                // emitter's prints (pure duplicates, nothing collapses them) are counted and logged
+                // rather than silently doubling the tape, while a takeover of a tape that has gone
+                // quiet is a handover. Not counted as *admitted*: nothing was, mirroring the
+                // `source_ts == 0` quote bypass above.
                 if t.trade_id == 0 {
                     let key = (t.venue.clone(), t.symbol.clone());
-                    let conflict = *self.no_id_owner.entry(key).or_insert(publisher) != publisher;
+                    let conflict = match self.no_id_owner.get_mut(&key) {
+                        // The owner printing again, or a challenger inheriting a tape that has gone
+                        // quiet past the handover window: either way one emitter, no conflict.
+                        Some((owner, last_ns)) => {
+                            let stale =
+                                t.recv_ts_ns.saturating_sub(*last_ns) > NO_ID_TAPE_HANDOVER_NS;
+                            let concurrent = *owner != publisher && !stale;
+                            if !concurrent {
+                                *owner = publisher;
+                                *last_ns = t.recv_ts_ns;
+                            }
+                            concurrent
+                        }
+                        None => {
+                            self.no_id_owner.insert(key, (publisher, t.recv_ts_ns));
+                            false
+                        }
+                    };
                     let vm = self.vm(&t.venue);
                     vm.trades_no_id.inc();
                     vm.emit[EMIT_TRADE].inc();
@@ -1252,6 +1284,55 @@ mod tests {
             seen, 3,
             "a conflicting print is still forwarded, not dropped"
         );
+    }
+
+    /// Tape ownership is not a permanent latch. A challenger taking over a tape that has gone quiet
+    /// past [`NO_ID_TAPE_HANDOVER_NS`] is a failover — a dead arm, an authority transfer, the
+    /// reconciler moving the tape between a venue's feed rows — and reporting that as a double-print
+    /// would pin the conflict counter non-zero for the life of the process, on the one signal that
+    /// has to stay trustworthy. Venue is unique to this test; the metrics registry is process-global.
+    #[test]
+    fn a_quiet_zero_id_tape_hands_over_without_a_conflict() {
+        let venue = "NoIdTapeHandover";
+        let t = |p, recv_ts_ns| {
+            let mut tr = trade(0);
+            tr.venue = venue.into();
+            tr.recv_ts_ns = recv_ts_ns;
+            (FeedMessage::Trade(tr), p)
+        };
+        let a1 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let a2 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let conflicts = metrics().trades_no_id_conflict.with_label_values(&[venue]);
+
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let (m, p) = t(a1, 1_000);
+        a.emit(m, p);
+
+        // Exactly at the window: a2 is still a concurrent second emitter, and a rejected challenger
+        // must not refresh the incumbent's clock (or a burst of them would hold the tape open).
+        let (m, p) = t(a2, 1_000 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(conflicts.get(), 1, "not yet past the window");
+
+        // Past it: a2 inherits the tape...
+        let (m, p) = t(a2, 1_001 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(conflicts.get(), 1, "a quiet tape hands over");
+
+        // ...and keeps it, so its own later prints are its own.
+        let (m, p) = t(a2, 1_002 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(
+            conflicts.get(),
+            1,
+            "the new owner's prints are not a conflict"
+        );
+
+        // The previous owner returning while a2 is live is a conflict again.
+        let (m, p) = t(a1, 1_003 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(conflicts.get(), 2, "two live emitters still conflict");
     }
 
     /// The bypass must not weaken dedup for prints that DO carry an id.
