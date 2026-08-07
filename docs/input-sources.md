@@ -17,7 +17,7 @@ input delivered a given update.
 | **Hyperliquid public WS** (`ingest::ws_feeder`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
 | **Phoenix public WS** (`ingest::phoenix_feeder`) | **off** | on when `--phoenix-ws-input-markets` is non-empty | `--phoenix-ws-input-markets` (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) · `--phoenix-ws-input-url` (`PHOENIX_WS_INPUT_URL`, default `wss://perp-api.phoenix.trade/v1/ws`) |
 
-One receiver task runs per `(venue, protocol, publisher)`, so a six-publisher venue runs six
+One receiver task runs per `(venue, protocol, publisher)`, so an eleven-publisher venue runs eleven
 receivers per protocol. Each is a full receiver — and for Market-by-Order a full independent book —
 so `--publisher-port` (`DZ_PUBLISHER_PORTS`) is the release valve for capping ingest cost or
 excluding a misbehaving publisher. A publisher is named by its **base port** — the market-data port
@@ -25,12 +25,14 @@ of its block — which is unique within a feed but not across feeds, so pair it 
 the narrowing to one venue.
 
 > **Size `--recv-buf` against the socket count, not one socket.** Every port of every publisher is
-> its own socket requesting `--recv-buf` (default 8 MiB): the six-publisher Hyperliquid fleet binds
-> 30 sockets (6 × 2 Top-of-Book + 6 × 3 Market-by-Order) where it previously bound 5, so the
-> requested `SO_RCVBUF` total goes from ~40 MiB to ~240 MiB. `net.core.rmem_max` clamps each socket
-> individually and will not catch the aggregate — lower `DZ_RECV_BUF` or narrow `--publisher-port` if that
-> exceeds the host's or container's memory budget. Market-by-Order additionally holds one independent
-> L3 book set per publisher.
+> its own socket requesting `--recv-buf` (default 8 MiB): the eleven-publisher Hyperliquid fleet
+> binds 55 sockets (11 × 2 Top-of-Book + 11 × 3 Market-by-Order), 57 with Phoenix, so the requested
+> `SO_RCVBUF` total is ~456 MiB where a single-publisher deployment requested ~40 MiB.
+> `net.core.rmem_max` clamps each socket individually and will not catch the aggregate — and the
+> value every installer sets (`268435456`) is a per-socket ceiling well above the 8 MiB default, so
+> it will not bound this either. Lower `DZ_RECV_BUF` or narrow `--publisher-port` if that exceeds the
+> host's or container's memory budget. Market-by-Order additionally holds one independent L3 book set
+> per publisher, so book memory also scales with the publisher count.
 
 ```bash
 # From source — run the edge multicast feed with the public WS backstop for BTC and ETH:

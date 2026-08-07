@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Five Hyperliquid publishers that had been live on `tiredsolid` since mid-June were missing from
+  the feed registry, so the bridge bound 6 of 11 port blocks and ingested roughly a third of the
+  group's datagrams — including none of the three highest-volume Top-of-Book blocks or the
+  highest-volume Market-by-Order one. The registry had been sourced from the publisher deployment
+  inventory, which covers only a subset of the hosts on the group; the authoritative list is the
+  feed-capture recorder inventory. Adds TOB 9011/9501/9701/9801/9901 and their Market-by-Order
+  peers, and pins the exact base-port set in a test so a future omission fails the build. **This
+  roughly doubles ingest cost: 23 receivers over 57 sockets, ~456 MiB of requested `SO_RCVBUF` at
+  the default `--recv-buf` — see the sizing note in `docs/input-sources.md`.** (#93)
+- The idle-rejoin interval now escalates (30s doubling to a 5-minute cap) when a rejoin produces no
+  market data, instead of rebinding the whole port block and logging a warn+info pair every 30s
+  forever. A permanently-silent block — a retired publisher, or a registry row whose endpoint never
+  went live — settles at ~12 rejoins/hour. Detection is unchanged: the socket stays bound, so a
+  returning publisher is picked up on its first datagram, and the first `status: down` still fires
+  at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
+
 ### Added
 - Single-arm arbitration for venues whose two redundant publishers stamp no comparable clock (`ingest::authority`, `ingest::arm_race`). Exactly one arm is authoritative and its stream is published verbatim. **Speed and silence are judged per arm, venue-wide** — latency is a property of an arm, so every sample from a source IP counts toward it whatever market carried it — while **health is the one per-market rule**, overriding the elected arm for a single market whose book is gapped and reverting when it recovers. Which arm is faster comes from `arm_race`, a cross-arm trade matcher keyed on content with a FIFO per signature (so identical repeats pair in order) that measures the two copies' arrival gap on our own receive clock; the venue's own timestamps are deliberately unused, because a publisher substitutes its own clock when the venue supplies none and an arm with no venue timestamp would look fastest by construction. Transfers need a median margin, a win rate and a sample floor to all hold (`--arb-*`). Nothing emits or consumes it yet — no processor wires a caller — so no running process behaves differently. (#98)
 - The incremental `book` message (PROTOCOL.md, still v1 — `book` is additive and `depth` is now marked deprecated-and-removed-in-v2): a batch of absolute price-level changes for one instrument, keyed on `(venue, channel, instrument_id)`. A re-baseline is structurally a batch led by a `clear` action rather than a separate type or a boolean, because the reference consumer's book dispatcher branches on the action alone and would silently ignore a snapshot flag; `last` is mandatory on the final batch, including a lone clear, or a buffering consumer wedges. Ships with `BookAccumulator`, the replay state a connecting client is bootstrapped from — an incremental product's last batch means nothing to a client holding no book, so the bridge accumulates and materializes a clear plus the full level set on demand. Nothing emits `book` yet: no processor and no feed row, so no running process behaves differently. (#99)
@@ -36,14 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped, so an unauthenticated forged stream cannot grow them without limit. Internal only — no
   codec, feed row or wire change yet, so no observable behaviour differs. (#96)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
-  one receiver per `(venue, protocol, publisher)`. All six live Hyperliquid publishers are ingested
-  (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
+  one receiver per `(venue, protocol, publisher)`. All eleven live Hyperliquid publishers are
+  ingested (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
   histograms and win-rate counters finally have a field of more than one. Publishers that share a
-  single port block still work unchanged. (#88)
+  single port block still work unchanged. (#88, #93)
 - `--publisher-port <port>` (`DZ_PUBLISHER_PORTS`) narrows the publisher set per feed by **base
   port** (the market-data port of a publisher's block) — each publisher is a full receiver, and for
-  Market-by-Order a full independent book, so a six-publisher venue is ~6x the ingest cost of one.
-  Base ports are unique within a feed but not across feeds; pair with `--feed` to scope to one
+  Market-by-Order a full independent book, so an eleven-publisher venue is ~11x the ingest cost of
+  one. Base ports are unique within a feed but not across feeds; pair with `--feed` to scope to one
   venue. (#88)
 - `dz_receiver_up{venue,kind,publisher}` — per-publisher receiver health, where the `publisher`
   label value is the base port. (#88)
