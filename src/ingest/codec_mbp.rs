@@ -26,11 +26,14 @@
 //! `Side` (0=Bid, 1=Ask) and `Aggressor Side` (0=Unknown, 1=Buy, 2=Sell) are DIFFERENT value
 //! spaces. They have separate constants here and must never share one.
 //!
-//! **Oracle strength: no real-frame fixture exists yet.** Every offset is pinned by the
-//! offset-independent unit tests below plus the Go decoder above; the three types inherited from
-//! top-of-book are additionally pinned to that byte-validated codec by
-//! `tests/codec_mbp_fixtures.rs`. That is stronger than `codec_midpoint` (self-consistency only)
-//! and weaker than `codec_mbo` (real capture) — capture a live frame before enabling a `FEEDS` row.
+//! **Oracle strength: real-capture backed.** Every offset is pinned by the offset-independent unit
+//! tests below plus the Go decoder above, and `tests/codec_mbp_fixtures.rs` decodes two committed
+//! captures of the live publisher — a sharded multi-channel one and a dense single-channel one —
+//! requiring zero unroutable messages, snapshot groups whose levels match their promised
+//! `total_levels`, a gapless per-instrument delta run, and a `depth_bound` the publisher stated.
+//! `BookClear`, `InstrumentReset`, `BatchBoundary` and `EndOfSession` appear in neither capture and
+//! so remain offset-test-only; see `tests/fixtures/PROVENANCE.md`, which also records the publisher
+//! deviations those captures contain.
 //!
 //! Oracle parity is per-*body*. The shared frame walker stays looser than the oracle on two header
 //! checks it does not make — a `frame_length` disagreeing with the datagram (the walker clamps) and

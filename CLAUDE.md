@@ -255,8 +255,10 @@ Modules are grouped by role under `src/`:
   **`codec_midpoint.rs` offsets still come from the edge-feed-spec draft and are NOT
   reference-validated**; its round-trip tests only pin self-consistency, so validate against a live
   frame hexdump before trusting its output (see "Conventions" below). **`codec_mbp.rs`
-  (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder but
-  has **no committed fixture** — nothing decodes it in production yet (no `FeedKind`, no `FEEDS`
+  (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
+  against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
+  a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
+  stay offset-test-only. Nothing decodes it in production yet (no `FeedKind`, no `FEEDS`
   row). It is the one codec that enforces **exact** body-length equality per type rather than
   bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's, so a lenient decode would
   read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
