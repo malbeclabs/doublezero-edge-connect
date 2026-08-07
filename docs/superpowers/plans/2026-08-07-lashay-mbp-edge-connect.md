@@ -14,7 +14,9 @@
 
 ## Progress
 
-**Status: Tasks 1, 2, 3, 7, 8, 9 are done, every step.** They are the whole bottom of the stack bar arbitration: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, the market-by-price decoder and the price book. Nothing they add is reachable from a running process yet — no `FeedKind`, no `FEEDS` row, no processor — so the branch is behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes.
+**Status: Tasks 1–10 are done, every step. Tasks 11–14 remain.** That is the whole stack below the processor: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, single-arm authority and its matcher, the `channel`/`type` filters, the market-by-price decoder, the price book, and the incremental `book` wire message. Nothing on the ingest side is reachable from a running process yet — no `FeedKind`, no `FEEDS` row, no processor — so the branch is behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes, and Task 6/10's additive WS surface.
+
+**Task 11 is next and nothing blocks it.** `MbpProcessor` is the piece that makes everything above reachable: it drives `PriceBook` from `codec_mbp`, emits `book`, and is where Task 12 then wires `authority` + `arm_race`. Two things it inherits that are not in its own section: it must key the open snapshot group and the per-instrument sequence **per `Channel ID`** (the live sports feed shards across three), and it must not restate the decoder's wire enums.
 
 **Wire facts the fixture capture settled, which later tasks need.** Read `tests/fixtures/PROVENANCE.md` for the full record; these are the ones that change a decision:
 
@@ -28,14 +30,14 @@
 | 1 — `trade_id == 0` bypass | **done** (`aafc871`, `2eeb93b`; review fixes `b2e9264`, `4d19da6`) |
 | 2 — per-publisher `RefDataState` | **done** (`a459c36`, `4f59d78`; review fix `23304c6`) |
 | 3 — arbitration mode plumbing | **done** (`8ad3377`; review fix `4d19da6`) |
-| 4 — `StickyAuthority` | **done, then amended** (`5b2d045`, `3286b1c`) — authority is per **arm** for speed and silence, per **market** for health only. **Read Task 4's ⚠️ AMENDED block before building Task 12.** |
-| 5 — re-election sampling | **done, then amended** (`4229f4e`) — the specified sampling statistic was **inert**; replaced by a cross-arm trade matcher on our own receive clock, pooled per arm. **Read Task 5's ⚠️ AMENDED block.** |
-| 6 — `channel`/`type` filters | not started |
+| 4 — `StickyAuthority` | **done, then amended** (`5b2d045`, `3286b1c`, rescoped in `6d004b4`) — authority is per **arm** for speed and silence, per **market** for health only. **Read Task 4's ⚠️ AMENDED block before building Task 12.** |
+| 5 — re-election sampling | **done, then amended** (`4229f4e`, rebuilt in `6d004b4`) — the specified statistic was **inert**; replaced by `ingest::arm_race`, a cross-arm trade matcher on our own receive clock, pooled per arm. **Read Task 5's ⚠️ AMENDED block.** |
+| 6 — `channel`/`type` filters | **done** (`bb75386`, `35c0c20`; PR #108) |
 | 7 — `codec_mbp` frame walk | **done** (`d12ff44`, `f89e68b`; review fix `75ce041`) |
 | 8 — `codec_mbp` price types | **done**, all steps (`1b003a3`, `f89e68b`; fixtures + real-frame tests in the Step 9 commit) |
 | 9 — `PriceBook` | **done** (`0f018cb`, `cc69ea6`, `e6bccee`; review fixes `503b6a6`, `3bf9a09`) |
-| 10 — `book` wire message | not started |
-| 11 — `MbpProcessor` | not started |
+| 10 — `book` wire message | **done** (`294ac74`, `35c0c20`; PR #108) |
+| 11 — `MbpProcessor` | not started — **the next task, and nothing blocks it** |
 | 12 — book authority gate | not started |
 | 13 — runtime tape ownership | not started |
 | 14 — Lashay feed rows | **blocked** (see *Blocking open question*) |
@@ -763,11 +765,11 @@ Two transfer triggers here; the speed margin is Task 5.
   }
   ```
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 3's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `src/ingest/authority.rs` with the test module only, so every rule is named before the implementation exists. Add `pub mod authority;` to `src/ingest/mod.rs`.
 
@@ -894,7 +896,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test --lib authority
@@ -902,11 +904,11 @@ cargo test --lib authority
 
 Expected: FAIL to compile — `cannot find type 'StickyAuthority' in this scope`.
 
-- [ ] **Step 4: Add `Hash` to `Publisher`**
+- [x] **Step 4: Add `Hash` to `Publisher`**
 
 `arbiter.rs:86` becomes `#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]`. `IpAddr` is `Hash`, so this is free.
 
-- [ ] **Step 5: Implement `StickyAuthority`**
+- [x] **Step 5: Implement `StickyAuthority`**
 
 Prepend to `src/ingest/authority.rs`:
 
@@ -1077,7 +1079,7 @@ impl StickyAuthority {
 
 Note the `leader_unhealthy` binding is computed **before** the `match` because `healthy()` borrows `self` immutably while the match arm holds a mutable borrow.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib authority
@@ -1085,7 +1087,7 @@ cargo test --lib authority
 
 Expected: all nine PASS.
 
-- [ ] **Step 7: Add the arm metrics**
+- [x] **Step 7: Add the arm metrics**
 
 Three fields in `src/metrics.rs` plus registrations. Check the existing helper set first — `counter_vec`, `histogram_vec` and `gauge` exist; add a `gauge_vec` mirroring `counter_vec` if it is missing.
 
@@ -1121,7 +1123,7 @@ Three fields in `src/metrics.rs` plus registrations. Check the existing helper s
 
 `winner` takes `"leader"` / `"challenger"` — relative, so the label set stays two-valued regardless of arm count.
 
-- [ ] **Step 8: Full suite, clippy, commit**
+- [x] **Step 8: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -1151,7 +1153,11 @@ git commit -m "feat(ingest): add single-arm sticky authority for uncoordinated p
 >
 > **Prior art, worth reading before writing the matcher.** The upstream publisher repo already has one — `src/publisher/compare.rs` in its publisher crate (447 lines, built and unit-tested), designed in its `2026-07-14-fix-ws-comparison-design.md` for a FIX-vs-WS comparison *inside* the publisher. A bounded time-windowed `pending` map keyed on a content signature, second transport to hit a key emits a signed delta and evicts, `evict_stale` counts "seen only on <transport>". Two gaps to close when lifting it: its trade key is `(ticker, price, size, side)` with **no time component**, and it reports milliseconds.
 >
-> **Interface delta:** `observe_challenger(&MarketKey, Publisher, u64)` becomes `observe_matched_lead(&str /* venue */, Publisher, i64 /* signed ns */)`, and `close_window` returns `Vec<(Arc<str>, Publisher)>`. The five tests below are replaced — they encode the arrival order being abandoned. Also added here: a **minimum-sample floor**, without which a single contested sample transfers a market.
+> **Interface delta:** `observe_challenger(&MarketKey, Publisher, u64)` becomes `observe_matched_lead(&str /* venue */, Publisher, i64 /* signed ns */)`, and `close_window` returns `Vec<(Arc<str>, Publisher)>`. The five tests below are replaced — they encode the arrival order being abandoned. Also added here: a **minimum-sample floor** (`--arb-min-window-samples`, 32), without which a handful of lucky matches transfers a venue.
+>
+> **The matcher shipped as `src/ingest/arm_race.rs`** (`6d004b4`). `ArmRace::on_trade(venue, instrument, price_raw, qty_raw, aggressor, arm, recv_ns) -> Option<Match>`, and `Match::lead_for(leader) -> Option<(challenger, signed_ns)>` does the sign conversion in **one tested place** — getting that sign backwards is what made the first version inert, so it does not belong at the call site. Content-keyed on raw fixed-point integers (never floats), with a **FIFO per signature** so identical repeats pair in order instead of colliding, window eviction that attributes unmatched arrivals per arm ("seen only on this arm"), and a `MAX_PENDING` cap because the source is unauthenticated. `a_faster_challenger_actually_wins_the_election` drives a genuinely faster arm through the matcher into `StickyAuthority` in true arrival order and asserts it takes authority — the round trip the old statistic failed.
+>
+> **Left for Task 12, deliberately:** the matcher's window is a `ArmRace::new(window_ns)` parameter with a 5s default rather than a CLI flag, because a flag nothing reads is the same defect as an inert knob. Wire it when the caller exists. Same for counting `evict_stale`'s per-arm unmatched returns.
 
 **Why:** without re-sampling, whichever arm delivers first at startup holds authority forever, even when persistently slower. With naive re-sampling, jitter flaps authority and re-baselines every consumer's book on each flip. The rule: **transfer only on a sustained margin, never on a single faster sample.**
 
@@ -1173,11 +1179,11 @@ The design leaves the interval, the threshold and the metric set open (§10 Q2).
 - Consumes: `StickyAuthority`, `MarketKey`, `transfer_to` from Task 4.
 - Produces: `pub struct AuthorityConfig { pub leader_timeout_ns: u64, pub sample_interval_ns: u64, pub transfer_margin_ns: u64, pub transfer_win_rate: f64 }` and `StickyAuthority::new(cfg: AuthorityConfig)` replacing the `u64` constructor; `observe_challenger`, `close_window`, `leader_of`. Task 12 constructs the config from the CLI args.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 4's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/authority.rs`:
 
@@ -1276,7 +1282,7 @@ Add to `mod tests` in `src/ingest/authority.rs`:
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib authority::tests::sustained_margin
@@ -1284,7 +1290,7 @@ cargo test --lib authority::tests::sustained_margin
 
 Expected: FAIL to compile — `cannot find struct 'AuthorityConfig' in this scope`.
 
-- [ ] **Step 4: Add the config**
+- [x] **Step 4: Add the config**
 
 In `src/ingest/authority.rs`:
 
@@ -1308,7 +1314,7 @@ pub struct AuthorityConfig {
 const MAX_WINDOW_SAMPLES: usize = 4096;
 ```
 
-- [ ] **Step 5: Extend `Held` and the constructor**
+- [x] **Step 5: Extend `Held` and the constructor**
 
 Add to `struct Held`:
 
@@ -1321,7 +1327,7 @@ Add to `struct Held`:
 
 Initialize `samples: Vec::new(), window_opened_ns: arrival_ns` at both `Held` construction sites (`admit`'s `None` arm and nothing else — `transfer_to` mutates in place). Replace the `leader_timeout_ns: u64` field with `cfg: AuthorityConfig`, change `new` to take it, and read `self.cfg.leader_timeout_ns` in `admit`. Update the Task 4 tests' `StickyAuthority::new(TIMEOUT)` calls to `StickyAuthority::new(AuthorityConfig { leader_timeout_ns: TIMEOUT, sample_interval_ns: u64::MAX, transfer_margin_ns: 1_000, transfer_win_rate: 0.8 })` so no window closes during them.
 
-- [ ] **Step 6: Implement the sampler**
+- [x] **Step 6: Implement the sampler**
 
 ```rust
     /// Record a challenger's arrival against the leader's most recent message. The arbiter calls
@@ -1400,7 +1406,7 @@ fn best_challenger(samples: &[(Publisher, i64)], margin: i64, rate: f64) -> Opti
 }
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib authority
@@ -1408,7 +1414,7 @@ cargo test --lib authority
 
 Expected: all fourteen PASS.
 
-- [ ] **Step 8: Add the CLI flags**
+- [x] **Step 8: Add the CLI flags**
 
 In `src/main.rs`'s `Args`, following the existing `#[arg(long, env = ...)]` convention:
 
@@ -1434,7 +1440,7 @@ In `src/main.rs`'s `Args`, following the existing `#[arg(long, env = ...)]` conv
 
 Build the `AuthorityConfig` next to the `Arbiter::new` call. The arbiter does not consume it until Task 12; bind it as `let authority_cfg = AuthorityConfig { ... };` with `#[allow(unused_variables)]` (or `let _ = &authority_cfg;`) for this commit and remove the allow in Task 12.
 
-- [ ] **Step 9: Document, then commit**
+- [x] **Step 9: Document, then commit**
 
 Add the three `dz_arm_*` rows to `docs/metrics.md`, each stating what an operator does with it, plus a "Tuning arm re-election" paragraph naming the four flags, their defaults, and the rule that the two transfer conditions are independent.
 
@@ -1468,11 +1474,11 @@ git commit -m "feat(ingest): re-elect the authoritative arm on a sustained speed
   - `PreparedFrame.channel: Option<u32>`, populated by Task 11.
   - `async fn replay_scoped(write, instruments, depth, subs) -> Result<()>` — the scoped replay both the connect path and the subscribe path use.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 5's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/sinks/ws.rs`. These test `matches` directly — a pure function, so no server plumbing is needed.
 
@@ -1541,7 +1547,7 @@ Add to `mod tests` in `src/sinks/ws.rs`. These test `matches` directly — a pur
     }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test --lib ws::tests
@@ -1549,7 +1555,7 @@ cargo test --lib ws::tests
 
 Expected: FAIL to compile — `this method takes 2 arguments but 4 arguments were supplied`.
 
-- [ ] **Step 4: Widen `SubFilter` and fold both match paths into one function**
+- [x] **Step 4: Widen `SubFilter` and fold both match paths into one function**
 
 Replace `ws.rs:106-125` with:
 
@@ -1598,7 +1604,7 @@ impl SubFilter {
 
 The `channel` arm is the one to read twice. A message with no channel passes a channel filter only when it is venue-level (`symbol.is_none()`); a symbol-bearing message with no channel is excluded by an explicit channel filter, which is what `channel_filter_excludes_channelless_messages` pins.
 
-- [ ] **Step 5: Carry channel on the prepared frame**
+- [x] **Step 5: Carry channel on the prepared frame**
 
 Add to `struct PreparedFrame` (`ws.rs:36-46`):
 
@@ -1610,7 +1616,7 @@ Add to `struct PreparedFrame` (`ws.rs:36-46`):
 
 In `prepare` (`ws.rs:77-90`), extend the destructuring tuple to yield `channel` — `None` for all six existing variants — and set it on the constructed frame.
 
-- [ ] **Step 6: Route both filter paths through `matches`**
+- [x] **Step 6: Route both filter paths through `matches`**
 
 Replace the `msg = rx.recv()` filter block (`ws.rs:364-379`) with a single call, deleting the duplicated inline venue comparison:
 
@@ -1629,7 +1635,7 @@ Replace the `msg = rx.recv()` filter block (`ws.rs:364-379`) with a single call,
 
 The rest of the arm (metrics, write) is unchanged. This is the fix for trap 1: there is now exactly one match path, so a future dimension cannot be added to half of it.
 
-- [ ] **Step 7: Scope the replay**
+- [x] **Step 7: Scope the replay**
 
 Extract the two replay loops from `serve_client` (`ws.rs:260-286`) into one function both the connect path and the subscribe path call:
 
@@ -1690,7 +1696,7 @@ In `serve_client`, replace the two inline loops with `replay_scoped(&mut write, 
 
 Replaying only the newly-added filter, not all of `subs`, keeps a client that subscribes to ten symbols from getting ten full replays of the first one.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -1698,7 +1704,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass, including the existing `ws` integration tests and `tests/e2e.rs`.
 
-- [ ] **Step 9: Document**
+- [x] **Step 9: Document**
 
 In `PROTOCOL.md`'s *Subscriptions & filtering* section, replace the filter description:
 
@@ -1718,7 +1724,7 @@ Instrument definitions and current book state are replayed on connect (unfiltere
 
 Add a `CHANGELOG.md` entry under Unreleased → Added naming both dimensions and the scoped replay.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add -A
@@ -3275,11 +3281,11 @@ git commit -m "feat(ingest): add the price-keyed book with snapshot and delta re
   **Why an accumulator and not the last message.** `depth` is full state, so storing the last one is a valid replay. `book` is incremental, so the last batch is meaningless to a client that holds nothing. The map therefore accumulates — the same operation a consumer performs — and materializes a `clear` plus the complete level set on demand. Cost is one book per market for the authoritative arm only, updated in O(changes) per batch rather than O(book). That is the honest price of offering connect-time bootstrap for an incremental product; the alternative is making every new client wait a full snapshot cycle.
   `FeedMessage::venue_symbol` gains a `Book` arm; a new `FeedMessage::channel(&self) -> Option<u32>` returns `Some` only for `Book`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 9's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `src/model.rs`:
 
@@ -3440,7 +3446,7 @@ Add to `mod tests` in `src/sinks/ws.rs`:
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib model:: sinks::ws::tests::prepare_populates
@@ -3448,7 +3454,7 @@ cargo test --lib model:: sinks::ws::tests::prepare_populates
 
 Expected: FAIL to compile — `cannot find struct 'NormalizedBook'`.
 
-- [ ] **Step 4: Add the wire types**
+- [x] **Step 4: Add the wire types**
 
 In `src/model.rs`, after `NormalizedDepth`:
 
@@ -3640,7 +3646,7 @@ pub type BookSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), BookAccumulator>
 
 Add a test asserting `apply` then `to_book` round-trips: a `clear` + two bids + one ask, then an `update` moving one bid and a `delete` removing the ask, must materialize as `clear` + two bids descending + no asks.
 
-- [ ] **Step 5: Wire `book` through the WS serializer**
+- [x] **Step 5: Wire `book` through the WS serializer**
 
 In `src/sinks/ws.rs`'s `prepare`, add to the `kind` match:
 
@@ -3653,7 +3659,7 @@ In `src/sinks/ws.rs`'s `prepare`, add to the `kind` match:
 
 and extend the `(venue, symbol, channel)` destructuring so `Book` yields `Some(b.channel)` while every other variant yields `None`.
 
-- [ ] **Step 6: Add a temporary arbiter passthrough**
+- [x] **Step 6: Add a temporary arbiter passthrough**
 
 `emit`'s match is exhaustive by design (a new variant must be a compile error, not a silent miss). Add, with the comment that says exactly what replaces it:
 
@@ -3670,7 +3676,7 @@ and extend the `(venue, symbol, channel)` destructuring so `Book` yields `Some(b
 
 Add `EMIT_BOOK: usize = 6` and widen `VenueMetrics::emit` to `[IntCounter; 7]` with `emit_kind("book")`.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -3678,7 +3684,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 8: Document the message in PROTOCOL.md**
+- [x] **Step 8: Document the message in PROTOCOL.md**
 
 Add `book` to the envelope table (`| \`book\` | A batch of incremental order-book level changes. |`) and a full `### book` section after `### depth`:
 
@@ -3732,7 +3738,7 @@ Then, in the *Connection lifecycle* section, add `book` to step 3's list, and no
 - **`depth` is deprecated.** It is the full-state top-*N* product served from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally. `depth` is removed in v2, when the Market-by-Order feed migrates to `book`. Until then both are served: `book` for Market-by-Price feeds, `depth` for Market-by-Order ones. New consumers should implement `book`.
 ```
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add -A
