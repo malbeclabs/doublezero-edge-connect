@@ -288,9 +288,19 @@ Modules are grouped by role under `src/`:
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
-  `NormalizedDepth`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the `now_ns()` /
-  `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
-  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other.
+  `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
+  `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
+  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other; `BookSnapshot` is keyed by
+  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label and
+  collides across markets, so it is not an identity.
+  `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
+  absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
+  reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`
+  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookSnapshot`
+  holds a `BookAccumulator` per market rather than the last message, because an incremental product's
+  last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
+  the full level set on demand. Nothing emits `book` yet (no processor, no `FEEDS` row); the arbiter's
+  `Book` arm is a **temporary** undeduped passthrough, replaced by the authority gate.
 
 ## Conventions and gotchas
 

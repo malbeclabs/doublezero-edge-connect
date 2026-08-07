@@ -504,8 +504,8 @@ fn pub_idx(p: Publisher) -> usize {
 /// Pre-resolved `dz_*` metric children for one venue. Built once per venue via [`VenueMetrics::new`];
 /// every field is a cheap-to-`inc()` handle, so the per-message emit path pays no label lookup.
 struct VenueMetrics {
-    /// `dz_emit_total{kind}` indexed by kind: quote/trade/instrument/midpoint/depth/status.
-    emit: [IntCounter; 6],
+    /// `dz_emit_total{kind}` indexed by kind: quote/trade/instrument/midpoint/depth/status/book.
+    emit: [IntCounter; 7],
     /// `dz_quotes_admitted_total{publisher}` / `dz_trades_admitted_total{publisher}`, `[edge, public]`.
     quotes_admitted: [IntCounter; 2],
     trades_admitted: [IntCounter; 2],
@@ -556,6 +556,7 @@ impl VenueMetrics {
                 emit_kind("midpoint"),
                 emit_kind("depth"),
                 emit_kind("status"),
+                emit_kind("book"),
             ],
             quotes_admitted: by_pub(&m.quotes_admitted),
             trades_admitted: by_pub(&m.trades_admitted),
@@ -583,6 +584,7 @@ const EMIT_INSTRUMENT: usize = 2;
 const EMIT_MIDPOINT: usize = 3;
 const EMIT_DEPTH: usize = 4;
 const EMIT_STATUS: usize = 5;
+const EMIT_BOOK: usize = 6;
 
 impl Arbiter {
     pub fn new(tx: broadcast::Sender<Arc<FeedMessage>>, trade_window: usize) -> Self {
@@ -862,6 +864,14 @@ impl Arbiter {
                         self.vm(&d.venue).depth_dropped[pub_idx(publisher)].inc();
                     }
                 }
+            }
+            // TEMPORARY: `book` is passed through undeduped so the processor can land before the
+            // authority gate. Replaced by the `StickyAuthority` routing in the next change — an
+            // incremental stream must be single-arm, and two arms passing through here would
+            // interleave unrelated delta series on the wire.
+            FeedMessage::Book(b) => {
+                self.vm(&b.venue).emit[EMIT_BOOK].inc();
+                let _ = self.tx.send(Arc::new(msg));
             }
             // `Status` is currently never routed through `emit` — receivers send it straight via
             // `sender()` (see `emit_status`), and no other source produces it — so `dz_emit_total

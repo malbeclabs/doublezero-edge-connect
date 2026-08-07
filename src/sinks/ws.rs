@@ -73,6 +73,10 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
             d.ws_send_ts_ns = now;
             "depth"
         }
+        FeedMessage::Book(b) => {
+            b.ws_send_ts_ns = now;
+            "book"
+        }
         FeedMessage::Instrument(_) => "instrument",
         FeedMessage::Status(_) => "status",
     };
@@ -83,6 +87,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone()), None),
         FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone()), None),
         FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone()), None),
+        FeedMessage::Book(b) => (b.venue.clone(), Some(b.symbol.clone()), Some(b.channel)),
         FeedMessage::Status(s) => (s.venue.clone(), None, None),
     };
     Some(Arc::new(PreparedFrame {
@@ -562,6 +567,46 @@ mod tests {
     #[test]
     fn type_filter_still_excludes_status() {
         assert!(!filter(r#"{"type":"book"}"#).matches("Lashay", None, None, "status"));
+    }
+
+    /// A `book` frame must carry its channel so an explicit channel filter can select it.
+    #[test]
+    fn prepare_populates_the_channel_for_book_only() {
+        use super::prepare;
+        use crate::model::{BookAction, BookChange, BookSide, NormalizedBook};
+        let b = FeedMessage::Book(NormalizedBook {
+            venue: "Lashay".into(),
+            symbol: "KXBTCPERP".into(),
+            channel: 2,
+            instrument_id: 41,
+            changes: vec![BookChange {
+                action: BookAction::Update,
+                side: BookSide::Bid,
+                price: 0.62,
+                size: 150.0,
+            }],
+            snapshot: false,
+            last: true,
+            source_ts_ns: 1,
+            recv_ts_ns: 2,
+            kernel_rx_ts_ns: 3,
+            ws_send_ts_ns: 0,
+        });
+        let f = prepare(&b).expect("serializes");
+        assert_eq!(f.kind, "book");
+        assert_eq!(f.channel, Some(2));
+        assert!(f.payload.contains(r#""ws_send_ts_ns":"#));
+        assert!(
+            !f.payload.contains(r#""ws_send_ts_ns":0"#),
+            "stamped, not left at 0"
+        );
+        // Every other kind carries no channel, which is what the filter's exclusion rule rests on.
+        assert_eq!(
+            prepare(&FeedMessage::Quote(sample_quote()))
+                .expect("serializes")
+                .channel,
+            None
+        );
     }
 
     #[test]
