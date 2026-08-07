@@ -389,7 +389,12 @@ impl FrameProcessor for TobProcessor {
 /// Structurally parallel to [`TobProcessor`] but for the `0x4D44` sibling protocol.
 pub struct MidpointProcessor {
     state: RefDataState<codec_midpoint::InstrumentDefinition>,
-    seq: SeqTracker,
+    /// Per-publisher, per-channel frame sequence tracker, keyed and bounded exactly like
+    /// [`TobProcessor::seq`] — see its docs for why a shared tracker marks a mirrored publisher's
+    /// every frame stale, and why [`MAX_PUBLISHERS`] is not optional.
+    seq: HashMap<IpAddr, SeqTracker>,
+    /// Insertion order of `seq` keys, oldest at the front, for the [`MAX_PUBLISHERS`] eviction.
+    seq_order: VecDeque<IpAddr>,
     warned_source_mismatch: bool,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
@@ -407,11 +412,31 @@ impl MidpointProcessor {
     pub fn new() -> Self {
         Self {
             state: RefDataState::new(),
-            seq: SeqTracker::default(),
+            seq: HashMap::new(),
+            seq_order: VecDeque::new(),
             warned_source_mismatch: false,
             decode_warn: WarnRateLimit::default(),
             seq_events: SeqEvents::default(),
         }
+    }
+
+    /// The sequence tracker for `publisher`, creating it on first sight and evicting the
+    /// least-recently-inserted entry once [`MAX_PUBLISHERS`] is reached. Mirrors
+    /// [`TobProcessor::seq_for`].
+    fn seq_for(&mut self, publisher: IpAddr) -> &mut SeqTracker {
+        if !self.seq.contains_key(&publisher) {
+            while self.seq.len() >= MAX_PUBLISHERS {
+                match self.seq_order.pop_front() {
+                    Some(old) => {
+                        self.seq.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.seq.insert(publisher, SeqTracker::default());
+            self.seq_order.push_back(publisher);
+        }
+        self.seq.get_mut(&publisher).expect("just inserted/present")
     }
 }
 
@@ -436,9 +461,11 @@ impl FrameProcessor for MidpointProcessor {
 
         // Same stale/out-of-order rejection as quotes: a midpoint is full state per instrument.
         let mids_fresh = if handle_mids {
-            let check = self
-                .seq
-                .check(header.channel_id, header.reset_count, header.sequence);
+            let check = self.seq_for(ctx.publisher).check(
+                header.channel_id,
+                header.reset_count,
+                header.sequence,
+            );
             self.seq_events.record(ctx.venue, &check);
             !matches!(check, SeqCheck::Stale)
         } else {
@@ -958,7 +985,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor, TobProcessor, WarnRateLimit};
+    use super::{upsert_instrument, MboProcessor, MidpointProcessor, TobProcessor, WarnRateLimit};
     use crate::{
         ingest::{
             arbiter::{Arbiter, SharedArbiter},
@@ -970,6 +997,7 @@ mod tests {
                 InstrumentReset, OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
                 MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
             },
+            codec_midpoint,
             receiver::{FrameCtx, FrameProcessor, PortRole},
         },
         model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
@@ -1020,6 +1048,129 @@ mod tests {
             "newest publisher retained"
         );
         assert!(!p.seq.contains_key(&ip(0)), "oldest publisher evicted");
+    }
+
+    /// Same bound, same reason, on the Midpoint sibling: the per-publisher map is keyed by a
+    /// spoofable source IP, so it must evict rather than grow.
+    #[test]
+    fn midpoint_seq_map_is_bounded_under_publisher_flood() {
+        use super::MAX_PUBLISHERS;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut p = MidpointProcessor::new();
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)); // 10.x.y.z
+        let flood = (MAX_PUBLISHERS as u32) + 50;
+        for i in 0..flood {
+            let _ = p.seq_for(ip(i));
+        }
+        assert!(
+            p.seq.len() <= MAX_PUBLISHERS,
+            "seq map must stay bounded, got {}",
+            p.seq.len()
+        );
+        assert!(
+            p.seq.contains_key(&ip(flood - 1)),
+            "newest publisher retained"
+        );
+        assert!(!p.seq.contains_key(&ip(0)), "oldest publisher evicted");
+    }
+
+    /// Frame sequence is scoped to `(source_ip, group, port)`, so two publishers mirroring one feed
+    /// onto a shared port block carry independent, unrelated sequence spaces. A single shared
+    /// tracker interleaves them and reads the lower-numbered publisher's every frame as stale
+    /// against the other's anchor, silently dropping all of its mids while
+    /// `dz_seq_events_total{kind="stale"}` climbs on a healthy feed. Keying by source IP - what
+    /// `TobProcessor` already does - keeps both flowing.
+    #[test]
+    fn midpoint_seq_is_tracked_per_publisher() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        /// `codec_midpoint::tests::frame` stamps sequence 0; the frame header carries the sequence
+        /// at bytes 4..12 (see `codec_common::FrameHeader`).
+        fn mid_frame(sequence: u64, body: Vec<u8>, msg_count: u8) -> Vec<u8> {
+            let mut f = codec_midpoint::tests::frame(body, msg_count);
+            f[4..12].copy_from_slice(&sequence.to_le_bytes());
+            f
+        }
+        fn ctx_for<'a>(
+            publisher: IpAddr,
+            arbiter: &'a SharedArbiter,
+            instruments: &'a crate::model::InstrumentSnapshot,
+            role: PortRole,
+        ) -> FrameCtx<'a> {
+            let mut c = make_ctx(arbiter, instruments, role);
+            c.publisher = publisher;
+            c
+        }
+        let mid = |raw: i64| {
+            codec_midpoint::tests::encode_midpoint(&codec_midpoint::Midpoint {
+                instrument_id: 7,
+                source_id: 0, // unregistered: the emitted venue stays this feed's venue
+                method: 0,
+                quality_flags: 0,
+                book_ts: 0,
+                compute_ts: 0,
+                mid_price_raw: raw,
+            })
+        };
+
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MidpointProcessor::new();
+
+        // Reference data from one publisher is enough - the definition is shared - and arrives on
+        // the refdata role, which skips the sequence check entirely.
+        proc.on_datagram(
+            &mid_frame(
+                1,
+                [
+                    codec_midpoint::tests::encode_manifest(1, 1),
+                    codec_midpoint::tests::encode_instrument(
+                        &codec_midpoint::InstrumentDefinition {
+                            instrument_id: 7,
+                            symbol: "SOL".into(),
+                            price_exponent: 0, // raw mid == emitted mid
+                            default_method: 0,
+                            manifest_seq: 1,
+                        },
+                    ),
+                ]
+                .concat(),
+                2,
+            ),
+            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Refdata),
+        );
+
+        // Interleave the two publishers' own contiguous sequences. They are far apart, as
+        // independent counters are: every one of B's frames sits below A's anchor.
+        for (publisher, sequence, raw) in [
+            (pub_a, 1000, 10),
+            (pub_b, 5, 20),
+            (pub_a, 1001, 11),
+            (pub_b, 6, 21),
+            (pub_a, 1002, 12),
+            (pub_b, 7, 22),
+        ] {
+            proc.on_datagram(
+                &mid_frame(sequence, mid(raw), 1),
+                &ctx_for(publisher, &arbiter, &instruments, PortRole::Mktdata),
+            );
+        }
+
+        let mut mids = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Midpoint(mp) = &*m {
+                mids.push(mp.mid);
+            }
+        }
+        assert_eq!(
+            mids,
+            vec![10.0, 20.0, 11.0, 21.0, 12.0, 22.0],
+            "every publisher's mids must survive; a shared tracker drops B's entirely"
+        );
     }
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
