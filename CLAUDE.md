@@ -6,11 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `doublezero-edge-connect` ingests one or more DoubleZero (DZ) Edge **binary multicast** feeds,
 decodes them, runs the reference-data subscriber state machine, and re-serves normalized market
-data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks three edge-feed-spec
+data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks four edge-feed-spec
 sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
-`midpoint`), and **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
-re-serves it as full-state `depth`). Each feed maps to one venue. The input (multicast/binary) is
+`midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
+re-serves it as full-state `depth`), and **Market-by-Price** (magic `0x4442`; the bridge
+reconstructs the price-aggregated book and re-serves it as the incremental `book` — no `FEEDS` row
+uses it yet). Each feed maps to one venue. The input (multicast/binary) is
 an implementation detail; the *only* external contract is the WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
 consumer is not part of the protocol.
@@ -73,6 +75,7 @@ cross-source duplicates collapse and the public copy fills in only when the edge
 
 Modules are grouped by role under `src/`:
 - **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
+  `pricebook` (the price-keyed sibling of `book`), `authority`,
   `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
   `subscriber`, `arbiter`, the **`subscriptions`** detector + **`reconcile`** activation loop (which
   decide what runs — see Architecture above), the optional public feeders (`public_feeder`
@@ -232,7 +235,8 @@ Modules are grouped by role under `src/`:
 - **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
-  + trades). All gate emission **per instrument** on a known definition (precision before price). The
+  + trades), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
+  incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
   IP and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
@@ -249,6 +253,23 @@ Modules are grouped by role under `src/`:
   content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
   tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
   `source_ts` per depth).
+  `MbpProcessor` keys its books on **`(publisher, channel, instrument)`** — two arms mirror one feed
+  with unrelated per-instrument delta series, and one group is sharded across channels whose state
+  machines are independent — and carries the design's cross-instrument/cross-publisher conformance
+  items: `SnapshotLevel` routes by the **open group** per `(publisher, channel)` (never by
+  `snapshot_id`, which is monotonic per `(channel, instrument)` and so collides across instruments
+  within a rotation), a **cross-instrument** buffer budget (`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`, 2^20;
+  overflow drops the largest instrument's buffer and marks it `Gap` rather than taking the channel
+  down — `pricebook`'s per-book cap is a quarter of it, so the budget only binds with several heavy
+  books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's
+  venue-wide clear would tear down a live peer arm's published book), and a channel reset on any
+  **change** of the frame header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts).
+  `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
+  O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are
+  reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped arm
+  over to its peer. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
+  `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
+  whole-side clear would tell the consumer to drop levels this book still holds.
 - **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs` / `codec_mbp.rs`** — pure decoders for each protocol's
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).
@@ -263,8 +284,8 @@ Modules are grouped by role under `src/`:
   (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
   against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
   a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
-  stay offset-test-only. Nothing decodes it in production yet (no `FeedKind`, no `FEEDS`
-  row). It is the one codec that enforces **exact** body-length equality per type rather than
+  stay offset-test-only. `FeedKind::MarketByPrice` decodes it, but no `FEEDS` row selects that kind
+  yet. It is the one codec that enforces **exact** body-length equality per type rather than
   bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's, so a lenient decode would
   read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
   therefore also the one that rejects an unimplemented `SCHEMA_VERSION` itself rather than leaving
@@ -273,6 +294,12 @@ Modules are grouped by role under `src/`:
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
   Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
+- **`ingest/pricebook.rs`** — `PriceBook`: per-instrument **price-keyed** book + the market-by-price
+  snapshot+delta recovery machine (`AwaitingSnapshot`/`BuildingSnapshot`/`Ready`/`Gap`). A **sibling**
+  of `book.rs`, not a reuse: the wire is already price-aggregated and each level carries its absolute
+  resulting quantity, so `Action` never gates the apply (quantity alone decides) and the
+  `Add`/`Cancel`/`Execute` vocabulary does not apply. Reports the levels a `BookClear` removed through
+  a caller-supplied buffer, since the wire `Clear` has no price bound.
 - **`ingest/subscriber.rs`** — `RefDataState<D>`, the reference-data state machine, **generic over** any
   instrument-definition type implementing `InstrumentDef` (its id + manifest seq), so all three
   protocols reuse it. Collects definitions tagged with the latest `ManifestSummary` seq; `ready()`
@@ -298,8 +325,8 @@ Modules are grouped by role under `src/`:
   firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
   `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
   (`status`) paths call, so a new dimension can't silently exempt half the stream; a channelless
-  message is excluded by an explicit `channel` filter, `instrument` excepted (precision must reach a
-  channel-scoped client). Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
+  message is excluded by an explicit `channel` filter, with `status` (venue-level) the one carve-out —
+  `instrument` carries its own channel and is filtered like `book`, including on the replay path. Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
@@ -317,8 +344,12 @@ Modules are grouped by role under `src/`:
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
-  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book. Nothing emits `book` yet (no processor, no `FEEDS` row); the arbiter's
-  `Book` arm is a **temporary** undeduped passthrough, replaced by the authority gate.
+  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book.
+  `MbpProcessor` emits `book`, but no `FEEDS` row activates it and the arbiter's `Book` arm is still a
+  **temporary** undeduped passthrough, replaced by the authority gate. `NormalizedInstrument` carries
+  the same `(channel, instrument_id)` identity pair as `NormalizedBook`, so a consumer joins a book to
+  its precision on the identity rather than the colliding `symbol`; the arbiter's definition rate
+  limit keys on that triple for the same reason.
 
 ## Conventions and gotchas
 

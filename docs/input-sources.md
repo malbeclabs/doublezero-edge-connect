@@ -34,6 +34,10 @@ the narrowing to one venue.
 > host's or container's memory budget. Market-by-Order additionally holds one independent L3 book set
 > per publisher, so book memory also scales with the publisher count.
 
+**Market-by-Price** (frame magic `0x4442`) is a further multicast protocol alongside Top-of-Book, Midpoint and Market-by-Order. Like Market-by-Order it binds three ports per publisher — mktdata (level deltas + trade prints), refdata (instrument definitions), and a snapshot port for recovery — and the bridge reconstructs the book internally, re-serving it as the **incremental `book`** product rather than full-state `depth`. It keeps one reconstructed book per `(publisher, channel, instrument)`: two arms mirror one feed but their per-instrument delta sequences are unrelated by construction, and a single group can be sharded across channels, so nothing below that triple identifies a book. **No `FEEDS` row selects this kind yet, so nothing activates it** — the protocol is wired but no venue routes to it.
+
+> **The Market-by-Price memory caps are per receiver task, not per process.** One task holds at most 4096 books, 256 `(publisher, channel)` reset/snapshot-routing keys, and 2^20 buffered deltas across every book it tracks. N publishers on separate port blocks are N tasks and so hold N times each bound; publishers sharing one port block share a single task's. On crossing the delta budget the processor drops the **largest** instrument's buffer and marks that instrument `Gap` — it recovers on its next snapshot and every other instrument keeps streaming. Sustained `dz_mbp_buffer_overflows_total` means the publisher's snapshot period is too long for this host, not that anything is broken; the other two caps are anti-forgery bounds on unauthenticated wire fields and should never bind in normal operation.
+
 ```bash
 # From source — run the edge multicast feed with the public WS backstop for BTC and ETH:
 ./target/release/doublezero-edge-connect --feed Hyperliquid --ws-input-coins BTC,ETH
