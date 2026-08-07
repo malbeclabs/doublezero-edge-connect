@@ -106,11 +106,14 @@ pub enum DeltaOutcome {
     Buffered,
     /// `seq` at or below the last applied one: a duplicate or late arrival, discarded.
     Duplicate,
-    /// The book stopped being usable at this delta. Either a forward sequence gap (`status` becomes
-    /// [`Status::Gap`] and the delta is buffered), or the level cap was hit — in which case the book
-    /// and buffer are discarded and `status` becomes [`Status::AwaitingSnapshot`], since nothing was
-    /// missed, we refused to grow.
+    /// A forward sequence gap: deltas were lost. `status` becomes [`Status::Gap`] and this delta is
+    /// buffered for replay after the next snapshot.
     Gap,
+    /// The level cap was hit, so the book and buffer were discarded and `status` is
+    /// [`Status::AwaitingSnapshot`] — nothing was missed, we refused to grow. Distinct from [`Self::Gap`]
+    /// because the cause (a malformed or forged stream, never packet loss) and the resulting `status`
+    /// both differ; a caller counting one as the other would read a hostile book as a lossy network.
+    Overflow,
     Applied {
         divergence: Option<Divergence>,
     },
@@ -407,8 +410,8 @@ impl PriceBook {
                 self.buffer(op);
                 break;
             }
-            if self.apply(op) == DeltaOutcome::Gap {
-                return; // level cap: the book and the buffer are gone, and the rest goes with them
+            if self.apply(op) == DeltaOutcome::Overflow {
+                return; // the book and the buffer are gone, and the rest goes with them
             }
         }
         for op in ops {
@@ -440,7 +443,7 @@ impl PriceBook {
                 {
                     // Refused before the trackers move: nothing was applied, so nothing advances.
                     self.overflow();
-                    return DeltaOutcome::Gap;
+                    return DeltaOutcome::Overflow;
                 }
                 self.advance(op.seq, op.ts);
                 let levels = if is_ask {
@@ -1185,8 +1188,8 @@ mod tests {
         }
         assert_eq!(
             outcome,
-            DeltaOutcome::Gap,
-            "the level past the cap is refused"
+            DeltaOutcome::Overflow,
+            "the level past the cap is refused, and not as a sequence gap"
         );
         assert_eq!(b.status(), Status::AwaitingSnapshot);
         assert!(bids_of(&b).is_empty(), "the book is discarded, not grown");
