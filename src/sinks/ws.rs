@@ -151,11 +151,10 @@ impl SubFilter {
                 Some(s) => self.symbol.as_deref().is_none_or(|f| f == s),
             }
             && match channel {
-                // `instrument` is infrastructure, not market data: precision must arrive before
-                // price, so it passes an explicit channel filter the way a venue-level message
-                // does. The carve-out is deliberately just this one kind on this one dimension —
-                // widening it would make `{"channel":2}` a firehose of quotes.
-                None => self.channel.is_none() || symbol.is_none() || kind == "instrument",
+                // A venue-level message (`status`) is about no single channel, so an explicit
+                // channel filter must not exclude it; a channelless *market* message is excluded,
+                // or `{"channel":2}` would be a firehose of quotes.
+                None => self.channel.is_none() || symbol.is_none(),
                 Some(c) => self.channel.is_none_or(|f| f == c),
             }
     }
@@ -300,13 +299,13 @@ where
     W: SinkExt<WsMessage> + Unpin,
     <W as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
 {
-    // `channel: None` is correct for every kind replayed here; a channel-bearing kind (`book`) must
-    // pass its own channel or a `{"channel":N}` client silently gets no bootstrap.
-    let pass = |venue: &str, symbol: &str, kind: &str| {
+    // Each kind passes its own channel: a channel-bearing kind that passed `None` would leave a
+    // `{"channel":N}` client with no bootstrap at all.
+    let pass = |venue: &str, symbol: &str, channel: Option<u32>, kind: &str| {
         subs.is_empty()
             || subs
                 .iter()
-                .any(|f| f.matches(venue, Some(symbol), None, kind))
+                .any(|f| f.matches(venue, Some(symbol), channel, kind))
     };
     // Both locks are taken and released before any `await`: a `std::sync::MutexGuard` held across an
     // await point does not compile here, and would be a latency bug regardless.
@@ -314,7 +313,7 @@ where
         let guard = crate::model::lock(instruments);
         guard
             .values()
-            .filter(|i| pass(&i.venue, &i.symbol, "instrument"))
+            .filter(|i| pass(&i.venue, &i.symbol, Some(i.channel), "instrument"))
             .cloned()
             .map(FeedMessage::Instrument)
             .collect()
@@ -323,7 +322,7 @@ where
         let guard = crate::model::lock(depth);
         guard
             .values()
-            .filter(|d| pass(&d.venue, &d.symbol, "depth"))
+            .filter(|d| pass(&d.venue, &d.symbol, None, "depth"))
             .cloned()
             .map(FeedMessage::Depth)
             .collect()
@@ -548,19 +547,18 @@ mod tests {
         assert!(!filter(r#"{"channel":2}"#).matches("Hyperliquid", Some("SOL"), None, "quote"));
     }
 
-    /// ...except `instrument`, which carries no channel and never will until the processor supplies
-    /// one. Excluding it would leave a channel-scoped client unable to scale the books it just
-    /// subscribed to, breaking the protocol's precision-before-price promise.
+    /// `instrument` carries its own channel, so it is filtered like `book`: a channel-scoped client
+    /// gets the definitions it needs to scale that channel's books, and no other channel's.
     #[test]
-    fn channel_filter_still_delivers_instrument_definitions() {
+    fn channel_filter_selects_one_channels_instrument_definitions() {
         let f = filter(r#"{"channel":2}"#);
-        assert!(f.matches("Lashay", Some("KXBTCPERP"), None, "instrument"));
-        assert!(!f.matches("Lashay", Some("KXBTCPERP"), None, "quote"));
-        // The carve-out is on the channel dimension only — `symbol` still narrows instruments.
+        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "instrument"));
+        assert!(!f.matches("Lashay", Some("KXETHPERP"), Some(1), "instrument"));
+        // `symbol` still narrows instruments independently of the channel.
         assert!(!filter(r#"{"channel":2,"symbol":"SOL"}"#).matches(
             "Lashay",
             Some("KXBTCPERP"),
-            None,
+            Some(2),
             "instrument"
         ));
     }
@@ -582,9 +580,10 @@ mod tests {
         assert!(!filter(r#"{"type":"book"}"#).matches("Lashay", None, None, "status"));
     }
 
-    /// A `book` frame must carry its channel so an explicit channel filter can select it.
+    /// `book` and `instrument` must carry their channel so an explicit channel filter can select
+    /// them; every other kind carries none, which is what the filter's exclusion rule rests on.
     #[test]
-    fn prepare_populates_the_channel_for_book_only() {
+    fn prepare_populates_the_channel_for_book_and_instrument() {
         use super::prepare;
         use crate::model::{BookAction, BookChange, BookSide, NormalizedBook};
         let b = FeedMessage::Book(NormalizedBook {
@@ -613,7 +612,18 @@ mod tests {
             !f.payload.contains(r#""ws_send_ts_ns":0"#),
             "stamped, not left at 0"
         );
-        // Every other kind carries no channel, which is what the filter's exclusion rule rests on.
+        let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
+            venue: "Lashay".into(),
+            symbol: "KXBTCPERP".into(),
+            channel: 2,
+            instrument_id: 41,
+            price_exponent: -2,
+            qty_exponent: -2,
+        }))
+        .expect("serializes");
+        assert_eq!(i.kind, "instrument");
+        assert_eq!(i.channel, Some(2));
+
         assert_eq!(
             prepare(&FeedMessage::Quote(sample_quote()))
                 .expect("serializes")
@@ -904,6 +914,101 @@ mod tests {
             next_text(&mut ws, Duration::from_millis(200)).await,
             None,
             "a re-subscribe must not replay again"
+        );
+
+        srv.abort();
+    }
+
+    /// A `{"channel":N}` subscriber's replay is scoped by the instrument's own channel, so it is
+    /// bootstrapped with the definitions it can use and not another channel's. The two markets use
+    /// different symbols because the snapshot is keyed `(venue, symbol)`. `#[serial]` for the shared
+    /// `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn replay_is_scoped_to_the_subscribed_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+
+        let mut defs = HashMap::new();
+        for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
+            let arc: Arc<str> = sym.into();
+            defs.insert(
+                (Arc::<str>::from("Lashay"), arc.clone()),
+                NormalizedInstrument {
+                    venue: "Lashay".into(),
+                    symbol: arc,
+                    channel,
+                    instrument_id: 41,
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                },
+            );
+        }
+        let instruments = Arc::new(Mutex::new(defs));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
+        where
+            S: futures_util::StreamExt<
+                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
+                > + Unpin,
+        {
+            timeout(within, async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                        Some(Ok(_)) => continue,
+                        other => panic!("stream ended: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .ok()
+        }
+
+        // Connect-time replay has no subscriptions to scope by: both definitions arrive.
+        for _ in 0..2 {
+            next_text(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed instrument");
+        }
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":2}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let replayed = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped replay frame");
+        assert!(
+            replayed.contains(r#""instrument""#) && replayed.contains(r#""KXBTCPERP""#),
+            "got {replayed}"
+        );
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "channel 3's definition must not be replayed for a channel 2 subscription"
         );
 
         srv.abort();
