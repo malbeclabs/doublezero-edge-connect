@@ -28,8 +28,8 @@
 | 1 — `trade_id == 0` bypass | **done** (`aafc871`, `2eeb93b`; review fixes `b2e9264`, `4d19da6`) |
 | 2 — per-publisher `RefDataState` | **done** (`a459c36`, `4f59d78`; review fix `23304c6`) |
 | 3 — arbitration mode plumbing | **done** (`8ad3377`; review fix `4d19da6`) |
-| 4 — `StickyAuthority` | not started |
-| 5 — re-election sampling | not started |
+| 4 — `StickyAuthority` | **done, then amended** (`5b2d045`, `3286b1c`) — authority is per **arm** for speed and silence, per **market** for health only. **Read Task 4's ⚠️ AMENDED block before building Task 12.** |
+| 5 — re-election sampling | **done, then amended** (`4229f4e`) — the specified sampling statistic was **inert**; replaced by a cross-arm trade matcher on our own receive clock, pooled per arm. **Read Task 5's ⚠️ AMENDED block.** |
 | 6 — `channel`/`type` filters | not started |
 | 7 — `codec_mbp` frame walk | **done** (`d12ff44`, `f89e68b`; review fix `75ce041`) |
 | 8 — `codec_mbp` price types | **done**, all steps (`1b003a3`, `f89e68b`; fixtures + real-frame tests in the Step 9 commit) |
@@ -47,6 +47,8 @@
 - `pricebook` no longer restates the wire enums — it imports `SIDE_*`/`CLEAR_SIDE_*`/`SCOPE_*` from `codec_mbp`. Task 11 passes a decoded `side` byte straight through, and two copies that drifted would swap bids and asks with every sequence check still passing. **Do not reintroduce a local copy.**
 - `PriceBook`'s level-cap overflow returns `DeltaOutcome::Overflow`, not `Gap`; the two leave different `status` behind. Task 11's metrics must not merge them.
 - Task 1's zero-id tape owner hands over after 5s of silence rather than latching forever, so `dz_trades_no_id_conflict_total` still means *concurrent* double-printing once Tasks 4 and 13 start moving tape ownership at runtime.
+
+**Tasks 4 and 5 shipped and were then restructured — Task 12 builds on the amended shape, not on what those sections originally specified.** Both carry a ⚠️ AMENDED block at the top; Task 4's ends with an explicit five-point *Task 12 contract changes* list. In one line each: authority is elected **per arm** for speed and silence and only overridden **per market** for health (per-market silence was flapping on every quiet market — 93 of 1,239 sports instruments saw any update at all in 39 s), and the speed statistic is a **cross-arm trade matcher on our own receive clock** because the originally specified one was provably inert.
 
 Two tests are correct now and are **meant** to fail later; both say so in their doc comments. `feeds::tests::at_most_one_trade_emitting_row_per_venue` is superseded by Task 13's runtime assertion, and `existing_venues_are_coordinated` excludes `Lashay` so Task 14's `Sticky` rows don't read as a regression.
 
@@ -696,12 +698,49 @@ Expected: all pass with **no** behavior change.
 
 ## Task 4: `StickyAuthority` — one authoritative arm per market
 
+> ### ⚠️ AMENDED 2026-08-07, after the task shipped — authority is scoped **per arm**, not per arm-market
+>
+> Built as specified below (`5b2d045`, `4229f4e`, `3286b1c`), then restructured. **Read this block instead of the scoping in the section below; the rest of the section still stands.** Task 12 inherits the amended shape — see *Task 12 contract changes* at the end of this block.
+>
+> **What changed and why.** The section below elects a leader independently per `(venue, channel_id, instrument_id)`. That is the wrong grain for two of the three transfer triggers, because **latency is a property of an arm, not of a market**: every message from a source IP is evidence about that arm's speed, so splitting the evidence per market splits it as finely as it can possibly be split. The three triggers have genuinely different natural scopes:
+>
+> | Trigger | Scope | Why |
+> |---|---|---|
+> | **Speed** (Task 5) | **per arm**, venue-wide | Pooled evidence. One verdict per venue per window, applied to every market the winning arm does not already hold. |
+> | **Silence** | **per arm**, venue-wide | An arm is live or it is not. Per-market silence is a *bug* — see below. |
+> | **Health** | **per market** | An arm can be `Synced` on 1,200 markets and `Gap` on one. Venue-wide health would either transfer the whole venue over one bad book, or serve a knowingly-stale book — the exact failure the rule exists to prevent. |
+>
+> **The bug per-market silence causes, which is why it had to move.** `leader_arrival_ns` advances only when the leader itself sends, so on a market quieter than `leader_timeout` the challenger's next message always reads as leader silence and takes authority — then the original arm's next message takes it back. On the sports capture **93 of 1,239 instruments saw any level update at all in 39 s**, so nearly every market is quiet for far longer than the 2 s default and nearly every update on those markets would register as a transfer, each one re-baselining the consumer's book under Task 12. Venue-wide silence measures what silence means: the arm has sent nothing *for the venue* within the timeout.
+>
+> **The amended model.** One leader per venue, elected by speed and silence, with a **per-market override**: when the venue leader's book for a market is unhealthy and another arm's is not, that market alone is served by the healthy arm. The override is a pure function of health and the venue leader — no stored per-market authority — so it reverts automatically when the leader's book recovers.
+>
+> **Two properties this buys.** The wire-keyed `(channel_id, instrument_id)` maps that both reviewers flagged as unbounded stop being growable by a forged stream: the sampling and liveness state is now keyed per `(venue, arm)`, and **only arms holding a metric ordinal are eligible at all** — past `MAX_LABELLED_ARMS` a publisher is neither recorded nor ever authoritative, so the cap that existed to bound the label set now bounds admission too. What remains per market is health plus the last-admitted arm, written only for markets that already have a book, so it is bounded transitively by `MAX_PRICE_BOOKS`.
+>
+> **Interface delta** (the section's `Interfaces` block is otherwise unchanged):
+>
+> ```rust
+> // MarketKey survives: still the caller's key, the health key, and what `leader_of` answers for.
+> pub fn venue_leader(&self, venue: &str) -> Option<Publisher>;             // new
+> pub fn transfer_venue_to(&mut self, venue: &str, to: Publisher, at_ns: u64) -> bool;  // replaces transfer_to
+> pub fn observe_matched_lead(&mut self, venue: &str, arm: Publisher, lead_ns: i64);    // replaces observe_challenger
+> pub fn close_window(&mut self, now_ns: u64) -> Vec<(Arc<str>, Publisher)>;            // was Vec<(MarketKey, Publisher)>
+> ```
+>
+> `Admit::Contest`'s `lead_ns` is **not** a lead and never was — it is how late the non-authoritative copy arrived relative to the leader's previous message, which is inter-arm phase. It stays as a drop-path diagnostic and **no longer feeds `dz_arm_lead_ns`**, which is now fed only by `observe_matched_lead`. That is what makes `{winner="challenger"}` reachable.
+>
+> **Task 12 contract changes.** Task 12 wires the caller and must now:
+> 1. Call `set_health(&market_key, arm, healthy)` on every `PriceBook` status transition — unchanged, still per market.
+> 2. Feed `observe_matched_lead(venue, arm, lead_ns)` from a **cross-arm trade matcher** (Task 5 as amended), pooled per venue. Not per market, and not from `Admit::Contest`.
+> 3. Drive `close_window` on a periodic tick and apply each returned `(venue, arm)` by calling `transfer_venue_to`.
+> 4. Publish `dz_arm_markets_held{venue,arm}` from `markets_held`, which is O(markets) — call it on the metrics tick, never per message.
+> 5. Gate `admit` on an instrument that already resolves to a definition and a book, which is what keeps the per-market maps bounded. This is a **precondition Task 12 owns**, not something `authority` enforces.
+
 **Why:** the Lashay arms are one FIX-sourced and one WS-sourced publisher with no comparable coordinate. Authority is per `(venue, channel_id, instrument_id)` — **per instrument, never per level**, because per-level leadership interleaves the arms, and two arms' delta series are unrelated by construction, so interleaving corrupts the book while every per-arm sequence check still passes.
 
 Two transfer triggers here; the speed margin is Task 5.
 
 1. **Health.** A leader sitting in `gap` or `awaiting-snapshot` is unhealthy. Under full-state output a lost level self-heals on the next message; under incremental output it does not heal until the next snapshot, so a stalled leader must yield.
-2. **Silence.** A leader that stops sending is unhealthy. Data-driven, no timer task: a challenger's arrival more than `leader_timeout` after the leader's last message takes authority.
+2. **Silence.** A leader that stops sending is unhealthy. Data-driven, no timer task: a challenger's arrival more than `leader_timeout` after the leader's last message takes authority. *(Amended: venue-wide, not per market — see the block above.)*
 
 **Files:**
 - Create: `src/ingest/authority.rs`
@@ -1093,6 +1132,26 @@ git commit -m "feat(ingest): add single-arm sticky authority for uncoordinated p
 ---
 
 ## Task 5: Election sampling and periodic re-election
+
+> ### ⚠️ AMENDED 2026-08-07, after the task shipped — the statistic was inert; it is now a matched-trade lead
+>
+> Built as specified below, then corrected. **The sampling statistic in this section does not work.** The rest — the four flags, both-conditions-must-hold, the sticky philosophy — stands.
+>
+> **Why the specified statistic is inert, not merely weak.** `observe_challenger` computed `challenger_arrival - leader_last_arrival`. `admit` updates the leader's arrival on every leader message and messages are processed in arrival order, so that quantity is **structurally non-negative**, while `best_challenger` only counts a win at `lead < -margin`. `wins` is therefore always 0, no challenger ever clears the rate condition, and a persistently slower arm keeps authority forever — the exact failure this task exists to prevent. The five tests below passed only because they call `observe_challenger(arm2, t - 10_000)` after `admit(arm1, t)`, an arrival order no real-time caller can produce. Found by the build instance and confirmed by reading the code.
+>
+> **What it was measuring** is inter-arm *phase*, not lead: the arms are unpairable by wire coordinate, so "the leader's previous message" is not the same event as the challenger's message.
+>
+> **The replacement: a cross-arm trade matcher on our own receive clock.** Pair the two arms' copies of the *same trade* by content signature, and take `recv_A - recv_B` for the matched pair on a single ns-resolution clock. Signed, so `{winner="challenger"}` is reachable. Pooled **per arm per venue** — latency is an arm property, so every matched trade from a source IP is evidence about that arm, whatever market it came from. That is what makes the sample supply workable: the sports feed carries ~5 trades per 39 s across the whole venue, which is nothing per market but ~38 per 300 s window pooled.
+>
+> **Match on trades only, never level updates.** `authority`'s own module doc already gives the reason: a level update's cross-arm-common fields reduce to `(side, price, quantity)` on a coarse bounded price grid, so a content match would mis-pair constantly. A trade's `(instrument, price, size, aggressor)` plus arrival proximity is near-unique. **The key needs a time component** — the reference implementation's does not, so two identical trades inside its window collide (see *Prior art*).
+>
+> **Two approaches rejected, recorded so they are not revisited:**
+> * **Inter-message gap** ("time since the other arm's last message"; the faster arm shows the larger median gap). Directionally right but rate-sensitive — it biases toward the chattier arm when the two differ in message granularity — and it **inverts** whenever the lead exceeds half the message period, since it compares `P - L` against `L`.
+> * **`recv_ts - venue_ts` per arm.** Tempting: `LevelUpdate.Timestamp` is the venue's own time (publisher `venue.rs`, "`ts_ms` is the venue's own time for the change, lifted"), it is plentiful, and its millisecond quantization is common-mode so it cancels in a difference of medians. It fails on the asymmetry that matters: `ts_ms` is `Option`, and when the venue supplies none the publisher silently substitutes its own clock (`feed.rs:1206`, `lu.timestamp = TsNs(now_ns())`) with **no flag on the wire**. An arm with no venue timestamp then measures only the network leg and looks fastest by construction — and filtering those samples out by their non-millisecond granularity disenfranchises that arm entirely instead. Since the FIX arm is the one both expected to be faster and expected to lack venue timestamps, this is precisely backwards. *(All 30,075 / 22,453 / 643 `LevelUpdate`s in the three 2026-08-07 captures were venue-sourced, i.e. exact-millisecond — but those are presumed all-WS arms, so that measures nothing about FIX.)*
+>
+> **Prior art, worth reading before writing the matcher.** The upstream publisher repo already has one — `src/publisher/compare.rs` in its publisher crate (447 lines, built and unit-tested), designed in its `2026-07-14-fix-ws-comparison-design.md` for a FIX-vs-WS comparison *inside* the publisher. A bounded time-windowed `pending` map keyed on a content signature, second transport to hit a key emits a signed delta and evicts, `evict_stale` counts "seen only on <transport>". Two gaps to close when lifting it: its trade key is `(ticker, price, size, side)` with **no time component**, and it reports milliseconds.
+>
+> **Interface delta:** `observe_challenger(&MarketKey, Publisher, u64)` becomes `observe_matched_lead(&str /* venue */, Publisher, i64 /* signed ns */)`, and `close_window` returns `Vec<(Arc<str>, Publisher)>`. The five tests below are replaced — they encode the arrival order being abandoned. Also added here: a **minimum-sample floor**, without which a single contested sample transfers a market.
 
 **Why:** without re-sampling, whichever arm delivers first at startup holds authority forever, even when persistently slower. With naive re-sampling, jitter flaps authority and re-baselines every consumer's book on each flip. The rule: **transfer only on a sustained margin, never on a single faster sample.**
 
