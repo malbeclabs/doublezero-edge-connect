@@ -50,10 +50,40 @@ pub const MSG_END_OF_SESSION: u8 = 0x06;
 pub const MSG_MANIFEST_SUMMARY: u8 = 0x07;
 pub const MSG_LIQUIDATION: u8 = 0x08;
 
+// Control messages, byte-identical to the market-by-order feed's.
+pub const MSG_BATCH_BOUNDARY: u8 = 0x13;
+pub const MSG_INSTRUMENT_RESET: u8 = 0x14;
+// Snapshot group (snapshot port). `SnapshotBegin` is a prefix-superset of the sibling's; the level
+// record is price-keyed and its own type, so it does not collide with the sibling's `0x21`.
+pub const MSG_SNAPSHOT_BEGIN: u8 = 0x20;
+pub const MSG_SNAPSHOT_END: u8 = 0x22;
+// Price-keyed book messages, defined by this feed.
+pub const MSG_LEVEL_UPDATE: u8 = 0x40;
+pub const MSG_BOOK_CLEAR: u8 = 0x41;
+pub const MSG_SNAPSHOT_LEVEL: u8 = 0x42;
+
 /// Trade aggressor. NOT the book `Side` value space — see the module doc.
 pub const AGGRESSOR_UNKNOWN: u8 = 0;
 pub const AGGRESSOR_BUY: u8 = 1;
 pub const AGGRESSOR_SELL: u8 = 2;
+
+/// Book side. NOT the trade `AGGRESSOR_*` value space — see the module doc.
+pub const SIDE_BID: u8 = 0;
+pub const SIDE_ASK: u8 = 1;
+
+/// `BookClear`'s side, deliberately not the shared `Side`: it extends it with a value no other
+/// message in this feed or any sibling accepts.
+pub const CLEAR_SIDE_BID: u8 = 0;
+pub const CLEAR_SIDE_ASK: u8 = 1;
+pub const CLEAR_SIDE_BOTH: u8 = 2;
+
+/// `BookClear`'s scope: the entire side(s), or from `from_price` outward to the far end.
+pub const SCOPE_ENTIRE_SIDE: u8 = 0;
+pub const SCOPE_FROM_PRICE: u8 = 1;
+
+/// `0xFFFF` on `order_count`/`level_index` means "not provided, or beyond what this field can
+/// express" — both saturate at it rather than wrapping, so it must never be read as a magnitude.
+const U16_UNAVAILABLE: u16 = 0xFFFF;
 
 /// Total on-wire message sizes, including the 4-byte header. Enforced exactly (see the module doc).
 pub mod sizes {
@@ -63,6 +93,13 @@ pub mod sizes {
     pub const END_OF_SESSION: usize = 12;
     pub const MANIFEST_SUMMARY: usize = 24;
     pub const LIQUIDATION: usize = 48;
+    pub const BATCH_BOUNDARY: usize = 16;
+    pub const INSTRUMENT_RESET: usize = 28;
+    pub const SNAPSHOT_BEGIN: usize = 40;
+    pub const SNAPSHOT_END: usize = 20;
+    pub const LEVEL_UPDATE: usize = 48;
+    pub const BOOK_CLEAR: usize = 36;
+    pub const SNAPSHOT_LEVEL: usize = 32;
 }
 
 /// 80-byte instrument definition — the top-of-book layout verbatim.
@@ -108,6 +145,88 @@ pub struct ManifestSummary {
     pub ts: u64,
 }
 
+/// The feed's core message: the complete resulting state of one price level. `qty_raw` is the
+/// level's **absolute** resulting quantity; `0` removes the level. `action` is informational and
+/// MUST NOT gate the apply.
+#[derive(Debug, Clone)]
+pub struct LevelUpdate {
+    pub instrument_id: u32,
+    pub source_id: u16,
+    pub side: u8,
+    pub action: u8,
+    pub per_instrument_seq: u32,
+    pub price_raw: i64,
+    pub qty_raw: u64,
+    pub ts: u64,
+    pub order_count: Option<u16>,
+    /// Informational rank. Never a key, never a locator, and invalid after any later update to the
+    /// same side.
+    pub level_index: Option<u16>,
+    pub update_reason: u8,
+    pub level_flags: u8,
+}
+
+/// Bulk removal. Asserts the named levels are gone; NOT a resynchronization signal — a subscriber
+/// that applies it stays ready.
+#[derive(Debug, Clone)]
+pub struct BookClear {
+    pub instrument_id: u32,
+    pub source_id: u16,
+    pub clear_side: u8,
+    pub scope: u8,
+    pub per_instrument_seq: u32,
+    pub from_price_raw: i64,
+    pub ts: u64,
+    pub clear_reason: u8,
+}
+
+/// One level of a snapshot. No instrument id: it is implied by the containing `SnapshotBegin`, so
+/// routing keys on the open group.
+#[derive(Debug, Clone)]
+pub struct SnapshotLevel {
+    pub snapshot_id: u32,
+    pub price_raw: i64,
+    pub qty_raw: u64,
+    pub order_count: Option<u16>,
+    pub side: u8,
+    pub level_flags: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotBegin {
+    pub instrument_id: u32,
+    pub anchor_seq: u64,
+    pub total_levels: u32,
+    pub snapshot_id: u32,
+    pub last_instrument_seq: u32,
+    pub ts: u64,
+    /// `0` is a positive publisher claim that this snapshot carries the complete book. Non-zero is
+    /// levels-per-side, beyond which state is **unknown, not empty**.
+    pub depth_bound: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotEnd {
+    pub instrument_id: u32,
+    pub anchor_seq: u64,
+    pub snapshot_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchBoundary {
+    pub batch_id: u32,
+    pub batch_time: u64,
+}
+
+/// Carries no per-instrument seq — processed regardless of sequence state.
+#[derive(Debug, Clone)]
+pub struct InstrumentReset {
+    pub instrument_id: u32,
+    pub reason: u8,
+    pub new_anchor_seq: u64,
+    pub ts: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Heartbeat(u64),
@@ -115,6 +234,13 @@ pub enum Message {
     Trade(Trade),
     EndOfSession(u64),
     ManifestSummary(ManifestSummary),
+    LevelUpdate(LevelUpdate),
+    BookClear(BookClear),
+    SnapshotLevel(SnapshotLevel),
+    SnapshotBegin(SnapshotBegin),
+    SnapshotEnd(SnapshotEnd),
+    BatchBoundary(BatchBoundary),
+    InstrumentReset(InstrumentReset),
     /// Reserved (`0x03`/`0x05`), unknown, or malformed-length: skipped by declared length.
     Other,
 }
@@ -140,6 +266,27 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
                 .unwrap_or(Message::Other),
             MSG_MANIFEST_SUMMARY if exact(sizes::MANIFEST_SUMMARY) => {
                 decode_manifest_summary(b, body).unwrap_or(Message::Other)
+            }
+            MSG_LEVEL_UPDATE if exact(sizes::LEVEL_UPDATE) => {
+                decode_level_update(b, body).unwrap_or(Message::Other)
+            }
+            MSG_BOOK_CLEAR if exact(sizes::BOOK_CLEAR) => {
+                decode_book_clear(b, body).unwrap_or(Message::Other)
+            }
+            MSG_SNAPSHOT_LEVEL if exact(sizes::SNAPSHOT_LEVEL) => {
+                decode_snapshot_level(b, body).unwrap_or(Message::Other)
+            }
+            MSG_SNAPSHOT_BEGIN if exact(sizes::SNAPSHOT_BEGIN) => {
+                decode_snapshot_begin(b, body).unwrap_or(Message::Other)
+            }
+            MSG_SNAPSHOT_END if exact(sizes::SNAPSHOT_END) => {
+                decode_snapshot_end(b, body).unwrap_or(Message::Other)
+            }
+            MSG_BATCH_BOUNDARY if exact(sizes::BATCH_BOUNDARY) => {
+                decode_batch_boundary(b, body).unwrap_or(Message::Other)
+            }
+            MSG_INSTRUMENT_RESET if exact(sizes::INSTRUMENT_RESET) => {
+                decode_instrument_reset(b, body).unwrap_or(Message::Other)
             }
             // `0x03`/`0x05` are reserved to stop a misrouted sibling frame cross-decoding, and
             // `MSG_LIQUIDATION` carries nothing this bridge re-serves. Both fall through here.
@@ -183,6 +330,95 @@ fn decode_manifest_summary(b: &[u8], o: usize) -> Option<Message> {
         manifest_seq: u16le(b, o + 4)?,
         instrument_count: u32le(b, o + 8)?,
         ts: u64le(b, o + 12)?,
+    }))
+}
+
+/// `0xFFFF` -> `None`; every other value, including `0`, is a real magnitude.
+fn u16_opt(v: u16) -> Option<u16> {
+    (v != U16_UNAVAILABLE).then_some(v)
+}
+
+fn decode_level_update(b: &[u8], o: usize) -> Option<Message> {
+    Some(Message::LevelUpdate(LevelUpdate {
+        instrument_id: u32le(b, o)?,
+        source_id: u16le(b, o + 4)?,
+        side: u8le(b, o + 6)?,
+        action: u8le(b, o + 7)?,
+        per_instrument_seq: u32le(b, o + 8)?,
+        price_raw: i64le(b, o + 12)?,
+        qty_raw: u64le(b, o + 20)?,
+        ts: u64le(b, o + 28)?,
+        order_count: u16_opt(u16le(b, o + 36)?),
+        level_index: u16_opt(u16le(b, o + 38)?),
+        update_reason: u8le(b, o + 40)?,
+        level_flags: u8le(b, o + 41)?,
+    }))
+}
+
+fn decode_book_clear(b: &[u8], o: usize) -> Option<Message> {
+    let clear_side = u8le(b, o + 6)?;
+    let scope = u8le(b, o + 7)?;
+    // Malformed by spec: one price cannot bound both sides. Dropping it here rather than in the
+    // book logic means a bad frame can never clear both sides from a single bound.
+    if scope == SCOPE_FROM_PRICE && clear_side == CLEAR_SIDE_BOTH {
+        return None;
+    }
+    Some(Message::BookClear(BookClear {
+        instrument_id: u32le(b, o)?,
+        source_id: u16le(b, o + 4)?,
+        clear_side,
+        scope,
+        per_instrument_seq: u32le(b, o + 8)?,
+        from_price_raw: i64le(b, o + 12)?,
+        ts: u64le(b, o + 20)?,
+        clear_reason: u8le(b, o + 28)?,
+    }))
+}
+
+fn decode_snapshot_level(b: &[u8], o: usize) -> Option<Message> {
+    Some(Message::SnapshotLevel(SnapshotLevel {
+        snapshot_id: u32le(b, o)?,
+        price_raw: i64le(b, o + 4)?,
+        qty_raw: u64le(b, o + 12)?,
+        order_count: u16_opt(u16le(b, o + 20)?),
+        side: u8le(b, o + 22)?,
+        level_flags: u8le(b, o + 23)?,
+    }))
+}
+
+fn decode_snapshot_begin(b: &[u8], o: usize) -> Option<Message> {
+    Some(Message::SnapshotBegin(SnapshotBegin {
+        instrument_id: u32le(b, o)?,
+        anchor_seq: u64le(b, o + 4)?,
+        total_levels: u32le(b, o + 12)?,
+        snapshot_id: u32le(b, o + 16)?,
+        last_instrument_seq: u32le(b, o + 20)?,
+        ts: u64le(b, o + 24)?,
+        depth_bound: u32le(b, o + 32)?,
+    }))
+}
+
+fn decode_snapshot_end(b: &[u8], o: usize) -> Option<Message> {
+    Some(Message::SnapshotEnd(SnapshotEnd {
+        instrument_id: u32le(b, o)?,
+        anchor_seq: u64le(b, o + 4)?,
+        snapshot_id: u32le(b, o + 12)?,
+    }))
+}
+
+fn decode_batch_boundary(b: &[u8], o: usize) -> Option<Message> {
+    Some(Message::BatchBoundary(BatchBoundary {
+        batch_id: u32le(b, o)?,
+        batch_time: u64le(b, o + 4)?,
+    }))
+}
+
+fn decode_instrument_reset(b: &[u8], o: usize) -> Option<Message> {
+    Some(Message::InstrumentReset(InstrumentReset {
+        instrument_id: u32le(b, o)?,
+        reason: u8le(b, o + 4)?,
+        new_anchor_seq: u64le(b, o + 8)?,
+        ts: u64le(b, o + 16)?,
     }))
 }
 
@@ -377,36 +613,285 @@ mod tests {
         }
     }
 
-    /// The shared types' strongest guarantee is that they are the top-of-book layout, which is
-    /// byte-validated against the reference Go decoder. Decode the SAME body bytes through both
-    /// codecs and require equal fields, so a drift in either is a test failure rather than a
-    /// silent divergence.
+    /// spec: LevelUpdate 0x40, 48 bytes. Body: id @0, source @4, side @6, action @7, seq @8,
+    /// price i64 @12, qty u64 @20, ts @28, order_count @36, level_index @38, reason @40, flags @41.
     #[test]
-    fn tob_shared_layouts_decode_identically() {
-        let mut b = vec![0u8; 76];
+    fn level_update_decodes() {
+        let mut b = vec![0u8; 44];
         b[0..4].copy_from_slice(&41u32.to_le_bytes());
-        b[4..15].copy_from_slice(b"KXBTCPERP\0\0");
-        b[37] = (-4i8) as u8;
-        b[38] = (-2i8) as u8;
-        b[74..76].copy_from_slice(&9u16.to_le_bytes());
+        b[4..6].copy_from_slice(&3u16.to_le_bytes());
+        b[6] = SIDE_ASK;
+        b[7] = 2; // Change
+        b[8..12].copy_from_slice(&17u32.to_le_bytes());
+        b[12..20].copy_from_slice(&(-6300i64).to_le_bytes()); // price is SIGNED
+        b[20..28].copy_from_slice(&150u64.to_le_bytes());
+        b[28..36].copy_from_slice(&999u64.to_le_bytes());
+        b[36..38].copy_from_slice(&4u16.to_le_bytes());
+        b[38..40].copy_from_slice(&1u16.to_le_bytes());
+        b[40] = 1; // Trade
+        b[41] = 0b10; // AMM-synthetic
+        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let Message::LevelUpdate(u) = &m[0] else {
+            panic!("{:?}", m[0])
+        };
+        assert_eq!(u.instrument_id, 41);
+        assert_eq!(u.side, SIDE_ASK);
+        assert_eq!(u.action, 2);
+        assert_eq!(u.per_instrument_seq, 17);
+        assert_eq!(u.price_raw, -6300);
+        assert_eq!(u.qty_raw, 150);
+        assert_eq!(u.ts, 999);
+        assert_eq!(u.order_count, Some(4));
+        assert_eq!(u.level_index, Some(1));
+        assert_eq!(u.update_reason, 1);
+        assert_eq!(u.level_flags, 0b10);
+    }
 
-        let mut mbp = frame_header(1, 0, 80);
-        mbp.extend_from_slice(&msg(MSG_INSTRUMENT_DEFINITION, 0, &b));
-        let mut tob = mbp.clone();
-        tob[0..2].copy_from_slice(&crate::ingest::codec::MAGIC.to_le_bytes());
-
-        let (_, m) = decode_frame(&mbp).unwrap();
-        let (_, t) = crate::ingest::codec::decode_frame(&tob).unwrap();
-        let Message::InstrumentDefinition(a) = &m[0] else {
+    /// `0xFFFF` on order_count / level_index means "not provided, or beyond what this field can
+    /// express" — both saturate at it. A subscriber MUST NOT read it as the magnitude 65535, so it
+    /// decodes to `None`. `order_count = 0` by contrast is a REAL value on a LevelUpdate.
+    #[test]
+    fn level_update_u16_sentinels_are_none_but_zero_is_real() {
+        let mut b = vec![0u8; 44];
+        b[36..38].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        b[38..40].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let Message::LevelUpdate(u) = &m[0] else {
             panic!()
         };
-        let crate::ingest::codec::Message::InstrumentDefinition(c) = &t[0] else {
+        assert_eq!(u.order_count, None);
+        assert_eq!(u.level_index, None);
+
+        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &[0u8; 44])).unwrap();
+        let Message::LevelUpdate(u) = &m[0] else {
             panic!()
         };
-        assert_eq!(a.instrument_id, c.instrument_id);
-        assert_eq!(&*a.symbol, &*c.symbol);
-        assert_eq!(a.price_exponent, c.price_exponent);
-        assert_eq!(a.qty_exponent, c.qty_exponent);
-        assert_eq!(a.manifest_seq, c.manifest_seq);
+        assert_eq!(u.order_count, Some(0), "0 is a real order count");
+    }
+
+    /// `Quantity = 0` is valid and means "remove this level" — it must decode, not be rejected.
+    #[test]
+    fn level_update_zero_quantity_is_valid() {
+        let mut b = vec![0u8; 44];
+        b[12..20].copy_from_slice(&6300i64.to_le_bytes());
+        b[20..28].copy_from_slice(&0u64.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let Message::LevelUpdate(u) = &m[0] else {
+            panic!()
+        };
+        assert_eq!(u.qty_raw, 0);
+    }
+
+    /// Enums decode permissively: any `u8` is accepted and interpretation is the caller's. The
+    /// decoder must not reject or remap — an `Action` byte that is wrong must never be able to
+    /// corrupt a book, and the apply rule ignores `Action` entirely.
+    #[test]
+    fn level_update_enums_are_permissive() {
+        let mut b = vec![0u8; 44];
+        b[6] = 200; // side
+        b[7] = 200; // action
+        b[40] = 200; // update reason
+        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let Message::LevelUpdate(u) = &m[0] else {
+            panic!()
+        };
+        assert_eq!((u.side, u.action, u.update_reason), (200, 200, 200));
+    }
+
+    /// spec: BookClear 0x41, 36 bytes. Body: id @0, source @4, clear_side @6, scope @7, seq @8,
+    /// from_price i64 @12, ts @20, clear_reason @28.
+    #[test]
+    fn book_clear_decodes() {
+        let mut b = vec![0u8; 32];
+        b[0..4].copy_from_slice(&41u32.to_le_bytes());
+        b[6] = CLEAR_SIDE_BID;
+        b[7] = SCOPE_FROM_PRICE;
+        b[8..12].copy_from_slice(&18u32.to_le_bytes());
+        b[12..20].copy_from_slice(&6100i64.to_le_bytes());
+        b[20..28].copy_from_slice(&1_234u64.to_le_bytes());
+        b[28] = 1; // Halt
+        let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+        let Message::BookClear(c) = &m[0] else {
+            panic!("{:?}", m[0])
+        };
+        assert_eq!(c.clear_side, CLEAR_SIDE_BID);
+        assert_eq!(c.scope, SCOPE_FROM_PRICE);
+        assert_eq!(c.per_instrument_seq, 18);
+        assert_eq!(c.from_price_raw, 6100);
+        assert_eq!(c.clear_reason, 1);
+    }
+
+    /// `Scope = 1` with `Clear Side = 2` is malformed: one price cannot bound both sides. A
+    /// subscriber MUST discard and count it — so the decoder must not hand it up as a valid clear,
+    /// or the book logic would clear both sides from one bound.
+    #[test]
+    fn book_clear_from_price_on_both_sides_is_malformed() {
+        let mut b = vec![0u8; 32];
+        b[6] = CLEAR_SIDE_BOTH;
+        b[7] = SCOPE_FROM_PRICE;
+        let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+        assert!(matches!(m[0], Message::Other), "must not decode as a clear");
+    }
+
+    /// ...but `Clear Side = 2` with `Scope = 0` (clear both sides entirely) is the normal case.
+    #[test]
+    fn book_clear_both_sides_entirely_is_valid() {
+        let mut b = vec![0u8; 32];
+        b[6] = CLEAR_SIDE_BOTH;
+        b[7] = SCOPE_ENTIRE_SIDE;
+        let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+        assert!(matches!(m[0], Message::BookClear(_)));
+    }
+
+    /// spec: SnapshotLevel 0x42, 32 bytes. Body: snapshot_id @0, price i64 @4, qty u64 @12,
+    /// order_count @20, side @22, level_flags @23. Carries NO instrument id — it is implied by the
+    /// containing SnapshotBegin, which is why routing must key on the open group (Task 9).
+    #[test]
+    fn snapshot_level_decodes() {
+        let mut b = vec![0u8; 28];
+        b[0..4].copy_from_slice(&5u32.to_le_bytes());
+        b[4..12].copy_from_slice(&6200i64.to_le_bytes());
+        b[12..20].copy_from_slice(&150u64.to_le_bytes());
+        b[20..22].copy_from_slice(&2u16.to_le_bytes());
+        b[22] = SIDE_BID;
+        b[23] = 1;
+        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_LEVEL, 1, &b)).unwrap();
+        let Message::SnapshotLevel(l) = &m[0] else {
+            panic!("{:?}", m[0])
+        };
+        assert_eq!(l.snapshot_id, 5);
+        assert_eq!(l.price_raw, 6200);
+        assert_eq!(l.qty_raw, 150);
+        assert_eq!(l.order_count, Some(2));
+        assert_eq!(l.side, SIDE_BID);
+        assert_eq!(l.level_flags, 1);
+    }
+
+    /// spec: SnapshotBegin 0x20, 40 bytes. Body: id @0, anchor_seq @4, total_levels @12,
+    /// snapshot_id @16, last_instrument_seq @20, ts @24, **depth_bound @32**. Body bytes 0-31 are
+    /// the market-by-order feed's 32-byte body verbatim (its `Total Orders` reads as `Total
+    /// Levels`); `ts` at 24 is deliberately not 8-byte aligned, inherited, not a cost of the
+    /// superset.
+    #[test]
+    fn snapshot_begin_decodes_including_depth_bound() {
+        let mut b = vec![0u8; 36];
+        b[0..4].copy_from_slice(&41u32.to_le_bytes());
+        b[4..12].copy_from_slice(&900u64.to_le_bytes());
+        b[12..16].copy_from_slice(&1210u32.to_le_bytes());
+        b[16..20].copy_from_slice(&5u32.to_le_bytes());
+        b[20..24].copy_from_slice(&16u32.to_le_bytes());
+        b[24..32].copy_from_slice(&7_777u64.to_le_bytes());
+        b[32..36].copy_from_slice(&0u32.to_le_bytes()); // 0 = complete book
+        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &b)).unwrap();
+        let Message::SnapshotBegin(s) = &m[0] else {
+            panic!("{:?}", m[0])
+        };
+        assert_eq!(s.instrument_id, 41);
+        assert_eq!(s.anchor_seq, 900);
+        assert_eq!(s.total_levels, 1210);
+        assert_eq!(s.snapshot_id, 5);
+        assert_eq!(s.last_instrument_seq, 16);
+        assert_eq!(s.ts, 7_777);
+        assert_eq!(s.depth_bound, 0);
+    }
+
+    /// The reason exact-length matters: a market-by-order-shaped SnapshotBegin body must NOT decode
+    /// here. If it did, `depth_bound` would read whatever followed, and a `0` there is a positive
+    /// publisher claim of a complete book that no publisher made.
+    #[test]
+    fn snapshot_begin_rejects_the_short_sibling_layout() {
+        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &[0u8; 32])).unwrap();
+        assert!(matches!(m[0], Message::Other));
+    }
+
+    #[test]
+    fn snapshot_begin_bounded_depth_decodes() {
+        let mut b = vec![0u8; 36];
+        b[32..36].copy_from_slice(&25u32.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &b)).unwrap();
+        let Message::SnapshotBegin(s) = &m[0] else {
+            panic!()
+        };
+        assert_eq!(s.depth_bound, 25);
+    }
+
+    /// spec: SnapshotEnd 0x22, 20 bytes. Body: id @0, anchor_seq @4, snapshot_id @12.
+    #[test]
+    fn snapshot_end_decodes() {
+        let mut b = vec![0u8; 16];
+        b[0..4].copy_from_slice(&41u32.to_le_bytes());
+        b[4..12].copy_from_slice(&900u64.to_le_bytes());
+        b[12..16].copy_from_slice(&5u32.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_END, 1, &b)).unwrap();
+        let Message::SnapshotEnd(e) = &m[0] else {
+            panic!()
+        };
+        assert_eq!((e.instrument_id, e.anchor_seq, e.snapshot_id), (41, 900, 5));
+    }
+
+    /// spec: BatchBoundary 0x13, 16 bytes. Body: batch_id @0, batch_time @4. Carries no instrument
+    /// id — it applies to the whole channel.
+    #[test]
+    fn batch_boundary_decodes() {
+        let mut b = vec![0u8; 12];
+        b[0..4].copy_from_slice(&123u32.to_le_bytes());
+        b[4..12].copy_from_slice(&456u64.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_BATCH_BOUNDARY, 0, &b)).unwrap();
+        let Message::BatchBoundary(bb) = &m[0] else {
+            panic!()
+        };
+        assert_eq!((bb.batch_id, bb.batch_time), (123, 456));
+    }
+
+    /// spec: InstrumentReset 0x14, 28 bytes. Body: id @0, reason @4, reserved 5-7,
+    /// new_anchor_seq @8, ts @16. Carries NO per-instrument seq — it is processed regardless of
+    /// sequence state.
+    #[test]
+    fn instrument_reset_decodes() {
+        let mut b = vec![0u8; 24];
+        b[0..4].copy_from_slice(&41u32.to_le_bytes());
+        b[4] = 3; // UpstreamGap
+        b[8..16].copy_from_slice(&1_000u64.to_le_bytes());
+        b[16..24].copy_from_slice(&2_000u64.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_RESET, 0, &b)).unwrap();
+        let Message::InstrumentReset(r) = &m[0] else {
+            panic!()
+        };
+        assert_eq!(
+            (r.instrument_id, r.reason, r.new_anchor_seq, r.ts),
+            (41, 3, 1_000, 2_000)
+        );
+    }
+
+    /// Extend the exact-length sweep to the price-keyed types.
+    #[test]
+    fn wrong_body_length_does_not_decode_price_types() {
+        for (ty, correct) in [
+            (MSG_BATCH_BOUNDARY, 12usize),
+            (MSG_INSTRUMENT_RESET, 24),
+            (MSG_SNAPSHOT_BEGIN, 36),
+            (MSG_SNAPSHOT_END, 16),
+            (MSG_LEVEL_UPDATE, 44),
+            (MSG_BOOK_CLEAR, 32),
+            (MSG_SNAPSHOT_LEVEL, 28),
+        ] {
+            for len in [correct - 1, correct + 1] {
+                let (_, m) = decode_frame(&one(ty, 0, &vec![0u8; len])).unwrap();
+                assert!(
+                    matches!(m[0], Message::Other),
+                    "type {ty:#04x} len {len} decoded"
+                );
+            }
+        }
+    }
+
+    /// The `0x50`-`0x5F` range is reserved for a future positional-index addressing mode. There is
+    /// no mode negotiation: a price-keyed subscriber skips them by length like any unknown type.
+    #[test]
+    fn index_addressing_range_is_skipped() {
+        for ty in 0x50u8..=0x5F {
+            let (_, m) = decode_frame(&one(ty, 0, &[0u8; 20])).unwrap();
+            assert!(matches!(m[0], Message::Other), "type {ty:#04x} decoded");
+        }
     }
 }

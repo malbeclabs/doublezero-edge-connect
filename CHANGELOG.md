@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ingest::codec_mbp` — pure decoder for the Market-by-Price feed (frame magic `0x4442`): the frame
+  walk, the five message types inherited from the byte-validated Top-of-Book layout, and the seven
+  price-keyed types (`LevelUpdate`, `BookClear`, `SnapshotLevel`, `Snapshot{Begin,End}`,
+  `BatchBoundary`, `InstrumentReset`). Nothing ingests it yet — no `FEEDS` row, no processor. Body
+  length is checked for exact equality with the type's declared size, unlike the sibling codecs:
+  within schema v1 an unexpected length is malformed, and `SnapshotBegin` is a prefix-superset of
+  Market-by-Order's, so a lenient decode would read `depth_bound` out of trailing bytes. Offsets
+  are validated field-for-field against the Go reference decoder; **no real-frame fixture exists
+  yet** (see `tests/fixtures/PROVENANCE.md`). (#95)
+- `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
+  with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All six live Hyperliquid publishers are ingested
   (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
