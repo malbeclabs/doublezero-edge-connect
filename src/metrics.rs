@@ -153,7 +153,7 @@ pub struct Metrics {
     /// [`crate::ingest::authority::StickyAuthority`].
     pub arm_lead_ns: HistogramVec,
     /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
-    /// thresholds are too tight: every transfer re-baselines each consumer's book.
+    /// thresholds are too loose: every transfer re-baselines each consumer's book.
     pub arm_transfers: IntCounterVec,
     /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
     /// authority is fragmented; all on one arm is the steady state.
@@ -466,7 +466,7 @@ impl Metrics {
                 &registry,
                 "dz_arm_authority_transfers_total",
                 "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
-                 means the thresholds are too tight — every transfer re-baselines each consumer.",
+                 means the thresholds are too loose — every transfer re-baselines each consumer.",
                 &["venue", "reason"],
             ),
             arm_markets_held: gauge_vec(

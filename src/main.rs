@@ -232,12 +232,13 @@ struct Args {
     )]
     arb_transfer_margin_us: u64,
 
-    /// Fraction of a window's contested samples the challenger must also lead (meaningful range
-    /// 0.0-1.0). Independent of the margin, so a heavy tail alone cannot carry a transfer.
+    /// Fraction of a window's contested samples the challenger must also lead, 0.0-1.0.
+    /// Independent of the margin, so a heavy tail alone cannot carry a transfer.
     #[arg(
         long = "arb-transfer-win-rate",
         env = "DZ_ARB_TRANSFER_WIN_RATE",
-        default_value_t = 0.8
+        default_value_t = 0.8,
+        value_parser = parse_win_rate
     )]
     arb_transfer_win_rate: f64,
 
@@ -248,6 +249,18 @@ struct Args {
         default_value_t = 2
     )]
     arb_leader_timeout_secs: u64,
+}
+
+/// A win rate outside `0.0..=1.0` silently disables one of the two transfer conditions (above 1.0
+/// no challenger ever clears it, below 0.0 every one does), and `NaN` compares false against both.
+/// Reject it at startup rather than shipping a knob that reads as set but does nothing.
+fn parse_win_rate(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("`{s}` is outside 0.0-1.0"))
+    }
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
