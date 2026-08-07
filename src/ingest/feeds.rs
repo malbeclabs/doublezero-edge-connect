@@ -352,6 +352,12 @@ mod tests {
     /// not the row's — so neither two arms of one row nor a remapped SourceID is visible here. The
     /// runtime half is `dz_trades_no_id_conflict_total`, which reports a second tape owner instead
     /// of asserting there isn't one.
+    ///
+    /// NOTE: this static form holds only until a venue carries a tape on two separately-gated feeds,
+    /// which is deliberate and coming — a host subscribed to the market-by-price group alone must
+    /// still get a tape, so both of that venue's rows set `emit_trades`. **When this fails for that
+    /// reason, replace it with the runtime-ownership assertion, not the rows.** Same invariant — at
+    /// most one tape emitter per venue at any moment — enforced where ownership actually lives.
     #[test]
     fn at_most_one_trade_emitting_row_per_venue() {
         let mut emitters = std::collections::HashMap::new();
@@ -384,11 +390,13 @@ mod tests {
         }
     }
 
-    /// The existing venues race on a comparable venue clock and must keep doing so — the mode is a
-    /// seam, not a behavior change.
+    /// The venues that predate arbitration modes race on a comparable venue clock and must keep
+    /// doing so — the mode is a seam, not a behavior change. Scoped by exclusion rather than
+    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose arms carry
+    /// no shared clock can declare it; a new such venue is the feature working, not a regression.
     #[test]
     fn existing_venues_are_coordinated() {
-        for f in FEEDS {
+        for f in FEEDS.iter().filter(|f| f.venue != "Lashay") {
             assert_eq!(f.arbitration, ArbitrationMode::Coordinated, "{}", f.venue);
         }
     }
