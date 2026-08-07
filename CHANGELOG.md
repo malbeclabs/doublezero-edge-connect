@@ -10,14 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Each `Feed` now declares an `ArbitrationMode` (`Coordinated`/`Sticky`), carried into the arbiter as a per-venue map. Behaviour-neutral: every existing venue is `Coordinated` — today's latch-to-leader staleness floor — and an unregistered venue defaults to it. The seam exists for venues whose redundant publishers stamp no comparable venue clock, which cannot be arbitrated by a per-tick floor. (#94)
 - `ingest::codec_mbp` — pure decoder for the Market-by-Price feed (frame magic `0x4442`): the frame
-  walk, the five message types inherited from the byte-validated Top-of-Book layout, and the seven
-  price-keyed types (`LevelUpdate`, `BookClear`, `SnapshotLevel`, `Snapshot{Begin,End}`,
-  `BatchBoundary`, `InstrumentReset`). Nothing ingests it yet — no `FEEDS` row, no processor. Body
-  length is checked for exact equality with the type's declared size, unlike the sibling codecs:
-  within schema v1 an unexpected length is malformed, and `SnapshotBegin` is a prefix-superset of
-  Market-by-Order's, so a lenient decode would read `depth_bound` out of trailing bytes. Offsets
-  are validated field-for-field against the Go reference decoder; **no real-frame fixture exists
-  yet** (see `tests/fixtures/PROVENANCE.md`). (#95)
+  walk, the five message types inherited from the byte-validated Top-of-Book layout, the three
+  price-keyed payloads this feed defines (`LevelUpdate`, `BookClear`, `SnapshotLevel`), and the four
+  it shares byte-for-byte with Market-by-Order (`Snapshot{Begin,End}`, `BatchBoundary`,
+  `InstrumentReset`). Nothing ingests it yet — no `FEEDS` row, no processor. Two rules make it
+  stricter than the sibling codecs, and they depend on each other: a frame declaring an
+  unimplemented schema version is rejected whole, and within v1 a body length must equal the type's
+  declared size exactly. `SnapshotBegin` is a prefix-superset of Market-by-Order's, so a lenient
+  decode would read `depth_bound` from whatever follows the body — and the version gate is what
+  keeps the length rule from silently rejecting a v2 frame whose bodies legally grew. Offsets are
+  validated field-for-field against the Go reference decoder; **no real-frame fixture exists yet**
+  (see `tests/fixtures/PROVENANCE.md`). (#95)
 - `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
   with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
