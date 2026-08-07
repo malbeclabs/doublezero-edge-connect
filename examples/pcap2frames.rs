@@ -539,14 +539,18 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         md_ids: Vec<u32>,   // level-update/clear/reset/trade instrument ids
     }
     let mut summaries: Vec<Frame> = Vec::new();
-    // The open snapshot group, in capture order: (instrument_id, snapshot_id).
-    let mut open_group: Option<(u32, u32)> = None;
+    // The open snapshot group per **channel**, in capture order: channel -> (instrument, snapshot).
+    // Keyed per channel because a channel is an independent state machine with its own snapshot
+    // cycle, and one snapshot port may carry several: two channels whose groups alternate there are
+    // each conformant, so a single port-wide slot mis-attributes every level of the interleaved one.
+    let mut open_group: HashMap<u8, (u32, u32)> = HashMap::new();
 
     for f in frames {
-        let Ok((_hdr, msgs)) = codec_mbp::decode_frame(f) else {
+        let Ok((hdr, msgs)) = codec_mbp::decode_frame(f) else {
             errors += 1;
             continue;
         };
+        let chan = hdr.channel_id;
         let mut fr = Frame {
             payload: f.clone(),
             refdata: false,
@@ -593,16 +597,16 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 Message::SnapshotBegin(s) => {
                     snaps += 1;
                     fr.snapshot = true;
-                    open_group = Some((s.instrument_id, s.snapshot_id));
+                    open_group.insert(chan, (s.instrument_id, s.snapshot_id));
                     fr.snap_insts.push(s.instrument_id);
                 }
                 Message::SnapshotLevel(s) => {
                     snaps += 1;
                     fr.snapshot = true;
-                    match open_group {
-                        // A level whose id disagrees with the open group is discarded by the spec;
-                        // one arriving before any begin is a capture that started mid-group.
-                        Some((inst, sid)) if sid == s.snapshot_id => fr.snap_insts.push(inst),
+                    match open_group.get(&chan) {
+                        // A level whose id disagrees with its channel's open group is discarded by
+                        // the spec; one before any begin is a capture that started mid-group.
+                        Some((inst, sid)) if *sid == s.snapshot_id => fr.snap_insts.push(*inst),
                         _ => orphan_levels += 1,
                     }
                 }
@@ -610,7 +614,7 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                     snaps += 1;
                     fr.snapshot = true;
                     fr.snap_insts.push(s.instrument_id);
-                    open_group = None;
+                    open_group.remove(&chan);
                 }
                 // Channel-wide like BatchBoundary, and the strongest reset signal there is.
                 Message::EndOfSession(_) => {
