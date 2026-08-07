@@ -237,7 +237,9 @@ Modules are grouped by role under `src/`:
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
   IP and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
   a shared port block one publisher's restart would otherwise clear every publisher's definitions and
-  blank the venue. `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
+  blank the venue. Reads take the **non-inserting** `PerPublisher::def`; only the refdata handlers use
+  the inserting `get`, so a forged-source market-data flood can't evict a real publisher's definitions.
+  `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
   datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
   sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
   instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
