@@ -92,7 +92,7 @@ const MAX_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 /// essentially always opens (leads) a tick and the public copy at that tick is dropped as a
 /// non-leader no-op. When the edge feed gaps, no edge publisher opens the next tick, so the public
 /// feed's sample is the first to cross the floor — it leads and fills in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Publisher {
     /// A DZ Edge multicast publisher, identified by its datagram source IP.
     Edge(IpAddr),
