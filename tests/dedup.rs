@@ -227,11 +227,15 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // The fixture carries 8788 raw BTC mktdata quotes split across two publishers mirroring the same
     // feed (417 distinct source_ts). Latch-to-leader emits the leader's distinct canonical BBOs at a
     // non-decreasing floor — the `bbo_hash` identity (px, sz, bid_n, ask_n), so a count-only change at
-    // an unchanged price/size is a distinct quote. Observed: 4540 (the 4468 px/sz-distinct BBOs plus
-    // 72 count-only changes the source-count identity now keeps; ~1.6%). Far above a strict
-    // one-per-tick watermark (~417, which over-drops real intra-tick changes).
+    // an unchanged price/size is a distinct quote. Far above a strict one-per-tick watermark (~417,
+    // which over-drops real intra-tick changes).
+    //
+    // 4521, down from 4540 before reference-data state became per publisher: each arm now gates on
+    // its OWN definitions, and the second arm's first burst lands ~280 records after the first's, so
+    // its quotes in that startup window no longer ride the peer's definitions. Startup-only — both
+    // arms re-burst every few seconds, and the arm that already has definitions covers the tick.
     assert_eq!(
-        quotes, 4540,
+        quotes, 4521,
         "two-pub latch-to-leader quote count (leader's distinct canonical BBOs incl. bid_n/ask_n)"
     );
 }
