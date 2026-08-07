@@ -305,3 +305,30 @@ subscribed to the `edge-solana-*` groups, then re-run the extraction (curate dat
 variant bytes + multi-group keys into the record format, and build `shred_leaders.json` by inverting
 a current `getLeaderSchedule` for the captured slots). The leader schedule must be fetched while the
 captured epoch is still within the RPC's retention.
+
+## Market-by-price fixtures
+
+**None are committed yet.** `codec_mbp.rs` decodes frame magic `0x4442`, and no capture of that
+feed exists in this repo — a capture needs a host with the DoubleZero tunnel up and subscribed to
+the perps market-by-price group, which no CI or dev environment here has.
+
+What backs the decoder instead: the offset-independent unit tests in `src/ingest/codec_mbp.rs`
+(every test frame is built from literal spec offsets, so it cannot agree with the decoder by
+sharing them), field-for-field parity with the Go reference decoder
+(`go/marketbyprice-parser/marketbyprice_wire.go` in `malbeclabs/edge-multicast-ref`), and
+`tests/codec_mbp_fixtures.rs`, which pins the three types inherited from top-of-book to that
+byte-validated codec. That is stronger than `codec_midpoint` (self-consistency only) and weaker
+than the MBO trio above (real capture).
+
+A real capture would need the three port roles (refdata, mktdata, snapshot) for one publisher over
+a window long enough to contain a complete snapshot group plus its contiguous post-anchor
+`LevelUpdate`s, and the definition that resolves the symbol's precision:
+
+```
+sudo timeout 120 tcpdump -i doublezero1 -nn -s 0 -w mbp.pcap 'host <group> and udp'
+cargo run --example pcap2frames -- mbp.pcap --protocol mbp --group <group> \
+  --src <publisher-ip> --to 40 -o tests/fixtures/mbp
+```
+
+Record the source IP, capture date, frame counts and the observed `depth_bound` here when one is
+taken. `--combined-with` is not implemented for `--protocol mbp`.

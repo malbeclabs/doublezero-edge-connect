@@ -77,7 +77,7 @@ Modules are grouped by role under `src/`:
   `subscriber`, `arbiter`, the **`subscriptions`** detector + **`reconcile`** activation loop (which
   decide what runs — see Architecture above), the optional public feeders (`public_feeder`
   scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
-  `codec_midpoint`, `codec_mbo`). Intra-pipeline references use `crate::ingest::*`; this half knows
+  `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
@@ -249,7 +249,7 @@ Modules are grouped by role under `src/`:
   content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
   tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
   `source_ts` per depth).
-- **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs`** — pure decoders for each protocol's
+- **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs` / `codec_mbp.rs`** — pure decoders for each protocol's
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).
   **`codec.rs` (TOB) offsets are validated byte-for-byte** against the authoritative Go decoder in
@@ -259,7 +259,12 @@ Modules are grouped by role under `src/`:
   test over the byte-validated committed golden fixtures (`tests/codec_mbo_fixtures.rs`). ⚠️
   **`codec_midpoint.rs` offsets still come from the edge-feed-spec draft and are NOT
   reference-validated**; its round-trip tests only pin self-consistency, so validate against a live
-  frame hexdump before trusting its output (see "Conventions" below).
+  frame hexdump before trusting its output (see "Conventions" below). **`codec_mbp.rs`
+  (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder but
+  has **no committed fixture** — nothing decodes it in production yet (no `FeedKind`, no `FEEDS`
+  row). It is the one codec that enforces **exact** body-length equality per type rather than
+  bounds-checked reads: `SnapshotBegin` is a prefix-superset of MBO's, so a lenient decode would
+  read `depth_bound` (whose `0` claims a *complete* book) out of trailing bytes.
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
   Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
