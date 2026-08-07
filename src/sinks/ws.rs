@@ -43,6 +43,9 @@ struct PreparedFrame {
     venue: Arc<str>,
     /// The message's symbol, or `None` for a venue-level `status` (matched by venue alone).
     symbol: Option<Arc<str>>,
+    /// The message's `channel_id`, or `None` for a type that carries none. Populated when the
+    /// incremental `book` message lands; every current type is `None`.
+    channel: Option<u32>,
 }
 
 /// Serialize one backbone message once: clone it, stamp the shared `ws_send_ts_ns`, render the JSON,
@@ -70,6 +73,10 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
             d.ws_send_ts_ns = now;
             "depth"
         }
+        FeedMessage::Book(b) => {
+            b.ws_send_ts_ns = now;
+            "book"
+        }
         FeedMessage::Instrument(_) => "instrument",
         FeedMessage::Status(_) => "status",
     };
@@ -80,6 +87,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone())),
         FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone())),
         FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone())),
+        FeedMessage::Book(b) => (b.venue.clone(), Some(b.symbol.clone())),
         FeedMessage::Status(s) => (s.venue.clone(), None),
     };
     Some(Arc::new(PreparedFrame {
@@ -87,6 +95,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         kind,
         venue,
         symbol,
+        channel: m.channel(),
     }))
 }
 
@@ -110,17 +119,45 @@ struct SubFilter {
     venue: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
+    /// The wire `channel_id` — the competition, not the arm. Arm identity is deliberately not
+    /// client-selectable: exactly one arbitrated book per market reaches the wire.
+    #[serde(default)]
+    channel: Option<u32>,
+    /// Message `type` (`quote`/`trade`/`book`/...). Named `msg_type` in Rust because `type` is a
+    /// keyword; the wire name is `type`.
+    #[serde(rename = "type", default)]
+    msg_type: Option<String>,
 }
 
 impl SubFilter {
-    fn matches(&self, venue: &str, symbol: &str) -> bool {
+    /// The single match path. `symbol`/`channel` are `None` for a venue-level message (today only
+    /// `status`), and a `None` on the *message* side satisfies a filter on that dimension — a
+    /// venue-level message is about the whole venue, so a symbol- or channel-scoped subscriber must
+    /// still receive it. A filter dimension the message *does* carry is matched normally.
+    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u32>, kind: &str) -> bool {
         // Venue codes are registry identifiers, not free text - match case-insensitively so a
-        // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol
-        // stays an exact match (venues name symbols precisely, e.g. `SOL-PERP`).
+        // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol and
+        // type stay exact (venues name symbols precisely; types are a closed protocol set).
         self.venue
             .as_deref()
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
-            && self.symbol.as_deref().is_none_or(|s| s == symbol)
+            // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
+            // one type asked for that type. Filters are a union, so wanting books plus definitions is
+            // two subscriptions. `venue`/`symbol`/`channel` below are *scope* selectors — which
+            // markets — and those do carve out messages that aren't about one market.
+            && self.msg_type.as_deref().is_none_or(|t| t == kind)
+            && match symbol {
+                None => true,
+                Some(s) => self.symbol.as_deref().is_none_or(|f| f == s),
+            }
+            && match channel {
+                // `instrument` is infrastructure, not market data: precision must arrive before
+                // price, so it passes an explicit channel filter the way a venue-level message
+                // does. The carve-out is deliberately just this one kind on this one dimension —
+                // widening it would make `{"channel":2}` a firehose of quotes.
+                None => self.channel.is_none() || symbol.is_none() || kind == "instrument",
+                Some(c) => self.channel.is_none_or(|f| f == c),
+            }
     }
 }
 
@@ -247,6 +284,58 @@ fn text(value: serde_json::Value) -> WsMessage {
     WsMessage::Text(value.to_string().into())
 }
 
+/// Replay current full state matching `subs` (empty = everything): instrument definitions first so
+/// precision is known before any book, then the latest `depth` per `(venue, symbol)`.
+///
+/// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
+/// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
+/// state, so the overlap a connect-then-subscribe client sees is harmless.
+async fn replay_scoped<W>(
+    write: &mut W,
+    instruments: &InstrumentSnapshot,
+    depth: &DepthSnapshot,
+    subs: &[SubFilter],
+) -> Result<()>
+where
+    W: SinkExt<WsMessage> + Unpin,
+    <W as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    // `channel: None` is correct for every kind replayed here; a channel-bearing kind (`book`) must
+    // pass its own channel or a `{"channel":N}` client silently gets no bootstrap.
+    let pass = |venue: &str, symbol: &str, kind: &str| {
+        subs.is_empty()
+            || subs
+                .iter()
+                .any(|f| f.matches(venue, Some(symbol), None, kind))
+    };
+    // Both locks are taken and released before any `await`: a `std::sync::MutexGuard` held across an
+    // await point does not compile here, and would be a latency bug regardless.
+    let snapshot: Vec<FeedMessage> = {
+        let guard = crate::model::lock(instruments);
+        guard
+            .values()
+            .filter(|i| pass(&i.venue, &i.symbol, "instrument"))
+            .cloned()
+            .map(FeedMessage::Instrument)
+            .collect()
+    };
+    let books: Vec<FeedMessage> = {
+        let guard = crate::model::lock(depth);
+        guard
+            .values()
+            .filter(|d| pass(&d.venue, &d.symbol, "depth"))
+            .cloned()
+            .map(FeedMessage::Depth)
+            .collect()
+    };
+    for m in snapshot.into_iter().chain(books) {
+        write
+            .send(WsMessage::Text(serde_json::to_string(&m)?.into()))
+            .await?;
+    }
+    Ok(())
+}
+
 async fn serve_client(
     stream: TcpStream,
     mut rx: broadcast::Receiver<Arc<PreparedFrame>>,
@@ -257,36 +346,15 @@ async fn serve_client(
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
-    // Replay current instrument definitions first so precision is known before any quote/depth.
-    let snapshot: Vec<FeedMessage> = {
-        let guard = instruments.lock().unwrap();
-        guard
-            .values()
-            .cloned()
-            .map(FeedMessage::Instrument)
-            .collect()
-    };
-    for inst in snapshot {
-        write
-            .send(WsMessage::Text(serde_json::to_string(&inst)?.into()))
-            .await?;
-    }
-
-    // Then replay the latest order-book `depth` per (venue, symbol): depth is full state, so one
-    // replayed snapshot bootstraps a mid-stream consumer immediately instead of waiting for the
-    // next periodic one. (Quotes/trades are not replayed - the next quote is itself full state.)
-    let depth_snapshot: Vec<FeedMessage> = {
-        let guard = depth.lock().unwrap();
-        guard.values().cloned().map(FeedMessage::Depth).collect()
-    };
-    for d in depth_snapshot {
-        write
-            .send(WsMessage::Text(serde_json::to_string(&d)?.into()))
-            .await?;
-    }
-
     // Per-client state. Empty `subs` = firehose (receive every venue/symbol).
     let mut subs: Vec<SubFilter> = Vec::new();
+
+    // Replay definitions (precision first) then the latest full-state `depth` per (venue, symbol),
+    // so a mid-stream consumer is bootstrapped immediately instead of waiting for the next periodic
+    // book. (Quotes/trades are not replayed - the next quote is itself full state.) `subs` is empty
+    // here, so this connect-time replay is unfiltered.
+    replay_scoped(&mut write, &instruments, &depth, &subs).await?;
+
     let mut last_seen = Instant::now();
     let mut win_start = Instant::now();
     let mut win_count: u32 = 0;
@@ -318,13 +386,23 @@ async fn serve_client(
                             if subs.len() >= cfg.max_subs {
                                 write.send(text(json!({"channel": "error", "error": "max subscriptions reached"}))).await?;
                             } else {
-                                if !subs.contains(&subscription) {
+                                let added = !subs.contains(&subscription);
+                                if added {
                                     subs.push(subscription.clone());
                                 }
                                 write.send(text(json!({
                                     "channel": "subscription_response", "method": "subscribe",
                                     "subscription": subscription,
                                 }))).await?;
+                                // Bootstrap the newly-added scope only: not all of `subs` (else a
+                                // client subscribing to ten symbols replays the first one ten times),
+                                // and nothing at all for a duplicate — a re-subscribe adds no scope,
+                                // and replaying anyway would let a client loop O(state) snapshot work
+                                // (taken under the mutex the ingest emit path shares) at the inbound
+                                // rate limit without ever reaching `max_subs`.
+                                if added {
+                                    replay_scoped(&mut write, &instruments, &depth, std::slice::from_ref(&subscription)).await?;
+                                }
                             }
                         }
                         Ok(ClientMsg::Unsubscribe { subscription }) => {
@@ -362,21 +440,17 @@ async fn serve_client(
             // upstream (see `serve`); here we only filter and write a cheap `Utf8Bytes` clone.
             msg = rx.recv() => match msg {
                 Ok(frame) => {
-                    let pass = match &frame.symbol {
-                        // A venue-level status has no symbol, so match it by venue alone - else a
-                        // symbol-scoped subscription (e.g. {venue,symbol:"SOL"}) would never see it.
-                        None => {
-                            subs.is_empty()
-                                || subs.iter().any(|f| {
-                                    f.venue
-                                        .as_deref()
-                                        .is_none_or(|v| v.eq_ignore_ascii_case(&frame.venue))
-                                })
-                        }
-                        Some(sym) => {
-                            subs.is_empty() || subs.iter().any(|f| f.matches(&frame.venue, sym))
-                        }
-                    };
+                    // One match path for every kind, venue-level included: a dimension added to
+                    // `matches` cannot silently exempt half the stream.
+                    let pass = subs.is_empty()
+                        || subs.iter().any(|f| {
+                            f.matches(
+                                &frame.venue,
+                                frame.symbol.as_deref(),
+                                frame.channel,
+                                frame.kind,
+                            )
+                        });
                     if pass {
                         metrics().ws_messages_sent.with_label_values(&[frame.kind]).inc();
                         metrics().ws_bytes_sent.with_label_values(&[frame.kind]).inc_by(frame.payload.len() as u64);
@@ -406,14 +480,11 @@ mod tests {
     use super::{serve, SubFilter, WsConfig, WsMessage};
     use crate::{
         metrics::metrics,
-        model::{FeedMessage, NormalizedQuote},
+        model::{FeedMessage, NormalizedInstrument, NormalizedQuote},
     };
 
-    fn filter(venue: Option<&str>, symbol: Option<&str>) -> SubFilter {
-        SubFilter {
-            venue: venue.map(str::to_string),
-            symbol: symbol.map(str::to_string),
-        }
+    fn filter(json: &str) -> SubFilter {
+        serde_json::from_str(json).expect("filter parses")
     }
 
     #[test]
@@ -421,17 +492,139 @@ mod tests {
         // The wire venue is `Phoenix`; a filter spelled any case must still select it (the
         // PROTOCOL.md example historically showed `PHOENIX`, which would silently drop the feed
         // under an exact match).
-        assert!(filter(Some("PHOENIX"), None).matches("Phoenix", "BTC"));
-        assert!(filter(Some("phoenix"), None).matches("Phoenix", "BTC"));
-        assert!(filter(Some("Phoenix"), None).matches("Phoenix", "BTC"));
-        assert!(!filter(Some("Hyperliquid"), None).matches("Phoenix", "BTC"));
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"phoenix"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"Phoenix"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+        assert!(!filter(r#"{"venue":"Hyperliquid"}"#).matches(
+            "Phoenix",
+            Some("BTC"),
+            None,
+            "quote"
+        ));
     }
 
     #[test]
     fn omitted_field_matches_any_symbol_exact() {
-        assert!(filter(None, None).matches("Phoenix", "BTC")); // {} = everything
-        assert!(filter(None, Some("BTC")).matches("Phoenix", "BTC"));
-        assert!(!filter(None, Some("btc")).matches("Phoenix", "BTC")); // symbol stays exact
+        assert!(filter("{}").matches("Phoenix", Some("BTC"), None, "quote")); // {} = everything
+        assert!(filter(r#"{"symbol":"BTC"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+        // symbol stays exact
+        assert!(!filter(r#"{"symbol":"btc"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+    }
+
+    /// The omitted-field-matches-anything rule must survive the two new dimensions.
+    #[test]
+    fn empty_filter_still_matches_everything() {
+        let f = filter("{}");
+        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(f.matches("Hyperliquid", Some("SOL"), None, "quote"));
+        assert!(f.matches("Lashay", None, None, "status"));
+    }
+
+    #[test]
+    fn type_filter_selects_one_message_kind() {
+        let f = filter(r#"{"type":"book"}"#);
+        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches("Lashay", Some("KXBTCPERP"), Some(2), "quote"));
+    }
+
+    /// `type` is matched exactly, like `symbol`: the wire values are a closed set the protocol
+    /// defines, so a near-miss is a client bug worth surfacing as "no data" rather than guessing.
+    #[test]
+    fn type_filter_is_exact() {
+        assert!(!filter(r#"{"type":"BOOK"}"#).matches("Lashay", Some("X"), None, "book"));
+    }
+
+    #[test]
+    fn channel_filter_selects_one_channel() {
+        let f = filter(r#"{"channel":2}"#);
+        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches("Lashay", Some("KXBTCPERP"), Some(1), "book"));
+    }
+
+    /// An explicit channel filter must not pass a message that carries no channel — otherwise
+    /// `{"channel":2}` would receive every quote on every venue.
+    #[test]
+    fn channel_filter_excludes_channelless_messages() {
+        assert!(!filter(r#"{"channel":2}"#).matches("Hyperliquid", Some("SOL"), None, "quote"));
+    }
+
+    /// ...except `instrument`, which carries no channel and never will until the processor supplies
+    /// one. Excluding it would leave a channel-scoped client unable to scale the books it just
+    /// subscribed to, breaking the protocol's precision-before-price promise.
+    #[test]
+    fn channel_filter_still_delivers_instrument_definitions() {
+        let f = filter(r#"{"channel":2}"#);
+        assert!(f.matches("Lashay", Some("KXBTCPERP"), None, "instrument"));
+        assert!(!f.matches("Lashay", Some("KXBTCPERP"), None, "quote"));
+        // The carve-out is on the channel dimension only — `symbol` still narrows instruments.
+        assert!(!filter(r#"{"channel":2,"symbol":"SOL"}"#).matches(
+            "Lashay",
+            Some("KXBTCPERP"),
+            None,
+            "instrument"
+        ));
+    }
+
+    /// `status` is venue-level: no symbol and no channel, so it matches on venue and type alone —
+    /// the same carve-out `symbol` already has, extended to `channel`. Without this a
+    /// `{"venue":"Lashay","channel":2}` subscriber would never learn its venue went down.
+    #[test]
+    fn status_matches_on_venue_despite_symbol_and_channel_filters() {
+        let f = filter(r#"{"venue":"Lashay","symbol":"KXBTCPERP","channel":2}"#);
+        assert!(f.matches("Lashay", None, None, "status"));
+        assert!(!f.matches("Hyperliquid", None, None, "status"));
+    }
+
+    /// ...but an explicit `type` filter still excludes it, so a consumer that asked for `book` only
+    /// does not get status frames it never requested.
+    #[test]
+    fn type_filter_still_excludes_status() {
+        assert!(!filter(r#"{"type":"book"}"#).matches("Lashay", None, None, "status"));
+    }
+
+    /// A `book` frame must carry its channel so an explicit channel filter can select it.
+    #[test]
+    fn prepare_populates_the_channel_for_book_only() {
+        use super::prepare;
+        use crate::model::{BookAction, BookChange, BookSide, NormalizedBook};
+        let b = FeedMessage::Book(NormalizedBook {
+            venue: "Lashay".into(),
+            symbol: "KXBTCPERP".into(),
+            channel: 2,
+            instrument_id: 41,
+            changes: vec![BookChange {
+                action: BookAction::Update,
+                side: BookSide::Bid,
+                price: 0.62,
+                size: 150.0,
+            }],
+            snapshot: false,
+            last: true,
+            source_ts_ns: 1,
+            recv_ts_ns: 2,
+            kernel_rx_ts_ns: 3,
+            ws_send_ts_ns: 0,
+        });
+        let f = prepare(&b).expect("serializes");
+        assert_eq!(f.kind, "book");
+        assert_eq!(f.channel, Some(2));
+        assert!(f.payload.contains(r#""ws_send_ts_ns":"#));
+        assert!(
+            !f.payload.contains(r#""ws_send_ts_ns":0"#),
+            "stamped, not left at 0"
+        );
+        // Every other kind carries no channel, which is what the filter's exclusion rule rests on.
+        assert_eq!(
+            prepare(&FeedMessage::Quote(sample_quote()))
+                .expect("serializes")
+                .channel,
+            None
+        );
+    }
+
+    #[test]
+    fn venue_stays_case_insensitive() {
+        assert!(filter(r#"{"venue":"lashay"}"#).matches("Lashay", Some("X"), None, "book"));
     }
 
     /// Poll `cond` until it holds, failing the test if it doesn't within ~2s. The metric updates we
@@ -596,6 +789,119 @@ mod tests {
         assert!(
             t1.contains("ws_send_ts_ns"),
             "quote must carry ws_send_ts_ns"
+        );
+
+        srv.abort();
+    }
+
+    /// A `subscribe` replays current state scoped to the filter just added, so a client that narrows
+    /// after connecting is bootstrapped for its new scope instead of waiting for the next event —
+    /// and only for that scope. `#[serial]` for the shared `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_replays_only_the_new_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+
+        let mut defs = HashMap::new();
+        for sym in ["SOL", "BTC"] {
+            let arc: Arc<str> = sym.into();
+            defs.insert(
+                (Arc::<str>::from("Hyperliquid"), arc.clone()),
+                NormalizedInstrument {
+                    venue: "Hyperliquid".into(),
+                    symbol: arc,
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                },
+            );
+        }
+        let instruments = Arc::new(Mutex::new(defs));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // The next text frame, skipping the server's heartbeat Pings.
+        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
+        where
+            S: futures_util::StreamExt<
+                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
+                > + Unpin,
+        {
+            timeout(within, async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                        Some(Ok(_)) => continue,
+                        other => panic!("stream ended: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .ok()
+        }
+
+        // Connect-time replay is unfiltered: both definitions arrive.
+        let mut connect_replay = Vec::new();
+        for _ in 0..2 {
+            connect_replay.push(
+                next_text(&mut ws, Duration::from_secs(2))
+                    .await
+                    .expect("replayed instrument"),
+            );
+        }
+        assert!(connect_replay.iter().any(|t| t.contains("\"SOL\"")));
+        assert!(connect_replay.iter().any(|t| t.contains("\"BTC\"")));
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"SOL"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // The ack, then a replay scoped to the filter just added: SOL only, nothing else.
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let replayed = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped replay frame");
+        assert!(replayed.contains("\"instrument\"") && replayed.contains("\"SOL\""));
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "BTC must not be replayed for a SOL subscription"
+        );
+
+        // A duplicate subscribe adds no scope, so it is acked and replays nothing — otherwise a
+        // client could loop full-state replays at the inbound rate limit without reaching max_subs.
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"SOL"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "a re-subscribe must not replay again"
         );
 
         srv.abort();

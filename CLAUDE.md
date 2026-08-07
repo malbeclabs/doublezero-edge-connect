@@ -290,17 +290,35 @@ Modules are grouped by role under `src/`:
   `Utf8Bytes` clone (so N clients cost one serialization, and `ws_send_ts_ns` is one instant shared by
   all consumers of a message — see PROTOCOL.md). With no clients connected the serializer skips the
   work. On connect it replays the instrument snapshot (precision first) **then the latest
-  `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Implements the
+  `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Replay is one
+  `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
+  scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
+  replaying every market. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
-  firehose), app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
+  firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
+  `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
+  (`status`) paths call, so a new dimension can't silently exempt half the stream; a channelless
+  message is excluded by an explicit `channel` filter, `instrument` excepted (precision must reach a
+  channel-scoped client). Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
-  `NormalizedDepth`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the `now_ns()` /
-  `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
-  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other.
+  `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
+  `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
+  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other; `BookSnapshot` is keyed by
+  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label and
+  collides across markets, so it is not an identity.
+  `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
+  absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
+  reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`
+  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookSnapshot`
+  holds a `BookAccumulator` per market rather than the last message, because an incremental product's
+  last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
+  the full level set on demand. It commits per *logical event* (buffering until `last`), since
+  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book. Nothing emits `book` yet (no processor, no `FEEDS` row); the arbiter's
+  `Book` arm is a **temporary** undeduped passthrough, replaced by the authority gate.
 
 ## Conventions and gotchas
 
