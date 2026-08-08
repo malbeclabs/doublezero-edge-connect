@@ -12,7 +12,7 @@ sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it as full-state `depth`), and **Market-by-Price** (magic `0x4442`; the bridge
 reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
-row selects it but stays inert until the group rename lands). Each feed maps to one venue. The
+row selects it, on a group that is live). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
 WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
@@ -131,9 +131,11 @@ Modules are grouped by role under `src/`:
   venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
   ride separate groups with separate codes. The two **Lashay** perps rows (`lashay-1` TOB
   `233.84.178.3:7576/7577`, `lashay-2` MBP `233.84.178.4:31000/41000/51000`, both `Sticky`, both
-  claiming the tape) are exactly that case; ⚠️ they are **inert until the upstream group rename
-  lands** — `doublezero status` reports no matching code, so the reconciler never activates them and
-  there is no error to see.
+  claiming the tape) are exactly that case. Both groups are **live and activated** (testnet and
+  mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
+  that does not match its live group fails **silently** — no warning, no failed bind, just a
+  permanently-zero `dz_receiver_up`; `feeds::tests::lashay_rows_match_the_deployment` pins both rows
+  against the deployment so a transcription slip fails the build instead.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
@@ -280,8 +282,8 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the venue's eight
   admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
-  non-negative). Nothing exercises this live yet: the only `FEEDS` row of that kind (`lashay-2`) stays
-  inert until the group rename lands, so no running process behaves differently.
+  non-negative). The only `FEEDS` row of that kind is `lashay-2`, whose group is live, so these series
+  populate on any host subscribed to it — and report nothing on a host that is not.
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -363,8 +365,8 @@ Modules are grouped by role under `src/`:
   (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
   against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
   a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
-  stay offset-test-only. `FeedKind::MarketByPrice` decodes it; the `lashay-2` row selects it but
-  stays inert until the group rename lands. It is the one codec that enforces **exact** body-length
+  stay offset-test-only — and the `lashay-2` group is live, so those four now decode against real
+  traffic for the first time. It is the one codec that enforces **exact** body-length
   equality per type rather than bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's,
   so a lenient decode would
   read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
@@ -430,8 +432,7 @@ Modules are grouped by role under `src/`:
   it is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the
   single-arm
   authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-arm
-  accumulators; `MbpProcessor` emits `book`, and the `lashay-2` row selects it but stays inert
-  until the group rename lands.
+  accumulators; `MbpProcessor` emits `book`, and the `lashay-2` row selects it on a live group.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.

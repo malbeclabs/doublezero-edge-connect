@@ -391,10 +391,10 @@ pub const FEEDS: &[Feed] = &[
     // market-by-price book. Both claim the tape — a host holding only `lashay-2` must still serve
     // `trade` — and which of them prints is the reconciler's runtime decision (see `Feed::emit_trades`).
     //
-    // ⚠️ These `code` values are the *intended* names. The live deployment still carries the old ones
-    // until the group rename lands, so until then `doublezero status --json` reports no match, the
-    // reconciler never activates these rows, and the failure mode is silent: no warning, no failed
-    // bind, just a receiver that never starts.
+    // ⚠️ A `code` that does not match the live group fails **silently**: `doublezero status --json`
+    // reports no match, the reconciler never activates the row, and there is no warning and no failed
+    // bind — just a receiver that never starts. Both groups are live on testnet and mainnet as of
+    // 2026-08-07; a permanently-zero `dz_receiver_up` here means a transcription slip, not a quiet feed.
     //
     // One `FeedPublisher` per row: the two arms share a port block and are distinguished only by
     // datagram source IP (the shared-block model in `FeedPublisher`'s docs). The market-by-price
@@ -690,10 +690,10 @@ mod tests {
         }
     }
 
-    /// The Lashay rows are **inert until the upstream group rename lands**: `doublezero status`
-    /// reports no matching code, so the reconciler never activates them and the only symptom of a
-    /// wrong value here would be a permanently-zero `dz_receiver_up`. Pin the deployment exactly so
-    /// a transcription slip fails the build instead.
+    /// Both Lashay groups are live (testnet and mainnet, 2026-08-07), so a wrong value here activates
+    /// nothing and says nothing: `doublezero status` reports no matching code, the reconciler never
+    /// spawns the receiver, and the only symptom is a permanently-zero `dz_receiver_up`. Pin the
+    /// deployment exactly so a transcription slip fails the build instead.
     #[test]
     fn lashay_rows_match_the_deployment() {
         let row = |kind| FEEDS.iter().find(|f| f.venue == "Lashay" && f.kind == kind);

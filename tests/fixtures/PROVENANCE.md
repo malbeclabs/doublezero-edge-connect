@@ -361,16 +361,29 @@ protocol's intent. All three are publisher-side, not decoder-side.
    `EndOfSession` have. Three are exceptional events and a quiet window explaining their absence is
    expected; `BatchBoundary` is not, so confirm whether the publisher emits it at all.
 
-### Unmeasured: does either perps top-of-book arm stamp `trade_id == 0`?
+### Measured: the two perps arms use disjoint `trade_id` conventions
 
-Open. `examples/pcap2frames.rs --protocol tob` now reports `zero_id_trades=` alongside `trades=`, and
-`--src` already selects one publisher, so one run per source IP against a perps top-of-book capture
-answers it per arm: always, never, or sometimes. Record the split here when it is run.
+The arms split cleanly, and identically on both protocols. Measured 2026-08-07 with
+`examples/pcap2frames.rs`, which reports `zero_id_trades=` alongside `trades=`; `--src` selects one
+publisher, so one run per source IP gives the per-arm answer.
 
-It answers only that. Whether the two arms stamp *different real* ids for the same fill needs
-content-matched id sets across arms and is not measured by this. The tape gate is id-independent for
-exactly that reason, so the number does not gate the design either way — it is on the record so a
-later argument to simplify the gate is a decision rather than a guess.
+| Arm | Protocol | trades | `zero_id_trades` |
+|---|---|---|---|
+| `148.51.121.69` | top-of-book | 102 | 102 (always) |
+| `148.51.120.6`  | top-of-book | 65  | 0 (never) |
+| `148.51.121.69` | market-by-price | 102 | 102 (always) |
+| `148.51.120.6`  | market-by-price | 65  | 0 (never) |
+
+**This is why the tape gate is `trade_id`-independent rather than a sentinel latch.** One arm's prints
+bypass the dedup window (the `0` sentinel means "no venue trade id"); the peer's carry real ids and
+route to `WindowedDedup`. The two copies of one fill therefore never meet in either mechanism, so a
+sentinel-only gate would collapse nothing and every print would double.
+
+Two limits on what this shows. The captures do not overlap in time, so this is disjoint id
+conventions on a shared group, not a captured duplicate — a simultaneous two-arm capture would
+demonstrate it outright. And it does not establish whether the two arms stamp *different real* ids
+for the same fill; that needs content-matched id sets across arms and is not measured here. The
+id-independent gate covers that case regardless.
 
 Also worth knowing: the two arms' captures do **not** overlap in time (the older feed's are ~16s
 apart), so no two-arm interleaved fixture can be cut from them — a future capture should run both

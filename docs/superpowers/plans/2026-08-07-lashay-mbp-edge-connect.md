@@ -14,31 +14,57 @@
 
 ## Progress
 
-**Status: not started.** Nothing below has been implemented.
+**Status: COMPLETE. Tasks 1–14 are done and Task 14 Step 7, the live verification, ran on 2026-08-08** against both live perps groups on mainnet-beta. Every criterion passed, including the runtime tape handover; the book was validated against `marketbyprice-parser` (12/13 markets byte-exact, the 13th explained); and the content-dedup open question is answered — `Sticky` is permanent, not an interim. One defect surfaced and was fixed on the branch (`7ccdcf4`, the orphan/declined counter split). See *Step 7 results* under Task 14 for the numbers and the two upstream items it raised.
+
+**The rows are no longer inert.** `doublezero multicast group list` shows `lashay-1` (`233.84.178.3`) and `lashay-2` (`233.84.178.4`) **activated on testnet and mainnet**, 2 publishers and 3 subscribers each, matching the shipped `FEEDS` rows exactly on both code and group. The sports pair is live too (`lashay-3` `233.84.178.17`, `lashay-4` `233.84.178.20`), still out of scope. So this branch is **not** behaviour-neutral: a host subscribed to either code begins ingesting a new venue on upgrade, serves `book` on the WebSocket, and runs the tape gate on real prints. Three things that were theoretical while the rows were inert are now live exposure, and Step 7 is what closes them — the two residual limits on the tape gate (a forged source printing first holds the tape until it goes quiet; the gate is venue-wide, so genuinely *sharded* arms would lose the non-serving arm's fills), and the four `codec_mbp` message types with no fixture (`BookClear`, `InstrumentReset`, `BatchBoundary`, `EndOfSession`) meeting real traffic for the first time.
+
+**What Task 13's ⚠️ AMENDED block turned into, because the shipped shape is not what it specified.** The block called for routing `Trade` through the same venue authority `book` uses. That is unbuildable as written: `StickyAuthority::admit` is the only thing that creates a `VenueState`, and it is reached only from the `book` path, so on a top-of-book-only host `venue_leader()` is `None` forever — a gate on it either drops the entire tape or leaves the double-print. What shipped instead is a **per-venue tape leader** in `arbiter.rs` (`Sticky` venues only): first arm to print leads, an arm the authority *tracks* displaces one it does not, the book-elected arm takes over once per election, and a silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS`. It reads `venue_leader()` but never calls `admit` — trades follow the election and must not drive it, since `admit` mutates the silence clock and `opened_tick`, which are book state.
+
+**The gate is deliberately `trade_id`-independent, and that is now measured rather than assumed.** Across all four perps captures the two arms split cleanly: `148.51.121.69` stamps the `trade_id == 0` sentinel on 100% of its prints (102/102 top-of-book, 102/102 market-by-price) and `148.51.120.6` on 0% (0/65 and 0/65). A sentinel-only gate would therefore collapse nothing — one arm's prints bypass the dedup window while its peer's carry real ids and route to `WindowedDedup`, so the two copies of a fill never meet. Note the captures do not overlap in time, so this is disjoint id conventions on a shared group rather than a captured duplicate.
+
+**Wire facts the fixture capture settled, which later tasks need.** Read `tests/fixtures/PROVENANCE.md` for the full record; these are the ones that change a decision:
+
+- **The market-by-price deployment is `Channel ID`-sharded** — the live sports feed runs three channels on one group (10/63/120), each an independent state machine with its own snapshot cycle, with zero instrument-id overlap between them. Anything tracking an open snapshot group, or a per-instrument sequence, must key **per channel**; a port-wide slot mis-attributes every level of an interleaved channel (spec §"Scoped to the channel, not to the port"). Task 11's `MbpProcessor` inherits this directly.
+- **But the older perps feed's two arms stamp *different* `Channel ID`s (1 and 2) for an identical instrument set.** Task 4's `MarketKey = (venue, channel_id, instrument_id)` deliberately excludes the arm so both arms contest one key — with per-arm channel ids they never would. Treated as a defect of a publisher being retired (raised with its author 2026-08-07), so **Task 4's key stands as planned**; re-check against the next capture before building Task 12 on it.
+- **`instrument_id` is becoming a hash of the full ticker** (publisher-side decision, 2026-08-07), because independent publishers otherwise assign different ids for the same market and nothing cross-arm can key on them. Three things follow. **(a) Do not assume the id is small or dense** — captured ids today are sequential `1..1239`, a ticker hash is a sparse `u32` across the whole range, so any `Vec` indexed by id, any `1..N` assumption, or any cache sized from the instrument count breaks the moment it ships. `HashMap` keying is fine, and this reaches Task 11 *now*. **(b) Cross-arm id agreement is not yet a property you can rely on** — it was measured identical on both *perps* arms (13/13), but the sports feed had only one publisher capturing, and the whole point of hashing is that agreement is not currently guaranteed. **(c) A `u32` hash collides at this venue's scale** — birthday bound gives ~1% at 10,000 markets and near-certainty by 100,000, against 1,239 seen in one 39-second window of one channel set. An *id* collision is worse than the symbol collision it fixes, because the id is what everything keys on. Raised with the publisher; a `u64` field or explicit collision detection is the ask.
+- **Symbols overflow the 16-byte wire field on the sharded feed**, and one truncation collides across two instrument ids. `InstrumentSnapshot`/`DepthSnapshot` are keyed `(venue, symbol)`, so this is a live collision risk for Tasks 11–12, not a cosmetic one.
+- **Group addresses, ports and `source_id`,** which the *Blocking open question* below was missing half of: market-by-price `233.84.178.4` (perps) / `233.84.178.20` (sports), top-of-book `233.84.178.3` (perps) / `233.84.178.17` (sports). Perps ports `31000`/`41000`/`51000` mktdata/refdata/snapshot and top-of-book `7576`/`7577`; sports encodes the channel in the port (`33010`/`43010`/`53010` for channel 10, etc.). Every frame carries `source_id = 3`, which `codec::source_name` does not map — Task 14 adds it. **Still missing: the DoubleZero group *codes* for `Feed.code`**, which is the other half of that question and the part that actually blocks Task 14.
 
 | Task | State |
 |---|---|
-| 1 — `trade_id == 0` bypass | not started |
-| 2 — per-publisher `RefDataState` | not started |
-| 3 — arbitration mode plumbing | not started |
-| 4 — `StickyAuthority` | not started |
-| 5 — re-election sampling | not started |
-| 6 — `channel`/`type` filters | not started |
-| 7 — `codec_mbp` frame walk | not started |
-| 8 — `codec_mbp` price types | not started |
-| 9 — `PriceBook` | not started |
-| 10 — `book` wire message | not started |
-| 11 — `MbpProcessor` | not started |
-| 12 — book authority gate | not started |
-| 13 — runtime tape ownership | not started |
-| 14 — Lashay feed rows | **blocked** (see *Blocking open question*) |
+| 1 — `trade_id == 0` bypass | **done** (`aafc871`, `2eeb93b`; review fixes `b2e9264`, `4d19da6`) |
+| 2 — per-publisher `RefDataState` | **done** (`a459c36`, `4f59d78`; review fix `23304c6`) |
+| 3 — arbitration mode plumbing | **done** (`8ad3377`; review fix `4d19da6`) |
+| 4 — `StickyAuthority` | **done, then amended** (`5b2d045`, `3286b1c`, rescoped in `6d004b4`) — authority is per **arm** for speed and silence, per **market** for health only. **Read Task 4's ⚠️ AMENDED block before building Task 12.** |
+| 5 — re-election sampling | **done, then amended** (`4229f4e`, rebuilt in `6d004b4`) — the specified statistic was **inert**; replaced by `ingest::arm_race`, a cross-arm trade matcher on our own receive clock, pooled per arm. **Read Task 5's ⚠️ AMENDED block.** |
+| 6 — `channel`/`type` filters | **done** (`bb75386`, `35c0c20`; PR #108) |
+| 7 — `codec_mbp` frame walk | **done** (`d12ff44`, `f89e68b`; review fix `75ce041`) |
+| 8 — `codec_mbp` price types | **done**, all steps (`1b003a3`, `f89e68b`; fixtures + real-frame tests in the Step 9 commit) |
+| 9 — `PriceBook` | **done** (`0f018cb`, `cc69ea6`, `e6bccee`; review fixes `503b6a6`, `3bf9a09`) |
+| 10 — `book` wire message | **done** (`294ac74`, `35c0c20`; PR #108) |
+| 11 — `MbpProcessor` | **done** (`4b9593d`, `523bbe2`; PR #111) |
+| 12 — book authority gate | **done** (`6934461`; PR #112) — the arbitration is **wired end to end**: `set_book_health` from `processor.rs`, and `on_trade` -> `observe_matched_lead` -> `close_window` from the arbiter |
+| 13 — runtime tape ownership | **done** (`f683a8e` rows, `ff486f4` arms, `c9fc522` review fixes; PR #113) — both halves: `reconcile::tape_owners` picks the owning row, `arbiter`'s per-venue tape leader picks the arm within it. Ownership is ordered **liveness before rank**, so a subscribed-but-dead row cannot hold the tape while its peer decodes prints and drops them |
+| 14 — Lashay feed rows | **done, and the groups are live** (`5a8bc78`; PR #113) — `lashay-1` TOB `233.84.178.3:7576/7577`, `lashay-2` MBP `233.84.178.4:31000/41000/51000`, both `Sticky`, both claiming the tape; codes and groups verified against `doublezero multicast group list` (activated, 2 publishers each). **Step 7 (live verification) ran 2026-08-08 and passed** — see *Step 7 results* in that task |
+
+**Where the work lives.** All of it is on the single long-lived branch **`bdz/lashay-mbp`**, not one branch per task — see the amended bullet below. It was first built as four stacked-in-name-only PRs (#100–#103, all off `main`), reviewed as a set, then combined and closed in favour of this branch.
+
+**What the set review changed, and what a later task inherits from it.** Six fixes landed on top of the six tasks. Three matter to whoever picks this up:
+
+- `pricebook` no longer restates the wire enums — it imports `SIDE_*`/`CLEAR_SIDE_*`/`SCOPE_*` from `codec_mbp`. Task 11 passes a decoded `side` byte straight through, and two copies that drifted would swap bids and asks with every sequence check still passing. **Do not reintroduce a local copy.**
+- `PriceBook`'s level-cap overflow returns `DeltaOutcome::Overflow`, not `Gap`; the two leave different `status` behind. Task 11's metrics must not merge them.
+- Task 1's zero-id tape owner hands over after 5s of silence rather than latching forever, so `dz_trades_no_id_conflict_total` still means *concurrent* double-printing once Tasks 4 and 13 start moving tape ownership at runtime.
+
+**Tasks 4 and 5 shipped and were then restructured — Task 12 builds on the amended shape, not on what those sections originally specified.** Both carry a ⚠️ AMENDED block at the top; Task 4's ends with an explicit five-point *Task 12 contract changes* list. In one line each: authority is elected **per arm** for speed and silence and only overridden **per market** for health (per-market silence was flapping on every quiet market — 93 of 1,239 sports instruments saw any update at all in 39 s), and the speed statistic is a **cross-arm trade matcher on our own receive clock** because the originally specified one was provably inert.
+
+Two tests are correct now and are **meant** to fail later; both say so in their doc comments. `feeds::tests::at_most_one_trade_emitting_row_per_venue` is superseded by Task 13's runtime assertion, and `existing_venues_are_coordinated` excludes `Lashay` so Task 14's `Sticky` rows don't read as a regression.
 
 **How to hand this off, and how to pick it up.** This file is the working record, so keep it current as you go rather than at the end:
 
 - Tick each `- [ ]` to `- [x]` as its step lands, and update the row above (`not started` → `in progress` → `done`, with the commit SHA once a task's final commit exists).
 - Commit the plan update **with** the code it describes, in the same commit. A ticked box with no commit behind it is worse than an unticked one.
 - If you stop mid-task, add a line under that task's row saying which step you stopped at and anything you learned that the plan does not already say — especially a step that turned out wrong.
-- Tasks are sequential: each branches off its predecessor's tip (Task 1 off `main`). Picking up means checking out the last completed branch and starting the next task from it.
+- ~~Tasks are sequential: each branches off its predecessor's tip (Task 1 off `main`).~~ **Amended after Tasks 1–3/7–9 shipped:** the whole feature is built on **`bdz/lashay-mbp`**, so there is no PR gate between tasks. Start the next task from that branch's tip; a delegated build takes its own branch off it and merges back. The task *order* is still a dependency order — a later task will not compile without its predecessors — and Tasks 4–6 are unbuilt, so anything depending on `authority` (Task 12, and the `Sticky` half of the arbiter) is still blocked on them.
 - Task 14 is the only blocked one and it is last, so a pickup never has to wait on it.
 
 ---
@@ -49,7 +75,7 @@ Every task's requirements implicitly include this section.
 
 - **The venue is `Lashay`** — in source, comments, tests, fixture names, file names, branch names, commit messages, and PR titles and bodies. `Lashay` names the venue this bridge ingests; it is never part of an *identifier* that belongs to something else. Refer to external packages, crates, services and multicast group codes by their own names, and describe them rather than renaming them. (In prose, `Lashay-shaped` and the like are ordinary English — the rule is about identifiers.)
 - **Never credit Claude or any AI.** No `Co-Authored-By`, no "Generated with Claude Code", no AI-attribution comments.
-- **One branch per task, each off its predecessor's tip** (Task 1 off `main`). The order is a dependency order, not a preference — a later task will not compile without its predecessors.
+- **Everything lands on `bdz/lashay-mbp`**, the long-lived feature branch, so the feature is reviewed once when it is whole rather than task by task. Work on that branch directly, or on a short-lived branch off its tip that merges back. (This replaces the original "one branch per task off its predecessor's tip" rule; the four task branches that produced Tasks 1–3/7–9 were combined into it.) The task order is still a dependency order, not a preference — a later task will not compile without its predecessors.
 - **This software targets Linux and is never validated on a macOS or Windows host.** CI runs on Linux and host runs diverge (rustfmt nightly availability, workspace feature unification, target-specific `cfg` gates), so run `cargo test` / `clippy` / `fmt` in whatever Linux environment you build in.
 - **Two sibling checkouts are referenced below** as `<edge-feed-spec>` (`malbeclabs/edge-feed-spec` — the wire spec) and `<edge-multicast-ref>` (`malbeclabs/edge-multicast-ref` — the reference Go decoders this plan validates against). Substitute wherever they sit locally.
 - **PROTOCOL.md is the contract.** Any wire change must keep the forward-compat rule (consumers ignore unknown types and fields) and be reflected there in the same commit.
@@ -73,6 +99,8 @@ The `2026-08-05-edge-connect-multi-publisher-ports.md` plan is **fully executed*
 Also inherited from that work and load-bearing here: `FeedPublisher` has **no `name` field** — a publisher's identity is its base port (`FeedPublisher::base_port() -> u16`), and the CLI flag is `--publisher-port`, not `--publisher`.
 
 **Scope of this plan:** the design's §7 PRs **1–6**. PR 7 (migrating Hyperliquid MBO to the incremental output as a true `L3_MBO` book, and deleting `depth`/`DEPTH_LEVELS`) is explicitly gated on its own design doc (§2.2) and is **not** in this plan. Consequence: `depth` and `book` coexist on the wire when this plan finishes — MBP emits `book`, MBO keeps emitting `depth`.
+
+**Re-keying the symbol-keyed snapshots on `instrument_id`** — added to this list 2026-08-07, and the one item here with a real correctness motive rather than tidiness. `InstrumentSnapshot` and `DepthSnapshot` are keyed `(venue, symbol)`, but the wire `Symbol` is `char[16]` and the spec explicitly says "Human-readable label. Truncate if needed", while `Instrument ID` is the identifier. On the live sports feed 2,312 definitions overflow the field and **two different instruments on the same channel truncate to `EAVE-27JAN01-YES`**, so their snapshot entries clobber each other. Keying on `channel_id` as well does *not* fix it — that collision is within one channel — so the fix is `(venue, instrument_id)` with the symbol as a display label. Deliberately not folded into Task 11: it ripples into `upsert_instrument` and both public feeders, which genuinely look markets up by symbol because their public APIs have no instrument id, and that is a three-venue decision rather than a processor change. **Precondition, and it is being met:** the publisher is moving `instrument_id` to a **hash of the full ticker** so that independent publishers agree on it, which is what makes it a usable shared key. Two consequences that reach the tasks in this plan — see *Wire facts* in the Progress section.
 
 Also out of scope, tracked separately: binding the seventh Hyperliquid publisher (`9501/9502`, `10501/10502/10503` — index 5, absent from `FEEDS` and pinned as `6` by `feeds.rs:413` and `main.rs:552`); `MidpointProcessor`'s single un-keyed `SeqTracker` (`processor.rs:392`); adding `channel_id` to the MBO book key (degenerate today — HL is all channel 0); **venue-compatible output sinks** (design §7 PR 8, added 2026-08-07) — the sink for Lashay depends on this plan's Task 12 and nothing else, so it becomes reachable the moment this plan lands, while the Hyperliquid `l2Book`/`l4Book` sinks wait on PR 7.
 
@@ -112,7 +140,11 @@ Both rows therefore set `emit_trades: true`, and ownership becomes a **runtime**
 
 ---
 
-## Blocking open question — must be answered before Task 14
+## Blocking open question — RESOLVED via option (1)
+
+**Answered.** The groups are being renamed upstream, and Task 14 shipped both codes as literals: `lashay-1` (perps top-of-book, `233.84.178.3`, ports `7576`/`7577`) and `lashay-2` (perps market-by-price, `233.84.178.4`, ports `31000`/`41000`/`51000`). The second unknown below — the top-of-book group address — was answered by the 2026-08-07 captures. Out of scope but recorded so it is not re-derived: `lashay-3` is sports top-of-book (`233.84.178.17`) and `lashay-4` sports market-by-price (`233.84.178.20`).
+
+**The rename has landed.** All four codes are activated on testnet and mainnet as of 2026-08-07 and match the shipped rows, so nothing is gated on it any more and Task 14 Step 7 is runnable. The residual hazard is the one this question always carried: a `code` that does not match its live group activates nothing and reports nothing, so it is pinned by `feeds::tests::lashay_rows_match_the_deployment` rather than left to a live check. The original question and its options are kept below as the record of the decision.
 
 `Feed.code` is the DoubleZero multicast group code the reconciler matches against `doublezero status --json`. **Neither** of the two live Lashay group codes follows the venue-neutral naming every code in `FEEDS` uses today (`tiredsolid`, `scottsdale`), so neither can go in as written. The design sidesteps it ("Both group codes come from the deployment config; this doc does not restate them") but `Feed.code` is a `&'static str` compiled into the binary — there is no deployment config path today.
 
@@ -172,11 +204,11 @@ Task 14 assumes **(1)** and takes both neutral codes and the group address as pa
 - Consumes: nothing from earlier tasks.
 - Produces: `Metrics::trades_no_id: IntCounterVec` (`dz_trades_no_id_total{venue}`); the `FEEDS` invariant "at most one `emit_trades: true` row per venue" — true for the tree this ships into, and generalized to **at most one tape emitter per venue at any moment** by Task 13, which is the form the bypass actually depends on.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off `main`.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to the `mod tests` block at the bottom of `src/ingest/arbiter.rs`. It drives the real `Arbiter::emit`, not `WindowedDedup` directly, because the bypass lives in the `emit` arm.
 
@@ -234,7 +266,7 @@ Add to the `mod tests` block at the bottom of `src/ingest/arbiter.rs`. It drives
 
 `NormalizedTrade` and `Side` need importing in the test module — the existing `use crate::model::{NormalizedQuote, Side};` at `arbiter.rs:1011` becomes `use crate::model::{NormalizedQuote, NormalizedTrade, Side};`.
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 ```bash
 cargo test --lib zero_trade_id_bypasses_the_window
@@ -242,7 +274,7 @@ cargo test --lib zero_trade_id_bypasses_the_window
 
 Expected: FAIL — `assertion \`left == right\` failed: every zero-id print must be emitted; left: 1, right: 5`.
 
-- [ ] **Step 4: Add the metric**
+- [x] **Step 4: Add the metric**
 
 In `src/metrics.rs`, add the field next to `trades_dropped` (`:99`):
 
@@ -261,7 +293,7 @@ and the registration next to `quotes_no_source_ts` (`:435-440`):
             ),
 ```
 
-- [ ] **Step 5: Pre-resolve the metric child**
+- [x] **Step 5: Pre-resolve the metric child**
 
 In `src/ingest/arbiter.rs`, add to `struct VenueMetrics` next to `trades_dropped` (`:516`):
 
@@ -275,7 +307,7 @@ and to `VenueMetrics::new` next to `trades_dropped` (`:565`):
             trades_no_id: m.trades_no_id.with_label_values(&[venue]),
 ```
 
-- [ ] **Step 6: Implement the bypass**
+- [x] **Step 6: Implement the bypass**
 
 Replace the head of the `FeedMessage::Trade(t)` arm (`arbiter.rs:752-754`) so the sentinel short-circuits before the window:
 
@@ -302,7 +334,7 @@ Replace the head of the `FeedMessage::Trade(t)` arm (`arbiter.rs:752-754`) so th
 
 The rest of the arm is unchanged.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib trade
@@ -310,7 +342,7 @@ cargo test --lib trade
 
 Expected: PASS, including the pre-existing `trade_new_admitted_repeat_dropped` and `trade_keys_independent_and_window_evicts`.
 
-- [ ] **Step 8: Pin the invariant the bypass depends on**
+- [x] **Step 8: Pin the invariant the bypass depends on**
 
 Add to `mod tests` in `src/ingest/feeds.rs`:
 
@@ -338,7 +370,7 @@ Add to `mod tests` in `src/ingest/feeds.rs`:
     }
 ```
 
-- [ ] **Step 9: Run the full suite and clippy**
+- [x] **Step 9: Run the full suite and clippy**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -346,7 +378,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 10: Document**
+- [x] **Step 10: Document**
 
 Add to `docs/metrics.md` alongside the other arbiter counters:
 
@@ -360,7 +392,7 @@ Add to `CHANGELOG.md` under Unreleased → Fixed:
 - Trades stamped `trade_id == 0` (the "no venue trade id" sentinel, emitted by FIX-sourced publishers) now bypass the cross-source dedup window instead of being keyed on it. Previously the second and every later such print was discarded as a same-publisher duplicate and `0` never aged out of the window, collapsing the tape to a single print per `(venue, symbol)` for the process's lifetime.
 ```
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add -A
@@ -383,11 +415,11 @@ Not currently reachable — one receiver task binds one port block, so each `Ref
 - Consumes: nothing.
 - Produces: the private helper pattern `fn state_for(&mut self, publisher: IpAddr) -> &mut RefDataState<D>` on each processor, plus `MAX_PUBLISHERS`-bounded eviction. `MbpProcessor` (Task 10) copies this shape.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 1's final commit.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to `mod tests` in `src/ingest/processor.rs`. It drives `TobProcessor` with two source IPs and bumps only one's `reset_count`.
 
@@ -430,7 +462,7 @@ Add to `mod tests` in `src/ingest/processor.rs`. It drives `TobProcessor` with t
 
 `state_for` must be visible to the test module — declare it `pub(crate)` or leave it private (the test module is a child of `processor`, so private is fine). `InstrumentDefinition` is `crate::ingest::codec::InstrumentDefinition`; check the existing test-module imports and extend them.
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 ```bash
 cargo test --lib refdata_reset_is_scoped
@@ -438,7 +470,7 @@ cargo test --lib refdata_reset_is_scoped
 
 Expected: FAIL to compile — `no method named 'state_for' found for struct 'TobProcessor'`.
 
-- [ ] **Step 4: Add the shared per-publisher map helper**
+- [x] **Step 4: Add the shared per-publisher map helper**
 
 Add near `MAX_PUBLISHERS` (`processor.rs:106`) — one generic helper all three processors use, so the eviction rule is written once:
 
@@ -476,7 +508,7 @@ impl<D: crate::ingest::subscriber::InstrumentDef> PerPublisher<D> {
 }
 ```
 
-- [ ] **Step 5: Convert `TobProcessor`**
+- [x] **Step 5: Convert `TobProcessor`**
 
 Change the field at `processor.rs:136`:
 
@@ -506,7 +538,7 @@ Then rewrite every `self.state.<method>` call in `TobProcessor::on_datagram` to 
   ```
 - `on_instrument_definition(d)` consumes `d`, so build the `NormalizedInstrument` from `d` first, then hand `d` to the state, then emit.
 
-- [ ] **Step 6: Convert `MidpointProcessor` and `MboProcessor` the same way**
+- [x] **Step 6: Convert `MidpointProcessor` and `MboProcessor` the same way**
 
 `MidpointProcessor.state` (`:391`) and `MboProcessor.state` (`:519`) both become `PerPublisher<...>`, each gaining a `state_for(publisher)` accessor and the same call-site rewrite. `MboProcessor` has more sites — `book_for`'s gate 1 (`self.state.definition(instrument_id)?`), the `book_for` eviction's `self.state.definition(old_id)`, `emit_depth`'s definition lookup, and the `ManifestSummary` / `InstrumentDefinition` / `Trade` / `OrderExecute` handlers.
 
@@ -522,7 +554,7 @@ Then rewrite every `self.state.<method>` call in `TobProcessor::on_datagram` to 
 
 Do **not** change `MidpointProcessor`'s un-keyed `SeqTracker` (`:392`) — out of scope, and the 2026-08-05 plan deliberately left it.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -530,7 +562,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass, including the existing `tests/codec_mbo_fixtures.rs` and `tests/e2e.rs`.
 
-- [ ] **Step 8: Document and commit**
+- [x] **Step 8: Document and commit**
 
 `CHANGELOG.md` under Unreleased → Fixed:
 
@@ -560,11 +592,11 @@ git commit -m "fix(ingest): scope reference-data state per publisher, not per re
 - Consumes: nothing.
 - Produces: `pub enum ArbitrationMode { Coordinated, Sticky }` in `ingest::feeds` (`Copy + PartialEq + Eq + Debug`); `Feed.arbitration: ArbitrationMode`; `Arbiter::set_mode(&mut self, venue: &'static str, mode: ArbitrationMode)`; `Arbiter::mode_for(&self, venue: &str) -> ArbitrationMode` defaulting to `Coordinated`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 2's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/feeds.rs`:
 
@@ -592,7 +624,7 @@ Add to `mod tests` in `src/ingest/feeds.rs`:
     }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test --lib arbitration_mode_agrees
@@ -600,7 +632,7 @@ cargo test --lib arbitration_mode_agrees
 
 Expected: FAIL to compile — `no field 'arbitration' on type '&Feed'`.
 
-- [ ] **Step 4: Add the enum and the field**
+- [x] **Step 4: Add the enum and the field**
 
 In `src/ingest/feeds.rs`, above `struct Feed`:
 
@@ -626,7 +658,7 @@ pub enum ArbitrationMode {
 
 Add `pub arbitration: ArbitrationMode,` to `struct Feed` with a one-line doc, and `arbitration: ArbitrationMode::Coordinated,` to all three existing `FEEDS` rows.
 
-- [ ] **Step 5: Carry the mode into the arbiter**
+- [x] **Step 5: Carry the mode into the arbiter**
 
 In `src/ingest/arbiter.rs`, add to `struct Arbiter`:
 
@@ -655,7 +687,7 @@ Initialize it to `HashMap::new()` in `Arbiter::new`, and add:
     }
 ```
 
-- [ ] **Step 6: Populate the map in `main.rs`**
+- [x] **Step 6: Populate the map in `main.rs`**
 
 Immediately after `Arbiter::new(...)` and before the arbiter is wrapped in the `SharedArbiter`, register every selected feed's mode, using whatever local binding holds the selected feed list at that point (the value handed to `ReconcilerConfig.enabled`):
 
@@ -665,7 +697,7 @@ Immediately after `Arbiter::new(...)` and before the arbiter is wrapped in the `
     }
 ```
 
-- [ ] **Step 7: Run everything, then commit**
+- [x] **Step 7: Run everything, then commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -679,12 +711,49 @@ Expected: all pass with **no** behavior change.
 
 ## Task 4: `StickyAuthority` — one authoritative arm per market
 
+> ### ⚠️ AMENDED 2026-08-07, after the task shipped — authority is scoped **per arm**, not per arm-market
+>
+> Built as specified below (`5b2d045`, `4229f4e`, `3286b1c`), then restructured. **Read this block instead of the scoping in the section below; the rest of the section still stands.** Task 12 inherits the amended shape — see *Task 12 contract changes* at the end of this block.
+>
+> **What changed and why.** The section below elects a leader independently per `(venue, channel_id, instrument_id)`. That is the wrong grain for two of the three transfer triggers, because **latency is a property of an arm, not of a market**: every message from a source IP is evidence about that arm's speed, so splitting the evidence per market splits it as finely as it can possibly be split. The three triggers have genuinely different natural scopes:
+>
+> | Trigger | Scope | Why |
+> |---|---|---|
+> | **Speed** (Task 5) | **per arm**, venue-wide | Pooled evidence. One verdict per venue per window, applied to every market the winning arm does not already hold. |
+> | **Silence** | **per arm**, venue-wide | An arm is live or it is not. Per-market silence is a *bug* — see below. |
+> | **Health** | **per market** | An arm can be `Synced` on 1,200 markets and `Gap` on one. Venue-wide health would either transfer the whole venue over one bad book, or serve a knowingly-stale book — the exact failure the rule exists to prevent. |
+>
+> **The bug per-market silence causes, which is why it had to move.** `leader_arrival_ns` advances only when the leader itself sends, so on a market quieter than `leader_timeout` the challenger's next message always reads as leader silence and takes authority — then the original arm's next message takes it back. On the sports capture **93 of 1,239 instruments saw any level update at all in 39 s**, so nearly every market is quiet for far longer than the 2 s default and nearly every update on those markets would register as a transfer, each one re-baselining the consumer's book under Task 12. Venue-wide silence measures what silence means: the arm has sent nothing *for the venue* within the timeout.
+>
+> **The amended model.** One leader per venue, elected by speed and silence, with a **per-market override**: when the venue leader's book for a market is unhealthy and another arm's is not, that market alone is served by the healthy arm. The override is a pure function of health and the venue leader — no stored per-market authority — so it reverts automatically when the leader's book recovers.
+>
+> **Two properties this buys.** The wire-keyed `(channel_id, instrument_id)` maps that both reviewers flagged as unbounded stop being growable by a forged stream: the sampling and liveness state is now keyed per `(venue, arm)`, and **only arms holding a metric ordinal are eligible at all** — past `MAX_LABELLED_ARMS` a publisher is neither recorded nor ever authoritative, so the cap that existed to bound the label set now bounds admission too. What remains per market is health plus the last-admitted arm, written only for markets that already have a book, so it is bounded transitively by `MAX_PRICE_BOOKS`.
+>
+> **Interface delta** (the section's `Interfaces` block is otherwise unchanged):
+>
+> ```rust
+> // MarketKey survives: still the caller's key, the health key, and what `leader_of` answers for.
+> pub fn venue_leader(&self, venue: &str) -> Option<Publisher>;             // new
+> pub fn transfer_venue_to(&mut self, venue: &str, to: Publisher, at_ns: u64) -> bool;  // replaces transfer_to
+> pub fn observe_matched_lead(&mut self, venue: &str, arm: Publisher, lead_ns: i64);    // replaces observe_challenger
+> pub fn close_window(&mut self, now_ns: u64) -> Vec<(Arc<str>, Publisher)>;            // was Vec<(MarketKey, Publisher)>
+> ```
+>
+> `Admit::Contest`'s `lead_ns` is **not** a lead and never was — it is how late the non-authoritative copy arrived relative to the leader's previous message, which is inter-arm phase. It stays as a drop-path diagnostic and **no longer feeds `dz_arm_lead_ns`**, which is now fed only by `observe_matched_lead`. That is what makes `{winner="challenger"}` reachable.
+>
+> **Task 12 contract changes.** Task 12 wires the caller and must now:
+> 1. Call `set_health(&market_key, arm, healthy)` on every `PriceBook` status transition — unchanged, still per market.
+> 2. Feed `observe_matched_lead(venue, arm, lead_ns)` from a **cross-arm trade matcher** (Task 5 as amended), pooled per venue. Not per market, and not from `Admit::Contest`.
+> 3. Drive `close_window` on a periodic tick and apply each returned `(venue, arm)` by calling `transfer_venue_to`.
+> 4. Publish `dz_arm_markets_held{venue,arm}` from `markets_held`, which is O(markets) — call it on the metrics tick, never per message.
+> 5. Gate `admit` on an instrument that already resolves to a definition and a book, which is what keeps the per-market maps bounded. This is a **precondition Task 12 owns**, not something `authority` enforces.
+
 **Why:** the Lashay arms are one FIX-sourced and one WS-sourced publisher with no comparable coordinate. Authority is per `(venue, channel_id, instrument_id)` — **per instrument, never per level**, because per-level leadership interleaves the arms, and two arms' delta series are unrelated by construction, so interleaving corrupts the book while every per-arm sequence check still passes.
 
 Two transfer triggers here; the speed margin is Task 5.
 
 1. **Health.** A leader sitting in `gap` or `awaiting-snapshot` is unhealthy. Under full-state output a lost level self-heals on the next message; under incremental output it does not heal until the next snapshot, so a stalled leader must yield.
-2. **Silence.** A leader that stops sending is unhealthy. Data-driven, no timer task: a challenger's arrival more than `leader_timeout` after the leader's last message takes authority.
+2. **Silence.** A leader that stops sending is unhealthy. Data-driven, no timer task: a challenger's arrival more than `leader_timeout` after the leader's last message takes authority. *(Amended: venue-wide, not per market — see the block above.)*
 
 **Files:**
 - Create: `src/ingest/authority.rs`
@@ -707,11 +776,11 @@ Two transfer triggers here; the speed margin is Task 5.
   }
   ```
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 3's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `src/ingest/authority.rs` with the test module only, so every rule is named before the implementation exists. Add `pub mod authority;` to `src/ingest/mod.rs`.
 
@@ -838,7 +907,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test --lib authority
@@ -846,11 +915,11 @@ cargo test --lib authority
 
 Expected: FAIL to compile — `cannot find type 'StickyAuthority' in this scope`.
 
-- [ ] **Step 4: Add `Hash` to `Publisher`**
+- [x] **Step 4: Add `Hash` to `Publisher`**
 
 `arbiter.rs:86` becomes `#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]`. `IpAddr` is `Hash`, so this is free.
 
-- [ ] **Step 5: Implement `StickyAuthority`**
+- [x] **Step 5: Implement `StickyAuthority`**
 
 Prepend to `src/ingest/authority.rs`:
 
@@ -1021,7 +1090,7 @@ impl StickyAuthority {
 
 Note the `leader_unhealthy` binding is computed **before** the `match` because `healthy()` borrows `self` immutably while the match arm holds a mutable borrow.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib authority
@@ -1029,7 +1098,7 @@ cargo test --lib authority
 
 Expected: all nine PASS.
 
-- [ ] **Step 7: Add the arm metrics**
+- [x] **Step 7: Add the arm metrics**
 
 Three fields in `src/metrics.rs` plus registrations. Check the existing helper set first — `counter_vec`, `histogram_vec` and `gauge` exist; add a `gauge_vec` mirroring `counter_vec` if it is missing.
 
@@ -1065,7 +1134,7 @@ Three fields in `src/metrics.rs` plus registrations. Check the existing helper s
 
 `winner` takes `"leader"` / `"challenger"` — relative, so the label set stays two-valued regardless of arm count.
 
-- [ ] **Step 8: Full suite, clippy, commit**
+- [x] **Step 8: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -1076,6 +1145,30 @@ git commit -m "feat(ingest): add single-arm sticky authority for uncoordinated p
 ---
 
 ## Task 5: Election sampling and periodic re-election
+
+> ### ⚠️ AMENDED 2026-08-07, after the task shipped — the statistic was inert; it is now a matched-trade lead
+>
+> Built as specified below, then corrected. **The sampling statistic in this section does not work.** The rest — the four flags, both-conditions-must-hold, the sticky philosophy — stands.
+>
+> **Why the specified statistic is inert, not merely weak.** `observe_challenger` computed `challenger_arrival - leader_last_arrival`. `admit` updates the leader's arrival on every leader message and messages are processed in arrival order, so that quantity is **structurally non-negative**, while `best_challenger` only counts a win at `lead < -margin`. `wins` is therefore always 0, no challenger ever clears the rate condition, and a persistently slower arm keeps authority forever — the exact failure this task exists to prevent. The five tests below passed only because they call `observe_challenger(arm2, t - 10_000)` after `admit(arm1, t)`, an arrival order no real-time caller can produce. Found by the build instance and confirmed by reading the code.
+>
+> **What it was measuring** is inter-arm *phase*, not lead: the arms are unpairable by wire coordinate, so "the leader's previous message" is not the same event as the challenger's message.
+>
+> **The replacement: a cross-arm trade matcher on our own receive clock.** Pair the two arms' copies of the *same trade* by content signature, and take `recv_A - recv_B` for the matched pair on a single ns-resolution clock. Signed, so `{winner="challenger"}` is reachable. Pooled **per arm per venue** — latency is an arm property, so every matched trade from a source IP is evidence about that arm, whatever market it came from. That is what makes the sample supply workable: the sports feed carries ~5 trades per 39 s across the whole venue, which is nothing per market but ~38 per 300 s window pooled.
+>
+> **Match on trades only, never level updates.** `authority`'s own module doc already gives the reason: a level update's cross-arm-common fields reduce to `(side, price, quantity)` on a coarse bounded price grid, so a content match would mis-pair constantly. A trade's `(instrument, price, size, aggressor)` plus arrival proximity is near-unique. **The key needs a time component** — the reference implementation's does not, so two identical trades inside its window collide (see *Prior art*).
+>
+> **Two approaches rejected, recorded so they are not revisited:**
+> * **Inter-message gap** ("time since the other arm's last message"; the faster arm shows the larger median gap). Directionally right but rate-sensitive — it biases toward the chattier arm when the two differ in message granularity — and it **inverts** whenever the lead exceeds half the message period, since it compares `P - L` against `L`.
+> * **`recv_ts - venue_ts` per arm.** Tempting: `LevelUpdate.Timestamp` is the venue's own time (publisher `venue.rs`, "`ts_ms` is the venue's own time for the change, lifted"), it is plentiful, and its millisecond quantization is common-mode so it cancels in a difference of medians. It fails on the asymmetry that matters: `ts_ms` is `Option`, and when the venue supplies none the publisher silently substitutes its own clock (`feed.rs:1206`, `lu.timestamp = TsNs(now_ns())`) with **no flag on the wire**. An arm with no venue timestamp then measures only the network leg and looks fastest by construction — and filtering those samples out by their non-millisecond granularity disenfranchises that arm entirely instead. Since the FIX arm is the one both expected to be faster and expected to lack venue timestamps, this is precisely backwards. *(All 30,075 / 22,453 / 643 `LevelUpdate`s in the three 2026-08-07 captures were venue-sourced, i.e. exact-millisecond — but those are presumed all-WS arms, so that measures nothing about FIX.)*
+>
+> **Prior art, worth reading before writing the matcher.** The upstream publisher repo already has one — `src/publisher/compare.rs` in its publisher crate (447 lines, built and unit-tested), designed in its `2026-07-14-fix-ws-comparison-design.md` for a FIX-vs-WS comparison *inside* the publisher. A bounded time-windowed `pending` map keyed on a content signature, second transport to hit a key emits a signed delta and evicts, `evict_stale` counts "seen only on <transport>". Two gaps to close when lifting it: its trade key is `(ticker, price, size, side)` with **no time component**, and it reports milliseconds.
+>
+> **Interface delta:** `observe_challenger(&MarketKey, Publisher, u64)` becomes `observe_matched_lead(&str /* venue */, Publisher, i64 /* signed ns */)`, and `close_window` returns `Vec<(Arc<str>, Publisher)>`. The five tests below are replaced — they encode the arrival order being abandoned. Also added here: a **minimum-sample floor** (`--arb-min-window-samples`, 32), without which a handful of lucky matches transfers a venue.
+>
+> **The matcher shipped as `src/ingest/arm_race.rs`** (`6d004b4`). `ArmRace::on_trade(venue, instrument, price_raw, qty_raw, aggressor, arm, recv_ns) -> Option<Match>`, and `Match::lead_for(leader) -> Option<(challenger, signed_ns)>` does the sign conversion in **one tested place** — getting that sign backwards is what made the first version inert, so it does not belong at the call site. Content-keyed on raw fixed-point integers (never floats), with a **FIFO per signature** so identical repeats pair in order instead of colliding, window eviction that attributes unmatched arrivals per arm ("seen only on this arm"), and a `MAX_PENDING` cap because the source is unauthenticated. `a_faster_challenger_actually_wins_the_election` drives a genuinely faster arm through the matcher into `StickyAuthority` in true arrival order and asserts it takes authority — the round trip the old statistic failed.
+>
+> **Left for Task 12, deliberately:** the matcher's window is a `ArmRace::new(window_ns)` parameter with a 5s default rather than a CLI flag, because a flag nothing reads is the same defect as an inert knob. Wire it when the caller exists. Same for counting `evict_stale`'s per-arm unmatched returns.
 
 **Why:** without re-sampling, whichever arm delivers first at startup holds authority forever, even when persistently slower. With naive re-sampling, jitter flaps authority and re-baselines every consumer's book on each flip. The rule: **transfer only on a sustained margin, never on a single faster sample.**
 
@@ -1097,11 +1190,11 @@ The design leaves the interval, the threshold and the metric set open (§10 Q2).
 - Consumes: `StickyAuthority`, `MarketKey`, `transfer_to` from Task 4.
 - Produces: `pub struct AuthorityConfig { pub leader_timeout_ns: u64, pub sample_interval_ns: u64, pub transfer_margin_ns: u64, pub transfer_win_rate: f64 }` and `StickyAuthority::new(cfg: AuthorityConfig)` replacing the `u64` constructor; `observe_challenger`, `close_window`, `leader_of`. Task 12 constructs the config from the CLI args.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 4's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/authority.rs`:
 
@@ -1200,7 +1293,7 @@ Add to `mod tests` in `src/ingest/authority.rs`:
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib authority::tests::sustained_margin
@@ -1208,7 +1301,7 @@ cargo test --lib authority::tests::sustained_margin
 
 Expected: FAIL to compile — `cannot find struct 'AuthorityConfig' in this scope`.
 
-- [ ] **Step 4: Add the config**
+- [x] **Step 4: Add the config**
 
 In `src/ingest/authority.rs`:
 
@@ -1232,7 +1325,7 @@ pub struct AuthorityConfig {
 const MAX_WINDOW_SAMPLES: usize = 4096;
 ```
 
-- [ ] **Step 5: Extend `Held` and the constructor**
+- [x] **Step 5: Extend `Held` and the constructor**
 
 Add to `struct Held`:
 
@@ -1245,7 +1338,7 @@ Add to `struct Held`:
 
 Initialize `samples: Vec::new(), window_opened_ns: arrival_ns` at both `Held` construction sites (`admit`'s `None` arm and nothing else — `transfer_to` mutates in place). Replace the `leader_timeout_ns: u64` field with `cfg: AuthorityConfig`, change `new` to take it, and read `self.cfg.leader_timeout_ns` in `admit`. Update the Task 4 tests' `StickyAuthority::new(TIMEOUT)` calls to `StickyAuthority::new(AuthorityConfig { leader_timeout_ns: TIMEOUT, sample_interval_ns: u64::MAX, transfer_margin_ns: 1_000, transfer_win_rate: 0.8 })` so no window closes during them.
 
-- [ ] **Step 6: Implement the sampler**
+- [x] **Step 6: Implement the sampler**
 
 ```rust
     /// Record a challenger's arrival against the leader's most recent message. The arbiter calls
@@ -1324,7 +1417,7 @@ fn best_challenger(samples: &[(Publisher, i64)], margin: i64, rate: f64) -> Opti
 }
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib authority
@@ -1332,7 +1425,7 @@ cargo test --lib authority
 
 Expected: all fourteen PASS.
 
-- [ ] **Step 8: Add the CLI flags**
+- [x] **Step 8: Add the CLI flags**
 
 In `src/main.rs`'s `Args`, following the existing `#[arg(long, env = ...)]` convention:
 
@@ -1358,7 +1451,7 @@ In `src/main.rs`'s `Args`, following the existing `#[arg(long, env = ...)]` conv
 
 Build the `AuthorityConfig` next to the `Arbiter::new` call. The arbiter does not consume it until Task 12; bind it as `let authority_cfg = AuthorityConfig { ... };` with `#[allow(unused_variables)]` (or `let _ = &authority_cfg;`) for this commit and remove the allow in Task 12.
 
-- [ ] **Step 9: Document, then commit**
+- [x] **Step 9: Document, then commit**
 
 Add the three `dz_arm_*` rows to `docs/metrics.md`, each stating what an operator does with it, plus a "Tuning arm re-election" paragraph naming the four flags, their defaults, and the rule that the two transfer conditions are independent.
 
@@ -1392,11 +1485,11 @@ git commit -m "feat(ingest): re-elect the authoritative arm on a sustained speed
   - `PreparedFrame.channel: Option<u32>`, populated by Task 11.
   - `async fn replay_scoped(write, instruments, depth, subs) -> Result<()>` — the scoped replay both the connect path and the subscribe path use.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 5's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/sinks/ws.rs`. These test `matches` directly — a pure function, so no server plumbing is needed.
 
@@ -1465,7 +1558,7 @@ Add to `mod tests` in `src/sinks/ws.rs`. These test `matches` directly — a pur
     }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test --lib ws::tests
@@ -1473,7 +1566,7 @@ cargo test --lib ws::tests
 
 Expected: FAIL to compile — `this method takes 2 arguments but 4 arguments were supplied`.
 
-- [ ] **Step 4: Widen `SubFilter` and fold both match paths into one function**
+- [x] **Step 4: Widen `SubFilter` and fold both match paths into one function**
 
 Replace `ws.rs:106-125` with:
 
@@ -1522,7 +1615,7 @@ impl SubFilter {
 
 The `channel` arm is the one to read twice. A message with no channel passes a channel filter only when it is venue-level (`symbol.is_none()`); a symbol-bearing message with no channel is excluded by an explicit channel filter, which is what `channel_filter_excludes_channelless_messages` pins.
 
-- [ ] **Step 5: Carry channel on the prepared frame**
+- [x] **Step 5: Carry channel on the prepared frame**
 
 Add to `struct PreparedFrame` (`ws.rs:36-46`):
 
@@ -1534,7 +1627,7 @@ Add to `struct PreparedFrame` (`ws.rs:36-46`):
 
 In `prepare` (`ws.rs:77-90`), extend the destructuring tuple to yield `channel` — `None` for all six existing variants — and set it on the constructed frame.
 
-- [ ] **Step 6: Route both filter paths through `matches`**
+- [x] **Step 6: Route both filter paths through `matches`**
 
 Replace the `msg = rx.recv()` filter block (`ws.rs:364-379`) with a single call, deleting the duplicated inline venue comparison:
 
@@ -1553,7 +1646,7 @@ Replace the `msg = rx.recv()` filter block (`ws.rs:364-379`) with a single call,
 
 The rest of the arm (metrics, write) is unchanged. This is the fix for trap 1: there is now exactly one match path, so a future dimension cannot be added to half of it.
 
-- [ ] **Step 7: Scope the replay**
+- [x] **Step 7: Scope the replay**
 
 Extract the two replay loops from `serve_client` (`ws.rs:260-286`) into one function both the connect path and the subscribe path call:
 
@@ -1614,7 +1707,7 @@ In `serve_client`, replace the two inline loops with `replay_scoped(&mut write, 
 
 Replaying only the newly-added filter, not all of `subs`, keeps a client that subscribes to ten symbols from getting ten full replays of the first one.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -1622,7 +1715,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass, including the existing `ws` integration tests and `tests/e2e.rs`.
 
-- [ ] **Step 9: Document**
+- [x] **Step 9: Document**
 
 In `PROTOCOL.md`'s *Subscriptions & filtering* section, replace the filter description:
 
@@ -1642,7 +1735,7 @@ Instrument definitions and current book state are replayed on connect (unfiltere
 
 Add a `CHANGELOG.md` entry under Unreleased → Added naming both dimensions and the scoped replay.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add -A
@@ -1676,7 +1769,7 @@ git commit -m "feat(ws): add channel and type subscription filters, scope replay
   pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)>
   ```
 
-- [ ] **Step 1: Branch, and confirm the oracle is current**
+- [x] **Step 1: Branch, and confirm the oracle is current**
 
 Branch off Task 6's final commit. Then check the reference decoder checkout is up to date, since this task validates against it:
 
@@ -1687,7 +1780,7 @@ git -C <edge-multicast-ref> log --oneline -1 origin/main
 
 The local checkout is one commit behind `origin/main` (`b2a5b48`, merged PR #34, which adds `go/marketbyprice-bot` — the *state-machine* oracle Task 9 wants). `go/marketbyprice-parser/marketbyprice_wire.go` is the codec oracle for this task and is already present.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `src/ingest/codec_mbp.rs`. Every test builds a frame from literal offsets transcribed from the spec, so it is offset-independent of the decoder.
 
@@ -1865,7 +1958,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Add `pub mod codec_mbp;` to `src/ingest/mod.rs`, then:
 
@@ -1875,7 +1968,7 @@ cargo test --lib codec_mbp
 
 Expected: FAIL to compile — `cannot find value 'MAGIC' in this scope`.
 
-- [ ] **Step 4: Write the module head, constants and inherited types**
+- [x] **Step 4: Write the module head, constants and inherited types**
 
 Prepend to `src/ingest/codec_mbp.rs`:
 
@@ -1992,7 +2085,7 @@ pub enum Message {
 }
 ```
 
-- [ ] **Step 5: Write the frame walk and the body decoders**
+- [x] **Step 5: Write the frame walk and the body decoders**
 
 ```rust
 /// Decode one datagram. `msg_len` is checked for exact equality with the type's declared size
@@ -2063,7 +2156,7 @@ fn decode_manifest_summary(b: &[u8], o: usize) -> Option<Message> {
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib codec_mbp
@@ -2071,7 +2164,7 @@ cargo test --lib codec_mbp
 
 Expected: all eleven PASS.
 
-- [ ] **Step 7: Cross-check every offset against the Go oracle**
+- [x] **Step 7: Cross-check every offset against the Go oracle**
 
 Open `<edge-multicast-ref>/go/marketbyprice-parser/marketbyprice_wire.go` and confirm each struct's slice bounds against the decoder above. The Go offsets are **body-relative**; ours are body-relative too (`o` already points past the 4-byte header), so they compare directly:
 
@@ -2085,7 +2178,7 @@ Open `<edge-multicast-ref>/go/marketbyprice-parser/marketbyprice_wire.go` and co
 
 Any disagreement is a decoder bug, not an oracle bug — fix ours.
 
-- [ ] **Step 8: Pin the sharing with the byte-validated top-of-book codec**
+- [x] **Step 8: Pin the sharing with the byte-validated top-of-book codec**
 
 Add a test asserting the shared layouts really are shared, so the claim is self-enforcing rather than eyeballed (this mirrors `codec_mbo_fixtures.rs`'s `tob_shared_layouts_decode_identically`):
 
@@ -2122,7 +2215,7 @@ Add a test asserting the shared layouts really are shared, so the claim is self-
 
 `codec::MAGIC` and `codec::Message` may need `pub` visibility — check `src/ingest/codec.rs` and widen if so.
 
-- [ ] **Step 9: Full suite, clippy, commit**
+- [x] **Step 9: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -2160,11 +2253,11 @@ git commit -m "feat(codec): add the market-by-price frame walk and inherited mes
   ```
   New `Message` variants for each. `depth_bound` stays a plain `u32` here — the wire always carries it — and the *unknown* state (`Option<u32>`) belongs to `PriceBook` in Task 9, which is where "no publisher has claimed a bound yet" is a real state.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 7's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/codec_mbp.rs`. Offsets are transcribed from `market-by-price/spec.md`'s field tables and are **message-relative minus 4** (body-relative), matching the Go oracle's slices.
 
@@ -2421,7 +2514,7 @@ Add to `mod tests` in `src/ingest/codec_mbp.rs`. Offsets are transcribed from `m
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib codec_mbp
@@ -2429,7 +2522,7 @@ cargo test --lib codec_mbp
 
 Expected: FAIL to compile — `cannot find value 'MSG_LEVEL_UPDATE'`.
 
-- [ ] **Step 4: Add the constants, sizes and structs**
+- [x] **Step 4: Add the constants, sizes and structs**
 
 Append to the constants block in `src/ingest/codec_mbp.rs`:
 
@@ -2486,7 +2579,7 @@ Then the seven structs, exactly as listed in **Interfaces** above. Doc lines wor
 - `SnapshotBegin.depth_bound`: "`0` is a positive publisher claim that this snapshot carries the complete book. Non-zero is levels-per-side, beyond which state is **unknown, not empty**."
 - `InstrumentReset`: "Carries no per-instrument seq — processed regardless of sequence state."
 
-- [ ] **Step 5: Add the `Message` variants and the decoders**
+- [x] **Step 5: Add the `Message` variants and the decoders**
 
 Extend `enum Message` with `LevelUpdate(LevelUpdate)`, `BookClear(BookClear)`, `SnapshotLevel(SnapshotLevel)`, `SnapshotBegin(SnapshotBegin)`, `SnapshotEnd(SnapshotEnd)`, `BatchBoundary(BatchBoundary)`, `InstrumentReset(InstrumentReset)`, then add the arms to `decode_frame`'s match (each `if exact(sizes::X)`) and the body decoders:
 
@@ -2581,7 +2674,7 @@ fn decode_instrument_reset(b: &[u8], o: usize) -> Option<Message> {
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib codec_mbp
@@ -2589,7 +2682,7 @@ cargo test --lib codec_mbp
 
 Expected: all twenty-six PASS.
 
-- [ ] **Step 7: Cross-check every offset against the Go oracle**
+- [x] **Step 7: Cross-check every offset against the Go oracle**
 
 Against `marketbyprice_wire.go`, body-relative:
 
@@ -2605,11 +2698,11 @@ Against `marketbyprice_wire.go`, body-relative:
 
 Signedness to mirror: `i64` for every `*price*` field, `i8` for the two exponents, unsigned everywhere else. A disagreement is our bug.
 
-- [ ] **Step 8: Add the fixture test harness**
+- [x] **Step 8: Add the fixture test harness** — both halves: the cross-codec pinning plus the real-frame decode tests over the captures Step 9 produced.
 
 Create `tests/codec_mbp_fixtures.rs` with the cross-codec equality test moved out of the unit module (so the integration suite also pins it) plus a real-frame decode test over `tests/fixtures/mbp_{mktdata,refdata,snapshot}.bin`, using `tests/common/replay.rs`'s `split_frames` reader exactly as `tests/codec_mbo_fixtures.rs` does — read that file first and mirror its structure. The real-frame test asserts, at minimum: zero decode errors across every frame; `total_levels` equals the decoded `SnapshotLevel` count between a `SnapshotBegin`/`SnapshotEnd` pair; every `LevelUpdate.per_instrument_seq` for one instrument is dense; and at least one `depth_bound == 0` is observed (the live perps publisher carries the complete book).
 
-- [ ] **Step 9: Capture the fixtures**
+- [x] **Step 9: Capture the fixtures** — done from wire captures taken 2026-08-07, but **read `tests/fixtures/PROVENANCE.md` before trusting them as normative.** Two sets are committed rather than one, because the deployment turned out to have two shapes and each covers what the other cannot: `mbp_*` is the **sharded** feed (three `Channel ID`s on one group — the only fixture that exercises per-channel snapshot grouping) and `mbp_perps_*` is the **dense** feed (one channel, thousands of contiguous deltas — what pins sequence handling). The captures also surfaced three publisher-side deviations, all recorded in PROVENANCE: per-arm `Channel ID`s on the older feed (which would break a channel-keyed market key — relevant to Task 4), 16-byte symbol truncation with one real collision on a `(venue, symbol)`-keyed map, and no `BookClear`/`InstrumentReset`/`BatchBoundary`/`EndOfSession` in either window. A longer capture with publisher fixes is expected; the fixture tests assert invariants, not recorded counts, so it drops in without editing a number.
 
 `examples/pcap2frames.rs` needs an `Mbp` variant: add it to `enum Protocol` (`:44`) with magic `[0x42, 0x44]` (`0x4442` LE) and a `process_mbp` arm mirroring `process_mbo` (`:1089`, `:1105`). Then, on a host with the DoubleZero tunnel up and subscribed to the perps MBP group:
 
@@ -2623,7 +2716,7 @@ Record the source IP, capture date, frame counts and observed `depth_bound` in `
 
 **If tunnel access is unavailable to whoever executes this task, stop here and say so rather than synthesizing a fixture and calling it a capture.** Ship Steps 1–8 with the module doc recording MBP's oracle strength honestly: offset tests plus field-for-field Go-oracle parity, **no real-frame fixture yet**. That is strictly stronger than `codec_midpoint` (self-consistency only) and weaker than `codec_mbo` (real capture), and the difference must be stated, not papered over. Add the missing fixture to the PR body's "what was not verified".
 
-- [ ] **Step 10: Full suite, clippy, commit**
+- [x] **Step 10: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -2677,11 +2770,11 @@ This task implements four of the design's §4 conformance items, each with a nam
   }
   ```
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 8's final commit.
 
-- [ ] **Step 2: Fetch the state-machine oracle**
+- [x] **Step 2: Fetch the state-machine oracle**
 
 ```bash
 git -C <edge-multicast-ref> pull --ff-only origin main
@@ -2690,7 +2783,7 @@ ls <edge-multicast-ref>/go/marketbyprice-bot
 
 `marketbyprice-bot` (merged PR #34) is the reference book engine. Read `instrument.go` — `SnapshotAcceptable`, `BeginSnapshot`/`AddSnapshotLevel`/`EndSnapshot`, `ApplyLevelUpdate`, `ApplyBookClear`, `Crossed` — and mirror its decisions. **Two places to deliberately diverge:** its `reorderWindow = 16` (treating deltas up to 16 ahead as reordering rather than a gap) has no basis in the spec, which says `> last + 1` is a gap, full stop — do not port it. Its shard-level `maxBufferedDeltasPerShard` is a cross-instrument bound; that is Task 10's.
 
-- [ ] **Step 3: Write the failing tests**
+- [x] **Step 3: Write the failing tests**
 
 Create `src/ingest/pricebook.rs` with the test module only.
 
@@ -3113,7 +3206,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run to verify failure**
+- [x] **Step 4: Run to verify failure**
 
 Add `pub mod pricebook;` to `src/ingest/mod.rs`, then:
 
@@ -3123,7 +3216,7 @@ cargo test --lib pricebook
 
 Expected: FAIL to compile — `cannot find type 'PriceBook' in this scope`.
 
-- [ ] **Step 5: Implement `PriceBook`**
+- [x] **Step 5: Implement `PriceBook`**
 
 Write the implementation against the tests. Every public item and rule is fixed by **Interfaces** and the tests above; these are the decisions the tests do not spell out in code:
 
@@ -3139,7 +3232,7 @@ Write the implementation against the tests. Every public item and rule is fixed 
 
 Mark `MAX_BUFFERED_DELTAS` `pub(crate)` so the test module and Task 10 both see it.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib pricebook
@@ -3147,7 +3240,7 @@ cargo test --lib pricebook
 
 Expected: all twenty-four PASS.
 
-- [ ] **Step 7: Full suite, clippy, commit**
+- [x] **Step 7: Full suite, clippy, commit**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -3199,11 +3292,11 @@ git commit -m "feat(ingest): add the price-keyed book with snapshot and delta re
   **Why an accumulator and not the last message.** `depth` is full state, so storing the last one is a valid replay. `book` is incremental, so the last batch is meaningless to a client that holds nothing. The map therefore accumulates — the same operation a consumer performs — and materializes a `clear` plus the complete level set on demand. Cost is one book per market for the authoritative arm only, updated in O(changes) per batch rather than O(book). That is the honest price of offering connect-time bootstrap for an incremental product; the alternative is making every new client wait a full snapshot cycle.
   `FeedMessage::venue_symbol` gains a `Book` arm; a new `FeedMessage::channel(&self) -> Option<u32>` returns `Some` only for `Book`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 9's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `src/model.rs`:
 
@@ -3364,7 +3457,7 @@ Add to `mod tests` in `src/sinks/ws.rs`:
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib model:: sinks::ws::tests::prepare_populates
@@ -3372,7 +3465,7 @@ cargo test --lib model:: sinks::ws::tests::prepare_populates
 
 Expected: FAIL to compile — `cannot find struct 'NormalizedBook'`.
 
-- [ ] **Step 4: Add the wire types**
+- [x] **Step 4: Add the wire types**
 
 In `src/model.rs`, after `NormalizedDepth`:
 
@@ -3564,7 +3657,7 @@ pub type BookSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), BookAccumulator>
 
 Add a test asserting `apply` then `to_book` round-trips: a `clear` + two bids + one ask, then an `update` moving one bid and a `delete` removing the ask, must materialize as `clear` + two bids descending + no asks.
 
-- [ ] **Step 5: Wire `book` through the WS serializer**
+- [x] **Step 5: Wire `book` through the WS serializer**
 
 In `src/sinks/ws.rs`'s `prepare`, add to the `kind` match:
 
@@ -3577,7 +3670,7 @@ In `src/sinks/ws.rs`'s `prepare`, add to the `kind` match:
 
 and extend the `(venue, symbol, channel)` destructuring so `Book` yields `Some(b.channel)` while every other variant yields `None`.
 
-- [ ] **Step 6: Add a temporary arbiter passthrough**
+- [x] **Step 6: Add a temporary arbiter passthrough**
 
 `emit`'s match is exhaustive by design (a new variant must be a compile error, not a silent miss). Add, with the comment that says exactly what replaces it:
 
@@ -3594,7 +3687,7 @@ and extend the `(venue, symbol, channel)` destructuring so `Book` yields `Some(b
 
 Add `EMIT_BOOK: usize = 6` and widen `VenueMetrics::emit` to `[IntCounter; 7]` with `emit_kind("book")`.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -3602,7 +3695,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 8: Document the message in PROTOCOL.md**
+- [x] **Step 8: Document the message in PROTOCOL.md**
 
 Add `book` to the envelope table (`| \`book\` | A batch of incremental order-book level changes. |`) and a full `### book` section after `### depth`:
 
@@ -3656,7 +3749,7 @@ Then, in the *Connection lifecycle* section, add `book` to step 3's list, and no
 - **`depth` is deprecated.** It is the full-state top-*N* product served from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally. `depth` is removed in v2, when the Market-by-Order feed migrates to `book`. Until then both are served: `book` for Market-by-Price feeds, `depth` for Market-by-Order ones. New consumers should implement `book`.
 ```
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add -A
@@ -3686,11 +3779,11 @@ git commit -m "feat(protocol): add the incremental book message"
 - Consumes: `codec_mbp` (Tasks 7–8), `PriceBook`/`DeltaOp`/`BookDelta`/`Status`/`DeltaOutcome`/`Divergence` (Task 9), `NormalizedBook`/`BookChange`/`BookAction`/`BookSide` (Task 10), `PerPublisher` (Task 2), `MarketKey` (Task 4).
 - Produces: `FeedKind::MarketByPrice` (label `"mbp"`); `pub struct MbpProcessor` with `pub fn new(emit_trades: bool) -> Self`; `FrameCtx.channel_id: u8` (set by `drive` from the decoded frame header — see Step 5).
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 10's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/processor.rs`. Read the existing MBO processor tests first and reuse their harness (a `FrameCtx` builder over a `SharedArbiter` with a subscribed receiver, so emitted messages can be drained and asserted).
 
@@ -3786,7 +3879,7 @@ Add to `mod tests` in `src/ingest/processor.rs`. Read the existing MBO processor
 
 Fill each body against the MBO tests' harness. **Do not leave a test with a comment-only body** — the comments state the assertion; write it.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib processor::tests
@@ -3794,7 +3887,7 @@ cargo test --lib processor::tests
 
 Expected: FAIL to compile — `cannot find struct 'MbpProcessor'`.
 
-- [ ] **Step 4: Add the feed kind**
+- [x] **Step 4: Add the feed kind**
 
 In `src/ingest/feeds.rs`, add to `enum FeedKind` and `label()`:
 
@@ -3810,11 +3903,11 @@ In `src/ingest/feeds.rs`, add to `enum FeedKind` and `label()`:
 
 Extend `feed_kind_labels_are_stable` with `assert_eq!(FeedKind::MarketByPrice.label(), "mbp");`.
 
-- [ ] **Step 5: Carry `channel_id` on the frame context**
+- [x] **Step 5: Carry `channel_id` on the frame context**
 
 `MarketKey` and the wire message both need the channel, and it comes from the frame header — which `drive` does not decode (each processor decodes its own). So the processor reads it from its own decode and threads it through, rather than `FrameCtx` gaining a field it cannot fill. **Do not add `channel_id` to `FrameCtx`** — `drive` is protocol-agnostic by design and would have to decode a header it has no magic for. Correct the Interfaces note above accordingly: `MbpProcessor` takes `header.channel_id` from `codec_mbp::decode_frame` and passes it down its own call chain.
 
-- [ ] **Step 6: Implement `MbpProcessor`**
+- [x] **Step 6: Implement `MbpProcessor`**
 
 Add to `src/ingest/processor.rs`. Structure, mirroring `MboProcessor` where the shape carries over:
 
@@ -3887,7 +3980,7 @@ Then `on_datagram`, in order:
 
 `book_for` mirrors `MboProcessor::book_for`: gate on a resolved definition first (releasing the `state` borrow), then bound to `MAX_PRICE_BOOKS` with least-recently-inserted eviction, dropping the evicted key's `open`/`emitted_symbol` entries in lockstep.
 
-- [ ] **Step 7: Add the metrics**
+- [x] **Step 7: Add the metrics**
 
 Five counters in `src/metrics.rs`, all `&["venue"]` except the divergence one:
 
@@ -3899,11 +3992,11 @@ Five counters in `src/metrics.rs`, all `&["venue"]` except the divergence one:
 | `dz_mbp_crossed_total` | `venue` | Crossed inside markets observed at a consistency point. Observability only; never acted on. |
 | `dz_mbp_divergence_total` | `venue`, `kind` | `Action`-vs-quantity disagreements, by kind. Never changes the applied result. |
 
-- [ ] **Step 8: Wire the receiver**
+- [x] **Step 8: Wire the receiver**
 
 In `src/ingest/receiver.rs`'s `run_feed`, add the `MarketByPrice` arm. It is the `MarketByOrder` arm with `MbpProcessor::new(feed.emit_trades)` in place of `MboProcessor::new(depth, feed.emit_trades)` — same `FeedPorts::ThreePort` destructuring, same `bail!` on a two-port row, same three `PortRole`s. Update the `bail!` text to name Market-by-Price. Also update `PortRole::Snapshot`'s doc comment (`receiver.rs:63`) — it says "(Constructed once the MBO receiver lands)", which is now stale twice over — and drop its `#[allow(dead_code)]` if it is no longer needed.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [x] **Step 9: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -3911,7 +4004,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 10: Document and commit**
+- [x] **Step 10: Document and commit**
 
 Add the five metrics to `docs/metrics.md`. In `docs/input-sources.md`, add Market-by-Price alongside the other protocols: three ports, one book per `(publisher, channel, instrument)`, the `MAX_PRICE_BOOKS` and buffer-budget bounds, and the note that the caps are per receiver task — so N publishers hold N times the per-task bound, the same documentation point the order-keyed processor already carries.
 
@@ -3939,11 +4032,11 @@ git commit -m "feat(ingest): add the market-by-price processor and receiver"
 - Consumes: `StickyAuthority`/`AuthorityConfig`/`MarketKey` (Tasks 4–5), `NormalizedBook`/`BookAccumulator`/`BookSnapshot` (Task 10), `Arbiter::mode_for` (Task 3).
 - Produces: `Arbiter::new(tx, trade_window, authority: AuthorityConfig)`; `Arbiter::set_book_replay(&mut self, books: BookSnapshot)`; `Arbiter::close_authority_windows(&mut self)`; `ws::serve(listener, tx, instruments, depth, books, cfg)`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 11's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/arbiter.rs`:
 
@@ -4081,7 +4174,7 @@ Add `fn test_authority_cfg() -> AuthorityConfig` to the test module with `sample
 
 Add to `tests/dedup.rs` an integration test replaying two arms' interleaved MBP frames (once the Task 8 fixture exists; otherwise synthesize the two arms from the codec's own encoders as `tests/dedup.rs` already does for other cases) and asserting: exactly one arm's `book` messages reach a WS client, and applying them in order reproduces the authoritative arm's `PriceBook` level-for-level.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib arbiter::tests::book_
@@ -4089,7 +4182,7 @@ cargo test --lib arbiter::tests::book_
 
 Expected: FAIL — `book_publishes_one_arm_only` asserts 5 but gets 10 (the Task 10 passthrough).
 
-- [ ] **Step 4: Add the authority to the arbiter**
+- [x] **Step 4: Add the authority to the arbiter**
 
 In `src/ingest/arbiter.rs`:
 
@@ -4107,7 +4200,7 @@ In `src/ingest/arbiter.rs`:
 
 `Arbiter::new` gains an `authority: AuthorityConfig` parameter and initializes `books: StickyAuthority::new(authority)`, `book_replay: None`. Add `set_book_replay`, mirroring `set_depth_replay`.
 
-- [ ] **Step 5: Replace the passthrough with the gate**
+- [x] **Step 5: Replace the passthrough with the gate**
 
 ```rust
             FeedMessage::Book(b) => {
@@ -4152,7 +4245,7 @@ In `src/ingest/arbiter.rs`:
 
 Add `book_dropped: IntCounter` to `VenueMetrics` backed by a new `dz_book_dropped_total{venue}`. `arm_ordinal` is called for its side effect of registering the arm and logging the ordinal-to-IP mapping once; keep the `let _ = arm;` only if clippy objects to the unused binding, otherwise drop the binding and call it as a statement.
 
-- [ ] **Step 6: Drive the re-election window**
+- [x] **Step 6: Drive the re-election window**
 
 ```rust
     /// Close every elapsed re-election window, transferring authority where a challenger cleared
@@ -4177,7 +4270,7 @@ In `src/main.rs`, spawn a task that ticks every `arb_sample_interval_secs` and c
 
 **Note on the transfer's consumer effect:** a transfer means the next batch comes from a different arm whose delta series is unrelated to the old one's. The processor for the new arm holds its own `Ready` book, so its next emission is an ordinary incremental batch — which a consumer would apply on top of the *old* arm's state. That is wrong. **A transfer must force a re-baseline.** Implement it here: on a transfer, materialize the replay accumulator for that market, `clear` it, and broadcast the new arm's full state as a `snapshot: true, last: true` re-baseline before its next incremental batch. The simplest correct form is to drop the accumulator entry and set a per-market `needs_rebaseline` flag the `Book` arm checks: while set, the first admitted batch from the new arm is replaced by `to_book()` of that arm's state — but the arbiter does not hold that arm's book. So instead: on transfer, emit a `Clear`-only re-baseline (`changes: [clear both]`, `snapshot: true`, `last: true`) immediately, and clear the accumulator. The consumer's book empties, and the new arm's subsequent incremental batches rebuild it. A lone clear is an explicitly legal message (Task 10 pins it), and `last: true` on it is exactly why that field is mandatory. Add a test: after a margin transfer, the next broadcast for that market is a clear-only re-baseline.
 
-- [ ] **Step 7: Replay the book on connect and subscribe**
+- [x] **Step 7: Replay the book on connect and subscribe**
 
 Thread `books: BookSnapshot` through `ws::serve` → `serve_client` → `replay_scoped`, and extend `replay_scoped` to materialize matching accumulators after the instruments and alongside `depth`:
 
@@ -4194,7 +4287,7 @@ Thread `books: BookSnapshot` through `ws::serve` → `serve_client` → `replay_
 
 `BookAccumulator` needs a `pub fn symbol(&self) -> &str`. Chain `live` into the existing send loop, after `snapshot` and `books`' `depth` entries. Update `main.rs`'s `ws::serve` call and the existing `ws` tests' call sites.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -4202,7 +4295,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 9: Document and commit**
+- [x] **Step 9: Document and commit**
 
 `PROTOCOL.md`: in the `book` section's "One book per market" paragraph, add that a failover surfaces as a `clear`-only re-baseline followed by the new source rebuilding the book, so a consumer that honors `clear` needs no other handling. Add `dz_book_dropped_total` to `docs/metrics.md` and the `arm_transfers` `reason` values (`elected`, `margin`, plus `health`/`silence` if Task 4's transfers are also counted — wire those counters here if they were left unwired).
 
@@ -4215,9 +4308,19 @@ git commit -m "feat(arbiter): publish one arm's book per market and replay accum
 
 ## Task 13: runtime tape ownership
 
+> ### ⚠️ AMENDED 2026-08-07 — ownership between **rows** is only half the invariant; arms need it too
+>
+> Found while building Task 12, before Task 13 started. **This is a release blocker, not a nicety, and it belongs here rather than in a follow-up issue.**
+>
+> The invariant below — *at most one tape emitter per venue at any moment* — is enforced only **between `FEEDS` rows**. But a single row carries **N publishers**, and both Lashay arms print `trade_id == 0`, which by design bypasses the dedup window because a FIX source carries no venue trade id. So even with row ownership resolved perfectly, **one active row with two live arms double-prints every trade**: a consumer summing `size` overstates volume by 2×, and `dz_trades_no_id_conflict_total` counts every print rather than staying flat. That is a data-correctness bug on the wire, not a metrics blemish.
+>
+> The fix is small because the mechanism already exists: for a `Sticky` venue, route `FeedMessage::Trade` through the **same venue authority** `book` goes through (`ingest::authority`), publishing the authoritative arm's prints and dropping the peer's. Trades cannot use a content floor — a trade is a point-in-time event, so a floor loses prints, which is why the windowed dedup exists — and they cannot use the window either when the id is `0`. Authority is the only mechanism left, and it is the same argument that makes `book` single-arm.
+>
+> Note the two halves compose rather than conflict: row ownership picks *which row* emits, arm authority picks *which arm within it*. Both are needed, and the `trade_id == 0` bypass is only sound once both hold.
+
 **Why:** the two Lashay groups are separately subscription-gated, so a host may be subscribed to the market-by-price group and not the top-of-book one. That host's WebSocket output must still carry a tape — a consumer that never receives the top-of-book feed on the wire still needs one. So both rows carry `emit_trades: true`, and *which one actually emits* becomes a runtime decision.
 
-The invariant to preserve is the one that licenses Task 1's `trade_id == 0` bypass: **at most one tape emitter per venue at any moment.** Two active emitters would duplicate every FIX-sourced print, because a bypassed `0` has no window to collapse against. Ownership rule: **the top-of-book row owns a venue's tape whenever it is active; otherwise the highest-priority active row that carries one does.**
+The invariant to preserve is the one that licenses Task 1's `trade_id == 0` bypass: **at most one tape emitter per venue at any moment** — see the amendment above: that means one row *and* one arm within it. Two active emitters would duplicate every FIX-sourced print, because a bypassed `0` has no window to collapse against. Ownership rule: **the top-of-book row owns a venue's tape whenever it is active; otherwise the highest-priority active row that carries one does.**
 
 The reconciler is already the single activation authority and already recomputes the active set every tick, so it is the only place that knows the answer. Ownership is published as a shared flag the processor reads per trade rather than baked into the task at spawn time — a flag flip costs an atomic load, whereas making ownership part of the task key would abort and respawn a healthy receiver (dropping its books and reference data) every time the peer feed's subscription changed.
 
@@ -4241,11 +4344,11 @@ The reconciler is already the single activation authority and already recomputes
   ```
   `run_feed` gains a `tape: TapeOwner` parameter, replacing `feed.emit_trades` as what the processors gate on. `TobProcessor::new`, `MidpointProcessor::new`, `MboProcessor::new` and `MbpProcessor::new` take `TapeOwner` in place of `emit_trades: bool`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 12's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/reconcile.rs`:
 
@@ -4332,7 +4435,7 @@ Add to `mod tests` in `src/ingest/processor.rs`:
 
 Fill both comment-only bodies — the comments state the assertions; write them.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib reconcile::tests::top_of_book_owns
@@ -4340,7 +4443,7 @@ cargo test --lib reconcile::tests::top_of_book_owns
 
 Expected: FAIL to compile — `cannot find function 'tape_owners'`.
 
-- [ ] **Step 4: Implement the pure ownership rule**
+- [x] **Step 4: Implement the pure ownership rule**
 
 In `src/ingest/reconcile.rs`:
 
@@ -4391,7 +4494,7 @@ pub fn owns(owner: &FeedKey, key: &FeedKey) -> bool {
 }
 ```
 
-- [ ] **Step 5: Publish ownership from the reconcile loop**
+- [x] **Step 5: Publish ownership from the reconcile loop**
 
 `Reconciler` gains `tapes: HashMap<FeedKey, TapeOwner>`. In `apply_feeds`, create the flag before spawning a receiver and pass a clone into `run_feed`; drop the entry when a task is aborted or reaped, alongside the existing handle cleanup.
 
@@ -4411,13 +4514,13 @@ After the spawn/abort diff is applied — so the set is final for this tick — 
 
 `Relaxed` is right: the flag is advisory per-message policy, not a synchronization edge — a trade decided against a one-tick-stale value is at worst one duplicated or one dropped print at a subscription boundary, and there is no invariant that requires the flip to be observed atomically with anything else.
 
-- [ ] **Step 6: Thread the flag to the processors**
+- [x] **Step 6: Thread the flag to the processors**
 
 `run_feed` takes `tape: TapeOwner` and hands it to whichever processor it constructs, replacing `feed.emit_trades`. Each processor stores it and replaces its `if self.emit_trades` guard with `if self.tape.load(Ordering::Relaxed)`.
 
 `Feed.emit_trades` stays — it is now the *static capability* ("this protocol carries a tape at all"), which `tape_rank` already encodes per kind. Rather than keep two sources of truth, make `run_feed` pass `Arc::new(AtomicBool::new(false))` for a row with `emit_trades: false` and never flip it: the reconciler only ever considers kinds `tape_rank` admits, so the two agree by construction. Add a `FEEDS` test asserting they do — `emit_trades` is true exactly when `tape_rank(kind).is_some()` — so a future row cannot declare a capability the ownership rule will not honor.
 
-- [ ] **Step 7: Replace the static invariant test**
+- [x] **Step 7: Replace the static invariant test**
 
 In `src/ingest/feeds.rs`, delete `at_most_one_trade_emitting_row_per_venue` (Task 1's static form — a venue may now legitimately have two tape-bearing rows) and replace it with the capability-agreement test from Step 6:
 
@@ -4441,7 +4544,7 @@ In `src/ingest/feeds.rs`, delete `at_most_one_trade_emitting_row_per_venue` (Tas
 
 Expose `pub fn tape_rank_is_some(kind: FeedKind) -> bool` rather than making `tape_rank` public — the rank values are an internal ordering, not a contract.
 
-- [ ] **Step 8: Add the metric**
+- [x] **Step 8: Add the metric**
 
 ```rust
             tape_owner_changes: counter_vec(
@@ -4454,7 +4557,7 @@ Expose `pub fn tape_rank_is_some(kind: FeedKind) -> bool` rather than making `ta
             ),
 ```
 
-- [ ] **Step 9: Run everything**
+- [x] **Step 9: Run everything**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -4462,7 +4565,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass, including the existing `reconcile` plan tests and `tests/e2e.rs`.
 
-- [ ] **Step 10: Document and commit**
+- [x] **Step 10: Document and commit**
 
 `README.md`'s activation table: note that a venue's tape follows its active feeds — top-of-book owns it when subscribed, the market-by-price feed takes over when it is the only subscribed one, so a depth-only deployment still serves `trade`. Add the metric to `docs/metrics.md`. `CHANGELOG.md` under Unreleased → Changed: one line.
 
@@ -4475,7 +4578,7 @@ git commit -m "feat(reconcile): hand a venue's trade tape to whichever feed is a
 
 ## Task 14: the Lashay feed rows
 
-**Blocked on the group-code question** at the top of this plan — which now has two parts: both codes, and the top-of-book group address. Do not start this task until both are answered. Everything else in the plan is independent of them.
+~~**Blocked on the group-code question** at the top of this plan — which now has two parts: both codes, and the top-of-book group address. Do not start this task until both are answered. Everything else in the plan is independent of them.~~ **Unblocked and built** (`5a8bc78`, PR #113): both codes resolved via option (1) and the top-of-book group came from the 2026-08-07 captures. The code steps all landed; only Step 7 (live verification) is outstanding, and it is gated on the upstream rename rather than on anything in this plan. The `<neutral-tob-code>` / `<neutral-mbp-code>` placeholders in Steps 4 and 5 below shipped as `lashay-1` and `lashay-2`.
 
 **Why last:** the rows are what turn the machinery on, so they land only once every piece under them is tested. Two rows on two separately-gated groups: the perps top-of-book group (where the `trade_id == 0` fix from Task 1 first becomes load-bearing, since this is the first FIX-sourced feed the bridge binds) and the perps market-by-price group.
 
@@ -4488,11 +4591,11 @@ git commit -m "feat(reconcile): hand a venue's trade tape to whichever feed is a
 - Consumes: `FeedKind::MarketByPrice` (Task 11), `ArbitrationMode::Sticky` (Task 3), `reconcile::tape_owners` (Task 13).
 - Produces: nothing further; this is the top of the stack.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 13's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/feeds.rs`:
 
@@ -4559,7 +4662,7 @@ Add to `mod tests` in `src/ingest/feeds.rs`:
     }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib feeds::tests::lashay
@@ -4567,7 +4670,7 @@ cargo test --lib feeds::tests::lashay
 
 Expected: FAIL — `assertion failed: left == right; left: 0, right: 2`.
 
-- [ ] **Step 4: Re-key the group-code test on `(venue, kind)`**
+- [x] **Step 4: Re-key the group-code test on `(venue, kind)`**
 
 `every_feed_has_a_group_code` **panics on an unknown venue** (`feeds.rs:296`), so adding any row breaks it until the match is extended. But this is not just a new arm: the test is a `venue → code` map, and it asserts every row of a venue carries the *same* code. Lashay's two rows carry **different** codes, so the map's shape is wrong and must be re-keyed on `(venue, kind)`:
 
@@ -4590,7 +4693,7 @@ Both codes come from the blocking question's answer. **Neither may name the venu
 
 Note this also tightens the test: it previously accepted any `kind` for a known venue, so a Hyperliquid `Midpoint` row would have silently inherited `tiredsolid`. Now every `(venue, kind)` pair is enumerated explicitly.
 
-- [ ] **Step 5: Add the rows**
+- [x] **Step 5: Add the rows**
 
 **Two groups, two codes, gated independently.** Within each group the two arms share one port block and are distinguished only by datagram source IP, so **each protocol lists exactly one `FeedPublisher`** and its single receiver task sees two source IPs. That is the shared-port-block model `FeedPublisher`'s docs already describe — and it is precisely why Task 2's per-publisher reference-data state and Task 11's per-publisher book keying are prerequisites here rather than nice-to-haves.
 
@@ -4642,7 +4745,7 @@ Note this also tightens the test: it previously accepted any `kind` for a known 
 
 **Confirm the top-of-book group and both port blocks against the live deployment before committing.** Only the market-by-price row is known: group `233.84.178.4`, mkt 31000 / ref 41000 / snap 51000, measured and recorded in the design doc. The top-of-book row's **group address is unknown** — the design deliberately does not name it — and its port block above is **inferred** from the same base-port scheme. Both must come from deployment config. A wrong group or block shows up as a permanent `dz_receiver_up == 0` for that publisher rather than as an error, so it will not announce itself. `group_port_pairs_are_globally_unique` catches only a collision with an existing row, not a wrong-but-unused address.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -4650,7 +4753,9 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass. `venue_kind_pairs_are_unique`, `every_feed_has_at_least_one_publisher`, `publisher_base_ports_unique_within_a_feed`, `group_port_pairs_are_globally_unique`, `emit_trades_agrees_with_the_tape_ownership_rule` and `arbitration_mode_agrees_across_a_venues_rows` all cover the new rows automatically.
 
-- [ ] **Step 7: Verify against the live feed**
+- [x] **Step 7: Verify against the live feed**
+
+> ✅ **RAN 2026-08-08 against both live perps groups on mainnet-beta** (host subscribed to `lashay-1` + `lashay-2`, device `chi001-dz002`). Every item below passed. One defect was found and fixed in the process — `dz_mbp_orphan_snapshot_levels_total` counted declined rotations, so the `== 0` criterion below was unmeetable as written; see the *Results* block after this step. Two commands in this runbook were stale and are corrected inline.
 
 Run it three ways, because the third is the one the old static tape rule got wrong.
 
@@ -4659,7 +4764,10 @@ With the tunnel up and subscribed to both codes:
 ```bash
 cargo build --release
 sudo sysctl -w net.core.rmem_max=268435456
-RUST_LOG=info ./target/release/doublezero-edge-connect --iface doublezero1 --feed Lashay --ws-bind 0.0.0.0:8081
+# `--metrics-bind` is REQUIRED: it defaults to empty, and without it /metrics is never
+# exposed, so none of the checks below are readable.
+RUST_LOG=info ./target/release/doublezero-edge-connect --iface doublezero1 --feed Lashay \
+  --ws-bind 0.0.0.0:8081 --metrics-bind 127.0.0.1:9090
 ```
 
 Confirm, from `/metrics` and a WS client: `dz_receiver_up == 1` for both blocks; `dz_feed_up{venue="Lashay"} == 1`; `dz_arm_markets_held` shows both arms registered and one holding every market; `dz_arm_lead_ns` populating; `dz_mbp_orphan_snapshot_levels_total == 0`; `dz_mbp_crossed_total` at or near zero; a connecting client receives `instrument` messages then a `clear`-led re-baseline per market, then incremental batches. Cross-check one instrument's book against `marketbyprice-parser` pointed at the same group.
@@ -4668,14 +4776,35 @@ Confirm, from `/metrics` and a WS client: `dz_receiver_up == 1` for both blocks;
 
 ```bash
 # Top-of-book only: quotes and a tape, no books.
-RUST_LOG=info ./target/release/doublezero-edge-connect --iface doublezero1 --feed Lashay --ws-bind 0.0.0.0:8081 --publisher-port 30000
+# NOTE: 7576, not 30000. The 30000/40000 block in earlier drafts was inferred before the
+# 2026-08-07 captures; the row that shipped is `lashay-1` on 233.84.178.3:7576/7577.
+RUST_LOG=info ./target/release/doublezero-edge-connect --iface doublezero1 --feed Lashay \
+  --ws-bind 0.0.0.0:8081 --metrics-bind 127.0.0.1:9090 --publisher-port 7576
 ```
 
 With only the market-by-price code subscribed (or the top-of-book row otherwise inactive), confirm the WebSocket **still carries `trade`** and that `dz_tape_owner_changes_total{venue="Lashay"}` incremented once as ownership moved. Then re-subscribe the top-of-book code and confirm the tape moves back — one increment, no receiver respawn (`dz_receiver_up` for the market-by-price block must not blip to 0), and **no duplicated prints** in the overlap. That last check is the whole point of the invariant: a FIX-sourced print carries `trade_id == 0` and bypasses the dedup window, so a moment with two emitters would double every print with nothing to collapse them.
 
 **Also worth measuring here, and cheap now:** the recurrence-interval distribution of identical `(side, price, size)` within one arm against the inter-arm arrival skew. It needs only one arm and decides whether a windowed content dedup could ever be safe — i.e. whether `Sticky` is permanent or an interim. Record the result; do not act on it in this plan.
 
-- [ ] **Step 8: Document and commit**
+> **How to move a subscription at runtime.** `doublezero connect multicast --subscribe <codes>` does **not** mutate a live session — it re-provisions and leaves the group set alone (observed 2026-08-08). Use `doublezero multicast subscribe <codes>` / `unsubscribe <codes>`, which exist precisely for this and need no tunnel teardown. Narrowing a set does require `disconnect` then `connect multicast --subscribe <narrower set>`. Onchain propagation to `doublezero status` lags the CLI's success message by up to ~2 minutes, so poll rather than reading it once.
+
+### Step 7 results — 2026-08-08, mainnet-beta
+
+Every criterion passed. Full write-up in the verification report; the load-bearing findings:
+
+- **Both blocks healthy:** `dz_receiver_up == 1` for `tob/7576` and `mbp/31000`, `dz_feed_up == 1`, `dz_feed_stale_ms == 0`. Zero crossed books, divergence, buffer/level overflows, channel resets, book evictions or sequence gaps across the whole run.
+- **Arbitration works on real traffic.** Both arms registered (`148.51.121.69`, `148.51.120.6`); one arm held all 26 markets with no per-market flapping; a **margin-triggered re-election fired** (`dz_arm_authority_transfers_total{reason="margin"} 1`) and moved every market together. Arms measured ~2.3 ms apart.
+- **Book contents validated against the reference decoder:** 12 of 13 markets matched `marketbyprice-parser` **exactly** — every price and quantity, KXBTCPERP at 290 levels. The 13th differed by one level that provably oscillates `new`→`delete`→`new`→`delete` on the wire, i.e. our book was correct and more current than that snapshot instant.
+- **All three subscription shapes pass**, including the runtime handover the static rule got wrong: with only `lashay-2` subscribed, market-by-price owned and served the tape; subscribing `lashay-1` live moved ownership with `dz_tape_owner_changes_total` incrementing **exactly once**, and the reconciler log shows **one** `mbp` activation for the whole process — no abort, no respawn. 110 trade prints across the overlap, 110 distinct identities, **zero duplicated**, so the at-most-one-emitter invariant that licenses the `trade_id == 0` bypass held.
+- **Task 1's bypass is load-bearing here, not theoretical.** In the top-of-book-only run *all 52* prints arrived with `trade_id == 0`. `dz_trades_no_id_conflict_total` stayed 0 in every configuration.
+- **Defect found and fixed** (`7ccdcf4`): `dz_mbp_orphan_snapshot_levels_total` counted every level of a rotation the book *declined* (`Ready` and past its `Last Instrument Seq` — correct per §4.2), which is the steady state, so it read ~415/s — 100% of the feed's snapshot-level rate — burying the anomaly it exists to surface. Declined rotations now hold the route marked `accepted: false` and are counted by `dz_mbp_declined_rotation_levels_total`. **Alert on the orphan series, not the declined one.**
+- **Residual worth raising upstream:** with the noise gone, ~2.6% of snapshot levels arrive with no `SnapshotBegin`. Reproduced independently by `marketbyprice-parser` on the same group, spread evenly rather than clustered at start, with zero host-side UDP/socket/buffer errors — so upstream loss or reordering, not a receive-side defect.
+
+**Answer to the content-dedup question: `Sticky` is permanent, not an interim.** Over 41,825 level updates, 72.4% repeated an earlier `(side, price, size)` signature, and the **shortest within-arm recurrence was 2.255 ms against a mean inter-arm skew of ~2.25 ms**. Any window wide enough to collapse a cross-arm duplicate also collapses a genuine within-arm repeat, leaving a subscriber holding a stale quantity at a price with liquidity. There is no safe window at any size; the flip to `Coordinated` still depends on the venue supplying per-entry timestamps, exactly as the design says.
+
+**Not re-validated:** three of the four fixture-less `codec_mbp` types still have no live confirmation — no `BookClear`, `InstrumentReset` or `EndOfSession` appeared in the capture windows (`BatchBoundary` did, and drives the crossed-book check that stayed clean).
+
+- [x] **Step 8: Document and commit**
 
 `README.md`: add Lashay to the feed table and to the activation table (subscription-gated like every other market-data feed). `CHANGELOG.md` under Unreleased → Added: the two rows, the incremental `book` product, the `channel`/`type` filters, and single-arm arbitration — four lines, not four paragraphs.
 
@@ -4684,7 +4813,7 @@ git add -A
 git commit -m "feat(feeds): ingest the Lashay perps top-of-book and market-by-price groups"
 ```
 
-- [ ] **Step 9: Check the venue naming before any push**
+- [x] **Step 9: Check the venue naming before any push**
 
 ```bash
 grep -rn '[A-Za-z]Lashay\|Lashay[-_][a-z]' src tests examples
