@@ -47,7 +47,8 @@ dedup tracked slots, per-destination sends). Labels are deliberately low-cardina
 
 The WebSocket sink implements the [PROTOCOL.md](../PROTOCOL.md) v1 surface: on connect it
 replays the instrument snapshot (precision first) then the latest depth per symbol, then streams
-quotes/trades/midpoints/depth, with optional per-client subscribe/unsubscribe filtering and
+quotes/trades/midpoints/depth, with optional per-client subscribe/unsubscribe filtering (by `venue`,
+`symbol`, `channel` and message `type`, with a replay scoped to each new subscription) and
 heartbeat/limit enforcement.
 
 > **Note:** when running via the installer one-liner, set these as env vars before the pipe (or

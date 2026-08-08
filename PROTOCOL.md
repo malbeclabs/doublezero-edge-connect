@@ -28,8 +28,9 @@ On each new connection the producer:
 
 1. **Replays the current instrument definitions** - one `instrument` message per known symbol -
    so the consumer knows precision **before** the first quote/depth.
-2. **Replays the latest `depth`** per symbol (full-state order book), if any.
-3. **Streams** `quote`/`trade`/`midpoint`/`depth` messages as they arrive, fanned out to all
+2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and
+   for a Market-by-Price venue a `book` re-baseline (a `clear` plus the complete level set).
+3. **Streams** `quote`/`trade`/`midpoint`/`depth`/`book` messages as they arrive, fanned out to all
    connected consumers.
 
 ```
@@ -50,6 +51,7 @@ Every message is a JSON object tagged by a `type` field (`snake_case`):
 | `trade`      | A trade print (last sale).               |
 | `midpoint`   | A single derived mid price.              |
 | `depth`      | A full order-book depth snapshot.        |
+| `book`       | A batch of incremental order-book level changes. |
 | `status`     | A venue-level feed-health transition.    |
 
 Consumers **must ignore unknown `type` values and unknown fields** (forward compatibility).
@@ -216,6 +218,48 @@ client that connects mid-stream is replayed the latest `depth` per symbol on con
 > full-state `depth` (and `trade`) product. Raw order add/cancel/execute events are intentionally
 > **not** on the wire.
 
+### `book`
+
+```json
+{"type":"book","venue":"Lashay","symbol":"KXBTCPERP","channel":2,"instrument_id":41,
+ "changes":[{"action":"update","side":"bid","price":0.6200,"size":150},
+            {"action":"delete","side":"ask","price":0.6300,"size":0}],
+ "snapshot":false,"last":true,
+ "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
+ "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
+```
+
+A batch of **incremental** price-level changes for one instrument, derived in the producer from the DZ Edge Market-by-Price feed. Unlike `depth`, a `book` message is not full state: apply the changes in order to the book you already hold.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `type` | string | `"book"`. |
+| `venue` | string | Venue code. |
+| `symbol` | string | **Display label.** Not guaranteed unique — see *Identity* below. |
+| `channel` | uint32 | The publisher's channel id: the instrument set this feed carries. Filterable. |
+| `instrument_id` | uint32 | Instrument id, unique within `channel`. |
+| `changes` | object[] | Level changes, in order. `{ "action", "side", "price", "size" }`. |
+| `changes[].action` | string | `"clear"`, `"update"`, or `"delete"`. |
+| `changes[].side` | string | `"bid"`, `"ask"`, or `"both"` (`"both"` only on a `clear`). |
+| `changes[].price` | number | Price of the level (decimal). Ignored for a `clear`. |
+| `changes[].size` | number | The level's **absolute** resulting size (decimal), not a delta. `0` on a `delete`. |
+| `snapshot` | bool | Advisory: this batch is part of a rebuild. **Not** what re-baselines you. |
+| `last` | bool | This is the final batch of a logical book event. |
+| `source_ts_ns` | uint64 | Timestamp of the latest applied book event; `0` if unknown. |
+| `recv_ts_ns` | uint64 | When the producer built this batch, ns since epoch. |
+| `kernel_rx_ts_ns` | uint64 | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable. |
+| `ws_send_ts_ns` | uint64 | Wall clock the instant this batch is serialized; shared by all consumers of this message. `0` if unset. |
+
+**Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. An `instrument` message carries `venue` and `symbol` only, so joining a book to its definition means joining on `symbol` — sound where `symbol` is unique, which holds for perpetual futures (at most 11 bytes, so never truncated) and does not hold for longer tickers. `channel` and `instrument_id` on `instrument` are a planned addition.
+
+**Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative source changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
+
+**`last` is mandatory and must be honored.** A consumer that buffers a logical event until its final batch will wait forever if it is dropped — including on a re-baseline whose only change is the `clear`.
+
+**Gap detection is the producer's job.** The producer runs the upstream feed's snapshot+delta recovery internally, per publisher, and re-serves only sequences it has verified as contiguous. There are no sequence numbers on the wire and a consumer needs no gap machinery of its own: a recovery surfaces as a re-baseline.
+
+**One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed. The producer elects one authoritative publisher per market and republishes only its stream, so a consumer sees one coherent book and never has to merge two. A failover surfaces as a re-baseline.
+
 ### `status`
 
 ```json
@@ -253,9 +297,15 @@ A consumer may send control messages (JSON text frames) to filter the stream. **
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "venue"?: string, "symbol"?: string }` - an **omitted field matches
-any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue). `venue` is matched
-**case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol` is matched exactly.
+A subscription filter is `{ "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue` is matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+
+`venue`, `symbol` and `channel` are **scope** dimensions - which markets - and `type` is a **kind** dimension: which messages. The two behave differently on purpose.
+
+A scope dimension never excludes a message that is not about one market. A message type that carries no channel (everything except `book`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects book updates on channel 2 and nothing else - except `instrument`, which passes, because a client that cannot see a definition cannot scale the book it just subscribed to. A channel-filtered client currently receives every instrument definition its `venue`/`symbol` fields allow, not just that channel's, because `instrument` carries no channel yet (see *Identity* under [`book`](#book)). Likewise a venue-level message (`status`) carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
+
+A `type` filter is **absolute**: it delivers that message type and nothing else, including no `instrument` and no `status`. Filters are a union, so a consumer that wants books plus reference data and health subscribes to each - `{"type":"book"}`, `{"type":"instrument"}`, `{"type":"status"}` - or omits `type` and scopes by `venue`/`symbol`/`channel` instead. A client that sets `type` and never asks for `instrument` gets the connect-time replay of the definitions that exist then, and no later ones; that is the filter it asked for.
+
+`symbol` cannot select a single `book` market where a venue's tickers collide under truncation (see *Identity* under [`book`](#book)); such a subscription delivers every colliding market's book. Filtering `book` down to one market is not expressible in v1.
 
 **Client -> server:**
 
@@ -274,8 +324,9 @@ any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue). `ve
 ```
 
 Unknown/malformed control messages get `{"channel":"error","error":"unrecognized message"}` and
-are otherwise ignored. Instrument definitions are always replayed on connect regardless of
-subscriptions.
+are otherwise ignored.
+
+Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
 
 ## Heartbeat & liveness
 
@@ -319,6 +370,11 @@ on connect:
       "depth":                                       # full snapshot each message (self-healing)
         inst = instrument(msg.venue, msg.symbol)
         replace_book(inst, msg.bids, msg.asks)       # overwrite, don't merge
+      "book":                                        # incremental; apply in order
+        book = book_for(msg.venue, msg.channel, msg.instrument_id)
+        for c in msg.changes:                        # "clear" re-baselines, not msg.snapshot
+          apply(book, c.action, c.side, c.price, c.size)
+        if msg.last: publish(book)                   # honor `last` or you wedge
       _: ignore        # unknown type
     # ignore unknown fields throughout
   reply Pong to Ping; reconnect on close.
@@ -341,10 +397,11 @@ on connect:
 
 ## Versioning & compatibility
 
-- This document defines **v1**, which includes: the `instrument`/`quote`/`trade`/`midpoint`/`depth`
-  data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
+- This document defines **v1**, which includes: the `instrument`/`quote`/`trade`/`midpoint`/`depth`/
+  `book` data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
+- **`depth` is deprecated.** It is the full-state top-*N* product served from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally. `depth` is removed in v2, when the Market-by-Order feed migrates to `book`. Until then both are served: `book` for Market-by-Price feeds, `depth` for Market-by-Order ones. New consumers should implement `book`.
 - There is no `v` field on the wire; the contract is this spec plus the
   **forward-compatibility rule**: consumers ignore unknown message types and unknown fields,
   so additive changes are non-breaking. A future revision may add an explicit `v` field.
