@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `dz_mbp_orphan_snapshot_levels_total` counted every level of a snapshot rotation the book
+  **deliberately declined**, not just genuinely unroutable ones. A book that is `Ready` and already
+  past a rotation's `Last Instrument Seq` refuses it by design, but refusing opened no route, so its
+  levels fell through the same branch as a lost `SnapshotBegin`. Publishers rotate snapshots
+  continuously, so once the books sync this is the steady state: measured against the live Lashay
+  perps groups, it was ~415 levels/s — 100% of the feed's snapshot-level rate — which buried the
+  anomaly the counter exists to surface. A declined rotation now holds the route with an `accepted:
+  false` marker (so its levels stay attributable and out of a neighbouring instrument's book) and is
+  counted by the new `dz_mbp_declined_rotation_levels_total`, leaving the orphan counter to mean what
+  its name says. With the noise removed, the live feed shows a genuine residual of ~2.6% of snapshot
+  levels arriving with no `SnapshotBegin` — independently reproduced by `marketbyprice-parser` on the
+  same groups, with zero host-side UDP or socket errors, so it is upstream loss or reordering rather
+  than a receive-side defect.
 - Five Hyperliquid publishers that had been live on `tiredsolid` since mid-June were missing from
   the feed registry, so the bridge bound 6 of 11 port blocks and ingested roughly a third of the
   group's datagrams — including none of the three highest-volume Top-of-Book blocks or the

@@ -200,6 +200,7 @@ pub struct Metrics {
     /// `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups,
     /// or a lost `SnapshotBegin`.
     pub mbp_orphan_snapshot_levels: IntCounterVec,
+    pub mbp_declined_rotation_levels: IntCounterVec,
     /// Deltas discarded as duplicates (`seq` at or below the applied baseline). A `Ready` book
     /// emitting nothing but duplicates is the signature of a baseline installed above the
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
@@ -571,7 +572,18 @@ impl Metrics {
                 &registry,
                 "dz_mbp_orphan_snapshot_levels_total",
                 "SnapshotLevel with no open group to route it to (interleaved groups, or a lost \
-                 SnapshotBegin)",
+                 SnapshotBegin). An anomaly: a level that should have been attributable was not. \
+                 A rotation the book deliberately declined is NOT counted here — see \
+                 dz_mbp_declined_rotation_levels_total.",
+                &["venue"],
+            ),
+            mbp_declined_rotation_levels: counter_vec(
+                &registry,
+                "dz_mbp_declined_rotation_levels_total",
+                "SnapshotLevel belonging to a rotation the book declined because it is already \
+                 synced past it. Expected and benign: publishers rotate snapshots continuously, so \
+                 in steady state this tracks the feed's whole snapshot-level rate. Counted apart \
+                 from the orphan counter so a real orphan stays visible.",
                 &["venue"],
             ),
             mbp_duplicate_deltas: counter_vec(
@@ -868,6 +880,9 @@ mod tests {
         m.mbp_orphan_snapshot_levels
             .with_label_values(&["Lashay"])
             .inc();
+        m.mbp_declined_rotation_levels
+            .with_label_values(&["Lashay"])
+            .inc();
         m.mbp_duplicate_deltas.with_label_values(&["Lashay"]).inc();
         m.mbp_crossed.with_label_values(&["Lashay"]).inc();
         m.mbp_divergence
@@ -914,6 +929,7 @@ mod tests {
             "dz_mbp_buffer_overflows_total",
             "dz_mbp_level_overflows_total",
             "dz_mbp_orphan_snapshot_levels_total",
+            "dz_mbp_declined_rotation_levels_total",
             "dz_mbp_duplicate_deltas_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",

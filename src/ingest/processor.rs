@@ -1077,6 +1077,16 @@ type PriceBookKey = (IpAddr, u8, u32);
 struct OpenGroup {
     instrument_id: u32,
     snapshot_id: u32,
+    /// Whether the book took the rotation. A **declined** one still holds the route — its levels
+    /// arrive either way, and only a route makes them attributable — but they are discarded
+    /// instead of applied, and counted as declined rather than as orphans.
+    ///
+    /// Declining is the ordinary steady state, not an error: a book that is `Ready` and already
+    /// past the rotation's `Last Instrument Seq` refuses it (§4.2), and publishers rotate
+    /// snapshots continuously. Without this flag every level of every declined rotation scored as
+    /// an orphan, which on the live Lashay perps feed is ~100% of all snapshot levels — burying
+    /// the genuine anomaly the orphan counter exists to surface.
+    accepted: bool,
 }
 
 /// Market-by-Price processor: drives reference data per publisher, feeds level deltas and the
@@ -1636,19 +1646,31 @@ impl FrameProcessor for MbpProcessor {
                             OpenGroup {
                                 instrument_id: s.instrument_id,
                                 snapshot_id: s.snapshot_id,
+                                accepted: true,
                             },
                         );
                     } else if self
                         .open
                         .get(&group)
-                        .is_some_and(|g| g.instrument_id != s.instrument_id)
+                        .is_none_or(|g| g.instrument_id != s.instrument_id)
                     {
-                        // A refused begin for a DIFFERENT instrument than the one assembling means
-                        // the publisher interleaved groups: close the route so its levels are
-                        // orphaned and counted rather than landing in the open instrument's book.
-                        // A refused re-begin for the same instrument leaves the route alone — the
-                        // book deliberately keeps assembling (see `PriceBook::on_snapshot_begin`).
-                        self.open.remove(&group);
+                        // A refused begin with no route, or one for a DIFFERENT instrument than the
+                        // one assembling (the publisher interleaved groups). Either way take the
+                        // route for it: that keeps its levels out of the other instrument's book —
+                        // what the old `remove` achieved — while still attributing them, so a
+                        // declined rotation is not scored as an orphan.
+                        //
+                        // A refused re-begin for the SAME instrument leaves the route alone — the
+                        // book deliberately keeps assembling (see `PriceBook::on_snapshot_begin`),
+                        // and overwriting it would discard the levels of a live assembly.
+                        self.open.insert(
+                            group,
+                            OpenGroup {
+                                instrument_id: s.instrument_id,
+                                snapshot_id: s.snapshot_id,
+                                accepted: false,
+                            },
+                        );
                     }
                 }
                 codec_mbp::Message::SnapshotLevel(l) => {
@@ -1667,6 +1689,16 @@ impl FrameProcessor for MbpProcessor {
                             .inc();
                         continue;
                     };
+                    if !group.accepted {
+                        // The book declined this rotation because it is already synced past it. Its
+                        // levels are expected, carry nothing the book needs, and must not be
+                        // confused with an unroutable one.
+                        metrics()
+                            .mbp_declined_rotation_levels
+                            .with_label_values(&[ctx.venue])
+                            .inc();
+                        continue;
+                    }
                     let key = (ctx.publisher, channel, group.instrument_id);
                     self.with_book(&key, |b| {
                         b.on_snapshot_level(
@@ -1681,11 +1713,12 @@ impl FrameProcessor for MbpProcessor {
                 }
                 codec_mbp::Message::SnapshotEnd(e) => {
                     let group = (ctx.publisher, channel);
-                    if self
+                    let Some(open) = self
                         .open
                         .get(&group)
-                        .is_none_or(|g| g.instrument_id != e.instrument_id)
-                    {
+                        .copied()
+                        .filter(|g| g.instrument_id == e.instrument_id)
+                    else {
                         // A stray end for an instrument that is not the one assembling. Dropping it
                         // is the whole action: the open group belongs to another instrument and must
                         // keep assembling.
@@ -1696,8 +1729,14 @@ impl FrameProcessor for MbpProcessor {
                             "mbp SnapshotEnd for an instrument with no open group"
                         );
                         continue;
-                    }
+                    };
                     self.open.remove(&group);
+                    if !open.accepted {
+                        // A declined rotation closing. The route existed only to attribute its
+                        // levels; there is no assembly to install, and calling into the book here
+                        // would test sequences against a group it never opened.
+                        continue;
+                    }
                     let key = (ctx.publisher, channel, e.instrument_id);
                     touched.insert(e.instrument_id);
                     let installed = self
@@ -3819,6 +3858,89 @@ mod tests {
             before + 1
         );
         assert!(proc.books.is_empty(), "and it built no book to hold it");
+    }
+
+    /// A synced book **correctly** declines a rotation it does not need (§4.2: `Ready` plus a
+    /// `Last Instrument Seq` it has already applied). Its levels still arrive, and they are
+    /// counted apart from orphans rather than summed with them.
+    ///
+    /// This is the steady state, not an edge case: publishers rotate snapshots continuously, so
+    /// once the books sync every rotation is declined. Measured against the live Lashay perps feed
+    /// 2026-08-08, that was ~415 levels/s — 100% of the reference parser's ~410 levels/s — all of
+    /// it landing on the orphan counter and burying the genuine anomaly that counter exists to
+    /// surface (a lost `SnapshotBegin`, an interleaved group, or the stale epoch covered by
+    /// `mbp_a_stale_epoch_snapshot_neither_installs_nor_resets`).
+    #[test]
+    fn mbp_a_declined_rotation_is_counted_apart_from_orphans() {
+        let venue = "MbpDeclinedRotationTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+
+        proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &snap,
+        );
+        assert_eq!(drain_books(&mut rx).len(), 1, "the first rotation installs");
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+
+        let orphans = || {
+            metrics()
+                .mbp_orphan_snapshot_levels
+                .with_label_values(&[venue])
+                .get()
+        };
+        let declined = || {
+            metrics()
+                .mbp_declined_rotation_levels
+                .with_label_values(&[venue])
+                .get()
+        };
+        let before = (orphans(), declined());
+
+        // The next rotation for the same instrument: `Ready` and already at this
+        // `last_instrument_seq`, so `on_snapshot_begin` declines it — the correct call.
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                3,
+                &mbp_snapshot(
+                    41,
+                    2,
+                    0,
+                    0,
+                    &[
+                        (MBP_BID, 6200, 10),
+                        (MBP_BID, 6199, 20),
+                        (MBP_ASK, 6300, 30),
+                    ],
+                ),
+            ),
+            &snap,
+        );
+
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "declining republishes nothing, which is the point of declining"
+        );
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "and leaves the live book synced"
+        );
+        assert_eq!(
+            orphans(),
+            before.0,
+            "a declined rotation is not an orphan: nothing was unroutable"
+        );
+        assert_eq!(
+            declined(),
+            before.1 + 3,
+            "all three of its levels are counted as declined instead"
+        );
     }
 
     /// The authority gate decides which arm reaches the wire from per-market health, so a book
