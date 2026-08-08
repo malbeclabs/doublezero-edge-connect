@@ -14,9 +14,9 @@
 
 ## Progress
 
-**Status: Tasks 1–10 are done, every step. Tasks 11–14 remain.** That is the whole stack below the processor: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, single-arm authority and its matcher, the `channel`/`type` filters, the market-by-price decoder, the price book, and the incremental `book` wire message. Nothing on the ingest side is reachable from a running process yet — no `FeedKind`, no `FEEDS` row, no processor — so the branch is behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes, and Task 6/10's additive WS surface.
+**Status: Tasks 1–12 are done, every step. Tasks 13 and 14 remain.** That is everything but the feed rows and runtime tape ownership: the trade-tape fix, per-publisher reference data, the arbitration-mode seam, single-arm authority and its matcher, the `channel`/`type` filters, the market-by-price decoder, the price book, the incremental `book` wire message, the `MbpProcessor` and receiver, and the authority gate wired end to end. **The one thing still keeping it inert is that no `FEEDS` row selects `MarketByPrice`** — Task 14 — so the branch stays behaviour-neutral apart from Tasks 1 and 2, which are live bug fixes, and Task 6/10's additive WS surface.
 
-**Task 11 is next and nothing blocks it.** `MbpProcessor` is the piece that makes everything above reachable: it drives `PriceBook` from `codec_mbp`, emits `book`, and is where Task 12 then wires `authority` + `arm_race`. Two things it inherits that are not in its own section: it must key the open snapshot group and the per-instrument sequence **per `Channel ID`** (the live sports feed shards across three), and it must not restate the decoder's wire enums.
+**Task 13 is next.** Read its ⚠️ AMENDED block first: the invariant it exists to preserve is enforced only between `FEEDS` rows, but a row carries N publishers and both Lashay arms print `trade_id == 0`, so one active row with two live arms double-prints every trade. Routing `Trade` through the same venue authority `book` already uses is the fix, and it is a release blocker before Task 14's rows go live. Task 14 remains gated on the multicast group *codes* existing in the live deployment — its rows will compile, pass and stay **inert** until the rename, which is intended and will look like a bug.
 
 **Wire facts the fixture capture settled, which later tasks need.** Read `tests/fixtures/PROVENANCE.md` for the full record; these are the ones that change a decision:
 
@@ -38,9 +38,9 @@
 | 8 — `codec_mbp` price types | **done**, all steps (`1b003a3`, `f89e68b`; fixtures + real-frame tests in the Step 9 commit) |
 | 9 — `PriceBook` | **done** (`0f018cb`, `cc69ea6`, `e6bccee`; review fixes `503b6a6`, `3bf9a09`) |
 | 10 — `book` wire message | **done** (`294ac74`, `35c0c20`; PR #108) |
-| 11 — `MbpProcessor` | not started — **the next task, and nothing blocks it** |
-| 12 — book authority gate | not started |
-| 13 — runtime tape ownership | not started |
+| 11 — `MbpProcessor` | **done** (`4b9593d`, `523bbe2`; PR #111) |
+| 12 — book authority gate | **done** (`6934461`; PR #112) — the arbitration is **wired end to end**: `set_book_health` from `processor.rs`, and `on_trade` -> `observe_matched_lead` -> `close_window` from the arbiter |
+| 13 — runtime tape ownership | not started — **next**, and read its ⚠️ AMENDED block: row ownership is only half the invariant |
 | 14 — Lashay feed rows | **blocked** (see *Blocking open question*) |
 
 **Where the work lives.** All of it is on the single long-lived branch **`bdz/lashay-mbp`**, not one branch per task — see the amended bullet below. It was first built as four stacked-in-name-only PRs (#100–#103, all off `main`), reviewed as a set, then combined and closed in favour of this branch.
@@ -3771,11 +3771,11 @@ git commit -m "feat(protocol): add the incremental book message"
 - Consumes: `codec_mbp` (Tasks 7–8), `PriceBook`/`DeltaOp`/`BookDelta`/`Status`/`DeltaOutcome`/`Divergence` (Task 9), `NormalizedBook`/`BookChange`/`BookAction`/`BookSide` (Task 10), `PerPublisher` (Task 2), `MarketKey` (Task 4).
 - Produces: `FeedKind::MarketByPrice` (label `"mbp"`); `pub struct MbpProcessor` with `pub fn new(emit_trades: bool) -> Self`; `FrameCtx.channel_id: u8` (set by `drive` from the decoded frame header — see Step 5).
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 10's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/processor.rs`. Read the existing MBO processor tests first and reuse their harness (a `FrameCtx` builder over a `SharedArbiter` with a subscribed receiver, so emitted messages can be drained and asserted).
 
@@ -3871,7 +3871,7 @@ Add to `mod tests` in `src/ingest/processor.rs`. Read the existing MBO processor
 
 Fill each body against the MBO tests' harness. **Do not leave a test with a comment-only body** — the comments state the assertion; write it.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib processor::tests
@@ -3879,7 +3879,7 @@ cargo test --lib processor::tests
 
 Expected: FAIL to compile — `cannot find struct 'MbpProcessor'`.
 
-- [ ] **Step 4: Add the feed kind**
+- [x] **Step 4: Add the feed kind**
 
 In `src/ingest/feeds.rs`, add to `enum FeedKind` and `label()`:
 
@@ -3895,11 +3895,11 @@ In `src/ingest/feeds.rs`, add to `enum FeedKind` and `label()`:
 
 Extend `feed_kind_labels_are_stable` with `assert_eq!(FeedKind::MarketByPrice.label(), "mbp");`.
 
-- [ ] **Step 5: Carry `channel_id` on the frame context**
+- [x] **Step 5: Carry `channel_id` on the frame context**
 
 `MarketKey` and the wire message both need the channel, and it comes from the frame header — which `drive` does not decode (each processor decodes its own). So the processor reads it from its own decode and threads it through, rather than `FrameCtx` gaining a field it cannot fill. **Do not add `channel_id` to `FrameCtx`** — `drive` is protocol-agnostic by design and would have to decode a header it has no magic for. Correct the Interfaces note above accordingly: `MbpProcessor` takes `header.channel_id` from `codec_mbp::decode_frame` and passes it down its own call chain.
 
-- [ ] **Step 6: Implement `MbpProcessor`**
+- [x] **Step 6: Implement `MbpProcessor`**
 
 Add to `src/ingest/processor.rs`. Structure, mirroring `MboProcessor` where the shape carries over:
 
@@ -3972,7 +3972,7 @@ Then `on_datagram`, in order:
 
 `book_for` mirrors `MboProcessor::book_for`: gate on a resolved definition first (releasing the `state` borrow), then bound to `MAX_PRICE_BOOKS` with least-recently-inserted eviction, dropping the evicted key's `open`/`emitted_symbol` entries in lockstep.
 
-- [ ] **Step 7: Add the metrics**
+- [x] **Step 7: Add the metrics**
 
 Five counters in `src/metrics.rs`, all `&["venue"]` except the divergence one:
 
@@ -3984,11 +3984,11 @@ Five counters in `src/metrics.rs`, all `&["venue"]` except the divergence one:
 | `dz_mbp_crossed_total` | `venue` | Crossed inside markets observed at a consistency point. Observability only; never acted on. |
 | `dz_mbp_divergence_total` | `venue`, `kind` | `Action`-vs-quantity disagreements, by kind. Never changes the applied result. |
 
-- [ ] **Step 8: Wire the receiver**
+- [x] **Step 8: Wire the receiver**
 
 In `src/ingest/receiver.rs`'s `run_feed`, add the `MarketByPrice` arm. It is the `MarketByOrder` arm with `MbpProcessor::new(feed.emit_trades)` in place of `MboProcessor::new(depth, feed.emit_trades)` — same `FeedPorts::ThreePort` destructuring, same `bail!` on a two-port row, same three `PortRole`s. Update the `bail!` text to name Market-by-Price. Also update `PortRole::Snapshot`'s doc comment (`receiver.rs:63`) — it says "(Constructed once the MBO receiver lands)", which is now stale twice over — and drop its `#[allow(dead_code)]` if it is no longer needed.
 
-- [ ] **Step 9: Run the tests to verify they pass**
+- [x] **Step 9: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -3996,7 +3996,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 10: Document and commit**
+- [x] **Step 10: Document and commit**
 
 Add the five metrics to `docs/metrics.md`. In `docs/input-sources.md`, add Market-by-Price alongside the other protocols: three ports, one book per `(publisher, channel, instrument)`, the `MAX_PRICE_BOOKS` and buffer-budget bounds, and the note that the caps are per receiver task — so N publishers hold N times the per-task bound, the same documentation point the order-keyed processor already carries.
 
@@ -4024,11 +4024,11 @@ git commit -m "feat(ingest): add the market-by-price processor and receiver"
 - Consumes: `StickyAuthority`/`AuthorityConfig`/`MarketKey` (Tasks 4–5), `NormalizedBook`/`BookAccumulator`/`BookSnapshot` (Task 10), `Arbiter::mode_for` (Task 3).
 - Produces: `Arbiter::new(tx, trade_window, authority: AuthorityConfig)`; `Arbiter::set_book_replay(&mut self, books: BookSnapshot)`; `Arbiter::close_authority_windows(&mut self)`; `ws::serve(listener, tx, instruments, depth, books, cfg)`.
 
-- [ ] **Step 1: Branch**
+- [x] **Step 1: Branch**
 
 Branch off Task 11's final commit.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Add to `mod tests` in `src/ingest/arbiter.rs`:
 
@@ -4166,7 +4166,7 @@ Add `fn test_authority_cfg() -> AuthorityConfig` to the test module with `sample
 
 Add to `tests/dedup.rs` an integration test replaying two arms' interleaved MBP frames (once the Task 8 fixture exists; otherwise synthesize the two arms from the codec's own encoders as `tests/dedup.rs` already does for other cases) and asserting: exactly one arm's `book` messages reach a WS client, and applying them in order reproduces the authoritative arm's `PriceBook` level-for-level.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 ```bash
 cargo test --lib arbiter::tests::book_
@@ -4174,7 +4174,7 @@ cargo test --lib arbiter::tests::book_
 
 Expected: FAIL — `book_publishes_one_arm_only` asserts 5 but gets 10 (the Task 10 passthrough).
 
-- [ ] **Step 4: Add the authority to the arbiter**
+- [x] **Step 4: Add the authority to the arbiter**
 
 In `src/ingest/arbiter.rs`:
 
@@ -4192,7 +4192,7 @@ In `src/ingest/arbiter.rs`:
 
 `Arbiter::new` gains an `authority: AuthorityConfig` parameter and initializes `books: StickyAuthority::new(authority)`, `book_replay: None`. Add `set_book_replay`, mirroring `set_depth_replay`.
 
-- [ ] **Step 5: Replace the passthrough with the gate**
+- [x] **Step 5: Replace the passthrough with the gate**
 
 ```rust
             FeedMessage::Book(b) => {
@@ -4237,7 +4237,7 @@ In `src/ingest/arbiter.rs`:
 
 Add `book_dropped: IntCounter` to `VenueMetrics` backed by a new `dz_book_dropped_total{venue}`. `arm_ordinal` is called for its side effect of registering the arm and logging the ordinal-to-IP mapping once; keep the `let _ = arm;` only if clippy objects to the unused binding, otherwise drop the binding and call it as a statement.
 
-- [ ] **Step 6: Drive the re-election window**
+- [x] **Step 6: Drive the re-election window**
 
 ```rust
     /// Close every elapsed re-election window, transferring authority where a challenger cleared
@@ -4262,7 +4262,7 @@ In `src/main.rs`, spawn a task that ticks every `arb_sample_interval_secs` and c
 
 **Note on the transfer's consumer effect:** a transfer means the next batch comes from a different arm whose delta series is unrelated to the old one's. The processor for the new arm holds its own `Ready` book, so its next emission is an ordinary incremental batch — which a consumer would apply on top of the *old* arm's state. That is wrong. **A transfer must force a re-baseline.** Implement it here: on a transfer, materialize the replay accumulator for that market, `clear` it, and broadcast the new arm's full state as a `snapshot: true, last: true` re-baseline before its next incremental batch. The simplest correct form is to drop the accumulator entry and set a per-market `needs_rebaseline` flag the `Book` arm checks: while set, the first admitted batch from the new arm is replaced by `to_book()` of that arm's state — but the arbiter does not hold that arm's book. So instead: on transfer, emit a `Clear`-only re-baseline (`changes: [clear both]`, `snapshot: true`, `last: true`) immediately, and clear the accumulator. The consumer's book empties, and the new arm's subsequent incremental batches rebuild it. A lone clear is an explicitly legal message (Task 10 pins it), and `last: true` on it is exactly why that field is mandatory. Add a test: after a margin transfer, the next broadcast for that market is a clear-only re-baseline.
 
-- [ ] **Step 7: Replay the book on connect and subscribe**
+- [x] **Step 7: Replay the book on connect and subscribe**
 
 Thread `books: BookSnapshot` through `ws::serve` → `serve_client` → `replay_scoped`, and extend `replay_scoped` to materialize matching accumulators after the instruments and alongside `depth`:
 
@@ -4279,7 +4279,7 @@ Thread `books: BookSnapshot` through `ws::serve` → `serve_client` → `replay_
 
 `BookAccumulator` needs a `pub fn symbol(&self) -> &str`. Chain `live` into the existing send loop, after `snapshot` and `books`' `depth` entries. Update `main.rs`'s `ws::serve` call and the existing `ws` tests' call sites.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [x] **Step 8: Run the tests to verify they pass**
 
 ```bash
 cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -4287,7 +4287,7 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 Expected: all pass.
 
-- [ ] **Step 9: Document and commit**
+- [x] **Step 9: Document and commit**
 
 `PROTOCOL.md`: in the `book` section's "One book per market" paragraph, add that a failover surfaces as a `clear`-only re-baseline followed by the new source rebuilding the book, so a consumer that honors `clear` needs no other handling. Add `dz_book_dropped_total` to `docs/metrics.md` and the `arm_transfers` `reason` values (`elected`, `margin`, plus `health`/`silence` if Task 4's transfers are also counted — wire those counters here if they were left unwired).
 
