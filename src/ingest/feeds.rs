@@ -146,11 +146,13 @@ pub struct Feed {
     /// spawned per entry. A feed whose publishers all share one port block lists exactly one
     /// entry (see [`FeedPublisher`]).
     pub publishers: &'static [FeedPublisher],
-    /// Whether this feed *can* carry the venue's `trade` tape. A static capability claim only —
-    /// which claiming row actually serves it is the reconciler's runtime decision
-    /// (`reconcile::tape_owners`), because a venue's rows are separately subscription-gated and the
-    /// tape must survive on whichever subset is up. Pinned against the ranking by
-    /// `emit_trades_agrees_with_the_tape_ownership_rule`.
+    /// Whether this feed *can* carry the venue's `trade` tape — the registry's declaration of intent,
+    /// **not a runtime gate**: nothing reads it on the emit path, and setting it `false` on a
+    /// tape-ranked kind suppresses nothing. Which claiming row actually serves the tape is the
+    /// reconciler's decision (`reconcile::tape_owners`), because a venue's rows are separately
+    /// subscription-gated and the tape must survive on whichever subset is up.
+    /// `emit_trades_agrees_with_the_tape_ownership_rule` is what ties the declaration to that
+    /// ranking, so a disagreeing row fails the build rather than behaving unexpectedly.
     pub emit_trades: bool,
     /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
@@ -647,16 +649,17 @@ mod tests {
         );
     }
 
-    /// Within a publisher's block the offsets follow the publisher implementation, not the venue:
-    /// the Hyperliquid role spaces them `+1`/`+2`, the Lashay one `+10000`/`+20000` (and so does its
-    /// sports feed: 33010/43010/53010). The base port is free-form since v0.7, so this spacing is
-    /// the only structural rule left — it is what an unseen block may be derived from (10901/10903
-    /// were derived this way from 10902), and a row that breaks *both* schemes is a transcription
-    /// error rather than a new layout.
+    /// Within a publisher's block the offsets follow the publisher implementation: `+1`/`+2` on every
+    /// Hyperliquid and Phoenix block and on `lashay-1`, `+10000`/`+20000` on `lashay-2` (and on the
+    /// sports market-by-price feed: 33010/43010/53010). The base port is free-form since v0.7, so this
+    /// spacing is the only structural rule left — it is what an unseen block may be derived from
+    /// (10901/10903 were derived this way from 10902), and a row that breaks *both* schemes is a
+    /// transcription error rather than a new layout.
     ///
-    /// Framed by scheme rather than carved out per venue so `lashay-3`/`lashay-4` do not re-trip it.
-    /// Lashay's exact blocks are pinned by `lashay_rows_match_the_deployment`, so widening this one
-    /// loses nothing.
+    /// Scoped **per row**, not per venue: Lashay's two rows legitimately use different schemes, and
+    /// framing it by scheme rather than by a venue carve-out is what keeps `lashay-3`/`lashay-4` from
+    /// re-tripping it. Lashay's exact blocks are pinned by `lashay_rows_match_the_deployment`, so
+    /// widening this one loses nothing.
     #[test]
     fn publisher_blocks_use_a_known_layout() {
         const SCHEMES: [u16; 2] = [1, 10_000];

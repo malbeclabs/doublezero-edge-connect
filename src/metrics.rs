@@ -95,16 +95,15 @@ pub struct Metrics {
     /// Trades admitted by the windowed dedup, attributed to the winning `publisher` (edge/public) —
     /// the trade-side mirror of [`quotes_admitted`].
     pub trades_admitted: IntCounterVec,
-    /// Trades collapsed before the wire: a duplicate `trade_id` still inside the dedup window, or —
-    /// on a `Sticky` venue — a non-serving arm's copy dropped by the per-venue tape gate. In steady
-    /// state on such a venue this is the challenger arm's whole print stream.
+    /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
     pub trades_dropped: IntCounterVec,
     /// Trades forwarded with the `trade_id == 0` sentinel, bypassing the dedup window.
     pub trades_no_id: IntCounterVec,
     /// Zero-id trades forwarded from a second publisher for a `(venue, symbol)` another publisher
     /// already owns — the tape is double-printing, since a bypassed sentinel has no window to
-    /// collapse against. `Coordinated` venues only in practice: on a `Sticky` venue the tape gate
-    /// upstream has already dropped the peer arm's copy.
+    /// collapse against. `Coordinated` venues only: a `Sticky` venue's single-emitter guarantee comes
+    /// from the tape gate upstream, which makes this latch redundant there and — since it cannot see a
+    /// gate-approved handover — wrong.
     pub trades_no_id_conflict: IntCounterVec,
     /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
     /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
@@ -166,6 +165,11 @@ pub struct Metrics {
     /// [`tape_owner_changes`](Self::tape_owner_changes), and the same read: each transfer is a window
     /// where a print may double or drop.
     pub tape_arm_transfers: IntCounterVec,
+    /// Prints the per-venue tape gate dropped as a non-serving arm's copy. Its own counter rather than
+    /// folded into [`trades_dropped`](Self::trades_dropped): on a `Sticky` venue the steady state is
+    /// the challenger arm's whole stream, so mixing the two would hide a gate holding the tape against
+    /// the arm that should have it inside expected noise.
+    pub tape_arm_dropped: IntCounterVec,
     /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
     /// authority is fragmented; all on one arm is the steady state.
     pub arm_markets_held: IntGaugeVec,
@@ -421,8 +425,7 @@ impl Metrics {
             trades_dropped: counter_vec(
                 &registry,
                 "dz_trades_dropped_total",
-                "Trades collapsed before the wire: a duplicate trade_id inside the window, or a \
-                 non-serving arm's copy dropped by a Sticky venue's tape gate",
+                "Trades dropped by the windowed dedup",
                 &["venue"],
             ),
             instruments_dropped: counter_vec(
@@ -535,6 +538,13 @@ impl Metrics {
                 "dz_tape_arm_transfers_total",
                 "Trade-tape ownership moving between a venue's arms. The arm-level twin of \
                  dz_tape_owner_changes_total.",
+                &["venue"],
+            ),
+            tape_arm_dropped: counter_vec(
+                &registry,
+                "dz_tape_arm_dropped_total",
+                "Prints the per-venue tape gate dropped as a non-serving arm's copy. In steady state \
+                 this is the challenger arm's whole print stream.",
                 &["venue"],
             ),
             mbp_channel_resets: counter_vec(
@@ -849,6 +859,9 @@ mod tests {
         m.arm_markets_held
             .with_label_values(&["Lashay", "arm0"])
             .set(1);
+        m.tape_owner_changes.with_label_values(&["Lashay"]).inc();
+        m.tape_arm_transfers.with_label_values(&["Lashay"]).inc();
+        m.tape_arm_dropped.with_label_values(&["Lashay"]).inc();
         m.mbp_channel_resets.with_label_values(&["Lashay"]).inc();
         m.mbp_buffer_overflows.with_label_values(&["Lashay"]).inc();
         m.mbp_level_overflows.with_label_values(&["Lashay"]).inc();
@@ -894,6 +907,9 @@ mod tests {
             "dz_arm_lead_ns",
             "dz_arm_authority_transfers_total",
             "dz_arm_markets_held",
+            "dz_tape_owner_changes_total",
+            "dz_tape_arm_transfers_total",
+            "dz_tape_arm_dropped_total",
             "dz_mbp_channel_resets_total",
             "dz_mbp_buffer_overflows_total",
             "dz_mbp_level_overflows_total",

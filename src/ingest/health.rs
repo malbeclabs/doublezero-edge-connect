@@ -150,6 +150,16 @@ impl FeedHealth {
         venue_up_in(&self.lock(), venue)
     }
 
+    /// Whether this receiver is registered **and currently down** — what the reconciler's tape
+    /// ownership demotes on.
+    ///
+    /// Deliberately not the negation of "up": a receiver spawned this tick has not registered yet
+    /// (registration follows the socket bind), and demoting it would bounce the tape to a peer row on
+    /// every activation and back on the next tick.
+    pub fn is_down(&self, key: &ReceiverKey) -> bool {
+        self.lock().up.get(key) == Some(&false)
+    }
+
     /// Record `key`'s liveness, publishing the venue edge if the aggregate flipped — so one
     /// `status` transition fires per venue change rather than one per receiver.
     pub fn set(&self, key: ReceiverKey, up: bool, on_edge: impl FnOnce(bool)) {

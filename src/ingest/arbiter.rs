@@ -541,9 +541,9 @@ pub struct Arbiter {
     /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
     no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
-    /// Which **arm** serves each `Sticky` venue's tape, and when it last printed. See
-    /// [`Arbiter::tape_arm_admits`]. One entry per `Sticky` venue that has ever printed.
-    tape_leader: HashMap<Arc<str>, (Publisher, u64)>,
+    /// Which **arm** serves each `Sticky` venue's tape. See [`Arbiter::tape_arm_admits`]. One entry
+    /// per `Sticky` venue that has ever printed.
+    tape_leader: HashMap<Arc<str>, TapeLead>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
     /// Whether the "batches carry no `last`" warning has fired.
@@ -563,6 +563,16 @@ pub struct Arbiter {
     /// instrument_id)`. Mirrors the serving arm's state: seeded from its accumulator on every
     /// re-baseline, then advanced by each admitted batch. `None` when no replay map is wired.
     book_replay: Option<BookSnapshot>,
+}
+
+/// Who serves one `Sticky` venue's trade tape, per [`Arbiter::tape_arm_admits`].
+struct TapeLead {
+    arm: Publisher,
+    /// That arm's last admitted print, for the silence handover.
+    last_ns: u64,
+    /// The book election this tape has already deferred to, so the deferral fires once per election
+    /// rather than on every print by the elected arm.
+    honored_election: Option<Publisher>,
 }
 
 /// Per-market state behind the `book` authority gate.
@@ -986,42 +996,95 @@ impl Arbiter {
     /// bypass's owner latch (keyed on the sentinel) nor [`WindowedDedup`] (keyed on the id). Gating on
     /// arm identity instead of on the id collapses that case and the two-different-real-ids one alike.
     ///
-    /// Three rules, each load-bearing:
+    /// Four rules, each load-bearing:
     ///
     /// - **No dark start.** With no entry the first arm to print leads. A top-of-book-only deployment
     ///   carries no `book` traffic, so `venue_leader` is `None` forever and electing first would drop
     ///   the venue's whole tape.
-    /// - **Defer to the book election.** A challenger the authority has elected takes over at once, so
-    ///   the tape converges on the arm serving the books. Sound because a publisher host uses one
-    ///   source IP for both of a venue's protocols, making arm identity shared across its rows.
+    /// - **Corroborated beats uncorroborated.** A challenger the authority tracks displaces an
+    ///   incumbent it does not, immediately. The incumbent slot is filled by whoever prints first, and
+    ///   the wire is unauthenticated: without this an early forged print would hold the tape and mute
+    ///   the real arms for as long as it kept printing inside the silence window. (It does not close
+    ///   that hole on a venue with no `book` traffic, where the authority tracks nobody — see below.)
+    /// - **Defer to the book election.** A challenger the authority has *elected* takes over at once,
+    ///   so the tape converges on the arm serving the books. Sound because a publisher host uses one
+    ///   source IP for both of a venue's protocols, making arm identity shared across its rows. Honored
+    ///   once per election, not per print: re-honoring it on every print would let an elected arm whose
+    ///   trade stream is nearly dead reclaim the tape from the healthy peer after each straggler and
+    ///   mute it for another window — the two rules would fight and the tape would sawtooth. A silence
+    ///   handover marks the election it overrode as spent, which is what closes that loop.
     /// - **Silence handover.** A challenger also takes over after [`NO_ID_TAPE_HANDOVER_NS`] of
     ///   incumbent silence — otherwise an elected arm whose *trade* stream is dead would mute the tape.
+    ///
+    /// ⚠️ Two limits, both inherited from the unauthenticated wire rather than introduced here. On a
+    /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged source that
+    /// prints first holds the tape until it goes quiet for a window — the same primitive
+    /// [`StickyAuthority::admit`]'s no-dark-start already exposes for the `book` product, and not
+    /// closable without an identity the wire does not carry. And the gate is **venue-wide**: it assumes
+    /// the owning row's arms mirror one tape, so if they instead sharded prints between them the
+    /// non-serving arm's exclusive fills would be dropped. `dz_tape_arm_dropped_total` is what makes
+    /// either visible — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose
+    /// steady state here is the challenger's whole stream.
     ///
     /// Applies to every publisher class uniformly, [`Publisher::PublicWs`] included; no `Sticky` venue
     /// has a public backstop today, and adding one needs this revisited.
     fn tape_arm_admits(&mut self, t: &NormalizedTrade, publisher: Publisher) -> bool {
         let elected = self.books.venue_leader(&t.venue);
-        let Some((leader, last_ns)) = self.tape_leader.get_mut(&t.venue) else {
-            self.tape_leader
-                .insert(t.venue.clone(), (publisher, t.recv_ts_ns));
+        let tracked = self.books.tracks_arm(&t.venue, publisher);
+        let Some(lead) = self.tape_leader.get_mut(&t.venue) else {
+            self.tape_leader.insert(
+                t.venue.clone(),
+                TapeLead {
+                    arm: publisher,
+                    last_ns: t.recv_ts_ns,
+                    honored_election: None,
+                },
+            );
             return true;
         };
-        let transfer = *leader != publisher;
-        if transfer
-            && elected != Some(publisher)
-            && t.recv_ts_ns.saturating_sub(*last_ns) <= NO_ID_TAPE_HANDOVER_NS
-        {
-            return false;
-        }
-        *leader = publisher;
-        *last_ns = t.recv_ts_ns;
+        let transfer = lead.arm != publisher;
         if transfer {
+            let displaces_uncorroborated = tracked && !self.books.tracks_arm(&t.venue, lead.arm);
+            let new_election = elected == Some(publisher) && lead.honored_election != elected;
+            let silent = t.recv_ts_ns.saturating_sub(lead.last_ns) > NO_ID_TAPE_HANDOVER_NS;
+            if !(displaces_uncorroborated || new_election || silent) {
+                return false;
+            }
+            // The election in force as this arm took the tape. A silence handover deliberately
+            // overrides the election, so marking it spent here is what stops the arm it named from
+            // reclaiming on its next straggler print.
+            lead.honored_election = elected;
             metrics()
                 .tape_arm_transfers
                 .with_label_values(&[t.venue.as_ref()])
                 .inc();
         }
+        lead.arm = publisher;
+        lead.last_ns = t.recv_ts_ns;
         true
+    }
+
+    /// Claim the `(venue, symbol)` zero-id tape for `publisher`, returning whether a *concurrent*
+    /// second emitter was detected. `Coordinated` venues only — see the `Trade` arm.
+    fn claim_no_id_tape(&mut self, t: &NormalizedTrade, publisher: Publisher) -> bool {
+        let key = (t.venue.clone(), t.symbol.clone());
+        match self.no_id_owner.get_mut(&key) {
+            // The owner printing again, or a challenger inheriting a tape that has gone quiet past
+            // the handover window: either way one emitter, no conflict.
+            Some((owner, last_ns)) => {
+                let stale = t.recv_ts_ns.saturating_sub(*last_ns) > NO_ID_TAPE_HANDOVER_NS;
+                let concurrent = *owner != publisher && !stale;
+                if !concurrent {
+                    *owner = publisher;
+                    *last_ns = t.recv_ts_ns;
+                }
+                concurrent
+            }
+            None => {
+                self.no_id_owner.insert(key, (publisher, t.recv_ts_ns));
+                false
+            }
+        }
     }
 
     /// Pair this trade with the peer arm's copy and hand the signed lead to the authority — the only
@@ -1166,10 +1229,12 @@ impl Arbiter {
                 }
                 // Then the per-venue arm gate, for the same reason the `book` arm has one: a `Sticky`
                 // venue's two arms mirror one tape with no shared identity to collapse them on.
-                if self.mode_for(&t.venue) == ArbitrationMode::Sticky
-                    && !self.tape_arm_admits(t, publisher)
-                {
-                    self.vm(&t.venue).trades_dropped.inc();
+                let sticky = self.mode_for(&t.venue) == ArbitrationMode::Sticky;
+                if sticky && !self.tape_arm_admits(t, publisher) {
+                    metrics()
+                        .tape_arm_dropped
+                        .with_label_values(&[t.venue.as_ref()])
+                        .inc();
                     return;
                 }
                 // `trade_id == 0` is the "no venue trade id" sentinel (a FIX-sourced print has
@@ -1182,25 +1247,11 @@ impl Arbiter {
                 // quiet is a handover. Not counted as *admitted*: nothing was, mirroring the
                 // `source_ts == 0` quote bypass above.
                 if t.trade_id == 0 {
-                    let key = (t.venue.clone(), t.symbol.clone());
-                    let conflict = match self.no_id_owner.get_mut(&key) {
-                        // The owner printing again, or a challenger inheriting a tape that has gone
-                        // quiet past the handover window: either way one emitter, no conflict.
-                        Some((owner, last_ns)) => {
-                            let stale =
-                                t.recv_ts_ns.saturating_sub(*last_ns) > NO_ID_TAPE_HANDOVER_NS;
-                            let concurrent = *owner != publisher && !stale;
-                            if !concurrent {
-                                *owner = publisher;
-                                *last_ns = t.recv_ts_ns;
-                            }
-                            concurrent
-                        }
-                        None => {
-                            self.no_id_owner.insert(key, (publisher, t.recv_ts_ns));
-                            false
-                        }
-                    };
+                    // Skipped entirely on a `Sticky` venue: the gate above already enforced one
+                    // emitter, and this latch — which knows nothing about the election — would report
+                    // a gate-approved handover as a double-print on the one counter that has to stay
+                    // trustworthy.
+                    let conflict = !sticky && self.claim_no_id_tape(t, publisher);
                     let vm = self.vm(&t.venue);
                     vm.trades_no_id.inc();
                     vm.emit[EMIT_TRADE].inc();
@@ -3244,6 +3295,78 @@ mod tests {
         tape_print(&mut a, venue, arm(1), 12, 2_001); // ...and the elected arm takes it immediately
         tape_print(&mut a, venue, arm(2), 13, 2_002); // ...so the peer is dropped from here on
         assert_eq!(drain_trades(&mut rx), 2);
+    }
+
+    /// The gate is first-come, and the wire is unauthenticated — so an arm the authority tracks must
+    /// displace one it does not, or an early forged print would mute the real arms for as long as it
+    /// kept printing inside the silence window.
+    #[test]
+    fn a_tracked_arm_displaces_an_untracked_incumbent() {
+        let venue = "TapeArmDisplacesSquatter";
+        let (mut a, mut rx) = gated(venue, sticky_cfg());
+        a.set_mode(venue, ArbitrationMode::Sticky);
+        let squatter = arm(200);
+        assert!(!a.books.tracks_arm(venue, squatter));
+        assert!(a.books.tracks_arm(venue, arm(1)));
+
+        tape_print(&mut a, venue, squatter, 1, 2_000);
+        let _ = drain_trades(&mut rx);
+        for i in 0..3 {
+            tape_print(&mut a, venue, arm(1), 10 + i, 2_001 + i);
+            tape_print(&mut a, venue, squatter, 20 + i, 2_100 + i);
+        }
+        assert_eq!(drain_trades(&mut rx), 3, "the real arm keeps the tape");
+    }
+
+    /// The election deferral fires once per election, not per print. Otherwise an elected arm whose
+    /// trade stream is nearly dead would reclaim the tape after every straggler and mute the healthy
+    /// peer for another window — the two rules would fight and the tape would sawtooth.
+    #[test]
+    fn a_straggler_from_the_elected_arm_does_not_reclaim_the_tape() {
+        let venue = "TapeArmStraggler";
+        let (mut a, mut rx) = gated(venue, sticky_cfg());
+        a.set_mode(venue, ArbitrationMode::Sticky);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        let _ = drain_books(&mut rx);
+        let _ = drain_trades(&mut rx);
+
+        // arm(1) opens the tape as the elected arm, then goes quiet and arm(2) inherits it.
+        tape_print(&mut a, venue, arm(1), 1, 2_000);
+        let t0 = 2_001 + NO_ID_TAPE_HANDOVER_NS;
+        tape_print(&mut a, venue, arm(2), 2, t0);
+        let _ = drain_trades(&mut rx);
+
+        // One straggler from arm(1) must not take it back; arm(2)'s stream keeps reaching the wire.
+        tape_print(&mut a, venue, arm(1), 3, t0 + 1);
+        for i in 0..3 {
+            tape_print(&mut a, venue, arm(2), 10 + i, t0 + 2 + i);
+        }
+        assert_eq!(drain_trades(&mut rx), 3);
+    }
+
+    /// A gate-approved handover is one emitter by construction, so the zero-id latch — which knows
+    /// nothing about the election — must not report it on the counter that has to stay trustworthy.
+    #[test]
+    fn a_gate_approved_handover_is_not_a_zero_id_conflict() {
+        let venue = "TapeArmNoFalseConflict";
+        let conflicts = metrics().trades_no_id_conflict.with_label_values(&[venue]);
+        let before = conflicts.get();
+        let (mut a, _rx) = gated(venue, sticky_cfg());
+        a.set_mode(venue, ArbitrationMode::Sticky);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        tape_print(&mut a, venue, arm(2), 0, 2_000); // opens the tape
+        tape_print(&mut a, venue, arm(1), 0, 2_001); // the elected arm takes it over
+        for i in 0..5 {
+            tape_print(&mut a, venue, arm(1), 0, 2_002 + i);
+        }
+        assert_eq!(conflicts.get(), before);
     }
 
     /// The gate is `Sticky`-only, so every `Coordinated` venue keeps the id-keyed behaviour: two arms'
