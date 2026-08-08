@@ -26,7 +26,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
@@ -53,7 +53,7 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let depth = Arc::new(Mutex::new(HashMap::new()));
     // Trades off, as the live MBO row is (`feeds::FEEDS`): its `OrderExecute` prints carry no venue
     // trade id, so they bypass the arbiter's dedup window — see `mbo_prints_carry_no_venue_trade_id`.
-    let mut p = MboProcessor::new(depth, false);
+    let mut p = MboProcessor::new(depth, Arc::new(AtomicBool::new(false)));
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "Hyperliquid",
@@ -117,7 +117,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let (tx, mut rx) = broadcast::channel(1 << 16);
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
-    let mut p = TobProcessor::new(true);
+    let mut p = TobProcessor::new(Arc::new(AtomicBool::new(true)));
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "Hyperliquid",

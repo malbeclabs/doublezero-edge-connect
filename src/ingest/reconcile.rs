@@ -22,6 +22,10 @@ use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
     net::{SocketAddr, SocketAddrV4},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -37,6 +41,7 @@ use crate::{
         receiver,
         subscriptions::{self, Detected, HostSubs},
     },
+    metrics::metrics,
     model::{BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
     shred::{self, DedupMode, ShredConfig},
 };
@@ -45,7 +50,60 @@ use crate::{
 /// `(venue, kind)` identifies the feed row (unique across `FEEDS`, asserted by
 /// `feeds::tests::venue_kind_pairs_are_unique`) and the base port the block within it (unique per
 /// feed, asserted by `feeds::tests::publisher_base_ports_unique_within_a_feed`).
-type FeedKey = (&'static str, FeedKind, u16);
+pub type FeedKey = (&'static str, FeedKind, u16);
+
+/// Whether a receiver currently owns its venue's `trade` tape. Read once per print by the
+/// processors; the reconciler flips it in place so ownership can move **without respawning** the
+/// receiver — a respawn would drop a healthy publisher's books and reference data every time a
+/// *peer* feed's subscription changed.
+pub type TapeOwner = Arc<AtomicBool>;
+
+/// Which feed kind should carry a venue's tape, lowest first; `None` for a kind that never prints.
+///
+/// A venue's two groups are separately subscription-gated, so a host may hold the market-by-price
+/// group and not the top-of-book one. Both rows claim the tape ([`Feed::emit_trades`]); this ranking
+/// is what makes exactly one of them serve it at any moment — the invariant the arbiter's
+/// `trade_id == 0` bypass rests on. Top-of-book wins when both are up: it is the venue's primary
+/// tape, and market-by-price carries prints only as a by-product of the book stream.
+fn tape_rank(kind: FeedKind) -> Option<u8> {
+    match kind {
+        FeedKind::TopOfBook => Some(0),
+        FeedKind::MarketByPrice => Some(1),
+        FeedKind::MarketByOrder | FeedKind::Midpoint => None,
+    }
+}
+
+/// Whether a feed kind can ever own a tape — what `feeds::tests` asserts `emit_trades` against, so
+/// the rank values stay internal to this module.
+pub fn tape_rank_is_some(kind: FeedKind) -> bool {
+    tape_rank(kind).is_some()
+}
+
+/// The tape-owning feed row per venue over a set of running receivers: lowest [`tape_rank`] wins,
+/// base port breaking a tie so the result never depends on iteration order.
+pub fn tape_owners(active: impl IntoIterator<Item = FeedKey>) -> HashMap<&'static str, FeedKey> {
+    let mut best: HashMap<&'static str, (u8, FeedKey)> = HashMap::new();
+    for key in active {
+        let Some(rank) = tape_rank(key.1) else {
+            continue;
+        };
+        match best.get(key.0) {
+            Some(&(cur_rank, cur_key)) if (cur_rank, cur_key.2) <= (rank, key.2) => {}
+            _ => {
+                best.insert(key.0, (rank, key));
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(venue, (_, key))| (venue, key))
+        .collect()
+}
+
+/// Whether this receiver serves its venue's tape. Keyed on `(venue, kind)` and not the base port, so
+/// **every** publisher of the owning row emits — collapsing mirrored copies is the arbiter's job.
+pub fn owns(owners: &HashMap<&'static str, FeedKey>, key: &FeedKey) -> bool {
+    owners.get(key.0).is_some_and(|o| o.1 == key.1)
+}
 
 /// Every receiver key a feed contributes - one per publisher.
 fn feed_keys(f: &Feed) -> impl Iterator<Item = FeedKey> + '_ {
@@ -106,7 +164,10 @@ struct Desired {
 
 pub struct Reconciler {
     cfg: ReconcilerConfig,
-    active: HashMap<FeedKey, JoinHandle<Result<()>>>,
+    /// Each running receiver with the tape flag it reads. Deliberately one map and not two: a
+    /// separate `tapes` map would need cleaning up on both the abort path and the reap path, and
+    /// missing either leaks a flag for a receiver that is gone.
+    active: HashMap<FeedKey, (JoinHandle<Result<()>>, TapeOwner)>,
     ws_task: Option<JoinHandle<Result<()>>>,
     /// The running shred forwarder plus the (sorted) source set it was started with, so a changed
     /// set triggers a restart.
@@ -229,7 +290,7 @@ impl Reconciler {
     /// Drop handles for tasks that exited on their own so a later tick can respawn them if still
     /// desired (self-healing — replaces the old "process exits if any receiver returns").
     fn reap_finished(&mut self) {
-        self.active.retain(|k, h| {
+        self.active.retain(|k, (h, _)| {
             let done = h.is_finished();
             if done {
                 warn!(
@@ -259,7 +320,7 @@ impl Reconciler {
         let current: HashSet<FeedKey> = self.active.keys().copied().collect();
         let (to_spawn, to_abort) = plan(&current, desired);
         for key in to_abort {
-            if let Some(h) = self.active.remove(&key) {
+            if let Some((h, _)) = self.active.remove(&key) {
                 h.abort();
                 info!(
                     venue = key.0,
@@ -269,6 +330,11 @@ impl Reconciler {
                 );
             }
         }
+        // Ownership over the post-apply running set, which `desired` already is: the aborts above
+        // removed everything outside it and the spawns below add the rest. Computing it here lets a
+        // newly-spawned receiver start with the flag it will hold, so activating a feed is not also
+        // counted as a tape *change*.
+        let owners = tape_owners(desired.iter().copied());
         for key in to_spawn {
             let (feed, publisher) = self
                 .cfg
@@ -289,6 +355,7 @@ impl Reconciler {
                 mktdata = publisher.ports.mktdata(),
                 "activating market-data receiver (subscribed)"
             );
+            let tape: TapeOwner = Arc::new(AtomicBool::new(owns(&owners, &key)));
             let h = tokio::spawn(receiver::run_feed(
                 feed,
                 publisher,
@@ -298,8 +365,33 @@ impl Reconciler {
                 self.cfg.instruments.clone(),
                 self.cfg.depth.clone(),
                 self.health.clone(),
+                tape.clone(),
             ));
-            self.active.insert(key, h);
+            self.active.insert(key, (h, tape));
+        }
+        self.publish_tape_owners(&owners);
+    }
+
+    /// Push the current tape ownership onto every running receiver's flag.
+    ///
+    /// `Relaxed` throughout: the flag is advisory per-message policy, not a synchronization point,
+    /// and the worst case at a subscription boundary is one duplicated or one dropped print.
+    fn publish_tape_owners(&self, owners: &HashMap<&'static str, FeedKey>) {
+        for (key, (_, tape)) in &self.active {
+            let want = owns(owners, key);
+            if tape.swap(want, Ordering::Relaxed) != want {
+                metrics()
+                    .tape_owner_changes
+                    .with_label_values(&[key.0])
+                    .inc();
+                info!(
+                    venue = key.0,
+                    kind = key.1.label(),
+                    publisher = key.2,
+                    owns_tape = want,
+                    "trade-tape ownership changed"
+                );
+            }
         }
     }
 
@@ -461,6 +553,60 @@ mod tests {
         );
     }
 
+    const TOB: FeedKind = FeedKind::TopOfBook;
+    const MBP: FeedKind = FeedKind::MarketByPrice;
+    const MBO: FeedKind = FeedKind::MarketByOrder;
+
+    /// Both of a venue's rows claim the tape, so with both up the ranking must pick one — top of
+    /// book, the venue's primary tape.
+    #[test]
+    fn top_of_book_owns_the_tape_when_both_feeds_run() {
+        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)]);
+        assert_eq!(owners.get("V"), Some(&("V", TOB, 7576)));
+        assert!(owns(&owners, &("V", TOB, 7576)));
+        assert!(!owns(&owners, &("V", MBP, 31000)));
+    }
+
+    /// The case the static `emit_trades` rule got wrong: a host subscribed to the market-by-price
+    /// group alone still has to serve a tape.
+    #[test]
+    fn market_by_price_owns_the_tape_alone() {
+        let owners = tape_owners([("V", MBP, 31000)]);
+        assert!(owns(&owners, &("V", MBP, 31000)));
+    }
+
+    #[test]
+    fn tape_ownership_is_per_venue() {
+        let owners = tape_owners([("A", MBP, 31000), ("B", TOB, 7576)]);
+        assert!(owns(&owners, &("A", MBP, 31000)));
+        assert!(owns(&owners, &("B", TOB, 7576)));
+    }
+
+    /// Market-by-order is depth-only, so a venue carried only by it has no tape owner at all —
+    /// rather than one silently minted from a row that never prints.
+    #[test]
+    fn a_depth_only_venue_has_no_tape_owner() {
+        let owners = tape_owners([("V", MBO, 10001)]);
+        assert!(owners.is_empty());
+        assert!(!owns(&owners, &("V", MBO, 10001)));
+    }
+
+    /// Ownership is keyed on `(venue, kind)`, so every publisher of the owning row emits and no
+    /// publisher of a peer row does — collapsing the mirrored copies is the arbiter's job.
+    #[test]
+    fn every_publisher_of_the_owning_feed_emits() {
+        let owners = tape_owners([
+            ("V", TOB, 7576),
+            ("V", TOB, 7676),
+            ("V", MBP, 31000),
+            ("V", MBP, 31100),
+        ]);
+        assert!(owns(&owners, &("V", TOB, 7576)));
+        assert!(owns(&owners, &("V", TOB, 7676)));
+        assert!(!owns(&owners, &("V", MBP, 31000)));
+        assert!(!owns(&owners, &("V", MBP, 31100)));
+    }
+
     /// Distinct publishers of the same feed must not collide in the active-task map.
     #[test]
     fn plan_treats_publishers_as_independent() {
@@ -474,5 +620,107 @@ mod tests {
         let (to_spawn, to_abort) = plan(&current, &desired);
         assert_eq!(to_spawn, vec![("V", FeedKind::TopOfBook, 9201)]);
         assert!(to_abort.is_empty());
+    }
+
+    /// Losing the top-of-book subscription must hand the tape to market-by-price **in place**: the
+    /// surviving receiver keeps its books and reference data, which a respawn would drop. `ptr_eq`
+    /// is the assertion — a respawn mints a new flag — and it is the unit-level form of the live
+    /// check that `dz_receiver_up` for that block never blips to 0.
+    #[tokio::test]
+    async fn losing_top_of_book_moves_the_tape_without_respawning() {
+        static TOB_PUB: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::TwoPort {
+                mktdata: 7576,
+                refdata: 7577,
+            },
+        }];
+        static MBP_PUB: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 31000,
+                refdata: 41000,
+                snapshot: 51000,
+            },
+        }];
+        // A venue label used by no other test, so the counter delta below is this test's alone.
+        let venue = "TapeFlipVenue";
+        let mut r = test_reconciler(vec![
+            Feed {
+                venue,
+                kind: FeedKind::TopOfBook,
+                publishers: TOB_PUB,
+                ..test_feed(TOB_PUB)
+            },
+            Feed {
+                venue,
+                kind: FeedKind::MarketByPrice,
+                publishers: MBP_PUB,
+                ..test_feed(MBP_PUB)
+            },
+        ]);
+        let mbp_key = (venue, FeedKind::MarketByPrice, 31000u16);
+        let changes = metrics().tape_owner_changes.with_label_values(&[venue]);
+        let before = changes.get();
+
+        r.apply_feeds(
+            &[(venue, FeedKind::TopOfBook, 7576), mbp_key]
+                .into_iter()
+                .collect(),
+        );
+        let mbp_tape = r.active[&mbp_key].1.clone();
+        assert!(
+            !mbp_tape.load(Ordering::Relaxed),
+            "top of book owns the tape"
+        );
+
+        r.apply_feeds(&[mbp_key].into_iter().collect());
+        assert!(
+            mbp_tape.load(Ordering::Relaxed),
+            "the tape moved to market-by-price"
+        );
+        assert!(
+            Arc::ptr_eq(&mbp_tape, &r.active[&mbp_key].1),
+            "the market-by-price receiver was respawned"
+        );
+        assert_eq!(changes.get() - before, 1);
+    }
+
+    /// A `Reconciler` whose spawned receivers are never polled: `apply_feeds` is sync, so the tasks
+    /// it creates bind no sockets before the test drops them.
+    fn test_reconciler(enabled: Vec<Feed>) -> Reconciler {
+        let (tx, _rx) = broadcast::channel(16);
+        Reconciler::new(ReconcilerConfig {
+            arbiter: Arc::new(std::sync::Mutex::new(crate::ingest::arbiter::Arbiter::new(
+                tx.clone(),
+                16,
+            ))),
+            tx,
+            instruments: Default::default(),
+            depth: Default::default(),
+            books: Default::default(),
+            enabled,
+            iface: "127.0.0.1".into(),
+            recv_buf: 1 << 20,
+            refresh: Duration::from_secs(30),
+            gating_disabled: true,
+            ws_bind: String::new(),
+            ws_cfg: crate::sinks::ws::WsConfig {
+                heartbeat: Duration::from_secs(30),
+                idle_timeout: Duration::from_secs(90),
+                max_clients: 1,
+                max_subs: 1,
+                max_inbound_per_min: 1,
+                broadcast_capacity: 1,
+            },
+            shred: ShredParams {
+                disabled: true,
+                explicit_sources: Vec::new(),
+                code_prefix: String::new(),
+                port: 0,
+                forward: Vec::new(),
+                mode: DedupMode::None,
+                rpc_url: None,
+                dedup_window_slots: 1,
+            },
+        })
     }
 }

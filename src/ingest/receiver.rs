@@ -58,6 +58,7 @@ use crate::{
         feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
         processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor},
+        reconcile::TapeOwner,
     },
     metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
@@ -670,6 +671,7 @@ pub async fn run_feed(
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
     health: SharedFeedHealth,
+    tape: TapeOwner,
 ) -> Result<()> {
     let venue: &'static str = feed.venue;
     match feed.kind {
@@ -686,7 +688,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
-                TobProcessor::new(feed.emit_trades),
+                TobProcessor::new(tape),
             )
             .await
         }
@@ -736,7 +738,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
-                MboProcessor::new(depth, feed.emit_trades),
+                MboProcessor::new(depth, tape),
             )
             .await
         }
@@ -769,7 +771,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
-                MbpProcessor::new(feed.emit_trades),
+                MbpProcessor::new(tape),
             )
             .await
         }

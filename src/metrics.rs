@@ -155,6 +155,14 @@ pub struct Metrics {
     /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
     /// thresholds are too loose: every transfer re-baselines each consumer's book.
     pub arm_transfers: IntCounterVec,
+    /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
+    /// decision, on a subscription change). Each move is a window in which a print may double or
+    /// drop, so a sustained rate means subscriptions are flapping.
+    pub tape_owner_changes: IntCounterVec,
+    /// Trade-tape ownership moving from one **arm** to another within a venue — the arm-level twin of
+    /// [`tape_owner_changes`](Self::tape_owner_changes), and the same read: each transfer is a window
+    /// where a print may double or drop.
+    pub tape_arm_transfers: IntCounterVec,
     /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
     /// authority is fragmented; all on one arm is the steady state.
     pub arm_markets_held: IntGaugeVec,
@@ -510,6 +518,20 @@ impl Metrics {
                 "dz_arm_markets_held",
                 "Markets each arm is currently authoritative for.",
                 &["venue", "arm"],
+            ),
+            tape_owner_changes: counter_vec(
+                &registry,
+                "dz_tape_owner_changes_total",
+                "Trade-tape ownership moving between a venue's feed rows on a subscription change. \
+                 Each move is a window in which a print may double or drop.",
+                &["venue"],
+            ),
+            tape_arm_transfers: counter_vec(
+                &registry,
+                "dz_tape_arm_transfers_total",
+                "Trade-tape ownership moving between a venue's arms. The arm-level twin of \
+                 dz_tape_owner_changes_total.",
+                &["venue"],
             ),
             mbp_channel_resets: counter_vec(
                 &registry,

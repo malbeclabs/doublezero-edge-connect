@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     net::IpAddr,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -31,6 +31,7 @@ use crate::{
             Status as BookStatus,
         },
         receiver::{FrameCtx, FrameProcessor, SeqCheck, SeqTracker},
+        reconcile::TapeOwner,
         subscriber::{InstrumentDef, RefDataState},
     },
     metrics::metrics,
@@ -217,14 +218,16 @@ pub struct TobProcessor {
     warned_source_mismatch: bool,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
-    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
-    emit_trades: bool,
+    /// Whether this receiver currently owns its venue's tape. A runtime flag, not a static one: a
+    /// venue's rows are separately subscription-gated, so which of them serves the tape is the
+    /// reconciler's decision and moves without respawning this task (see [`TapeOwner`]).
+    tape: TapeOwner,
     /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
     seq_events: SeqEvents,
 }
 
 impl TobProcessor {
-    pub fn new(emit_trades: bool) -> Self {
+    pub fn new(tape: TapeOwner) -> Self {
         Self {
             state: PerPublisher::default(),
             seq: HashMap::new(),
@@ -232,7 +235,7 @@ impl TobProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             decode_warn: WarnRateLimit::default(),
-            emit_trades,
+            tape,
             seq_events: SeqEvents::default(),
         }
     }
@@ -449,7 +452,7 @@ impl FrameProcessor for TobProcessor {
                     };
                     // The arbiter's windowed trade dedup (on trade_id) collapses any cross-source
                     // copy downstream; this feed only gates on whether it owns this venue's trades.
-                    if self.emit_trades {
+                    if self.tape.load(Ordering::Relaxed) {
                         ctx.emit(FeedMessage::Trade(trade));
                     }
                 }
@@ -627,12 +630,12 @@ pub struct MboProcessor {
     warned_invalid_manifest: bool,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
-    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
-    emit_trades: bool,
+    /// Whether this receiver currently owns its venue's tape — see [`TobProcessor::tape`].
+    tape: TapeOwner,
 }
 
 impl MboProcessor {
-    pub fn new(depth: DepthSnapshot, emit_trades: bool) -> Self {
+    pub fn new(depth: DepthSnapshot, tape: TapeOwner) -> Self {
         Self {
             state: PerPublisher::default(),
             books: HashMap::new(),
@@ -643,7 +646,7 @@ impl MboProcessor {
             warned_source_mismatch: false,
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
-            emit_trades,
+            tape,
         }
     }
 
@@ -904,7 +907,7 @@ impl FrameProcessor for MboProcessor {
                             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                             ws_send_ts_ns: 0,
                         };
-                        if self.emit_trades {
+                        if self.tape.load(Ordering::Relaxed) {
                             ctx.emit(FeedMessage::Trade(trade));
                         }
                     }
@@ -936,7 +939,7 @@ impl FrameProcessor for MboProcessor {
                                   "mbo SourceID maps to a venue different from this feed's venue (logged once)");
                         }
                     }
-                    if self.emit_trades {
+                    if self.tape.load(Ordering::Relaxed) {
                         ctx.emit(FeedMessage::Trade(trade));
                     }
                 }
@@ -1109,12 +1112,12 @@ pub struct MbpProcessor {
     warned_source_mismatch: bool,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
-    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
-    emit_trades: bool,
+    /// Whether this receiver currently owns its venue's tape — see [`TobProcessor::tape`].
+    tape: TapeOwner,
 }
 
 impl MbpProcessor {
-    pub fn new(emit_trades: bool) -> Self {
+    pub fn new(tape: TapeOwner) -> Self {
         Self {
             state: PerPublisher::default(),
             books: HashMap::new(),
@@ -1128,7 +1131,7 @@ impl MbpProcessor {
             warned_invalid_manifest: false,
             warned_source_mismatch: false,
             decode_warn: WarnRateLimit::default(),
-            emit_trades,
+            tape,
         }
     }
 
@@ -1789,7 +1792,7 @@ impl FrameProcessor for MbpProcessor {
                                   "mbp SourceID maps to a venue different from this feed's venue (logged once)");
                         }
                     }
-                    if self.emit_trades {
+                    if self.tape.load(Ordering::Relaxed) {
                         ctx.emit(FeedMessage::Trade(trade));
                     }
                 }
@@ -1858,6 +1861,11 @@ mod tests {
         },
     };
 
+    /// A tape-ownership flag pinned to one value, for the tests that only need the static behaviour.
+    fn tape(on: bool) -> super::TapeOwner {
+        Arc::new(std::sync::atomic::AtomicBool::new(on))
+    }
+
     // The quote latch-to-leader floor and the trade windowed dedup now live in the shared
     // `ingest::arbiter` (lifted out of `TobProcessor` so the multicast processors and the WS feeder
     // converge on one floor per (venue, symbol)). Their unit coverage — leader latch, non-leader
@@ -1886,7 +1894,7 @@ mod tests {
         use super::MAX_PUBLISHERS;
         use std::net::{IpAddr, Ipv4Addr};
 
-        let mut p = TobProcessor::new(true);
+        let mut p = TobProcessor::new(tape(true));
         let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)); // 10.x.y.z
         let flood = (MAX_PUBLISHERS as u32) + 50;
         for i in 0..flood {
@@ -1958,7 +1966,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
         let ctx_for = |publisher: IpAddr, role: PortRole| {
             let mut c = make_ctx(&arbiter, &instruments, role);
             c.publisher = publisher;
@@ -2105,7 +2113,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
 
         // Refdata: a Valid=0 manifest (the live publisher's quirk) + the BTC definition under it.
         let mut manifest = enc_manifest_summary(5, 1);
@@ -2174,7 +2182,7 @@ mod tests {
         instruments: &crate::model::InstrumentSnapshot,
     ) -> MboProcessor {
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
         proc.on_datagram(
             &frame(&[
                 enc_manifest_summary(1, 1),
@@ -2288,7 +2296,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
         // Reference-data state is per publisher, so each arm publishes its own manifest burst -
         // which is what they do on the wire, sharing one refdata port.
         for publisher in [pub_a, pub_b] {
@@ -2524,7 +2532,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
 
         // Refdata: manifest declares 2 instruments; then their definitions.
         proc.on_datagram(
@@ -2696,7 +2704,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
 
         // No manifest/definition: an OrderAdd for an unknown instrument must be dropped, not booked.
         let f = frame(&[enc_order_add(&OrderAdd {
@@ -2734,7 +2742,7 @@ mod tests {
             a.set_depth_replay(depth.clone());
             Arc::new(Mutex::new(a))
         };
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
 
         let flood = (MAX_BOOKS as u32) + 50;
         // Declare and define every instrument so the definition gate admits each one.
@@ -2830,7 +2838,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-        let mut proc = MboProcessor::new(depth, false);
+        let mut proc = MboProcessor::new(depth, tape(false));
 
         // Define instrument 0 and sync it with an empty-anchor snapshot.
         proc.on_datagram(
@@ -3039,7 +3047,7 @@ mod tests {
         reset_count: u8,
         ids: &[u32],
     ) -> MbpProcessor {
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(channel, reset_count, 1, &mbp_refdata(ids)),
             &make_ctx(arbiter, instruments, PortRole::Combined),
@@ -3077,7 +3085,7 @@ mod tests {
     #[test]
     fn mbp_snapshot_levels_route_by_open_group_not_snapshot_id() {
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41, 42])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
@@ -3110,7 +3118,7 @@ mod tests {
     #[test]
     fn mbp_a_snapshot_install_emits_clear_then_the_full_level_set() {
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
@@ -3225,7 +3233,7 @@ mod tests {
     #[test]
     fn mbp_a_from_price_clear_publishes_exact_deletes() {
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
@@ -3315,7 +3323,7 @@ mod tests {
     #[test]
     fn mbp_no_book_is_emitted_before_the_instrument_definition() {
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
@@ -3354,7 +3362,7 @@ mod tests {
     #[test]
     fn mbp_instrument_definitions_carry_the_identity_pair() {
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(7, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
@@ -3386,7 +3394,7 @@ mod tests {
         });
         for (emit_trades, want) in [(true, 1), (false, 0)] {
             let (arbiter, mut rx, instruments) = mbp_harness();
-            let mut proc = MbpProcessor::new(emit_trades);
+            let mut proc = MbpProcessor::new(tape(emit_trades));
             proc.on_datagram(
                 &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
@@ -3410,7 +3418,7 @@ mod tests {
         let (arbiter, _rx, instruments) = mbp_harness();
         let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
         let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         // Reference-data state is per publisher, so each arm sends its own burst — which is what
         // they do on the wire, sharing one refdata port.
         for publisher in [pub_a, pub_b] {
@@ -3472,7 +3480,7 @@ mod tests {
         let (arbiter, _rx, instruments) = mbp_harness();
         let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
         let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         for publisher in [pub_a, pub_b] {
             let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
             refdata.publisher = publisher;
@@ -3507,7 +3515,7 @@ mod tests {
         let venue = "MbpBufferOverflowTest";
         let heavy: Vec<u32> = (41..=44).collect();
         let (arbiter, _rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         let mut ids = heavy.clone();
         ids.push(99);
         proc.on_datagram(
@@ -3674,7 +3682,7 @@ mod tests {
     fn mbp_a_crossed_book_is_counted_not_acted_on() {
         let venue = "MbpCrossedTest";
         let (arbiter, _rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
@@ -3726,7 +3734,7 @@ mod tests {
     fn mbp_duplicate_deltas_are_counted() {
         let venue = "MbpDuplicateDeltaTest";
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
@@ -3776,7 +3784,7 @@ mod tests {
     fn mbp_orphan_snapshot_levels_are_counted() {
         let venue = "MbpOrphanLevelTest";
         let (arbiter, _rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
@@ -3918,7 +3926,7 @@ mod tests {
     #[test]
     fn mbp_an_unrecognized_clear_side_publishes_nothing() {
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
             &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
@@ -3971,7 +3979,7 @@ mod tests {
     fn mbp_a_stale_epoch_snapshot_neither_installs_nor_resets() {
         let venue = "MbpStaleEpochTest";
         let (arbiter, mut rx, instruments) = mbp_harness();
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
         let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
         // Epoch 1: definitions, then a snapshot that installs and publishes its re-baseline.
@@ -4041,7 +4049,7 @@ mod tests {
             },
             5_000_000_000,
         );
-        let mut proc = MbpProcessor::new(false);
+        let mut proc = MbpProcessor::new(tape(false));
         let ids: Vec<u32> = (0..(MAX_PRICE_BOOKS as u32 + 50)).collect();
         // One burst per 200 definitions keeps each frame's message count inside the header's u8.
         for chunk in ids.chunks(200) {
