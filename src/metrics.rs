@@ -95,13 +95,16 @@ pub struct Metrics {
     /// Trades admitted by the windowed dedup, attributed to the winning `publisher` (edge/public) —
     /// the trade-side mirror of [`quotes_admitted`].
     pub trades_admitted: IntCounterVec,
-    /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
+    /// Trades collapsed before the wire: a duplicate `trade_id` still inside the dedup window, or —
+    /// on a `Sticky` venue — a non-serving arm's copy dropped by the per-venue tape gate. In steady
+    /// state on such a venue this is the challenger arm's whole print stream.
     pub trades_dropped: IntCounterVec,
     /// Trades forwarded with the `trade_id == 0` sentinel, bypassing the dedup window.
     pub trades_no_id: IntCounterVec,
     /// Zero-id trades forwarded from a second publisher for a `(venue, symbol)` another publisher
     /// already owns — the tape is double-printing, since a bypassed sentinel has no window to
-    /// collapse against.
+    /// collapse against. `Coordinated` venues only in practice: on a `Sticky` venue the tape gate
+    /// upstream has already dropped the peer arm's copy.
     pub trades_no_id_conflict: IntCounterVec,
     /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
     /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
@@ -418,7 +421,8 @@ impl Metrics {
             trades_dropped: counter_vec(
                 &registry,
                 "dz_trades_dropped_total",
-                "Trades dropped by the windowed dedup",
+                "Trades collapsed before the wire: a duplicate trade_id inside the window, or a \
+                 non-serving arm's copy dropped by a Sticky venue's tape gate",
                 &["venue"],
             ),
             instruments_dropped: counter_vec(
