@@ -263,7 +263,13 @@ Modules are grouped by role under `src/`:
   down — `pricebook`'s per-book cap is a quarter of it, so the budget only binds with several heavy
   books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's
   venue-wide clear would tear down a live peer arm's published book), and a channel reset on any
-  **change** of the frame header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts).
+  **change** of the frame header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
+  read from the **market-data role only** and only for a publisher whose reference data we already
+  hold: the three ports carry one epoch on three sockets, so a memo shared across them would re-reset
+  the channel on every interleaving of a restart's backlog, and minting reference-data state from the
+  market-data path is what would let a forged-source flood evict the real publishers' definitions. A
+  snapshot group whose epoch disagrees with the market data's is refused for the same reason — it
+  belongs to the publisher's previous run, and installing it would republish a dead session's book.
   `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
   O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are
   reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped arm
