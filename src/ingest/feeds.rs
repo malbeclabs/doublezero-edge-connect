@@ -146,8 +146,11 @@ pub struct Feed {
     /// spawned per entry. A feed whose publishers all share one port block lists exactly one
     /// entry (see [`FeedPublisher`]).
     pub publishers: &'static [FeedPublisher],
-    /// Whether this feed emits `trade` messages. A venue carried by both TOB and MBO would
-    /// otherwise double-emit the same trades; TOB owns trades, MBO is depth-only.
+    /// Whether this feed *can* carry the venue's `trade` tape. A static capability claim only —
+    /// which claiming row actually serves it is the reconciler's runtime decision
+    /// (`reconcile::tape_owners`), because a venue's rows are separately subscription-gated and the
+    /// tape must survive on whichever subset is up. Pinned against the ranking by
+    /// `emit_trades_agrees_with_the_tape_ownership_rule`.
     pub emit_trades: bool,
     /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
@@ -437,31 +440,27 @@ mod tests {
         assert!(hl.emit_trades);
     }
 
-    /// At most one row per venue may emit trades. Two would double-publish every print, and with
-    /// the `trade_id == 0` bypass in `arbiter::emit` there is no window to collapse the duplicate
-    /// for a FIX-sourced publisher — which carries no venue trade id at all.
+    /// `emit_trades` is the row's static *capability* claim; which claiming row actually serves the
+    /// tape is the reconciler's runtime decision (`reconcile::tape_owners`). The two must agree, in
+    /// both directions:
     ///
-    /// This covers *configured rows* only, which is less than the invariant the bypass wants. A row
-    /// carries N publishers, and a message's venue is the wire SourceID's (`codec::source_name`),
-    /// not the row's — so neither two arms of one row nor a remapped SourceID is visible here. The
-    /// runtime half is `dz_trades_no_id_conflict_total`, which reports a second tape owner instead
-    /// of asserting there isn't one.
+    /// - a row claiming trades on a kind the ranking never admits would have a flag stuck false and
+    ///   silently emit nothing — a venue with no tape at all if it is the only claimant;
+    /// - a row not claiming trades on a rankable kind would be handed the tape and print anyway,
+    ///   which is exactly the double-print the invariant exists to prevent.
     ///
-    /// NOTE: this static form holds only until a venue carries a tape on two separately-gated feeds,
-    /// which is deliberate and coming — a host subscribed to the market-by-price group alone must
-    /// still get a tape, so both of that venue's rows set `emit_trades`. **When this fails for that
-    /// reason, replace it with the runtime-ownership assertion, not the rows.** Same invariant — at
-    /// most one tape emitter per venue at any moment — enforced where ownership actually lives.
+    /// The invariant itself — at most one tape emitter per venue at any moment, which is what
+    /// licenses the `trade_id == 0` bypass in `arbiter::emit` — is enforced at runtime by
+    /// `tape_owners` (one row per venue) and the arbiter's per-venue tape leader (one arm within it),
+    /// with `dz_tape_owner_changes_total` / `dz_tape_arm_transfers_total` reporting the moves.
     #[test]
-    fn at_most_one_trade_emitting_row_per_venue() {
-        let mut emitters = std::collections::HashMap::new();
-        for f in FEEDS.iter().filter(|f| f.emit_trades) {
-            let prev = emitters.insert(f.venue, f.kind);
-            assert!(
-                prev.is_none(),
-                "{} emits trades on both {:?} and {:?}",
+    fn emit_trades_agrees_with_the_tape_ownership_rule() {
+        for f in FEEDS {
+            assert_eq!(
+                f.emit_trades,
+                crate::ingest::reconcile::tape_rank_is_some(f.kind),
+                "{} {:?}: emit_trades disagrees with the tape ranking",
                 f.venue,
-                prev.unwrap(),
                 f.kind
             );
         }
