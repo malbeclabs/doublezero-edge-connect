@@ -77,7 +77,8 @@ Modules are grouped by role under `src/`:
 - **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
   `pricebook` (the price-keyed sibling of `book`), `authority`,
   `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
-  `subscriber`, `arbiter`, the **`subscriptions`** detector + **`reconcile`** activation loop (which
+  `subscriber`, `arbiter`, `authority` + `arm_race` (the single-arm `book` gate and the cross-arm trade
+  matcher its re-election runs on), the **`subscriptions`** detector + **`reconcile`** activation loop (which
   decide what runs — see Architecture above), the optional public feeders (`public_feeder`
   scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
   `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
@@ -165,7 +166,8 @@ Modules are grouped by role under `src/`:
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → window, `Instrument` → a rate limit on the precision pair per
+  floor, depth → depth floor, trades → window, `book` → the single-arm authority gate below,
+  `Instrument` → a rate limit on the precision pair per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
@@ -209,6 +211,42 @@ Modules are grouped by role under `src/`:
   book replayed to a new client). The *quote* floor is
   deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
+- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**,
+  in *both* arbitration modes with no `mode_for` branch (#105): one `source_ts` tick can hold several
+  deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
+  arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
+  every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
+  dropped (`dz_book_dropped_total`). **Speed and silence are per arm, venue-wide; health is per market**
+  (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
+  overrides the elected arm for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
+  **Anything but "the arm that last reached the wire for this market" re-baselines the consumer**: a
+  serving-arm change (margin, silence, or that health override), a market's first admission, or a market
+  whose state was evicted. The re-baseline is a `clear` plus the new arm's complete current level set,
+  `snapshot`/`last` true — so the gate accumulates **every eligible arm's** book (`BookMarket::arms`), not
+  only the serving one. Three constraints shape it: it is emitted lazily on that arm's next *completed*
+  logical event, never as a venue-wide burst of clears (most markets are idle, and `to_book` of a
+  half-applied event goes out stamped `last` as a torn book); the wait is **bounded**
+  (`MAX_WITHHELD_BATCHES`) because `last` is a promise made by an unauthenticated producer; and it
+  degrades to a **bare `clear`** unless `BookAccumulator::baselined` holds — an arm that has sent no
+  producer re-baseline holds only the levels that moved since it started accumulating, and publishing
+  that as `snapshot` would tell the consumer to discard the rest. The replay map mirrors the serving
+  arm's accumulator, that flag included, so `sinks/ws.rs` skips exactly the markets this cannot
+  re-baseline.
+  Per-market state is capped by `MAX_BOOK_MARKETS` (`dz_book_markets_evicted_total`) and eviction drops
+  the accumulators, the replay entry **and** `StickyAuthority`'s own per-market entry together — that
+  pairing is what makes eviction safe rather than a corruption primitive, since losing `last_admitted` is
+  what forces the re-baseline. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
+  processor scopes `EndOfSession` per arm and channel, handing those markets to the peer). `arm_race` is the **only** producer of the matched-lead
+  samples the speed re-election consumes: it pairs the two arms' copies of the same **trade** by content
+  (`(venue, symbol, price bits, size bits, aggressor)`, FIFO per signature so identical repeats pair in
+  order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time. Trades only — a
+  level update's cross-arm-common fields recur on a coarse price grid and would mis-pair constantly — and
+  **edge arms the authority already tracks only** (`Arbiter::race_eligible`): the public backstop decodes
+  from parsed JSON and serves no `book`, and an untracked publisher would spend one of the venue's eight
+  admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
+  `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
+  non-negative). Nothing exercises this live yet: no MBP processor (#104) and no `FEEDS` row of that kind,
+  so no running process behaves differently.
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -323,7 +361,9 @@ Modules are grouped by role under `src/`:
   `Utf8Bytes` clone (so N clients cost one serialization, and `ws_send_ts_ns` is one instant shared by
   all consumers of a message — see PROTOCOL.md). With no clients connected the serializer skips the
   work. On connect it replays the instrument snapshot (precision first) **then the latest
-  `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Replay is one
+  `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
+  materialized from the serving arm's `BookAccumulator` and scoped by the `channel` filter dimension like
+  every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
   `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
   scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
   replaying every market. Implements the
@@ -350,12 +390,13 @@ Modules are grouped by role under `src/`:
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
-  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book.
-  `MbpProcessor` emits `book`, but no `FEEDS` row activates it and the arbiter's `Book` arm is still a
-  **temporary** undeduped passthrough, replaced by the authority gate. `NormalizedInstrument` carries
-  the same `(channel, instrument_id)` identity pair as `NormalizedBook`, so a consumer joins a book to
-  its precision on the identity rather than the colliding `symbol`; the arbiter's definition rate
-  limit keys on that triple for the same reason.
+  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book, and it
+  is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the single-arm
+  authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-arm
+  accumulators; `MbpProcessor` emits `book` but no `FEEDS` row activates it.
+  `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
+  so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
+  arbiter's definition rate limit keys on that triple for the same reason.
 
 ## Conventions and gotchas
 

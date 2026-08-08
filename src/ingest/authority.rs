@@ -43,6 +43,11 @@
 //! last-admitted arm. A caller only reports markets that resolve to a definition and a book, but that
 //! bounds only what it holds *live* — a churning id space would still grow this map for the life of
 //! the process — so [`MAX_TRACKED_MARKETS`] bounds it here.
+//!
+//! A caller holding its own per-market state must drop it through [`StickyAuthority::forget_market`],
+//! and in the same step. Dropping one half is worse than dropping neither: `last_admitted` is what
+//! tells the caller a market changed hands, so an entry gone from here while the caller still holds
+//! that market's book makes the next arm's deltas read as a continuation of the previous arm's.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -90,6 +95,28 @@ pub struct AuthorityConfig {
     pub min_window_samples: usize,
 }
 
+impl AuthorityConfig {
+    /// The defaults, so an [`Arbiter`](crate::ingest::arbiter::Arbiter) built without a config still
+    /// gates books rather than silently interleaving arms.
+    ///
+    /// **`main.rs`'s `--arb-*` clap defaults are derived from this**, not written out beside it — two
+    /// hand-maintained copies of five numbers is exactly how a documented default drifts from the one
+    /// a test-built arbiter actually uses.
+    pub const DEFAULT: Self = Self {
+        leader_timeout_ns: 2_000_000_000,
+        sample_interval_ns: 300_000_000_000,
+        transfer_margin_ns: 1_000_000,
+        transfer_win_rate: 0.8,
+        min_window_samples: 32,
+    };
+}
+
+impl Default for AuthorityConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Per-arm state within a venue.
 #[derive(Default)]
 struct Arm {
@@ -134,10 +161,12 @@ pub struct StickyAuthority {
     venues: HashMap<Arc<str>, VenueState>,
     markets: HashMap<MarketKey, MarketState>,
     /// Insertion order of `markets` keys, oldest at the front, for the [`MAX_TRACKED_MARKETS`]
-    /// eviction.
+    /// eviction. Bounding *this* rather than `markets` is what lets [`Self::forget_market`] leave its
+    /// entry behind: a stale one costs a no-op pop, and the queue can still never outgrow the cap.
     market_order: VecDeque<MarketKey>,
-    ordinals: HashMap<(String, Publisher), &'static str>,
-    ordinal_counts: HashMap<String, usize>,
+    /// Arm ordinals per venue. Nested rather than keyed on `(String, Publisher)` so the per-message
+    /// lookup borrows the venue instead of allocating one.
+    ordinals: HashMap<Arc<str>, HashMap<Publisher, &'static str>>,
     cfg: AuthorityConfig,
 }
 
@@ -148,16 +177,21 @@ impl StickyAuthority {
             markets: HashMap::new(),
             market_order: VecDeque::new(),
             ordinals: HashMap::new(),
-            ordinal_counts: HashMap::new(),
             cfg,
         }
+    }
+
+    /// Re-apply the tunables, keeping every elected leader and health flag. The bridge calls this once
+    /// at startup; replacing the whole authority instead would blank arbitration state mid-run.
+    pub fn set_config(&mut self, cfg: AuthorityConfig) {
+        self.cfg = cfg;
     }
 
     /// Per-market state for `key`, bounded by [`MAX_TRACKED_MARKETS`] with least-recently-inserted
     /// eviction — the market key is wire-supplied, so every path that creates one comes through here.
     fn market_mut(&mut self, key: &MarketKey) -> &mut MarketState {
         if !self.markets.contains_key(key) {
-            while self.markets.len() >= MAX_TRACKED_MARKETS {
+            while self.market_order.len() >= MAX_TRACKED_MARKETS {
                 match self.market_order.pop_front() {
                     Some(old) => {
                         self.markets.remove(&old);
@@ -264,17 +298,31 @@ impl StickyAuthority {
     /// becomes a label value. Past the cap returns [`OTHER_ARM`] and records nothing — which is also
     /// what makes that arm ineligible. The mapping is logged once, on first sight.
     pub fn arm_ordinal(&mut self, venue: &str, publisher: Publisher) -> &'static str {
-        if let Some(&label) = self.ordinals.get(&(venue.to_string(), publisher)) {
+        if let Some(&label) = self.ordinals.get(venue).and_then(|m| m.get(&publisher)) {
             return label;
         }
-        let n = self.ordinal_counts.entry(venue.to_string()).or_insert(0);
-        let Some(&label) = ARM_LABELS.get(*n) else {
+        let arms = match self.ordinals.get_mut(venue) {
+            Some(arms) => arms,
+            None => self.ordinals.entry(Arc::from(venue)).or_default(),
+        };
+        let Some(&label) = ARM_LABELS.get(arms.len()) else {
             return OTHER_ARM;
         };
-        *n += 1;
-        self.ordinals.insert((venue.to_string(), publisher), label);
+        arms.insert(publisher, label);
         tracing::info!(venue, arm = label, ?publisher, "arbitration arm registered");
         label
+    }
+
+    /// An arm's metric label, minting nothing — [`Self::arm_ordinal`] both labels *and* admits, so it
+    /// must only be reached from a path that has applied the eligibility rule. A metric label is not
+    /// one: a publisher can reach the counters without ever having been admitted, and registering it
+    /// there would spend the venue's admission budget on a source that never serves a book.
+    pub fn arm_label(&self, venue: &str, publisher: Publisher) -> &'static str {
+        self.ordinals
+            .get(venue)
+            .and_then(|m| m.get(&publisher))
+            .copied()
+            .unwrap_or(OTHER_ARM)
     }
 
     /// The venue-wide leader, before any per-market health override.
@@ -296,7 +344,9 @@ impl StickyAuthority {
         Some(
             arms.iter()
                 .filter(|(a, _)| **a != leader && self.healthy(key, **a))
-                .max_by_key(|(_, arm)| arm.last_seen_ns)
+                // The ordinal breaks a `last_seen_ns` tie: without it two tying arms are ordered by
+                // `HashMap` iteration and could alternate as the override, interleaving their deltas.
+                .max_by_key(|&(&a, arm)| (arm.last_seen_ns, self.arm_label(&key.0, a)))
                 .map_or(leader, |(a, _)| *a),
         )
     }
@@ -306,15 +356,46 @@ impl StickyAuthority {
         self.serving(key)
     }
 
-    /// How many of `venue`'s markets `publisher` currently serves — the gauge showing which arm is
-    /// live and whether health overrides have fragmented the venue. **O(markets)**: call it on a
-    /// metrics tick, never per message.
-    pub fn markets_held(&self, venue: &str, publisher: Publisher) -> usize {
-        self.markets
-            .keys()
-            .filter(|k| k.0.as_ref() == venue)
-            .filter(|k| self.leader_of(k) == Some(publisher))
-            .count()
+    /// Whether `venue` has recorded `arm` at all — true exactly for the arms [`Self::admit`] found
+    /// eligible, so a caller can bound its own per-arm state on the same rule without paying for (or
+    /// re-deriving) the ordinal.
+    pub fn tracks_arm(&self, venue: &str, arm: Publisher) -> bool {
+        self.venues
+            .get(venue)
+            .is_some_and(|v| v.arms.contains_key(&arm))
+    }
+
+    /// The arm last admitted for one market — who the consumer's book state came from. A change of
+    /// this across an [`Self::admit`] is what obliges the caller to re-baseline that market.
+    pub fn last_admitted(&self, key: &MarketKey) -> Option<Publisher> {
+        self.markets.get(key)?.last_admitted
+    }
+
+    /// Every known `(venue, arm)` with the market count it currently serves — the `dz_arm_markets_held`
+    /// input. Arms serving nothing are reported as `0`, so a displaced arm's gauge falls instead of
+    /// going stale.
+    ///
+    /// **O(markets + arms)**, resolving each market's serving arm exactly once: the metrics tick runs
+    /// this under the shared arbiter lock, so a per-arm rescan of every market would stall ingest.
+    pub fn markets_held_all(&self) -> Vec<(Arc<str>, Publisher, usize)> {
+        let mut held: HashMap<(Arc<str>, Publisher), usize> = self
+            .venues
+            .iter()
+            .flat_map(|(venue, v)| v.arms.keys().map(|&a| ((venue.clone(), a), 0)))
+            .collect();
+        for key in self.markets.keys() {
+            if let Some(p) = self.leader_of(key) {
+                *held.entry((key.0.clone(), p)).or_default() += 1;
+            }
+        }
+        held.into_iter().map(|((v, p), n)| (v, p, n)).collect()
+    }
+
+    /// Drop every trace of one market. The caller's own per-market state and this map must be dropped
+    /// together: `last_admitted` is what tells the caller a market changed hands, so keeping one
+    /// without the other either re-baselines a consumer needlessly or — worse — not at all.
+    pub fn forget_market(&mut self, key: &MarketKey) {
+        self.markets.remove(key);
     }
 
     /// Record one matched cross-arm lead for `arm` on `venue`: **negative** when `arm` beat the
@@ -660,18 +741,84 @@ mod tests {
         assert_eq!(a.venue_leader(VENUE), None, "no venue was created");
     }
 
+    /// The gauge counts the arm actually *serving* each market, so a health override shows as a split
+    /// venue rather than as the elected arm still holding everything.
     #[test]
     fn markets_held_counts_the_arm_actually_serving() {
         let mut a = StickyAuthority::new(no_window_cfg());
         a.admit(key(), arm(1), 1_000);
         a.admit(other_market(), arm(1), 1_000);
-        assert_eq!(a.markets_held(VENUE, arm(1)), 2);
-        assert_eq!(a.markets_held(VENUE, arm(2)), 0);
-        // A health override moves one market's count without moving the venue.
+        assert_eq!(held(&a, arm(1)), 2);
+        assert_eq!(held(&a, arm(2)), 0);
         a.set_health(&key(), arm(1), false);
         a.admit(key(), arm(2), 1_100);
-        assert_eq!(a.markets_held(VENUE, arm(1)), 1);
-        assert_eq!(a.markets_held(VENUE, arm(2)), 1);
+        assert_eq!(held(&a, arm(1)), 1);
+        assert_eq!(held(&a, arm(2)), 1);
+    }
+
+    fn held(a: &StickyAuthority, publisher: Publisher) -> usize {
+        a.markets_held_all()
+            .into_iter()
+            .find(|(v, p, _)| v.as_ref() == VENUE && *p == publisher)
+            .map_or(0, |(_, _, n)| n)
+    }
+
+    /// A market forgotten by the caller must leave nothing behind: a stale `last_admitted` would make
+    /// the next arm's deltas read as a continuation of the arm that used to serve it.
+    #[test]
+    fn a_forgotten_market_leaves_no_trace() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), arm(1), 1_000);
+        a.admit(other_market(), arm(1), 1_000);
+        a.forget_market(&key());
+        assert_eq!(a.last_admitted(&key()), None);
+        assert_eq!(a.last_admitted(&other_market()), Some(arm(1)));
+    }
+
+    /// A label lookup must not admit: the metrics path sees every publisher that sent a trade, so
+    /// minting there would spend the venue's eight admission slots on sources that never serve a book.
+    #[test]
+    fn arm_label_never_registers_an_arm() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        assert_eq!(a.arm_label(VENUE, arm(9)), OTHER_ARM);
+        assert_eq!(
+            a.arm_ordinal(VENUE, arm(1)),
+            "arm0",
+            "the slot was not taken"
+        );
+        assert_eq!(a.arm_label(VENUE, arm(1)), "arm0");
+    }
+
+    /// The re-baseline trigger: it tracks the arm actually admitted, so a health override registers
+    /// as a change even though the venue leader never moved.
+    #[test]
+    fn last_admitted_tracks_the_served_arm() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        assert_eq!(a.last_admitted(&key()), None);
+        a.admit(key(), arm(1), 1_000);
+        assert_eq!(a.last_admitted(&key()), Some(arm(1)));
+        a.set_health(&key(), arm(1), false);
+        a.admit(key(), arm(2), 1_100);
+        assert_eq!(a.last_admitted(&key()), Some(arm(2)));
+        // A dropped copy never becomes the served arm.
+        a.admit(key(), arm(1), 1_200);
+        assert_eq!(a.last_admitted(&key()), Some(arm(2)));
+    }
+
+    /// The gauge sweep reports every known arm, including one serving nothing — a displaced arm whose
+    /// series simply stopped being written would read as still holding its pre-transfer markets.
+    #[test]
+    fn markets_held_all_reports_idle_arms_as_zero() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        a.admit(key(), arm(1), 1_000);
+        a.admit(other_market(), arm(1), 1_000);
+        a.admit(key(), arm(2), 1_100); // dropped, but arm(2) is now known to the venue
+        let mut all = a.markets_held_all();
+        all.sort_by_key(|(_, p, _)| format!("{p:?}"));
+        assert_eq!(
+            all,
+            vec![(Arc::from(VENUE), arm(1), 2), (Arc::from(VENUE), arm(2), 0)]
+        );
     }
 
     // ---- pooled matched-lead re-election ----

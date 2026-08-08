@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// The aggressor (taker) side of a trade. Serializes as `"buy"`/`"sell"`/`"unknown"` (the PROTOCOL.md
 /// wire values) — a fixed enum rather than an owned `String`, so building a trade allocates nothing
 /// for the side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Side {
     Buy,
@@ -342,7 +342,17 @@ pub struct BookAccumulator {
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
     source_ts_ns: u64,
+    /// Whether a producer re-baseline has been folded in, i.e. whether these levels are the market's
+    /// **whole** book rather than only what has changed since accumulation started. See
+    /// [`BookAccumulator::baselined`].
+    baselined: bool,
 }
+
+/// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
+/// datagram source, so a stream that never sets `last` must not grow this without limit; the cap sits
+/// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
+/// rather than silently dropping changes from a book still claimed to be complete.
+const MAX_PENDING_CHANGES: usize = 8192;
 
 impl BookAccumulator {
     pub fn new(symbol: Arc<str>) -> Self {
@@ -353,7 +363,16 @@ impl BookAccumulator {
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
+            baselined: false,
         }
+    }
+
+    /// Whether these levels are the market's complete book, so materializing them as a re-baseline is
+    /// honest. False until a producer re-baseline (a `Clear` of both sides) has been folded in: an
+    /// accumulator seeded mid-stream holds only the levels that have moved since, and publishing that
+    /// as `snapshot: true` would tell a consumer to discard the levels it is missing.
+    pub fn baselined(&self) -> bool {
+        self.baselined
     }
 
     /// Buffer one broadcast batch, and fold the whole logical event into the book on its `last`
@@ -378,17 +397,32 @@ impl BookAccumulator {
                 .iter()
                 .filter(|c| c.price.is_finite() && c.size.is_finite()),
         );
+        // An event that outgrows the buffer is abandoned rather than truncated: keeping the levels it
+        // did fold in while dropping the rest would leave a book still claiming to be complete.
+        if self.pending.len() > MAX_PENDING_CHANGES {
+            self.pending.clear();
+            self.baselined = false;
+            return;
+        }
         if !b.last {
             return;
         }
+        let mut cleared = (false, false);
         for c in std::mem::take(&mut self.pending) {
             let key = (c.price * 10f64.powi(8)).round() as i128;
             match (c.action, c.side) {
-                (BookAction::Clear, BookSide::Bid) => self.bids.clear(),
-                (BookAction::Clear, BookSide::Ask) => self.asks.clear(),
+                (BookAction::Clear, BookSide::Bid) => {
+                    self.bids.clear();
+                    cleared.0 = true;
+                }
+                (BookAction::Clear, BookSide::Ask) => {
+                    self.asks.clear();
+                    cleared.1 = true;
+                }
                 (BookAction::Clear, BookSide::Both) => {
                     self.bids.clear();
                     self.asks.clear();
+                    cleared = (true, true);
                 }
                 (BookAction::Delete, BookSide::Bid) => {
                     self.bids.remove(&key);
@@ -407,10 +441,19 @@ impl BookAccumulator {
                 (_, BookSide::Both) => {}
             }
         }
+        // A both-sided clear is the producer re-baselining: from here the levels are the whole book.
+        self.baselined |= cleared == (true, true);
         self.source_ts_ns = self.pending_ts_ns;
     }
 
+    /// The market's display label, as last seen on the wire.
+    pub fn symbol(&self) -> &Arc<str> {
+        &self.symbol
+    }
+
     /// Materialize the current state as a re-baseline: `clear` first, then every level best-first.
+    /// Stamps `snapshot`/`last`, so only call it when [`Self::baselined`] holds — otherwise it claims
+    /// completeness for a book that is missing every level which has not moved.
     pub fn to_book(&self, venue: &Arc<str>, channel: u32, instrument_id: u32) -> NormalizedBook {
         let mut changes = Vec::with_capacity(self.bids.len() + self.asks.len() + 1);
         changes.push(BookChange {

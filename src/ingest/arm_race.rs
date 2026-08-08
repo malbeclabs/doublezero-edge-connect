@@ -10,8 +10,16 @@
 //!
 //! A level update's cross-arm-common fields reduce to `(side, price, quantity)` on a coarse bounded
 //! price grid, so content matching them would mis-pair constantly. A trade's
-//! `(instrument, price, size, aggressor)` is near-unique, and trades are rare enough that a bounded
+//! `(symbol, price, size, aggressor)` is near-unique, and trades are rare enough that a bounded
 //! pending set is cheap.
+//!
+//! # Matching on normalized fields
+//!
+//! The pair key is the [`crate::model::NormalizedTrade`]'s own fields, so `symbol` — a truncated
+//! 16-byte wire field — stands in for the instrument id and can collide across instruments on a
+//! sharded feed. A mis-pair then needs two colliding-symbol instruments to trade at an identical
+//! price *and* size *and* aggressor side inside the window; venue scoping and the FIFO per signature
+//! still hold. That is the recorded cost of matching on normalized rather than wire fields.
 //!
 //! # Why the venue timestamp is not used
 //!
@@ -35,17 +43,20 @@ use std::{
     sync::Arc,
 };
 
-use crate::ingest::arbiter::Publisher;
+use crate::{ingest::arbiter::Publisher, model::Side};
 
-/// A trade's cross-arm identity. Raw fixed-point integers, never floats: both arms scale by the same
-/// instrument definition, so the raw values are bit-identical and compare exactly.
+/// A trade's cross-arm identity. Price and size key on `f64::to_bits` — **exact**, no rounding step,
+/// which holds only for arms sharing one decode path ([`ArmRace::on_trade`]'s precondition); a
+/// public-JSON decimal would need `arbiter::QuoteId`'s `10^-8` canonicalization instead. A non-finite
+/// or signed-zero price is unreachable from a fixed-point decode, and either way costs at most a
+/// lost sample.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Signature {
     venue: Arc<str>,
-    instrument_id: u32,
-    price_raw: i64,
-    qty_raw: u64,
-    aggressor: u8,
+    symbol: Arc<str>,
+    price_bits: u64,
+    size_bits: u64,
+    aggressor: Side,
 }
 
 /// One arm's unmatched arrival.
@@ -91,16 +102,32 @@ impl Match {
 /// lead by a wide margin, and stay far below the interval between repeats of one signature.
 const DEFAULT_WINDOW_NS: u64 = 5_000_000_000; // 5s
 
-/// Cap on unmatched arrivals held across all signatures. The multicast source is unauthenticated, so
+/// Cap on `order` entries, arrivals and tombstones alike. The multicast source is unauthenticated, so
 /// a forged stream of distinct trades must not grow this without limit; past the cap the oldest
 /// arrival is dropped, which costs a sample and nothing else.
 const MAX_PENDING: usize = 1 << 16;
 
+/// Cap on one signature's FIFO. The queue exists only to pair identical repeats inside one window in
+/// arrival order, so a legitimate one is a handful deep — and it is scanned per call under the shared
+/// arbiter lock, so one arm repeating one signature must not be able to lengthen it.
+const MAX_PER_SIGNATURE: usize = 8;
+
+/// Cap on distinct `(venue, arm)` counter keys. A [`Publisher`] is a spoofable source IP, so past the
+/// cap a new key is refused rather than grown into.
+const MAX_UNMATCHED_KEYS: usize = 1024;
+
 pub struct ArmRace {
     window_ns: u64,
     pending: HashMap<Signature, VecDeque<Arrival>>,
-    /// Arrival order across signatures, so both eviction paths are O(1) amortized rather than a scan.
+    /// Arrival order across signatures, so eviction is O(1) amortized rather than a scan. An entry
+    /// whose arrival left `pending` early (matched, or dropped by a cap) stays as a **tombstone**: a
+    /// later no-op eviction, which is why `order.len()` counts held memory and not live arrivals.
     order: VecDeque<(Signature, u64)>,
+    /// Live arrivals across all queues, tracked rather than derived so no path has to scan `order`.
+    live: usize,
+    /// Window evictions since the last drain. Only those: the cap paths are overload, not a one-sided
+    /// print, and merging them would blur what the counter means.
+    unmatched: HashMap<(Arc<str>, Publisher), u64>,
 }
 
 impl Default for ArmRace {
@@ -115,6 +142,8 @@ impl ArmRace {
             window_ns,
             pending: HashMap::new(),
             order: VecDeque::new(),
+            live: 0,
+            unmatched: HashMap::new(),
         }
     }
 
@@ -123,23 +152,26 @@ impl ArmRace {
     ///
     /// `recv_ns` must be our own receive clock (`recv_ts_ns`), the same clock for both arms — the
     /// whole measurement is the difference between two readings of it. Never a publisher-stamped time.
+    ///
+    /// Offer only arms that decode the same wire integers under the same instrument definition: the
+    /// pair key compares `price`/`size` bit-for-bit (see [`Signature`]).
     #[allow(clippy::too_many_arguments)]
     pub fn on_trade(
         &mut self,
         venue: &Arc<str>,
-        instrument_id: u32,
-        price_raw: i64,
-        qty_raw: u64,
-        aggressor: u8,
+        symbol: &Arc<str>,
+        price: f64,
+        size: f64,
+        aggressor: Side,
         arm: Publisher,
         recv_ns: u64,
     ) -> Option<Match> {
         self.evict_stale(recv_ns);
         let sig = Signature {
             venue: venue.clone(),
-            instrument_id,
-            price_raw,
-            qty_raw,
+            symbol: symbol.clone(),
+            price_bits: price.to_bits(),
+            size_bits: size.to_bits(),
             aggressor,
         };
         if let Some(q) = self.pending.get_mut(&sig) {
@@ -150,7 +182,7 @@ impl ArmRace {
                 if q.is_empty() {
                     self.pending.remove(&sig);
                 }
-                self.forget_one(&sig, peer.recv_ns);
+                self.live = self.live.saturating_sub(1); // its `order` entry is now a tombstone
                 return Some(Match {
                     venue: venue.clone(),
                     first: peer.arm,
@@ -163,14 +195,20 @@ impl ArmRace {
         None
     }
 
-    /// Unmatched arrivals still waiting.
+    /// Unmatched arrivals still waiting: the live count, not `order.len()` (tombstones included).
     pub fn pending_len(&self) -> usize {
-        self.order.len()
+        self.live
     }
 
-    /// Drop arrivals older than the window, returning how many were dropped per arm — the
-    /// "seen only on this arm" signal, which is a drop or a genuine one-sided print, and worth a
-    /// counter once a caller wires it.
+    /// Take the per-`(venue, arm)` window-eviction counts accumulated since the last drain — the
+    /// "seen only on this arm" signal, which is a drop or a genuine one-sided print. Accumulated
+    /// rather than returned by [`Self::evict_stale`], which [`Self::on_trade`] calls mid-burst.
+    pub fn drain_unmatched(&mut self) -> Vec<((Arc<str>, Publisher), u64)> {
+        std::mem::take(&mut self.unmatched).into_iter().collect()
+    }
+
+    /// Drop arrivals older than the window, returning how many were dropped per arm and adding them
+    /// to the [`Self::drain_unmatched`] accumulator.
     pub fn evict_stale(&mut self, now_ns: u64) -> Vec<(Publisher, usize)> {
         let mut dropped: HashMap<Publisher, usize> = HashMap::new();
         while let Some((sig, at)) = self.order.front() {
@@ -181,13 +219,24 @@ impl ArmRace {
             self.order.pop_front();
             if let Some(arm) = self.drop_arrival(&sig, at) {
                 *dropped.entry(arm).or_default() += 1;
+                self.record_unmatched(&sig.venue, arm);
             }
         }
         dropped.into_iter().collect()
     }
 
+    fn record_unmatched(&mut self, venue: &Arc<str>, arm: Publisher) {
+        let key = (venue.clone(), arm);
+        if let Some(n) = self.unmatched.get_mut(&key) {
+            *n += 1;
+        } else if self.unmatched.len() < MAX_UNMATCHED_KEYS {
+            self.unmatched.insert(key, 1);
+        }
+    }
+
     fn push(&mut self, sig: Signature, arrival: Arrival) {
-        // Bound first: a forged flood of distinct signatures must not grow either structure.
+        // Bound first: a forged flood of distinct signatures must not grow either structure. The cap
+        // is on `order`, so tombstones are counted and memory stays bounded regardless of matching.
         while self.order.len() >= MAX_PENDING {
             let Some((old_sig, old_at)) = self.order.pop_front() else {
                 break;
@@ -195,18 +244,13 @@ impl ArmRace {
             self.drop_arrival(&old_sig, old_at);
         }
         self.order.push_back((sig.clone(), arrival.recv_ns));
-        self.pending.entry(sig).or_default().push_back(arrival);
-    }
-
-    /// Remove the `order` entry for one arrival that was matched out of `pending`.
-    fn forget_one(&mut self, sig: &Signature, recv_ns: u64) {
-        if let Some(i) = self
-            .order
-            .iter()
-            .position(|(s, at)| s == sig && *at == recv_ns)
-        {
-            self.order.remove(i);
+        let q = self.pending.entry(sig).or_default();
+        if q.len() >= MAX_PER_SIGNATURE {
+            q.pop_front();
+            self.live = self.live.saturating_sub(1);
         }
+        q.push_back(arrival);
+        self.live += 1;
     }
 
     /// Remove the queued arrival matching `(sig, at)`, returning its arm if it was still there.
@@ -217,6 +261,7 @@ impl ArmRace {
         if q.is_empty() {
             self.pending.remove(sig);
         }
+        self.live = self.live.saturating_sub(1);
         Some(arm)
     }
 }
@@ -230,8 +275,17 @@ mod tests {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
+    /// Distinct arms past a single octet, for the counter-map cap.
+    fn arm_n(n: usize) -> Publisher {
+        Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, (n >> 8) as u8, n as u8)))
+    }
+
     fn venue() -> Arc<str> {
         Arc::from("Lashay")
+    }
+
+    fn sym() -> Arc<str> {
+        Arc::from("KXBTCPERP")
     }
 
     /// One trade, both arms: arm(1) 10us ahead.
@@ -240,7 +294,7 @@ mod tests {
     }
 
     fn trade(r: &mut ArmRace, v: &Arc<str>, a: Publisher, recv_ns: u64) -> Option<Match> {
-        r.on_trade(v, 41, 6_200, 150, 1, a, recv_ns)
+        r.on_trade(v, &sym(), 6_200.0, 150.0, Side::Buy, a, recv_ns)
     }
 
     #[test]
@@ -300,13 +354,13 @@ mod tests {
 
         // arm(2) is genuinely 10us faster on every one of ten trades, in true arrival order.
         for i in 0..10u64 {
-            let t = 1_000_000 * i;
+            let (t, px) = (1_000_000 * i, 6_200.0 + i as f64);
             assert_eq!(
-                r.on_trade(&v, 41, 6_200 + i as i64, 150, 1, arm(2), t),
+                r.on_trade(&v, &sym(), px, 150.0, Side::Buy, arm(2), t),
                 None
             );
             let m = r
-                .on_trade(&v, 41, 6_200 + i as i64, 150, 1, arm(1), t + 10_000)
+                .on_trade(&v, &sym(), px, 150.0, Side::Buy, arm(1), t + 10_000)
                 .expect("the pair matches");
             let leader = auth.venue_leader(&v).unwrap();
             let (challenger, lead) = m.lead_for(leader).expect("leader is in the pair");
@@ -369,29 +423,33 @@ mod tests {
     #[test]
     fn distinct_trades_do_not_match() {
         let v = venue();
-        for (id, px, qty, aggr) in [
-            (42u32, 6_200i64, 150u64, 1u8),
-            (41, 6_201, 150, 1),
-            (41, 6_200, 151, 1),
-            (41, 6_200, 150, 2),
+        let other: Arc<str> = Arc::from("KXETHPERP");
+        for (s, px, size, side) in [
+            (other, 6_200.0, 150.0, Side::Buy),
+            (sym(), 6_201.0, 150.0, Side::Buy),
+            (sym(), 6_200.0, 151.0, Side::Buy),
+            (sym(), 6_200.0, 150.0, Side::Sell),
         ] {
             let mut r = ArmRace::new(1_000_000_000);
-            r.on_trade(&v, 41, 6_200, 150, 1, arm(1), 1_000);
+            r.on_trade(&v, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
             assert_eq!(
-                r.on_trade(&v, id, px, qty, aggr, arm(2), 2_000),
+                r.on_trade(&v, &s, px, size, side, arm(2), 2_000),
                 None,
-                "id={id} px={px} qty={qty} aggr={aggr} must not pair"
+                "sym={s} px={px} size={size} side={side:?} must not pair"
             );
         }
     }
 
-    /// Two venues sharing an instrument id and a price never cross-match.
+    /// Two venues sharing a symbol and a price never cross-match.
     #[test]
     fn venues_do_not_cross_match() {
         let mut r = ArmRace::new(1_000_000_000);
         let (a, b): (Arc<str>, Arc<str>) = (Arc::from("Lashay"), Arc::from("Other"));
-        r.on_trade(&a, 41, 6_200, 150, 1, arm(1), 1_000);
-        assert_eq!(r.on_trade(&b, 41, 6_200, 150, 1, arm(2), 2_000), None);
+        r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
+        assert_eq!(
+            r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, arm(2), 2_000),
+            None
+        );
     }
 
     /// The pending set is bounded: the source is unauthenticated, so a flood of distinct trades must
@@ -400,14 +458,18 @@ mod tests {
     fn pending_arrivals_are_bounded() {
         let mut r = ArmRace::new(u64::MAX); // no time-based eviction, so only the cap can bound it
         let v = venue();
-        for i in 0..(MAX_PENDING as i64 + 500) {
-            r.on_trade(&v, 41, i, 150, 1, arm(1), 1_000);
+        for i in 0..(MAX_PENDING + 500) {
+            r.on_trade(&v, &sym(), i as f64, 150.0, Side::Buy, arm(1), 1_000);
         }
         assert_eq!(r.pending_len(), MAX_PENDING);
         assert!(
             r.pending.len() <= MAX_PENDING,
             "the signature map must be bounded too, got {}",
             r.pending.len()
+        );
+        assert!(
+            r.drain_unmatched().is_empty(),
+            "the cap path is overload, not a one-sided print"
         );
     }
 
@@ -417,19 +479,132 @@ mod tests {
     fn the_order_index_stays_consistent_with_the_queues() {
         let mut r = ArmRace::new(1_000_000_000);
         let v = venue();
-        for i in 0..50i64 {
-            r.on_trade(&v, 41, i, 150, 1, arm(1), 1_000 + i as u64);
+        for i in 0..50 {
+            r.on_trade(
+                &v,
+                &sym(),
+                i as f64,
+                150.0,
+                Side::Buy,
+                arm(1),
+                1_000 + i as u64,
+            );
         }
         // Match half of them out of the middle of the index.
-        for i in 0..25i64 {
-            assert!(r.on_trade(&v, 41, i, 150, 1, arm(2), 5_000).is_some());
+        for i in 0..25 {
+            assert!(r
+                .on_trade(&v, &sym(), i as f64, 150.0, Side::Buy, arm(2), 5_000)
+                .is_some());
         }
         assert_eq!(r.pending_len(), 25);
         let queued: usize = r.pending.values().map(|q| q.len()).sum();
         assert_eq!(queued, r.pending_len(), "order index and queues agree");
-        // And the survivors still evict cleanly.
+        // And the survivors still evict cleanly, tombstones included.
         r.evict_stale(u64::MAX / 2);
         assert_eq!(r.pending_len(), 0);
         assert!(r.pending.is_empty(), "no empty queues left behind");
+        assert!(r.order.is_empty(), "no tombstones left behind");
+    }
+
+    /// One arm repeating one signature must not lengthen its queue: it is scanned per call under the
+    /// shared arbiter lock, so an unbounded queue is a stall for every venue, not just a lost sample.
+    #[test]
+    fn a_repeated_signature_cannot_grow_its_queue() {
+        let mut r = ArmRace::new(u64::MAX); // no time-based eviction
+        let v = venue();
+        for i in 0..(MAX_PER_SIGNATURE * 100) {
+            trade(&mut r, &v, arm(1), 1_000 + i as u64);
+        }
+        assert_eq!(r.pending.len(), 1, "one signature");
+        assert_eq!(r.pending_len(), MAX_PER_SIGNATURE);
+        assert_eq!(
+            r.pending.values().next().map(|q| q.len()),
+            Some(MAX_PER_SIGNATURE)
+        );
+        assert!(
+            r.drain_unmatched().is_empty(),
+            "the cap path is overload, not a one-sided print"
+        );
+        // The retained arrivals are the newest, and still pair oldest-first.
+        let m = trade(&mut r, &v, arm(2), 9_000).expect("pairs the oldest retained");
+        assert_eq!(
+            m.delta_ns,
+            9_000 - (1_000 + (MAX_PER_SIGNATURE * 99) as u64)
+        );
+    }
+
+    /// The counter map is keyed on a spoofable source IP, so it must refuse new keys past its cap
+    /// while still counting the keys it already holds.
+    #[test]
+    fn the_unmatched_counter_map_is_bounded() {
+        let mut r = ArmRace::new(0); // every arrival is stale by the next call
+        let v = venue();
+        for n in 0..(MAX_UNMATCHED_KEYS + 8) {
+            r.on_trade(
+                &v,
+                &sym(),
+                n as f64,
+                150.0,
+                Side::Buy,
+                arm_n(n),
+                1_000 + n as u64,
+            );
+        }
+        // A second eviction for an arm already in the map, which must still be counted.
+        r.on_trade(&v, &sym(), 0.0, 150.0, Side::Buy, arm_n(0), 9_000_000);
+        r.evict_stale(9_000_001);
+
+        let got: HashMap<_, _> = r.drain_unmatched().into_iter().collect();
+        assert_eq!(
+            got.len(),
+            MAX_UNMATCHED_KEYS,
+            "new keys refused past the cap"
+        );
+        assert_eq!(
+            got.get(&(v, arm_n(0))),
+            Some(&2),
+            "a held key keeps counting"
+        );
+    }
+
+    /// Evictions are attributed per `(venue, arm)`, and a drain leaves the accumulator empty.
+    #[test]
+    fn unmatched_evictions_are_attributed_per_venue_and_arm() {
+        let mut r = ArmRace::new(1_000_000_000);
+        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("Lashay"), Arc::from("Other"));
+        r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
+        r.on_trade(&a, &sym(), 6_201.0, 150.0, Side::Buy, arm(1), 1_000);
+        r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, arm(2), 1_000);
+        r.evict_stale(2_000_000_000);
+
+        let got: HashMap<_, _> = r.drain_unmatched().into_iter().collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get(&(a, arm(1))), Some(&2));
+        assert_eq!(got.get(&(b, arm(2))), Some(&1));
+        assert!(r.drain_unmatched().is_empty(), "the drain is destructive");
+    }
+
+    /// A matched pair must not read as a one-sided print, or the counter measures trade volume.
+    #[test]
+    fn a_matched_pair_counts_as_nothing_unmatched() {
+        let (mut r, v) = race();
+        trade(&mut r, &v, arm(1), 1_000);
+        trade(&mut r, &v, arm(2), 11_000).expect("the pair matches");
+        r.evict_stale(u64::MAX / 2);
+        assert!(r.drain_unmatched().is_empty());
+    }
+
+    /// `on_trade` evicts internally, so a burst of trades performs most of the evictions. Those must
+    /// survive to the next drain rather than being discarded as they were.
+    #[test]
+    fn evictions_during_on_trade_still_reach_the_drain() {
+        let (mut r, v) = race();
+        trade(&mut r, &v, arm(1), 1_000);
+        // A later, distinct trade: this call evicts the stale arrival before queueing its own.
+        r.on_trade(&v, &sym(), 6_300.0, 150.0, Side::Buy, arm(2), 2_000_000_000);
+        assert_eq!(r.pending_len(), 1, "only the new arrival is waiting");
+
+        let got: HashMap<_, _> = r.drain_unmatched().into_iter().collect();
+        assert_eq!(got.get(&(v, arm(1))), Some(&1));
     }
 }
