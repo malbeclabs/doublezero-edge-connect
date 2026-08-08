@@ -11,9 +11,10 @@ sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it as full-state `depth`), and **Market-by-Price** (magic `0x4442`; the bridge
-reconstructs the price-aggregated book and re-serves it as the incremental `book` — no `FEEDS` row
-uses it yet). Each feed maps to one venue. The input (multicast/binary) is
-an implementation detail; the *only* external contract is the WebSocket output, fully specified in
+reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
+row selects it but stays inert until the group rename lands). Each feed maps to one venue. The
+input (multicast/binary) is an implementation detail; the *only* external contract is the
+WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
 consumer is not part of the protocol.
 
@@ -126,7 +127,13 @@ Modules are grouped by role under `src/`:
   another venue (sibling-protocol rows are added once their live endpoints are known). `--feed
   <venue>` selects a subset of venues and `--publisher-port <port>` narrows the publishers within
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
-  the WS.
+  the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
+  venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
+  ride separate groups with separate codes. The two **Lashay** perps rows (`lashay-1` TOB
+  `233.84.178.3:7576/7577`, `lashay-2` MBP `233.84.178.4:31000/41000/51000`, both `Sticky`, both
+  claiming the tape) are exactly that case; ⚠️ they are **inert until the upstream group rename
+  lands** — `doublezero status` reports no matching code, so the reconciler never activates them and
+  there is no error to see.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
@@ -139,7 +146,13 @@ Modules are grouped by role under `src/`:
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
   (spawn/abort). Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
-  one `static_desired()`.
+  one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
+  per venue (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
+  `apply_feeds` publishes the result onto a `TapeOwner` (`Arc<AtomicBool>`) each processor reads per
+  print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
+  and reference data whenever a *peer* feed's subscription changed. The flag is stored **with** the
+  `JoinHandle` in one `active` map so it cannot outlive its receiver on either the abort or the reap
+  path. Changes are counted by `dz_tape_owner_changes_total{venue}`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
@@ -166,8 +179,8 @@ Modules are grouped by role under `src/`:
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → window, `book` → the single-arm authority gate below,
-  `Instrument` → a rate limit on the precision pair per
+  floor, depth → depth floor, trades → the per-venue **tape leader** then the window, `book` → the
+  single-arm authority gate below, `Instrument` → a rate limit on the precision pair per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
@@ -180,7 +193,18 @@ Modules are grouped by role under `src/`:
   `Contest{winner, lead_ns}` drops the losing cross-source copy and records the head-to-head
   lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
-  plain collapse. `emit` increments **pre-resolved per-venue metric children** (cached in the
+  plain collapse. The **tape leader** (`tape_leader`, `Sticky` venues only) is the arm-level twin of
+  the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
+  sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
+  venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
+  **id-independent**. First arm to print leads (a TOB-only deployment carries no `book` traffic, so
+  `venue_leader()` is `None` forever and electing first would mute the tape), the book-elected arm
+  takes over immediately (arm identity is shared across a venue's rows — one source IP per publisher
+  host, both protocols), and a silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS` so an elected
+  arm with a dead trade stream can't mute it either. The peer's prints are dropped
+  (`dz_trades_dropped_total`); transfers are `dz_tape_arm_transfers_total`. `no_id_owner` is untouched:
+  it is the `Coordinated` guard, disjoint by mode.
+  `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`
   label lookup.
   Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share
@@ -245,8 +269,8 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the venue's eight
   admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
-  non-negative). Nothing exercises this live yet: no MBP processor (#104) and no `FEEDS` row of that kind,
-  so no running process behaves differently.
+  non-negative). Nothing exercises this live yet: the only `FEEDS` row of that kind (`lashay-2`) stays
+  inert until the group rename lands, so no running process behaves differently.
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -328,9 +352,10 @@ Modules are grouped by role under `src/`:
   (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
   against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
   a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
-  stay offset-test-only. `FeedKind::MarketByPrice` decodes it, but no `FEEDS` row selects that kind
-  yet. It is the one codec that enforces **exact** body-length equality per type rather than
-  bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's, so a lenient decode would
+  stay offset-test-only. `FeedKind::MarketByPrice` decodes it; the `lashay-2` row selects it but
+  stays inert until the group rename lands. It is the one codec that enforces **exact** body-length
+  equality per type rather than bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's,
+  so a lenient decode would
   read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
   therefore also the one that rejects an unimplemented `SCHEMA_VERSION` itself rather than leaving
   it to the shared walker: without that gate the length rule would silently reject a v2 frame whose
@@ -390,10 +415,12 @@ Modules are grouped by role under `src/`:
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
-  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book, and it
-  is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the single-arm
+  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book, and
+  it is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the
+  single-arm
   authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-arm
-  accumulators; `MbpProcessor` emits `book` but no `FEEDS` row activates it.
+  accumulators; `MbpProcessor` emits `book`, and the `lashay-2` row selects it but stays inert
+  until the group rename lands.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.

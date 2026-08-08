@@ -107,6 +107,11 @@ struct in [`src/main.rs`](src/main.rs); per-feature config lives in the [docs](d
 > is subscribed** — so a shreds-only host serves no WS (and won't collide with an existing `:8081`
 > service) with no config. Running from source without the `doublezero` CLI, gating falls open to
 > the static always-on behaviour; `DZ_SUBSCRIPTION_GATING_DISABLE=1` forces that model explicitly.
+>
+> A venue whose feeds ride separate groups is gated per group, and its `trade` tape **follows
+> whichever of them is active** — so a host subscribed only to a venue's depth feed still gets a tape,
+> and the pick moves without restarting the receiver that keeps it. See
+> [Input sources](docs/input-sources.md).
 
 > **Logging defaults.** Unset, `RUST_LOG` defaults to `warn,doublezero_edge_connect=info`: the
 > bridge's own startup/operational lines stay at `info` while noisy dependency chatter is held to

@@ -361,6 +361,17 @@ protocol's intent. All three are publisher-side, not decoder-side.
    `EndOfSession` have. Three are exceptional events and a quiet window explaining their absence is
    expected; `BatchBoundary` is not, so confirm whether the publisher emits it at all.
 
+### Unmeasured: does either perps top-of-book arm stamp `trade_id == 0`?
+
+Open. `examples/pcap2frames.rs --protocol tob` now reports `zero_id_trades=` alongside `trades=`, and
+`--src` already selects one publisher, so one run per source IP against a perps top-of-book capture
+answers it per arm: always, never, or sometimes. Record the split here when it is run.
+
+It answers only that. Whether the two arms stamp *different real* ids for the same fill needs
+content-matched id sets across arms and is not measured by this. The tape gate is id-independent for
+exactly that reason, so the number does not gate the design either way — it is on the record so a
+later argument to simplify the gate is a decision rather than a guess.
+
 Also worth knowing: the two arms' captures do **not** overlap in time (the older feed's are ~16s
 apart), so no two-arm interleaved fixture can be cut from them — a future capture should run both
 publishers simultaneously. `--combined-with` is not implemented for `--protocol mbp` either.
