@@ -12,12 +12,15 @@
 mod common;
 
 use common::{assertions, replay as replay_helper};
-use doublezero_edge_connect::ingest::{
-    arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
-    codec, codec_mbo,
-    feeds::{FeedKind, FEEDS},
-    processor::{MboProcessor, TobProcessor},
-    receiver::{FrameCtx, FrameProcessor, PortRole},
+use doublezero_edge_connect::{
+    ingest::{
+        arbiter::{Arbiter, Publisher, SharedArbiter, TRADE_DEDUP_WINDOW},
+        codec, codec_mbo,
+        feeds::{FeedKind, FEEDS},
+        processor::{MboProcessor, TobProcessor},
+        receiver::{FrameCtx, FrameProcessor, PortRole},
+    },
+    model::{BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook},
 };
 use serde_json::Value;
 use std::{
@@ -601,6 +604,141 @@ fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
             )
         })
         .collect()
+}
+
+const BOOK_VENUE: &str = "BookArmsInterleave";
+const BOOK_CHANNEL: u32 = 2;
+const BOOK_INSTRUMENT: u32 = 41;
+
+fn arm(n: u8) -> Publisher {
+    Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+}
+
+fn level(side: BookSide, price: f64, size: f64) -> BookChange {
+    BookChange {
+        action: BookAction::Update,
+        side,
+        price,
+        size,
+    }
+}
+
+/// One `book` batch for the single market under test. `recv_ns` is the authority's arrival clock.
+fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage {
+    FeedMessage::Book(NormalizedBook {
+        venue: BOOK_VENUE.into(),
+        symbol: "BTC-PERP".into(),
+        channel: BOOK_CHANNEL,
+        instrument_id: BOOK_INSTRUMENT,
+        changes,
+        snapshot: false,
+        last,
+        source_ts_ns: recv_ns,
+        recv_ts_ns: recv_ns,
+        kernel_rx_ts_ns: 0,
+        ws_send_ts_ns: 0,
+    })
+}
+
+/// One arm's `(changes, last)` batch stream, parametrized on the arm's price/size base so two arms
+/// built from it publish divergent level sets. Batches 2 and 3 are one logical event.
+fn arm_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
+    vec![
+        (
+            vec![
+                level(BookSide::Bid, px, sz),
+                level(BookSide::Ask, px + 1.0, sz + 2.0),
+            ],
+            true,
+        ),
+        (vec![level(BookSide::Bid, px - 0.5, sz - 2.0)], false),
+        (
+            vec![
+                level(BookSide::Ask, px + 1.5, sz - 3.0),
+                BookChange {
+                    action: BookAction::Delete,
+                    side: BookSide::Bid,
+                    price: px,
+                    size: 0.0,
+                },
+            ],
+            true,
+        ),
+        (vec![level(BookSide::Bid, px - 0.5, sz - 1.0)], true),
+    ]
+}
+
+fn drain_books(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> Vec<NormalizedBook> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if let FeedMessage::Book(b) = &*m {
+            out.push(b.clone());
+        }
+    }
+    out
+}
+
+/// The single-arm authority gate for the incremental `book` product. Two arms mirror one venue and
+/// their per-instrument delta series are unrelated by construction, so interleaving both on one wire
+/// stream corrupts a consumer's book while every per-arm sequence check the producer ran still passes.
+/// Pinned: only the elected arm's batches reach the wire, and a `BookAccumulator` fed from the drained
+/// wire messages alone reproduces that arm's level set exactly. Against the pre-gate undeduped
+/// passthrough both fail — all eight batches go out, the challenger's levels enter the consumer's book,
+/// and its `last: false` batch folds into the leader's logical event.
+#[test]
+fn interleaved_book_arms_publish_one_coherent_stream() {
+    fn clear_both() -> BookChange {
+        BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+        }
+    }
+
+    let (tx, mut rx) = broadcast::channel(64);
+    let mut arb = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+    let (leader, challenger) = (arm_batches(100.0, 5.0), arm_batches(200.0, 50.0));
+    assert_ne!(
+        leader, challenger,
+        "identical arms would pass with the gate removed"
+    );
+
+    // Arm-by-arm, arrivals microseconds apart: past the 2s `leader_timeout_ns` authority would
+    // legitimately transfer on silence.
+    for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
+        let t = 1_000 + i as u64 * 2_000;
+        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1));
+        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2));
+    }
+
+    // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer
+    // re-baseline, so a bare `clear` leads the stream. Everything after it is the leader's, verbatim.
+    let published = drain_books(&mut rx);
+    let (first, rest) = published.split_first().expect("the re-baseline");
+    assert_eq!(first.changes, vec![clear_both()]);
+    assert_eq!(
+        rest.iter()
+            .map(|b| (b.changes.clone(), b.last))
+            .collect::<Vec<_>>(),
+        leader,
+        "the wire must carry the elected arm's batches verbatim and none of the challenger's"
+    );
+
+    let mut acc = BookAccumulator::new(published[0].symbol.clone());
+    for b in &published {
+        acc.apply(b);
+    }
+    let full = acc.to_book(&BOOK_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+    assert_eq!(
+        full.changes[1..].to_vec(), // [0] is the re-baseline `clear`
+        vec![
+            level(BookSide::Bid, 99.5, 4.0),
+            level(BookSide::Ask, 101.0, 7.0),
+            level(BookSide::Ask, 101.5, 2.0),
+        ],
+        "a consumer applying only what we published must hold the elected arm's book"
+    );
 }
 
 /// True if the frame carries a quote for `id` (used to build the DOGE-only subset; a TOB frame

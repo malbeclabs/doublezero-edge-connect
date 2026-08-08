@@ -3818,22 +3818,20 @@ mod tests {
     #[test]
     fn mbp_book_health_reaches_the_authority() {
         let (arbiter, _rx, instruments) = mbp_harness();
-        lock(&arbiter).set_authority(crate::ingest::authority::AuthorityConfig {
-            leader_timeout_ns: 1_000_000_000,
-            sample_interval_ns: 1_000_000_000,
-            transfer_margin_ns: 1_000,
-            transfer_win_rate: 0.6,
-            min_window_samples: 10,
-        });
+        lock(&arbiter).set_authority(
+            crate::ingest::authority::AuthorityConfig {
+                leader_timeout_ns: 1_000_000_000,
+                sample_interval_ns: 1_000_000_000,
+                transfer_margin_ns: 1_000,
+                transfer_win_rate: 0.6,
+                min_window_samples: 10,
+            },
+            5_000_000_000,
+        );
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 3, 0, &[41]);
         let market = (crate::model::venue_arc("TV"), 3u32, 41u32);
         let arm = Publisher::Edge(TEST_PUB);
-        let healthy = |a: &SharedArbiter| {
-            lock(a)
-                .authority()
-                .expect("configured")
-                .healthy(&market, arm)
-        };
+        let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, arm);
 
         proc.on_datagram(
             &mbp_wire::frame(3, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
@@ -4033,13 +4031,16 @@ mod tests {
     #[test]
     fn mbp_books_map_is_bounded_under_instrument_flood() {
         let (arbiter, _rx, instruments) = mbp_harness();
-        lock(&arbiter).set_authority(crate::ingest::authority::AuthorityConfig {
-            leader_timeout_ns: 1_000_000_000,
-            sample_interval_ns: 1_000_000_000,
-            transfer_margin_ns: 1_000,
-            transfer_win_rate: 0.6,
-            min_window_samples: 10,
-        });
+        lock(&arbiter).set_authority(
+            crate::ingest::authority::AuthorityConfig {
+                leader_timeout_ns: 1_000_000_000,
+                sample_interval_ns: 1_000_000_000,
+                transfer_margin_ns: 1_000,
+                transfer_win_rate: 0.6,
+                min_window_samples: 10,
+            },
+            5_000_000_000,
+        );
         let mut proc = MbpProcessor::new(false);
         let ids: Vec<u32> = (0..(MAX_PRICE_BOOKS as u32 + 50)).collect();
         // One burst per 200 definitions keeps each frame's message count inside the header's u8.
@@ -4079,7 +4080,7 @@ mod tests {
             "the oldest book was evicted"
         );
         assert!(
-            !lock(&arbiter).authority().expect("configured").healthy(
+            !lock(&arbiter).authority().healthy(
                 &(crate::model::venue_arc("TV"), 0u32, 0u32),
                 Publisher::Edge(TEST_PUB)
             ),

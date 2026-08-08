@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::{
     metrics::metrics,
-    model::{now_ns, DepthSnapshot, FeedMessage, InstrumentSnapshot},
+    model::{now_ns, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
 };
 
 /// A message serialized **once** for all clients: the JSON text plus the fields the per-client
@@ -199,6 +199,7 @@ pub async fn serve(
     tx: broadcast::Sender<Arc<FeedMessage>>,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
+    books: BookSnapshot,
     cfg: WsConfig,
 ) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
@@ -264,6 +265,7 @@ pub async fn serve(
         let rx = prepared_tx.subscribe();
         let instruments = instruments.clone();
         let depth = depth.clone();
+        let books = books.clone();
         let cfg = cfg.clone();
         // The guard releases the slot + gauge on drop, so the accounting is correct even if
         // `serve_client` panics rather than returning.
@@ -272,7 +274,7 @@ pub async fn serve(
         };
         tokio::spawn(async move {
             let _guard = guard;
-            if let Err(e) = serve_client(stream, rx, instruments, depth, cfg).await {
+            if let Err(e) = serve_client(stream, rx, instruments, depth, books, cfg).await {
                 warn!(%peer, "client ended: {e}");
             }
         });
@@ -284,7 +286,8 @@ fn text(value: serde_json::Value) -> WsMessage {
 }
 
 /// Replay current full state matching `subs` (empty = everything): instrument definitions first so
-/// precision is known before any book, then the latest `depth` per `(venue, symbol)`.
+/// precision is known before any book, then the latest `depth` per `(venue, symbol)` and a `book`
+/// re-baseline per `(venue, channel, instrument_id)`.
 ///
 /// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
 /// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
@@ -293,6 +296,7 @@ async fn replay_scoped<W>(
     write: &mut W,
     instruments: &InstrumentSnapshot,
     depth: &DepthSnapshot,
+    books: &BookSnapshot,
     subs: &[SubFilter],
 ) -> Result<()>
 where
@@ -307,7 +311,7 @@ where
                 .iter()
                 .any(|f| f.matches(venue, Some(symbol), channel, kind))
     };
-    // Both locks are taken and released before any `await`: a `std::sync::MutexGuard` held across an
+    // Every lock is taken and released before any `await`: a `std::sync::MutexGuard` held across an
     // await point does not compile here, and would be a latency bug regardless.
     let snapshot: Vec<FeedMessage> = {
         let guard = crate::model::lock(instruments);
@@ -318,7 +322,7 @@ where
             .map(FeedMessage::Instrument)
             .collect()
     };
-    let books: Vec<FeedMessage> = {
+    let depths: Vec<FeedMessage> = {
         let guard = crate::model::lock(depth);
         guard
             .values()
@@ -327,7 +331,18 @@ where
             .map(FeedMessage::Depth)
             .collect()
     };
-    for m in snapshot.into_iter().chain(books) {
+    let rebaselines: Vec<FeedMessage> = {
+        let guard = crate::model::lock(books);
+        guard
+            .iter()
+            // A market accumulated mid-stream holds only the levels that have moved since, so
+            // replaying it as full state would tell the client to discard the ones it never saw.
+            .filter(|(_, acc)| acc.baselined())
+            .filter(|((venue, channel, _), acc)| pass(venue, acc.symbol(), Some(*channel), "book"))
+            .map(|((venue, channel, id), acc)| FeedMessage::Book(acc.to_book(venue, *channel, *id)))
+            .collect()
+    };
+    for m in snapshot.into_iter().chain(depths).chain(rebaselines) {
         write
             .send(WsMessage::Text(serde_json::to_string(&m)?.into()))
             .await?;
@@ -340,6 +355,7 @@ async fn serve_client(
     mut rx: broadcast::Receiver<Arc<PreparedFrame>>,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
+    books: BookSnapshot,
     cfg: WsConfig,
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
@@ -348,11 +364,11 @@ async fn serve_client(
     // Per-client state. Empty `subs` = firehose (receive every venue/symbol).
     let mut subs: Vec<SubFilter> = Vec::new();
 
-    // Replay definitions (precision first) then the latest full-state `depth` per (venue, symbol),
-    // so a mid-stream consumer is bootstrapped immediately instead of waiting for the next periodic
-    // book. (Quotes/trades are not replayed - the next quote is itself full state.) `subs` is empty
-    // here, so this connect-time replay is unfiltered.
-    replay_scoped(&mut write, &instruments, &depth, &subs).await?;
+    // Replay definitions (precision first) then current book state, so a mid-stream consumer is
+    // bootstrapped immediately instead of waiting for the next periodic book. (Quotes/trades are not
+    // replayed - the next quote is itself full state.) `subs` is empty here, so this connect-time
+    // replay is unfiltered.
+    replay_scoped(&mut write, &instruments, &depth, &books, &subs).await?;
 
     let mut last_seen = Instant::now();
     let mut win_start = Instant::now();
@@ -400,7 +416,7 @@ async fn serve_client(
                                 // (taken under the mutex the ingest emit path shares) at the inbound
                                 // rate limit without ever reaching `max_subs`.
                                 if added {
-                                    replay_scoped(&mut write, &instruments, &depth, std::slice::from_ref(&subscription)).await?;
+                                    replay_scoped(&mut write, &instruments, &depth, &books, std::slice::from_ref(&subscription)).await?;
                                 }
                             }
                         }
@@ -456,7 +472,13 @@ async fn serve_client(
                         write.send(WsMessage::Text(frame.payload.clone())).await?;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => { metrics().ws_client_lagged.inc(); warn!("subscriber lagged, dropped {n}"); }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    metrics().ws_client_lagged.inc();
+                    warn!("subscriber lagged, dropped {n}");
+                    // `book` is incremental: a dropped batch leaves this client's book permanently
+                    // wrong, so re-baseline it. (`quote`/`depth` self-heal on the next message.)
+                    replay_scoped(&mut write, &instruments, &depth, &books, &subs).await?;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         }
@@ -479,7 +501,10 @@ mod tests {
     use super::{serve, SubFilter, WsConfig, WsMessage};
     use crate::{
         metrics::metrics,
-        model::{FeedMessage, NormalizedInstrument, NormalizedQuote},
+        model::{
+            BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook,
+            NormalizedInstrument, NormalizedQuote,
+        },
     };
 
     fn filter(json: &str) -> SubFilter {
@@ -585,7 +610,6 @@ mod tests {
     #[test]
     fn prepare_populates_the_channel_for_book_and_instrument() {
         use super::prepare;
-        use crate::model::{BookAction, BookChange, BookSide, NormalizedBook};
         let b = FeedMessage::Book(NormalizedBook {
             venue: "Lashay".into(),
             symbol: "KXBTCPERP".into(),
@@ -691,7 +715,8 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+        let books = Arc::new(Mutex::new(HashMap::new()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -754,7 +779,8 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+        let books = Arc::new(Mutex::new(HashMap::new()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws1, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -839,7 +865,8 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+        let books = Arc::new(Mutex::new(HashMap::new()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -955,7 +982,14 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+        let srv = tokio::spawn(serve(
+            listener,
+            tx.clone(),
+            instruments,
+            depth,
+            Arc::new(Mutex::new(HashMap::new())),
+            cfg,
+        ));
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -1010,6 +1044,344 @@ mod tests {
             None,
             "channel 3's definition must not be replayed for a channel 2 subscription"
         );
+
+        srv.abort();
+    }
+
+    fn level_update(side: BookSide, price: f64, size: f64) -> BookChange {
+        BookChange {
+            action: BookAction::Update,
+            side,
+            price,
+            size,
+        }
+    }
+
+    fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
+        NormalizedBook {
+            venue: "Lashay".into(),
+            symbol: symbol.into(),
+            channel: 0,
+            instrument_id: 0,
+            changes,
+            snapshot: false,
+            last,
+            source_ts_ns: 7,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// A market whose levels are its whole book: a producer re-baseline (`Clear`-led), folded from a
+    /// two-batch logical event (the first batch is not `last`, so only the pair together is replayed).
+    fn accumulator(symbol: &str, bid: f64, ask: f64) -> BookAccumulator {
+        let mut acc = BookAccumulator::new(symbol.into());
+        acc.apply(&book_batch(
+            symbol,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                },
+                level_update(BookSide::Bid, bid, 10.0),
+            ],
+            false,
+        ));
+        acc.apply(&book_batch(
+            symbol,
+            vec![level_update(BookSide::Ask, ask, 20.0)],
+            true,
+        ));
+        acc
+    }
+
+    /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
+    /// the caller for the lifetime of the test.
+    async fn spawn_server(
+        instruments: HashMap<(Arc<str>, Arc<str>), NormalizedInstrument>,
+        books: HashMap<(Arc<str>, u32, u32), BookAccumulator>,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        broadcast::Sender<std::sync::Arc<FeedMessage>>,
+        std::net::SocketAddr,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let srv = tokio::spawn(serve(
+            listener,
+            tx.clone(),
+            Arc::new(Mutex::new(instruments)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(books)),
+            cfg,
+        ));
+        (srv, tx, addr)
+    }
+
+    /// The next text frame, skipping the server's heartbeat Pings.
+    async fn next_frame<S>(ws: &mut S, within: Duration) -> Option<String>
+    where
+        S: futures_util::StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        timeout(within, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("stream ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    fn parse_book(frame: &str) -> NormalizedBook {
+        match serde_json::from_str(frame).expect("frame parses") {
+            FeedMessage::Book(b) => b,
+            other => panic!("expected a book frame, got {other:?}"),
+        }
+    }
+
+    /// A connecting client is bootstrapped with the accumulated `book` state as a re-baseline: a
+    /// `Clear`/`Both` leading the complete level set, best-first, marked `last`.
+    #[tokio::test]
+    #[serial]
+    async fn connect_replays_the_accumulated_book_rebaseline() {
+        let mut books = HashMap::new();
+        books.insert(
+            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed book");
+        let b = parse_book(&frame);
+        assert_eq!(
+            (&*b.symbol, b.channel, b.instrument_id),
+            ("KXBTCPERP", 2, 41)
+        );
+        assert!(b.snapshot && b.last, "a re-baseline is a complete event");
+        assert_eq!(b.changes[0].action, BookAction::Clear);
+        assert_eq!(b.changes[0].side, BookSide::Both);
+        assert_eq!(
+            b.changes[1..],
+            [
+                level_update(BookSide::Bid, 0.61, 10.0),
+                level_update(BookSide::Ask, 0.63, 20.0),
+            ]
+        );
+
+        srv.abort();
+    }
+
+    /// A `{"channel":N}` subscribe replays only that channel's markets — the reason `replay_scoped`
+    /// passes each message's own channel to the filter instead of `None`.
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_scopes_the_book_replay_by_channel() {
+        let mut books = HashMap::new();
+        books.insert(
+            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        books.insert(
+            (Arc::<str>::from("Lashay"), 3u32, 7u32),
+            accumulator("KXETHPERP", 0.41, 0.43),
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Connect-time replay is unfiltered: both markets arrive.
+        for _ in 0..2 {
+            next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed book");
+        }
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":3}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("scoped book replay"),
+        );
+        assert_eq!((b.channel, b.instrument_id), (3, 7));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "channel 2 must not be replayed for a channel 3 subscription"
+        );
+
+        srv.abort();
+    }
+
+    /// Precision before price: the `instrument` definition is replayed ahead of the market's `book`.
+    #[tokio::test]
+    #[serial]
+    async fn instrument_is_replayed_before_the_book() {
+        let mut defs = HashMap::new();
+        defs.insert(
+            (Arc::<str>::from("Lashay"), Arc::<str>::from("KXBTCPERP")),
+            NormalizedInstrument {
+                venue: "Lashay".into(),
+                symbol: "KXBTCPERP".into(),
+                channel: 2,
+                instrument_id: 41,
+                price_exponent: -2,
+                qty_exponent: -2,
+            },
+        );
+        let mut books = HashMap::new();
+        books.insert(
+            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, _tx, addr) = spawn_server(defs, books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let first = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed instrument");
+        assert!(
+            first.contains(r#""type":"instrument""#) && first.contains("KXBTCPERP"),
+            "definition must arrive first, got {first}"
+        );
+        let second = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed book");
+        assert_eq!(parse_book(&second).channel, 2);
+
+        srv.abort();
+    }
+
+    /// Only a re-baselined market is bootstrapped. One accumulated mid-stream holds just the levels
+    /// that have moved since, and `to_book` stamps `snapshot: true` — replaying it would tell the
+    /// client to discard the rest of the book. Such a client waits for the producer's next
+    /// re-baseline, as it did before the book replay existed.
+    #[tokio::test]
+    #[serial]
+    async fn mid_stream_markets_are_not_replayed() {
+        let mut mid_stream = BookAccumulator::new("KXETHPERP".into());
+        mid_stream.apply(&book_batch(
+            "KXETHPERP",
+            vec![level_update(BookSide::Bid, 0.41, 5.0)],
+            true,
+        ));
+        assert!(!mid_stream.baselined(), "no Clear was folded in");
+
+        let mut books = HashMap::new();
+        books.insert((Arc::<str>::from("Lashay"), 3u32, 7u32), mid_stream);
+        books.insert(
+            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed book"),
+        );
+        assert_eq!((b.channel, b.instrument_id), (2, 41));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "a market with no re-baseline must not be replayed as full state"
+        );
+
+        srv.abort();
+    }
+
+    /// A client that lagged is re-baselined rather than left holding a book missing a batch. The lag
+    /// is deterministic: the receiver is overflowed before `serve_client` first polls it, so the very
+    /// first `recv` returns `Lagged`.
+    #[tokio::test]
+    async fn a_lagging_client_is_rebaselined() {
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+
+        let mut books = HashMap::new();
+        books.insert(
+            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Connect replay, the re-baseline the lag triggers, then the frame that survived the overflow.
+        for expected in ["connect replay", "re-baseline after lag"] {
+            let frame = next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect(expected);
+            assert_eq!(parse_book(&frame).instrument_id, 41, "{expected}");
+        }
+        let quote = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("surviving quote");
+        assert!(quote.contains(r#""type":"quote""#), "got {quote}");
 
         srv.abort();
     }

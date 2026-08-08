@@ -262,7 +262,7 @@ A batch of **incremental** price-level changes for one instrument, derived in th
 
 **Gap detection is the producer's job.** The producer runs the upstream feed's snapshot+delta recovery internally, per publisher, and re-serves only sequences it has verified as contiguous. There are no sequence numbers on the wire and a consumer needs no gap machinery of its own: a recovery surfaces as a re-baseline.
 
-**One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed. The producer elects one authoritative publisher per market and republishes only its stream, so a consumer sees one coherent book and never has to merge two. A failover surfaces as a re-baseline.
+**One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed. The producer elects one authoritative publisher per market and republishes only its stream, so a consumer sees one coherent book and never has to merge two. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow. A consumer that honors `clear` therefore needs nothing else in either case: it is never told which publisher it is reading and never has to detect the change.
 
 ### `status`
 

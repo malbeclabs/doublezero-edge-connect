@@ -220,7 +220,7 @@ struct Args {
     #[arg(
         long = "arb-sample-interval-secs",
         env = "DZ_ARB_SAMPLE_INTERVAL_SECS",
-        default_value_t = 300
+        default_value_t = ARB.sample_interval_ns / 1_000_000_000
     )]
     arb_sample_interval_secs: u64,
 
@@ -228,7 +228,7 @@ struct Args {
     #[arg(
         long = "arb-transfer-margin-us",
         env = "DZ_ARB_TRANSFER_MARGIN_US",
-        default_value_t = 1000
+        default_value_t = ARB.transfer_margin_ns / 1_000
     )]
     arb_transfer_margin_us: u64,
 
@@ -237,7 +237,7 @@ struct Args {
     #[arg(
         long = "arb-transfer-win-rate",
         env = "DZ_ARB_TRANSFER_WIN_RATE",
-        default_value_t = 0.8,
+        default_value_t = ARB.transfer_win_rate,
         value_parser = parse_win_rate
     )]
     arb_transfer_win_rate: f64,
@@ -248,7 +248,7 @@ struct Args {
     #[arg(
         long = "arb-leader-timeout-secs",
         env = "DZ_ARB_LEADER_TIMEOUT_SECS",
-        default_value_t = 2
+        default_value_t = ARB.leader_timeout_ns / 1_000_000_000
     )]
     arb_leader_timeout_secs: u64,
 
@@ -257,11 +257,26 @@ struct Args {
     #[arg(
         long = "arb-min-window-samples",
         env = "DZ_ARB_MIN_WINDOW_SAMPLES",
-        default_value_t = 32,
+        default_value_t = ARB.min_window_samples as u64,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     arb_min_window_samples: u64,
+
+    /// Seconds an arm's trade waits for the peer arm's copy of the same print before it counts as
+    /// unmatched. Must exceed the worst plausible inter-arm lead and stay well under the interval
+    /// between repeats of one identical trade.
+    #[arg(
+        long = "arb-match-window-secs",
+        env = "DZ_ARB_MATCH_WINDOW_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_match_window_secs: u64,
 }
+
+/// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
+/// the ones `--help` advertises cannot drift apart.
+const ARB: ingest::authority::AuthorityConfig = ingest::authority::AuthorityConfig::DEFAULT;
 
 /// A win rate outside `0.0..=1.0` silently disables one of the two transfer conditions (above 1.0
 /// no challenger ever clears it, below 0.0 every one does), and `NaN` compares false against both.
@@ -402,8 +417,9 @@ async fn main() -> Result<()> {
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-    // Single-arm authority tunables for `Sticky` venues, validated here at startup and handed to the
-    // arbiter so the market-by-price processor's per-market health reports have somewhere to land.
+    let books: model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    // Single-arm authority tunables for `Sticky` venues, plus the cross-arm matcher's pairing window,
+    // validated here at startup and handed to the arbiter.
     let authority_cfg = ingest::authority::AuthorityConfig {
         leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
         sample_interval_ns: args.arb_sample_interval_secs.saturating_mul(1_000_000_000),
@@ -421,8 +437,30 @@ async fn main() -> Result<()> {
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
         a.set_depth_replay(depth.clone());
-        a.set_authority(authority_cfg);
+        a.set_book_replay(books.clone());
+        a.set_authority(
+            authority_cfg,
+            args.arb_match_window_secs.saturating_mul(1_000_000_000),
+        );
         Arc::new(Mutex::new(a))
+    };
+
+    // The arm sampler: closes each elapsed re-election window (a margin transfer moves venue
+    // authority here), refreshes the O(markets × arms) gauges and drains the matcher's unmatched
+    // counts. Off the emit path entirely, so a slow sweep never touches ingest latency.
+    let sampler = {
+        let arbiter = arbiter.clone();
+        // A fraction of the window, not the window itself: the authority closes a window only once
+        // `sample_interval_ns` has really elapsed, so ticking at exactly that period lets ordinary
+        // scheduling jitter push a verdict a whole window late.
+        let period = std::time::Duration::from_secs((args.arb_sample_interval_secs / 4).max(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            loop {
+                tick.tick().await;
+                ingest::arbiter::lock(&arbiter).close_authority_windows();
+            }
+        })
     };
 
     // WebSocket sink config. The sink itself is activated by the subscription reconciler (below),
@@ -532,6 +570,7 @@ async fn main() -> Result<()> {
             arbiter,
             instruments,
             depth,
+            books,
             enabled,
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
@@ -544,10 +583,12 @@ async fn main() -> Result<()> {
         .run(),
     );
 
-    // The reconciler and the (independent, config-gated) public feeders + metrics endpoint all loop
-    // forever; the process exits only if one of them panics or the metrics server fails to bind.
+    // The reconciler, the arm sampler and the (independent, config-gated) public feeders + metrics
+    // endpoint all loop forever; the process exits only if one of them panics or the metrics server
+    // fails to bind.
     tokio::select! {
         r = reconciler => r??,
+        r = sampler => r?,
         r = async { match ws_input {
             Some(handle) => handle.await,
             None => std::future::pending().await,

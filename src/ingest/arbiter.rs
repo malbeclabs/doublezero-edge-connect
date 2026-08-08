@@ -47,12 +47,14 @@ use tracing::warn;
 
 use crate::{
     ingest::{
-        authority::{AuthorityConfig, MarketKey, StickyAuthority},
+        arm_race::ArmRace,
+        authority::{AuthorityConfig, MarketKey, StickyAuthority, OTHER_ARM},
         feeds::ArbitrationMode,
     },
     metrics::metrics,
     model::{
-        self, now_mono_ns, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote,
+        self, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot, FeedMessage,
+        NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade,
     },
 };
 
@@ -84,6 +86,18 @@ pub const DEPTH_TICK_CAP: usize = 1024;
 /// — wedging the *primary* edge feed for that symbol. The bound caps the worst-case wedge to itself
 /// and self-heals; it is generous enough to absorb ordinary clock skew between the venue and host.
 const MAX_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
+
+/// Cap on markets whose `book` state the authority gate tracks, evicting oldest-first. The key is
+/// wire-supplied `(channel_id, instrument_id)`, so a forged stream must cost evictions rather than
+/// memory; the cap sits an order of magnitude above the largest real venue (~1,200 instruments).
+const MAX_BOOK_MARKETS: usize = 16_384;
+
+/// Cap on batches withheld from one market while waiting for the new arm to close a logical event.
+/// `last` is mandatory in PROTOCOL.md, but a producer that stops setting it — a bug, a truncated
+/// frame, a forged source — would otherwise withhold that market from the wire forever. Sized like
+/// `model`'s pending-change cap, which desynchronizes the accumulator at the same scale, so the
+/// abandoned re-baseline degrades to a bare `clear` rather than to a book claiming completeness.
+const MAX_WITHHELD_BATCHES: u32 = 8192;
 
 /// Which ingest source produced an update — the floor's per-tick leader identity. The edge
 /// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
@@ -529,11 +543,80 @@ pub struct Arbiter {
     no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
-    /// Single-arm authority for the incremental `book` product, wired by [`Self::set_authority`].
-    /// `None` until then, which is an honest passthrough for a process that never configured it —
-    /// there is deliberately no `Default` for [`AuthorityConfig`], since it would duplicate the five
-    /// `--arb-*` clap defaults and drift from them.
-    authority: Option<StickyAuthority>,
+    /// Whether the "batches carry no `last`" warning has fired.
+    book_withhold_logged: bool,
+    /// Single-arm authority for the incremental `book` product, in **both** arbitration modes. A
+    /// `source_ts` tick can hold several deltas, so the per-tick latch the quote floor uses would
+    /// interleave two arms inside one logical event; there is no mode in which that is acceptable.
+    books: StickyAuthority,
+    /// The cross-arm trade matcher: the only producer of the matched leads
+    /// [`StickyAuthority::observe_matched_lead`] elects on.
+    race: ArmRace,
+    /// Per-market `book` state, bounded by [`MAX_BOOK_MARKETS`] with `book_order` as the eviction
+    /// queue (oldest first, mirroring `processor::PerPublisher`).
+    book_markets: HashMap<MarketKey, BookMarket>,
+    book_order: VecDeque<MarketKey>,
+    /// Shared accumulated-`book` map the WS server replays on connect, keyed `(venue, channel,
+    /// instrument_id)`. Mirrors the serving arm's state: seeded from its accumulator on every
+    /// re-baseline, then advanced by each admitted batch. `None` when no replay map is wired.
+    book_replay: Option<BookSnapshot>,
+}
+
+/// Per-market state behind the `book` authority gate.
+#[derive(Default)]
+struct BookMarket {
+    /// **Every** eligible arm's accumulated book, not just the serving one. A transfer re-baselines
+    /// the consumer against the new arm's *current* levels, which exist only if its stream was folded
+    /// in all along. Bounded by the caller's eligibility check (`StickyAuthority::tracks_arm`).
+    arms: HashMap<Publisher, BookAccumulator>,
+    /// Set when the serving arm changed. The re-baseline then waits for that arm to close a logical
+    /// event, because a `to_book` of a half-applied one goes out stamped `last` as a torn book.
+    rebaseline: bool,
+    /// Batches withheld waiting for that event boundary. `last` is mandatory on the wire but the wire
+    /// is unauthenticated, so the wait is bounded — see [`MAX_WITHHELD_BATCHES`].
+    withheld: u32,
+}
+
+/// The `dz_arm_authority_transfers_total` reason for an admitted `book` batch, or `None` when nothing
+/// moved. `margin` is counted where it happens (the sampler tick), and the venue leader taking a
+/// market back from a health override follows either that or a recovery, so it is not attributable
+/// here and is deliberately left uncounted rather than mislabelled.
+fn transfer_reason(
+    prev: Option<Publisher>,
+    leader_before: Option<Publisher>,
+    leader_after: Option<Publisher>,
+    publisher: Publisher,
+) -> Option<&'static str> {
+    if leader_before.is_none() {
+        return Some("initial"); // the venue's first eligible arm
+    }
+    if leader_before != leader_after {
+        return Some("silence"); // only `admit`'s own timeout path moves it
+    }
+    if leader_after != Some(publisher) && prev != Some(publisher) {
+        return Some("health"); // the per-market override took this market
+    }
+    None
+}
+
+/// A `clear`-only re-baseline for one market: what a consumer gets when the gate has no accumulated
+/// levels to republish (an evicted market). Legal on its own, and `last` is why that field is
+/// mandatory.
+fn clear_only(b: &NormalizedBook) -> NormalizedBook {
+    NormalizedBook {
+        changes: vec![model::BookChange {
+            action: model::BookAction::Clear,
+            side: model::BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+        }],
+        snapshot: true,
+        last: true,
+        // Producer-synthesized, like `to_book`'s: the triggering batch's arrival time is not when this
+        // message was built.
+        recv_ts_ns: now_ns(),
+        ..b.clone()
+    }
 }
 
 /// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
@@ -566,11 +649,17 @@ struct VenueMetrics {
     depth_admitted: [IntCounter; 2],
     depth_dropped: [IntCounter; 2],
     depth_future_rejected: IntCounter,
+    /// `dz_book_dropped_total{publisher}`, `[edge, public]` — the `depth_dropped` shape, keeping the
+    /// which-arm-is-losing signal a scalar would lose.
+    book_dropped: [IntCounter; 2],
+    book_markets_evicted: IntCounter,
     /// `dz_quote_lead_ns{winner,loser}` / `dz_trade_lead_ns{winner,loser}` / `dz_depth_lead_ns
     /// {winner,loser}` indexed `winner_idx * 2 + loser_idx` over `[edge, public]`.
     quote_lead: [Histogram; 4],
     trade_lead: [Histogram; 4],
     depth_lead: [Histogram; 4],
+    /// `dz_arm_lead_ns{winner}` indexed `[leader, challenger]` — one matched cross-arm trade pair.
+    arm_lead: [Histogram; 2],
 }
 
 impl VenueMetrics {
@@ -617,9 +706,15 @@ impl VenueMetrics {
             depth_admitted: by_pub(&m.depth_admitted),
             depth_dropped: by_pub(&m.depth_dropped),
             depth_future_rejected: m.depth_future_rejected.with_label_values(&[venue]),
+            book_dropped: by_pub(&m.book_dropped),
+            book_markets_evicted: m.book_markets_evicted.with_label_values(&[venue]),
             quote_lead: lead(&m.quote_lead_ns),
             trade_lead: lead(&m.trade_lead_ns),
             depth_lead: lead(&m.depth_lead_ns),
+            arm_lead: [
+                m.arm_lead_ns.with_label_values(&[venue, "leader"]),
+                m.arm_lead_ns.with_label_values(&[venue, "challenger"]),
+            ],
         }
     }
 }
@@ -646,29 +741,44 @@ impl Arbiter {
             modes: HashMap::new(),
             no_id_owner: HashMap::new(),
             no_id_conflict_logged: false,
-            authority: None,
+            book_withhold_logged: false,
+            books: StickyAuthority::new(AuthorityConfig::DEFAULT),
+            race: ArmRace::default(),
+            book_markets: HashMap::new(),
+            book_order: VecDeque::new(),
+            book_replay: None,
         }
     }
 
-    /// Wire the single-arm authority for `book`, built from the validated `--arb-*` config. Called
-    /// once at startup; without it `book` passes through undeduped (see the `Book` emit arm).
-    pub fn set_authority(&mut self, cfg: AuthorityConfig) {
-        self.authority = Some(StickyAuthority::new(cfg));
+    /// Install the `--arb-*` arbitration tunables: the single-arm authority config, and the cross-arm
+    /// matcher's pairing window. Called once at startup; without it both take
+    /// [`AuthorityConfig::DEFAULT`] — the same values `main.rs`'s clap defaults are derived from — so
+    /// an arbiter built anywhere still gates `book` rather than interleaving two arms.
+    pub fn set_authority(&mut self, cfg: AuthorityConfig, match_window_ns: u64) {
+        self.books.set_config(cfg);
+        self.race = ArmRace::new(match_window_ns);
     }
 
-    /// The configured authority, so a test can assert a processor's health reports landed.
+    /// Wire the shared WS-replay `book` map so a connecting client is bootstrapped with the serving
+    /// arm's accumulated levels. Without it the gate still arbitrates; there is just no replay state.
+    pub fn set_book_replay(&mut self, books: BookSnapshot) {
+        self.book_replay = Some(books);
+    }
+
+    /// The authority, so a test can assert a processor's health reports landed.
     #[cfg(test)]
-    pub(crate) fn authority(&self) -> Option<&StickyAuthority> {
-        self.authority.as_ref()
+    pub(crate) fn authority(&self) -> &StickyAuthority {
+        &self.books
     }
 
-    /// Report one arm's book health for a market, so authority transfers away from an arm whose book
-    /// is gapped or awaiting a snapshot. Called by the market-by-price processor on every `Ready`
-    /// transition; a no-op until [`Self::set_authority`] has run.
+    /// Report one arm's book health for a market — the seam the MBP processor calls on every
+    /// `PriceBook` status transition, since `books` is private here.
+    ///
+    /// Health is a **per-market override** on venue-wide authority: an arm gapped on one market yields
+    /// that market only, and takes it back on its own once the book recovers. Under incremental output
+    /// a lost level does not self-heal until the next snapshot, so an unhealthy arm must not serve.
     pub fn set_book_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
-        if let Some(a) = &mut self.authority {
-            a.set_health(key, publisher, healthy);
-        }
+        self.books.set_health(key, publisher, healthy);
     }
 
     /// Declare a venue's arbitration mode. Called once per selected feed at startup; a venue's rows
@@ -677,7 +787,9 @@ impl Arbiter {
         self.modes.insert(venue, mode);
     }
 
-    #[allow(dead_code)] // consumed by the `Sticky` dispatch once that arbitration arm lands
+    // Unused: the `book` gate is deliberately unconditional across modes (see its `emit` arm), and
+    // nothing else dispatches on the mode yet.
+    #[allow(dead_code)]
     fn mode_for(&self, venue: &str) -> ArbitrationMode {
         self.modes
             .get(venue)
@@ -764,6 +876,167 @@ impl Arbiter {
             .inc_by(cleared as u64);
     }
 
+    /// Fold one arm's batch into that arm's own accumulator for `key`, admitting the market to the
+    /// tracked set (evicting the oldest when it is full).
+    fn accumulate_book(&mut self, key: &MarketKey, publisher: Publisher, b: &NormalizedBook) {
+        if !self.book_markets.contains_key(key) {
+            self.track_book_market(key);
+        }
+        let Some(market) = self.book_markets.get_mut(key) else {
+            return;
+        };
+        market
+            .arms
+            .entry(publisher)
+            .or_insert_with(|| BookAccumulator::new(b.symbol.clone()))
+            .apply(b);
+    }
+
+    /// Start tracking `key`, evicting the oldest markets to stay within [`MAX_BOOK_MARKETS`].
+    ///
+    /// Eviction drops the market's accumulators, its replay entry **and** its authority state together
+    /// (`StickyAuthority::forget_market`). That pairing is what makes eviction safe: losing
+    /// `last_admitted` makes the market's next batch read as a change of serving arm, so it
+    /// re-baselines the consumer instead of resuming another arm's delta series on top of its state.
+    fn track_book_market(&mut self, key: &MarketKey) {
+        while self.book_markets.len() >= MAX_BOOK_MARKETS {
+            let Some(old) = self.book_order.pop_front() else {
+                break;
+            };
+            self.book_markets.remove(&old);
+            if let Some(replay) = &self.book_replay {
+                model::lock(replay).remove(&old);
+            }
+            self.books.forget_market(&old);
+            self.vm(&old.0).book_markets_evicted.inc();
+        }
+        self.book_order.push_back(key.clone());
+        self.book_markets.insert(key.clone(), BookMarket::default());
+    }
+
+    /// Republish `publisher`'s whole book for `key` as a re-baseline — a `clear` plus its complete
+    /// current level set — and reset the shared replay entry to that arm's accumulator.
+    ///
+    /// `None` when the accumulator is not [`BookAccumulator::baselined`]: seeded mid-stream, it holds
+    /// only the levels that have moved since, so publishing it as `snapshot` would tell the consumer to
+    /// discard every level it is missing. The caller degrades to a bare `clear`, which is incomplete
+    /// but says so — and the replay entry carries the same flag, so the WS replay skips it too.
+    fn rebaseline_book(&mut self, key: &MarketKey, publisher: Publisher) -> Option<NormalizedBook> {
+        let acc = self
+            .book_markets
+            .get(key)
+            .and_then(|m| m.arms.get(&publisher))
+            .cloned()?;
+        if let Some(replay) = &self.book_replay {
+            model::lock(replay).insert(key.clone(), acc.clone());
+        }
+        acc.baselined().then(|| acc.to_book(&key.0, key.1, key.2))
+    }
+
+    /// Drop one market's tracked `book` state — the session-reset seam, mirroring
+    /// [`Self::reset_depth_floor_for_symbol`]. The authority entry goes with it, so the market's next
+    /// batch re-baselines the consumer rather than resuming on state that was just discarded.
+    ///
+    /// There is deliberately no venue-wide variant: the MBP processor scopes `EndOfSession` to the
+    /// emitting arm and channel and reports those markets unhealthy, which hands them to the peer arm
+    /// rather than tearing down a live arm's published book.
+    pub fn reset_book_for_market(&mut self, key: &MarketKey) {
+        self.book_markets.remove(key);
+        self.book_order.retain(|k| k != key);
+        if let Some(replay) = &self.book_replay {
+            model::lock(replay).remove(key);
+        }
+        self.books.forget_market(key);
+    }
+
+    /// Advance the shared replay accumulator with an admitted batch, keeping it in step with the
+    /// serving arm's own. Skips markets outside the tracked set, so it inherits the same cap.
+    fn apply_book_replay(&mut self, key: &MarketKey, b: &NormalizedBook) {
+        let Some(replay) = &self.book_replay else {
+            return;
+        };
+        if !self.book_markets.contains_key(key) {
+            return;
+        }
+        model::lock(replay)
+            .entry(key.clone())
+            .or_insert_with(|| BookAccumulator::new(b.symbol.clone()))
+            .apply(b);
+    }
+
+    /// Whether a trade from `publisher` is evidence about a book-serving arm.
+    ///
+    /// Two filters, both load-bearing. **An edge arm only**: the public WS backstop reaches `emit` with
+    /// the same trades, decodes them from parsed JSON rather than the arms' shared fixed-point, and
+    /// serves no `book` at all — matching it would poison `dz_arm_lead_ns` with edge-vs-public leads
+    /// and could hand a venue's books to a source that publishes none. **Already tracked by the
+    /// authority**: `observe_matched_lead` creates an arm entry for whatever it is handed, so an
+    /// untracked publisher (a peer feed row of the same venue, a forged source IP) would otherwise
+    /// spend one of the venue's eight admission slots and could displace a real mirror arm.
+    fn race_eligible(&self, venue: &str, publisher: Publisher) -> bool {
+        matches!(publisher, Publisher::Edge(_)) && self.books.tracks_arm(venue, publisher)
+    }
+
+    /// Pair this trade with the peer arm's copy and hand the signed lead to the authority — the only
+    /// producer of the evidence [`StickyAuthority::close_window`] elects on.
+    fn observe_trade_race(&mut self, t: &NormalizedTrade, publisher: Publisher) {
+        let Some(m) = self.race.on_trade(
+            &t.venue,
+            &t.symbol,
+            t.price,
+            t.size,
+            t.aggressor_side,
+            publisher,
+            t.recv_ts_ns,
+        ) else {
+            return;
+        };
+        let Some(leader) = self.books.venue_leader(&t.venue) else {
+            return;
+        };
+        let Some((challenger, lead_ns)) = m.lead_for(leader) else {
+            return;
+        };
+        self.books
+            .observe_matched_lead(&t.venue, challenger, lead_ns);
+        // A matched pair has a real winner either way, which is what makes `{winner="challenger"}`
+        // reachable — unlike `Admit::Contest`'s structurally non-negative phase.
+        self.vm(&t.venue).arm_lead[usize::from(lead_ns < 0)].observe(lead_ns.unsigned_abs() as f64);
+    }
+
+    /// Close every elapsed arm-sampling window, then refresh the per-arm gauge and drain the matcher's
+    /// unmatched counts. Driven by a periodic task on `--arb-sample-interval-secs`, **never per
+    /// message**: `markets_held_all` is O(markets × arms).
+    ///
+    /// A margin transfer moves venue authority here; each affected market re-baselines on its next
+    /// admitted batch rather than in a burst of `O(markets)` clears for markets the new arm may not
+    /// even speak for (93 of 1,239 instruments saw any update at all in 39 s on the live sports feed).
+    pub fn close_authority_windows(&mut self) {
+        for (venue, _) in self.books.close_window(now_ns()) {
+            metrics()
+                .arm_transfers
+                .with_label_values(&[venue.as_ref(), "margin"])
+                .inc();
+        }
+        // `arm_label`, never `arm_ordinal`: labelling must not admit. `drain_unmatched`'s keys are
+        // every publisher that sent a trade for the venue, so minting here would spend the venue's
+        // admission slots on sources that never serve a book.
+        for (venue, arm, held) in self.books.markets_held_all() {
+            let label = self.books.arm_label(&venue, arm);
+            metrics()
+                .arm_markets_held
+                .with_label_values(&[venue.as_ref(), label])
+                .set(held as i64);
+        }
+        for ((venue, arm), n) in self.race.drain_unmatched() {
+            let label = self.books.arm_label(&venue, arm);
+            metrics()
+                .arm_unmatched_trades
+                .with_label_values(&[venue.as_ref(), label])
+                .inc_by(n);
+        }
+    }
+
     /// Apply the appropriate dedup and broadcast if the message survives it. `publisher` is the
     /// source racing for the quote floor's per-tick leadership; it is ignored for non-quote
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
@@ -838,6 +1111,12 @@ impl Arbiter {
                 }
             }
             FeedMessage::Trade(t) => {
+                // Feed the cross-arm matcher BEFORE the `trade_id == 0` bypass returns: that sentinel
+                // is exactly what a FIX-sourced arm prints, so a call below it would never see the arm
+                // the election exists to judge.
+                if self.race_eligible(&t.venue, publisher) {
+                    self.observe_trade_race(t, publisher);
+                }
                 // `trade_id == 0` is the "no venue trade id" sentinel (a FIX-sourced print has
                 // none). Keying the window on it drops every later print for the key: `0` is
                 // inserted once and never ages out (eviction is by insertion order), so every
@@ -999,11 +1278,90 @@ impl Arbiter {
                     }
                 }
             }
-            // TEMPORARY: `book` is passed through undeduped so the processor can land before the
-            // authority gate. Replaced by the `StickyAuthority` routing in the next change — an
-            // incremental stream must be single-arm, and two arms passing through here would
-            // interleave unrelated delta series on the wire.
+            // The single-arm authority gate, in BOTH arbitration modes (no `mode_for` branch): a
+            // `source_ts` tick can hold several deltas, so the quote floor's per-tick latch would
+            // interleave two arms inside one logical event, and the arms' per-instrument delta series
+            // are unrelated by construction — a consumer's book corrupts while every per-arm sequence
+            // check the producer ran still passes.
             FeedMessage::Book(b) => {
+                let key: MarketKey = (b.venue.clone(), b.channel, b.instrument_id);
+                // Eligibility first, exactly as `admit` applies it: an arm past the authority's
+                // per-venue cap enters no map here either, so a forged source can neither be served
+                // nor evict a real market's state.
+                if self.books.arm_ordinal(&b.venue, publisher) == OTHER_ARM {
+                    self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                    return;
+                }
+                // Then track the market before admitting it, so the authority's own wire-keyed
+                // per-market map is bounded by `MAX_BOOK_MARKETS` too — it has no cap of its own, and
+                // the instrument-resolves-to-a-book precondition bounds nothing upstream today.
+                if !self.book_markets.contains_key(&key) {
+                    self.track_book_market(&key);
+                }
+                let prev = self.books.last_admitted(&key);
+                let leader_before = self.books.venue_leader(&b.venue);
+                let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
+                // Accumulate the arm's stream whether or not it was admitted: a transfer republishes
+                // the new arm's current levels, which exist only if its copies were folded in all along.
+                self.accumulate_book(&key, publisher, b);
+                if !decision.emitted() {
+                    self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                    return;
+                }
+                let leader_after = self.books.venue_leader(&b.venue);
+                if let Some(reason) = transfer_reason(prev, leader_before, leader_after, publisher)
+                {
+                    metrics()
+                        .arm_transfers
+                        .with_label_values(&[b.venue.as_ref(), reason])
+                        .inc();
+                }
+                // Anything other than "the arm that last reached the wire for this market" means the
+                // consumer's state cannot be assumed to continue from this batch: a serving-arm change,
+                // a first admission, or a market whose state was evicted. All three re-baseline.
+                let (mut rebaseline_now, mut abandoned) = (false, false);
+                if let Some(m) = self.book_markets.get_mut(&key) {
+                    m.rebaseline |= prev != Some(publisher);
+                    if m.rebaseline {
+                        // Wait for the new arm to close a logical event before republishing its book: a
+                        // `to_book` of a half-applied one goes out stamped `last` as a torn book.
+                        // Bounded, because `last` is a promise made by an unauthenticated producer.
+                        if !b.last && m.withheld < MAX_WITHHELD_BATCHES {
+                            m.withheld += 1;
+                            self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                            return;
+                        }
+                        abandoned = !b.last;
+                        m.rebaseline = false;
+                        m.withheld = 0;
+                        rebaseline_now = true;
+                    }
+                }
+                if abandoned && !self.book_withhold_logged {
+                    self.book_withhold_logged = true;
+                    warn!(
+                        venue = %b.venue, channel = b.channel, instrument = b.instrument_id,
+                        "book batches carry no `last`: re-baselining on an unterminated event"
+                    );
+                }
+                if rebaseline_now {
+                    let re = self.rebaseline_book(&key, publisher);
+                    self.vm(&b.venue).emit[EMIT_BOOK].inc();
+                    match re {
+                        // The arm's whole book, this batch included, so it replaces it on the wire.
+                        Some(full) => {
+                            let _ = self.tx.send(Arc::new(FeedMessage::Book(full)));
+                            return;
+                        }
+                        // Nothing complete to republish: empty the consumer's book and let the batch
+                        // below rebuild onto it.
+                        None => {
+                            let _ = self.tx.send(Arc::new(FeedMessage::Book(clear_only(b))));
+                        }
+                    }
+                } else {
+                    self.apply_book_replay(&key, b);
+                }
                 self.vm(&b.venue).emit[EMIT_BOOK].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
@@ -2228,5 +2586,632 @@ mod tests {
         // ...and the clock restarts, so the next mirror copy collapses again.
         a.emit(instrument(1, "BTC", -2, -4), edge);
         assert!(drain_instruments(&mut rx).is_empty());
+    }
+
+    // ---- the `book` authority gate ----
+
+    use crate::model::{BookAction, BookChange, BookSide, NormalizedBook};
+
+    const BOOK_CHANNEL: u32 = 2;
+    const BOOK_INSTRUMENT: u32 = 41;
+
+    fn arm(n: u8) -> Publisher {
+        Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    }
+
+    fn bid(price: f64, size: f64) -> BookChange {
+        BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price,
+            size,
+        }
+    }
+
+    fn clear_both() -> BookChange {
+        BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+        }
+    }
+
+    /// One batch for `(venue, BOOK_CHANNEL, instrument)`. `recv_ns` is the authority's arrival clock.
+    fn book(
+        venue: &str,
+        instrument_id: u32,
+        changes: Vec<BookChange>,
+        last: bool,
+        recv_ns: u64,
+    ) -> FeedMessage {
+        FeedMessage::Book(NormalizedBook {
+            venue: venue.into(),
+            symbol: "KXBTCPERP".into(),
+            channel: BOOK_CHANNEL,
+            instrument_id,
+            changes,
+            snapshot: false,
+            last,
+            source_ts_ns: 1_000,
+            recv_ts_ns: recv_ns,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        })
+    }
+
+    /// The producer's opening re-baseline, which is what an MBP processor emits for a market once its
+    /// book syncs. Until an arm has sent one, the gate holds only the levels that moved since it
+    /// started accumulating and can honestly republish nothing but a bare `clear`.
+    fn synced(
+        a: &mut Arbiter,
+        venue: &str,
+        instrument_id: u32,
+        publisher: Publisher,
+        recv_ns: u64,
+    ) {
+        a.emit(
+            book(venue, instrument_id, vec![clear_both()], true, recv_ns),
+            publisher,
+        );
+    }
+
+    fn drain_books(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> Vec<NormalizedBook> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Book(b) = &*m {
+                out.push(b.clone());
+            }
+        }
+        out
+    }
+
+    /// Short windows and a low sample floor so a margin transfer is drivable in a test; silence is
+    /// disabled so only the path under test can move authority.
+    fn sticky_cfg() -> AuthorityConfig {
+        AuthorityConfig {
+            leader_timeout_ns: u64::MAX,
+            sample_interval_ns: 1_000,
+            transfer_margin_ns: 1_000,
+            transfer_win_rate: 0.8,
+            min_window_samples: 5,
+        }
+    }
+
+    /// Feed `n` matched trade pairs in which `fast` beats `slow` by 50us, through `emit` so the
+    /// production call site is what supplies the election's evidence.
+    fn race_trades(a: &mut Arbiter, venue: &str, fast: Publisher, slow: Publisher, n: u64) {
+        for i in 0..n {
+            let mut t = trade(i + 1);
+            t.venue = venue.into();
+            t.price = 0.60 + i as f64 / 1_000.0;
+            t.recv_ts_ns = 10_000 + i * 1_000_000;
+            let mut peer = t.clone();
+            peer.recv_ts_ns = t.recv_ts_ns + 50_000;
+            a.emit(FeedMessage::Trade(t), fast);
+            a.emit(FeedMessage::Trade(peer), slow);
+        }
+    }
+
+    /// Both arms synced and elected, the wire drained: the steady state every test below starts from.
+    fn gated(
+        venue: &str,
+        cfg: AuthorityConfig,
+    ) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>) {
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_authority(cfg, 1_000_000_000);
+        synced(&mut a, venue, BOOK_INSTRUMENT, arm(1), 1_000);
+        synced(&mut a, venue, BOOK_INSTRUMENT, arm(2), 1_001);
+        let _ = drain_books(&mut rx);
+        (a, rx)
+    }
+
+    /// The corruption the gate exists to prevent: two arms' delta series for one instrument are
+    /// unrelated, so only the authoritative arm's batches may reach the wire.
+    #[test]
+    fn book_publishes_one_arm_only() {
+        let (mut a, mut rx) = gated("Lashay", AuthorityConfig::default());
+        for i in 0..5 {
+            let px = 0.40 + i as f64 / 100.0;
+            a.emit(
+                book("Lashay", BOOK_INSTRUMENT, vec![bid(px, 10.0)], true, 1_100),
+                arm(1),
+            );
+            a.emit(
+                book("Lashay", BOOK_INSTRUMENT, vec![bid(px, 99.0)], true, 1_101),
+                arm(2),
+            );
+        }
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 5, "one arm's batches, not both interleaved");
+        assert!(
+            out.iter().all(|b| b.changes[0].size == 10.0),
+            "every batch must come from the elected arm"
+        );
+    }
+
+    /// There is no mode branch: a `source_ts` tick can hold several deltas, so `Coordinated`'s
+    /// per-tick latch would interleave two arms inside one logical event.
+    #[test]
+    fn book_publishes_one_arm_in_coordinated_mode_too() {
+        let (mut a, mut rx) = gated("Hyperliquid", AuthorityConfig::default());
+        a.set_mode("Hyperliquid", ArbitrationMode::Coordinated);
+        for _ in 0..3 {
+            for (p, size) in [(arm(1), 10.0), (arm(2), 99.0)] {
+                a.emit(
+                    book(
+                        "Hyperliquid",
+                        BOOK_INSTRUMENT,
+                        vec![bid(0.40, size)],
+                        true,
+                        1_100,
+                    ),
+                    p,
+                );
+            }
+        }
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|b| b.changes[0].size == 10.0));
+    }
+
+    /// Authority is venue-wide (per the amended `StickyAuthority`), so the arm that won the venue
+    /// serves every market — including one a challenger got to first.
+    #[test]
+    fn book_authority_is_venue_wide_across_markets() {
+        let venue = "BookVenueWide";
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        for id in [42, 43] {
+            // The challenger speaks first for a market the leader has never sent for.
+            a.emit(book(venue, id, vec![bid(0.40, 99.0)], true, 1_100), arm(2));
+            assert!(
+                drain_books(&mut rx).is_empty(),
+                "market {id}: a challenger must not take a market by getting there first"
+            );
+            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_101), arm(1));
+            // A market's first admitted batch re-baselines too, and this arm has sent no producer
+            // re-baseline for it, so the honest re-baseline is a bare clear ahead of the batch.
+            let out = drain_books(&mut rx);
+            assert_eq!(out.len(), 2, "market {id}");
+            assert_eq!(out[0].changes, vec![clear_both()]);
+            assert_eq!(out[1].changes, vec![bid(0.40, 10.0)]);
+        }
+    }
+
+    /// The replay map must hold what was broadcast, so a connecting client is bootstrapped with the
+    /// authoritative arm's book and never a discarded arm's divergent copy.
+    #[test]
+    fn book_replay_accumulates_the_authoritative_arm() {
+        let venue = "BookReplayLeader";
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+        synced(&mut a, venue, BOOK_INSTRUMENT, arm(1), 1_000);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 99.0)], true, 1_101),
+            arm(2),
+        );
+        let guard = model::lock(&replay);
+        let acc = guard
+            .get(&(Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT))
+            .expect("the admitted market is in the replay map");
+        let full = acc.to_book(&Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        assert_eq!(
+            full.changes[1..].to_vec(),
+            vec![bid(0.40, 10.0)],
+            "the loser's size must not reach the replay state"
+        );
+    }
+
+    /// `book` is incremental, so it must never pass through a content floor: an oscillation back to a
+    /// previously-seen state is a real event, not a duplicate.
+    #[test]
+    fn book_never_routes_through_a_content_floor() {
+        let venue = "BookNoFloor";
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        for size in [100.0, 0.0, 100.0] {
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![bid(0.40, size)], true, 1_100),
+                arm(1),
+            );
+        }
+        assert_eq!(
+            drain_books(&mut rx)
+                .iter()
+                .map(|b| b.changes[0].size)
+                .collect::<Vec<_>>(),
+            vec![100.0, 0.0, 100.0]
+        );
+    }
+
+    /// **The transfer contract.** A margin transfer hands the market to an arm whose delta series is
+    /// unrelated to the state the consumer holds, so the next broadcast must republish that arm's
+    /// *whole* book — a `clear` plus every level it holds, not just the batch that triggered it. A
+    /// bare clear would leave the consumer knowingly incomplete until the next snapshot rotation.
+    #[test]
+    fn a_transfer_republishes_the_new_arms_whole_book() {
+        let venue = "BookMarginTransfer";
+        let transfers = |reason: &str| {
+            metrics()
+                .arm_transfers
+                .with_label_values(&[venue, reason])
+                .get()
+        };
+        let (initial, margin) = (transfers("initial"), transfers("margin"));
+        let (mut a, mut rx) = gated(venue, sticky_cfg());
+
+        // arm(1) serves; arm(2)'s copies are dropped from the wire but still accumulated.
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
+            arm(2),
+        );
+        assert_eq!(drain_books(&mut rx).len(), 1);
+
+        race_trades(&mut a, venue, arm(2), arm(1), 6);
+        a.close_authority_windows();
+
+        // arm(1) has lost the venue; its stream stops reaching the wire.
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 11.0)], true, 2_000),
+            arm(1),
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "the displaced arm is muted"
+        );
+
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 66.0)], true, 2_100),
+            arm(2),
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1, "one re-baseline, not a batch plus a clear");
+        let re = &out[0];
+        assert!(
+            re.snapshot && re.last,
+            "a re-baseline is one complete event"
+        );
+        assert_eq!(
+            re.changes,
+            vec![clear_both(), bid(0.41, 66.0), bid(0.40, 55.0)],
+            "clear plus arm(2)'s whole book, best bid first"
+        );
+        assert_eq!(transfers("initial"), initial + 1);
+        assert_eq!(transfers("margin"), margin + 1);
+    }
+
+    /// A per-market health override changes the serving arm without moving venue authority, and it
+    /// re-baselines the consumer for the same reason a transfer does.
+    #[test]
+    fn a_health_override_also_rebaselines() {
+        let venue = "BookHealthOverride";
+        let health = metrics()
+            .arm_transfers
+            .with_label_values(&[venue, "health"]);
+        let before = health.get();
+        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
+            arm(2),
+        );
+        let _ = drain_books(&mut rx);
+
+        a.set_book_health(&key, arm(1), false);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 66.0)], true, 1_200),
+            arm(2),
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].changes,
+            vec![clear_both(), bid(0.42, 66.0), bid(0.40, 55.0)]
+        );
+        assert_eq!(
+            a.books.venue_leader(venue),
+            Some(arm(1)),
+            "the venue is untouched"
+        );
+        assert_eq!(health.get(), before + 1);
+    }
+
+    /// A re-baseline waits for the new arm to close a logical event. Materializing a half-applied one
+    /// would publish a torn book stamped `last: true`, which is exactly what that field promises not
+    /// to be — so the market stays on its stale (but coherent) state until the boundary.
+    #[test]
+    fn a_rebaseline_waits_for_the_event_boundary() {
+        let venue = "BookRebaselineBoundary";
+        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+        a.set_book_health(&key, arm(1), false);
+
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 20.0)], false, 1_200),
+            arm(2),
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "nothing goes out mid-event"
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 30.0)], true, 1_201),
+            arm(2),
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].changes[1..].to_vec(),
+            vec![bid(0.42, 30.0), bid(0.41, 20.0)],
+            "the withheld batch is not lost, it lands in the re-baseline"
+        );
+    }
+
+    /// `last` is mandatory on the wire, but the wire is unauthenticated: an arm that stops closing
+    /// events must not withhold a market from the wire forever. The market re-baselines on the bound
+    /// and keeps streaming.
+    #[test]
+    fn an_unterminated_event_does_not_withhold_forever() {
+        let venue = "BookUnterminated";
+        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+        a.set_book_health(&key, arm(1), false);
+
+        for i in 0..=MAX_WITHHELD_BATCHES {
+            a.emit(
+                book(
+                    venue,
+                    BOOK_INSTRUMENT,
+                    vec![bid(0.41, f64::from(i))],
+                    false,
+                    1_200,
+                ),
+                arm(2),
+            );
+        }
+        let out = drain_books(&mut rx);
+        assert!(!out.is_empty(), "the market must not be withheld forever");
+        assert_eq!(
+            out[0].changes[0].action,
+            BookAction::Clear,
+            "it re-baselines rather than resuming on the old arm's state"
+        );
+    }
+
+    /// An arm that has never sent a producer re-baseline holds only the levels that moved since it
+    /// started accumulating. Publishing that as `snapshot` would tell the consumer to discard every
+    /// level it is missing, so the gate degrades to a bare `clear` — incomplete, but honest.
+    #[test]
+    fn a_mid_stream_arm_rebaselines_with_a_bare_clear() {
+        let venue = "BookMidStreamArm";
+        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        synced(&mut a, venue, BOOK_INSTRUMENT, arm(1), 1_000);
+        // arm(2) joins mid-stream: deltas only, no re-baseline of its own.
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_100),
+            arm(2),
+        );
+        let _ = drain_books(&mut rx);
+
+        a.set_book_health(&key, arm(1), false);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 66.0)], true, 1_200),
+            arm(2),
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(
+            out[0].changes,
+            vec![clear_both()],
+            "a bare clear, never arm(2)'s partial levels dressed as a snapshot"
+        );
+        assert_eq!(
+            out[1].changes,
+            vec![bid(0.41, 66.0)],
+            "the batch then rebuilds onto the emptied book"
+        );
+    }
+
+    /// The public WS backstop reaches `emit` with the same trades but decodes them from parsed JSON
+    /// and serves no `book` at all. Admitting it as an arm would poison the lead histogram and could
+    /// hand a venue's books to a source that publishes none.
+    #[test]
+    fn the_public_backstop_is_not_an_election_arm() {
+        let venue = "BookPublicNotAnArm";
+        let (mut a, _rx) = gated(venue, sticky_cfg());
+        race_trades(&mut a, venue, Publisher::PublicWs, arm(1), 20);
+        a.close_authority_windows();
+        assert!(!a.books.tracks_arm(venue, Publisher::PublicWs));
+        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+    }
+
+    /// A trade publisher the authority does not track — a peer feed row of the same venue, or a forged
+    /// source IP — must not spend one of the venue's eight admission slots through the metrics path.
+    /// Once they are gone a real mirror arm is ineligible and the venue can never fail over.
+    #[test]
+    fn an_untracked_trade_publisher_never_becomes_an_arm() {
+        let venue = "BookForgedTradeSource";
+        let (mut a, _rx) = gated(venue, sticky_cfg());
+        for n in 20..40u8 {
+            let mut t = trade(u64::from(n));
+            t.venue = venue.into();
+            a.emit(FeedMessage::Trade(t), arm(n));
+        }
+        a.close_authority_windows();
+        for n in 20..40u8 {
+            assert!(!a.books.tracks_arm(venue, arm(n)), "arm {n} was admitted");
+            assert_eq!(
+                a.books.arm_label(venue, arm(n)),
+                crate::ingest::authority::OTHER_ARM
+            );
+        }
+        // ...and a third real arm still gets a slot.
+        assert_ne!(
+            a.books.arm_ordinal(venue, arm(3)),
+            crate::ingest::authority::OTHER_ARM
+        );
+    }
+
+    /// An arm past the authority's per-venue cap enters no per-market map, so a forged source can
+    /// neither be served nor evict a real market's book state through the gate.
+    #[test]
+    fn an_ineligible_arm_creates_no_book_state() {
+        let venue = "BookIneligibleArm";
+        let (mut a, _rx) = gated(venue, AuthorityConfig::default());
+        for n in 3..=8 {
+            a.books.arm_ordinal(venue, arm(n)); // fill the eight labelled slots
+        }
+        let before = a.book_markets.len();
+        a.emit(
+            book(venue, 777, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(200),
+        );
+        assert_eq!(a.book_markets.len(), before, "no market was tracked for it");
+    }
+
+    /// A losing arm's batches are attributed to it, keeping the which-arm-is-losing signal a scalar
+    /// counter would flatten.
+    #[test]
+    fn book_dropped_is_attributed_to_the_losing_publisher() {
+        let venue = "BookDroppedAttribution";
+        let dropped = metrics().book_dropped.with_label_values(&[venue, "edge"]);
+        let (mut a, _rx) = gated(venue, AuthorityConfig::default());
+        let before = dropped.get();
+        for _ in 0..3 {
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 99.0)], true, 1_100),
+                arm(2),
+            );
+        }
+        assert_eq!(dropped.get(), before + 3);
+    }
+
+    /// The tracked-market set is bounded: the key is wire-supplied, so a flood of distinct markets
+    /// must cost evictions rather than memory — and the authority's own per-market map, which has no
+    /// cap of its own, must be evicted with it.
+    #[test]
+    fn book_markets_are_bounded() {
+        let venue = "BookMarketCap";
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+        for id in 0..(MAX_BOOK_MARKETS as u32 + 64) {
+            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_000), arm(1));
+        }
+        assert_eq!(a.book_markets.len(), MAX_BOOK_MARKETS);
+        assert_eq!(a.book_order.len(), MAX_BOOK_MARKETS);
+        assert_eq!(
+            model::lock(&replay).len(),
+            MAX_BOOK_MARKETS,
+            "the replay map inherits the same cap"
+        );
+        assert_eq!(
+            a.books.markets_held_all(),
+            vec![(Arc::from(venue), arm(1), MAX_BOOK_MARKETS)],
+            "the authority's per-market map is evicted in step"
+        );
+    }
+
+    /// Eviction drops the authority's record of who served a market, and that is what keeps it safe:
+    /// the market's next batch reads as a change of serving arm and re-baselines the consumer instead
+    /// of resuming an unrelated delta series on top of its state.
+    #[test]
+    fn an_evicted_market_rebaselines_rather_than_resuming() {
+        let venue = "BookEvictionRebaseline";
+        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let (mut a, _rx) = gated(venue, AuthorityConfig::default());
+        assert_eq!(a.books.last_admitted(&key), Some(arm(1)));
+
+        a.reset_book_for_market(&key);
+        assert_eq!(a.books.last_admitted(&key), None);
+
+        let mut rx = a.sender().subscribe();
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+        );
+        assert_eq!(
+            drain_books(&mut rx)[0].changes[0].action,
+            BookAction::Clear,
+            "a market with no served-arm record must be re-baselined"
+        );
+    }
+
+    /// The health seam reaches the authority for a market that has delivered no `book` yet — the MBP
+    /// processor reports a `PriceBook` transition before its first batch, and dropping that would let
+    /// an arm serve a book it has already declared gapped. The map it grows is bounded there, by
+    /// `MAX_TRACKED_MARKETS`.
+    #[test]
+    fn book_health_reaches_the_authority_before_the_first_batch() {
+        let venue = "BookHealthEarly";
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        let fresh: MarketKey = (Arc::from(venue), BOOK_CHANNEL, 999);
+        a.set_book_health(&fresh, arm(1), false);
+        a.emit(book(venue, 999, vec![bid(0.40, 10.0)], true, 1_100), arm(1));
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "an arm known gapped here must not serve this market"
+        );
+    }
+
+    /// The election has one producer: matched cross-arm trade pairs. Observable as a transfer, since
+    /// nothing else here can move authority (silence is disabled).
+    #[test]
+    fn matched_trades_feed_the_election() {
+        let venue = "BookMatchedTrades";
+        let (mut a, _rx) = gated(venue, sticky_cfg());
+        race_trades(&mut a, venue, arm(2), arm(1), 6);
+        a.close_authority_windows();
+        assert_eq!(a.books.venue_leader(venue), Some(arm(2)));
+    }
+
+    /// The one placement error that would make the whole election inert for the venue it was built
+    /// for: a FIX-sourced arm stamps every print `trade_id == 0`, and that branch returns early.
+    #[test]
+    fn the_zero_id_tape_still_feeds_the_matcher() {
+        let venue = "BookZeroIdMatcher";
+        let (mut a, _rx) = gated(venue, sticky_cfg());
+        for i in 0..6u64 {
+            let mut t = trade(0);
+            t.venue = venue.into();
+            t.price = 0.60 + i as f64 / 1_000.0;
+            t.recv_ts_ns = 10_000 + i * 1_000_000;
+            let mut peer = t.clone();
+            peer.recv_ts_ns = t.recv_ts_ns + 50_000;
+            a.emit(FeedMessage::Trade(t), arm(2));
+            a.emit(FeedMessage::Trade(peer), arm(1));
+        }
+        a.close_authority_windows();
+        assert_eq!(
+            a.books.venue_leader(venue),
+            Some(arm(2)),
+            "the zero-id tape must still be matched"
+        );
     }
 }
