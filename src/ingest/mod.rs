@@ -6,6 +6,8 @@
 //! re-served.
 
 pub mod arbiter;
+pub mod arm_race;
+pub mod authority;
 pub mod book;
 pub mod codec;
 pub mod codec_common;

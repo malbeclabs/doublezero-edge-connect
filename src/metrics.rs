@@ -148,6 +148,16 @@ pub struct Metrics {
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
     pub quotes_no_source_ts: IntCounterVec,
+    /// Nanoseconds the authoritative arm led the challenger's copy by, per contested message —
+    /// the series `--arb-transfer-margin-us` is read off. See
+    /// [`crate::ingest::authority::StickyAuthority`].
+    pub arm_lead_ns: HistogramVec,
+    /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
+    /// thresholds are too loose: every transfer re-baselines each consumer's book.
+    pub arm_transfers: IntCounterVec,
+    /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
+    /// authority is fragmented; all on one arm is the steady state.
+    pub arm_markets_held: IntGaugeVec,
 
     // --- WebSocket sink ---
     /// Currently-connected WebSocket clients.
@@ -444,6 +454,27 @@ impl Metrics {
                 "Quotes forwarded with the source_ts==0 sentinel (floor bypassed)",
                 &["venue"],
             ),
+            arm_lead_ns: histogram_vec(
+                &registry,
+                "dz_arm_lead_ns",
+                "Nanoseconds the authoritative arm led the challenger's copy by, per contested \
+                 message. The series the re-election thresholds are read off.",
+                &["venue", "winner"],
+                LEAD_NS_BUCKETS,
+            ),
+            arm_transfers: counter_vec(
+                &registry,
+                "dz_arm_authority_transfers_total",
+                "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
+                 means the thresholds are too loose — every transfer re-baselines each consumer.",
+                &["venue", "reason"],
+            ),
+            arm_markets_held: gauge_vec(
+                &registry,
+                "dz_arm_markets_held",
+                "Markets each arm is currently authoritative for.",
+                &["venue", "arm"],
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -679,6 +710,15 @@ mod tests {
         m.depth_ticks_won
             .with_label_values(&["Hyperliquid", "edge"])
             .inc();
+        m.arm_lead_ns
+            .with_label_values(&["Lashay", "leader"])
+            .observe(123_456.0);
+        m.arm_transfers
+            .with_label_values(&["Lashay", "silence"])
+            .inc();
+        m.arm_markets_held
+            .with_label_values(&["Lashay", "arm0"])
+            .set(1);
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -705,6 +745,9 @@ mod tests {
             "dz_depth_lead_ns",
             "dz_quote_ticks_won_total",
             "dz_depth_ticks_won_total",
+            "dz_arm_lead_ns",
+            "dz_arm_authority_transfers_total",
+            "dz_arm_markets_held",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {
