@@ -37,7 +37,7 @@ use crate::{
         receiver,
         subscriptions::{self, Detected, HostSubs},
     },
-    model::{DepthSnapshot, FeedMessage, InstrumentSnapshot},
+    model::{BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
     shred::{self, DedupMode, ShredConfig},
 };
 
@@ -79,6 +79,7 @@ pub struct ReconcilerConfig {
     pub arbiter: SharedArbiter,
     pub instruments: InstrumentSnapshot,
     pub depth: DepthSnapshot,
+    pub books: BookSnapshot,
     /// The `--feed`/`--publisher-port`-selected market-data feeds this process may run (subject to
     /// subscription). Owned rather than `&'static` because `--publisher-port` narrows each row's
     /// publisher list.
@@ -312,6 +313,7 @@ impl Reconciler {
                         self.cfg.tx.clone(),
                         self.cfg.instruments.clone(),
                         self.cfg.depth.clone(),
+                        self.cfg.books.clone(),
                         self.cfg.ws_cfg.clone(),
                     )));
                 }

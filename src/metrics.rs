@@ -148,9 +148,9 @@ pub struct Metrics {
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
     pub quotes_no_source_ts: IntCounterVec,
-    /// Nanoseconds the authoritative arm led the challenger's copy by, per contested message —
-    /// the series `--arb-transfer-margin-us` is read off. See
-    /// [`crate::ingest::authority::StickyAuthority`].
+    /// Nanoseconds between the two arms' copies of one **matched trade**, on our own receive clock —
+    /// the series `--arb-transfer-margin-us` is read off. Fed only by
+    /// [`crate::ingest::arm_race::ArmRace`] pairs, never by a dropped copy's inter-arm phase.
     pub arm_lead_ns: HistogramVec,
     /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
     /// thresholds are too loose: every transfer re-baselines each consumer's book.
@@ -158,6 +158,19 @@ pub struct Metrics {
     /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
     /// authority is fragmented; all on one arm is the steady state.
     pub arm_markets_held: IntGaugeVec,
+    /// Trades an `arm` delivered that its peer never did inside the match window — a drop on one arm,
+    /// or a genuine one-sided print. The denominator for how much of the election's evidence is being
+    /// lost; a rate near the trade rate means the arms are barely pairing at all.
+    pub arm_unmatched_trades: IntCounterVec,
+    /// Incremental `book` batches the authority gate did not publish, by the `publisher` class whose
+    /// copy was dropped: a non-authoritative arm's copy, or a batch withheld while a market waits for
+    /// its new arm to close a logical event. In steady state this is the challenger's whole stream, so
+    /// it tracks its message rate rather than any fault.
+    pub book_dropped: IntCounterVec,
+    /// Markets evicted from the `book` authority gate's tracked set because the cap was reached. The
+    /// key is wire-supplied, so this is the forged-market backstop: an evicted market loses its replay
+    /// bootstrap, and its next batch re-baselines the consumer from whatever it accumulates again.
+    pub book_markets_evicted: IntCounterVec,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -480,8 +493,8 @@ impl Metrics {
             arm_lead_ns: histogram_vec(
                 &registry,
                 "dz_arm_lead_ns",
-                "Nanoseconds the authoritative arm led the challenger's copy by, per contested \
-                 message. The series the re-election thresholds are read off.",
+                "Nanoseconds between the two arms' copies of one matched trade, on our own receive \
+                 clock. The series the re-election thresholds are read off.",
                 &["venue", "winner"],
                 LEAD_NS_BUCKETS,
             ),
@@ -544,6 +557,27 @@ impl Metrics {
                 "Publisher Action-vs-quantity disagreements by kind; never changes the applied \
                  result",
                 &["venue", "kind"],
+            ),
+            arm_unmatched_trades: counter_vec(
+                &registry,
+                "dz_arm_unmatched_trades_total",
+                "Trades one arm delivered that its peer never did inside the match window — a drop \
+                 on that arm, or a one-sided print. Election evidence lost.",
+                &["venue", "arm"],
+            ),
+            book_dropped: counter_vec(
+                &registry,
+                "dz_book_dropped_total",
+                "Incremental book batches the authority gate did not publish, by the publisher class \
+                 whose copy was dropped (in steady state, the challenger arm's whole stream).",
+                &["venue", "publisher"],
+            ),
+            book_markets_evicted: counter_vec(
+                &registry,
+                "dz_book_markets_evicted_total",
+                "Markets evicted from the book authority gate's tracked set because the cap was \
+                 reached; an evicted market loses its replay bootstrap.",
+                &["venue"],
             ),
             trades_no_id: counter_vec(
                 &registry,
@@ -800,6 +834,11 @@ mod tests {
         m.mbp_divergence
             .with_label_values(&["Lashay", "delete_with_quantity"])
             .inc();
+        m.arm_unmatched_trades
+            .with_label_values(&["Lashay", "arm1"])
+            .inc();
+        m.book_dropped.with_label_values(&["Lashay", "edge"]).inc();
+        m.book_markets_evicted.with_label_values(&["Lashay"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -836,6 +875,9 @@ mod tests {
             "dz_mbp_duplicate_deltas_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",
+            "dz_arm_unmatched_trades_total",
+            "dz_book_dropped_total",
+            "dz_book_markets_evicted_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {
