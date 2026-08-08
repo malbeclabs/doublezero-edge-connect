@@ -238,6 +238,9 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec::Message;
     let (mut quotes, mut trades, mut defs, mut manifests, mut hb, mut other, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    // Does this arm stamp the "no venue trade id" sentinel always, never, or sometimes? Run once per
+    // `--src` to get the answer per arm; a cross-arm comparison of the real ids is out of scope.
+    let mut zero_id_trades = 0u64;
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
     let mut refdata: Vec<Vec<u8>> = Vec::new();
     // Buffered with their instrument ids: the symbol filter is resolved after the full scan,
@@ -259,6 +262,7 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 }
                 Message::Trade(t) => {
                     trades += 1;
+                    zero_id_trades += u64::from(t.trade_id == 0);
                     ids.push(t.instrument_id);
                 }
                 Message::InstrumentDefinition(d) => {
@@ -313,7 +317,7 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         args,
         symbol_to_id.len(),
         errors,
-        &format!("decode: quotes={quotes} trades={trades} defs={defs} manifests={manifests} heartbeats={hb} other={other} errors={errors}"),
+        &format!("decode: quotes={quotes} trades={trades} zero_id_trades={zero_id_trades} defs={defs} manifests={manifests} heartbeats={hb} other={other} errors={errors}"),
     );
     if !args.symbol.is_empty() {
         eprintln!(
@@ -521,6 +525,7 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec_mbp::Message;
     let (mut levels, mut clears, mut resets, mut trades, mut batches) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut zero_id_trades = 0u64;
     let (mut defs, mut manifests, mut snaps, mut hb, mut eos, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     // Unrouted types tallied by type byte: a capture where the decoder rejects every LevelUpdate
@@ -577,6 +582,7 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
                 }
                 Message::Trade(t) => {
                     trades += 1;
+                    zero_id_trades += u64::from(t.trade_id == 0);
                     fr.md_ids.push(t.instrument_id);
                 }
                 // Channel-wide, no instrument id: kept regardless of the symbol filter so a
@@ -662,7 +668,7 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         args,
         symbol_to_id.len(),
         errors,
-        &format!("decode: level_update={levels} book_clear={clears} instrument_reset={resets} trades={trades} batch_boundary={batches} end_of_session={eos} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} errors={errors}"),
+        &format!("decode: level_update={levels} book_clear={clears} instrument_reset={resets} trades={trades} zero_id_trades={zero_id_trades} batch_boundary={batches} end_of_session={eos} defs={defs} manifests={manifests} snapshot_msgs={snaps} heartbeats={hb} errors={errors}"),
     );
     if !other.is_empty() {
         let by_type: Vec<String> = other.iter().map(|(t, n)| format!("{t:#04x}={n}")).collect();
