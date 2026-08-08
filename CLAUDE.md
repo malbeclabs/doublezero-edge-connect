@@ -290,6 +290,12 @@ Modules are grouped by role under `src/`:
 - **PROTOCOL.md is the contract.** Any change to the WebSocket JSON (field names, message types,
   control frames) must keep the forward-compat rule (consumers ignore unknown types/fields) and
   be reflected in PROTOCOL.md. There is no `v` field on the wire.
+- **Each feed gates its own schema versions.** `decode_frame_with` takes the caller's accepted set
+  and rejects anything else, because a schema bump means field offsets moved. Top-of-Book and
+  Market-by-Order accept `[1, 2]` and pick the `InstrumentDefinition` layout from the frame's
+  version byte (the one mapping lives in `codec_common::InstrumentDefLayout`); midpoint accepts
+  `[1]` only and keeps its own 64-byte definition. Adding a version means adding its layout there,
+  never widening a field in place.
 - **Midpoint offsets are still unvalidated.** The `codec_midpoint.rs` byte layout came from the
   edge-feed-spec *draft*, not a reference codec; its round-trip tests only pin self-consistency.
   Before enabling a live Midpoint feed, run the bridge with `RUST_LOG=debug` against the real

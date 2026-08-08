@@ -23,6 +23,12 @@ use crate::ingest::codec_common::{
 
 pub const MAGIC: u16 = 0x4D44; // "DM"
 
+/// Schema versions this decoder accepts. Midpoint is deliberately still at 1: the schema-2 bump
+/// widened the Top-of-Book/Market-by-Order `InstrumentDefinition`, and this feed kept its own
+/// slimmer 64-byte definition. A `2` here would be a publisher emitting a layout that does not
+/// exist for this feed.
+pub const SCHEMA_VERSIONS: &[u8] = &[1];
+
 pub const MSG_HEARTBEAT: u8 = 0x01;
 pub const MSG_INSTRUMENT_DEFINITION: u8 = 0x02;
 pub const MSG_MIDPOINT: u8 = 0x03;
@@ -100,9 +106,13 @@ pub enum Message {
 
 /// Decode one Midpoint-feed UDP datagram into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
-        decode_message(msg_type, b, o)
-    })
+    // The schema is unused past the gate: this feed has one generation of every message.
+    decode_frame_with(
+        buf,
+        MAGIC,
+        SCHEMA_VERSIONS,
+        |msg_type, _flags, b, o, _sv| decode_message(msg_type, b, o),
+    )
 }
 
 fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
@@ -123,6 +133,8 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
             compute_ts: u64le(b, body + 16)?,
             mid_price_raw: i64le(b, body + 24)?,
         }),
+        // This feed's own 64-byte definition: its 16-byte `Symbol` is not the field the
+        // Top-of-Book/Market-by-Order schema-2 bump widened.
         MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
             instrument_id: u32le(b, body)?,
             symbol: cstr(b, body + 4, 16)?.into(),
@@ -248,6 +260,58 @@ mod tests {
                 assert_eq!(got.manifest_seq, 5);
             }
             other => panic!("expected instrument definition, got {other:?}"),
+        }
+    }
+
+    /// This feed's `Symbol` stayed `char[16]` when its siblings widened to 64, so a symbol filling
+    /// the field must stop at 16 and not run on into `Leg1`.
+    #[test]
+    fn symbol_filling_the_field_stops_at_16_bytes() {
+        let mut b = encode_instrument(&InstrumentDefinition {
+            instrument_id: 7,
+            symbol: "".into(),
+            price_exponent: -2,
+            default_method: 3,
+            manifest_seq: 5,
+        });
+        b[8..24].copy_from_slice(b"ABCDEFGHIJKLMNOP"); // symbol @4 of a body starting at msg+4
+        b[24..32].copy_from_slice(b"LEGONEXX"); // leg1 @20
+        let (_h, msgs) = decode_frame(&frame(b, 1)).unwrap();
+        match &msgs[0] {
+            Message::InstrumentDefinition(got) => {
+                assert_eq!(got.symbol.as_ref(), "ABCDEFGHIJKLMNOP");
+                assert_eq!(got.price_exponent, -2);
+                assert_eq!(got.manifest_seq, 5);
+            }
+            other => panic!("expected instrument definition, got {other:?}"),
+        }
+    }
+
+    /// Midpoint never cut a schema 2 — its siblings' widened `InstrumentDefinition` is a message
+    /// this feed does not define, so a `2` here is a publisher bug and its frame is discarded.
+    #[test]
+    fn frame_gate_accepts_schema_1_only() {
+        let mut f = frame(
+            encode_midpoint(&Midpoint {
+                instrument_id: 7,
+                source_id: 1,
+                method: 0,
+                quality_flags: 0,
+                book_ts: 0,
+                compute_ts: 0,
+                mid_price_raw: 18_420,
+            }),
+            1,
+        );
+        assert!(decode_frame(&f).is_ok());
+        for schema in [0u8, 2, 3, 255] {
+            f[2] = schema;
+            let err = decode_frame(&f).expect_err("unimplemented schema must be refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("unsupported schema version {schema}")),
+                "unexpected error for schema {schema}: {err}"
+            );
         }
     }
 

@@ -3,8 +3,9 @@
 //! A sibling protocol carrying the full L3 resting-order population per instrument, with in-band
 //! snapshot+delta recovery. It shares the 24-byte frame header / 4-byte message header / generic
 //! frame-walker in [`crate::ingest::codec_common`]; only the magic and message bodies differ. It reuses
-//! the 80-byte Top-of-Book `InstrumentDefinition` layout for reference data, and adds order
-//! deltas (`OrderAdd`/`OrderCancel`/`OrderExecute`), batch/reset control messages, and a snapshot
+//! the Top-of-Book `InstrumentDefinition` layout for reference data — both feeds cut schema 2
+//! together, so both carry either generation of it — and adds order deltas
+//! (`OrderAdd`/`OrderCancel`/`OrderExecute`), batch/reset control messages, and a snapshot
 //! group (`SnapshotBegin`/`SnapshotOrder`/`SnapshotEnd`) on a dedicated port. The reconstructed
 //! book is re-served as a full-state `depth` product (see PROTOCOL.md), never as raw deltas.
 //!
@@ -40,10 +41,15 @@ use anyhow::Result;
 
 pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
 use crate::ingest::codec_common::{
-    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader,
+    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader, InstrumentDefLayout,
+    INSTRUMENT_DEF_SYMBOL,
 };
 
 pub const MAGIC: u16 = 0x4444; // "DD"
+
+/// Schema versions this decoder accepts, matching Top-of-Book's — the two feeds share the
+/// `InstrumentDefinition` the schema-2 bump widened, and their publishers roll out together.
+pub const SCHEMA_VERSIONS: &[u8] = &[1, 2];
 
 // Shared / reference-data message types (same wire layout as Top-of-Book).
 pub const MSG_HEARTBEAT: u8 = 0x01;
@@ -82,11 +88,14 @@ pub mod sizes {
     pub const SNAPSHOT_BEGIN: u8 = 36;
     pub const SNAPSHOT_ORDER: u8 = 44;
     pub const SNAPSHOT_END: u8 = 20;
+    /// Schema 1's definition; schema 2's widened `Symbol` makes it 128.
     pub const INSTRUMENT_DEFINITION: u8 = 80;
+    pub const INSTRUMENT_DEFINITION_SCHEMA_2: u8 = 128;
     pub const TRADE: u8 = 52;
 }
 
-/// 80-byte instrument definition (same layout as Top-of-Book). Only the fields the bridge needs.
+/// Instrument definition (same layout as Top-of-Book, 80 bytes at schema 1 and 128 at schema 2).
+/// Only the fields the bridge needs.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InstrumentDefinition {
@@ -242,21 +251,21 @@ pub enum Message {
 
 /// Decode one Market-by-Order UDP datagram into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
-        decode_message(msg_type, b, o)
+    decode_frame_with(buf, MAGIC, SCHEMA_VERSIONS, |msg_type, _flags, b, o, sv| {
+        decode_message(msg_type, b, o, sv)
     })
 }
 
-fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
+fn decode_message(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Message {
     // A message shorter than its declared type's fields decodes to `None` -> `Other` (skipped),
     // never an out-of-bounds panic (the readers are bounds-checked; see `codec_common`).
-    decode_body(msg_type, b, o).unwrap_or(Message::Other(msg_type))
+    decode_body(msg_type, b, o, schema_version).unwrap_or(Message::Other(msg_type))
 }
 
 // Field offsets per arm are validated against the authorities documented in the module header and
 // asserted by the offset-independent tests below (e.g. `order_add_offsets_match_authority`, which
 // carries the OrderAdd field map). Do not change an offset without updating its matching test.
-fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
+fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<Message> {
     let body = o + MSG_HEADER_SIZE;
     Some(match msg_type {
         MSG_ORDER_ADD => Message::OrderAdd(OrderAdd {
@@ -330,13 +339,16 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
             trade_id: u64le(b, body + 32)?,
             cumulative_volume_raw: u64le(b, body + 40)?,
         }),
-        MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
-            instrument_id: u32le(b, body)?,
-            symbol: cstr(b, body + 4, 16)?.into(),
-            price_exponent: u8le(b, body + 37)? as i8,
-            qty_exponent: u8le(b, body + 38)? as i8,
-            manifest_seq: u16le(b, body + 74)?,
-        }),
+        MSG_INSTRUMENT_DEFINITION => {
+            let def = InstrumentDefLayout::for_schema(schema_version)?;
+            Message::InstrumentDefinition(InstrumentDefinition {
+                instrument_id: u32le(b, body)?,
+                symbol: cstr(b, body + INSTRUMENT_DEF_SYMBOL, def.symbol_len)?.into(),
+                price_exponent: u8le(b, body + def.price_exponent)? as i8,
+                qty_exponent: u8le(b, body + def.qty_exponent)? as i8,
+                manifest_seq: u16le(b, body + def.manifest_seq)?,
+            })
+        }
         MSG_MANIFEST_SUMMARY => Message::ManifestSummary(ManifestSummary {
             channel_id: u8le(b, body)?,
             valid: u8le(b, body + 1)? != 0,
@@ -838,6 +850,144 @@ pub(crate) mod tests {
                 assert_eq!(g.manifest_seq, 13);
             }
             other => panic!("expected InstrumentDefinition, got {other:?}"),
+        }
+    }
+
+    /// The 80-byte schema-1 definition body, fields at their literal offsets, wrapped in a frame
+    /// declaring schema 1. `Leg1` is filled so a symbol read past its field edge shows up.
+    fn schema_1_def(
+        id: u32,
+        symbol: &[u8],
+        price_exp: i8,
+        qty_exp: i8,
+        manifest_seq: u16,
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; 76]; // size 80 - 4 header
+        put(&mut body, 0, &id.to_le_bytes());
+        put(&mut body, 4, symbol); // symbol char[16] @4
+        put(&mut body, 20, b"LEGONEXX"); // leg1 @20
+        body[37] = price_exp as u8;
+        body[38] = qty_exp as u8;
+        put(&mut body, 74, &manifest_seq.to_le_bytes());
+        frame_one(
+            MSG_INSTRUMENT_DEFINITION,
+            sizes::INSTRUMENT_DEFINITION,
+            &body,
+        )
+    }
+
+    /// The 128-byte schema-2 definition: `Symbol` is `char[64]`, so every later field sits 48 bytes
+    /// further in. The frame's version byte is stamped to 2.
+    fn schema_2_def(
+        id: u32,
+        symbol: &[u8],
+        price_exp: i8,
+        qty_exp: i8,
+        manifest_seq: u16,
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; 124]; // size 128 - 4 header
+        put(&mut body, 0, &id.to_le_bytes());
+        put(&mut body, 4, symbol); // symbol char[64] @4
+        put(&mut body, 68, b"LEGONEXX"); // leg1 @68
+        body[85] = price_exp as u8;
+        body[86] = qty_exp as u8;
+        put(&mut body, 122, &manifest_seq.to_le_bytes());
+        let mut f = frame_one(
+            MSG_INSTRUMENT_DEFINITION,
+            sizes::INSTRUMENT_DEFINITION_SCHEMA_2,
+            &body,
+        );
+        f[2] = 2; // schema_version
+        f
+    }
+
+    fn decode_def(frame: &[u8]) -> InstrumentDefinition {
+        match decode_frame(frame).unwrap().1.remove(0) {
+            Message::InstrumentDefinition(d) => d,
+            other => panic!("expected instrument definition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instrument_definition_schema_1_decodes() {
+        let f = schema_1_def(7, b"BTC-USDT", -1, -8, 13);
+        assert_eq!(f.len(), FRAME_HEADER_SIZE + 80);
+        let d = decode_def(&f);
+        assert_eq!(d.instrument_id, 7);
+        assert_eq!(d.symbol.as_ref(), "BTC-USDT");
+        assert_eq!(d.price_exponent, -1);
+        assert_eq!(d.qty_exponent, -8);
+        assert_eq!(d.manifest_seq, 13);
+    }
+
+    /// The same instrument published at schema 2 must reach the book identically — nothing
+    /// downstream of the decoder learns which generation produced the record.
+    #[test]
+    fn instrument_definition_schema_2_decodes_the_same_instrument() {
+        let f = schema_2_def(7, b"BTC-USDT", -1, -8, 13);
+        assert_eq!(f.len(), FRAME_HEADER_SIZE + 128);
+        let d = decode_def(&f);
+        assert_eq!(d.instrument_id, 7);
+        assert_eq!(d.symbol.as_ref(), "BTC-USDT");
+        assert_eq!(d.price_exponent, -1);
+        assert_eq!(d.qty_exponent, -8);
+        assert_eq!(d.manifest_seq, 13);
+
+        let one = decode_def(&schema_1_def(7, b"BTC-USDT", -1, -8, 13));
+        assert_eq!(d.symbol, one.symbol);
+        assert_eq!(d.price_exponent, one.price_exponent);
+        assert_eq!(d.qty_exponent, one.qty_exponent);
+        assert_eq!(d.manifest_seq, one.manifest_seq);
+    }
+
+    /// A symbol past 16 bytes is what actually pins the widening: any symbol that fits in the old
+    /// field decodes the same at either width, so a decoder still reading 16 bytes would pass every
+    /// other test here. This one truncates the symbol under it.
+    #[test]
+    fn schema_2_symbol_longer_than_16_bytes() {
+        let symbol = b"KXPRESPARTYWINNER-2028-DEMOCRATIC";
+        assert!(symbol.len() > 16);
+        let d = decode_def(&schema_2_def(7, symbol, -1, -8, 13));
+        assert_eq!(d.symbol.as_ref(), "KXPRESPARTYWINNER-2028-DEMOCRATIC");
+        assert_eq!(d.price_exponent, -1);
+        assert_eq!(d.qty_exponent, -8);
+        assert_eq!(d.manifest_seq, 13);
+    }
+
+    /// A symbol that fills its field leaves no NUL to stop at, so the width itself is the only
+    /// bound: the decode must stop at the field edge and not run on into `Leg1`.
+    #[test]
+    fn symbol_filling_the_field_stops_at_its_width() {
+        let d = decode_def(&schema_1_def(7, b"ABCDEFGHIJKLMNOP", -1, -8, 13));
+        assert_eq!(d.symbol.as_ref(), "ABCDEFGHIJKLMNOP");
+
+        let wide = [b'S'; 64];
+        let d = decode_def(&schema_2_def(7, &wide, -1, -8, 13));
+        assert_eq!(d.symbol.as_ref(), "S".repeat(64));
+        assert_eq!(d.manifest_seq, 13);
+    }
+
+    /// Both generations are on the wire while the schema-2 rollout is staged, so both are accepted;
+    /// a version this build has no layout for is discarded rather than parsed at guessed offsets.
+    #[test]
+    fn frame_gate_accepts_schemas_1_and_2_only() {
+        let mut f = frame(&[enc_snapshot_end(&SnapshotEnd {
+            instrument_id: 7,
+            anchor_seq: 100,
+            snapshot_id: 9,
+        })]);
+        for schema in [1u8, 2] {
+            f[2] = schema;
+            assert!(decode_frame(&f).is_ok(), "schema {schema} must be accepted");
+        }
+        for schema in [0u8, 3, 255] {
+            f[2] = schema;
+            let err = decode_frame(&f).expect_err("unimplemented schema must be refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("unsupported schema version {schema}")),
+                "unexpected error for schema {schema}: {err}"
+            );
         }
     }
 

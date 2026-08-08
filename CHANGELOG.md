@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
 
 ### Added
+- Wire schema 2 is decoded alongside schema 1 on Top-of-Book and Market-by-Order. The `2.0.0`
+  edge-feed-spec release widened `InstrumentDefinition`'s `Symbol` from `char[16]` to `char[64]`,
+  moving every field after it by 48 bytes and growing the message from 80 to 128; the frame's
+  version byte at offset 2 now selects the layout, so a staged publisher rollout can put both
+  generations on the wire at once and nothing downstream of the decoder can tell them apart.
+  Midpoint kept its slimmer 64-byte definition and stays at schema 1. Frames carrying a version
+  the build does not implement are discarded with an error naming both — until now the version
+  byte was decoded and never compared, so a schema-2 frame would have been parsed at schema-1
+  offsets, reading `price_exponent`, `qty_exponent` and `manifest_seq` out of the middle of the
+  symbol and publishing plausible-looking wrong precision.
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All eleven live Hyperliquid publishers are
   ingested (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
