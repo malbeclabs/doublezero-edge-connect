@@ -152,7 +152,10 @@ Modules are grouped by role under `src/`:
   print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
   and reference data whenever a *peer* feed's subscription changed. The flag is stored **with** the
   `JoinHandle` in one `active` map so it cannot outlive its receiver on either the abort or the reap
-  path. Changes are counted by `dz_tape_owner_changes_total{venue}`.
+  path, and ownership is ordered **liveness before rank** (`FeedHealth::is_down` — a subscribed-but-
+  dead row must not hold the tape while its peer decodes prints and drops them; "not registered yet"
+  is not down, or activating a feed would bounce the tape). Changes are counted by
+  `dz_tape_owner_changes_total{venue}`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
@@ -197,13 +200,21 @@ Modules are grouped by role under `src/`:
   the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
   sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
   venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
-  **id-independent**. First arm to print leads (a TOB-only deployment carries no `book` traffic, so
-  `venue_leader()` is `None` forever and electing first would mute the tape), the book-elected arm
-  takes over immediately (arm identity is shared across a venue's rows — one source IP per publisher
-  host, both protocols), and a silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS` so an elected
-  arm with a dead trade stream can't mute it either. The peer's prints are dropped
-  (`dz_trades_dropped_total`); transfers are `dz_tape_arm_transfers_total`. `no_id_owner` is untouched:
-  it is the `Coordinated` guard, disjoint by mode.
+  **id-independent**. Four rules: first arm to print leads (a TOB-only deployment carries no `book`
+  traffic, so `venue_leader()` is `None` forever and electing first would mute the tape); an arm the
+  authority *tracks* displaces one it does not (the slot is first-come on an unauthenticated wire);
+  the book-*elected* arm takes over, **once per election** rather than per print (arm identity is
+  shared across a venue's rows — one source IP per publisher host, both protocols — and re-honouring
+  per print would let a nearly-dead elected arm sawtooth the tape away from the healthy peer); and a
+  silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS`, marking the election it overrode as spent.
+  The peer's prints are dropped on their own `dz_tape_arm_dropped_total` (not folded into
+  `dz_trades_dropped_total`, whose steady state here is the challenger's whole stream); transfers are
+  `dz_tape_arm_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
+  wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
+  holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
+  no-dark-start already exposes for `book` — and the gate is venue-wide, so arms that *sharded* prints
+  rather than mirroring them would lose the non-serving arm's fills. `no_id_owner` is skipped entirely
+  for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
   `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`
   label lookup.

@@ -79,18 +79,30 @@ pub fn tape_rank_is_some(kind: FeedKind) -> bool {
     tape_rank(kind).is_some()
 }
 
-/// The tape-owning feed row per venue over a set of running receivers: lowest [`tape_rank`] wins,
-/// base port breaking a tie so the result never depends on iteration order.
-pub fn tape_owners(active: impl IntoIterator<Item = FeedKey>) -> HashMap<&'static str, FeedKey> {
-    let mut best: HashMap<&'static str, (u8, FeedKey)> = HashMap::new();
+/// The tape-owning feed row per venue over a set of running receivers.
+///
+/// Ordered `(down, rank, base port)`, lowest wins: **liveness before rank**, base port breaking a tie
+/// so the result never depends on iteration order. Rank alone would let a subscribed-but-dead row
+/// hold the tape indefinitely while its peer decodes prints and drops them — the group being
+/// subscribed and a publisher actually sending to it are independent facts, which is the normal state
+/// during a rollout. `down` is the *registered and down* set only, never "not registered yet": a
+/// receiver spawned this tick has not bound its sockets, and demoting it would bounce the tape on
+/// every activation. With every row down the ordering falls back to rank, so nothing changes at
+/// startup.
+pub fn tape_owners(
+    active: impl IntoIterator<Item = FeedKey>,
+    down: impl Fn(&FeedKey) -> bool,
+) -> HashMap<&'static str, FeedKey> {
+    let mut best: HashMap<&'static str, ((bool, u8, u16), FeedKey)> = HashMap::new();
     for key in active {
         let Some(rank) = tape_rank(key.1) else {
             continue;
         };
+        let order = (down(&key), rank, key.2);
         match best.get(key.0) {
-            Some(&(cur_rank, cur_key)) if (cur_rank, cur_key.2) <= (rank, key.2) => {}
+            Some(&(cur, _)) if cur <= order => {}
             _ => {
-                best.insert(key.0, (rank, key));
+                best.insert(key.0, (order, key));
             }
         }
     }
@@ -320,7 +332,11 @@ impl Reconciler {
         let current: HashSet<FeedKey> = self.active.keys().copied().collect();
         let (to_spawn, to_abort) = plan(&current, desired);
         for key in to_abort {
-            if let Some((h, _)) = self.active.remove(&key) {
+            if let Some((h, tape)) = self.active.remove(&key) {
+                // Before the abort, which lands at the task's next await: an outgoing owner that
+                // keeps printing while the incoming one is already on doubles the tape, and a zero-id
+                // print in that window has nothing downstream to collapse it.
+                tape.store(false, Ordering::Relaxed);
                 h.abort();
                 info!(
                     venue = key.0,
@@ -331,10 +347,13 @@ impl Reconciler {
             }
         }
         // Ownership over the post-apply running set, which `desired` already is: the aborts above
-        // removed everything outside it and the spawns below add the rest. Computing it here lets a
-        // newly-spawned receiver start with the flag it will hold, so activating a feed is not also
+        // removed everything outside it and the spawns below add the rest. Published to the
+        // survivors *before* the spawn loop — an incumbent that has lost the tape must be switched
+        // off before its replacement is switched on, for the same reason as the abort above — and
+        // each spawn then starts with the flag it will hold, so activating a feed is not also
         // counted as a tape *change*.
-        let owners = tape_owners(desired.iter().copied());
+        let owners = tape_owners(desired.iter().copied(), |k| self.health.is_down(k));
+        self.publish_tape_owners(&owners);
         for key in to_spawn {
             let (feed, publisher) = self
                 .cfg
@@ -369,7 +388,6 @@ impl Reconciler {
             ));
             self.active.insert(key, (h, tape));
         }
-        self.publish_tape_owners(&owners);
     }
 
     /// Push the current tape ownership onto every running receiver's flag.
@@ -557,11 +575,16 @@ mod tests {
     const MBP: FeedKind = FeedKind::MarketByPrice;
     const MBO: FeedKind = FeedKind::MarketByOrder;
 
+    /// The steady state: nothing registered down.
+    fn all_live(_: &FeedKey) -> bool {
+        false
+    }
+
     /// Both of a venue's rows claim the tape, so with both up the ranking must pick one — top of
     /// book, the venue's primary tape.
     #[test]
     fn top_of_book_owns_the_tape_when_both_feeds_run() {
-        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)]);
+        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], all_live);
         assert_eq!(owners.get("V"), Some(&("V", TOB, 7576)));
         assert!(owns(&owners, &("V", TOB, 7576)));
         assert!(!owns(&owners, &("V", MBP, 31000)));
@@ -571,13 +594,13 @@ mod tests {
     /// group alone still has to serve a tape.
     #[test]
     fn market_by_price_owns_the_tape_alone() {
-        let owners = tape_owners([("V", MBP, 31000)]);
+        let owners = tape_owners([("V", MBP, 31000)], all_live);
         assert!(owns(&owners, &("V", MBP, 31000)));
     }
 
     #[test]
     fn tape_ownership_is_per_venue() {
-        let owners = tape_owners([("A", MBP, 31000), ("B", TOB, 7576)]);
+        let owners = tape_owners([("A", MBP, 31000), ("B", TOB, 7576)], all_live);
         assert!(owns(&owners, &("A", MBP, 31000)));
         assert!(owns(&owners, &("B", TOB, 7576)));
     }
@@ -586,7 +609,7 @@ mod tests {
     /// rather than one silently minted from a row that never prints.
     #[test]
     fn a_depth_only_venue_has_no_tape_owner() {
-        let owners = tape_owners([("V", MBO, 10001)]);
+        let owners = tape_owners([("V", MBO, 10001)], all_live);
         assert!(owners.is_empty());
         assert!(!owns(&owners, &("V", MBO, 10001)));
     }
@@ -595,16 +618,44 @@ mod tests {
     /// publisher of a peer row does — collapsing the mirrored copies is the arbiter's job.
     #[test]
     fn every_publisher_of_the_owning_feed_emits() {
-        let owners = tape_owners([
-            ("V", TOB, 7576),
-            ("V", TOB, 7676),
-            ("V", MBP, 31000),
-            ("V", MBP, 31100),
-        ]);
+        let owners = tape_owners(
+            [
+                ("V", TOB, 7576),
+                ("V", TOB, 7676),
+                ("V", MBP, 31000),
+                ("V", MBP, 31100),
+            ],
+            all_live,
+        );
         assert!(owns(&owners, &("V", TOB, 7576)));
         assert!(owns(&owners, &("V", TOB, 7676)));
         assert!(!owns(&owners, &("V", MBP, 31000)));
         assert!(!owns(&owners, &("V", MBP, 31100)));
+    }
+
+    /// The group being subscribed and a publisher actually sending to it are independent facts, so
+    /// rank alone would let a dead top-of-book row hold the tape while the market-by-price receiver
+    /// decodes prints and drops them. Liveness outranks rank; with everything down it falls back.
+    #[test]
+    fn a_dead_row_yields_the_tape_to_a_live_peer() {
+        let keys = [("V", TOB, 7576), ("V", MBP, 31000)];
+        let owners = tape_owners(keys, |k| k.1 == TOB);
+        assert!(owns(&owners, &("V", MBP, 31000)));
+        assert!(!owns(&owners, &("V", TOB, 7576)));
+
+        let both_down = tape_owners(keys, |_| true);
+        assert!(owns(&both_down, &("V", TOB, 7576)), "falls back to rank");
+    }
+
+    /// One live publisher makes its row live: `down` is per receiver but ownership is per row.
+    #[test]
+    fn one_live_publisher_keeps_the_row_owning() {
+        let owners = tape_owners(
+            [("V", TOB, 7576), ("V", TOB, 7676), ("V", MBP, 31000)],
+            |k| *k == ("V", TOB, 7576),
+        );
+        assert!(owns(&owners, &("V", TOB, 7676)));
+        assert!(!owns(&owners, &("V", MBP, 31000)));
     }
 
     /// Distinct publishers of the same feed must not collide in the active-task map.
