@@ -23,7 +23,7 @@ use crate::{
         codec::{apply_exponent, decode_frame, source_name, InstrumentDefinition, Message},
         codec_mbo, codec_midpoint,
         receiver::{FrameCtx, FrameProcessor, SeqCheck, SeqTracker},
-        subscriber::RefDataState,
+        subscriber::{InstrumentDef, RefDataState},
     },
     metrics::metrics,
     model::{
@@ -105,6 +105,58 @@ impl SeqEvents {
 /// inserted publisher is evicted (it simply re-anchors its sequence on its next frame).
 const MAX_PUBLISHERS: usize = 256;
 
+/// Per-publisher reference-data state, bounded exactly like the per-publisher sequence map.
+///
+/// `reset_count` is scoped to `(source_ip, group, port)`, so two publishers sharing a port block
+/// carry unrelated reset counters: under one shared [`RefDataState`] either arm's restart clears the
+/// other's instrument set, blanking both, since every emission path gates on a resolved definition.
+/// The source IP is spoofable, so the map takes the same [`MAX_PUBLISHERS`] least-recently-inserted
+/// eviction as the sequence map — an evicted publisher re-learns its definitions from the next
+/// reference-data burst.
+struct PerPublisher<D> {
+    states: HashMap<IpAddr, RefDataState<D>>,
+    /// Insertion order of `states` keys, oldest at the front, for the [`MAX_PUBLISHERS`] eviction.
+    order: VecDeque<IpAddr>,
+}
+
+impl<D> Default for PerPublisher<D> {
+    fn default() -> Self {
+        // Not `#[derive(Default)]`: that would impose `D: Default`, which the definition types
+        // don't (and needn't) implement - only the collections need defaulting.
+        Self {
+            states: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl<D: InstrumentDef> PerPublisher<D> {
+    /// The state for `publisher`, **creating it on first sight** — reference-data writes only. A
+    /// read must use [`Self::def`]: minting an entry from the market-data path would let a forged-
+    /// source flood evict the real publishers' definitions without ever sending reference data.
+    fn get(&mut self, publisher: IpAddr) -> &mut RefDataState<D> {
+        if !self.states.contains_key(&publisher) {
+            while self.states.len() >= MAX_PUBLISHERS {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.states.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.states.insert(publisher, RefDataState::new());
+            self.order.push_back(publisher);
+        }
+        self.states.get_mut(&publisher).expect("just inserted")
+    }
+
+    /// `publisher`'s definition for `instrument_id`, creating nothing. Borrows only this field, so
+    /// callers keep the disjoint borrows of their other state.
+    fn def(&self, publisher: IpAddr, instrument_id: u32) -> Option<&D> {
+        self.states.get(&publisher)?.definition(instrument_id)
+    }
+}
+
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
 /// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
 /// multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same key; they are expected to
@@ -133,7 +185,8 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 /// and emits normalized quotes (gated per-instrument on a known definition) on the market-data
 /// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote frames.
 pub struct TobProcessor {
-    state: RefDataState<InstrumentDefinition>,
+    /// Per-publisher reference-data state (see [`PerPublisher`]).
+    state: PerPublisher<InstrumentDefinition>,
     /// Per-publisher, per-channel frame sequence tracker. Independent publishers mirror this feed
     /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
     /// frames stale and drop them before dedup; keying by source IP keeps each publisher's sequence
@@ -157,7 +210,7 @@ pub struct TobProcessor {
 impl TobProcessor {
     pub fn new(emit_trades: bool) -> Self {
         Self {
-            state: RefDataState::new(),
+            state: PerPublisher::default(),
             seq: HashMap::new(),
             seq_order: VecDeque::new(),
             warned_invalid_manifest: false,
@@ -206,7 +259,7 @@ impl FrameProcessor for TobProcessor {
         let handle_quotes = ctx.role.handles_mktdata();
 
         if handle_refdata {
-            self.state.on_frame(header.reset_count);
+            self.state.get(ctx.publisher).on_frame(header.reset_count);
         }
 
         // Per edge-feed-spec, the frame Sequence Number is monotonically increasing per channel and
@@ -268,8 +321,11 @@ impl FrameProcessor for TobProcessor {
                             "manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
                         );
                     }
-                    self.state
-                        .on_manifest(true, m.manifest_seq, m.instrument_count);
+                    self.state.get(ctx.publisher).on_manifest(
+                        true,
+                        m.manifest_seq,
+                        m.instrument_count,
+                    );
                 }
                 Message::InstrumentDefinition(d) if handle_refdata => {
                     let inst = NormalizedInstrument {
@@ -281,12 +337,13 @@ impl FrameProcessor for TobProcessor {
                     // Update the shared snapshot so newly-connecting subscribers get this
                     // instrument before any quote.
                     upsert_instrument(ctx.instruments, &inst);
-                    self.state.on_instrument_definition(d);
+                    self.state.get(ctx.publisher).on_instrument_definition(d);
                     ctx.emit(FeedMessage::Instrument(inst));
                 }
                 Message::ChannelReset(ts) if handle_refdata => {
                     warn!(ts, "channel reset; discarding reference-data state");
-                    self.state = RefDataState::new();
+                    // A channel reset belongs to the publisher that sent it, not the port block.
+                    *self.state.get(ctx.publisher) = RefDataState::new();
                 }
                 Message::EndOfSession(ts) if handle_refdata => {
                     info!(ts, "end of session");
@@ -304,7 +361,7 @@ impl FrameProcessor for TobProcessor {
                     // until a *full* burst landed within a single valid manifest epoch.
                     // Gating per instrument lets each symbol's quotes flow the moment its
                     // definition is known, independent of the others.
-                    let Some(def) = self.state.definition(q.instrument_id) else {
+                    let Some(def) = self.state.def(ctx.publisher, q.instrument_id) else {
                         continue; // no definition for this instrument yet; drop until we have it
                     };
                     // This feed maps to a single venue (see feeds.rs), so instruments and quotes
@@ -352,7 +409,7 @@ impl FrameProcessor for TobProcessor {
                 Message::Trade(t) if handle_quotes && quotes_fresh => {
                     // Same per-instrument precision gate as quotes: a trade is dropped until we
                     // hold its definition, so we never emit a price without knowing its exponents.
-                    let Some(def) = self.state.definition(t.instrument_id) else {
+                    let Some(def) = self.state.def(ctx.publisher, t.instrument_id) else {
                         continue;
                     };
                     let venue: &'static str = source_name(t.source_id).unwrap_or(ctx.venue);
@@ -388,7 +445,8 @@ impl FrameProcessor for TobProcessor {
 /// normalized mid price (gated per-instrument on a known definition) on the market-data stream.
 /// Structurally parallel to [`TobProcessor`] but for the `0x4D44` sibling protocol.
 pub struct MidpointProcessor {
-    state: RefDataState<codec_midpoint::InstrumentDefinition>,
+    /// Per-publisher reference-data state (see [`PerPublisher`]).
+    state: PerPublisher<codec_midpoint::InstrumentDefinition>,
     seq: SeqTracker,
     warned_source_mismatch: bool,
     /// Rate limit for the per-datagram decode-error warning.
@@ -406,7 +464,7 @@ impl Default for MidpointProcessor {
 impl MidpointProcessor {
     pub fn new() -> Self {
         Self {
-            state: RefDataState::new(),
+            state: PerPublisher::default(),
             seq: SeqTracker::default(),
             warned_source_mismatch: false,
             decode_warn: WarnRateLimit::default(),
@@ -431,7 +489,7 @@ impl FrameProcessor for MidpointProcessor {
         let handle_mids = ctx.role.handles_mktdata();
 
         if handle_refdata {
-            self.state.on_frame(header.reset_count);
+            self.state.get(ctx.publisher).on_frame(header.reset_count);
         }
 
         // Same stale/out-of-order rejection as quotes: a midpoint is full state per instrument.
@@ -451,8 +509,11 @@ impl FrameProcessor for MidpointProcessor {
                     // Unlike the Top-of-Book HL publisher (which emits Valid=0 - see TobProcessor),
                     // we pass the Midpoint manifest's `valid` honestly; if the Midpoint publisher
                     // turns out to share that defect, apply the same override here.
-                    self.state
-                        .on_manifest(m.valid, m.manifest_seq, m.instrument_count);
+                    self.state.get(ctx.publisher).on_manifest(
+                        m.valid,
+                        m.manifest_seq,
+                        m.instrument_count,
+                    );
                 }
                 codec_midpoint::Message::InstrumentDefinition(d) if handle_refdata => {
                     // A mid price has no size, so there is no qty exponent on the Midpoint feed;
@@ -464,14 +525,14 @@ impl FrameProcessor for MidpointProcessor {
                         qty_exponent: 0,
                     };
                     upsert_instrument(ctx.instruments, &inst);
-                    self.state.on_instrument_definition(d);
+                    self.state.get(ctx.publisher).on_instrument_definition(d);
                     ctx.emit(FeedMessage::Instrument(inst));
                 }
                 codec_midpoint::Message::EndOfSession(ts) if handle_refdata => {
                     info!(ts, "midpoint end of session");
                 }
                 codec_midpoint::Message::Midpoint(mp) if handle_mids && mids_fresh => {
-                    let Some(def) = self.state.definition(mp.instrument_id) else {
+                    let Some(def) = self.state.def(ctx.publisher, mp.instrument_id) else {
                         continue; // no definition yet; drop until we know precision
                     };
                     if let Some(name) = source_name(mp.source_id) {
@@ -516,7 +577,8 @@ const MAX_BOOKS: usize = 4096;
 /// and emits a full-state `depth` snapshot whenever an instrument's top-N changes - plus `trade`
 /// prints. The reconstructed book lives here so consumers never see raw deltas (PROTOCOL.md).
 pub struct MboProcessor {
-    state: RefDataState<codec_mbo::InstrumentDefinition>,
+    /// Per-publisher reference-data state (see [`PerPublisher`]).
+    state: PerPublisher<codec_mbo::InstrumentDefinition>,
     /// One independent L3 book per `(publisher, instrument)`. Two publishers mirror the same feed but
     /// reconstruct from independent, instance-scoped per-instrument delta sequences (whose sequence
     /// spaces collide), so their books CANNOT be merged — each runs its own recovery state machine.
@@ -552,7 +614,7 @@ pub struct MboProcessor {
 impl MboProcessor {
     pub fn new(depth: DepthSnapshot, emit_trades: bool) -> Self {
         Self {
-            state: RefDataState::new(),
+            state: PerPublisher::default(),
             books: HashMap::new(),
             books_order: VecDeque::new(),
             depth,
@@ -581,7 +643,7 @@ impl MboProcessor {
     ///    `books`. An evicted legitimate book simply re-syncs from the next snapshot.
     fn book_for(&mut self, instrument_id: u32, ctx: &FrameCtx) -> Option<&mut BookState> {
         // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
-        self.state.definition(instrument_id)?;
+        self.state.def(ctx.publisher, instrument_id)?;
         let key = (ctx.publisher, instrument_id);
         if !self.books.contains_key(&key) {
             while self.books.len() >= MAX_BOOKS {
@@ -597,10 +659,12 @@ impl MboProcessor {
                         // dropped from replay; it self-heals via full-state otherwise).
                         self.last_top.remove(&old);
                         self.emitted_symbol.remove(&old);
-                        let (_old_pub, old_id) = old;
+                        let (old_pub, old_id) = old;
                         let symbol_still_served = self.books.keys().any(|(_p, i)| *i == old_id);
                         if !symbol_still_served {
-                            if let Some(def) = self.state.definition(old_id) {
+                            // Resolved against the evicted book's OWN publisher: reference data is
+                            // per publisher, so two arms can map one id to different symbols.
+                            if let Some(def) = self.state.def(old_pub, old_id) {
                                 crate::model::lock(&self.depth)
                                     .remove(&(venue_arc(ctx.venue), def.symbol.clone()));
                             }
@@ -625,7 +689,7 @@ impl MboProcessor {
         if !book.is_synced() {
             return;
         }
-        let Some(def) = self.state.definition(instrument_id) else {
+        let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
             return; // precision unknown; don't emit a book we can't scale
         };
         let (bids_raw, asks_raw) = book.top_levels(DEPTH_LEVELS);
@@ -688,7 +752,7 @@ impl FrameProcessor for MboProcessor {
         };
 
         if ctx.role.handles_refdata() {
-            self.state.on_frame(header.reset_count);
+            self.state.get(ctx.publisher).on_frame(header.reset_count);
         }
 
         // Instruments whose book changed this frame; depth is emitted once per frame per instrument
@@ -714,8 +778,11 @@ impl FrameProcessor for MboProcessor {
                             "mbo manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
                         );
                     }
-                    self.state
-                        .on_manifest(true, m.manifest_seq, m.instrument_count);
+                    self.state.get(ctx.publisher).on_manifest(
+                        true,
+                        m.manifest_seq,
+                        m.instrument_count,
+                    );
                 }
                 codec_mbo::Message::InstrumentDefinition(d) => {
                     let inst = NormalizedInstrument {
@@ -725,7 +792,7 @@ impl FrameProcessor for MboProcessor {
                         qty_exponent: d.qty_exponent,
                     };
                     upsert_instrument(ctx.instruments, &inst);
-                    self.state.on_instrument_definition(d);
+                    self.state.get(ctx.publisher).on_instrument_definition(d);
                     ctx.emit(FeedMessage::Instrument(inst));
                 }
                 codec_mbo::Message::EndOfSession(ts) => {
@@ -801,7 +868,7 @@ impl FrameProcessor for MboProcessor {
                         }
                     }
                     // An execution is also a public trade print; emit it like a Top-of-Book trade.
-                    if let Some(def) = self.state.definition(o.instrument_id) {
+                    if let Some(def) = self.state.def(ctx.publisher, o.instrument_id) {
                         let trade = NormalizedTrade {
                             venue: venue_arc(ctx.venue),
                             symbol: def.symbol.clone(),
@@ -821,7 +888,7 @@ impl FrameProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::Trade(t) => {
-                    let Some(def) = self.state.definition(t.instrument_id) else {
+                    let Some(def) = self.state.def(ctx.publisher, t.instrument_id) else {
                         continue;
                     };
                     let trade = NormalizedTrade {
@@ -879,7 +946,7 @@ impl FrameProcessor for MboProcessor {
                         .cloned()
                         .or_else(|| {
                             self.state
-                                .definition(r.instrument_id)
+                                .def(ctx.publisher, r.instrument_id)
                                 .map(|d| d.symbol.clone())
                         });
                     let mut arb = lock(ctx.arbiter);
@@ -1020,6 +1087,121 @@ mod tests {
             "newest publisher retained"
         );
         assert!(!p.seq.contains_key(&ip(0)), "oldest publisher evicted");
+    }
+
+    /// The per-publisher reference-data map carries a full instrument set per entry, so it needs the
+    /// same [`MAX_PUBLISHERS`] bound as the sequence map — the source IP is spoofable. A *read* must
+    /// mint nothing, or a market-data flood from forged sources would evict the real publishers'
+    /// definitions without ever sending reference data.
+    #[test]
+    fn refdata_state_map_is_bounded_and_reads_mint_nothing() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use super::{PerPublisher, MAX_PUBLISHERS};
+        use crate::ingest::codec::InstrumentDefinition;
+
+        let mut m: PerPublisher<InstrumentDefinition> = PerPublisher::default();
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i));
+        let flood = (MAX_PUBLISHERS as u32) + 50;
+        for i in 0..flood {
+            let _ = m.get(ip(i));
+        }
+        assert!(
+            m.states.len() <= MAX_PUBLISHERS,
+            "refdata map must stay bounded, got {}",
+            m.states.len()
+        );
+        assert!(m.states.contains_key(&ip(flood - 1)), "newest retained");
+        assert!(!m.states.contains_key(&ip(0)), "oldest evicted");
+
+        let before = m.states.len();
+        assert!(
+            m.def(ip(flood + 1), 7).is_none(),
+            "unseen publisher has no definition"
+        );
+        assert_eq!(m.states.len(), before, "a read must not create an entry");
+    }
+
+    /// Two publishers share one port block and differ only by source IP. `reset_count` is
+    /// per-publisher state, so one arm's restart must not clear the other arm's instrument set —
+    /// which would blank both arms until the next refdata burst, since every emission path gates on
+    /// a resolved definition. Driven through `on_datagram` so it pins the wiring, not just the map.
+    #[test]
+    fn refdata_reset_is_scoped_to_the_publisher_that_reset() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        /// Rewrite a frame's `reset_count` (frame-header byte 21) to simulate a publisher restart.
+        fn with_reset_count(mut f: Vec<u8>, n: u8) -> Vec<u8> {
+            f[21] = n;
+            f
+        }
+
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, false);
+        let ctx_for = |publisher: IpAddr, role: PortRole| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        let burst = frame(&[
+            enc_manifest_summary(1, 1),
+            enc_instrument_def(0, "INST-0", 1),
+        ]);
+        let anchor = |sid: u32| {
+            frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: sid,
+                    last_instrument_seq: 0,
+                    ts: 0,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: sid,
+                }),
+            ])
+        };
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(&burst, &ctx_for(publisher, PortRole::Combined));
+            proc.on_datagram(&anchor(1), &ctx_for(publisher, PortRole::Snapshot));
+        }
+        let _ = drain_depth_ts(&mut rx);
+
+        // A restarts: its `reset_count` bumps on A's frames only, clearing A's definitions. An
+        // empty frame, so the clear isn't immediately undone by the burst that would follow it.
+        proc.on_datagram(
+            &with_reset_count(frame(&[]), 1),
+            &ctx_for(pub_a, PortRole::Refdata),
+        );
+
+        // A is dark until its next burst (no definition -> no book -> no depth) ...
+        proc.on_datagram(
+            &frame(&[add(1, 100, 7000)]),
+            &ctx_for(pub_a, PortRole::Mktdata),
+        );
+        assert!(
+            drain_depth_ts(&mut rx).is_empty(),
+            "A's own definitions clear on its reset"
+        );
+
+        // ... but B, which never reset, keeps streaming.
+        proc.on_datagram(
+            &frame(&[add(1, 101, 8000)]),
+            &ctx_for(pub_b, PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_depth_ts(&mut rx),
+            vec![8000],
+            "B's definitions must survive A's restart"
+        );
     }
 
     /// Encode a ManifestSummary wire message (24 bytes total, valid=true).
@@ -1291,13 +1473,17 @@ mod tests {
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, false);
-        proc.on_datagram(
-            &frame(&[
-                enc_manifest_summary(1, 1),
-                enc_instrument_def(0, "INST-0", 1),
-            ]),
-            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Combined),
-        );
+        // Reference-data state is per publisher, so each arm publishes its own manifest burst -
+        // which is what they do on the wire, sharing one refdata port.
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(
+                &frame(&[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(0, "INST-0", 1),
+                ]),
+                &ctx_for(publisher, &arbiter, &instruments, PortRole::Combined),
+            );
+        }
         let anchor = |sid: u32| {
             frame(&[
                 enc_snapshot_begin(&SnapshotBegin {

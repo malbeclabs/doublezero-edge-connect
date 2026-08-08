@@ -105,6 +105,24 @@ impl FeedPublisher {
     }
 }
 
+/// How the bridge resolves two publishers mirroring one venue.
+///
+/// Both modes hold exactly one authoritative publisher per key; what differs is when authority
+/// transfers. `Coordinated` re-latches every tick, because the publishers stamp a venue clock that
+/// is comparable between them. `Sticky` cannot: its arms carry no shared coordinate — no stable
+/// entry id, no per-entry venue timestamp, and the transport's own send time is not the venue's —
+/// and a content hash is no substitute, since a level oscillating 100 -> 0 -> 100 emits
+/// byte-identical updates and collapsing those leaves a subscriber holding 0 at a price that has
+/// liquidity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbitrationMode {
+    /// Comparable venue clock: latch to the tick's leader, re-latch every tick.
+    Coordinated,
+    /// No comparable coordinate: elect one arm and hold it, transferring only on a health verdict,
+    /// on silence, or on a sustained speed margin.
+    Sticky,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Feed {
     /// Venue name stamped on every instrument and message from this feed. Matches the
@@ -127,6 +145,9 @@ pub struct Feed {
     /// Whether this feed emits `trade` messages. A venue carried by both TOB and MBO would
     /// otherwise double-emit the same trades; TOB owns trades, MBO is depth-only.
     pub emit_trades: bool,
+    /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
+    /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
+    pub arbitration: ArbitrationMode,
 }
 
 /// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue, each mirrored by
@@ -235,6 +256,7 @@ pub const FEEDS: &[Feed] = &[
             },
         ],
         emit_trades: true,
+        arbitration: ArbitrationMode::Coordinated,
     },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
     // (paired with the TOB row above). Depth-only: TOB owns this venue's trades.
@@ -339,6 +361,7 @@ pub const FEEDS: &[Feed] = &[
             },
         ],
         emit_trades: false,
+        arbitration: ArbitrationMode::Coordinated,
     },
     Feed {
         venue: "Phoenix",
@@ -352,6 +375,7 @@ pub const FEEDS: &[Feed] = &[
             },
         }],
         emit_trades: true,
+        arbitration: ArbitrationMode::Coordinated,
     },
 ];
 
@@ -407,6 +431,64 @@ mod tests {
             .find(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::TopOfBook)
             .unwrap();
         assert!(hl.emit_trades);
+    }
+
+    /// At most one row per venue may emit trades. Two would double-publish every print, and with
+    /// the `trade_id == 0` bypass in `arbiter::emit` there is no window to collapse the duplicate
+    /// for a FIX-sourced publisher — which carries no venue trade id at all.
+    ///
+    /// This covers *configured rows* only, which is less than the invariant the bypass wants. A row
+    /// carries N publishers, and a message's venue is the wire SourceID's (`codec::source_name`),
+    /// not the row's — so neither two arms of one row nor a remapped SourceID is visible here. The
+    /// runtime half is `dz_trades_no_id_conflict_total`, which reports a second tape owner instead
+    /// of asserting there isn't one.
+    ///
+    /// NOTE: this static form holds only until a venue carries a tape on two separately-gated feeds,
+    /// which is deliberate and coming — a host subscribed to the market-by-price group alone must
+    /// still get a tape, so both of that venue's rows set `emit_trades`. **When this fails for that
+    /// reason, replace it with the runtime-ownership assertion, not the rows.** Same invariant — at
+    /// most one tape emitter per venue at any moment — enforced where ownership actually lives.
+    #[test]
+    fn at_most_one_trade_emitting_row_per_venue() {
+        let mut emitters = std::collections::HashMap::new();
+        for f in FEEDS.iter().filter(|f| f.emit_trades) {
+            let prev = emitters.insert(f.venue, f.kind);
+            assert!(
+                prev.is_none(),
+                "{} emits trades on both {:?} and {:?}",
+                f.venue,
+                prev.unwrap(),
+                f.kind
+            );
+        }
+    }
+
+    /// A venue's arms are the same hosts whatever protocol they speak, so every row for a venue
+    /// must declare the same arbitration mode. Disagreement would make the arbiter's per-venue mode
+    /// depend on which row registered last.
+    #[test]
+    fn arbitration_mode_agrees_across_a_venues_rows() {
+        let mut modes = std::collections::HashMap::new();
+        for f in FEEDS {
+            if let Some(prev) = modes.insert(f.venue, f.arbitration) {
+                assert_eq!(
+                    prev, f.arbitration,
+                    "{} declares two arbitration modes",
+                    f.venue
+                );
+            }
+        }
+    }
+
+    /// The venues that predate arbitration modes race on a comparable venue clock and must keep
+    /// doing so — the mode is a seam, not a behavior change. Scoped by exclusion rather than
+    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose arms carry
+    /// no shared clock can declare it; a new such venue is the feature working, not a regression.
+    #[test]
+    fn existing_venues_are_coordinated() {
+        for f in FEEDS.iter().filter(|f| f.venue != "Lashay") {
+            assert_eq!(f.arbitration, ArbitrationMode::Coordinated, "{}", f.venue);
+        }
     }
 
     #[test]

@@ -14,7 +14,8 @@ mod common;
 use common::{assertions, replay as replay_helper};
 use doublezero_edge_connect::ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
-    codec,
+    codec, codec_mbo,
+    feeds::{FeedKind, FEEDS},
     processor::{MboProcessor, TobProcessor},
     receiver::{FrameCtx, FrameProcessor, PortRole},
 };
@@ -47,7 +48,9 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
     let depth = Arc::new(Mutex::new(HashMap::new()));
-    let mut p = MboProcessor::new(depth, true);
+    // Trades off, as the live MBO row is (`feeds::FEEDS`): its `OrderExecute` prints carry no venue
+    // trade id, so they bypass the arbiter's dedup window — see `mbo_prints_carry_no_venue_trade_id`.
+    let mut p = MboProcessor::new(depth, false);
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "Hyperliquid",
@@ -227,11 +230,15 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // The fixture carries 8788 raw BTC mktdata quotes split across two publishers mirroring the same
     // feed (417 distinct source_ts). Latch-to-leader emits the leader's distinct canonical BBOs at a
     // non-decreasing floor — the `bbo_hash` identity (px, sz, bid_n, ask_n), so a count-only change at
-    // an unchanged price/size is a distinct quote. Observed: 4540 (the 4468 px/sz-distinct BBOs plus
-    // 72 count-only changes the source-count identity now keeps; ~1.6%). Far above a strict
-    // one-per-tick watermark (~417, which over-drops real intra-tick changes).
+    // an unchanged price/size is a distinct quote. Far above a strict one-per-tick watermark (~417,
+    // which over-drops real intra-tick changes).
+    //
+    // 4521, down from 4540 before reference-data state became per publisher: each arm now gates on
+    // its OWN definitions, and the second arm's first burst lands ~280 records after the first's, so
+    // its quotes in that startup window no longer ride the peer's definitions. Startup-only — both
+    // arms re-burst every few seconds, and the arm that already has definitions covers the tick.
     assert_eq!(
-        quotes, 4540,
+        quotes, 4521,
         "two-pub latch-to-leader quote count (leader's distinct canonical BBOs incl. bid_n/ask_n)"
     );
 }
@@ -536,6 +543,46 @@ fn mbo_depth_mirror_from_second_publisher_collapses() {
         depth_identities(&mirror_msgs),
         "mirroring every packet from a second publisher changed the emitted depth set"
     );
+}
+
+/// Every print in the live Market-by-Order golden carries `trade_id == 0` — the venue stamps no
+/// trade id on `OrderExecute`. That is why the arbiter treats `0` as "no identity" rather than a
+/// dedup key, and why the Market-by-Order rows must stay `emit_trades: false`: two mirrored
+/// publishers' zero-id prints have no window to collapse against.
+#[test]
+fn mbo_prints_carry_no_venue_trade_id() {
+    let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
+    let mut prints = 0;
+    for (_ip, _role, frame) in &recs {
+        let Ok((_h, msgs)) = codec_mbo::decode_frame(frame) else {
+            continue;
+        };
+        for m in &msgs {
+            let id = match m {
+                codec_mbo::Message::OrderExecute(o) => o.trade_id,
+                codec_mbo::Message::Trade(t) => t.trade_id,
+                _ => continue,
+            };
+            prints += 1;
+            assert_eq!(
+                id, 0,
+                "golden carries a venue trade id — revisit the bypass"
+            );
+        }
+    }
+    assert!(
+        prints > 0,
+        "golden carried no prints — the fact is unpinned"
+    );
+
+    // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
+    // real trade ids, and that is its own row's call.
+    for f in FEEDS
+        .iter()
+        .filter(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::MarketByOrder)
+    {
+        assert!(!f.emit_trades, "{} would publish zero-id prints", f.venue);
+    }
 }
 
 /// The content-inclusive identity set of emitted depths (`venue|symbol|source_ts|bids|asks`), the

@@ -345,6 +345,11 @@ async fn main() -> Result<()> {
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
+        // Every registry venue, not just the selected ones: a message's venue comes from the wire
+        // SourceID, so a venue can reach the arbiter without its own feed being ingested.
+        for f in ingest::feeds::FEEDS {
+            a.set_mode(f.venue, f.arbitration);
+        }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
         a.set_depth_replay(depth.clone());

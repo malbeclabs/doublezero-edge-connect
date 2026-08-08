@@ -234,6 +234,11 @@ Modules are grouped by role under `src/`:
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
   + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
+  All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
+  IP and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
+  a shared port block one publisher's restart would otherwise clear every publisher's definitions and
+  blank the venue. Reads take the **non-inserting** `PerPublisher::def`; only the refdata handlers use
+  the inserting `get`, so a forged-source market-data flood can't evict a real publisher's definitions.
   `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
   datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
   sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
@@ -275,7 +280,9 @@ Modules are grouped by role under `src/`:
   per instrument, not on `ready()`**: a processor emits as soon as `definition(id)` resolves, so
   consumers never see a price before its precision, but a single symbol flows without waiting for
   the full set (an all-or-nothing gate could wedge the feed on a startup/reset race). Uses
-  wraparound-safe u16 sequence comparison (`is_later`).
+  wraparound-safe u16 sequence comparison (`is_later`). One instance tracks **one publisher** — the
+  per-source-IP map lives in `processor.rs` (`PerPublisher`), keeping this state machine
+  single-publisher and unit-testable.
 - **`sinks/ws.rs`** — fans the broadcast out to clients (on by default; disable with an empty
   `--ws-bind`). **Serializes each message once, not per client:** a single serializer task reads the
   `Arc<FeedMessage>` backbone, stamps one shared `ws_send_ts_ns`, renders the JSON once, and

@@ -25,7 +25,8 @@
 //!   the emitted series is one publisher's coherent, in-order subsequence.
 //! - trades ([`WindowedDedup`]): a trade is a *point-in-time event*, not state, so a floor would lose
 //!   prints. It keeps the windowed `trade_id` identity instead: a competing publisher's copy or an
-//!   in-window reorder is dropped, but every distinct print is kept.
+//!   in-window reorder is dropped, but every distinct print is kept. `trade_id == 0` is the "venue
+//!   assigned none" sentinel and is forwarded unkeyed — see the `Trade` arm of [`Arbiter::emit`].
 //!
 //! MBO `depth` reuses the quote's [`StalenessFloor`] as a *third* arm (keyed on [`DepthId`], the
 //! full top-N book content): two publishers each reconstruct an independent book and emit full-state
@@ -42,8 +43,10 @@ use std::{
 
 use prometheus::{Histogram, IntCounter};
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use crate::{
+    ingest::feeds::ArbitrationMode,
     metrics::metrics,
     model::{
         self, now_mono_ns, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote,
@@ -53,6 +56,12 @@ use crate::{
 /// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
 pub const TRADE_DEDUP_WINDOW: usize = 8192;
+
+/// How long a zero-id tape's owning publisher may go silent before a challenger takes the tape over
+/// without being reported as a double-print (see `Arbiter::no_id_owner`). Well past any inter-print
+/// gap on a live tape, and well under how long an operator would tolerate a stalled one, so a
+/// genuine failover reads as a handover and two concurrent emitters still read as a conflict.
+const NO_ID_TAPE_HANDOVER_NS: u64 = 5_000_000_000; // 5s
 
 /// Cap on distinct leader BBOs tracked per `source_ts` tick by the quote floor — a safety bound so a
 /// stalled/repeated `source_ts` can't grow the per-tick set without limit. Far above the real
@@ -491,6 +500,29 @@ pub struct Arbiter {
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
     venue_metrics: HashMap<Arc<str>, VenueMetrics>,
+    /// Per-venue arbitration mode, populated at startup from every `FEEDS` row — not from the
+    /// *selected* rows: `emit`'s venue comes from the wire SourceID, so a venue can reach the
+    /// arbiter without its feed being ingested (a remapped SourceID, or a public feeder, neither of
+    /// which is `--feed`-gated). A venue absent from the map arbitrates as `Coordinated`. Keyed on
+    /// the registry's `&'static str` rather than the `Arc<str>` the dedup keys use; lookups borrow
+    /// as `&str`, so this needs no `venue_arc` interning.
+    modes: HashMap<&'static str, ArbitrationMode>,
+    /// Who owns each `(venue, symbol)` zero-id tape, and when they last printed. A bypassed
+    /// `trade_id == 0` has no window to collapse against, so a *concurrent* second publisher's
+    /// zero-id prints are pure duplicates; they are still forwarded (dropping is an authority
+    /// decision, not a dedup one) but counted and logged.
+    ///
+    /// Ownership is not a permanent latch: a challenger takes it over once the incumbent has been
+    /// silent for [`NO_ID_TAPE_HANDOVER_NS`]. Tape ownership moves at runtime — a failed arm, an
+    /// authority transfer, a reconciler handing the tape from one feed row to another — and latching
+    /// the first publisher forever would report every legitimate failover as a double-print for the
+    /// life of the process, which is exactly the alert nobody would then trust.
+    ///
+    /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
+    /// print, which no live feed does today.
+    no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
+    /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
+    no_id_conflict_logged: bool,
 }
 
 /// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
@@ -514,6 +546,8 @@ struct VenueMetrics {
     depth_ticks_won: [IntCounter; 2],
     quotes_dropped: IntCounter,
     trades_dropped: IntCounter,
+    trades_no_id: IntCounter,
+    trades_no_id_conflict: IntCounter,
     instruments_dropped: IntCounter,
     quotes_future_rejected: IntCounter,
     quotes_no_source_ts: IntCounter,
@@ -563,6 +597,8 @@ impl VenueMetrics {
             depth_ticks_won: by_pub(&m.depth_ticks_won),
             quotes_dropped: m.quotes_dropped.with_label_values(&[venue]),
             trades_dropped: m.trades_dropped.with_label_values(&[venue]),
+            trades_no_id: m.trades_no_id.with_label_values(&[venue]),
+            trades_no_id_conflict: m.trades_no_id_conflict.with_label_values(&[venue]),
             instruments_dropped: m.instruments_dropped.with_label_values(&[venue]),
             quotes_future_rejected: m.quotes_future_rejected.with_label_values(&[venue]),
             quotes_no_source_ts: m.quotes_no_source_ts.with_label_values(&[venue]),
@@ -594,7 +630,24 @@ impl Arbiter {
             depth_replay: None,
             instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
+            modes: HashMap::new(),
+            no_id_owner: HashMap::new(),
+            no_id_conflict_logged: false,
         }
+    }
+
+    /// Declare a venue's arbitration mode. Called once per selected feed at startup; a venue's rows
+    /// are pinned to one mode by `feeds::tests::arbitration_mode_agrees_across_a_venues_rows`.
+    pub fn set_mode(&mut self, venue: &'static str, mode: ArbitrationMode) {
+        self.modes.insert(venue, mode);
+    }
+
+    #[allow(dead_code)] // consumed by the `Sticky` dispatch once that arbitration arm lands
+    fn mode_for(&self, venue: &str) -> ArbitrationMode {
+        self.modes
+            .get(venue)
+            .copied()
+            .unwrap_or(ArbitrationMode::Coordinated)
     }
 
     /// Wire the shared WS-replay `depth` map so the arbiter updates it on each admitted (leader)
@@ -750,6 +803,54 @@ impl Arbiter {
                 }
             }
             FeedMessage::Trade(t) => {
+                // `trade_id == 0` is the "no venue trade id" sentinel (a FIX-sourced print has
+                // none). Keying the window on it drops every later print for the key: `0` is
+                // inserted once and never ages out (eviction is by insertion order), so every
+                // subsequent `0` reads as a same-publisher duplicate. Forward unkeyed instead —
+                // correct only while one publisher owns the venue's tape, so a *concurrent* second
+                // emitter's prints (pure duplicates, nothing collapses them) are counted and logged
+                // rather than silently doubling the tape, while a takeover of a tape that has gone
+                // quiet is a handover. Not counted as *admitted*: nothing was, mirroring the
+                // `source_ts == 0` quote bypass above.
+                if t.trade_id == 0 {
+                    let key = (t.venue.clone(), t.symbol.clone());
+                    let conflict = match self.no_id_owner.get_mut(&key) {
+                        // The owner printing again, or a challenger inheriting a tape that has gone
+                        // quiet past the handover window: either way one emitter, no conflict.
+                        Some((owner, last_ns)) => {
+                            let stale =
+                                t.recv_ts_ns.saturating_sub(*last_ns) > NO_ID_TAPE_HANDOVER_NS;
+                            let concurrent = *owner != publisher && !stale;
+                            if !concurrent {
+                                *owner = publisher;
+                                *last_ns = t.recv_ts_ns;
+                            }
+                            concurrent
+                        }
+                        None => {
+                            self.no_id_owner.insert(key, (publisher, t.recv_ts_ns));
+                            false
+                        }
+                    };
+                    let vm = self.vm(&t.venue);
+                    vm.trades_no_id.inc();
+                    vm.emit[EMIT_TRADE].inc();
+                    if conflict {
+                        vm.trades_no_id_conflict.inc();
+                    }
+                    if conflict && !self.no_id_conflict_logged {
+                        self.no_id_conflict_logged = true;
+                        warn!(
+                            venue = %t.venue,
+                            symbol = %t.symbol,
+                            "a second publisher is emitting trades with no venue trade id: the \
+                             tape is double-printing (one tape owner per venue is the sentinel \
+                             bypass's precondition)"
+                        );
+                    }
+                    let _ = self.tx.send(Arc::new(msg));
+                    return;
+                }
                 let key = (t.venue.clone(), t.symbol.clone());
                 let decision = self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns);
                 let vm = self.vm(&t.venue);
@@ -1008,7 +1109,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::{NormalizedQuote, Side};
+    use crate::model::{NormalizedQuote, NormalizedTrade, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
@@ -1107,6 +1208,147 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![7, 8]);
+    }
+
+    fn trade(trade_id: u64) -> NormalizedTrade {
+        NormalizedTrade {
+            venue: "Lashay".into(),
+            symbol: "KXBTCPERP".into(),
+            price: 0.62,
+            size: 100.0,
+            aggressor_side: Side::Buy,
+            trade_id,
+            cumulative_volume: 0.0,
+            source_ts_ns: 1_000,
+            recv_ts_ns: 2_000,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// A FIX-sourced publisher has no venue trade id and stamps every print `trade_id == 0`.
+    /// Keying the window on `0` collapses the tape to a single print forever (`0` is inserted
+    /// once and never evicted), so `0` must mean "no identity" and bypass the window entirely.
+    #[test]
+    fn zero_trade_id_bypasses_the_window() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        for _ in 0..5 {
+            a.emit(FeedMessage::Trade(trade(0)), p);
+        }
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 5, "every zero-id print must be emitted");
+    }
+
+    /// A bypassed `0` has no window to collapse against, so a second publisher's zero-id prints
+    /// double the tape. They are still forwarded — dropping one is an authority decision, not a
+    /// dedup one — but `dz_trades_no_id_conflict_total` reports it, and one publisher's own repeats
+    /// never do. Venue is unique to this test; the metrics registry is process-global.
+    #[test]
+    fn second_publisher_zero_id_tape_is_reported_as_a_conflict() {
+        let venue = "NoIdTapeConflict";
+        let t = |p| {
+            let mut tr = trade(0);
+            tr.venue = venue.into();
+            (FeedMessage::Trade(tr), p)
+        };
+        let a1 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let a2 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let conflicts = metrics().trades_no_id_conflict.with_label_values(&[venue]);
+
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let (m, p) = t(a1);
+        a.emit(m, p);
+        let (m, p) = t(a1);
+        a.emit(m, p); // the owner's own repeat is not a conflict
+        assert_eq!(conflicts.get(), 0);
+
+        let (m, p) = t(a2);
+        a.emit(m, p);
+        assert_eq!(
+            conflicts.get(),
+            1,
+            "second publisher's tape must be reported"
+        );
+
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(
+            seen, 3,
+            "a conflicting print is still forwarded, not dropped"
+        );
+    }
+
+    /// Tape ownership is not a permanent latch. A challenger taking over a tape that has gone quiet
+    /// past [`NO_ID_TAPE_HANDOVER_NS`] is a failover — a dead arm, an authority transfer, the
+    /// reconciler moving the tape between a venue's feed rows — and reporting that as a double-print
+    /// would pin the conflict counter non-zero for the life of the process, on the one signal that
+    /// has to stay trustworthy. Venue is unique to this test; the metrics registry is process-global.
+    #[test]
+    fn a_quiet_zero_id_tape_hands_over_without_a_conflict() {
+        let venue = "NoIdTapeHandover";
+        let t = |p, recv_ts_ns| {
+            let mut tr = trade(0);
+            tr.venue = venue.into();
+            tr.recv_ts_ns = recv_ts_ns;
+            (FeedMessage::Trade(tr), p)
+        };
+        let a1 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let a2 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let conflicts = metrics().trades_no_id_conflict.with_label_values(&[venue]);
+
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let (m, p) = t(a1, 1_000);
+        a.emit(m, p);
+
+        // Exactly at the window: a2 is still a concurrent second emitter, and a rejected challenger
+        // must not refresh the incumbent's clock (or a burst of them would hold the tape open).
+        let (m, p) = t(a2, 1_000 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(conflicts.get(), 1, "not yet past the window");
+
+        // Past it: a2 inherits the tape...
+        let (m, p) = t(a2, 1_001 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(conflicts.get(), 1, "a quiet tape hands over");
+
+        // ...and keeps it, so its own later prints are its own.
+        let (m, p) = t(a2, 1_002 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(
+            conflicts.get(),
+            1,
+            "the new owner's prints are not a conflict"
+        );
+
+        // The previous owner returning while a2 is live is a conflict again.
+        let (m, p) = t(a1, 1_003 + NO_ID_TAPE_HANDOVER_NS);
+        a.emit(m, p);
+        assert_eq!(conflicts.get(), 2, "two live emitters still conflict");
+    }
+
+    /// The bypass must not weaken dedup for prints that DO carry an id.
+    #[test]
+    fn nonzero_trade_id_still_dedupes() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        for _ in 0..5 {
+            a.emit(FeedMessage::Trade(trade(77)), p);
+        }
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 1, "a repeated id is still a duplicate");
     }
 
     /// Two byte-for-byte identical quote packets from the *same* multicast publisher collapse to a
