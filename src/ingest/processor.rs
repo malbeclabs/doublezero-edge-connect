@@ -1678,10 +1678,10 @@ impl FrameProcessor for MbpProcessor {
                 }
                 codec_mbp::Message::SnapshotEnd(e) => {
                     let group = (ctx.publisher, channel);
-                    if !self
+                    if self
                         .open
                         .get(&group)
-                        .is_some_and(|g| g.instrument_id == e.instrument_id)
+                        .is_none_or(|g| g.instrument_id != e.instrument_id)
                     {
                         // A stray end for an instrument that is not the one assembling. Dropping it
                         // is the whole action: the open group belongs to another instrument and must
