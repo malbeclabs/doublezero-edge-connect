@@ -77,6 +77,20 @@ the publisher's **base port** (the market-data port of its block, e.g. `9201`), 
 >   and measures **inter-mirror skew**. The headline "DZ beats the public feed" margin remains
 >   `{winner="edge",loser="public"}` only.
 
+## Market-by-Price processor (per venue)
+
+Recorded by the Market-by-Price processor (`src/ingest/processor.rs`), which demultiplexes publishers by source IP and so carries no `publisher` label. Labelled by `venue`. **No `FEEDS` row selects `MarketByPrice` yet**, so a scrape today reports nothing here; do not read an empty result as a healthy book.
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `dz_mbp_channel_resets_total` | counter | `venue` | One publisher-and-channel's books discarded on a frame-header `Reset Count` change — any change, including the `255 -> 0` wrap. Read from the **market-data port only**: the three ports carry the same epoch on separate sockets, so a shared memo would count one publisher restart once per interleaved frame of its backlog. |
+| `dz_mbp_buffer_overflows_total` | counter | `venue` | Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer and marked it `Gap`. Sustained means the publisher's snapshot period is too long for this host's memory budget — a tuning signal, not a fault. |
+| `dz_mbp_level_overflows_total` | counter | `venue` | A book discarded on hitting its per-book price-level cap. Deliberately **not** the same series as a sequence gap: the cause is a malformed or forged stream, never packet loss, and the resulting book status differs. |
+| `dz_mbp_orphan_snapshot_levels_total` | counter | `venue` | `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups, a lost `SnapshotBegin`, or a rotation from the publisher's previous epoch still draining after a restart (its group is refused rather than installed, so the dead session's book is never republished). |
+| `dz_mbp_duplicate_deltas_total` | counter | `venue` | Deltas discarded as duplicates. **Worth an alert:** a `Ready` book emitting nothing but duplicates is the signature of a baseline installed above the publisher's real counter, which is deliberately not self-healed (only a routed `Reset Count` clears it), so this counter is the only thing that surfaces that wedge. |
+| `dz_mbp_crossed_total` | counter | `venue` | Crossed inside markets observed at a `BatchBoundary`. Observability only, never acted on. |
+| `dz_mbp_divergence_total` | counter | `venue`, `kind` | Publisher `Action`-byte-vs-quantity disagreements, by `kind` (`new_on_present_level`/`change_on_absent_level`/`delete_with_quantity`/`zero_quantity_without_delete`). Never changes the applied result. |
+
 ## Arbiter emit stage (per feed)
 
 Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Labelled by `venue`.
@@ -101,7 +115,7 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | `dz_arm_authority_transfers_total` | counter | `venue`, `reason` | Authority handovers, by `reason` (`initial`/`health`/`silence`/`margin`). Every transfer re-baselines each consumer's book, so a sustained rate means the thresholds are too loose; a `health`/`silence` rate means an arm is actually broken. `health` is a single market changing hands; the other three are venue-wide. |
 | `dz_arm_markets_held` | gauge | `venue`, `arm` | Markets each arm is currently **serving** — the venue's elected arm, plus any market a health override moved to a peer. `arm` is a stable per-venue ordinal (`arm0`…`arm7`, then `other`), never the spoofable source IP. All markets on one arm is the steady state; a persistent split means health overrides are fragmenting the venue, i.e. the elected arm's books keep gapping. |
 
-**None of the three emits until the incremental book path wires a caller** (plan Task 12). The series are registered so a dashboard can be built against them, but a scrape today reports nothing for them; do not read an empty result as a healthy venue.
+**None of the three emits in a running process yet.** The Market-by-Price processor now reports per-market health into the authority, but no `FEEDS` row selects that kind and every registered venue is `Coordinated`, so a scrape today reports nothing for them; do not read an empty result as a healthy venue.
 
 ### Tuning arm re-election
 

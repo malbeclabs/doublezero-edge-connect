@@ -57,7 +57,7 @@ use crate::{
         arbiter::{lock, Publisher, SharedArbiter},
         feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
-        processor::{MboProcessor, MidpointProcessor, TobProcessor},
+        processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor},
     },
     metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
@@ -76,8 +76,7 @@ pub enum PortRole {
     Mktdata,
     /// Reference data: instrument definitions + manifest.
     Refdata,
-    /// Market-by-Order snapshot recovery stream. (Constructed once the MBO receiver lands.)
-    #[allow(dead_code)]
+    /// The in-band snapshot recovery stream of a book protocol (Market-by-Order/-Price).
     Snapshot,
     /// A single port carrying everything (loopback demo): both market and reference data.
     Combined,
@@ -738,6 +737,39 @@ pub async fn run_feed(
                 instruments,
                 health,
                 MboProcessor::new(depth, feed.emit_trades),
+            )
+            .await
+        }
+        FeedKind::MarketByPrice => {
+            let FeedPorts::ThreePort {
+                mktdata,
+                refdata,
+                snapshot,
+            } = publisher.ports
+            else {
+                bail!(
+                    "Market-by-Price feed '{venue}' publisher '{}' must use FeedPorts::ThreePort \
+                     (mktdata/refdata/snapshot)",
+                    publisher.base_port()
+                );
+            };
+            let ports = vec![
+                (PortRole::Mktdata, mktdata),
+                (PortRole::Refdata, refdata),
+                (PortRole::Snapshot, snapshot),
+            ];
+            drive(
+                feed.group,
+                ports,
+                iface,
+                recv_buf,
+                venue,
+                feed.kind,
+                publisher.base_port(),
+                arbiter,
+                instruments,
+                health,
+                MbpProcessor::new(feed.emit_trades),
             )
             .await
         }

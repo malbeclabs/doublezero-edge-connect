@@ -40,12 +40,12 @@
 //! run two arms.
 //!
 //! What stays keyed on wire-supplied `(channel_id, instrument_id)` is per-market health and the
-//! last-admitted arm. The caller must only [`StickyAuthority::admit`] an instrument that already
-//! resolves to a definition and a book, which bounds those transitively by the processor's own book
-//! cap — a precondition the caller owns, not one this module can enforce.
+//! last-admitted arm. A caller only reports markets that resolve to a definition and a book, but that
+//! bounds only what it holds *live* — a churning id space would still grow this map for the life of
+//! the process — so [`MAX_TRACKED_MARKETS`] bounds it here.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -63,6 +63,13 @@ const ARM_LABELS: [&str; MAX_LABELLED_ARMS] = [
 
 /// Returned for an arm past [`MAX_LABELLED_ARMS`]: unlabelled, unrecorded, never authoritative.
 pub const OTHER_ARM: &str = "other";
+
+/// Cap on `(venue, channel, instrument)` markets whose per-market state is retained. The processor's
+/// book cap bounds only the books it holds *live*; an id space that churns (a venue relisting markets
+/// daily, or a forged stream minting ids) would otherwise grow this map for the life of the process.
+/// Least-recently-inserted eviction: losing an entry costs at most one stale health opinion, which
+/// that arm's next report re-establishes.
+const MAX_TRACKED_MARKETS: usize = 1 << 16;
 
 /// Cap on matched-lead samples retained per arm per window. Overflow is head-biased — an arm busy
 /// enough to hit it decides on the window's first 4096 matches — so the cap sits well above what the
@@ -126,6 +133,9 @@ struct MarketState {
 pub struct StickyAuthority {
     venues: HashMap<Arc<str>, VenueState>,
     markets: HashMap<MarketKey, MarketState>,
+    /// Insertion order of `markets` keys, oldest at the front, for the [`MAX_TRACKED_MARKETS`]
+    /// eviction.
+    market_order: VecDeque<MarketKey>,
     ordinals: HashMap<(String, Publisher), &'static str>,
     ordinal_counts: HashMap<String, usize>,
     cfg: AuthorityConfig,
@@ -136,16 +146,39 @@ impl StickyAuthority {
         Self {
             venues: HashMap::new(),
             markets: HashMap::new(),
+            market_order: VecDeque::new(),
             ordinals: HashMap::new(),
             ordinal_counts: HashMap::new(),
             cfg,
         }
     }
 
+    /// Per-market state for `key`, bounded by [`MAX_TRACKED_MARKETS`] with least-recently-inserted
+    /// eviction — the market key is wire-supplied, so every path that creates one comes through here.
+    fn market_mut(&mut self, key: &MarketKey) -> &mut MarketState {
+        if !self.markets.contains_key(key) {
+            while self.markets.len() >= MAX_TRACKED_MARKETS {
+                match self.market_order.pop_front() {
+                    Some(old) => {
+                        self.markets.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.market_order.push_back(key.clone());
+        }
+        self.markets.entry(key.clone()).or_default()
+    }
+
     /// Record an arm's book health for one market. `false` means `gap`/`awaiting-snapshot`; the
     /// processor calls this on every state transition.
     pub fn set_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
-        let m = self.markets.entry(key.clone()).or_default();
+        // Same eligibility bound as `admit`: an ineligible arm (past the labelled cap — the source IP
+        // is spoofable) is never authoritative, so it must not enter per-market state either.
+        if self.arm_ordinal(&key.0, publisher) == OTHER_ARM {
+            return;
+        }
+        let m = self.market_mut(key);
         if healthy {
             m.unhealthy.remove(&publisher);
         } else {
@@ -153,7 +186,7 @@ impl StickyAuthority {
         }
     }
 
-    fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
+    pub(crate) fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
         self.markets
             .get(key)
             .is_none_or(|m| !m.unhealthy.contains(&publisher))
@@ -193,7 +226,7 @@ impl StickyAuthority {
                     window_opened_ns: arrival_ns,
                 },
             );
-            self.markets.entry(key).or_default().last_admitted = Some(publisher);
+            self.market_mut(&key).last_admitted = Some(publisher);
             return Admit::Emitted { opened_tick: true };
         };
         venue.arms.entry(publisher).or_default().last_seen_ns = arrival_ns;
@@ -209,7 +242,7 @@ impl StickyAuthority {
         if self.serving(&key) != Some(publisher) {
             return Admit::Dropped;
         }
-        let m = self.markets.entry(key).or_default();
+        let m = self.market_mut(&key);
         let opened_tick = m.last_admitted != Some(publisher);
         m.last_admitted = Some(publisher);
         Admit::Emitted { opened_tick }
@@ -409,6 +442,53 @@ mod tests {
             sample_interval_ns: 1_000_000, // 1ms window keeps the tests fast
             ..no_window_cfg()
         }
+    }
+
+    // ---- per-market state bounds ----
+
+    /// `markets` is keyed on wire-supplied ids, so a churning or forged id space must not grow it for
+    /// the life of the process. Eviction is least-recently-inserted.
+    #[test]
+    fn tracked_markets_are_bounded() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        let flood = MAX_TRACKED_MARKETS + 50;
+        for id in 0..flood {
+            a.set_health(&(VENUE.into(), 2, id as u32), arm(1), false);
+        }
+        assert!(
+            a.markets.len() <= MAX_TRACKED_MARKETS,
+            "market map must stay bounded, got {}",
+            a.markets.len()
+        );
+        assert!(
+            a.markets
+                .contains_key(&(VENUE.into(), 2, (flood - 1) as u32)),
+            "newest retained"
+        );
+        assert!(
+            !a.markets.contains_key(&(VENUE.into(), 2, 0)),
+            "oldest evicted"
+        );
+    }
+
+    /// An arm past the labelled cap is never authoritative, so a health report from one — the source IP
+    /// is spoofable — must not enter per-market state either.
+    #[test]
+    fn an_ineligible_arm_reports_no_health() {
+        let mut a = StickyAuthority::new(no_window_cfg());
+        for n in 0..MAX_LABELLED_ARMS as u8 {
+            assert_ne!(a.arm_ordinal(VENUE, arm(n)), OTHER_ARM);
+        }
+        let ineligible = arm(MAX_LABELLED_ARMS as u8);
+        a.set_health(&key(), ineligible, false);
+        assert!(
+            a.markets.is_empty(),
+            "an ineligible arm mints no market state"
+        );
+        assert!(
+            a.healthy(&key(), ineligible),
+            "and is reported healthy by absence, since it can never serve anyway"
+        );
     }
 
     // ---- venue-wide election ----

@@ -59,7 +59,7 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 ### `instrument`
 
 ```json
-{"type":"instrument","venue":"Hyperliquid","symbol":"SOL","price_exponent":-2,"qty_exponent":-2}
+{"type":"instrument","venue":"Hyperliquid","symbol":"SOL","channel":0,"instrument_id":1,"price_exponent":-2,"qty_exponent":-2}
 ```
 
 | Field            | Type   | Meaning                                                              |
@@ -67,8 +67,12 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 | `type`           | string | `"instrument"`.                                                      |
 | `venue`          | string | Venue code (e.g. `Hyperliquid`, `Phoenix`).                         |
 | `symbol`         | string | Instrument symbol as the venue names it (e.g. `SOL`, `SOL-PERP`).   |
+| `channel`        | uint32 | The publisher's channel id: the instrument set this feed carries. Filterable. |
+| `instrument_id`  | uint32 | Instrument id, unique within `channel`.                              |
 | `price_exponent` | int8   | Price increment exponent: tick size = `10^price_exponent` (e.g. `-2` -> `0.01`). |
 | `qty_exponent`   | int8   | Size increment exponent: step = `10^qty_exponent`.                  |
+
+`channel` and `instrument_id` are the identity a consumer joins a [`book`](#book) to its definition on, rather than the colliding `symbol`.
 
 `price_exponent` / `qty_exponent` give the venue's **precision**; `quote` prices/sizes are
 already decimal values (below), so the exponents are used to set tick size / decimal places, not
@@ -250,7 +254,7 @@ A batch of **incremental** price-level changes for one instrument, derived in th
 | `kernel_rx_ts_ns` | uint64 | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable. |
 | `ws_send_ts_ns` | uint64 | Wall clock the instant this batch is serialized; shared by all consumers of this message. `0` if unset. |
 
-**Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. An `instrument` message carries `venue` and `symbol` only, so joining a book to its definition means joining on `symbol` — sound where `symbol` is unique, which holds for perpetual futures (at most 11 bytes, so never truncated) and does not hold for longer tickers. `channel` and `instrument_id` on `instrument` are a planned addition.
+**Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
 
 **Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative source changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
 
@@ -301,7 +305,7 @@ A subscription filter is `{ "venue"?: string, "symbol"?: string, "channel"?: uin
 
 `venue`, `symbol` and `channel` are **scope** dimensions - which markets - and `type` is a **kind** dimension: which messages. The two behave differently on purpose.
 
-A scope dimension never excludes a message that is not about one market. A message type that carries no channel (everything except `book`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects book updates on channel 2 and nothing else - except `instrument`, which passes, because a client that cannot see a definition cannot scale the book it just subscribed to. A channel-filtered client currently receives every instrument definition its `venue`/`symbol` fields allow, not just that channel's, because `instrument` carries no channel yet (see *Identity* under [`book`](#book)). Likewise a venue-level message (`status`) carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
+A scope dimension never excludes a message that is not about one market. A message type that carries no channel (everything except `book` and `instrument`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects channel 2's book updates and channel 2's instrument definitions - enough to scale those books - and nothing else. The one carve-out is a venue-level message (`status`), which carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
 
 A `type` filter is **absolute**: it delivers that message type and nothing else, including no `instrument` and no `status`. Filters are a union, so a consumer that wants books plus reference data and health subscribes to each - `{"type":"book"}`, `{"type":"instrument"}`, `{"type":"status"}` - or omits `type` and scopes by `venue`/`symbol`/`channel` instead. A client that sets `type` and never asks for `instrument` gets the connect-time replay of the definitions that exist then, and no later ones; that is the filter it asked for.
 

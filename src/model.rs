@@ -233,10 +233,20 @@ pub struct NormalizedBook {
 }
 
 /// A normalized instrument definition (so subscribers know precision/venue).
+///
+/// Carries the same `(channel, instrument_id)` identity pair as [`NormalizedBook`], so a consumer
+/// joins a book to its definition on the identity rather than on `symbol` — which collides across
+/// markets on venues with long tickers (see the `NormalizedBook` docs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedInstrument {
     pub venue: Arc<str>,
     pub symbol: Arc<str>,
+    /// The publisher's `channel_id`: the instrument set this definition came from. Filterable.
+    #[serde(default)]
+    pub channel: u32,
+    /// Instrument id, unique within `channel`.
+    #[serde(default)]
+    pub instrument_id: u32,
     pub price_exponent: i8,
     pub qty_exponent: i8,
 }
@@ -285,11 +295,13 @@ impl FeedMessage {
         }
     }
 
-    /// The `channel_id` this message is about, for per-channel subscription filtering. Only the
-    /// incremental `book` product carries one; every other type is venue/symbol-scoped.
+    /// The `channel_id` this message is about, for per-channel subscription filtering. The
+    /// incremental `book` product and the `instrument` definition that scales it carry one; every
+    /// other type is venue/symbol-scoped.
     pub fn channel(&self) -> Option<u32> {
         match self {
             FeedMessage::Book(b) => Some(b.channel),
+            FeedMessage::Instrument(i) => Some(i.channel),
             _ => None,
         }
     }

@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 use crate::ingest::codec_mbp::{
     CLEAR_SIDE_ASK, CLEAR_SIDE_BID, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, SCOPE_FROM_PRICE, SIDE_ASK,
+    SIDE_BID,
 };
 
 /// `Action` values from the spec's enum — the one wire enum the decoder does not name, since it
@@ -226,7 +227,13 @@ impl PriceBook {
     /// Apply a delta, or buffer it when the book is not `Ready`. A sustained run of `Duplicate` is
     /// the one symptom of a baseline above the publisher's real counter — see
     /// [`Self::on_end_of_session`] for the escape — so a caller should count it.
-    pub fn on_delta(&mut self, op: DeltaOp) -> DeltaOutcome {
+    ///
+    /// `removed` is **cleared at entry** and then collects the `(side, price_raw)` of every level a
+    /// `Clear` dropped, both scopes. A consumer whose only clear primitive is whole-side cannot
+    /// express `SCOPE_FROM_PRICE` without the exact prices, and telling it to drop the side would
+    /// diverge from the levels we still hold.
+    pub fn on_delta(&mut self, op: DeltaOp, removed: &mut Vec<(u8, i64)>) -> DeltaOutcome {
+        removed.clear();
         if self.status != Status::Ready {
             self.buffer(op);
             return DeltaOutcome::Buffered;
@@ -242,7 +249,7 @@ impl PriceBook {
             self.pending.push(op);
             return DeltaOutcome::Gap;
         }
-        self.apply(op)
+        self.apply(op, removed)
     }
 
     /// Open a snapshot group, returning whether it was accepted. Declined when an `InstrumentReset`
@@ -400,6 +407,8 @@ impl PriceBook {
         let mut pending = std::mem::take(&mut self.pending);
         pending.retain(|d| d.mktdata_seq > anchor);
         pending.sort_by_key(|d| d.mktdata_seq);
+        // Discarded: the snapshot install re-baselines the whole book downstream anyway.
+        let mut removed = Vec::new();
         let mut ops = pending.into_iter();
         for op in ops.by_ref() {
             if op.seq <= self.last_applied_instrument_seq {
@@ -410,7 +419,7 @@ impl PriceBook {
                 self.buffer(op);
                 break;
             }
-            if self.apply(op) == DeltaOutcome::Overflow {
+            if self.apply(op, &mut removed) == DeltaOutcome::Overflow {
                 return; // the book and the buffer are gone, and the rest goes with them
             }
         }
@@ -421,7 +430,7 @@ impl PriceBook {
 
     /// Apply an in-sequence delta, advancing the trackers. Only reachable once the sequence has been
     /// classified.
-    fn apply(&mut self, op: DeltaOp) -> DeltaOutcome {
+    fn apply(&mut self, op: DeltaOp, removed: &mut Vec<(u8, i64)>) -> DeltaOutcome {
         match op.delta {
             BookDelta::Level {
                 side,
@@ -481,10 +490,10 @@ impl PriceBook {
                     return DeltaOutcome::Applied { divergence: None };
                 }
                 if clear_side == CLEAR_SIDE_BID || clear_side == CLEAR_SIDE_BOTH {
-                    clear_side_levels(&mut self.bids, true, scope, from_price_raw);
+                    clear_side_levels(&mut self.bids, SIDE_BID, scope, from_price_raw, removed);
                 }
                 if clear_side == CLEAR_SIDE_ASK || clear_side == CLEAR_SIDE_BOTH {
-                    clear_side_levels(&mut self.asks, false, scope, from_price_raw);
+                    clear_side_levels(&mut self.asks, SIDE_ASK, scope, from_price_raw, removed);
                 }
                 DeltaOutcome::Applied { divergence: None }
             }
@@ -523,22 +532,29 @@ fn divergence(action: u8, qty_raw: u64, present: bool) -> Option<Divergence> {
 }
 
 /// `SCOPE_ENTIRE_SIDE` empties the side and ignores `from`; `SCOPE_FROM_PRICE` clears outward from
-/// `from` inclusively — for bids everything at or below it, for asks everything at or above.
-fn clear_side_levels(levels: &mut BTreeMap<i64, LevelState>, is_bid: bool, scope: u8, from: i64) {
-    if scope == SCOPE_ENTIRE_SIDE {
-        levels.clear();
-    } else if is_bid {
-        levels.retain(|p, _| *p > from);
-    } else {
-        levels.retain(|p, _| *p < from);
-    }
+/// `from` inclusively — for bids everything at or below it, for asks everything at or above. Each
+/// dropped price is appended to `removed` as `(side, price)`.
+fn clear_side_levels(
+    levels: &mut BTreeMap<i64, LevelState>,
+    side: u8,
+    scope: u8,
+    from: i64,
+    removed: &mut Vec<(u8, i64)>,
+) {
+    let entire = scope == SCOPE_ENTIRE_SIDE;
+    let is_ask = side == SIDE_ASK;
+    levels.retain(|p, _| {
+        let survives = !entire && if is_ask { *p < from } else { *p > from };
+        if !survives {
+            removed.push((side, *p));
+        }
+        survives
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The impl only ever branches on `SIDE_ASK`; the tests need both sides named.
-    use crate::ingest::codec_mbp::SIDE_BID;
 
     /// Action values from the spec's enum: 1=New, 2=Change, 3=Delete, 0=Unknown.
     const NEW: u8 = 1;
@@ -573,6 +589,11 @@ mod tests {
                 from_price_raw: from,
             },
         }
+    }
+
+    /// For the tests that assert on the outcome alone.
+    fn apply_delta(b: &mut PriceBook, op: DeltaOp) -> DeltaOutcome {
+        b.on_delta(op, &mut Vec::new())
     }
 
     /// Bring a book to `Ready` at anchor `S`, per-instrument seq `K`, with the given levels.
@@ -630,13 +651,13 @@ mod tests {
         let mut b = synced(100, 5, 0, &[]);
         // `Delete` on an absent level with a NON-zero quantity: the quantity wins, level is set.
         assert!(matches!(
-            b.on_delta(level(6, 101, SIDE_BID, 6200, 150, DELETE)),
+            apply_delta(&mut b, level(6, 101, SIDE_BID, 6200, 150, DELETE)),
             DeltaOutcome::Applied { .. }
         ));
         assert_eq!(bids_of(&b), vec![(6200, 150)]);
         // `New` on a present level with quantity 0: the quantity wins, level is removed.
         assert!(matches!(
-            b.on_delta(level(7, 102, SIDE_BID, 6200, 0, NEW)),
+            apply_delta(&mut b, level(7, 102, SIDE_BID, 6200, 0, NEW)),
             DeltaOutcome::Applied { .. }
         ));
         assert!(bids_of(&b).is_empty());
@@ -666,7 +687,7 @@ mod tests {
             ),
         ];
         for (op, want) in cases {
-            match b.on_delta(op) {
+            match apply_delta(&mut b, op) {
                 DeltaOutcome::Applied {
                     divergence: Some(got),
                 } => assert_eq!(got, want),
@@ -680,7 +701,7 @@ mod tests {
     fn a_correct_delete_is_not_divergence() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(matches!(
-            b.on_delta(level(6, 101, SIDE_BID, 6200, 0, DELETE)),
+            apply_delta(&mut b, level(6, 101, SIDE_BID, 6200, 0, DELETE)),
             DeltaOutcome::Applied { divergence: None }
         ));
     }
@@ -691,27 +712,27 @@ mod tests {
     fn contiguous_deltas_apply_and_a_gap_buffers() {
         let mut b = synced(100, 5, 0, &[]);
         assert!(matches!(
-            b.on_delta(level(6, 101, SIDE_BID, 6200, 10, NEW)),
+            apply_delta(&mut b, level(6, 101, SIDE_BID, 6200, 10, NEW)),
             DeltaOutcome::Applied { .. }
         ));
         // seq <= last is a duplicate or late arrival: discard silently.
         assert!(matches!(
-            b.on_delta(level(6, 101, SIDE_BID, 6200, 99, NEW)),
+            apply_delta(&mut b, level(6, 101, SIDE_BID, 6200, 99, NEW)),
             DeltaOutcome::Duplicate
         ));
         assert!(matches!(
-            b.on_delta(level(5, 100, SIDE_BID, 6200, 99, NEW)),
+            apply_delta(&mut b, level(5, 100, SIDE_BID, 6200, 99, NEW)),
             DeltaOutcome::Duplicate
         ));
         assert_eq!(bids_of(&b), vec![(6200, 10)], "neither duplicate applied");
         // A forward gap marks the instrument and buffers.
         assert!(matches!(
-            b.on_delta(level(9, 104, SIDE_BID, 6100, 20, NEW)),
+            apply_delta(&mut b, level(9, 104, SIDE_BID, 6100, 20, NEW)),
             DeltaOutcome::Gap
         ));
         assert_eq!(b.status(), Status::Gap);
         assert!(matches!(
-            b.on_delta(level(10, 105, SIDE_BID, 6000, 30, NEW)),
+            apply_delta(&mut b, level(10, 105, SIDE_BID, 6000, 30, NEW)),
             DeltaOutcome::Buffered
         ));
         assert_eq!(
@@ -727,16 +748,16 @@ mod tests {
     #[test]
     fn a_snapshot_does_not_reset_the_per_instrument_seq() {
         let mut b = synced(100, 5, 0, &[]);
-        b.on_delta(level(6, 101, SIDE_BID, 6200, 10, NEW));
+        apply_delta(&mut b, level(6, 101, SIDE_BID, 6200, 10, NEW));
         // A later snapshot at K = 20 re-baselines; seq 21 must be next, not 1.
         assert!(b.on_snapshot_begin(2, 200, 0, 20, 0));
         assert!(b.on_snapshot_end(200, 2));
         assert!(matches!(
-            b.on_delta(level(1, 201, SIDE_BID, 6200, 10, NEW)),
+            apply_delta(&mut b, level(1, 201, SIDE_BID, 6200, 10, NEW)),
             DeltaOutcome::Duplicate
         ));
         assert!(matches!(
-            b.on_delta(level(21, 201, SIDE_BID, 6200, 10, NEW)),
+            apply_delta(&mut b, level(21, 201, SIDE_BID, 6200, 10, NEW)),
             DeltaOutcome::Applied { .. }
         ));
     }
@@ -880,7 +901,7 @@ mod tests {
             "K=9 > 5, we are behind"
         );
         assert!(matches!(
-            b.on_delta(level(10, 501, SIDE_BID, 6100, 20, NEW)),
+            apply_delta(&mut b, level(10, 501, SIDE_BID, 6100, 20, NEW)),
             DeltaOutcome::Buffered
         ));
         assert_eq!(
@@ -923,9 +944,9 @@ mod tests {
     #[test]
     fn buffered_deltas_replay_past_the_anchor() {
         let mut b = PriceBook::new();
-        b.on_delta(level(3, 98, SIDE_BID, 6000, 1, NEW)); // <= anchor, dropped
-        b.on_delta(level(6, 101, SIDE_BID, 6100, 20, NEW));
-        b.on_delta(level(7, 102, SIDE_BID, 6200, 30, NEW));
+        apply_delta(&mut b, level(3, 98, SIDE_BID, 6000, 1, NEW)); // <= anchor, dropped
+        apply_delta(&mut b, level(6, 101, SIDE_BID, 6100, 20, NEW));
+        apply_delta(&mut b, level(7, 102, SIDE_BID, 6200, 30, NEW));
         assert_eq!(b.buffered_len(), 3);
         assert!(b.on_snapshot_begin(1, 100, 1, 5, 0));
         b.on_snapshot_level(1, SIDE_ASK, 6300, 99, Some(1), 0);
@@ -943,8 +964,8 @@ mod tests {
     #[test]
     fn a_gap_in_the_replay_reverts_to_awaiting_snapshot() {
         let mut b = PriceBook::new();
-        b.on_delta(level(6, 101, SIDE_BID, 6100, 20, NEW));
-        b.on_delta(level(9, 104, SIDE_BID, 6200, 30, NEW)); // gap: 7, 8 missing
+        apply_delta(&mut b, level(6, 101, SIDE_BID, 6100, 20, NEW));
+        apply_delta(&mut b, level(9, 104, SIDE_BID, 6200, 30, NEW)); // gap: 7, 8 missing
         assert!(b.on_snapshot_begin(1, 100, 0, 5, 0));
         assert!(b.on_snapshot_end(100, 1));
         assert_eq!(b.status(), Status::Gap);
@@ -967,7 +988,10 @@ mod tests {
             ],
         );
         assert!(matches!(
-            b.on_delta(clear(6, 101, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 9_999)),
+            apply_delta(
+                &mut b,
+                clear(6, 101, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 9_999)
+            ),
             DeltaOutcome::Applied { .. }
         ));
         assert!(bids_of(&b).is_empty());
@@ -978,7 +1002,7 @@ mod tests {
     #[test]
     fn clear_both_sides_empties_the_book() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10), (SIDE_ASK, 6300, 30)]);
-        b.on_delta(clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, 0));
+        apply_delta(&mut b, clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, 0));
         assert!(bids_of(&b).is_empty() && asks_of(&b).is_empty());
     }
 
@@ -999,9 +1023,15 @@ mod tests {
                 (SIDE_ASK, 6500, 60),
             ],
         );
-        b.on_delta(clear(6, 101, CLEAR_SIDE_BID, SCOPE_FROM_PRICE, 6100));
+        apply_delta(
+            &mut b,
+            clear(6, 101, CLEAR_SIDE_BID, SCOPE_FROM_PRICE, 6100),
+        );
         assert_eq!(bids_of(&b), vec![(6200, 10)], "6100 and 6000 gone");
-        b.on_delta(clear(7, 102, CLEAR_SIDE_ASK, SCOPE_FROM_PRICE, 6400));
+        apply_delta(
+            &mut b,
+            clear(7, 102, CLEAR_SIDE_ASK, SCOPE_FROM_PRICE, 6400),
+        );
         assert_eq!(asks_of(&b), vec![(6300, 40)], "6400 and 6500 gone");
     }
 
@@ -1011,14 +1041,17 @@ mod tests {
     fn clear_from_price_on_both_sides_is_malformed_and_clears_nothing() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10), (SIDE_ASK, 6300, 30)]);
         assert!(matches!(
-            b.on_delta(clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_FROM_PRICE, 6250)),
+            apply_delta(
+                &mut b,
+                clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_FROM_PRICE, 6250)
+            ),
             DeltaOutcome::Applied { .. }
         ));
         assert_eq!(bids_of(&b), vec![(6200, 10)]);
         assert_eq!(asks_of(&b), vec![(6300, 30)]);
         assert!(
             matches!(
-                b.on_delta(level(7, 102, SIDE_BID, 6100, 20, NEW)),
+                apply_delta(&mut b, level(7, 102, SIDE_BID, 6100, 20, NEW)),
                 DeltaOutcome::Applied { .. }
             ),
             "the malformed clear still consumed seq 6"
@@ -1031,14 +1064,98 @@ mod tests {
     fn clear_shares_the_delta_sequence() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
         assert!(matches!(
-            b.on_delta(clear(5, 100, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 0)),
+            apply_delta(&mut b, clear(5, 100, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 0)),
             DeltaOutcome::Duplicate
         ));
         assert_eq!(bids_of(&b), vec![(6200, 10)]);
         assert!(matches!(
-            b.on_delta(clear(8, 103, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 0)),
+            apply_delta(&mut b, clear(8, 103, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 0)),
             DeltaOutcome::Gap
         ));
+    }
+
+    // ---- Reported clear removals ----
+
+    /// A consumer whose only clear primitive is whole-side has to re-express `SCOPE_FROM_PRICE` as
+    /// per-level deletes, so the exact set matters: reporting a survivor would delete a level we
+    /// still hold, and omitting a removal would leave the consumer holding one we dropped.
+    #[test]
+    fn clear_from_price_reports_exactly_the_removed_levels() {
+        let mut b = synced(
+            100,
+            5,
+            0,
+            &[
+                (SIDE_BID, 6200, 10),
+                (SIDE_BID, 6100, 20),
+                (SIDE_BID, 6000, 30),
+                (SIDE_ASK, 6300, 40),
+                (SIDE_ASK, 6400, 50),
+                (SIDE_ASK, 6500, 60),
+            ],
+        );
+        let mut removed = Vec::new();
+        b.on_delta(
+            clear(6, 101, CLEAR_SIDE_BID, SCOPE_FROM_PRICE, 6100),
+            &mut removed,
+        );
+        removed.sort_unstable();
+        assert_eq!(removed, vec![(SIDE_BID, 6000), (SIDE_BID, 6100)]);
+        b.on_delta(
+            clear(7, 102, CLEAR_SIDE_ASK, SCOPE_FROM_PRICE, 6400),
+            &mut removed,
+        );
+        removed.sort_unstable();
+        assert_eq!(removed, vec![(SIDE_ASK, 6400), (SIDE_ASK, 6500)]);
+    }
+
+    #[test]
+    fn clear_entire_side_reports_every_level_of_both_sides() {
+        let mut b = synced(
+            100,
+            5,
+            0,
+            &[
+                (SIDE_BID, 6200, 10),
+                (SIDE_BID, 6100, 20),
+                (SIDE_ASK, 6300, 30),
+            ],
+        );
+        let mut removed = Vec::new();
+        b.on_delta(
+            clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, 0),
+            &mut removed,
+        );
+        removed.sort_unstable();
+        assert_eq!(
+            removed,
+            vec![(SIDE_BID, 6100), (SIDE_BID, 6200), (SIDE_ASK, 6300)]
+        );
+    }
+
+    /// A buffered clear has not touched the book, so it has removed nothing to report.
+    #[test]
+    fn a_buffered_clear_reports_nothing() {
+        let mut b = PriceBook::new();
+        let mut removed = Vec::new();
+        assert_eq!(
+            b.on_delta(
+                clear(6, 101, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, 0),
+                &mut removed
+            ),
+            DeltaOutcome::Buffered
+        );
+        assert!(removed.is_empty());
+    }
+
+    /// The buffer is cleared at entry, so a caller reusing one scratch across deltas can never read
+    /// the previous call's levels as this one's.
+    #[test]
+    fn a_stale_removed_buffer_is_not_visible_to_the_next_call() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
+        let mut removed = vec![(SIDE_ASK, 9_999)];
+        b.on_delta(level(6, 101, SIDE_BID, 6100, 20, NEW), &mut removed);
+        assert!(removed.is_empty(), "a level update removes no levels");
     }
 
     // ---- InstrumentReset ----
@@ -1048,7 +1165,7 @@ mod tests {
     #[test]
     fn instrument_reset_requires_an_anchor_at_or_past_the_new_one() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
-        b.on_delta(level(6, 101, SIDE_BID, 6100, 20, NEW));
+        apply_delta(&mut b, level(6, 101, SIDE_BID, 6100, 20, NEW));
         b.on_instrument_reset(500);
         assert_eq!(b.status(), Status::AwaitingSnapshot);
         assert!(bids_of(&b).is_empty());
@@ -1088,8 +1205,8 @@ mod tests {
     #[test]
     fn instrument_reset_keeps_post_anchor_buffered_deltas() {
         let mut b = PriceBook::new();
-        b.on_delta(level(6, 500, SIDE_BID, 6000, 1, NEW)); // at S', superseded
-        b.on_delta(level(7, 501, SIDE_BID, 6100, 20, NEW)); // past S', kept
+        apply_delta(&mut b, level(6, 500, SIDE_BID, 6000, 1, NEW)); // at S', superseded
+        apply_delta(&mut b, level(7, 501, SIDE_BID, 6100, 20, NEW)); // past S', kept
         b.on_instrument_reset(500);
         assert_eq!(b.buffered_len(), 1);
         assert!(b.on_snapshot_begin(2, 500, 0, 6, 0));
@@ -1110,7 +1227,7 @@ mod tests {
     #[test]
     fn end_of_session_drops_everything_including_the_event_clock() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
-        b.on_delta(level(6, 101, SIDE_BID, 6100, 20, NEW));
+        apply_delta(&mut b, level(6, 101, SIDE_BID, 6100, 20, NEW));
         assert!(b.last_event_ts() > 0);
         b.on_end_of_session();
         assert_eq!(b.status(), Status::AwaitingSnapshot);
@@ -1134,9 +1251,9 @@ mod tests {
     fn crossed_is_observability_and_strict() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10), (SIDE_ASK, 6300, 20)]);
         assert!(!b.crossed());
-        b.on_delta(level(6, 101, SIDE_ASK, 6200, 5, NEW)); // locked
+        apply_delta(&mut b, level(6, 101, SIDE_ASK, 6200, 5, NEW)); // locked
         assert!(!b.crossed(), "locked is not crossed");
-        b.on_delta(level(7, 102, SIDE_ASK, 6100, 5, NEW)); // crossed
+        apply_delta(&mut b, level(7, 102, SIDE_ASK, 6100, 5, NEW)); // crossed
         assert!(b.crossed());
         assert_eq!(b.status(), Status::Ready, "monitoring never changes status");
     }
@@ -1155,7 +1272,7 @@ mod tests {
     fn buffered_deltas_are_bounded() {
         let mut b = PriceBook::new();
         for i in 1..=(MAX_BUFFERED_DELTAS as u32 + 100) {
-            b.on_delta(level(i, i as u64, SIDE_BID, 6200, 1, NEW));
+            apply_delta(&mut b, level(i, i as u64, SIDE_BID, 6200, 1, NEW));
         }
         assert_eq!(b.buffered_len(), MAX_BUFFERED_DELTAS);
     }
@@ -1166,7 +1283,7 @@ mod tests {
     #[test]
     fn drop_buffer_marks_the_instrument_gap() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
-        b.on_delta(level(9, 104, SIDE_BID, 6100, 20, NEW)); // gap
+        apply_delta(&mut b, level(9, 104, SIDE_BID, 6100, 20, NEW)); // gap
         assert!(b.buffered_len() > 0);
         b.drop_buffer();
         assert_eq!(b.buffered_len(), 0);
@@ -1184,7 +1301,7 @@ mod tests {
         let mut b = synced(100, 0, 0, &[]);
         let mut outcome = DeltaOutcome::Buffered;
         for i in 1..=(MAX_LEVELS_PER_BOOK as u32 + 1) {
-            outcome = b.on_delta(level(i, i as u64, SIDE_BID, i as i64, 1, NEW));
+            outcome = apply_delta(&mut b, level(i, i as u64, SIDE_BID, i as i64, 1, NEW));
         }
         assert_eq!(
             outcome,

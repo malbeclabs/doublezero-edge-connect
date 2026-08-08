@@ -6,9 +6,12 @@
 //! - [`MidpointProcessor`] - Midpoint (`codec_midpoint`, magic `0x4D44`).
 //! - [`MboProcessor`] - Market-by-Order (`codec_mbo`, magic `0x4444`): reconstructs the L3 book
 //!   in [`crate::ingest::book`] and re-serves it as full-state `depth` + `trade`.
+//! - [`MbpProcessor`] - Market-by-Price (`codec_mbp`, magic `0x4442`): reconstructs the
+//!   price-aggregated book in [`crate::ingest::pricebook`] and re-serves it as the incremental
+//!   `book` product + `trade`.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,17 +21,23 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        arbiter::lock,
+        arbiter::{lock, Publisher},
+        authority::MarketKey,
         book::{BookState, DeltaKind, DeltaOp, Level},
         codec::{apply_exponent, decode_frame, source_name, InstrumentDefinition, Message},
-        codec_mbo, codec_midpoint,
+        codec_mbo, codec_mbp, codec_midpoint,
+        pricebook::{
+            BookDelta, DeltaOp as PriceDeltaOp, DeltaOutcome, Divergence, PriceBook,
+            Status as BookStatus,
+        },
         receiver::{FrameCtx, FrameProcessor, SeqCheck, SeqTracker},
         subscriber::{InstrumentDef, RefDataState},
     },
     metrics::metrics,
     model::{
-        venue_arc, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedInstrument,
-        NormalizedMidpoint, NormalizedQuote, NormalizedTrade, Side,
+        venue_arc, BookAction, BookChange, BookSide, DepthSnapshot, FeedMessage, NormalizedBook,
+        NormalizedDepth, NormalizedInstrument, NormalizedMidpoint, NormalizedQuote,
+        NormalizedTrade, Side,
     },
 };
 
@@ -154,6 +163,13 @@ impl<D: InstrumentDef> PerPublisher<D> {
     /// callers keep the disjoint borrows of their other state.
     fn def(&self, publisher: IpAddr, instrument_id: u32) -> Option<&D> {
         self.states.get(&publisher)?.definition(instrument_id)
+    }
+
+    /// `publisher`'s state for mutation that must **not** mint one — a reset epoch can be observed on
+    /// the market-data path, where [`Self::get`] would let a forged-source flood evict the real
+    /// publishers' definitions.
+    fn state_mut(&mut self, publisher: IpAddr) -> Option<&mut RefDataState<D>> {
+        self.states.get_mut(&publisher)
     }
 }
 
@@ -331,6 +347,8 @@ impl FrameProcessor for TobProcessor {
                     let inst = NormalizedInstrument {
                         venue: venue_arc(ctx.venue),
                         symbol: d.symbol.clone(),
+                        channel: header.channel_id as u32,
+                        instrument_id: d.instrument_id,
                         price_exponent: d.price_exponent,
                         qty_exponent: d.qty_exponent,
                     };
@@ -521,6 +539,8 @@ impl FrameProcessor for MidpointProcessor {
                     let inst = NormalizedInstrument {
                         venue: venue_arc(ctx.venue),
                         symbol: d.symbol.clone(),
+                        channel: header.channel_id as u32,
+                        instrument_id: d.instrument_id,
                         price_exponent: d.price_exponent,
                         qty_exponent: 0,
                     };
@@ -788,6 +808,8 @@ impl FrameProcessor for MboProcessor {
                     let inst = NormalizedInstrument {
                         venue: venue_arc(ctx.venue),
                         symbol: d.symbol.clone(),
+                        channel: header.channel_id as u32,
+                        instrument_id: d.instrument_id,
                         price_exponent: d.price_exponent,
                         qty_exponent: d.qty_exponent,
                     };
@@ -1016,6 +1038,790 @@ impl FrameProcessor for MboProcessor {
     }
 }
 
+/// Cap on distinct `(publisher, channel, instrument)` books one Market-by-Price receiver tracks. The
+/// wire `channel_id`/`instrument_id` and the datagram source IP are all unauthenticated and
+/// spoofable, so this bounds a forged stream exactly as [`MAX_BOOKS`] does for the order-keyed
+/// processor. Nothing may be sized off the instrument *count*: ids are sequential in today's
+/// captures but a ticker hash would spread them sparsely across the whole `u32`.
+const MAX_PRICE_BOOKS: usize = 4096;
+
+/// Cap on distinct `(publisher, channel)` pairs whose reset counter and open snapshot group are
+/// tracked. Both key components are unauthenticated wire data, so an unbounded map is a
+/// memory-exhaustion vector; two arms across a handful of shards sit far below this.
+const MAX_CHANNEL_KEYS: usize = 256;
+
+/// Deltas [`MbpProcessor`] holds buffered **across every book** before the overflow policy fires —
+/// distinct from `pricebook`'s per-book `MAX_BUFFERED_DELTAS` (2^18), which bounds nothing useful in
+/// aggregate: [`MAX_PRICE_BOOKS`] books at that cap is 2^30 deltas. This is the bound that holds, and
+/// it binds only once several instruments buffer heavily, since one alone clamps at 2^18. The spec's
+/// own cold-start worst case is ~30 M buffered messages / ~1.4 GB, so an unbounded total is a
+/// documented way to lose the process. On overflow the instrument holding the most buffered data is
+/// dropped and marked `Gap`, recovering on its next snapshot like any other `Gap` instrument;
+/// sustained overflow means the publisher's snapshot period is too long for this host's memory
+/// budget, which is why it is counted.
+const MAX_BUFFERED_DELTAS_ACROSS_BOOKS: usize = 1 << 20;
+
+/// One reconstructed book's identity within a receiver: `(publisher, channel, instrument)`.
+type PriceBookKey = (IpAddr, u8, u32);
+
+/// The snapshot group currently open on one `(publisher, channel)`.
+///
+/// Publishers must not interleave two groups within a channel, and `SnapshotLevel` carries no
+/// instrument id — so the open group is what ROUTES a level. `snapshot_id` only validates
+/// membership: it is monotonic per `(channel, instrument)`, so two instruments routinely share a
+/// value within one rotation and routing on it would cross their books.
+#[derive(Debug, Clone, Copy)]
+struct OpenGroup {
+    instrument_id: u32,
+    snapshot_id: u32,
+}
+
+/// Market-by-Price processor: drives reference data per publisher, feeds level deltas and the
+/// snapshot stream into a [`PriceBook`] per `(publisher, channel, instrument)`, and emits the
+/// incremental `book` product plus `trade` prints.
+pub struct MbpProcessor {
+    /// Per-publisher reference-data state (see [`PerPublisher`]).
+    state: PerPublisher<codec_mbp::InstrumentDefinition>,
+    /// One independent book per `(publisher, channel, instrument)`. Two arms mirror one feed but
+    /// their per-instrument delta series are unrelated by construction, so their books can never be
+    /// merged — which arm reaches the wire is the authority gate's decision, downstream.
+    books: HashMap<PriceBookKey, PriceBook>,
+    /// Insertion order of `books` keys, oldest at the front, for the [`MAX_PRICE_BOOKS`] eviction.
+    books_order: VecDeque<PriceBookKey>,
+    /// The open snapshot group per `(publisher, channel)` — see [`OpenGroup`].
+    open: HashMap<(IpAddr, u8), OpenGroup>,
+    /// Last `Reset Count` seen per `(publisher, channel)`, compared for inequality only (see
+    /// [`Self::note_reset_count`]).
+    last_reset: HashMap<(IpAddr, u8), u8>,
+    /// Insertion order of the `last_reset`/`open` keys, for the [`MAX_CHANNEL_KEYS`] eviction.
+    channel_order: VecDeque<(IpAddr, u8)>,
+    /// Deltas buffered across every book, kept in step by [`Self::with_book`] so the budget check is
+    /// O(1) rather than a sweep over `books` per datagram — which would cost most during exactly the
+    /// cold start the budget exists for.
+    buffered_total: usize,
+    /// Last `Ready`-ness reported per book, so health reaches the authority on transitions only.
+    /// Evicted in lockstep with `books`, so its keys are always a subset of `books`' keys.
+    health_reported: HashMap<PriceBookKey, bool>,
+    /// Reused buffer for the levels a `BookClear` removed, so the clear path never allocates.
+    cleared: Vec<(u8, i64)>,
+    /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
+    warned_invalid_manifest: bool,
+    warned_source_mismatch: bool,
+    /// Rate limit for the per-datagram decode-error warning.
+    decode_warn: WarnRateLimit,
+    /// Whether to emit `trade` messages (false when another feed owns this venue's trades).
+    emit_trades: bool,
+}
+
+impl MbpProcessor {
+    pub fn new(emit_trades: bool) -> Self {
+        Self {
+            state: PerPublisher::default(),
+            books: HashMap::new(),
+            books_order: VecDeque::new(),
+            open: HashMap::new(),
+            last_reset: HashMap::new(),
+            channel_order: VecDeque::new(),
+            buffered_total: 0,
+            health_reported: HashMap::new(),
+            cleared: Vec::new(),
+            warned_invalid_manifest: false,
+            warned_source_mismatch: false,
+            decode_warn: WarnRateLimit::default(),
+            emit_trades,
+        }
+    }
+
+    /// One instrument's `(price, qty)` exponents, or `None` while its definition is unknown — the
+    /// precision-before-price gate, copied out so the `state` borrow ends here.
+    fn exponents(&self, publisher: IpAddr, instrument_id: u32) -> Option<(i8, i8)> {
+        self.state
+            .def(publisher, instrument_id)
+            .map(|d| (d.price_exponent, d.qty_exponent))
+    }
+
+    /// Record this frame's `Reset Count` for `(publisher, channel)`, returning the previous one.
+    /// Bounded to [`MAX_CHANNEL_KEYS`] with least-recently-inserted eviction; an evicted live
+    /// publisher simply re-anchors its baseline on its next frame (reporting no reset for it).
+    fn note_reset_count(&mut self, publisher: IpAddr, channel: u8, reset_count: u8) -> Option<u8> {
+        let key = (publisher, channel);
+        if !self.last_reset.contains_key(&key) {
+            while self.last_reset.len() >= MAX_CHANNEL_KEYS {
+                match self.channel_order.pop_front() {
+                    Some(old) => {
+                        self.last_reset.remove(&old);
+                        self.open.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.channel_order.push_back(key);
+        }
+        self.last_reset.insert(key, reset_count)
+    }
+
+    /// Get-or-create the book for one `(publisher, channel, instrument)`, **gated and bounded** the
+    /// same way [`MboProcessor::book_for`] is: no book without a resolved definition (it could never
+    /// emit, so it would be dead memory), and [`MAX_PRICE_BOOKS`] with least-recently-inserted
+    /// eviction. Returns the key rather than the book: every mutation runs through
+    /// [`Self::with_book`], which is what keeps [`Self::buffered_total`] honest.
+    fn ensure_book(
+        &mut self,
+        ctx: &FrameCtx,
+        channel: u8,
+        instrument_id: u32,
+    ) -> Option<PriceBookKey> {
+        self.state.def(ctx.publisher, instrument_id)?;
+        let key = (ctx.publisher, channel, instrument_id);
+        if !self.books.contains_key(&key) {
+            while self.books.len() >= MAX_PRICE_BOOKS {
+                match self.books_order.pop_front() {
+                    Some(old) => {
+                        // Unhealthy before forgetting: this arm no longer holds that market, and
+                        // leaving the authority its last `healthy` report would keep electing it
+                        // while a peer arm's live book is dropped.
+                        self.report_health(ctx, &old, false);
+                        self.forget_book(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.books.insert(key, PriceBook::new());
+            self.books_order.push_back(key);
+        }
+        Some(key)
+    }
+
+    /// Drop one book and every map keyed off it, keeping the buffer total in step. Does not touch
+    /// `books_order`: the eviction path has already popped the key, and the reset path clears the
+    /// whole channel's keys in one pass.
+    fn forget_book(&mut self, key: &PriceBookKey) {
+        if let Some(book) = self.books.remove(key) {
+            self.buffered_total = self.buffered_total.saturating_sub(book.buffered_len());
+        }
+        self.health_reported.remove(key);
+        if self
+            .open
+            .get(&(key.0, key.1))
+            .is_some_and(|g| g.instrument_id == key.2)
+        {
+            self.open.remove(&(key.0, key.1));
+        }
+    }
+
+    /// Run `f` against one book, keeping [`Self::buffered_total`] in step with that book's buffer.
+    /// **Every** path that can change a buffer must go through here.
+    fn with_book<R>(
+        &mut self,
+        key: &PriceBookKey,
+        f: impl FnOnce(&mut PriceBook) -> R,
+    ) -> Option<R> {
+        let book = self.books.get_mut(key)?;
+        let before = book.buffered_len();
+        let out = f(book);
+        let after = book.buffered_len();
+        self.buffered_total = (self.buffered_total + after).saturating_sub(before);
+        Some(out)
+    }
+
+    /// The key of the book holding the most buffered deltas among those matching `pick`, or `None`
+    /// when none of them holds any.
+    fn largest_buffer(&self, pick: impl Fn(&PriceBookKey) -> bool) -> Option<PriceBookKey> {
+        self.books
+            .iter()
+            .filter(|(k, b)| pick(k) && b.buffered_len() > 0)
+            .max_by_key(|(_, b)| b.buffered_len())
+            .map(|(k, _)| *k)
+    }
+
+    /// §4.5: hold the cross-instrument buffer inside [`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`] by dropping
+    /// the largest buffer (`drop_buffer` marks that instrument `Gap` in the same step) until back
+    /// under budget. Finding the largest is O(books), which is fine because overflow is rare and the
+    /// check that gates it is O(1). Never takes the channel down: every other instrument keeps
+    /// streaming and the dropped one recovers on its next snapshot.
+    fn enforce_buffer_budget(&mut self, ctx: &FrameCtx) {
+        while self.buffered_total > MAX_BUFFERED_DELTAS_ACROSS_BOOKS {
+            // The arm that filled the budget is the one sending, so take its own largest buffer
+            // first: a global maximum would let one flooding arm cost a peer arm its recovering book.
+            let largest = self
+                .largest_buffer(|(p, _, _)| *p == ctx.publisher)
+                .or_else(|| self.largest_buffer(|_| true));
+            // Nothing left to drop: the total disagrees with the books, so stop rather than spin.
+            let Some(key) = largest else { return };
+            self.with_book(&key, |b| b.drop_buffer());
+            metrics()
+                .mbp_buffer_overflows
+                .with_label_values(&[ctx.venue])
+                .inc();
+            self.report_health(ctx, &key, false);
+        }
+    }
+
+    /// Report one book's `Ready`-ness for its market, but only when it changed: an unhealthy arm
+    /// loses the market to its peer, so this is a transition signal rather than a per-frame one.
+    fn report_health(&mut self, ctx: &FrameCtx, key: &PriceBookKey, healthy: bool) {
+        if self.health_reported.get(key) == Some(&healthy) {
+            return;
+        }
+        self.health_reported.insert(*key, healthy);
+        let market: MarketKey = (venue_arc(ctx.venue), key.1 as u32, key.2);
+        lock(ctx.arbiter).set_book_health(&market, Publisher::Edge(key.0), healthy);
+    }
+
+    /// §4.9: discard everything a `Reset Count` change invalidated for one `(publisher, channel)` —
+    /// its books and their open snapshot group, plus that publisher's reference data, whose
+    /// `reset_count` epoch just ended. Routed from any port, since the change can be seen on market
+    /// data first. `RefDataState` is per publisher rather than per channel, so a sharded publisher's
+    /// reset clears every channel's definitions — an over-approximation that self-heals on the next
+    /// reference-data burst.
+    fn on_channel_reset(&mut self, ctx: &FrameCtx, channel: u8, reset_count: u8) {
+        let keys: Vec<PriceBookKey> = self
+            .books
+            .keys()
+            .copied()
+            .filter(|(p, c, _)| *p == ctx.publisher && *c == channel)
+            .collect();
+        for key in &keys {
+            // Unhealthy before forgetting: `forget_book` drops the memo this reads.
+            self.report_health(ctx, key, false);
+            self.forget_book(key);
+        }
+        self.books_order
+            .retain(|(p, c, _)| !(*p == ctx.publisher && *c == channel));
+        self.open.remove(&(ctx.publisher, channel));
+        if let Some(state) = self.state.state_mut(ctx.publisher) {
+            state.on_frame(reset_count);
+        }
+        metrics()
+            .mbp_channel_resets
+            .with_label_values(&[ctx.venue])
+            .inc();
+    }
+
+    /// Count what a delta did. `Overflow` (the per-book level cap: a malformed or forged stream) is
+    /// deliberately its own series rather than a gap — the cause and the resulting status both
+    /// differ, and merging them would read a hostile book as a lossy network.
+    fn record_outcome(&self, venue: &str, outcome: &DeltaOutcome) {
+        let m = metrics();
+        match outcome {
+            DeltaOutcome::Duplicate => m.mbp_duplicate_deltas.with_label_values(&[venue]).inc(),
+            DeltaOutcome::Overflow => m.mbp_level_overflows.with_label_values(&[venue]).inc(),
+            DeltaOutcome::Applied {
+                divergence: Some(d),
+            } => m
+                .mbp_divergence
+                .with_label_values(&[venue, divergence_label(*d)])
+                .inc(),
+            _ => {}
+        }
+    }
+
+    /// Emit a full re-baseline for one instrument: `Clear{Both}` then every level it now holds.
+    /// `changes[0].action == Clear` is what re-baselines a consumer (the `snapshot` flag is
+    /// advisory), so this is a batch rather than a distinct message type.
+    fn emit_rebaseline(&self, ctx: &FrameCtx, channel: u8, instrument_id: u32) {
+        let Some(book) = self.books.get(&(ctx.publisher, channel, instrument_id)) else {
+            return;
+        };
+        let Some((price_exp, qty_exp)) = self.exponents(ctx.publisher, instrument_id) else {
+            return;
+        };
+        let level = |side: BookSide, price_raw: i64, qty_raw: u64| BookChange {
+            action: BookAction::Update,
+            side,
+            price: apply_exponent(price_raw, price_exp),
+            size: scaled_qty(qty_raw, qty_exp),
+        };
+        let mut changes = vec![BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+        }];
+        changes.extend(book.bids().map(|(p, l)| level(BookSide::Bid, p, l.qty_raw)));
+        changes.extend(book.asks().map(|(p, l)| level(BookSide::Ask, p, l.qty_raw)));
+        self.send_book(ctx, channel, instrument_id, changes, true);
+    }
+
+    /// The one place a `book` reaches the arbiter: resolves the display symbol and the book's event
+    /// clock, and refuses to publish a book that is not `Ready`.
+    fn send_book(
+        &self,
+        ctx: &FrameCtx,
+        channel: u8,
+        instrument_id: u32,
+        changes: Vec<BookChange>,
+        snapshot: bool,
+    ) {
+        let Some(book) = self.books.get(&(ctx.publisher, channel, instrument_id)) else {
+            return;
+        };
+        if book.status() != BookStatus::Ready {
+            return;
+        }
+        let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
+            return; // precision unknown; don't emit prices we can't scale
+        };
+        ctx.emit(FeedMessage::Book(NormalizedBook {
+            venue: venue_arc(ctx.venue),
+            symbol: def.symbol.clone(),
+            channel: channel as u32,
+            instrument_id,
+            changes,
+            snapshot,
+            last: true,
+            source_ts_ns: book.last_event_ts(),
+            recv_ts_ns: ctx.recv_ts_ns,
+            kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
+            ws_send_ts_ns: 0, // stamped by the WS server just before send
+        }));
+    }
+}
+
+/// The wire book `Side` mapped to the published side. Only `SIDE_ASK` is distinguished, matching
+/// [`PriceBook`]'s own apply.
+fn book_side(side: u8) -> BookSide {
+    if side == codec_mbp::SIDE_ASK {
+        BookSide::Ask
+    } else {
+        BookSide::Bid
+    }
+}
+
+/// `BookClear`'s side, a value space of its own (it extends `Side` with `Both`). `None` for a value
+/// the apply does not act on: the book clears nothing for it, so the wire must claim nothing either.
+fn clear_book_side(clear_side: u8) -> Option<BookSide> {
+    match clear_side {
+        codec_mbp::CLEAR_SIDE_BID => Some(BookSide::Bid),
+        codec_mbp::CLEAR_SIDE_ASK => Some(BookSide::Ask),
+        codec_mbp::CLEAR_SIDE_BOTH => Some(BookSide::Both),
+        _ => None,
+    }
+}
+
+/// Scale a wire quantity. Saturates rather than reinterpreting: a `u64` past `i64::MAX` is nonsense
+/// either way, but a negative `size` would contradict the book we hold.
+fn scaled_qty(qty_raw: u64, exponent: i8) -> f64 {
+    apply_exponent(qty_raw.min(i64::MAX as u64) as i64, exponent)
+}
+
+/// Stable, low-cardinality `kind` label for `dz_mbp_divergence_total`.
+fn divergence_label(d: Divergence) -> &'static str {
+    match d {
+        Divergence::NewOnPresentLevel => "new_on_present_level",
+        Divergence::ChangeOnAbsentLevel => "change_on_absent_level",
+        Divergence::DeleteWithQuantity => "delete_with_quantity",
+        Divergence::ZeroQuantityWithoutDelete => "zero_quantity_without_delete",
+    }
+}
+
+impl FrameProcessor for MbpProcessor {
+    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx) {
+        let (header, messages) = match codec_mbp::decode_frame(buf) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(suppressed) = self.decode_warn.allow() {
+                    warn!(role = ?ctx.role, suppressed, "mbp decode error: {e}");
+                }
+                return;
+            }
+        };
+        // The channel comes from this codec's own frame header rather than `FrameCtx`: `drive` is
+        // protocol-agnostic and would have to decode a header it has no magic for.
+        let channel = header.channel_id;
+
+        if ctx.role.handles_refdata() {
+            self.state.get(ctx.publisher).on_frame(header.reset_count);
+        }
+        // §4.9: a reset is any CHANGE of `Reset Count` — `!=`, never `>`, so the `255 -> 0` wrap is
+        // not silently ignored while deltas keep applying against discarded publisher state.
+        //
+        // Tracked from the **market-data role only**, and only for a publisher we already hold
+        // reference data for. The role restriction is what makes the epoch monotone: all three ports
+        // carry the same epoch but are separate sockets with separate kernel queues, so one memo
+        // shared across them would flip on every interleaving of a restart's backlog and re-reset the
+        // channel thousands of times. One socket is FIFO, so the market-data epoch never goes
+        // backwards. The publisher restriction keeps [`PerPublisher::get`]'s rule: a publisher with no
+        // definitions has no books to invalidate, and minting state from the market-data path is how a
+        // forged-source flood would evict the real publishers' definitions.
+        if ctx.role.handles_mktdata()
+            && self.state.state_mut(ctx.publisher).is_some()
+            && self
+                .note_reset_count(ctx.publisher, channel, header.reset_count)
+                .is_some_and(|prev| prev != header.reset_count)
+        {
+            self.on_channel_reset(ctx, channel, header.reset_count);
+        }
+
+        // Wire changes per instrument, emitted once per frame; a `BTreeMap` gives deterministic
+        // ascending-id order across a multi-instrument frame, matching `MboProcessor`'s `BTreeSet`.
+        let mut accum: BTreeMap<u32, Vec<BookChange>> = BTreeMap::new();
+        // Instruments touched since the previous `BatchBoundary`, and since the frame started (for
+        // the health sweep). Both are frame-scoped: the publisher and channel are fixed per datagram.
+        let mut since_boundary: BTreeSet<u32> = BTreeSet::new();
+        let mut touched: BTreeSet<u32> = BTreeSet::new();
+        // Moved out so the `&mut self` book calls below can borrow it; put back before returning.
+        let mut cleared = std::mem::take(&mut self.cleared);
+
+        for msg in messages {
+            match msg {
+                codec_mbp::Message::ManifestSummary(m) => {
+                    // Same TEMP WORKAROUND as the sibling processors: a live publisher emitting
+                    // `Valid=0` would keep `RefDataState` from ever resolving a definition, and
+                    // every emission path gates on one — so the whole venue would go dark. Force
+                    // valid=true. REVISIT: pass `m.valid` once publishers are corrected.
+                    if !m.valid && !self.warned_invalid_manifest {
+                        self.warned_invalid_manifest = true;
+                        warn!(
+                            manifest_seq = m.manifest_seq,
+                            instrument_count = m.instrument_count,
+                            "mbp manifest Valid=0 from publisher; overriding to valid (temporary, logged once)"
+                        );
+                    }
+                    self.state.get(ctx.publisher).on_manifest(
+                        true,
+                        m.manifest_seq,
+                        m.instrument_count,
+                    );
+                }
+                codec_mbp::Message::InstrumentDefinition(d) => {
+                    let inst = NormalizedInstrument {
+                        venue: venue_arc(ctx.venue),
+                        symbol: d.symbol.clone(),
+                        channel: channel as u32,
+                        instrument_id: d.instrument_id,
+                        price_exponent: d.price_exponent,
+                        qty_exponent: d.qty_exponent,
+                    };
+                    upsert_instrument(ctx.instruments, &inst);
+                    self.state.get(ctx.publisher).on_instrument_definition(d);
+                    ctx.emit(FeedMessage::Instrument(inst));
+                }
+                codec_mbp::Message::LevelUpdate(l) => {
+                    let Some((price_exp, qty_exp)) = self.exponents(ctx.publisher, l.instrument_id)
+                    else {
+                        continue;
+                    };
+                    let Some(key) = self.ensure_book(ctx, channel, l.instrument_id) else {
+                        continue;
+                    };
+                    let op = PriceDeltaOp {
+                        seq: l.per_instrument_seq,
+                        mktdata_seq: header.sequence,
+                        ts: l.ts,
+                        delta: BookDelta::Level {
+                            side: l.side,
+                            price_raw: l.price_raw,
+                            qty_raw: l.qty_raw,
+                            order_count: l.order_count,
+                            level_flags: l.level_flags,
+                            action: l.action,
+                        },
+                    };
+                    touched.insert(l.instrument_id);
+                    since_boundary.insert(l.instrument_id);
+                    let Some(outcome) = self.with_book(&key, |b| b.on_delta(op, &mut cleared))
+                    else {
+                        continue;
+                    };
+                    self.record_outcome(ctx.venue, &outcome);
+                    if matches!(outcome, DeltaOutcome::Applied { .. }) {
+                        // Quantity alone decides the action, exactly as the apply does: `0` removes
+                        // the level, anything else states its complete resulting state.
+                        accum.entry(l.instrument_id).or_default().push(BookChange {
+                            action: if l.qty_raw == 0 {
+                                BookAction::Delete
+                            } else {
+                                BookAction::Update
+                            },
+                            side: book_side(l.side),
+                            price: apply_exponent(l.price_raw, price_exp),
+                            size: if l.qty_raw == 0 {
+                                0.0
+                            } else {
+                                scaled_qty(l.qty_raw, qty_exp)
+                            },
+                        });
+                    }
+                }
+                codec_mbp::Message::BookClear(c) => {
+                    let Some((price_exp, _)) = self.exponents(ctx.publisher, c.instrument_id)
+                    else {
+                        continue;
+                    };
+                    let Some(key) = self.ensure_book(ctx, channel, c.instrument_id) else {
+                        continue;
+                    };
+                    let op = PriceDeltaOp {
+                        seq: c.per_instrument_seq,
+                        mktdata_seq: header.sequence,
+                        ts: c.ts,
+                        delta: BookDelta::Clear {
+                            clear_side: c.clear_side,
+                            scope: c.scope,
+                            from_price_raw: c.from_price_raw,
+                        },
+                    };
+                    touched.insert(c.instrument_id);
+                    since_boundary.insert(c.instrument_id);
+                    let Some(outcome) = self.with_book(&key, |b| b.on_delta(op, &mut cleared))
+                    else {
+                        continue;
+                    };
+                    self.record_outcome(ctx.venue, &outcome);
+                    if !matches!(outcome, DeltaOutcome::Applied { .. }) {
+                        continue;
+                    }
+                    let changes = accum.entry(c.instrument_id).or_default();
+                    if c.scope == codec_mbp::SCOPE_ENTIRE_SIDE {
+                        // Only for a side the apply acted on: an unrecognized byte clears nothing in
+                        // the book, and a `Clear` would tell the consumer to drop a side we still
+                        // hold — silently, with every later sequence check passing.
+                        if let Some(side) = clear_book_side(c.clear_side) {
+                            changes.push(BookChange {
+                                action: BookAction::Clear,
+                                side,
+                                price: 0.0,
+                                size: 0.0,
+                            });
+                        }
+                    } else {
+                        // The wire `Clear` carries no price bound, so a from-price clear is
+                        // published as the exact levels it removed. A whole-side `Clear` would tell
+                        // the consumer to drop levels this book still holds, and the two would
+                        // diverge silently with every sequence check passing.
+                        changes.extend(cleared.iter().map(|&(side, price_raw)| BookChange {
+                            action: BookAction::Delete,
+                            side: book_side(side),
+                            price: apply_exponent(price_raw, price_exp),
+                            size: 0.0,
+                        }));
+                    }
+                }
+                codec_mbp::Message::SnapshotBegin(s) => {
+                    // A group whose epoch disagrees with the market data's belongs to a different run
+                    // of the publisher: the snapshot port is its own socket, so a restart leaves the
+                    // previous epoch's rotation queued, and installing it would republish the dead
+                    // session's book as a fresh re-baseline. Its levels are then counted as orphans.
+                    // Before any market data the epoch is unknown, so the group is accepted.
+                    if self
+                        .last_reset
+                        .get(&(ctx.publisher, channel))
+                        .is_some_and(|epoch| *epoch != header.reset_count)
+                    {
+                        continue;
+                    }
+                    let Some(key) = self.ensure_book(ctx, channel, s.instrument_id) else {
+                        continue;
+                    };
+                    touched.insert(s.instrument_id);
+                    let accepted = self
+                        .with_book(&key, |b| {
+                            b.on_snapshot_begin(
+                                s.snapshot_id,
+                                s.anchor_seq,
+                                s.total_levels,
+                                s.last_instrument_seq,
+                                s.depth_bound,
+                            )
+                        })
+                        .unwrap_or(false);
+                    let group = (ctx.publisher, channel);
+                    if accepted {
+                        self.open.insert(
+                            group,
+                            OpenGroup {
+                                instrument_id: s.instrument_id,
+                                snapshot_id: s.snapshot_id,
+                            },
+                        );
+                    } else if self
+                        .open
+                        .get(&group)
+                        .is_some_and(|g| g.instrument_id != s.instrument_id)
+                    {
+                        // A refused begin for a DIFFERENT instrument than the one assembling means
+                        // the publisher interleaved groups: close the route so its levels are
+                        // orphaned and counted rather than landing in the open instrument's book.
+                        // A refused re-begin for the same instrument leaves the route alone — the
+                        // book deliberately keeps assembling (see `PriceBook::on_snapshot_begin`).
+                        self.open.remove(&group);
+                    }
+                }
+                codec_mbp::Message::SnapshotLevel(l) => {
+                    // §4.1: routed by the OPEN GROUP, never by `snapshot_id` — that is monotonic per
+                    // `(channel, instrument)`, so two instruments routinely share a value within one
+                    // rotation and routing on it sends one's levels into the other's book.
+                    let route = self
+                        .open
+                        .get(&(ctx.publisher, channel))
+                        .filter(|g| g.snapshot_id == l.snapshot_id)
+                        .copied();
+                    let Some(group) = route else {
+                        metrics()
+                            .mbp_orphan_snapshot_levels
+                            .with_label_values(&[ctx.venue])
+                            .inc();
+                        continue;
+                    };
+                    let key = (ctx.publisher, channel, group.instrument_id);
+                    self.with_book(&key, |b| {
+                        b.on_snapshot_level(
+                            l.snapshot_id,
+                            l.side,
+                            l.price_raw,
+                            l.qty_raw,
+                            l.order_count,
+                            l.level_flags,
+                        )
+                    });
+                }
+                codec_mbp::Message::SnapshotEnd(e) => {
+                    let group = (ctx.publisher, channel);
+                    if !self
+                        .open
+                        .get(&group)
+                        .is_some_and(|g| g.instrument_id == e.instrument_id)
+                    {
+                        // A stray end for an instrument that is not the one assembling. Dropping it
+                        // is the whole action: the open group belongs to another instrument and must
+                        // keep assembling.
+                        debug!(
+                            venue = ctx.venue,
+                            channel,
+                            instrument_id = e.instrument_id,
+                            "mbp SnapshotEnd for an instrument with no open group"
+                        );
+                        continue;
+                    }
+                    self.open.remove(&group);
+                    let key = (ctx.publisher, channel, e.instrument_id);
+                    touched.insert(e.instrument_id);
+                    let installed = self
+                        .with_book(&key, |b| b.on_snapshot_end(e.anchor_seq, e.snapshot_id))
+                        .unwrap_or(false);
+                    if installed {
+                        // The re-baseline replaces everything accumulated for this instrument so
+                        // far, and goes out here so a delta later in the same frame follows it.
+                        accum.remove(&e.instrument_id);
+                        self.emit_rebaseline(ctx, channel, e.instrument_id);
+                    }
+                }
+                codec_mbp::Message::InstrumentReset(r) => {
+                    // Reset the existing book directly, NOT via `ensure_book`, whose definition gate
+                    // would skip the reset in a transient no-definition window and leave a stale
+                    // `Ready` book whose sequences then reject the post-reset snapshot.
+                    let key = (ctx.publisher, channel, r.instrument_id);
+                    if self
+                        .with_book(&key, |b| b.on_instrument_reset(r.new_anchor_seq))
+                        .is_some()
+                    {
+                        accum.remove(&r.instrument_id);
+                        self.report_health(ctx, &key, false);
+                    }
+                    // The book dropped any group it was assembling, so the route goes with it.
+                    if self
+                        .open
+                        .get(&(ctx.publisher, channel))
+                        .is_some_and(|g| g.instrument_id == r.instrument_id)
+                    {
+                        self.open.remove(&(ctx.publisher, channel));
+                    }
+                }
+                codec_mbp::Message::EndOfSession(ts) => {
+                    info!(ts, channel, "mbp end of session");
+                    // §4.7: per-arm and per-channel — the shard whose session ended. Dropping every
+                    // publisher's books (as the order-keyed processor does) would tear down a live
+                    // peer arm's published book; reporting each market unhealthy is what hands
+                    // authority to that peer instead.
+                    let keys: Vec<PriceBookKey> = self
+                        .books
+                        .keys()
+                        .copied()
+                        .filter(|(p, c, _)| *p == ctx.publisher && *c == channel)
+                        .collect();
+                    for key in keys {
+                        self.with_book(&key, |b| b.on_end_of_session());
+                        self.report_health(ctx, &key, false);
+                        accum.remove(&key.2);
+                    }
+                    self.open.remove(&(ctx.publisher, channel));
+                }
+                codec_mbp::Message::BatchBoundary(_) => {
+                    // The crossed-book consistency point: within a batch the inside market may
+                    // legitimately cross. Observability only — it must never change status or
+                    // discard a book. An instrument holding corrupt state is repaired by its next
+                    // snapshot on exactly the schedule it would have been anyway.
+                    for id in std::mem::take(&mut since_boundary) {
+                        if self
+                            .books
+                            .get(&(ctx.publisher, channel, id))
+                            .is_some_and(|b| b.crossed())
+                        {
+                            metrics().mbp_crossed.with_label_values(&[ctx.venue]).inc();
+                        }
+                    }
+                }
+                codec_mbp::Message::Trade(t) => {
+                    let Some(def) = self.state.def(ctx.publisher, t.instrument_id) else {
+                        continue;
+                    };
+                    let trade = NormalizedTrade {
+                        venue: venue_arc(source_name(t.source_id).unwrap_or(ctx.venue)),
+                        symbol: def.symbol.clone(),
+                        price: apply_exponent(t.trade_price_raw, def.price_exponent),
+                        size: apply_exponent(t.trade_qty_raw as i64, def.qty_exponent),
+                        aggressor_side: Side::from_code(t.aggressor_side),
+                        trade_id: t.trade_id,
+                        cumulative_volume: apply_exponent(
+                            t.cumulative_volume_raw as i64,
+                            def.qty_exponent,
+                        ),
+                        source_ts_ns: t.source_ts,
+                        recv_ts_ns: ctx.recv_ts_ns,
+                        kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
+                        ws_send_ts_ns: 0,
+                    };
+                    if let Some(name) = source_name(t.source_id) {
+                        if name != ctx.venue && !self.warned_source_mismatch {
+                            self.warned_source_mismatch = true;
+                            warn!(source_id = t.source_id, registry_venue = name, feed_venue = %ctx.venue,
+                                  "mbp SourceID maps to a venue different from this feed's venue (logged once)");
+                        }
+                    }
+                    if self.emit_trades {
+                        ctx.emit(FeedMessage::Trade(trade));
+                    }
+                }
+                codec_mbp::Message::Heartbeat(_) | codec_mbp::Message::Other(_) => {}
+            }
+        }
+
+        cleared.clear();
+        self.cleared = cleared;
+        self.enforce_buffer_budget(ctx);
+        // One batch per instrument, `last: true`: a frame is one logical event per instrument, since
+        // cross-instrument atomicity is not promised. A clear that removed nothing has no changes to
+        // publish.
+        for (instrument_id, changes) in accum {
+            if !changes.is_empty() {
+                self.send_book(ctx, channel, instrument_id, changes, false);
+            }
+        }
+        for id in touched {
+            let key = (ctx.publisher, channel, id);
+            let Some(healthy) = self
+                .books
+                .get(&key)
+                .map(|b| b.status() == BookStatus::Ready)
+            else {
+                continue;
+            };
+            self.report_health(ctx, &key, healthy);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1025,10 +1831,15 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::{upsert_instrument, MboProcessor, TobProcessor, WarnRateLimit};
+    use std::net::IpAddr;
+
+    use super::{
+        upsert_instrument, MboProcessor, MbpProcessor, TobProcessor, WarnRateLimit,
+        MAX_BUFFERED_DELTAS_ACROSS_BOOKS, MAX_CHANNEL_KEYS, MAX_PRICE_BOOKS,
+    };
     use crate::{
         ingest::{
-            arbiter::{Arbiter, SharedArbiter},
+            arbiter::{lock, Arbiter, Publisher, SharedArbiter},
             codec_mbo::{
                 tests::{
                     enc_end_of_session, enc_instrument_reset, enc_order_add, enc_snapshot_begin,
@@ -1037,9 +1848,14 @@ mod tests {
                 InstrumentReset, OrderAdd, SnapshotBegin, SnapshotEnd, MSG_INSTRUMENT_DEFINITION,
                 MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
             },
+            codec_mbp::{self, tests as mbp_wire, SIDE_ASK as MBP_ASK, SIDE_BID as MBP_BID},
+            pricebook::{BookDelta, DeltaOp as PriceDeltaOp, Status as BookStatus},
             receiver::{FrameCtx, FrameProcessor, PortRole},
         },
-        model::{DepthSnapshot, FeedMessage, NormalizedInstrument},
+        metrics::metrics,
+        model::{
+            BookAction, BookSide, DepthSnapshot, FeedMessage, NormalizedBook, NormalizedInstrument,
+        },
     };
 
     // The quote latch-to-leader floor and the trade windowed dedup now live in the shared
@@ -1832,6 +2648,8 @@ mod tests {
         let base = NormalizedInstrument {
             venue: "TestVenue".into(),
             symbol: "BTC".into(),
+            channel: 0,
+            instrument_id: 1,
             price_exponent: -2,
             qty_exponent: -4,
         };
@@ -2090,6 +2908,1182 @@ mod tests {
             drain_depth_ids(&mut rx).len(),
             1,
             "a top-N change must re-emit depth"
+        );
+    }
+
+    // ---- Market-by-Price ----
+
+    /// A reference-data burst defining `INST-{id}` for each id, exponents 0 so raw ints reach the
+    /// wire unscaled and the assertions read as the numbers the builders wrote.
+    fn mbp_refdata(ids: &[u32]) -> Vec<Vec<u8>> {
+        let mut out = vec![mbp_wire::enc_manifest_summary(
+            &codec_mbp::ManifestSummary {
+                channel_id: 0,
+                valid: true,
+                manifest_seq: 1,
+                instrument_count: ids.len() as u32,
+                ts: 0,
+            },
+        )];
+        out.extend(ids.iter().map(|id| {
+            mbp_wire::enc_instrument_definition(&codec_mbp::InstrumentDefinition {
+                instrument_id: *id,
+                symbol: format!("INST-{id}").into(),
+                price_exponent: 0,
+                qty_exponent: 0,
+                manifest_seq: 1,
+            })
+        }));
+        out
+    }
+
+    /// One level update: `qty` is the level's absolute resulting quantity, `0` removing it.
+    fn mbp_level(id: u32, seq: u32, side: u8, price: i64, qty: u64, ts: u64) -> Vec<u8> {
+        mbp_wire::enc_level_update(&codec_mbp::LevelUpdate {
+            instrument_id: id,
+            source_id: 0,
+            side,
+            action: if qty == 0 { 3 } else { 1 },
+            per_instrument_seq: seq,
+            price_raw: price,
+            qty_raw: qty,
+            ts,
+            order_count: Some(1),
+            level_index: None,
+            update_reason: 0,
+            level_flags: 0,
+        })
+    }
+
+    /// A complete snapshot group for `id`: begin, its levels, end. `k` is the publisher's
+    /// `last_instrument_seq` at capture and `anchor` the mktdata sequence it was captured at.
+    fn mbp_snapshot(
+        id: u32,
+        sid: u32,
+        anchor: u64,
+        k: u32,
+        levels: &[(u8, i64, u64)],
+    ) -> Vec<Vec<u8>> {
+        let mut out = vec![mbp_wire::enc_snapshot_begin(&codec_mbp::SnapshotBegin {
+            instrument_id: id,
+            anchor_seq: anchor,
+            total_levels: levels.len() as u32,
+            snapshot_id: sid,
+            last_instrument_seq: k,
+            ts: 1,
+            depth_bound: 0,
+        })];
+        out.extend(levels.iter().map(|&(side, price, qty)| {
+            mbp_wire::enc_snapshot_level(&codec_mbp::SnapshotLevel {
+                snapshot_id: sid,
+                price_raw: price,
+                qty_raw: qty,
+                order_count: Some(1),
+                side,
+                level_flags: 0,
+            })
+        }));
+        out.push(mbp_wire::enc_snapshot_end(&codec_mbp::SnapshotEnd {
+            instrument_id: id,
+            anchor_seq: anchor,
+            snapshot_id: sid,
+        }));
+        out
+    }
+
+    fn drain_books(
+        rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) -> Vec<NormalizedBook> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Book(b) = &*m {
+                out.push(b.clone());
+            }
+        }
+        out
+    }
+
+    /// `(action, side, price, size)` per change, so a batch's shape asserts on one line.
+    fn shape(b: &NormalizedBook) -> Vec<(BookAction, BookSide, f64, f64)> {
+        b.changes
+            .iter()
+            .map(|c| (c.action, c.side, c.price, c.size))
+            .collect()
+    }
+
+    /// The status of one reconstructed book, or `None` when the processor tracks no such book.
+    fn mbp_status(p: &MbpProcessor, publisher: IpAddr, channel: u8, id: u32) -> Option<BookStatus> {
+        p.books.get(&(publisher, channel, id)).map(|b| b.status())
+    }
+
+    /// A `FrameCtx` on a venue unique to one test. The Prometheus registry is process-global, so a
+    /// metric assertion driven through `make_ctx`'s shared `"TV"` venue would count every other
+    /// test's increments too.
+    fn mbp_ctx<'a>(
+        venue: &'static str,
+        arbiter: &'a SharedArbiter,
+        instruments: &'a crate::model::InstrumentSnapshot,
+        role: PortRole,
+    ) -> FrameCtx<'a> {
+        let mut c = make_ctx(arbiter, instruments, role);
+        c.venue = venue;
+        c
+    }
+
+    /// An `MbpProcessor` with `ids` defined and each synced from an empty-book anchor, in the drive
+    /// order the wire uses: reference data, then the snapshot stream, then deltas.
+    fn synced_mbp_proc(
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+        channel: u8,
+        reset_count: u8,
+        ids: &[u32],
+    ) -> MbpProcessor {
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(channel, reset_count, 1, &mbp_refdata(ids)),
+            &make_ctx(arbiter, instruments, PortRole::Combined),
+        );
+        for (n, id) in ids.iter().enumerate() {
+            proc.on_datagram(
+                &mbp_wire::frame(
+                    channel,
+                    reset_count,
+                    2 + n as u64,
+                    &mbp_snapshot(*id, 1, 0, 0, &[]),
+                ),
+                &make_ctx(arbiter, instruments, PortRole::Snapshot),
+            );
+        }
+        proc
+    }
+
+    /// A shared arbiter over a fresh broadcast channel — the four lines every processor test needs.
+    fn mbp_harness() -> (
+        SharedArbiter,
+        broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+        crate::model::InstrumentSnapshot,
+    ) {
+        let (tx, rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        (arbiter, rx, instruments)
+    }
+
+    /// §4.1 — `SnapshotLevel` carries no instrument id and MUST route by the open group. Two
+    /// instruments legitimately share a `snapshot_id` within one rotation (it is monotonic per
+    /// `(channel, instrument)`, not per channel), so keying the route on the id sends one
+    /// instrument's levels into the other's book.
+    #[test]
+    fn mbp_snapshot_levels_route_by_open_group_not_snapshot_id() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41, 42])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        // Both rotations use snapshot_id 5 — the collision the route must not key on.
+        for (id, price) in [(41u32, 6200i64), (42, 6300)] {
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 2, &mbp_snapshot(id, 5, 0, 0, &[(MBP_BID, price, 10)])),
+                &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+            );
+        }
+
+        let books = drain_books(&mut rx);
+        assert_eq!(books.len(), 2, "one re-baseline per instrument");
+        for (b, price) in books.iter().zip([6200.0, 6300.0]) {
+            assert_eq!(
+                shape(b),
+                vec![
+                    (BookAction::Clear, BookSide::Both, 0.0, 0.0),
+                    (BookAction::Update, BookSide::Bid, price, 10.0),
+                ],
+                "instrument {} holds only its own level",
+                b.instrument_id
+            );
+        }
+    }
+
+    /// A snapshot install re-baselines: `clear` first, then the complete level set, `snapshot: true`
+    /// and `last: true`. `changes[0].action == Clear` is what a consumer keys on.
+    #[test]
+    fn mbp_a_snapshot_install_emits_clear_then_the_full_level_set() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                2,
+                &mbp_snapshot(
+                    41,
+                    1,
+                    0,
+                    0,
+                    &[
+                        (MBP_BID, 6100, 20),
+                        (MBP_BID, 6200, 10),
+                        (MBP_ASK, 6300, 30),
+                    ],
+                ),
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+
+        let books = drain_books(&mut rx);
+        assert_eq!(books.len(), 1);
+        assert!(books[0].snapshot, "advisory rebuild flag");
+        assert!(books[0].last, "a buffering consumer wedges without it");
+        assert_eq!(
+            shape(&books[0]),
+            vec![
+                (BookAction::Clear, BookSide::Both, 0.0, 0.0),
+                (BookAction::Update, BookSide::Bid, 6200.0, 10.0),
+                (BookAction::Update, BookSide::Bid, 6100.0, 20.0),
+                (BookAction::Update, BookSide::Ask, 6300.0, 30.0),
+            ],
+            "clear, then bids best-first and asks best-first"
+        );
+    }
+
+    /// A batch of level updates in one frame coalesces into ONE `book` message per instrument, with
+    /// `last: true`. Cross-instrument atomicity is not promised, so per-frame batching is correct.
+    #[test]
+    fn mbp_one_book_message_per_instrument_per_frame() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41, 42]);
+        let _ = drain_books(&mut rx);
+
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                100,
+                &[
+                    mbp_level(41, 1, MBP_BID, 6200, 10, 7_000),
+                    mbp_level(42, 1, MBP_BID, 6300, 20, 7_001),
+                    mbp_level(41, 2, MBP_ASK, 6400, 30, 7_002),
+                ],
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        let books = drain_books(&mut rx);
+        assert_eq!(books.len(), 2, "one batch per instrument, not per message");
+        assert_eq!(
+            books.iter().map(|b| b.instrument_id).collect::<Vec<_>>(),
+            vec![41, 42],
+            "ascending instrument id"
+        );
+        assert!(books.iter().all(|b| b.last && !b.snapshot));
+        assert_eq!(
+            shape(&books[0]),
+            vec![
+                (BookAction::Update, BookSide::Bid, 6200.0, 10.0),
+                (BookAction::Update, BookSide::Ask, 6400.0, 30.0),
+            ],
+            "41 carries both of its changes in arrival order"
+        );
+        assert_eq!(
+            books[0].source_ts_ns, 7_002,
+            "the latest applied event's time"
+        );
+    }
+
+    /// A level update to quantity `0` removes the level, so it publishes as `Delete` with size 0 —
+    /// the wire `Action` byte never decides this, the quantity does.
+    #[test]
+    fn mbp_a_zero_quantity_level_publishes_as_a_delete() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mkt,
+        );
+        let _ = drain_books(&mut rx);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 101, &[mbp_level(41, 2, MBP_BID, 6200, 0, 7_001)]),
+            &mkt,
+        );
+
+        assert_eq!(
+            shape(&drain_books(&mut rx)[0]),
+            vec![(BookAction::Delete, BookSide::Bid, 6200.0, 0.0)]
+        );
+    }
+
+    /// A `BookClear` scoped to a price publishes the exact levels it removed. The wire `Clear`
+    /// carries no price bound, so publishing one would tell the consumer to drop the whole side
+    /// while this book keeps its inside levels — the two would diverge with every sequence check
+    /// passing. A whole-side clear is expressible and stays one `Clear`.
+    #[test]
+    fn mbp_a_from_price_clear_publishes_exact_deletes() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                2,
+                &mbp_snapshot(
+                    41,
+                    1,
+                    0,
+                    0,
+                    &[
+                        (MBP_BID, 6200, 10),
+                        (MBP_BID, 6100, 20),
+                        (MBP_BID, 6000, 30),
+                        (MBP_ASK, 6300, 40),
+                    ],
+                ),
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        let _ = drain_books(&mut rx);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        let clear = |seq: u32, clear_side: u8, scope: u8, from: i64| {
+            mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                instrument_id: 41,
+                source_id: 0,
+                clear_side,
+                scope,
+                per_instrument_seq: seq,
+                from_price_raw: from,
+                ts: 7_000 + seq as u64,
+                clear_reason: 0,
+            })
+        };
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                100,
+                &[clear(
+                    1,
+                    codec_mbp::CLEAR_SIDE_BID,
+                    codec_mbp::SCOPE_FROM_PRICE,
+                    6100,
+                )],
+            ),
+            &mkt,
+        );
+        let books = drain_books(&mut rx);
+        assert_eq!(
+            shape(&books[0]),
+            vec![
+                (BookAction::Delete, BookSide::Bid, 6000.0, 0.0),
+                (BookAction::Delete, BookSide::Bid, 6100.0, 0.0),
+            ],
+            "only the levels the clear actually removed, not the surviving 6200"
+        );
+
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                101,
+                &[clear(
+                    2,
+                    codec_mbp::CLEAR_SIDE_ASK,
+                    codec_mbp::SCOPE_ENTIRE_SIDE,
+                    0,
+                )],
+            ),
+            &mkt,
+        );
+        assert_eq!(
+            shape(&drain_books(&mut rx)[0]),
+            vec![(BookAction::Clear, BookSide::Ask, 0.0, 0.0)],
+            "a whole-side clear is expressible verbatim"
+        );
+    }
+
+    /// Emission gates per instrument on a known definition — precision before price, the same gate
+    /// every other processor applies. A book for an undefined instrument is never even created.
+    #[test]
+    fn mbp_no_book_is_emitted_before_the_instrument_definition() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 2, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "no price without precision"
+        );
+        assert!(proc.books.is_empty(), "and no book to hold it");
+    }
+
+    /// Only the wire `symbol` is a label; the identity triple is what rides the message.
+    #[test]
+    fn mbp_emitted_books_carry_the_channel_and_instrument_id() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 7, 0, &[41]);
+        let _ = drain_books(&mut rx);
+        proc.on_datagram(
+            &mbp_wire::frame(7, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        let books = drain_books(&mut rx);
+        assert_eq!(books[0].channel, 7, "the frame header's channel_id");
+        assert_eq!(books[0].instrument_id, 41, "the wire instrument id");
+        assert_eq!(&*books[0].symbol, "INST-41", "a display label only");
+    }
+
+    /// The `instrument` definition carries the same identity pair, so a consumer joins a book to its
+    /// precision on `(venue, channel, instrument_id)` rather than the colliding `symbol`.
+    #[test]
+    fn mbp_instrument_definitions_carry_the_identity_pair() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(7, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+
+        let mut seen = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Instrument(i) = &*m {
+                seen.push((i.channel, i.instrument_id));
+            }
+        }
+        assert_eq!(seen, vec![(7, 41)]);
+        assert!(proc.books.is_empty(), "reference data alone builds no book");
+    }
+
+    /// Trades are emitted only when the feed row owns them, exactly as the other processors gate.
+    #[test]
+    fn mbp_trades_are_emitted_only_when_the_row_owns_them() {
+        let trade = mbp_wire::enc_trade(&codec_mbp::Trade {
+            instrument_id: 41,
+            source_id: 0,
+            aggressor_side: codec_mbp::AGGRESSOR_BUY,
+            trade_flags: 0,
+            source_ts: 7_000,
+            trade_price_raw: 6200,
+            trade_qty_raw: 5,
+            trade_id: 99,
+            cumulative_volume_raw: 500,
+        });
+        for (emit_trades, want) in [(true, 1), (false, 0)] {
+            let (arbiter, mut rx, instruments) = mbp_harness();
+            let mut proc = MbpProcessor::new(emit_trades);
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+                &make_ctx(&arbiter, &instruments, PortRole::Combined),
+            );
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 2, std::slice::from_ref(&trade)),
+                &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+            );
+            let trades = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|m| matches!(&**m, FeedMessage::Trade(_)))
+                .count();
+            assert_eq!(trades, want, "emit_trades = {emit_trades}");
+        }
+    }
+
+    /// §4.7 — `EndOfSession` from one arm must drop only that arm's books. Under the order-keyed
+    /// processor's handler it also cleared the venue's shared floor, so one arm shutting down tore
+    /// down the live published book.
+    #[test]
+    fn mbp_end_of_session_is_scoped_to_the_emitting_arm() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        let mut proc = MbpProcessor::new(false);
+        // Reference-data state is per publisher, so each arm sends its own burst — which is what
+        // they do on the wire, sharing one refdata port.
+        for publisher in [pub_a, pub_b] {
+            let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
+            refdata.publisher = publisher;
+            proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            let mut snap = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
+            snap.publisher = publisher;
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+                &snap,
+            );
+        }
+        assert_eq!(mbp_status(&proc, pub_b, 0, 41), Some(BookStatus::Ready));
+
+        let mut a_mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        a_mkt.publisher = pub_a;
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
+            &a_mkt,
+        );
+
+        assert_eq!(
+            mbp_status(&proc, pub_a, 0, 41),
+            Some(BookStatus::AwaitingSnapshot),
+            "the ending arm's book is dropped"
+        );
+        assert_eq!(
+            mbp_status(&proc, pub_b, 0, 41),
+            Some(BookStatus::Ready),
+            "the peer arm keeps serving; authority transfers to it"
+        );
+    }
+
+    /// §4.9 — a reset is any CHANGE in `Reset Count`, including the 255 -> 0 wrap. Comparing for
+    /// ordering (`>`) would silently ignore the wrap and keep applying deltas against discarded
+    /// publisher state.
+    #[test]
+    fn mbp_reset_count_wrap_is_a_reset() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 255, &[41]);
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            None,
+            "the pre-wrap book is discarded, not applied to"
+        );
+    }
+
+    /// ...and it is scoped to the publisher that reset, per the same rule as reference data.
+    #[test]
+    fn mbp_reset_count_change_is_scoped_to_the_publisher() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        let mut proc = MbpProcessor::new(false);
+        for publisher in [pub_a, pub_b] {
+            let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
+            refdata.publisher = publisher;
+            proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            let mut snap = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
+            snap.publisher = publisher;
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+                &snap,
+            );
+        }
+
+        let mut a_mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        a_mkt.publisher = pub_a;
+        proc.on_datagram(&mbp_wire::frame(0, 1, 100, &[]), &a_mkt);
+
+        assert_eq!(mbp_status(&proc, pub_a, 0, 41), None, "A's state discarded");
+        assert_eq!(
+            mbp_status(&proc, pub_b, 0, 41),
+            Some(BookStatus::Ready),
+            "B never reset"
+        );
+    }
+
+    /// §4.5 — the cross-instrument buffer is bounded and overflow drops the largest buffer, marks
+    /// that instrument `Gap`, and counts it. It must never take the channel down.
+    ///
+    /// The budget is only reachable with several heavily-buffering instruments: `pricebook`'s
+    /// per-book cap is a quarter of it, so one instrument alone is clamped there first.
+    #[test]
+    fn mbp_buffer_overflow_drops_the_largest_instrument_and_counts_it() {
+        let venue = "MbpBufferOverflowTest";
+        let heavy: Vec<u32> = (41..=44).collect();
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        let mut ids = heavy.clone();
+        ids.push(99);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&ids)),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
+        );
+        // Deltas for a never-snapshotted instrument buffer. Filled through `with_book` rather than
+        // millions of datagrams: the path under test is the budget check on the next datagram, and
+        // `with_book` is the one accounting seam the running total depends on.
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        let fill = |proc: &mut MbpProcessor, id: u32, n: usize| {
+            let key = proc.ensure_book(&mkt, 0, id).expect("defined instrument");
+            proc.with_book(&key, |b| {
+                for seq in 1..=n as u32 {
+                    b.on_delta(
+                        PriceDeltaOp {
+                            seq,
+                            mktdata_seq: seq as u64,
+                            ts: seq as u64,
+                            delta: BookDelta::Level {
+                                side: MBP_BID,
+                                price_raw: 6_200,
+                                qty_raw: 1,
+                                order_count: None,
+                                level_flags: 0,
+                                action: 1,
+                            },
+                        },
+                        &mut Vec::new(),
+                    );
+                }
+            });
+        };
+        let per_book = MAX_BUFFERED_DELTAS_ACROSS_BOOKS / heavy.len();
+        for id in &heavy {
+            fill(&mut proc, *id, per_book);
+        }
+        fill(&mut proc, 99, 10);
+        assert_eq!(
+            proc.buffered_total,
+            MAX_BUFFERED_DELTAS_ACROSS_BOOKS + 10,
+            "the running total tracks every book"
+        );
+
+        let before = metrics()
+            .mbp_buffer_overflows
+            .with_label_values(&[venue])
+            .get();
+        proc.on_datagram(&mbp_wire::frame(0, 0, 2, &[]), &mkt);
+
+        assert!(
+            proc.buffered_total <= MAX_BUFFERED_DELTAS_ACROSS_BOOKS,
+            "back under budget, got {}",
+            proc.buffered_total
+        );
+        let dropped: Vec<u32> = heavy
+            .iter()
+            .copied()
+            .filter(|id| proc.books[&(TEST_PUB, 0, *id)].buffered_len() == 0)
+            .collect();
+        assert_eq!(dropped.len(), 1, "exactly one heavy buffer is dropped");
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, dropped[0]),
+            Some(BookStatus::Gap),
+            "and recovers on its next snapshot like any other gapped instrument"
+        );
+        assert_eq!(
+            proc.books[&(TEST_PUB, 0, 99)].buffered_len(),
+            10,
+            "the small instrument is untouched — the channel never goes down"
+        );
+        assert_eq!(
+            metrics()
+                .mbp_buffer_overflows
+                .with_label_values(&[venue])
+                .get(),
+            before + 1
+        );
+    }
+
+    /// The O(1) budget check rests on `buffered_total` matching the true sum, so every path that can
+    /// change a buffer must run through `with_book`. This drives all of them and compares.
+    #[test]
+    fn mbp_buffered_total_matches_the_recomputed_sum() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41, 42]);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let recomputed =
+            |p: &MbpProcessor| p.books.values().map(|b| b.buffered_len()).sum::<usize>();
+
+        // Gap both instruments (a forward jump buffers), then exercise each mutation in turn.
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                100,
+                &[
+                    mbp_level(41, 9, MBP_BID, 6200, 10, 7_000),
+                    mbp_level(42, 9, MBP_BID, 6300, 10, 7_001),
+                    mbp_level(41, 10, MBP_BID, 6100, 10, 7_002),
+                ],
+            ),
+            &mkt,
+        );
+        assert!(proc.buffered_total > 0, "the gap buffered something");
+        assert_eq!(proc.buffered_total, recomputed(&proc), "after buffering");
+
+        // A snapshot install replays past the anchor and drains what it consumed.
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 101, &mbp_snapshot(41, 2, 100, 8, &[])),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        assert_eq!(proc.buffered_total, recomputed(&proc), "after a replay");
+
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                102,
+                &[mbp_wire::enc_instrument_reset(
+                    &codec_mbp::InstrumentReset {
+                        instrument_id: 42,
+                        reason: 0,
+                        new_anchor_seq: 200,
+                        ts: 7_003,
+                    },
+                )],
+            ),
+            &mkt,
+        );
+        assert_eq!(proc.buffered_total, recomputed(&proc), "after a reset");
+
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 103, &[mbp_level(42, 20, MBP_BID, 6300, 10, 7_004)]),
+            &mkt,
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 104, &[mbp_wire::enc_end_of_session(9_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            proc.buffered_total, 0,
+            "an ended session's buffers belong to it"
+        );
+        assert_eq!(
+            proc.buffered_total,
+            recomputed(&proc),
+            "after end of session"
+        );
+
+        // ...and a forgotten book takes its buffer out of the total.
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 105, &[mbp_level(41, 30, MBP_BID, 6200, 10, 7_005)]),
+            &mkt,
+        );
+        proc.forget_book(&(TEST_PUB, 0, 41));
+        assert_eq!(proc.buffered_total, recomputed(&proc), "after an eviction");
+    }
+
+    /// A crossed inside market is counted and surfaced, and MUST NOT change status or discard the
+    /// book — an instrument holding corrupt state is repaired by its next snapshot on exactly the
+    /// schedule it would have been anyway.
+    #[test]
+    fn mbp_a_crossed_book_is_counted_not_acted_on() {
+        let venue = "MbpCrossedTest";
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                2,
+                &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10), (MBP_ASK, 6300, 20)]),
+            ),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot),
+        );
+
+        let before = metrics().mbp_crossed.with_label_values(&[venue]).get();
+        // The boundary is the consistency point: mid-batch a crossed inside market is legitimate.
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                100,
+                &[
+                    mbp_level(41, 1, MBP_ASK, 6100, 5, 7_000),
+                    mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                        batch_id: 1,
+                        batch_time: 7_001,
+                    }),
+                ],
+            ),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert_eq!(
+            metrics().mbp_crossed.with_label_values(&[venue]).get(),
+            before + 1
+        );
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "monitoring never changes status"
+        );
+    }
+
+    /// A `last_applied_instrument_seq` above the publisher's real counter makes every delta read as
+    /// a duplicate and every snapshot as current while the book still reports `Ready`. We do not
+    /// self-heal that (the reference implementation does not either — a routed `Reset Count` clears
+    /// it), so the counter is the only thing that surfaces the wedge.
+    #[test]
+    fn mbp_duplicate_deltas_are_counted() {
+        let venue = "MbpDuplicateDeltaTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
+        );
+        // A snapshot claiming a baseline of 100 while the publisher is really at 1.
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 100, &[])),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot),
+        );
+        let _ = drain_books(&mut rx);
+
+        let before = metrics()
+            .mbp_duplicate_deltas
+            .with_label_values(&[venue])
+            .get();
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                100,
+                &[
+                    mbp_level(41, 1, MBP_BID, 6200, 10, 7_000),
+                    mbp_level(41, 2, MBP_BID, 6100, 10, 7_001),
+                ],
+            ),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert_eq!(
+            metrics()
+                .mbp_duplicate_deltas
+                .with_label_values(&[venue])
+                .get(),
+            before + 2,
+            "every delta below the installed baseline is counted"
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "a Ready book publishing nothing is the wedge's signature"
+        );
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+    }
+
+    /// A `SnapshotLevel` that no open group can route is dropped and counted — a publisher
+    /// interleaving groups, or a lost `SnapshotBegin`. It must never land in another book.
+    #[test]
+    fn mbp_orphan_snapshot_levels_are_counted() {
+        let venue = "MbpOrphanLevelTest";
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
+        );
+
+        let before = metrics()
+            .mbp_orphan_snapshot_levels
+            .with_label_values(&[venue])
+            .get();
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                2,
+                &[mbp_wire::enc_snapshot_level(&codec_mbp::SnapshotLevel {
+                    snapshot_id: 5,
+                    price_raw: 6200,
+                    qty_raw: 10,
+                    order_count: Some(1),
+                    side: MBP_BID,
+                    level_flags: 0,
+                })],
+            ),
+            &mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot),
+        );
+
+        assert_eq!(
+            metrics()
+                .mbp_orphan_snapshot_levels
+                .with_label_values(&[venue])
+                .get(),
+            before + 1
+        );
+        assert!(proc.books.is_empty(), "and it built no book to hold it");
+    }
+
+    /// The authority gate decides which arm reaches the wire from per-market health, so a book
+    /// leaving `Ready` has to be reported. Only transitions are reported, not every frame.
+    #[test]
+    fn mbp_book_health_reaches_the_authority() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        lock(&arbiter).set_authority(crate::ingest::authority::AuthorityConfig {
+            leader_timeout_ns: 1_000_000_000,
+            sample_interval_ns: 1_000_000_000,
+            transfer_margin_ns: 1_000,
+            transfer_win_rate: 0.6,
+            min_window_samples: 10,
+        });
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 3, 0, &[41]);
+        let market = (crate::model::venue_arc("TV"), 3u32, 41u32);
+        let arm = Publisher::Edge(TEST_PUB);
+        let healthy = |a: &SharedArbiter| {
+            lock(a)
+                .authority()
+                .expect("configured")
+                .healthy(&market, arm)
+        };
+
+        proc.on_datagram(
+            &mbp_wire::frame(3, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert!(
+            !healthy(&arbiter),
+            "an ended session hands the market to the peer arm"
+        );
+
+        // The recovery direction is what pins a real report: `healthy` answers true for a market the
+        // authority has never heard of, so only the unhealthy -> healthy transition proves the call.
+        proc.on_datagram(
+            &mbp_wire::frame(3, 0, 101, &mbp_snapshot(41, 2, 0, 0, &[])),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        assert!(healthy(&arbiter), "a re-synced book takes its market back");
+    }
+
+    /// The `(publisher, channel)` reset/open-group maps take their keys from unauthenticated wire
+    /// data, so they must stay bounded — and a publisher we hold no reference data for must not enter
+    /// them at all: it has no books to invalidate, and minting state from the market-data path is what
+    /// would let a forged-source flood evict the real publishers' definitions.
+    #[test]
+    fn mbp_channel_key_maps_are_bounded_and_untracked_publishers_mint_nothing() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+
+        // A market-data flood from publishers that never sent reference data, each bumping its epoch.
+        for i in 0..(MAX_CHANNEL_KEYS as u32 + 50) {
+            for reset_count in [0, 1] {
+                let mut ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+                ctx.publisher = ip(i);
+                proc.on_datagram(&mbp_wire::frame(0, reset_count, 1, &[]), &ctx);
+            }
+        }
+        assert_eq!(
+            proc.last_reset.len(),
+            1,
+            "only the real publisher is tracked"
+        );
+        assert!(
+            proc.state.def(TEST_PUB, 41).is_some(),
+            "its definitions survive"
+        );
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "and so does its book"
+        );
+
+        // Two tracked publishers across the whole channel space overflow the map, oldest first.
+        let peer = ip(1_000);
+        let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
+        refdata.publisher = peer;
+        proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        for publisher in [TEST_PUB, peer] {
+            for channel in 0..=u8::MAX {
+                let mut ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+                ctx.publisher = publisher;
+                proc.on_datagram(&mbp_wire::frame(channel, 0, 1, &[]), &ctx);
+            }
+        }
+        assert!(
+            proc.last_reset.len() <= MAX_CHANNEL_KEYS,
+            "reset map must stay bounded, got {}",
+            proc.last_reset.len()
+        );
+        assert!(
+            proc.last_reset.contains_key(&(peer, u8::MAX)),
+            "newest kept"
+        );
+        assert!(
+            !proc.last_reset.contains_key(&(TEST_PUB, 1)),
+            "oldest evicted"
+        );
+    }
+
+    /// An unrecognized `clear_side` clears nothing in the book (`PriceBook::apply` matches the three
+    /// known values exactly), so the wire must claim nothing either. Publishing a whole-side `Clear`
+    /// would drop a side the consumer should keep, silently, with every later sequence check passing
+    /// and no snapshot rotation to repair it.
+    #[test]
+    fn mbp_an_unrecognized_clear_side_publishes_nothing() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                2,
+                &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10), (MBP_ASK, 6300, 20)]),
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        let _ = drain_books(&mut rx);
+
+        proc.on_datagram(
+            &mbp_wire::frame(
+                0,
+                0,
+                100,
+                &[mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                    instrument_id: 41,
+                    source_id: 0,
+                    clear_side: 3, // outside the wire's three defined values
+                    scope: codec_mbp::SCOPE_ENTIRE_SIDE,
+                    per_instrument_seq: 1,
+                    from_price_raw: 0,
+                    ts: 7_000,
+                    clear_reason: 0,
+                })],
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "the book cleared nothing, so nothing is published"
+        );
+        let book = &proc.books[&(TEST_PUB, 0, 41)];
+        assert_eq!(book.bids().count(), 1, "both sides intact");
+        assert_eq!(book.asks().count(), 1);
+    }
+
+    /// A publisher restart bumps the epoch on all three ports, but they are separate sockets with
+    /// separate queues: the previous epoch's snapshot rotation is still arriving after the market-data
+    /// port has moved on. Installing it would republish the dead session's book as a fresh
+    /// re-baseline, and a reset memo shared across the roles would re-reset the channel on every
+    /// interleaving of the backlog.
+    #[test]
+    fn mbp_a_stale_epoch_snapshot_neither_installs_nor_resets() {
+        let venue = "MbpStaleEpochTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(false);
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        // Epoch 1: definitions, then a snapshot that installs and publishes its re-baseline.
+        proc.on_datagram(&mbp_wire::frame(0, 1, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::frame(0, 1, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &snap,
+        );
+        assert_eq!(drain_books(&mut rx).len(), 1, "the current epoch installs");
+
+        let resets = || {
+            metrics()
+                .mbp_channel_resets
+                .with_label_values(&[venue])
+                .get()
+        };
+        let before = (
+            resets(),
+            metrics()
+                .mbp_orphan_snapshot_levels
+                .with_label_values(&[venue])
+                .get(),
+        );
+        // The previous run's rotation, still draining off the snapshot socket.
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 3, &mbp_snapshot(41, 9, 0, 0, &[(MBP_BID, 1, 1)])),
+            &snap,
+        );
+
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "the dead epoch's book is not republished"
+        );
+        assert_eq!(
+            resets(),
+            before.0,
+            "and a snapshot-port frame resets nothing"
+        );
+        assert_eq!(
+            metrics()
+                .mbp_orphan_snapshot_levels
+                .with_label_values(&[venue])
+                .get(),
+            before.1 + 1,
+            "its levels are counted as unroutable"
+        );
+        assert_eq!(
+            proc.books[&(TEST_PUB, 0, 41)].bids().next().map(|(p, _)| p),
+            Some(6200),
+            "the live book is untouched"
+        );
+    }
+
+    /// The book map is bounded the same way, since the wire `instrument_id` is spoofable too. An
+    /// evicted book must also be reported unhealthy: this arm no longer holds that market, and a stale
+    /// `healthy` report would keep the authority electing it while a peer arm's live book is dropped.
+    #[test]
+    fn mbp_books_map_is_bounded_under_instrument_flood() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        lock(&arbiter).set_authority(crate::ingest::authority::AuthorityConfig {
+            leader_timeout_ns: 1_000_000_000,
+            sample_interval_ns: 1_000_000_000,
+            transfer_margin_ns: 1_000,
+            transfer_win_rate: 0.6,
+            min_window_samples: 10,
+        });
+        let mut proc = MbpProcessor::new(false);
+        let ids: Vec<u32> = (0..(MAX_PRICE_BOOKS as u32 + 50)).collect();
+        // One burst per 200 definitions keeps each frame's message count inside the header's u8.
+        for chunk in ids.chunks(200) {
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 1, &mbp_refdata(chunk)),
+                &make_ctx(&arbiter, &instruments, PortRole::Combined),
+            );
+        }
+        for chunk in ids.chunks(100) {
+            let deltas: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|id| mbp_level(*id, 1, MBP_BID, 6200, 10, 7_000))
+                .collect();
+            proc.on_datagram(
+                &mbp_wire::frame(0, 0, 100, &deltas),
+                &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+            );
+        }
+
+        assert!(
+            proc.books.len() <= MAX_PRICE_BOOKS,
+            "book map must stay bounded, got {}",
+            proc.books.len()
+        );
+        assert_eq!(
+            proc.books.len(),
+            proc.books_order.len(),
+            "the eviction order tracks the map exactly"
+        );
+        assert!(
+            proc.health_reported.len() <= proc.books.len(),
+            "sibling maps stay a subset"
+        );
+        assert!(
+            !proc.books.contains_key(&(TEST_PUB, 0, 0)),
+            "the oldest book was evicted"
+        );
+        assert!(
+            !lock(&arbiter).authority().expect("configured").healthy(
+                &(crate::model::venue_arc("TV"), 0u32, 0u32),
+                Publisher::Edge(TEST_PUB)
+            ),
+            "an evicted book leaves its market unhealthy for this arm"
         );
     }
 }

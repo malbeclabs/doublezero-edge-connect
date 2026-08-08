@@ -46,7 +46,10 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::{
-    ingest::feeds::ArbitrationMode,
+    ingest::{
+        authority::{AuthorityConfig, MarketKey, StickyAuthority},
+        feeds::ArbitrationMode,
+    },
     metrics::metrics,
     model::{
         self, now_mono_ns, now_ns, DepthSnapshot, FeedMessage, NormalizedDepth, NormalizedQuote,
@@ -490,12 +493,15 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
-    /// Last broadcast content per `(venue, symbol)` plus the monotonic time it went out, so
-    /// mirrored publishers' identical definition bursts collapse to one wire message while the
-    /// content is still re-announced every [`INSTRUMENT_REANNOUNCE_NS`]. Keyed identically to the
-    /// `InstrumentSnapshot` that `processor::upsert_instrument` already maintains, so this adds no
-    /// new unbounded-growth surface beyond the one that map already has.
-    instrument_defs: HashMap<(Arc<str>, Arc<str>), (InstrumentId, u64)>,
+    /// Last broadcast content per `(venue, channel, instrument_id)` plus the monotonic time it went
+    /// out, so mirrored publishers' identical definition bursts collapse to one wire message while
+    /// the content is still re-announced every [`INSTRUMENT_REANNOUNCE_NS`]. Keyed on the identity
+    /// triple rather than `(venue, symbol)`: the market-by-price wire truncates symbols to 16 bytes
+    /// and two instrument ids already collide on one truncation in a live capture, so a
+    /// symbol-keyed rate limit would starve a `{"channel":N}` subscriber of a definition another
+    /// channel announced first. Bounded by the distinct instrument count, like the
+    /// `InstrumentSnapshot` `processor::upsert_instrument` maintains.
+    instrument_defs: HashMap<MarketKey, (InstrumentId, u64)>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -523,6 +529,11 @@ pub struct Arbiter {
     no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
+    /// Single-arm authority for the incremental `book` product, wired by [`Self::set_authority`].
+    /// `None` until then, which is an honest passthrough for a process that never configured it —
+    /// there is deliberately no `Default` for [`AuthorityConfig`], since it would duplicate the five
+    /// `--arb-*` clap defaults and drift from them.
+    authority: Option<StickyAuthority>,
 }
 
 /// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
@@ -635,6 +646,28 @@ impl Arbiter {
             modes: HashMap::new(),
             no_id_owner: HashMap::new(),
             no_id_conflict_logged: false,
+            authority: None,
+        }
+    }
+
+    /// Wire the single-arm authority for `book`, built from the validated `--arb-*` config. Called
+    /// once at startup; without it `book` passes through undeduped (see the `Book` emit arm).
+    pub fn set_authority(&mut self, cfg: AuthorityConfig) {
+        self.authority = Some(StickyAuthority::new(cfg));
+    }
+
+    /// The configured authority, so a test can assert a processor's health reports landed.
+    #[cfg(test)]
+    pub(crate) fn authority(&self) -> Option<&StickyAuthority> {
+        self.authority.as_ref()
+    }
+
+    /// Report one arm's book health for a market, so authority transfers away from an arm whose book
+    /// is gapped or awaiting a snapshot. Called by the market-by-price processor on every `Ready`
+    /// transition; a no-op until [`Self::set_authority`] has run.
+    pub fn set_book_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
+        if let Some(a) = &mut self.authority {
+            a.set_health(key, publisher, healthy);
         }
     }
 
@@ -884,7 +917,7 @@ impl Arbiter {
                     qty_exponent: i.qty_exponent,
                 };
                 let now = now_mono_ns();
-                let key = (i.venue.clone(), i.symbol.clone());
+                let key = (i.venue.clone(), i.channel, i.instrument_id);
                 let forward = match self.instrument_defs.get(&key) {
                     Some((prev, last)) => {
                         *prev != id || now.saturating_sub(*last) >= INSTRUMENT_REANNOUNCE_NS
@@ -2114,10 +2147,19 @@ mod tests {
         }
     }
 
-    fn instrument(symbol: &str, price_exponent: i8, qty_exponent: i8) -> FeedMessage {
+    /// The dedup key is the identity triple, so an `instrument_id` per symbol is what the test
+    /// venue's publisher would send — two symbols sharing an id would legitimately collapse.
+    fn instrument(
+        instrument_id: u32,
+        symbol: &str,
+        price_exponent: i8,
+        qty_exponent: i8,
+    ) -> FeedMessage {
         FeedMessage::Instrument(crate::model::NormalizedInstrument {
             venue: "Hyperliquid".into(),
             symbol: symbol.into(),
+            channel: 0,
+            instrument_id,
             price_exponent,
             qty_exponent,
         })
@@ -2144,12 +2186,12 @@ mod tests {
         let peer = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(instrument("BTC", -2, -4), edge);
-        a.emit(instrument("BTC", -2, -4), edge); // same publisher's next burst -> dropped
-        a.emit(instrument("BTC", -2, -4), peer); // mirror's copy -> dropped
-        a.emit(instrument("ETH", -2, -4), edge); // different symbol -> kept
-        a.emit(instrument("BTC", -3, -4), peer); // real precision change -> kept
-        a.emit(instrument("BTC", -3, -4), edge); // ...then deduped at the new content
+        a.emit(instrument(1, "BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge); // same publisher's next burst -> dropped
+        a.emit(instrument(1, "BTC", -2, -4), peer); // mirror's copy -> dropped
+        a.emit(instrument(2, "ETH", -2, -4), edge); // different symbol -> kept
+        a.emit(instrument(1, "BTC", -3, -4), peer); // real precision change -> kept
+        a.emit(instrument(1, "BTC", -3, -4), edge); // ...then deduped at the new content
         assert_eq!(
             drain_instruments(&mut rx),
             vec![
@@ -2169,22 +2211,22 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(instrument("BTC", -2, -4), edge);
-        a.emit(instrument("BTC", -2, -4), edge); // inside the interval -> collapsed
+        a.emit(instrument(1, "BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge); // inside the interval -> collapsed
         assert_eq!(drain_instruments(&mut rx).len(), 1);
 
         // Backdate the last-broadcast stamp past the interval rather than sleeping 30s.
         for (_, last) in a.instrument_defs.values_mut() {
             *last = last.saturating_sub(INSTRUMENT_REANNOUNCE_NS);
         }
-        a.emit(instrument("BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge);
         assert_eq!(
             drain_instruments(&mut rx),
             vec![("BTC".to_string(), -2, -4)],
             "unchanged content must be re-announced once the interval elapses"
         );
         // ...and the clock restarts, so the next mirror copy collapses again.
-        a.emit(instrument("BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge);
         assert!(drain_instruments(&mut rx).is_empty());
     }
 }
