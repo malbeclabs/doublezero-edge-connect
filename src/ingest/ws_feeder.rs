@@ -326,7 +326,7 @@ mod tests {
         handle_text(frame, &arbiter, &instruments);
         match &*rx.try_recv().expect("a quote was emitted") {
             FeedMessage::Quote(q) => {
-                assert_eq!(q.venue, "Hyperliquid".into());
+                assert_eq!(q.venue, "HYPERLIQUID".into());
                 assert_eq!(q.symbol, "BTC".into());
                 assert_eq!(q.bid, 104783.0);
                 assert_eq!(q.ask, 104784.0);
@@ -479,7 +479,7 @@ mod tests {
         );
         assert_eq!(
             hl.venue(),
-            "Hyperliquid",
+            "HYPERLIQUID",
             "must match what the edge emits for this id"
         );
     }

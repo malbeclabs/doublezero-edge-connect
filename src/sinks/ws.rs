@@ -526,11 +526,11 @@ mod tests {
         // The wire venue is `Phoenix`; a filter spelled any case must still select it (the
         // PROTOCOL.md example historically showed `PHOENIX`, which would silently drop the feed
         // under an exact match).
-        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
-        assert!(filter(r#"{"venue":"phoenix"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
-        assert!(filter(r#"{"venue":"Phoenix"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
-        assert!(!filter(r#"{"venue":"Hyperliquid"}"#).matches(
-            "Phoenix",
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"phoenix"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(!filter(r#"{"venue":"HYPERLIQUID"}"#).matches(
+            "PHOENIX",
             Some("BTC"),
             None,
             "quote"
@@ -539,47 +539,47 @@ mod tests {
 
     #[test]
     fn omitted_field_matches_any_symbol_exact() {
-        assert!(filter("{}").matches("Phoenix", Some("BTC"), None, "quote")); // {} = everything
-        assert!(filter(r#"{"symbol":"BTC"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+        assert!(filter("{}").matches("PHOENIX", Some("BTC"), None, "quote")); // {} = everything
+        assert!(filter(r#"{"symbol":"BTC"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
         // symbol stays exact
-        assert!(!filter(r#"{"symbol":"btc"}"#).matches("Phoenix", Some("BTC"), None, "quote"));
+        assert!(!filter(r#"{"symbol":"btc"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
     }
 
     /// The omitted-field-matches-anything rule must survive the two new dimensions.
     #[test]
     fn empty_filter_still_matches_everything() {
         let f = filter("{}");
-        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "book"));
-        assert!(f.matches("Hyperliquid", Some("SOL"), None, "quote"));
-        assert!(f.matches("Lashay", None, None, "status"));
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(f.matches("KALSHI", None, None, "status"));
     }
 
     #[test]
     fn type_filter_selects_one_message_kind() {
         let f = filter(r#"{"type":"book"}"#);
-        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "book"));
-        assert!(!f.matches("Lashay", Some("KXBTCPERP"), Some(2), "quote"));
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "quote"));
     }
 
     /// `type` is matched exactly, like `symbol`: the wire values are a closed set the protocol
     /// defines, so a near-miss is a client bug worth surfacing as "no data" rather than guessing.
     #[test]
     fn type_filter_is_exact() {
-        assert!(!filter(r#"{"type":"BOOK"}"#).matches("Lashay", Some("X"), None, "book"));
+        assert!(!filter(r#"{"type":"BOOK"}"#).matches("KALSHI", Some("X"), None, "book"));
     }
 
     #[test]
     fn channel_filter_selects_one_channel() {
         let f = filter(r#"{"channel":2}"#);
-        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "book"));
-        assert!(!f.matches("Lashay", Some("KXBTCPERP"), Some(1), "book"));
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches("KALSHI", Some("KXBTCPERP"), Some(1), "book"));
     }
 
     /// An explicit channel filter must not pass a message that carries no channel — otherwise
     /// `{"channel":2}` would receive every quote on every venue.
     #[test]
     fn channel_filter_excludes_channelless_messages() {
-        assert!(!filter(r#"{"channel":2}"#).matches("Hyperliquid", Some("SOL"), None, "quote"));
+        assert!(!filter(r#"{"channel":2}"#).matches("HYPERLIQUID", Some("SOL"), None, "quote"));
     }
 
     /// `instrument` carries its own channel, so it is filtered like `book`: a channel-scoped client
@@ -587,11 +587,11 @@ mod tests {
     #[test]
     fn channel_filter_selects_one_channels_instrument_definitions() {
         let f = filter(r#"{"channel":2}"#);
-        assert!(f.matches("Lashay", Some("KXBTCPERP"), Some(2), "instrument"));
-        assert!(!f.matches("Lashay", Some("KXETHPERP"), Some(1), "instrument"));
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "instrument"));
+        assert!(!f.matches("KALSHI", Some("KXETHPERP"), Some(1), "instrument"));
         // `symbol` still narrows instruments independently of the channel.
         assert!(!filter(r#"{"channel":2,"symbol":"SOL"}"#).matches(
-            "Lashay",
+            "KALSHI",
             Some("KXBTCPERP"),
             Some(2),
             "instrument"
@@ -600,19 +600,19 @@ mod tests {
 
     /// `status` is venue-level: no symbol and no channel, so it matches on venue and type alone —
     /// the same carve-out `symbol` already has, extended to `channel`. Without this a
-    /// `{"venue":"Lashay","channel":2}` subscriber would never learn its venue went down.
+    /// `{"venue":"KALSHI","channel":2}` subscriber would never learn its venue went down.
     #[test]
     fn status_matches_on_venue_despite_symbol_and_channel_filters() {
-        let f = filter(r#"{"venue":"Lashay","symbol":"KXBTCPERP","channel":2}"#);
-        assert!(f.matches("Lashay", None, None, "status"));
-        assert!(!f.matches("Hyperliquid", None, None, "status"));
+        let f = filter(r#"{"venue":"KALSHI","symbol":"KXBTCPERP","channel":2}"#);
+        assert!(f.matches("KALSHI", None, None, "status"));
+        assert!(!f.matches("HYPERLIQUID", None, None, "status"));
     }
 
     /// ...but an explicit `type` filter still excludes it, so a consumer that asked for `book` only
     /// does not get status frames it never requested.
     #[test]
     fn type_filter_still_excludes_status() {
-        assert!(!filter(r#"{"type":"book"}"#).matches("Lashay", None, None, "status"));
+        assert!(!filter(r#"{"type":"book"}"#).matches("KALSHI", None, None, "status"));
     }
 
     /// `book` and `instrument` must carry their channel so an explicit channel filter can select
@@ -621,8 +621,8 @@ mod tests {
     fn prepare_populates_the_channel_for_book_and_instrument() {
         use super::prepare;
         let b = FeedMessage::Book(NormalizedBook {
-            venue: "Lashay".into(),
-            source: "Lashay".into(),
+            venue: "KALSHI".into(),
+            source: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -649,8 +649,8 @@ mod tests {
             "stamped, not left at 0"
         );
         let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
-            venue: "Lashay".into(),
-            source: "Lashay".into(),
+            venue: "KALSHI".into(),
+            source: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn venue_stays_case_insensitive() {
-        assert!(filter(r#"{"venue":"lashay"}"#).matches("Lashay", Some("X"), None, "book"));
+        assert!(filter(r#"{"venue":"kalshi"}"#).matches("KALSHI", Some("X"), None, "book"));
     }
 
     /// Poll `cond` until it holds, failing the test if it doesn't within ~2s. The metric updates we
@@ -689,8 +689,8 @@ mod tests {
 
     fn sample_quote() -> NormalizedQuote {
         NormalizedQuote {
-            venue: "Hyperliquid".into(),
-            source: "Hyperliquid".into(),
+            venue: "HYPERLIQUID".into(),
+            source: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bid: 1.0,
@@ -860,10 +860,10 @@ mod tests {
         for sym in ["SOL", "BTC"] {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("Hyperliquid"), arc.clone()),
+                (Arc::<str>::from("HYPERLIQUID"), arc.clone()),
                 NormalizedInstrument {
-                    venue: "Hyperliquid".into(),
-                    source: "Hyperliquid".into(),
+                    venue: "HYPERLIQUID".into(),
+                    source: "HYPERLIQUID".into(),
                     source_id: 0,
                     symbol: arc,
                     channel: 0,
@@ -979,10 +979,10 @@ mod tests {
         for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("Lashay"), arc.clone()),
+                (Arc::<str>::from("KALSHI"), arc.clone()),
                 NormalizedInstrument {
-                    venue: "Lashay".into(),
-                    source: "Lashay".into(),
+                    venue: "KALSHI".into(),
+                    source: "KALSHI".into(),
                     source_id: 0,
                     symbol: arc,
                     channel,
@@ -1079,8 +1079,8 @@ mod tests {
 
     fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
         NormalizedBook {
-            venue: "Lashay".into(),
-            source: "Lashay".into(),
+            venue: "KALSHI".into(),
+            source: "KALSHI".into(),
             source_id: 0,
             symbol: symbol.into(),
             channel: 0,
@@ -1185,7 +1185,7 @@ mod tests {
     async fn connect_replays_the_accumulated_book_rebaseline() {
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1222,11 +1222,11 @@ mod tests {
     async fn subscribe_scopes_the_book_replay_by_channel() {
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         books.insert(
-            (Arc::<str>::from("Lashay"), 3u32, 7u32),
+            (Arc::<str>::from("KALSHI"), 3u32, 7u32),
             accumulator("KXETHPERP", 0.41, 0.43),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1273,10 +1273,10 @@ mod tests {
     async fn instrument_is_replayed_before_the_book() {
         let mut defs = HashMap::new();
         defs.insert(
-            (Arc::<str>::from("Lashay"), Arc::<str>::from("KXBTCPERP")),
+            (Arc::<str>::from("KALSHI"), Arc::<str>::from("KXBTCPERP")),
             NormalizedInstrument {
-                venue: "Lashay".into(),
-                source: "Lashay".into(),
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
                 source_id: 0,
                 symbol: "KXBTCPERP".into(),
                 channel: 2,
@@ -1287,7 +1287,7 @@ mod tests {
         );
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(defs, books).await;
@@ -1326,9 +1326,9 @@ mod tests {
         assert!(!mid_stream.baselined(), "no Clear was folded in");
 
         let mut books = HashMap::new();
-        books.insert((Arc::<str>::from("Lashay"), 3u32, 7u32), mid_stream);
+        books.insert((Arc::<str>::from("KALSHI"), 3u32, 7u32), mid_stream);
         books.insert(
-            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1368,7 +1368,7 @@ mod tests {
 
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("Lashay"), 2u32, 41u32),
+            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let cfg = WsConfig {
@@ -1412,14 +1412,14 @@ mod tests {
 
     #[test]
     fn a_source_filter_selects_the_same_messages_as_a_venue_filter() {
-        let by_venue: SubFilter = serde_json::from_str(r#"{"venue":"Hyperliquid"}"#).unwrap();
-        let by_source: SubFilter = serde_json::from_str(r#"{"source":"Hyperliquid"}"#).unwrap();
+        let by_venue: SubFilter = serde_json::from_str(r#"{"venue":"HYPERLIQUID"}"#).unwrap();
+        let by_source: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
         for kind in ["quote", "trade", "status"] {
             assert_eq!(
-                by_venue.matches("Hyperliquid", Some("SOL"), None, kind),
-                by_source.matches("Hyperliquid", Some("SOL"), None, kind),
+                by_venue.matches("HYPERLIQUID", Some("SOL"), None, kind),
+                by_source.matches("HYPERLIQUID", Some("SOL"), None, kind),
             );
-            assert!(!by_source.matches("Phoenix", Some("SOL"), None, kind));
+            assert!(!by_source.matches("PHOENIX", Some("SOL"), None, kind));
         }
     }
 
@@ -1427,7 +1427,7 @@ mod tests {
     #[test]
     fn a_source_filter_is_case_insensitive() {
         let f: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
-        assert!(f.matches("Hyperliquid", Some("SOL"), None, "quote"));
+        assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
     }
 
     /// Both keys present and disagreeing must match nothing — silently honouring one would make a
@@ -1435,8 +1435,8 @@ mod tests {
     #[test]
     fn disagreeing_source_and_venue_keys_match_nothing() {
         let f: SubFilter =
-            serde_json::from_str(r#"{"venue":"Hyperliquid","source":"Phoenix"}"#).unwrap();
-        assert!(!f.matches("Hyperliquid", Some("SOL"), None, "quote"));
-        assert!(!f.matches("Phoenix", Some("SOL"), None, "quote"));
+            serde_json::from_str(r#"{"venue":"HYPERLIQUID","source":"PHOENIX"}"#).unwrap();
+        assert!(!f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 }

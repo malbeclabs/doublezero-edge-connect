@@ -613,8 +613,8 @@ mod tests {
 
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
-            venue: "Lashay".into(),
-            source: "Lashay".into(),
+            venue: "KALSHI".into(),
+            source: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -653,7 +653,7 @@ mod tests {
         ));
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
         assert_eq!(v["type"], "book");
-        assert_eq!(v["venue"], "Lashay");
+        assert_eq!(v["venue"], "KALSHI");
         assert_eq!(v["symbol"], "KXBTCPERP");
         assert_eq!(v["channel"], 2);
         assert_eq!(v["instrument_id"], 41);
@@ -744,8 +744,8 @@ mod tests {
         let b = FeedMessage::Book(book(vec![], false, true));
         assert_eq!(b.channel(), Some(2));
         let q = FeedMessage::Status(FeedStatus {
-            venue: "Lashay".into(),
-            source: "Lashay".into(),
+            venue: "KALSHI".into(),
+            source: "KALSHI".into(),
             source_id: 0,
             state: "ok".into(),
             stale_ms: 0,
@@ -759,7 +759,7 @@ mod tests {
     #[test]
     fn book_reports_its_venue_and_symbol_for_filtering() {
         let b = FeedMessage::Book(book(vec![], false, true));
-        assert_eq!(b.venue_symbol(), ("Lashay", "KXBTCPERP"));
+        assert_eq!(b.venue_symbol(), ("KALSHI", "KXBTCPERP"));
     }
 
     /// The replay accumulator performs the same operation a consumer does, so a materialized book
@@ -767,7 +767,7 @@ mod tests {
     /// output leads with the `clear` that re-baselines the client.
     #[test]
     fn the_accumulator_materializes_the_applied_state() {
-        let venue: Arc<str> = "Lashay".into();
+        let venue: Arc<str> = "KALSHI".into();
         let mut acc = BookAccumulator::new("KXBTCPERP".into());
         acc.apply(&book(
             vec![
@@ -852,7 +852,7 @@ mod tests {
     /// output `last: true`, so a torn level set would be published to a replayed client as complete.
     #[test]
     fn a_batch_awaiting_its_last_is_not_materialized() {
-        let venue: Arc<str> = "Lashay".into();
+        let venue: Arc<str> = "KALSHI".into();
         let mut acc = BookAccumulator::new("KXBTCPERP".into());
         let bid = |price, size| BookChange {
             action: BookAction::Update,
@@ -914,7 +914,7 @@ mod tests {
     /// one entry that then lives in the replay map forever. Drop the change instead.
     #[test]
     fn non_finite_prices_and_sizes_are_dropped() {
-        let venue: Arc<str> = "Lashay".into();
+        let venue: Arc<str> = "KALSHI".into();
         let mut acc = BookAccumulator::new("KXBTCPERP".into());
         acc.apply(&book(
             vec![
@@ -970,7 +970,7 @@ mod tests {
     /// blank the last known event time on every later replay.
     #[test]
     fn a_zero_source_ts_does_not_blank_the_replayed_event_time() {
-        let venue: Arc<str> = "Lashay".into();
+        let venue: Arc<str> = "KALSHI".into();
         let mut acc = BookAccumulator::new("KXBTCPERP".into());
         acc.apply(&book(vec![], false, true));
         assert_eq!(
@@ -990,8 +990,8 @@ mod tests {
     #[test]
     fn a_quote_serializes_both_the_new_and_the_deprecated_source_fields() {
         let q = NormalizedQuote {
-            venue: Arc::from("Hyperliquid"),
-            source: Arc::from("Hyperliquid"),
+            venue: Arc::from("HYPERLIQUID"),
+            source: Arc::from("HYPERLIQUID"),
             source_id: 1,
             symbol: Arc::from("SOL"),
             bid: 1.0,
@@ -1006,8 +1006,8 @@ mod tests {
             ws_send_ts_ns: 0,
         };
         let v: serde_json::Value = serde_json::to_value(&q).unwrap();
-        assert_eq!(v["venue"], "Hyperliquid");
-        assert_eq!(v["source"], "Hyperliquid");
+        assert_eq!(v["venue"], "HYPERLIQUID");
+        assert_eq!(v["source"], "HYPERLIQUID");
         assert_eq!(v["source_id"], 1);
     }
 
@@ -1015,10 +1015,10 @@ mod tests {
     /// fixture and every older consumer's round-trip breaks.
     #[test]
     fn a_payload_without_the_new_fields_still_deserializes() {
-        let json = r#"{"venue":"Phoenix","symbol":"SOL","bid":1.0,"ask":2.0,
+        let json = r#"{"venue":"PHOENIX","symbol":"SOL","bid":1.0,"ask":2.0,
             "bid_size":3.0,"ask_size":4.0,"source_ts_ns":0,"recv_ts_ns":0}"#;
         let q: NormalizedQuote = serde_json::from_str(json).unwrap();
-        assert_eq!(&*q.venue, "Phoenix");
+        assert_eq!(&*q.venue, "PHOENIX");
         assert_eq!(&*q.source, "");
         assert_eq!(q.source_id, 0);
     }
@@ -1028,7 +1028,7 @@ mod tests {
     /// book that reports 0.
     #[test]
     fn a_materialized_book_carries_the_accumulated_source_id() {
-        let venue: Arc<str> = Arc::from("Hyperliquid");
+        let venue: Arc<str> = Arc::from("HYPERLIQUID");
         let mut acc = BookAccumulator::new(Arc::from("SOL"));
         acc.apply(&NormalizedBook {
             venue: venue.clone(),

@@ -73,7 +73,7 @@ async fn edge_leads_steady_state_public_dropped() {
     let mock = MockWsInput::start().await;
     let url = mock.url();
     let bridge = Bridge::spawn_with_args(
-        "Hyperliquid",
+        "HYPERLIQUID",
         18181,
         &["--ws-input-url", &url, "--ws-input-coins", "BTC"],
     );
@@ -155,7 +155,7 @@ async fn edge_gap_public_fills_in() {
     let mock = MockWsInput::start().await;
     let url = mock.url();
     let bridge = Bridge::spawn_with_args(
-        "Hyperliquid",
+        "HYPERLIQUID",
         18182,
         &["--ws-input-url", &url, "--ws-input-coins", "BTC"],
     );
@@ -215,7 +215,7 @@ async fn edge_gap_public_fills_in() {
     assert!(
         quotes
             .iter()
-            .all(|q| q.get("venue").and_then(|v| v.as_str()) == Some("Hyperliquid")),
+            .all(|q| q.get("venue").and_then(|v| v.as_str()) == Some("HYPERLIQUID")),
         "public quotes must be tagged with the Hyperliquid venue"
     );
     assert!(

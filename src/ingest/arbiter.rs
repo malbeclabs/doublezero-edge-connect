@@ -1620,8 +1620,8 @@ mod tests {
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
-            venue: "Hyperliquid".into(),
-            source: "Hyperliquid".into(),
+            venue: "HYPERLIQUID".into(),
+            source: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bid,
@@ -1692,8 +1692,8 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |id: u64| {
             FeedMessage::Trade(NormalizedTrade {
-                venue: "Hyperliquid".into(),
-                source: "Hyperliquid".into(),
+                venue: "HYPERLIQUID".into(),
+                source: "HYPERLIQUID".into(),
                 source_id: 0,
                 symbol: "BTC".into(),
                 price: 100.0,
@@ -1723,8 +1723,8 @@ mod tests {
 
     fn trade(trade_id: u64) -> NormalizedTrade {
         NormalizedTrade {
-            venue: "Lashay".into(),
-            source: "Lashay".into(),
+            venue: "KALSHI".into(),
+            source: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             price: 0.62,
@@ -1899,8 +1899,8 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = || {
             FeedMessage::Trade(NormalizedTrade {
-                venue: "Hyperliquid".into(),
-                source: "Hyperliquid".into(),
+                venue: "HYPERLIQUID".into(),
+                source: "HYPERLIQUID".into(),
                 source_id: 0,
                 symbol: "BTC".into(),
                 price: 100.0,
@@ -2105,8 +2105,8 @@ mod tests {
 
     fn depth(source_ts_ns: u64, bids: Vec<[f64; 2]>, asks: Vec<[f64; 2]>) -> NormalizedDepth {
         NormalizedDepth {
-            venue: "Hyperliquid".into(),
-            source: "Hyperliquid".into(),
+            venue: "HYPERLIQUID".into(),
+            source: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bids,
@@ -2273,7 +2273,7 @@ mod tests {
         ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
         let map = model::lock(&replay);
         let entry = map
-            .get(&("Hyperliquid".into(), "BTC".into()))
+            .get(&("HYPERLIQUID".into(), "BTC".into()))
             .expect("leader depth recorded in replay map");
         assert_eq!(
             entry.bids,
@@ -2419,7 +2419,7 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         a.emit(mk("BTC", 5000), edge);
         a.emit(mk("ETH", 5000), edge);
-        a.reset_depth_floor_for_symbol("Hyperliquid", "BTC", "instrument_reset");
+        a.reset_depth_floor_for_symbol("HYPERLIQUID", "BTC", "instrument_reset");
         a.emit(mk("BTC", 100), edge); // cleared -> admitted
         a.emit(mk("ETH", 100), edge); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
@@ -2632,8 +2632,8 @@ mod tests {
         qty_exponent: i8,
     ) -> FeedMessage {
         FeedMessage::Instrument(crate::model::NormalizedInstrument {
-            venue: "Hyperliquid".into(),
-            source: "Hyperliquid".into(),
+            venue: "HYPERLIQUID".into(),
+            source: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: symbol.into(),
             channel: 0,
@@ -2833,15 +2833,15 @@ mod tests {
     /// unrelated, so only the authoritative arm's batches may reach the wire.
     #[test]
     fn book_publishes_one_arm_only() {
-        let (mut a, mut rx) = gated("Lashay", AuthorityConfig::default());
+        let (mut a, mut rx) = gated("KALSHI", AuthorityConfig::default());
         for i in 0..5 {
             let px = 0.40 + i as f64 / 100.0;
             a.emit(
-                book("Lashay", BOOK_INSTRUMENT, vec![bid(px, 10.0)], true, 1_100),
+                book("KALSHI", BOOK_INSTRUMENT, vec![bid(px, 10.0)], true, 1_100),
                 arm(1),
             );
             a.emit(
-                book("Lashay", BOOK_INSTRUMENT, vec![bid(px, 99.0)], true, 1_101),
+                book("KALSHI", BOOK_INSTRUMENT, vec![bid(px, 99.0)], true, 1_101),
                 arm(2),
             );
         }
@@ -2857,13 +2857,13 @@ mod tests {
     /// per-tick latch would interleave two arms inside one logical event.
     #[test]
     fn book_publishes_one_arm_in_coordinated_mode_too() {
-        let (mut a, mut rx) = gated("Hyperliquid", AuthorityConfig::default());
-        a.set_mode("Hyperliquid", ArbitrationMode::Coordinated);
+        let (mut a, mut rx) = gated("HYPERLIQUID", AuthorityConfig::default());
+        a.set_mode("HYPERLIQUID", ArbitrationMode::Coordinated);
         for _ in 0..3 {
             for (p, size) in [(arm(1), 10.0), (arm(2), 99.0)] {
                 a.emit(
                     book(
-                        "Hyperliquid",
+                        "HYPERLIQUID",
                         BOOK_INSTRUMENT,
                         vec![bid(0.40, size)],
                         true,

@@ -17,7 +17,7 @@
 //! `instrument_id == public assetId`; no namespace prefix, no `-PERP` suffix); `side` maps
 //! `bid -> buy` / `ask -> sell`; and the fill's `baseAmount` (size) and `quoteAmount / baseAmount`
 //! (price) equal the edge's size and trade price (every shared fill had `numFills == 1`). So a public
-//! fill tagged `(venue="Phoenix", symbol, trade_id)` lines up 1:1 with the edge copy and dedups. No
+//! fill tagged `(venue="PHOENIX", symbol, trade_id)` lines up 1:1 with the edge copy and dedups. No
 //! `FEEDS` row depends on this feeder; it stays off until explicitly enabled with
 //! `--phoenix-ws-input-markets`.
 
@@ -347,7 +347,7 @@ mod tests {
         );
         match &*rx.try_recv().expect("a trade was emitted") {
             FeedMessage::Trade(t) => {
-                assert_eq!(t.venue, "Phoenix".into());
+                assert_eq!(t.venue, "PHOENIX".into());
                 assert_eq!(t.symbol, "SOL".into());
                 assert_eq!(t.trade_id, 100);
                 assert_eq!(t.price, 150.0);
@@ -524,7 +524,7 @@ mod tests {
         );
         assert_eq!(
             v.venue(),
-            "Phoenix",
+            "PHOENIX",
             "must match what the edge emits for this id"
         );
     }

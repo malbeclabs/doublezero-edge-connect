@@ -281,7 +281,7 @@ mod tests {
     }
 
     fn venue() -> Arc<str> {
-        Arc::from("Lashay")
+        Arc::from("KALSHI")
     }
 
     fn sym() -> Arc<str> {
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn venues_do_not_cross_match() {
         let mut r = ArmRace::new(1_000_000_000);
-        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("Lashay"), Arc::from("Other"));
+        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("KALSHI"), Arc::from("Other"));
         r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
         assert_eq!(
             r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, arm(2), 2_000),
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn unmatched_evictions_are_attributed_per_venue_and_arm() {
         let mut r = ArmRace::new(1_000_000_000);
-        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("Lashay"), Arc::from("Other"));
+        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("KALSHI"), Arc::from("Other"));
         r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
         r.on_trade(&a, &sym(), 6_201.0, 150.0, Side::Buy, arm(1), 1_000);
         r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, arm(2), 1_000);

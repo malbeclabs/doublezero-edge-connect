@@ -110,7 +110,7 @@ fn phoenix_mktdata_fixture_trades_validate() {
                     t.source_id, 2,
                     "every fixture trade must be Phoenix (source_id 2)"
                 );
-                assert_eq!(codec::source_name(t.source_id), Some("Phoenix"));
+                assert_eq!(codec::source_name(t.source_id), Some("PHOENIX"));
                 assert!(
                     t.trade_id > 0,
                     "trade_id (= public tradeSequenceNumber) must be real"

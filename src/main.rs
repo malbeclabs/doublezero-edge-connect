@@ -624,8 +624,8 @@ mod tests {
 
     #[test]
     fn repeated_name_selects_same_as_single() {
-        let once = select_feeds(&["Hyperliquid".to_string()]).unwrap();
-        let twice = select_feeds(&["Hyperliquid".to_string(), "Hyperliquid".to_string()]).unwrap();
+        let once = select_feeds(&["HYPERLIQUID".to_string()]).unwrap();
+        let twice = select_feeds(&["HYPERLIQUID".to_string(), "HYPERLIQUID".to_string()]).unwrap();
         // Repeating a name must spawn the same receivers (same keys, same order) as passing it once.
         assert_eq!(keys(&once), keys(&twice));
         // Hyperliquid maps to >1 row (TOB + MBO), so this actually exercises multi-row dedup.
@@ -635,20 +635,20 @@ mod tests {
     #[test]
     fn distinct_names_union_without_dup() {
         let sel = select_feeds(&[
-            "Hyperliquid".to_string(),
-            "Phoenix".to_string(),
-            "Hyperliquid".to_string(),
+            "HYPERLIQUID".to_string(),
+            "PHOENIX".to_string(),
+            "HYPERLIQUID".to_string(),
         ])
         .unwrap();
         // Union of the two distinct venues' rows, each receiver once — no row spawned twice.
         let k = keys(&sel);
         let uniq: std::collections::HashSet<_> = k.iter().collect();
         assert_eq!(uniq.len(), k.len());
-        // The repeated "Hyperliquid" added nothing beyond the first: selecting both venues equals
+        // The repeated "HYPERLIQUID" added nothing beyond the first: selecting both venues equals
         // selecting each once.
         assert_eq!(
             k,
-            keys(&select_feeds(&["Hyperliquid".to_string(), "Phoenix".to_string()]).unwrap())
+            keys(&select_feeds(&["HYPERLIQUID".to_string(), "PHOENIX".to_string()]).unwrap())
         );
     }
 
@@ -662,14 +662,14 @@ mod tests {
         let all = filter_publishers(select_feeds(&[]).unwrap(), &[]).unwrap();
         let hl_tob = all
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
         // Compare against the registry, not a literal: this test is about the empty selection
         // being a no-op, and a hardcoded count silently turns it into a fleet-size assertion that
         // has to be edited every time a publisher is onboarded (`feeds.rs` already pins the set).
         let registry = feeds::FEEDS
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
         assert_eq!(hl_tob.publishers.len(), registry.publishers.len());
     }
@@ -679,7 +679,7 @@ mod tests {
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
         let hl_tob = sel
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
         let ports: Vec<u16> = hl_tob.publishers.iter().map(|p| p.base_port()).collect();
         assert_eq!(ports, vec![9201, 9401]);
@@ -690,8 +690,8 @@ mod tests {
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
-        assert!(!sel.iter().any(|f| f.venue == "Phoenix"));
-        assert!(sel.iter().any(|f| f.venue == "Hyperliquid"));
+        assert!(!sel.iter().any(|f| f.venue == "PHOENIX"));
+        assert!(sel.iter().any(|f| f.venue == "HYPERLIQUID"));
     }
 
     /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
@@ -701,15 +701,15 @@ mod tests {
     fn base_ports_are_not_unique_across_feeds() {
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
         let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
-        assert!(venues.contains("Hyperliquid"));
-        assert!(venues.contains("Phoenix"));
+        assert!(venues.contains("HYPERLIQUID"));
+        assert!(venues.contains("PHOENIX"));
         assert!(sel
             .iter()
             .all(|f| f.publishers.iter().all(|p| p.base_port() == 9201)));
 
         let scoped =
-            filter_publishers(select_feeds(&["Phoenix".to_string()]).unwrap(), &[9201]).unwrap();
-        assert!(scoped.iter().all(|f| f.venue == "Phoenix"));
+            filter_publishers(select_feeds(&["PHOENIX".to_string()]).unwrap(), &[9201]).unwrap();
+        assert!(scoped.iter().all(|f| f.venue == "PHOENIX"));
     }
 
     #[test]

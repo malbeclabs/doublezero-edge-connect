@@ -352,8 +352,8 @@ mod tests {
 
     #[test]
     fn source_registry_maps_known_ids() {
-        assert_eq!(source_name(1), Some("Hyperliquid"));
-        assert_eq!(source_name(2), Some("Phoenix"));
+        assert_eq!(source_name(1), Some("HYPERLIQUID"));
+        assert_eq!(source_name(2), Some("PHOENIX"));
         assert_eq!(source_name(0), None); // reserved, never on wire
         assert_eq!(source_name(999), None); // unassigned -> caller falls back
     }

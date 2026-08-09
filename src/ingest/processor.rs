@@ -3016,11 +3016,11 @@ mod tests {
                 seen.push((i.source_id, i.venue.to_string()));
             }
         }
-        assert_eq!(seen, vec![(1, "Hyperliquid".to_string())], "first reveal");
+        assert_eq!(seen, vec![(1, "HYPERLIQUID".to_string())], "first reveal");
 
         let before = metrics()
             .source_id_changed
-            .with_label_values(&["Phoenix"])
+            .with_label_values(&["PHOENIX"])
             .get();
         proc.on_datagram(
             &tob_frame(2, &[enc_tob_quote(41, 2, 2_000)]),
@@ -3034,13 +3034,13 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![(2, "Phoenix".to_string())],
+            vec![(2, "PHOENIX".to_string())],
             "a changed id is re-announced under the new venue"
         );
         assert_eq!(
             metrics()
                 .source_id_changed
-                .with_label_values(&["Phoenix"])
+                .with_label_values(&["PHOENIX"])
                 .get(),
             before + 1,
             "the change is counted, labelled by the NEW venue"
@@ -3090,11 +3090,11 @@ mod tests {
             map.keys().collect::<Vec<_>>()
         );
         assert!(
-            !map.contains_key(&(venue_arc("Hyperliquid"), Arc::<str>::from("INST-41"))),
+            !map.contains_key(&(venue_arc("HYPERLIQUID"), Arc::<str>::from("INST-41"))),
             "the stale entry under the OLD source must be purged, not merely superseded"
         );
         assert!(
-            map.contains_key(&(venue_arc("Phoenix"), Arc::<str>::from("INST-41"))),
+            map.contains_key(&(venue_arc("PHOENIX"), Arc::<str>::from("INST-41"))),
             "the entry under the CURRENT source must remain"
         );
     }
@@ -3149,7 +3149,7 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![(2, "Phoenix".to_string())],
+            vec![(2, "PHOENIX".to_string())],
             "exactly one Instrument, under the new source — no redundant re-announce under the old one"
         );
     }
@@ -3185,7 +3185,7 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![(1, "Hyperliquid".to_string(), 41)],
+            vec![(1, "HYPERLIQUID".to_string(), 41)],
             "the definition names itself, with no price at all"
         );
     }
@@ -3580,7 +3580,7 @@ mod tests {
             .collect();
         assert_eq!(
             venues,
-            vec!["Phoenix".to_string()],
+            vec!["PHOENIX".to_string()],
             "the id change is re-announced (finding 2 — already covered elsewhere, checked here \
              only to confirm the id change is really what's driving this scenario)"
         );
@@ -5154,10 +5154,10 @@ mod tests {
         };
         assert_eq!(inst.source_id, 1, "verbatim wire Source ID");
         assert_eq!(
-            &*inst.source, "Hyperliquid",
+            &*inst.source, "HYPERLIQUID",
             "named from the wire id, not the feed row"
         );
-        assert_eq!(&*inst.venue, "Hyperliquid");
+        assert_eq!(&*inst.venue, "HYPERLIQUID");
         assert!(
             matches!(msgs[1], FeedMessage::Book(_)),
             "expected the book second, got {:?}",
@@ -5186,10 +5186,10 @@ mod tests {
         );
         assert_eq!(books[0].source_id, 1, "verbatim wire Source ID");
         assert_eq!(
-            &*books[0].source, "Hyperliquid",
+            &*books[0].source, "HYPERLIQUID",
             "named from the wire id, not the feed row"
         );
-        assert_eq!(&*books[0].venue, "Hyperliquid");
+        assert_eq!(&*books[0].venue, "HYPERLIQUID");
     }
 
     /// An instrument that never receives an id-bearing message never appears on the wire at all —
@@ -6228,7 +6228,7 @@ mod tests {
             ),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
-        let market = (crate::model::venue_arc("Hyperliquid"), 3u32, 41u32);
+        let market = (crate::model::venue_arc("HYPERLIQUID"), 3u32, 41u32);
         let arm = Publisher::Edge(TEST_PUB);
         let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, arm);
 

@@ -965,7 +965,7 @@ mod tests {
     /// for the case where a row's revealed set contains a *different* venue.
     #[test]
     fn emit_status_reports_the_revealed_venue_with_its_registry_source_id() {
-        let venue = "Lashay";
+        let venue = "KALSHI";
         record_revealed(venue, venue);
         let (arbiter, mut rx) = test_arbiter();
         emit_status(&arbiter, venue, true, 0);
@@ -985,16 +985,16 @@ mod tests {
     fn record_revealed_is_idempotent_and_scoped_per_row() {
         let a = "RecordRevealedRowA";
         let b = "RecordRevealedRowB";
-        record_revealed(a, "Hyperliquid");
-        record_revealed(a, "Hyperliquid");
-        record_revealed(a, "Phoenix");
-        record_revealed(b, "Lashay");
+        record_revealed(a, "HYPERLIQUID");
+        record_revealed(a, "HYPERLIQUID");
+        record_revealed(a, "PHOENIX");
+        record_revealed(b, "KALSHI");
         let revealed_a = revealed_venues_for(a);
         assert_eq!(revealed_a.len(), 2);
-        assert!(revealed_a.contains("Hyperliquid") && revealed_a.contains("Phoenix"));
+        assert!(revealed_a.contains("HYPERLIQUID") && revealed_a.contains("PHOENIX"));
         let revealed_b = revealed_venues_for(b);
         assert_eq!(revealed_b.len(), 1);
-        assert!(revealed_b.contains("Lashay"));
+        assert!(revealed_b.contains("KALSHI"));
     }
 
     /// A wire label the registry does not resolve (`sources::source_id_of` returns `None` — the
@@ -1018,15 +1018,15 @@ mod tests {
     /// speaks for itself; this row must not also report `status` under its name.
     #[test]
     fn emit_status_never_reports_a_venue_that_owns_its_own_feeds_row() {
-        let row = "Hyperliquid";
+        let row = "HYPERLIQUID";
         // This is a real `FEEDS` venue with its own rows — exactly the superset scenario
         // `feeds.rs`/`sources.rs` document for a superset group's Source-ID-3 traffic.
-        record_revealed(row, "Hyperliquid");
-        record_revealed(row, "Lashay");
+        record_revealed(row, "HYPERLIQUID");
+        record_revealed(row, "KALSHI");
         let (arbiter, mut rx) = test_arbiter();
         emit_status(&arbiter, row, false, 1_234);
         match &*rx.try_recv().expect("the row's own venue still reports") {
-            FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), "Hyperliquid"),
+            FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), "HYPERLIQUID"),
             other => panic!("expected a status, got {other:?}"),
         }
         assert!(
@@ -1047,7 +1047,7 @@ mod tests {
         let row_venue: &'static str = "FrameCtxEmitRow";
         // Must be a name the registry resolves: `record_revealed` (called by `ctx.emit` below)
         // only records registered names — see `record_revealed_ignores_unregistered_wire_labels`.
-        let wire_venue: &'static str = "Phoenix";
+        let wire_venue: &'static str = "PHOENIX";
         let (arbiter, _rx) = test_arbiter();
         let instruments: InstrumentSnapshot =
             std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -1097,11 +1097,11 @@ mod tests {
     fn a_receiver_reports_status_via_its_revealed_venue_and_suppresses_a_foreign_owned_one() {
         use crate::ingest::{feeds::FeedKind, health::FeedHealth};
 
-        // "Phoenix" is this row's own (real) venue; the second name mirrors the superset-group
+        // "PHOENIX" is this row's own (real) venue; the second name mirrors the superset-group
         // scenario (`feeds.rs`) where a row's revealed set also picks up a DIFFERENT venue's
         // name, one with its own `FEEDS` rows and its own independent `FeedHealth` aggregate.
-        let row_venue = "Phoenix";
-        let foreign_venue = "Lashay";
+        let row_venue = "PHOENIX";
+        let foreign_venue = "KALSHI";
         // Simulates this receiver's own `ctx.emit` calls having already resolved and emitted
         // under both wire venues.
         record_revealed(row_venue, row_venue);

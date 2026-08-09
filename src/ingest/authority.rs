@@ -495,7 +495,7 @@ mod tests {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
-    const VENUE: &str = "Lashay";
+    const VENUE: &str = "KALSHI";
     const TIMEOUT: u64 = 2_000_000_000; // 2s
 
     fn key() -> MarketKey {

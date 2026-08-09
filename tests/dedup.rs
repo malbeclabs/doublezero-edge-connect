@@ -56,7 +56,7 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let mut p = MboProcessor::new(depth, Arc::new(AtomicBool::new(false)));
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
-            venue: "Hyperliquid",
+            venue: "HYPERLIQUID",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -120,7 +120,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let mut p = TobProcessor::new(Arc::new(AtomicBool::new(true)));
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
-            venue: "Hyperliquid",
+            venue: "HYPERLIQUID",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -243,10 +243,10 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // for a different registered venue, not Hyperliquid, as of the registry becoming strict. That is a
     // real defect in the second publisher, not a decode issue: it is misreporting its own identity on
     // every quote in this capture. Under the old `unwrap_or(ctx.venue)` fallback, id 3 was unmapped, so
-    // BOTH publishers' quotes fell back to this feed's static venue ("Hyperliquid") and competed on ONE
+    // BOTH publishers' quotes fell back to this feed's static venue ("HYPERLIQUID") and competed on ONE
     // dedup floor, silently merging the mislabeled arm into the correct one — exactly the "name it
     // after the multicast group it arrived on" workaround the plan reversal exists to remove. With the
-    // fallback gone, the two arms are honestly reported as different venues (4508 "Hyperliquid" + 3000
+    // fallback gone, the two arms are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
     // for the other venue = 7508) and no longer share a floor, so the cross-arm duplication this
     // fixture's two mirrors actually represent is no longer collapsed — each arm now only dedups
     // against itself (4699 -> 4508, 4133 -> 3000). This is the correct, intended behavior of the new
@@ -609,7 +609,7 @@ fn mbo_prints_carry_no_venue_trade_id() {
     // real trade ids, and that is its own row's call.
     for f in FEEDS
         .iter()
-        .filter(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::MarketByOrder)
+        .filter(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::MarketByOrder)
     {
         assert!(!f.emit_trades, "{} would publish zero-id prints", f.venue);
     }

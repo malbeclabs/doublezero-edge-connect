@@ -136,6 +136,19 @@ Modules are grouped by role under `src/`:
   that does not match its live group fails **silently** — no warning, no failed bind, just a
   permanently-zero `dz_receiver_up`; `feeds::tests::lashay_rows_match_the_deployment` pins both rows
   against the deployment so a transcription slip fails the build instead.
+- **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
+  (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
+  authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never
+  remapped here. Three production IDs are assigned. Names are **uppercase** because that is the form
+  that reaches consumers — `venue`/`source` on the WebSocket, every `venue=` metric label value, and
+  the `SOURCE:SYMBOL` product identifier a consumer composes from them. `source_name` is the one
+  emitted name per ID; `source_id_of` additionally accepts a **legacy name** for ID 3, so operator-
+  and ledger-facing strings predating the current registry name keep resolving to the same ID
+  instead of falling through to `None` — only the registry name is ever emitted. A `venue` in `FEEDS`
+  **must** be a name
+  `source_id_of` resolves, or `receiver::record_revealed` silently drops it and the row's `status`
+  stream goes unrecorded. An unassigned ID gets a stable synthesized `SOURCE_<id>` (distinct per ID,
+  since the arbiter keys dedup on `(venue, symbol)`), bounded by `MAX_UNREGISTERED_SOURCES`.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from

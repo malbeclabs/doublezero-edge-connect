@@ -13,26 +13,42 @@ use std::{
 /// Map a wire `Source ID` to its registered source name.
 ///
 /// Returns `None` only for IDs with no registry row. The wire value is authoritative: a publisher
-/// stamping the wrong ID is a publisher defect and is reported as-is, never substituted.
+/// stamping the wrong ID is a publisher defect, fixed at the publisher, and is reported here as-is
+/// and never substituted. Exactly three production IDs are assigned.
+///
+/// Names are **uppercase**, which is the form that reaches consumers: this is what `venue`/`source`
+/// carry on the WebSocket and what every `venue=` metric label holds, so it is also the form a
+/// product identifier like `HYPERLIQUID:BTC` composes from.
 pub fn source_name(source_id: u16) -> Option<&'static str> {
     match source_id {
-        1 => Some("Hyperliquid"),
-        2 => Some("Phoenix"),
-        3 => Some("Lashay"),
+        1 => Some("HYPERLIQUID"),
+        2 => Some("PHOENIX"),
+        3 => Some(KALSHI),
         _ => None,
     }
 }
 
+/// Source ID 3's registry name, and the pre-launch codename the same row also answers to.
+///
+/// Only [`KALSHI`] is ever emitted — it is what `venue`/`source` carry on the wire and what every
+/// `venue=` metric label value holds. [`KALSHI_CODENAME`] is accepted on **input** alone: it is
+/// still what the DoubleZero ledger registers the groups under (the `code` values in `feeds.rs`),
+/// so operator- and ledger-facing strings keep resolving to this ID instead of falling through to
+/// `None`. Drop the alias once the ledger rename lands and nothing feeds the old name in.
+const KALSHI: &str = "KALSHI";
+const KALSHI_CODENAME: &str = "LASHAY";
+
 /// Map a registry source *name* back to its `Source ID`.
 ///
-/// Unlike [`source_name`], this covers every assigned row including the one whose ID is ambiguous on
-/// the wire: names are unique in the registry even where an ID is overloaded. This is what lets a
-/// resolved source carry a numeric identity a consumer can join against the registry.
+/// Unlike [`source_name`], this covers every name an assigned row answers to, not just the one that
+/// is emitted — see [`KALSHI_CODENAME`]. This is what lets a resolved source carry a numeric identity
+/// a consumer can join against the registry, and what `receiver::record_revealed` tests a wire venue
+/// against before recording it.
 pub fn source_id_of(source: &str) -> Option<u16> {
     match source {
-        "Hyperliquid" => Some(1),
-        "Phoenix" => Some(2),
-        "Lashay" => Some(3),
+        "HYPERLIQUID" => Some(1),
+        "PHOENIX" => Some(2),
+        KALSHI | KALSHI_CODENAME => Some(3),
         _ => None,
     }
 }
@@ -121,17 +137,29 @@ mod tests {
 
     #[test]
     fn registered_ids_map_to_their_names() {
-        assert_eq!(source_name(1), Some("Hyperliquid"));
-        assert_eq!(source_name(2), Some("Phoenix"));
+        assert_eq!(source_name(1), Some("HYPERLIQUID"));
+        assert_eq!(source_name(2), Some("PHOENIX"));
     }
 
-    /// The registry assigns this ID, so it resolves. That two publishers currently stamp it is a
-    /// publisher defect, fixed at the publisher; this crate reports what the wire says.
+    /// All three assigned production IDs resolve. The wire value is authoritative — a publisher
+    /// stamping the wrong ID is a publisher defect, fixed at the publisher; this crate reports what
+    /// the wire says and never substitutes a row's own venue for it.
     #[test]
     fn every_assigned_id_resolves() {
-        assert_eq!(source_name(1), Some("Hyperliquid"));
-        assert_eq!(source_name(2), Some("Phoenix"));
-        assert_eq!(source_name(3), Some("Lashay"));
+        assert_eq!(source_name(1), Some("HYPERLIQUID"));
+        assert_eq!(source_name(2), Some("PHOENIX"));
+        assert_eq!(source_name(3), Some(KALSHI));
+    }
+
+    /// Registry names are uppercase, so a consumer composing `SOURCE:SYMBOL` never has to case-fold
+    /// what the wire gave it.
+    #[test]
+    fn registry_names_are_uppercase() {
+        for id in 0u16..1024 {
+            if let Some(name) = source_name(id) {
+                assert_eq!(name, name.to_uppercase(), "id {id} is not uppercase");
+            }
+        }
     }
 
     /// A label is always available, so `venue` is never blank. Registered ids only, so this
@@ -139,8 +167,22 @@ mod tests {
     /// unregistered-id map (see `label_in` below for that logic, tested against injected state).
     #[test]
     fn assigned_ids_label_as_their_name() {
-        assert_eq!(source_label(1), "Hyperliquid");
-        assert_eq!(source_label(3), "Lashay");
+        assert_eq!(source_label(1), "HYPERLIQUID");
+        assert_eq!(source_label(3), KALSHI);
+    }
+
+    /// ID 3 answers to its pre-launch codename as well as its registry name, so operator- and
+    /// ledger-facing strings keep resolving to the same ID rather than falling through to `None`.
+    /// Only the registry name is ever *emitted*.
+    #[test]
+    fn the_id_3_codename_resolves_to_the_same_id() {
+        assert_eq!(source_id_of(KALSHI), Some(3));
+        assert_eq!(source_id_of(KALSHI_CODENAME), Some(3));
+        assert_eq!(
+            source_name(3),
+            Some(KALSHI),
+            "the codename is accepted on input, never the emitted name"
+        );
     }
 
     /// The public entry point's unregistered branch: read-lock miss, write-lock re-check,
@@ -205,8 +247,8 @@ mod tests {
 
     #[test]
     fn names_map_back_to_their_registry_ids() {
-        assert_eq!(source_id_of("Hyperliquid"), Some(1));
-        assert_eq!(source_id_of("Phoenix"), Some(2));
+        assert_eq!(source_id_of("HYPERLIQUID"), Some(1));
+        assert_eq!(source_id_of("PHOENIX"), Some(2));
         assert_eq!(source_id_of("Nonesuch"), None);
     }
 
@@ -226,10 +268,17 @@ mod tests {
     }
 
     /// The default short name is the uppercase of the registry name; an explicit row overrides it.
+    /// Registry names are already uppercase, so this is the identity for every assigned row until
+    /// upstream assigns a short name that differs from the name itself.
     #[test]
     fn short_name_defaults_to_uppercase() {
-        assert_eq!(short_name("Hyperliquid"), "HYPERLIQUID");
-        assert_eq!(short_name("Phoenix"), "PHOENIX");
+        assert_eq!(short_name("HYPERLIQUID"), "HYPERLIQUID");
+        assert_eq!(short_name("PHOENIX"), "PHOENIX");
+        for id in 0u16..1024 {
+            if let Some(name) = source_name(id) {
+                assert_eq!(short_name(name), name, "id {id} short name drifted");
+            }
+        }
     }
 
     #[test]

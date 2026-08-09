@@ -201,7 +201,7 @@ mod tests {
         // Bump a metric so the body is non-trivial.
         metrics()
             .emit
-            .with_label_values(&["Hyperliquid", "quote"])
+            .with_label_values(&["HYPERLIQUID", "quote"])
             .inc();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

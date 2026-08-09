@@ -130,7 +130,7 @@ pub enum ArbitrationMode {
 #[derive(Debug, Clone, Copy)]
 pub struct Feed {
     /// Venue name stamped on every instrument and message from this feed. Matches the
-    /// edge-feed-spec source registry name (e.g. "Hyperliquid" for SourceID 1).
+    /// edge-feed-spec source registry name (e.g. "HYPERLIQUID" for SourceID 1).
     pub venue: &'static str,
     /// The DoubleZero multicast group **code** for this feed's group (e.g. "tiredsolid",
     /// "scottsdale") — the identifier `doublezero status`/`multicast group list` report. The
@@ -186,11 +186,13 @@ pub const FEEDS: &[Feed] = &[
     // on the group. Sourcing this table from the deployment inventory alone is what left five
     // blocks unbound and the bridge ingesting about a third of the group's datagrams.
     //
-    // The venue is still resolved per message from the wire SourceID (see processor.rs), so the
-    // `venue` below is only the default for unregistered SourceIDs (the SourceID-3 Hyperliquid
-    // superset on tiredsolid). Each publisher gets its own receiver + reference-data state.
+    // The venue is resolved per message from the wire SourceID (see processor.rs), so the `venue`
+    // below is only the default for SourceIDs the registry does not assign. All three production
+    // IDs are assigned, and the wire value is authoritative: a publisher stamping an ID that is not
+    // its own is a publisher defect and is corrected at the publisher, never remapped here. Each
+    // publisher gets its own receiver + reference-data state.
     Feed {
-        venue: "Hyperliquid",
+        venue: "HYPERLIQUID",
         code: "tiredsolid",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 15),
@@ -282,7 +284,7 @@ pub const FEEDS: &[Feed] = &[
     // Silently-failing ports here: 10903 (derived from an observed 10902) and the whole 10701
     // block (registry-only, never seen on the wire). Everything else was decoded from a capture.
     Feed {
-        venue: "Hyperliquid",
+        venue: "HYPERLIQUID",
         code: "tiredsolid",
         kind: FeedKind::MarketByOrder,
         group: Ipv4Addr::new(233, 84, 178, 15),
@@ -374,7 +376,7 @@ pub const FEEDS: &[Feed] = &[
         arbitration: ArbitrationMode::Coordinated,
     },
     Feed {
-        venue: "Phoenix",
+        venue: "PHOENIX",
         code: "scottsdale",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
@@ -391,6 +393,16 @@ pub const FEEDS: &[Feed] = &[
     // market-by-price book. Both claim the tape — a host holding only `lashay-2` must still serve
     // `trade` — and which of them prints is the reconciler's runtime decision (see `Feed::emit_trades`).
     //
+    // `code` is transcribed verbatim from what the DoubleZero ledger registers today, never from
+    // what reads better here: it is matched against what `doublezero status --json` reports, so a
+    // prettier code matches nothing and activates nothing. These carry the venue's pre-launch
+    // codename and are scheduled to be re-registered as `edge-kalshi-{perps,sports}-{tob,mbp}`;
+    // update these rows in the same change that lands the ledger rename, never before it.
+    //
+    // `venue` is independent of `code` — it is the source-registry name for the Source ID these rows
+    // carry (`sources::source_name(3)`), and `sources::source_id_of` also accepts the codename, so
+    // ledger-facing strings keep resolving while only the registry name is ever emitted.
+    //
     // ⚠️ A `code` that does not match the live group fails **silently**: `doublezero status --json`
     // reports no match, the reconciler never activates the row, and there is no warning and no failed
     // bind — just a receiver that never starts. Both groups are live on testnet and mainnet as of
@@ -400,7 +412,7 @@ pub const FEEDS: &[Feed] = &[
     // datagram source IP (the shared-block model in `FeedPublisher`'s docs). The market-by-price
     // block is spaced `+10000` / `+20000`, not the `+1` / `+2` the Hyperliquid publisher uses.
     Feed {
-        venue: "Lashay",
+        venue: "KALSHI",
         code: "lashay-1",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 3),
@@ -414,7 +426,7 @@ pub const FEEDS: &[Feed] = &[
         arbitration: ArbitrationMode::Sticky,
     },
     Feed {
-        venue: "Lashay",
+        venue: "KALSHI",
         code: "lashay-2",
         kind: FeedKind::MarketByPrice,
         group: Ipv4Addr::new(233, 84, 178, 4),
@@ -458,10 +470,10 @@ mod tests {
         // groups, which is what makes tape ownership a runtime decision in the first place.
         for f in FEEDS {
             let expected = match (f.venue, f.kind) {
-                ("Hyperliquid", FeedKind::TopOfBook | FeedKind::MarketByOrder) => "tiredsolid",
-                ("Phoenix", FeedKind::TopOfBook) => "scottsdale",
-                ("Lashay", FeedKind::TopOfBook) => "lashay-1",
-                ("Lashay", FeedKind::MarketByPrice) => "lashay-2",
+                ("HYPERLIQUID", FeedKind::TopOfBook | FeedKind::MarketByOrder) => "tiredsolid",
+                ("PHOENIX", FeedKind::TopOfBook) => "scottsdale",
+                ("KALSHI", FeedKind::TopOfBook) => "lashay-1",
+                ("KALSHI", FeedKind::MarketByPrice) => "lashay-2",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
@@ -483,7 +495,7 @@ mod tests {
     fn hyperliquid_tob_emits_trades() {
         let hl = FEEDS
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::TopOfBook)
             .unwrap();
         assert!(hl.emit_trades);
     }
@@ -537,7 +549,7 @@ mod tests {
     /// no shared clock can declare it; a new such venue is the feature working, not a regression.
     #[test]
     fn existing_venues_are_coordinated() {
-        for f in FEEDS.iter().filter(|f| f.venue != "Lashay") {
+        for f in FEEDS.iter().filter(|f| f.venue != "KALSHI") {
             assert_eq!(f.arbitration, ArbitrationMode::Coordinated, "{}", f.venue);
         }
     }
@@ -633,7 +645,7 @@ mod tests {
         let base_ports = |kind: FeedKind| -> Vec<u16> {
             let f = FEEDS
                 .iter()
-                .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
+                .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
                 .unwrap();
             let mut v: Vec<u16> = f.publishers.iter().map(|p| p.base_port()).collect();
             v.sort_unstable();
@@ -696,7 +708,7 @@ mod tests {
     /// deployment exactly so a transcription slip fails the build instead.
     #[test]
     fn lashay_rows_match_the_deployment() {
-        let row = |kind| FEEDS.iter().find(|f| f.venue == "Lashay" && f.kind == kind);
+        let row = |kind| FEEDS.iter().find(|f| f.venue == "KALSHI" && f.kind == kind);
 
         let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
         assert_eq!(tob.code, "lashay-1");
@@ -736,7 +748,7 @@ mod tests {
         let count = |kind: FeedKind| -> usize {
             FEEDS
                 .iter()
-                .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
+                .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
                 .unwrap()
                 .publishers
                 .len()

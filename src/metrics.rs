@@ -859,69 +859,69 @@ mod tests {
         // Touch a few families so they appear in the text output (a zero CounterVec child only
         // materializes once a label set is observed).
         m.datagrams_received
-            .with_label_values(&["Hyperliquid", "tob", "9201", "mktdata"])
+            .with_label_values(&["HYPERLIQUID", "tob", "9201", "mktdata"])
             .inc();
-        m.emit.with_label_values(&["Hyperliquid", "quote"]).inc();
+        m.emit.with_label_values(&["HYPERLIQUID", "quote"]).inc();
         m.ws_clients.set(0);
         m.shred_processed.inc();
         m.trades_admitted
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.quote_lead_ns
-            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
         m.trade_lead_ns
-            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
         m.depth_admitted
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.depth_dropped
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.depth_floor_resets
-            .with_label_values(&["Hyperliquid", "end_of_session"])
+            .with_label_values(&["HYPERLIQUID", "end_of_session"])
             .inc();
         m.depth_lead_ns
-            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
         m.quote_ticks_won
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.depth_ticks_won
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.arm_lead_ns
-            .with_label_values(&["Lashay", "leader"])
+            .with_label_values(&["KALSHI", "leader"])
             .observe(123_456.0);
         m.arm_transfers
-            .with_label_values(&["Lashay", "silence"])
+            .with_label_values(&["KALSHI", "silence"])
             .inc();
         m.arm_markets_held
-            .with_label_values(&["Lashay", "arm0"])
+            .with_label_values(&["KALSHI", "arm0"])
             .set(1);
-        m.tape_owner_changes.with_label_values(&["Lashay"]).inc();
-        m.tape_arm_transfers.with_label_values(&["Lashay"]).inc();
-        m.tape_arm_dropped.with_label_values(&["Lashay"]).inc();
-        m.mbp_channel_resets.with_label_values(&["Lashay"]).inc();
-        m.mbp_buffer_overflows.with_label_values(&["Lashay"]).inc();
-        m.mbp_level_overflows.with_label_values(&["Lashay"]).inc();
+        m.tape_owner_changes.with_label_values(&["KALSHI"]).inc();
+        m.tape_arm_transfers.with_label_values(&["KALSHI"]).inc();
+        m.tape_arm_dropped.with_label_values(&["KALSHI"]).inc();
+        m.mbp_channel_resets.with_label_values(&["KALSHI"]).inc();
+        m.mbp_buffer_overflows.with_label_values(&["KALSHI"]).inc();
+        m.mbp_level_overflows.with_label_values(&["KALSHI"]).inc();
         m.mbp_orphan_snapshot_levels
-            .with_label_values(&["Lashay"])
+            .with_label_values(&["KALSHI"])
             .inc();
         m.mbp_declined_rotation_levels
-            .with_label_values(&["Lashay"])
+            .with_label_values(&["KALSHI"])
             .inc();
-        m.mbp_duplicate_deltas.with_label_values(&["Lashay"]).inc();
-        m.mbp_crossed.with_label_values(&["Lashay"]).inc();
+        m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
+        m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
         m.mbp_divergence
-            .with_label_values(&["Lashay", "delete_with_quantity"])
+            .with_label_values(&["KALSHI", "delete_with_quantity"])
             .inc();
         m.arm_unmatched_trades
-            .with_label_values(&["Lashay", "arm1"])
+            .with_label_values(&["KALSHI", "arm1"])
             .inc();
-        m.book_dropped.with_label_values(&["Lashay", "edge"]).inc();
-        m.book_markets_evicted.with_label_values(&["Lashay"]).inc();
+        m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
+        m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])

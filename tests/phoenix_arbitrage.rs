@@ -70,7 +70,7 @@ async fn phoenix_edge_gap_public_trade_fills_in() {
     let mock = MockWsInput::start().await;
     let url = mock.url();
     let bridge = Bridge::spawn_with_args(
-        "Phoenix",
+        "PHOENIX",
         18185,
         &[
             "--phoenix-ws-input-url",
@@ -119,7 +119,7 @@ async fn phoenix_edge_gap_public_trade_fills_in() {
         "the public fill should reach the wire exactly once"
     );
     let t = hits[0];
-    assert_eq!(t.get("venue").and_then(|v| v.as_str()), Some("Phoenix"));
+    assert_eq!(t.get("venue").and_then(|v| v.as_str()), Some("PHOENIX"));
     assert_eq!(
         t.get("aggressor_side").and_then(|v| v.as_str()),
         Some("buy")
@@ -138,7 +138,7 @@ async fn phoenix_edge_leads_public_trade_deduped() {
     let mock = MockWsInput::start().await;
     let url = mock.url();
     let bridge = Bridge::spawn_with_args(
-        "Phoenix",
+        "PHOENIX",
         18186,
         &[
             "--phoenix-ws-input-url",
