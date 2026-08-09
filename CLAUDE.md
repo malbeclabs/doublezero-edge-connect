@@ -6,12 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `doublezero-edge-connect` ingests one or more DoubleZero (DZ) Edge **binary multicast** feeds,
 decodes them, runs the reference-data subscriber state machine, and re-serves normalized market
-data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks three edge-feed-spec
+data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks four edge-feed-spec
 sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
-`midpoint`), and **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
-re-serves it as full-state `depth`). Each feed maps to one venue. The input (multicast/binary) is
-an implementation detail; the *only* external contract is the WebSocket output, fully specified in
+`midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
+re-serves it as full-state `depth`), and **Market-by-Price** (magic `0x4442`; the bridge
+reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
+row selects it, on a group that is live). Each feed maps to one venue. The
+input (multicast/binary) is an implementation detail; the *only* external contract is the
+WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
 consumer is not part of the protocol.
 
@@ -73,11 +76,13 @@ cross-source duplicates collapse and the public copy fills in only when the edge
 
 Modules are grouped by role under `src/`:
 - **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
+  `pricebook` (the price-keyed sibling of `book`), `authority`,
   `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
-  `subscriber`, `arbiter`, the **`subscriptions`** detector + **`reconcile`** activation loop (which
+  `subscriber`, `arbiter`, `authority` + `arm_race` (the single-arm `book` gate and the cross-arm trade
+  matcher its re-election runs on), the **`subscriptions`** detector + **`reconcile`** activation loop (which
   decide what runs — see Architecture above), the optional public feeders (`public_feeder`
   scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
-  `codec_midpoint`, `codec_mbo`). Intra-pipeline references use `crate::ingest::*`; this half knows
+  `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
@@ -122,7 +127,28 @@ Modules are grouped by role under `src/`:
   another venue (sibling-protocol rows are added once their live endpoints are known). `--feed
   <venue>` selects a subset of venues and `--publisher-port <port>` narrows the publishers within
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
-  the WS.
+  the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
+  venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
+  ride separate groups with separate codes. The two **Lashay** perps rows (`lashay-1` TOB
+  `233.84.178.3:7576/7577`, `lashay-2` MBP `233.84.178.4:31000/41000/51000`, both `Sticky`, both
+  claiming the tape) are exactly that case. Both groups are **live and activated** (testnet and
+  mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
+  that does not match its live group fails **silently** — no warning, no failed bind, just a
+  permanently-zero `dz_receiver_up`; `feeds::tests::lashay_rows_match_the_deployment` pins both rows
+  against the deployment so a transcription slip fails the build instead.
+- **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
+  (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
+  authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never
+  remapped here. Three production IDs are assigned. Names are **uppercase** because that is the form
+  that reaches consumers — `venue`/`source` on the WebSocket, every `venue=` metric label value, and
+  the `SOURCE:SYMBOL` product identifier a consumer composes from them. `source_name` is the one
+  emitted name per ID; `source_id_of` additionally accepts a **legacy name** for ID 3, so operator-
+  and ledger-facing strings predating the current registry name keep resolving to the same ID
+  instead of falling through to `None` — only the registry name is ever emitted. A `venue` in `FEEDS`
+  **must** be a name
+  `source_id_of` resolves, or `receiver::record_revealed` silently drops it and the row's `status`
+  stream goes unrecorded. An unassigned ID gets a stable synthesized `SOURCE_<id>` (distinct per ID,
+  since the arbiter keys dedup on `(venue, symbol)`), bounded by `MAX_UNREGISTERED_SOURCES`.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
@@ -135,7 +161,20 @@ Modules are grouped by role under `src/`:
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
   (spawn/abort). Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
-  one `static_desired()`.
+  one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
+  per venue (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
+  `apply_feeds` publishes the result onto a `TapeOwner` (`Arc<AtomicBool>`) each processor reads per
+  print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
+  and reference data whenever a *peer* feed's subscription changed. The flag is stored **with** the
+  `JoinHandle` in one `active` map so it cannot outlive its receiver on either the abort or the reap
+  path, and ownership is ordered **liveness before rank** (`FeedHealth::liveness` → `TapeLiveness`,
+  three states: a subscribed-but-dead row must not hold the tape while its peer decodes prints and
+  drops them, and a row that never *registers* must not either — registration follows the socket
+  bind, so a row that can never bind respawns every tick and, ranked as live, would hold rank 0
+  forever and mute the venue. `Unregistered` therefore sits **between** `Up` and `Down`: below a live
+  row, so an incumbent keeps the tape until the newcomer really registers rather than bouncing on
+  activation; above a dead one, so a cold start where nothing has bound falls back to rank instead of
+  leaving the venue ownerless). Changes are counted by `dz_tape_owner_changes_total{venue}`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
@@ -162,7 +201,8 @@ Modules are grouped by role under `src/`:
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → window, `Instrument` → a rate limit on the precision pair per
+  floor, depth → depth floor, trades → the per-venue **tape leader** then the window, `book` → the
+  single-arm authority gate below, `Instrument` → a rate limit on the precision pair per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
@@ -175,7 +215,26 @@ Modules are grouped by role under `src/`:
   `Contest{winner, lead_ns}` drops the losing cross-source copy and records the head-to-head
   lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
-  plain collapse. `emit` increments **pre-resolved per-venue metric children** (cached in the
+  plain collapse. The **tape leader** (`tape_leader`, `Sticky` venues only) is the arm-level twin of
+  the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
+  sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
+  venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
+  **id-independent**. Four rules: first arm to print leads (a TOB-only deployment carries no `book`
+  traffic, so `venue_leader()` is `None` forever and electing first would mute the tape); an arm the
+  authority *tracks* displaces one it does not (the slot is first-come on an unauthenticated wire);
+  the book-*elected* arm takes over, **once per election** rather than per print (arm identity is
+  shared across a venue's rows — one source IP per publisher host, both protocols — and re-honouring
+  per print would let a nearly-dead elected arm sawtooth the tape away from the healthy peer); and a
+  silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS`, marking the election it overrode as spent.
+  The peer's prints are dropped on their own `dz_tape_arm_dropped_total` (not folded into
+  `dz_trades_dropped_total`, whose steady state here is the challenger's whole stream); transfers are
+  `dz_tape_arm_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
+  wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
+  holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
+  no-dark-start already exposes for `book` — and the gate is venue-wide, so arms that *sharded* prints
+  rather than mirroring them would lose the non-serving arm's fills. `no_id_owner` is skipped entirely
+  for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
+  `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`
   label lookup.
   Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share
@@ -206,6 +265,42 @@ Modules are grouped by role under `src/`:
   book replayed to a new client). The *quote* floor is
   deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
+- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**,
+  in *both* arbitration modes with no `mode_for` branch (#105): one `source_ts` tick can hold several
+  deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
+  arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
+  every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
+  dropped (`dz_book_dropped_total`). **Speed and silence are per arm, venue-wide; health is per market**
+  (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
+  overrides the elected arm for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
+  **Anything but "the arm that last reached the wire for this market" re-baselines the consumer**: a
+  serving-arm change (margin, silence, or that health override), a market's first admission, or a market
+  whose state was evicted. The re-baseline is a `clear` plus the new arm's complete current level set,
+  `snapshot`/`last` true — so the gate accumulates **every eligible arm's** book (`BookMarket::arms`), not
+  only the serving one. Three constraints shape it: it is emitted lazily on that arm's next *completed*
+  logical event, never as a venue-wide burst of clears (most markets are idle, and `to_book` of a
+  half-applied event goes out stamped `last` as a torn book); the wait is **bounded**
+  (`MAX_WITHHELD_BATCHES`) because `last` is a promise made by an unauthenticated producer; and it
+  degrades to a **bare `clear`** unless `BookAccumulator::baselined` holds — an arm that has sent no
+  producer re-baseline holds only the levels that moved since it started accumulating, and publishing
+  that as `snapshot` would tell the consumer to discard the rest. The replay map mirrors the serving
+  arm's accumulator, that flag included, so `sinks/ws.rs` skips exactly the markets this cannot
+  re-baseline.
+  Per-market state is capped by `MAX_BOOK_MARKETS` (`dz_book_markets_evicted_total`) and eviction drops
+  the accumulators, the replay entry **and** `StickyAuthority`'s own per-market entry together — that
+  pairing is what makes eviction safe rather than a corruption primitive, since losing `last_admitted` is
+  what forces the re-baseline. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
+  processor scopes `EndOfSession` per arm and channel, handing those markets to the peer). `arm_race` is the **only** producer of the matched-lead
+  samples the speed re-election consumes: it pairs the two arms' copies of the same **trade** by content
+  (`(venue, symbol, price bits, size bits, aggressor)`, FIFO per signature so identical repeats pair in
+  order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time. Trades only — a
+  level update's cross-arm-common fields recur on a coarse price grid and would mis-pair constantly — and
+  **edge arms the authority already tracks only** (`Arbiter::race_eligible`): the public backstop decodes
+  from parsed JSON and serves no `book`, and an untracked publisher would spend one of the venue's eight
+  admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
+  `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
+  non-negative). The only `FEEDS` row of that kind is `lashay-2`, whose group is live, so these series
+  populate on any host subscribed to it — and report nothing on a host that is not.
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -232,8 +327,14 @@ Modules are grouped by role under `src/`:
 - **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
-  + trades). All gate emission **per instrument** on a known definition (precision before price). The
+  + trades), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
+  incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
+  All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
+  IP and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
+  a shared port block one publisher's restart would otherwise clear every publisher's definitions and
+  blank the venue. Reads take the **non-inserting** `PerPublisher::def`; only the refdata handlers use
+  the inserting `get`, so a forged-source market-data flood can't evict a real publisher's definitions.
   `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
   datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
   sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
@@ -244,7 +345,36 @@ Modules are grouped by role under `src/`:
   content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
   tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
   `source_ts` per depth).
-- **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs`** — pure decoders for each protocol's
+  `MbpProcessor` keys its books on **`(publisher, channel, instrument)`** — two arms mirror one feed
+  with unrelated per-instrument delta series, and one group is sharded across channels whose state
+  machines are independent — and carries the design's cross-instrument/cross-publisher conformance
+  items: `SnapshotLevel` routes by the **open group** per `(publisher, channel)` (never by
+  `snapshot_id`, which is monotonic per `(channel, instrument)` and so collides across instruments
+  within a rotation), a **cross-instrument** buffer budget (`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`, 2^20;
+  overflow drops the largest instrument's buffer and marks it `Gap` rather than taking the channel
+  down — `pricebook`'s per-book cap is a quarter of it, so the budget only binds with several heavy
+  books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's
+  venue-wide clear would tear down a live peer arm's published book), and a channel reset on any
+  **change** of the frame header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
+  read from the **market-data role only** and only for a publisher whose reference data we already
+  hold: the three ports carry one epoch on three sockets, so a memo shared across them would re-reset
+  the channel on every interleaving of a restart's backlog, and minting reference-data state from the
+  market-data path is what would let a forged-source flood evict the real publishers' definitions. A
+  snapshot group whose epoch disagrees with the market data's is refused for the same reason — it
+  belongs to the publisher's previous run, and installing it would republish a dead session's book.
+  `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
+  O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are
+  reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped arm
+  over to its peer. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
+  `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
+  whole-side clear would tell the consumer to drop levels this book still holds. Its
+  `ManifestSummary`/`InstrumentDefinition` arms are `handle_refdata`-gated exactly like the three
+  siblings' — decode does not care which physical port a type arrives on, so without it one forged
+  datagram on the market-data or snapshot port clears a publisher's definitions and every emission
+  path (which all gate on a resolved definition) goes dark for the venue — and it drains
+  `PerPublisher::take_evicted` into `forget_publisher`, which drops the evicted publisher's books,
+  `revealed`/`announced_symbol` entries and per-channel snapshot/reset memos together.
+- **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs` / `codec_mbp.rs`** — pure decoders for each protocol's
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).
   **`codec.rs` (TOB) offsets are validated byte-for-byte** against the authoritative Go decoder in
@@ -254,10 +384,27 @@ Modules are grouped by role under `src/`:
   test over the byte-validated committed golden fixtures (`tests/codec_mbo_fixtures.rs`). ⚠️
   **`codec_midpoint.rs` offsets still come from the edge-feed-spec draft and are NOT
   reference-validated**; its round-trip tests only pin self-consistency, so validate against a live
-  frame hexdump before trusting its output (see "Conventions" below).
+  frame hexdump before trusting its output (see "Conventions" below). **`codec_mbp.rs`
+  (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
+  against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
+  a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
+  stay offset-test-only — and the `lashay-2` group is live, so those four now decode against real
+  traffic for the first time. It is the one codec that enforces **exact** body-length
+  equality per type rather than bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's,
+  so a lenient decode would
+  read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
+  therefore also the one that rejects an unimplemented `SCHEMA_VERSION` itself rather than leaving
+  it to the shared walker: without that gate the length rule would silently reject a v2 frame whose
+  bodies legally grew, and the whole feed would decode to `Other`.
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
   Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
+- **`ingest/pricebook.rs`** — `PriceBook`: per-instrument **price-keyed** book + the market-by-price
+  snapshot+delta recovery machine (`AwaitingSnapshot`/`BuildingSnapshot`/`Ready`/`Gap`). A **sibling**
+  of `book.rs`, not a reuse: the wire is already price-aggregated and each level carries its absolute
+  resulting quantity, so `Action` never gates the apply (quantity alone decides) and the
+  `Add`/`Cancel`/`Execute` vocabulary does not apply. Reports the levels a `BookClear` removed through
+  a caller-supplied buffer, since the wire `Clear` has no price bound.
 - **`ingest/subscriber.rs`** — `RefDataState<D>`, the reference-data state machine, **generic over** any
   instrument-definition type implementing `InstrumentDef` (its id + manifest seq), so all three
   protocols reuse it. Collects definitions tagged with the latest `ManifestSummary` seq; `ready()`
@@ -265,7 +412,9 @@ Modules are grouped by role under `src/`:
   per instrument, not on `ready()`**: a processor emits as soon as `definition(id)` resolves, so
   consumers never see a price before its precision, but a single symbol flows without waiting for
   the full set (an all-or-nothing gate could wedge the feed on a startup/reset race). Uses
-  wraparound-safe u16 sequence comparison (`is_later`).
+  wraparound-safe u16 sequence comparison (`is_later`). One instance tracks **one publisher** — the
+  per-source-IP map lives in `processor.rs` (`PerPublisher`), keeping this state machine
+  single-publisher and unit-testable.
 - **`sinks/ws.rs`** — fans the broadcast out to clients (on by default; disable with an empty
   `--ws-bind`). **Serializes each message once, not per client:** a single serializer task reads the
   `Arc<FeedMessage>` backbone, stamps one shared `ws_send_ts_ns`, renders the JSON once, and
@@ -273,17 +422,43 @@ Modules are grouped by role under `src/`:
   `Utf8Bytes` clone (so N clients cost one serialization, and `ws_send_ts_ns` is one instant shared by
   all consumers of a message — see PROTOCOL.md). With no clients connected the serializer skips the
   work. On connect it replays the instrument snapshot (precision first) **then the latest
-  `depth` per symbol** (full state), then streams quotes/trades/midpoints/depth. Implements the
+  `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
+  materialized from the serving arm's `BookAccumulator` and scoped by the `channel` filter dimension like
+  every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
+  `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
+  scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
+  replaying every market. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
-  firehose), app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
+  firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
+  `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
+  (`status`) paths call, so a new dimension can't silently exempt half the stream; a channelless
+  message is excluded by an explicit `channel` filter, with `status` (venue-level) the one carve-out —
+  `instrument` carries its own channel and is filtered like `book`, including on the replay path. Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
-  `NormalizedDepth`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the `now_ns()` /
-  `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
-  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other.
+  `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
+  `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
+  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other; `BookSnapshot` is keyed by
+  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label and
+  collides across markets, so it is not an identity.
+  `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
+  absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
+  reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`
+  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookSnapshot`
+  holds a `BookAccumulator` per market rather than the last message, because an incremental product's
+  last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
+  the full level set on demand. It commits per *logical event* (buffering until `last`), since
+  `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book, and
+  it is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the
+  single-arm
+  authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-arm
+  accumulators; `MbpProcessor` emits `book`, and the `lashay-2` row selects it on a live group.
+  `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
+  so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
+  arbiter's definition rate limit keys on that triple for the same reason.
 
 ## Conventions and gotchas
 

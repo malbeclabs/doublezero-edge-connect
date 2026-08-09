@@ -12,9 +12,11 @@
 //! set `SO_REUSEADDR`/`SO_REUSEPORT`, and a large `SO_RCVBUF`.
 
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -55,9 +57,11 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
+        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher, FEEDS},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
-        processor::{MboProcessor, MidpointProcessor, TobProcessor},
+        processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor},
+        reconcile::TapeOwner,
+        sources,
     },
     metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
@@ -76,8 +80,7 @@ pub enum PortRole {
     Mktdata,
     /// Reference data: instrument definitions + manifest.
     Refdata,
-    /// Market-by-Order snapshot recovery stream. (Constructed once the MBO receiver lands.)
-    #[allow(dead_code)]
+    /// The in-band snapshot recovery stream of a book protocol (Market-by-Order/-Price).
     Snapshot,
     /// A single port carrying everything (loopback demo): both market and reference data.
     Combined,
@@ -129,9 +132,110 @@ impl FrameCtx<'_> {
     /// Emit a normalized message through the shared arbiter, tagged with this datagram's edge
     /// publisher so the quote floor can race it against the other sources for the tick's leadership.
     /// The brief critical section is the arbiter's admit-decision-plus-send.
+    ///
+    /// Also records the message's own (wire-resolved) venue as one this feed row has revealed data
+    /// under (see [`record_revealed`]), so a later `status` for this row names what its receivers
+    /// actually emit rather than the row's static `venue`. This runs before the arbiter's own
+    /// admit decision, so a copy the arbiter goes on to drop as a cross-source duplicate still
+    /// counts as revealed — deliberate: revealing records what this row's wire decoded and
+    /// attempted to emit, a source-identity fact, independent of whether the arbiter's dedup floor
+    /// later broadcasts that particular copy.
     pub fn emit(&self, msg: FeedMessage) {
+        let (wire_venue, _) = msg.venue_symbol();
+        record_revealed(self.venue, wire_venue);
         lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher));
     }
+}
+
+/// Wire venues actually emitted under each feed row's static `venue`, tracked from every
+/// [`FrameCtx::emit`]. `FeedStatus` (built in [`emit_status`]) must report under what consumers'
+/// quotes/trades actually carry — a publisher's wire `Source ID` can resolve
+/// (`ingest::sources::source_label`) to a different registry name than `venue`, the static identity
+/// of the row this receiver was configured from (see the module doc and `ingest::sources`).
+///
+/// Scoped to the row `venue` — the same granularity `FeedHealth`'s own up/down aggregate already
+/// uses — rather than the finer per-receiver `ReceiverKey`, because `FrameCtx` carries no `kind`/port
+/// and is a fixed contract with `processor.rs`'s `FrameProcessor` implementations (not this fix's to
+/// change). This is not a loss of precision where it matters: `emit_status` only ever fires from
+/// `FeedHealth::with_edge` on a genuine aggregate flip (the whole point of that gate — see
+/// `health.rs`), so whichever receiver(s) of this row caused the flip are exactly the ones whose
+/// revealed venues belong in that flip's message. `emit_status` additionally never speaks for a
+/// revealed venue that owns its own `FEEDS` row (see there) — this map only records candidates.
+///
+/// A process-wide static rather than a `FrameCtx`/`ReceiverRegistration` field for the same reason:
+/// `FrameCtx`'s field set is fixed. The outer key space (row venues) is the small, fixed `FEEDS`
+/// registry, never wire-controlled; the inner sets hold only registry-resolved labels (see
+/// `record_revealed`), so the whole map is bounded by the registry, never by wire input.
+///
+/// A `BTreeSet` inner value (not `HashSet`) so [`revealed_venues_for`]'s iteration order — and so
+/// the order `emit_status` sends multiple `FeedStatus` messages on a multi-venue edge — is
+/// deterministic rather than hash-order-dependent.
+type RevealedVenueMap = RwLock<HashMap<&'static str, BTreeSet<Arc<str>>>>;
+static REVEALED_VENUES: OnceLock<RevealedVenueMap> = OnceLock::new();
+
+thread_local! {
+    /// Per-OS-thread mirror of [`REVEALED_VENUES`], so `record_revealed` can skip the global lock
+    /// entirely once this thread has already recorded a `(venue, wire_venue)` pair. A receiver task
+    /// normally keeps running on the same worker thread across polls, so in steady state this makes
+    /// the hot path (every emitted message) fully lock-free; the rare cross-thread migration (or a
+    /// second receiver task sharing the worker) just falls through to the global map once per new
+    /// thread, not once per message. A plain (unsynchronized) cell is correct here because each OS
+    /// thread only ever touches its own copy.
+    static LOCAL_REVEALED: RefCell<HashMap<&'static str, HashSet<Arc<str>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record that feed row `venue` has emitted data under wire venue `wire_venue`, unless `wire_venue`
+/// is not itself a registered [`sources::source_id_of`] name. The wire is explicitly
+/// unauthenticated and this map never decays, so recording an unregistered/synthesized label (the
+/// `SOURCE_<id>` fallback `sources::source_label` produces for an unassigned id) would let one
+/// forged burst permanently seed phantom venues that every later edge for this row would then emit
+/// a `status` for — bounded by `sources::MAX_UNREGISTERED_SOURCES`, but still real, silent
+/// corruption of the wire `status` stream. Lock-free in the steady state; see [`LOCAL_REVEALED`].
+fn record_revealed(venue: &'static str, wire_venue: &str) {
+    let already_known = LOCAL_REVEALED.with(|local| {
+        local
+            .borrow()
+            .get(venue)
+            .is_some_and(|set| set.contains(wire_venue))
+    });
+    if already_known {
+        return; // fully lock-free fast path: the steady-state common case
+    }
+    if sources::source_id_of(wire_venue).is_none() {
+        return; // not a registered name: never recorded (see the doc above)
+    }
+    let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
+    if !map
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(venue)
+        .is_some_and(|set| set.contains(wire_venue))
+    {
+        map.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(venue)
+            .or_default()
+            .insert(Arc::from(wire_venue));
+    }
+    LOCAL_REVEALED.with(|local| {
+        local
+            .borrow_mut()
+            .entry(venue)
+            .or_default()
+            .insert(Arc::from(wire_venue));
+    });
+}
+
+/// The wire venues recorded so far for feed row `venue` (see [`record_revealed`]), or an empty set
+/// if this row's receivers have not emitted any data yet.
+fn revealed_venues_for(venue: &str) -> BTreeSet<Arc<str>> {
+    let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
+    map.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(venue)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Protocol-specific frame handling. Implementors own their decode (they know their frame magic
@@ -220,6 +324,22 @@ impl Drop for ReceiverRegistration {
 /// connected). Called only from `FeedHealth`'s `on_edge`, i.e. only on a venue-level edge, and with
 /// that lock held — so two receivers can't publish contradictory states out of order. `stale_ms` is
 /// only meaningful on a `down` edge.
+///
+/// `venue` here is the feed **row's** static identity — used only for the health-map lookup above it
+/// and the `dz_feed_up`/`dz_feed_stale_ms` gauges, which stay keyed on the row (an operational
+/// aggregate wired to the registry, not the wire naming this fixes). The **wire** `status` message is
+/// different: it must name what this row's receivers have actually emitted quotes/trades under, since
+/// a publisher's wire Source ID can resolve to a different registry name than the row (see
+/// `record_revealed`). A row that has revealed no venue yet emits no `status` at all here — a receiver
+/// that has produced no data has nothing to declare an outage on.
+///
+/// A revealed venue that is itself the static `venue` of a **different** `FEEDS` row is skipped: that
+/// venue owns its own rows and its own independent `FeedHealth` aggregate, and reports itself through
+/// its own `emit_status` calls. Without this, a superset group whose publisher(s) also mirror another
+/// registered venue's Source ID onto this row (`feeds.rs` documents exactly this for a superset
+/// group's Source-ID-3 traffic) would make this row speak for that other venue too — on this row's `down` edge
+/// wrongly declaring the other venue down while its own rows still stream, and on this row's `ok` edge
+/// worse, silently overwriting a genuine `down` the other venue's own aggregate just published.
 fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
     let state = if up { "ok" } else { "down" };
     let stale_ms = if up { 0 } else { stale_ms };
@@ -232,17 +352,25 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
         .feed_stale_ms
         .with_label_values(&[venue])
         .set(stale_ms as i64);
-    // Status carries no business identity to dedup, so it goes straight to the broadcast sender
-    // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the `Arc`/`Arc<str>`
-    // allocation here is off the per-message hot path.
-    let _ = lock(arbiter)
-        .sender()
-        .send(std::sync::Arc::new(FeedMessage::Status(FeedStatus {
-            venue: std::sync::Arc::from(venue),
-            state: state.to_string(),
-            stale_ms,
-            ts_ns: now_ns(),
-        })));
+    for wire_venue in revealed_venues_for(venue) {
+        if wire_venue.as_ref() != venue && FEEDS.iter().any(|f| f.venue == wire_venue.as_ref()) {
+            continue; // that venue has its own row(s) and its own aggregate; it speaks for itself
+        }
+        let source_id = sources::source_id_of(wire_venue.as_ref()).unwrap_or(0);
+        // Status carries no business identity to dedup, so it goes straight to the broadcast sender
+        // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the allocation
+        // here is off the per-message hot path.
+        let _ = lock(arbiter)
+            .sender()
+            .send(Arc::new(FeedMessage::Status(FeedStatus {
+                venue: wire_venue.clone(),
+                source: wire_venue,
+                source_id,
+                state: state.to_string(),
+                stale_ms,
+                ts_ns: now_ns(),
+            })));
+    }
 }
 
 /// Receive one datagram, returning `(len, kernel_rx_ns, user_recv_ns)`.
@@ -671,6 +799,7 @@ pub async fn run_feed(
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
     health: SharedFeedHealth,
+    tape: TapeOwner,
 ) -> Result<()> {
     let venue: &'static str = feed.venue;
     match feed.kind {
@@ -687,7 +816,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
-                TobProcessor::new(feed.emit_trades),
+                TobProcessor::new(tape),
             )
             .await
         }
@@ -737,7 +866,40 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
-                MboProcessor::new(depth, feed.emit_trades),
+                MboProcessor::new(depth, tape),
+            )
+            .await
+        }
+        FeedKind::MarketByPrice => {
+            let FeedPorts::ThreePort {
+                mktdata,
+                refdata,
+                snapshot,
+            } = publisher.ports
+            else {
+                bail!(
+                    "Market-by-Price feed '{venue}' publisher '{}' must use FeedPorts::ThreePort \
+                     (mktdata/refdata/snapshot)",
+                    publisher.base_port()
+                );
+            };
+            let ports = vec![
+                (PortRole::Mktdata, mktdata),
+                (PortRole::Refdata, refdata),
+                (PortRole::Snapshot, snapshot),
+            ];
+            drive(
+                feed.group,
+                ports,
+                iface,
+                recv_buf,
+                venue,
+                feed.kind,
+                publisher.base_port(),
+                arbiter,
+                instruments,
+                health,
+                MbpProcessor::new(tape),
             )
             .await
         }
@@ -748,7 +910,11 @@ pub async fn run_feed(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    use super::{datagram_src_ip, init_feed_health, SeqCheck, SeqTracker, SockaddrStorage};
+    use super::{
+        datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_venues_for,
+        FeedMessage, FrameCtx, PortRole, ReceiverRegistration, SeqCheck, SeqTracker, SharedArbiter,
+        SockaddrStorage,
+    };
     use crate::metrics::metrics;
 
     #[test]
@@ -764,6 +930,205 @@ mod tests {
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
         assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);
         assert_eq!(metrics().feed_stale_ms.with_label_values(&[venue]).get(), 0);
+    }
+
+    fn test_arbiter() -> (
+        SharedArbiter,
+        tokio::sync::broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) {
+        use crate::ingest::arbiter::Arbiter;
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        (
+            std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 8))),
+            rx,
+        )
+    }
+
+    /// A row that has revealed no wire venue yet (no receiver has emitted data) declares no status
+    /// at all — deferral, not a guess dressed up as the row's static name.
+    #[test]
+    fn emit_status_emits_nothing_when_no_venue_revealed_yet() {
+        let (arbiter, mut rx) = test_arbiter();
+        emit_status(&arbiter, "EmitStatusNoRevealRow", false, 5_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "no revealed venue: nothing to declare an outage on"
+        );
+    }
+
+    /// `emit_status` reports under the revealed venue (not a hardcoded pass-through of the row
+    /// param) and resolves its registry `source_id` correctly. Row and wire are the same real
+    /// `FEEDS` venue here — the well-behaved case, where a row's own revealed identity matches
+    /// it — because every currently-registered name owns at least one `FEEDS` row, so a wire
+    /// venue that both differs from the row *and* survives `emit_status`'s ownership guard does
+    /// not exist in today's registry; see `emit_status_never_reports_a_venue_that_owns_its_own_feeds_row`
+    /// for the case where a row's revealed set contains a *different* venue.
+    #[test]
+    fn emit_status_reports_the_revealed_venue_with_its_registry_source_id() {
+        let venue = "KALSHI";
+        record_revealed(venue, venue);
+        let (arbiter, mut rx) = test_arbiter();
+        emit_status(&arbiter, venue, true, 0);
+        match &*rx.try_recv().expect("a status was emitted") {
+            FeedMessage::Status(s) => {
+                assert_eq!(s.venue.as_ref(), venue);
+                assert_eq!(s.source.as_ref(), venue);
+                assert_eq!(s.source_id, 3);
+                assert_eq!(s.state, "ok");
+            }
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    /// `record_revealed` is idempotent per `(venue, wire_venue)` pair and distinguishes rows.
+    #[test]
+    fn record_revealed_is_idempotent_and_scoped_per_row() {
+        let a = "RecordRevealedRowA";
+        let b = "RecordRevealedRowB";
+        record_revealed(a, "HYPERLIQUID");
+        record_revealed(a, "HYPERLIQUID");
+        record_revealed(a, "PHOENIX");
+        record_revealed(b, "KALSHI");
+        let revealed_a = revealed_venues_for(a);
+        assert_eq!(revealed_a.len(), 2);
+        assert!(revealed_a.contains("HYPERLIQUID") && revealed_a.contains("PHOENIX"));
+        let revealed_b = revealed_venues_for(b);
+        assert_eq!(revealed_b.len(), 1);
+        assert!(revealed_b.contains("KALSHI"));
+    }
+
+    /// A wire label the registry does not resolve (`sources::source_id_of` returns `None` — the
+    /// synthesized `SOURCE_<id>` fallback for an unassigned Source ID, or plain garbage) is never
+    /// recorded: the wire is unauthenticated and this map never decays, so one forged burst would
+    /// otherwise permanently seed a phantom venue that every later edge for this row emits a
+    /// `status` for.
+    #[test]
+    fn record_revealed_ignores_unregistered_wire_labels() {
+        let row = "RecordRevealedUnregisteredRow";
+        record_revealed(row, "SOURCE_54321");
+        record_revealed(row, "TotallyMadeUpVenue");
+        assert!(
+            revealed_venues_for(row).is_empty(),
+            "unregistered labels must not be recorded"
+        );
+    }
+
+    /// A superset group's Source-ID-3 traffic (`feeds.rs`) means a row can reveal a venue
+    /// that owns its own `FEEDS` rows and its own independent `FeedHealth` aggregate. That venue
+    /// speaks for itself; this row must not also report `status` under its name.
+    #[test]
+    fn emit_status_never_reports_a_venue_that_owns_its_own_feeds_row() {
+        let row = "HYPERLIQUID";
+        // This is a real `FEEDS` venue with its own rows — exactly the superset scenario
+        // `feeds.rs`/`sources.rs` document for a superset group's Source-ID-3 traffic.
+        record_revealed(row, "HYPERLIQUID");
+        record_revealed(row, "KALSHI");
+        let (arbiter, mut rx) = test_arbiter();
+        emit_status(&arbiter, row, false, 1_234);
+        match &*rx.try_recv().expect("the row's own venue still reports") {
+            FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), "HYPERLIQUID"),
+            other => panic!("expected a status, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must not also emit a status under the source name that owns its own aggregate"
+        );
+    }
+
+    /// `FrameCtx::emit` is the hook: it must record the message's OWN venue (as `processor.rs`
+    /// resolves it from the wire Source ID), not `ctx.venue` (the feed row's static identity) —
+    /// those are exactly the two that can differ.
+    #[test]
+    fn frame_ctx_emit_records_the_messages_own_venue() {
+        use std::collections::HashMap;
+
+        use crate::model::{InstrumentSnapshot, NormalizedQuote};
+
+        let row_venue: &'static str = "FrameCtxEmitRow";
+        // Must be a name the registry resolves: `record_revealed` (called by `ctx.emit` below)
+        // only records registered names — see `record_revealed_ignores_unregistered_wire_labels`.
+        let wire_venue: &'static str = "PHOENIX";
+        let (arbiter, _rx) = test_arbiter();
+        let instruments: InstrumentSnapshot =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ctx = FrameCtx {
+            venue: row_venue,
+            arbiter: &arbiter,
+            instruments: &instruments,
+            kernel_rx_ts_ns: 0,
+            recv_ts_ns: 0,
+            role: PortRole::Mktdata,
+            publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        };
+        let quote = NormalizedQuote {
+            venue: wire_venue.into(),
+            source: wire_venue.into(),
+            source_id: 2,
+            symbol: "X".into(),
+            bid: 1.0,
+            ask: 1.0,
+            bid_size: 1.0,
+            ask_size: 1.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 1,
+            recv_ts_ns: 1,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        };
+        ctx.emit(FeedMessage::Quote(quote));
+        let revealed = revealed_venues_for(row_venue);
+        assert!(
+            revealed.contains(wire_venue),
+            "ctx.emit must record the message's own venue, not the row's"
+        );
+        assert!(
+            !revealed.contains(row_venue),
+            "the feed row's static venue was never the message's own venue here"
+        );
+    }
+
+    /// End-to-end (through the real `ReceiverRegistration` → `FeedHealth` → `emit_status` wiring,
+    /// not just the unit-level `emit_status` call): a row whose revealed set picked up a foreign
+    /// venue's name (a superset group's Source-ID-3 superset scenario) reports `status` under its own
+    /// venue on its up edge and never under the foreign one, which owns its own `FEEDS` rows and
+    /// its own independent aggregate.
+    #[test]
+    fn a_receiver_reports_status_via_its_revealed_venue_and_suppresses_a_foreign_owned_one() {
+        use crate::ingest::{feeds::FeedKind, health::FeedHealth};
+
+        // "PHOENIX" is this row's own (real) venue; the second name mirrors the superset-group
+        // scenario (`feeds.rs`) where a row's revealed set also picks up a DIFFERENT venue's
+        // name, one with its own `FEEDS` rows and its own independent `FeedHealth` aggregate.
+        let row_venue = "PHOENIX";
+        let foreign_venue = "KALSHI";
+        // Simulates this receiver's own `ctx.emit` calls having already resolved and emitted
+        // under both wire venues.
+        record_revealed(row_venue, row_venue);
+        record_revealed(row_venue, foreign_venue);
+
+        let (arbiter, mut rx) = test_arbiter();
+        let health = FeedHealth::new();
+        let key = (row_venue, FeedKind::TopOfBook, 9101);
+        let up_gauge = metrics()
+            .receiver_up
+            .with_label_values(&[row_venue, "tob", "9101"]);
+        let reg = ReceiverRegistration::new(health.into(), arbiter, key, up_gauge);
+        // Registering the first (and only) receiver for this venue is an up edge, so `emit_status`
+        // fires synchronously from inside `ReceiverRegistration::new` — reporting only this row's
+        // own venue, never the foreign one that governs its own aggregate.
+        match &*rx
+            .try_recv()
+            .expect("registering the first receiver is an up edge")
+        {
+            FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), row_venue),
+            other => panic!("expected a status, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must not also emit a status under the foreign venue's name"
+        );
+        drop(reg);
     }
 
     /// The idle interval doubles per fruitless rejoin and stops at the cap, so a permanently-silent

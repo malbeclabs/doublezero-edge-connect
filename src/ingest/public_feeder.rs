@@ -10,6 +10,13 @@
 //! gaps the public copy is the first to cross and fills in. That backstop falls out of the arbiter
 //! with no health check.
 //!
+//! **The backstop needs the edge to have gone live at least once.** Each venue's `instrument_known`
+//! gate reads the shared `InstrumentSnapshot`, which `ingest::processor` populates only once the edge
+//! has revealed an instrument's wire Source ID (see that module's per-instrument deferral) — refdata
+//! alone never populates it. A mid-stream gap (the edge was live, then goes quiet) is backstopped
+//! normally; a cold start with no edge price at all for that instrument leaves this gate permanently
+//! closed for it, since there is no wire-derived precision/venue to key it by.
+//!
 //! Everything venue-specific (URL, subscribe frames, frame decode) lives behind [`PublicVenue`];
 //! this module owns only the reconnect/backoff loop, the frame pump, and the small validation
 //! helpers every venue decoder reuses.
@@ -150,7 +157,10 @@ where
 }
 
 /// True if the `(venue, symbol)` instrument is already in the shared snapshot, so a price emitted for
-/// it carries known precision (precision before price).
+/// it carries known precision (precision before price). The snapshot is populated by the edge side
+/// only once it has revealed that instrument's Source ID (see `ingest::processor`'s deferral), so
+/// this stays closed for an instrument the edge has never once gone live for — a cold start, not a
+/// gap.
 pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &str) -> bool {
     crate::model::lock(instruments).contains_key(&(Arc::from(venue), Arc::from(symbol)))
 }

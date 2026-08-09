@@ -6,6 +6,10 @@
 //! The state machine is identical across the edge-feed-spec protocols (Top-of-Book, Midpoint,
 //! Market-by-Order), which differ only in their instrument-definition *layout*, so it is generic
 //! over any definition type that implements [`InstrumentDef`] (its key + manifest sequence).
+//!
+//! One instance tracks **one publisher**: `reset_count` and the manifest epoch are scoped to
+//! `(source_ip, group, port)`. The per-source-IP map lives in the processors
+//! (`processor::PerPublisher`), which keeps this state machine single-publisher and unit-testable.
 
 use std::collections::HashMap;
 
@@ -103,6 +107,7 @@ mod tests {
     fn defn(iid: u32, seq: u16) -> InstrumentDefinition {
         InstrumentDefinition {
             instrument_id: iid,
+            source_id: None,
             symbol: format!("SYM{iid}").into(),
             price_exponent: -2,
             qty_exponent: -2,

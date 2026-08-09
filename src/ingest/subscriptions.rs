@@ -275,13 +275,13 @@ mod tests {
         let hl = subs(&["tiredsolid", "edge-solana-shreds"], &[]);
         let got = hl.market_data_feeds(enabled);
         assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|f| f.venue == "Hyperliquid"));
+        assert!(got.iter().all(|f| f.venue == "HYPERLIQUID"));
 
         // Subscribed to Phoenix only.
         let px = subs(&["scottsdale"], &[]);
         let got = px.market_data_feeds(enabled);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].venue, "Phoenix");
+        assert_eq!(got[0].venue, "PHOENIX");
 
         // Shreds-only host -> no market-data feeds.
         let shreds_only = subs(&["edge-solana-shreds", "edge-solana-root"], &[]);

@@ -33,14 +33,14 @@ fn tob_refdata_golden_splits_into_valid_frames() {
 #[test]
 #[serial]
 fn bridge_starts_and_serves_ws() {
-    let bridge = Bridge::spawn("Hyperliquid", 18090);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18090);
     assert!(std::net::TcpStream::connect(&bridge.ws_addr).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ws_client_connects_and_times_out_clean() {
-    let bridge = Bridge::spawn("Hyperliquid", 18091);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18091);
     // No data replayed: we just prove the client connects and the timeout path returns.
     let msgs = ws_client::collect(&bridge.ws_addr, Duration::from_millis(500), |_| false).await;
     // Connection succeeded; with no input there are no quotes.
@@ -50,7 +50,7 @@ async fn ws_client_connects_and_times_out_clean() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn spike_loopback_multicast_produces_a_quote() {
-    let bridge = Bridge::spawn("Hyperliquid", 18081);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18081);
     let ws_addr = bridge.ws_addr.clone();
 
     // Connect first so we don't miss streamed quotes (quotes are not replayed on connect).
@@ -87,7 +87,7 @@ async fn spike_loopback_multicast_produces_a_quote() {
     assert!(!quotes.is_empty(), "expected at least one quote on the WS");
     assert_eq!(
         quotes[0].get("venue").and_then(|v| v.as_str()),
-        Some("Hyperliquid")
+        Some("HYPERLIQUID")
     );
 }
 
@@ -96,7 +96,7 @@ async fn spike_loopback_multicast_produces_a_quote() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn tob_single_publisher_contract() {
-    let bridge = Bridge::spawn("Hyperliquid", 18082);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18082);
     let ws_addr = bridge.ws_addr.clone();
 
     // Collect for a fixed window after replay completes (we do not know the exact count
@@ -169,7 +169,7 @@ fn mbo_goldens_split_into_valid_frames() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mbo_single_publisher_depth_contract() {
-    let bridge = Bridge::spawn("Hyperliquid", 18083);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18083);
     let ws_addr = bridge.ws_addr.clone();
 
     let collector = tokio::spawn(async move {
@@ -277,7 +277,7 @@ async fn mbo_single_publisher_depth_contract() {
 #[serial]
 fn two_publisher_port_blocks_are_both_ingested() {
     let metrics_bind = "127.0.0.1:19231".to_string();
-    let _bridge = Bridge::spawn_with_args("Hyperliquid", 18231, &["--metrics-bind", &metrics_bind]);
+    let _bridge = Bridge::spawn_with_args("HYPERLIQUID", 18231, &["--metrics-bind", &metrics_bind]);
 
     let refdata = replay::split_frames(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),

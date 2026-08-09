@@ -10,8 +10,8 @@ use std::net::Ipv4Addr;
 
 /// Which edge-feed-spec protocol a feed speaks. Selects the frame magic + decoder + receiver
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
-// `Midpoint`/`MarketByOrder` are matched on by the receiver but only *constructed* by FEEDS rows,
-// which are added once their live multicast endpoints are known - hence the dead_code allow.
+// `Midpoint`/`MarketByOrder`/`MarketByPrice` are matched on by the receiver but only *constructed*
+// by FEEDS rows, added once their live multicast endpoints are known - hence the dead_code allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FeedKind {
@@ -21,6 +21,9 @@ pub enum FeedKind {
     Midpoint,
     /// Market-by-Order (frame magic `0x4444`): full L3 order book with snapshot+delta recovery.
     MarketByOrder,
+    /// Market-by-Price (frame magic `0x4442`): the price-aggregated book with snapshot+delta
+    /// recovery, re-served as the incremental `book` product.
+    MarketByPrice,
 }
 
 impl FeedKind {
@@ -30,6 +33,7 @@ impl FeedKind {
             FeedKind::TopOfBook => "tob",
             FeedKind::Midpoint => "midpoint",
             FeedKind::MarketByOrder => "mbo",
+            FeedKind::MarketByPrice => "mbp",
         }
     }
 }
@@ -105,10 +109,28 @@ impl FeedPublisher {
     }
 }
 
+/// How the bridge resolves two publishers mirroring one venue.
+///
+/// Both modes hold exactly one authoritative publisher per key; what differs is when authority
+/// transfers. `Coordinated` re-latches every tick, because the publishers stamp a venue clock that
+/// is comparable between them. `Sticky` cannot: its arms carry no shared coordinate — no stable
+/// entry id, no per-entry venue timestamp, and the transport's own send time is not the venue's —
+/// and a content hash is no substitute, since a level oscillating 100 -> 0 -> 100 emits
+/// byte-identical updates and collapsing those leaves a subscriber holding 0 at a price that has
+/// liquidity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbitrationMode {
+    /// Comparable venue clock: latch to the tick's leader, re-latch every tick.
+    Coordinated,
+    /// No comparable coordinate: elect one arm and hold it, transferring only on a health verdict,
+    /// on silence, or on a sustained speed margin.
+    Sticky,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Feed {
     /// Venue name stamped on every instrument and message from this feed. Matches the
-    /// edge-feed-spec source registry name (e.g. "Hyperliquid" for SourceID 1).
+    /// edge-feed-spec source registry name (e.g. "HYPERLIQUID" for SourceID 1).
     pub venue: &'static str,
     /// The DoubleZero multicast group **code** for this feed's group (e.g. "tiredsolid",
     /// "scottsdale") — the identifier `doublezero status`/`multicast group list` report. The
@@ -124,9 +146,17 @@ pub struct Feed {
     /// spawned per entry. A feed whose publishers all share one port block lists exactly one
     /// entry (see [`FeedPublisher`]).
     pub publishers: &'static [FeedPublisher],
-    /// Whether this feed emits `trade` messages. A venue carried by both TOB and MBO would
-    /// otherwise double-emit the same trades; TOB owns trades, MBO is depth-only.
+    /// Whether this feed *can* carry the venue's `trade` tape — the registry's declaration of intent,
+    /// **not a runtime gate**: nothing reads it on the emit path, and setting it `false` on a
+    /// tape-ranked kind suppresses nothing. Which claiming row actually serves the tape is the
+    /// reconciler's decision (`reconcile::tape_owners`), because a venue's rows are separately
+    /// subscription-gated and the tape must survive on whichever subset is up.
+    /// `emit_trades_agrees_with_the_tape_ownership_rule` is what ties the declaration to that
+    /// ranking, so a disagreeing row fails the build rather than behaving unexpectedly.
     pub emit_trades: bool,
+    /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
+    /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
+    pub arbitration: ArbitrationMode,
 }
 
 /// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue, each mirrored by
@@ -138,9 +168,10 @@ pub struct Feed {
 ///
 /// **Base ports follow no arithmetic rule.** The v0.7 publisher takes an arbitrary `mkt_port` per
 /// channel, so a block can sit anywhere (9011 is base+10, not base+N*100). The one guarantee is the
-/// layout *within* a block - `refdata = mktdata + 1`, `snapshot = mktdata + 2` - which the
-/// publisher role enforces fleet-wide and `publisher_blocks_use_the_canonical_layout` pins here.
-/// Derive a block from its market-data port; never derive the market-data port from an index.
+/// spacing *within* a block, which follows the publisher implementation: `+1`/`+2` for the
+/// Hyperliquid role, `+10000`/`+20000` for the Lashay one. `publisher_blocks_use_a_known_layout`
+/// pins both. Derive a block from its market-data port; never derive the market-data port from an
+/// index.
 ///
 /// Sibling-protocol feeds (Midpoint) are added here once their live multicast groups/ports are
 /// known; until then they are absent rather than carrying guessed endpoints.
@@ -155,11 +186,13 @@ pub const FEEDS: &[Feed] = &[
     // on the group. Sourcing this table from the deployment inventory alone is what left five
     // blocks unbound and the bridge ingesting about a third of the group's datagrams.
     //
-    // The venue is still resolved per message from the wire SourceID (see processor.rs), so the
-    // `venue` below is only the default for unregistered SourceIDs (the SourceID-3 Hyperliquid
-    // superset on tiredsolid). Each publisher gets its own receiver + reference-data state.
+    // The venue is resolved per message from the wire SourceID (see processor.rs), so the `venue`
+    // below is only the default for SourceIDs the registry does not assign. All three production
+    // IDs are assigned, and the wire value is authoritative: a publisher stamping an ID that is not
+    // its own is a publisher defect and is corrected at the publisher, never remapped here. Each
+    // publisher gets its own receiver + reference-data state.
     Feed {
-        venue: "Hyperliquid",
+        venue: "HYPERLIQUID",
         code: "tiredsolid",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 15),
@@ -235,6 +268,7 @@ pub const FEEDS: &[Feed] = &[
             },
         ],
         emit_trades: true,
+        arbitration: ArbitrationMode::Coordinated,
     },
     // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
     // (paired with the TOB row above). Depth-only: TOB owns this venue's trades.
@@ -250,7 +284,7 @@ pub const FEEDS: &[Feed] = &[
     // Silently-failing ports here: 10903 (derived from an observed 10902) and the whole 10701
     // block (registry-only, never seen on the wire). Everything else was decoded from a capture.
     Feed {
-        venue: "Hyperliquid",
+        venue: "HYPERLIQUID",
         code: "tiredsolid",
         kind: FeedKind::MarketByOrder,
         group: Ipv4Addr::new(233, 84, 178, 15),
@@ -339,9 +373,10 @@ pub const FEEDS: &[Feed] = &[
             },
         ],
         emit_trades: false,
+        arbitration: ArbitrationMode::Coordinated,
     },
     Feed {
-        venue: "Phoenix",
+        venue: "PHOENIX",
         code: "scottsdale",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
@@ -352,6 +387,58 @@ pub const FEEDS: &[Feed] = &[
             },
         }],
         emit_trades: true,
+        arbitration: ArbitrationMode::Coordinated,
+    },
+    // Lashay perps, two separately-gated groups: `lashay-1` carries top of book and `lashay-2` the
+    // market-by-price book. Both claim the tape — a host holding only `lashay-2` must still serve
+    // `trade` — and which of them prints is the reconciler's runtime decision (see `Feed::emit_trades`).
+    //
+    // `code` is transcribed verbatim from what the DoubleZero ledger registers today, never from
+    // what reads better here: it is matched against what `doublezero status --json` reports, so a
+    // prettier code matches nothing and activates nothing. These carry the venue's pre-launch
+    // codename and are scheduled to be re-registered as `edge-kalshi-{perps,sports}-{tob,mbp}`;
+    // update these rows in the same change that lands the ledger rename, never before it.
+    //
+    // `venue` is independent of `code` — it is the source-registry name for the Source ID these rows
+    // carry (`sources::source_name(3)`), and `sources::source_id_of` also accepts the codename, so
+    // ledger-facing strings keep resolving while only the registry name is ever emitted.
+    //
+    // ⚠️ A `code` that does not match the live group fails **silently**: `doublezero status --json`
+    // reports no match, the reconciler never activates the row, and there is no warning and no failed
+    // bind — just a receiver that never starts. Both groups are live on testnet and mainnet as of
+    // 2026-08-07; a permanently-zero `dz_receiver_up` here means a transcription slip, not a quiet feed.
+    //
+    // One `FeedPublisher` per row: the two arms share a port block and are distinguished only by
+    // datagram source IP (the shared-block model in `FeedPublisher`'s docs). The market-by-price
+    // block is spaced `+10000` / `+20000`, not the `+1` / `+2` the Hyperliquid publisher uses.
+    Feed {
+        venue: "KALSHI",
+        code: "lashay-1",
+        kind: FeedKind::TopOfBook,
+        group: Ipv4Addr::new(233, 84, 178, 3),
+        publishers: &[FeedPublisher {
+            ports: FeedPorts::TwoPort {
+                mktdata: 7576,
+                refdata: 7577,
+            },
+        }],
+        emit_trades: true,
+        arbitration: ArbitrationMode::Sticky,
+    },
+    Feed {
+        venue: "KALSHI",
+        code: "lashay-2",
+        kind: FeedKind::MarketByPrice,
+        group: Ipv4Addr::new(233, 84, 178, 4),
+        publishers: &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 31000,
+                refdata: 41000,
+                snapshot: 51000,
+            },
+        }],
+        emit_trades: true,
+        arbitration: ArbitrationMode::Sticky,
     },
 ];
 
@@ -379,13 +466,17 @@ mod tests {
         for f in FEEDS {
             assert!(!f.code.is_empty(), "{} {:?} has no code", f.venue, f.kind);
         }
+        // Keyed on `(venue, kind)` and not on venue alone: Lashay's two rows ride *different*
+        // groups, which is what makes tape ownership a runtime decision in the first place.
         for f in FEEDS {
-            let expected = match f.venue {
-                "Hyperliquid" => "tiredsolid",
-                "Phoenix" => "scottsdale",
-                other => panic!("unexpected venue {other}"),
+            let expected = match (f.venue, f.kind) {
+                ("HYPERLIQUID", FeedKind::TopOfBook | FeedKind::MarketByOrder) => "tiredsolid",
+                ("PHOENIX", FeedKind::TopOfBook) => "scottsdale",
+                ("KALSHI", FeedKind::TopOfBook) => "lashay-1",
+                ("KALSHI", FeedKind::MarketByPrice) => "lashay-2",
+                other => panic!("unexpected feed {other:?}"),
             };
-            assert_eq!(f.code, expected, "{} has wrong code", f.venue);
+            assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
         }
     }
 
@@ -404,9 +495,63 @@ mod tests {
     fn hyperliquid_tob_emits_trades() {
         let hl = FEEDS
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::TopOfBook)
             .unwrap();
         assert!(hl.emit_trades);
+    }
+
+    /// `emit_trades` is the row's static *capability* claim; which claiming row actually serves the
+    /// tape is the reconciler's runtime decision (`reconcile::tape_owners`). The two must agree, in
+    /// both directions:
+    ///
+    /// - a row claiming trades on a kind the ranking never admits would have a flag stuck false and
+    ///   silently emit nothing — a venue with no tape at all if it is the only claimant;
+    /// - a row not claiming trades on a rankable kind would be handed the tape and print anyway,
+    ///   which is exactly the double-print the invariant exists to prevent.
+    ///
+    /// The invariant itself — at most one tape emitter per venue at any moment, which is what
+    /// licenses the `trade_id == 0` bypass in `arbiter::emit` — is enforced at runtime by
+    /// `tape_owners` (one row per venue) and the arbiter's per-venue tape leader (one arm within it),
+    /// with `dz_tape_owner_changes_total` / `dz_tape_arm_transfers_total` reporting the moves.
+    #[test]
+    fn emit_trades_agrees_with_the_tape_ownership_rule() {
+        for f in FEEDS {
+            assert_eq!(
+                f.emit_trades,
+                crate::ingest::reconcile::tape_rank_is_some(f.kind),
+                "{} {:?}: emit_trades disagrees with the tape ranking",
+                f.venue,
+                f.kind
+            );
+        }
+    }
+
+    /// A venue's arms are the same hosts whatever protocol they speak, so every row for a venue
+    /// must declare the same arbitration mode. Disagreement would make the arbiter's per-venue mode
+    /// depend on which row registered last.
+    #[test]
+    fn arbitration_mode_agrees_across_a_venues_rows() {
+        let mut modes = std::collections::HashMap::new();
+        for f in FEEDS {
+            if let Some(prev) = modes.insert(f.venue, f.arbitration) {
+                assert_eq!(
+                    prev, f.arbitration,
+                    "{} declares two arbitration modes",
+                    f.venue
+                );
+            }
+        }
+    }
+
+    /// The venues that predate arbitration modes race on a comparable venue clock and must keep
+    /// doing so — the mode is a seam, not a behavior change. Scoped by exclusion rather than
+    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose arms carry
+    /// no shared clock can declare it; a new such venue is the feature working, not a regression.
+    #[test]
+    fn existing_venues_are_coordinated() {
+        for f in FEEDS.iter().filter(|f| f.venue != "KALSHI") {
+            assert_eq!(f.arbitration, ArbitrationMode::Coordinated, "{}", f.venue);
+        }
     }
 
     #[test]
@@ -500,7 +645,7 @@ mod tests {
         let base_ports = |kind: FeedKind| -> Vec<u16> {
             let f = FEEDS
                 .iter()
-                .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
+                .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
                 .unwrap();
             let mut v: Vec<u16> = f.publishers.iter().map(|p| p.base_port()).collect();
             v.sort_unstable();
@@ -516,33 +661,75 @@ mod tests {
         );
     }
 
-    /// Within a publisher's block the layout is fixed - `refdata = mktdata + 1` and (for
-    /// Market-by-Order) `snapshot = mktdata + 2`. The publisher role enforces this fleet-wide and
-    /// it is the ONLY structural rule left after v0.7 made the base port free-form, so it is what
-    /// an unseen block may be derived from (10901/10903 were derived this way from 10902). A row
-    /// that breaks it is a transcription error, not a new layout.
+    /// Within a publisher's block the offsets follow the publisher implementation: `+1`/`+2` on every
+    /// Hyperliquid and Phoenix block and on `lashay-1`, `+10000`/`+20000` on `lashay-2` (and on the
+    /// sports market-by-price feed: 33010/43010/53010). The base port is free-form since v0.7, so this
+    /// spacing is the only structural rule left — it is what an unseen block may be derived from
+    /// (10901/10903 were derived this way from 10902), and a row that breaks *both* schemes is a
+    /// transcription error rather than a new layout.
+    ///
+    /// Scoped **per row**, not per venue: Lashay's two rows legitimately use different schemes, and
+    /// framing it by scheme rather than by a venue carve-out is what keeps `lashay-3`/`lashay-4` from
+    /// re-tripping it. Lashay's exact blocks are pinned by `lashay_rows_match_the_deployment`, so
+    /// widening this one loses nothing.
     #[test]
-    fn publisher_blocks_use_the_canonical_layout() {
+    fn publisher_blocks_use_a_known_layout() {
+        const SCHEMES: [u16; 2] = [1, 10_000];
         for f in FEEDS {
+            let mut feed_scheme = None;
             for p in f.publishers {
                 let mkt = p.ports.mktdata();
+                let scheme = SCHEMES
+                    .iter()
+                    .copied()
+                    .find(|s| {
+                        p.ports.refdata() == mkt + s
+                            && p.ports.snapshot().is_none_or(|snap| snap == mkt + 2 * s)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{} {:?} block {mkt}: unknown port layout", f.venue, f.kind)
+                    });
+                // One publisher role serves a feed, so a block spaced differently from its peers is
+                // a typo in that row and not a second deployment.
                 assert_eq!(
-                    p.ports.refdata(),
-                    mkt + 1,
-                    "{} {:?} block {mkt}: refdata must be mktdata + 1",
+                    *feed_scheme.get_or_insert(scheme),
+                    scheme,
+                    "{} {:?} block {mkt}: mixed port layouts within one feed",
                     f.venue,
                     f.kind
                 );
-                if let Some(snap) = p.ports.snapshot() {
-                    assert_eq!(
-                        snap,
-                        mkt + 2,
-                        "{} {:?} block {mkt}: snapshot must be mktdata + 2",
-                        f.venue,
-                        f.kind
-                    );
-                }
             }
+        }
+    }
+
+    /// Both Lashay groups are live (testnet and mainnet, 2026-08-07), so a wrong value here activates
+    /// nothing and says nothing: `doublezero status` reports no matching code, the reconciler never
+    /// spawns the receiver, and the only symptom is a permanently-zero `dz_receiver_up`. Pin the
+    /// deployment exactly so a transcription slip fails the build instead.
+    #[test]
+    fn lashay_rows_match_the_deployment() {
+        let row = |kind| FEEDS.iter().find(|f| f.venue == "KALSHI" && f.kind == kind);
+
+        let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
+        assert_eq!(tob.code, "lashay-1");
+        assert_eq!(tob.group, Ipv4Addr::new(233, 84, 178, 3));
+        assert_eq!(tob.publishers.len(), 1);
+        assert_eq!(tob.publishers[0].ports.mktdata(), 7576);
+        assert_eq!(tob.publishers[0].ports.refdata(), 7577);
+        assert_eq!(tob.publishers[0].ports.snapshot(), None);
+
+        let mbp = row(FeedKind::MarketByPrice).expect("Lashay market-by-price row");
+        assert_eq!(mbp.code, "lashay-2");
+        assert_eq!(mbp.group, Ipv4Addr::new(233, 84, 178, 4));
+        assert_eq!(mbp.publishers.len(), 1);
+        assert_eq!(mbp.publishers[0].ports.mktdata(), 31000);
+        assert_eq!(mbp.publishers[0].ports.refdata(), 41000);
+        assert_eq!(mbp.publishers[0].ports.snapshot(), Some(51000));
+
+        // Both claim the tape (each group is gated on its own), and both race stickily.
+        for f in [tob, mbp] {
+            assert!(f.emit_trades, "{:?} must claim the tape", f.kind);
+            assert_eq!(f.arbitration, ArbitrationMode::Sticky);
         }
     }
 
@@ -561,7 +748,7 @@ mod tests {
         let count = |kind: FeedKind| -> usize {
             FEEDS
                 .iter()
-                .find(|f| f.venue == "Hyperliquid" && f.kind == kind)
+                .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
                 .unwrap()
                 .publishers
                 .len()
@@ -578,5 +765,6 @@ mod tests {
         assert_eq!(FeedKind::TopOfBook.label(), "tob");
         assert_eq!(FeedKind::Midpoint.label(), "midpoint");
         assert_eq!(FeedKind::MarketByOrder.label(), "mbo");
+        assert_eq!(FeedKind::MarketByPrice.label(), "mbp");
     }
 }

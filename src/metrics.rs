@@ -97,9 +97,23 @@ pub struct Metrics {
     pub trades_admitted: IntCounterVec,
     /// Trades dropped by the windowed dedup (a duplicate `trade_id` still inside the window).
     pub trades_dropped: IntCounterVec,
+    /// Trades forwarded with the `trade_id == 0` sentinel, bypassing the dedup window.
+    pub trades_no_id: IntCounterVec,
+    /// Zero-id trades forwarded from a second publisher for a `(venue, symbol)` another publisher
+    /// already owns — the tape is double-printing, since a bypassed sentinel has no window to
+    /// collapse against. `Coordinated` venues only: a `Sticky` venue's single-emitter guarantee comes
+    /// from the tape gate upstream, which makes this latch redundant there and — since it cannot see a
+    /// gate-approved handover — wrong.
+    pub trades_no_id_conflict: IntCounterVec,
     /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
     /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
     pub instruments_dropped: IntCounterVec,
+    /// A `(publisher, instrument)` already revealed under one wire Source ID named a DIFFERENT one
+    /// on a later message — a real publisher defect (this plan's own fixtures prove one exists), not
+    /// a decode issue. Counted, and re-announced under the new id rather than silently kept pinned
+    /// to the first one seen, or the new venue would never get a definition anywhere. Labelled by
+    /// the NEW (post-change) venue.
+    pub source_id_changed: IntCounterVec,
     /// Quote-tick *cross-source* contest lead time (ns): on a `source_ts` tick another publisher
     /// already led, how far ahead the leader was when this publisher's first copy arrived, labelled
     /// by the `winner` **and** `loser` (edge/public). Its `_count` is the head-to-head contest
@@ -142,6 +156,66 @@ pub struct Metrics {
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
     pub quotes_no_source_ts: IntCounterVec,
+    /// Nanoseconds between the two arms' copies of one **matched trade**, on our own receive clock —
+    /// the series `--arb-transfer-margin-us` is read off. Fed only by
+    /// [`crate::ingest::arm_race::ArmRace`] pairs, never by a dropped copy's inter-arm phase.
+    pub arm_lead_ns: HistogramVec,
+    /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
+    /// thresholds are too loose: every transfer re-baselines each consumer's book.
+    pub arm_transfers: IntCounterVec,
+    /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
+    /// decision, on a subscription change). Each move is a window in which a print may double or
+    /// drop, so a sustained rate means subscriptions are flapping.
+    pub tape_owner_changes: IntCounterVec,
+    /// Trade-tape ownership moving from one **arm** to another within a venue — the arm-level twin of
+    /// [`tape_owner_changes`](Self::tape_owner_changes), and the same read: each transfer is a window
+    /// where a print may double or drop.
+    pub tape_arm_transfers: IntCounterVec,
+    /// Prints the per-venue tape gate dropped as a non-serving arm's copy. Its own counter rather than
+    /// folded into [`trades_dropped`](Self::trades_dropped): on a `Sticky` venue the steady state is
+    /// the challenger arm's whole stream, so mixing the two would hide a gate holding the tape against
+    /// the arm that should have it inside expected noise.
+    pub tape_arm_dropped: IntCounterVec,
+    /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
+    /// authority is fragmented; all on one arm is the steady state.
+    pub arm_markets_held: IntGaugeVec,
+    /// Trades an `arm` delivered that its peer never did inside the match window — a drop on one arm,
+    /// or a genuine one-sided print. The denominator for how much of the election's evidence is being
+    /// lost; a rate near the trade rate means the arms are barely pairing at all.
+    pub arm_unmatched_trades: IntCounterVec,
+    /// Incremental `book` batches the authority gate did not publish, by the `publisher` class whose
+    /// copy was dropped: a non-authoritative arm's copy, or a batch withheld while a market waits for
+    /// its new arm to close a logical event. In steady state this is the challenger's whole stream, so
+    /// it tracks its message rate rather than any fault.
+    pub book_dropped: IntCounterVec,
+    /// Markets evicted from the `book` authority gate's tracked set because the cap was reached. The
+    /// key is wire-supplied, so this is the forged-market backstop: an evicted market loses its replay
+    /// bootstrap, and its next batch re-baselines the consumer from whatever it accumulates again.
+    pub book_markets_evicted: IntCounterVec,
+
+    // --- Market-by-price processor (per `venue`) ---
+    /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
+    pub mbp_channel_resets: IntCounterVec,
+    /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
+    /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
+    pub mbp_buffer_overflows: IntCounterVec,
+    /// A book discarded because its per-book price-level cap was hit — a malformed or forged stream,
+    /// never packet loss. Deliberately not counted as a sequence gap: the cause and the resulting
+    /// status differ, and merging them would read a hostile book as a lossy network.
+    pub mbp_level_overflows: IntCounterVec,
+    /// `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups,
+    /// or a lost `SnapshotBegin`.
+    pub mbp_orphan_snapshot_levels: IntCounterVec,
+    pub mbp_declined_rotation_levels: IntCounterVec,
+    /// Deltas discarded as duplicates (`seq` at or below the applied baseline). A `Ready` book
+    /// emitting nothing but duplicates is the signature of a baseline installed above the
+    /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
+    /// series that surfaces that wedge.
+    pub mbp_duplicate_deltas: IntCounterVec,
+    /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
+    pub mbp_crossed: IntCounterVec,
+    /// Publisher `Action`-vs-quantity disagreements by `kind`. Never changes the applied result.
+    pub mbp_divergence: IntCounterVec,
 
     // --- WebSocket sink ---
     /// Currently-connected WebSocket clients.
@@ -214,6 +288,12 @@ pub struct Metrics {
     /// Bytes successfully forwarded to each destination, by `dest` (sum of datagram lengths on a
     /// successful send; a failed send delivers nothing and is not counted here).
     pub shred_bytes_sent: IntCounterVec,
+
+    // --- Source registry (`ingest::sources`) ---
+    /// Distinct Source IDs seen with no registry row.
+    pub unregistered_sources: IntCounter,
+    /// Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached.
+    pub unregistered_source_labels_capped: IntCounter,
 }
 
 /// Build an [`IntCounterVec`] and register it, panicking on a registration error (a duplicate name
@@ -367,6 +447,13 @@ impl Metrics {
                 "Instrument definitions dropped as an exact repeat of the last broadcast content",
                 &["venue"],
             ),
+            source_id_changed: counter_vec(
+                &registry,
+                "dz_source_id_changed_total",
+                "A publisher named a different wire Source ID for an already-revealed instrument; \
+                 re-announced under the new id, labelled by it",
+                &["venue"],
+            ),
             quote_lead_ns: histogram_vec(
                 &registry,
                 "dz_quote_lead_ns",
@@ -436,6 +523,140 @@ impl Metrics {
                 &registry,
                 "dz_quotes_no_source_ts_total",
                 "Quotes forwarded with the source_ts==0 sentinel (floor bypassed)",
+                &["venue"],
+            ),
+            arm_lead_ns: histogram_vec(
+                &registry,
+                "dz_arm_lead_ns",
+                "Nanoseconds between the two arms' copies of one matched trade, on our own receive \
+                 clock. The series the re-election thresholds are read off.",
+                &["venue", "winner"],
+                LEAD_NS_BUCKETS,
+            ),
+            arm_transfers: counter_vec(
+                &registry,
+                "dz_arm_authority_transfers_total",
+                "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
+                 means the thresholds are too loose — every transfer re-baselines each consumer.",
+                &["venue", "reason"],
+            ),
+            arm_markets_held: gauge_vec(
+                &registry,
+                "dz_arm_markets_held",
+                "Markets each arm is currently authoritative for.",
+                &["venue", "arm"],
+            ),
+            tape_owner_changes: counter_vec(
+                &registry,
+                "dz_tape_owner_changes_total",
+                "Trade-tape ownership moving between a venue's feed rows on a subscription change. \
+                 Each move is a window in which a print may double or drop.",
+                &["venue"],
+            ),
+            tape_arm_transfers: counter_vec(
+                &registry,
+                "dz_tape_arm_transfers_total",
+                "Trade-tape ownership moving between a venue's arms. The arm-level twin of \
+                 dz_tape_owner_changes_total.",
+                &["venue"],
+            ),
+            tape_arm_dropped: counter_vec(
+                &registry,
+                "dz_tape_arm_dropped_total",
+                "Prints the per-venue tape gate dropped as a non-serving arm's copy. In steady state \
+                 this is the challenger arm's whole print stream.",
+                &["venue"],
+            ),
+            mbp_channel_resets: counter_vec(
+                &registry,
+                "dz_mbp_channel_resets_total",
+                "Publisher-and-channel book state discarded on a frame-header Reset Count change",
+                &["venue"],
+            ),
+            mbp_buffer_overflows: counter_vec(
+                &registry,
+                "dz_mbp_buffer_overflows_total",
+                "Cross-instrument delta-buffer budget overflows; the largest instrument's buffer \
+                 was dropped. Sustained means the snapshot period is too long for this host.",
+                &["venue"],
+            ),
+            mbp_level_overflows: counter_vec(
+                &registry,
+                "dz_mbp_level_overflows_total",
+                "Books discarded on hitting the per-book price-level cap (malformed or forged \
+                 stream, never packet loss — distinct from a sequence gap)",
+                &["venue"],
+            ),
+            mbp_orphan_snapshot_levels: counter_vec(
+                &registry,
+                "dz_mbp_orphan_snapshot_levels_total",
+                "SnapshotLevel with no open group to route it to (interleaved groups, or a lost \
+                 SnapshotBegin). An anomaly: a level that should have been attributable was not. \
+                 A rotation the book deliberately declined is NOT counted here — see \
+                 dz_mbp_declined_rotation_levels_total.",
+                &["venue"],
+            ),
+            mbp_declined_rotation_levels: counter_vec(
+                &registry,
+                "dz_mbp_declined_rotation_levels_total",
+                "SnapshotLevel belonging to a rotation the book declined because it is already \
+                 synced past it. Expected and benign: publishers rotate snapshots continuously, so \
+                 in steady state this tracks the feed's whole snapshot-level rate. Counted apart \
+                 from the orphan counter so a real orphan stays visible.",
+                &["venue"],
+            ),
+            mbp_duplicate_deltas: counter_vec(
+                &registry,
+                "dz_mbp_duplicate_deltas_total",
+                "Deltas discarded as duplicates. A Ready book emitting only these is a baseline \
+                 above the publisher's real counter, which only a Reset Count clears.",
+                &["venue"],
+            ),
+            mbp_crossed: counter_vec(
+                &registry,
+                "dz_mbp_crossed_total",
+                "Crossed inside markets observed at a BatchBoundary (observability only)",
+                &["venue"],
+            ),
+            mbp_divergence: counter_vec(
+                &registry,
+                "dz_mbp_divergence_total",
+                "Publisher Action-vs-quantity disagreements by kind; never changes the applied \
+                 result",
+                &["venue", "kind"],
+            ),
+            arm_unmatched_trades: counter_vec(
+                &registry,
+                "dz_arm_unmatched_trades_total",
+                "Trades one arm delivered that its peer never did inside the match window — a drop \
+                 on that arm, or a one-sided print. Election evidence lost.",
+                &["venue", "arm"],
+            ),
+            book_dropped: counter_vec(
+                &registry,
+                "dz_book_dropped_total",
+                "Incremental book batches the authority gate did not publish, by the publisher class \
+                 whose copy was dropped (in steady state, the challenger arm's whole stream).",
+                &["venue", "publisher"],
+            ),
+            book_markets_evicted: counter_vec(
+                &registry,
+                "dz_book_markets_evicted_total",
+                "Markets evicted from the book authority gate's tracked set because the cap was \
+                 reached; an evicted market loses its replay bootstrap.",
+                &["venue"],
+            ),
+            trades_no_id: counter_vec(
+                &registry,
+                "dz_trades_no_id_total",
+                "Trades forwarded with the trade_id==0 sentinel (dedup window bypassed)",
+                &["venue"],
+            ),
+            trades_no_id_conflict: counter_vec(
+                &registry,
+                "dz_trades_no_id_conflict_total",
+                "Zero-id trades from a second publisher for a (venue, symbol) another owns \
+                 (the tape is double-printing)",
                 &["venue"],
             ),
             ws_clients: gauge(
@@ -595,6 +816,16 @@ impl Metrics {
                 "Bytes successfully forwarded to each destination",
                 &["dest"],
             ),
+            unregistered_sources: counter(
+                &registry,
+                "dz_unregistered_sources_total",
+                "Distinct Source IDs seen with no registry row",
+            ),
+            unregistered_source_labels_capped: counter(
+                &registry,
+                "dz_unregistered_source_labels_capped_total",
+                "Messages labelled UNREGISTERED because the distinct-unregistered-ID cap was reached",
+            ),
             registry,
         }
     }
@@ -628,38 +859,69 @@ mod tests {
         // Touch a few families so they appear in the text output (a zero CounterVec child only
         // materializes once a label set is observed).
         m.datagrams_received
-            .with_label_values(&["Hyperliquid", "tob", "9201", "mktdata"])
+            .with_label_values(&["HYPERLIQUID", "tob", "9201", "mktdata"])
             .inc();
-        m.emit.with_label_values(&["Hyperliquid", "quote"]).inc();
+        m.emit.with_label_values(&["HYPERLIQUID", "quote"]).inc();
         m.ws_clients.set(0);
         m.shred_processed.inc();
         m.trades_admitted
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.quote_lead_ns
-            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
         m.trade_lead_ns
-            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
         m.depth_admitted
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.depth_dropped
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.depth_floor_resets
-            .with_label_values(&["Hyperliquid", "end_of_session"])
+            .with_label_values(&["HYPERLIQUID", "end_of_session"])
             .inc();
         m.depth_lead_ns
-            .with_label_values(&["Hyperliquid", "edge", "public"])
+            .with_label_values(&["HYPERLIQUID", "edge", "public"])
             .observe(123_456.0);
         m.quote_ticks_won
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
         m.depth_ticks_won
-            .with_label_values(&["Hyperliquid", "edge"])
+            .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
+        m.arm_lead_ns
+            .with_label_values(&["KALSHI", "leader"])
+            .observe(123_456.0);
+        m.arm_transfers
+            .with_label_values(&["KALSHI", "silence"])
+            .inc();
+        m.arm_markets_held
+            .with_label_values(&["KALSHI", "arm0"])
+            .set(1);
+        m.tape_owner_changes.with_label_values(&["KALSHI"]).inc();
+        m.tape_arm_transfers.with_label_values(&["KALSHI"]).inc();
+        m.tape_arm_dropped.with_label_values(&["KALSHI"]).inc();
+        m.mbp_channel_resets.with_label_values(&["KALSHI"]).inc();
+        m.mbp_buffer_overflows.with_label_values(&["KALSHI"]).inc();
+        m.mbp_level_overflows.with_label_values(&["KALSHI"]).inc();
+        m.mbp_orphan_snapshot_levels
+            .with_label_values(&["KALSHI"])
+            .inc();
+        m.mbp_declined_rotation_levels
+            .with_label_values(&["KALSHI"])
+            .inc();
+        m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
+        m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
+        m.mbp_divergence
+            .with_label_values(&["KALSHI", "delete_with_quantity"])
+            .inc();
+        m.arm_unmatched_trades
+            .with_label_values(&["KALSHI", "arm1"])
+            .inc();
+        m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
+        m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -686,6 +948,23 @@ mod tests {
             "dz_depth_lead_ns",
             "dz_quote_ticks_won_total",
             "dz_depth_ticks_won_total",
+            "dz_arm_lead_ns",
+            "dz_arm_authority_transfers_total",
+            "dz_arm_markets_held",
+            "dz_tape_owner_changes_total",
+            "dz_tape_arm_transfers_total",
+            "dz_tape_arm_dropped_total",
+            "dz_mbp_channel_resets_total",
+            "dz_mbp_buffer_overflows_total",
+            "dz_mbp_level_overflows_total",
+            "dz_mbp_orphan_snapshot_levels_total",
+            "dz_mbp_declined_rotation_levels_total",
+            "dz_mbp_duplicate_deltas_total",
+            "dz_mbp_crossed_total",
+            "dz_mbp_divergence_total",
+            "dz_arm_unmatched_trades_total",
+            "dz_book_dropped_total",
+            "dz_book_markets_evicted_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {

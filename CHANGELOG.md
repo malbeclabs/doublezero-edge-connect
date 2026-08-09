@@ -7,7 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- An instrument whose reference data carries its own Source ID (the newer feed-spec generation) is
+  now named the moment its definition is decoded, instead of waiting on a price. `instrument`
+  reaches the wire immediately — even for a symbol that never trades — and the connect-time replay
+  includes it. This applies to `TobProcessor`, `MboProcessor` and `MbpProcessor`; a publisher whose
+  reference data carries no Source ID of its own (the original generation) is unaffected and keeps
+  deferring exactly as before, as does Midpoint permanently (its own, narrower reference-data
+  message has no Source ID field at all, on any generation).
+- **Breaking:** the wire `Source ID` is now authoritative for naming a source. `source_id` carries it
+  verbatim and `source`/`venue` are its registry name. The bridge no longer substitutes its own
+  configured label for an unrecognised ID, so `venue` can hold a different string than before for a
+  publisher that stamps an incorrect Source ID. Re-check any consumer that filters or keys on `venue`.
+- **Breaking:** registry source names are now **uppercase** (`HYPERLIQUID`, `PHOENIX`, …), which is
+  the form `venue` and `source` carry on the WebSocket and every `venue=` metric label value holds —
+  so a consumer composing a `SOURCE:SYMBOL` product identifier never has to case-fold what the wire
+  gave it. The `--feed` argument and the `venue`/`source` subscription filters already compared
+  case-insensitively and are unaffected; **dashboards and alerts matching a `venue` label value
+  exactly must be updated.** Source ID 3 additionally answers to a legacy name through
+  `sources::source_id_of`, so operator- and ledger-facing strings predating the current registry
+  name keep resolving to the same ID; only the registry name is ever emitted.
+- Reference-data messages arriving on a Market-by-Price **market-data or snapshot** port are now
+  dropped instead of applied, matching the three sibling processors' `handle_refdata` gate. Decode
+  does not care which physical port a message type arrives on, so a single forged datagram spoofing
+  a publisher's source IP with a `ManifestSummary` one sequence ahead cleared that publisher's
+  instrument definitions — and since every emission path gates on a resolved definition, the venue's
+  `book` and trade tape went dark until the next reference-data burst. `MbpProcessor` also drains
+  `PerPublisher`'s eviction now, so an evicted publisher's books, revealed Source IDs, announced
+  symbols and per-channel snapshot state go with it rather than outliving the reference data they
+  depend on.
+- A `BookClear` whose `Clear Side` is *both* is now refused for **every** scope byte except the
+  recognized whole-side one, at the codec and in `PriceBook` alike. The guard tested `scope == 1`
+  while the apply path derives its behaviour from the complement, so an unassigned `2..=255` was
+  treated as price-bounded and `{ clear_side: 2, scope: 2 }` removed bids at/below and asks at/above
+  a single bound — the whole book — republished to every consumer as `Delete`s.
+- A duplicated `SnapshotBegin` datagram is now a no-op instead of restarting assembly. Mid-rotation
+  the status is `BuildingSnapshot`, which no decline rule covered, so an identical re-begin zeroed
+  the open group; `on_snapshot_end` then failed its level count and took the incomplete-group path,
+  which clears the book — destroying the **live** book on the `Ready`-rebuild path and dropping the
+  market to `AwaitingSnapshot` until the next rotation. A begin differing in any identifying field is
+  still a new rotation and still replaces the group under assembly.
+- Trade-tape ownership now ranks over the **registered** receiver set rather than the desired one.
+  Registration follows a successful socket bind, so a row that can never bind returned `Err`, was
+  reaped and respawned every tick without ever registering — and, ranked as if live, held rank 0
+  indefinitely while `publish_tape_owners` cleared the streaming peer's flag each tick, so no `trade`
+  reached the wire for the venue at all while `status` and `dz_feed_up` still read healthy. Liveness
+  is now three-state: "not registered yet" ranks below a live row (an incumbent keeps the tape until
+  the newcomer really registers) but above a registered-and-dead one, so a cold start where nothing
+  has bound still falls back to feed-kind rank.
+- **Breaking:** a message is emitted for an instrument only once its Source ID has been observed. A
+  publisher whose reference data carries no Source ID of its own can only reveal it through a price
+  message, so an instrument that has received a definition but no price produces nothing at all, and
+  the connect-time replay covers only symbols priced at least once. (A newer publisher generation
+  changes this — see above.)
+
+### Added
+- Every message now carries `source` and `source_id` alongside `venue`. The subscription filter
+  accepts `source` as an alias for `venue`; supplying both ANDs them.
+- `dz_source_id_changed_total{venue}` counts a publisher changing an instrument's Source ID
+  mid-stream, which triggers a fresh `instrument` announcement under the new name.
+
+### Deprecated
+- The `venue` field and the `venue` subscription filter key. Both still work and hold the same value
+  as `source`; read `source` instead. Removal will be announced separately.
+
 ### Fixed
+- `dz_mbp_orphan_snapshot_levels_total` counted every level of a snapshot rotation the book
+  **deliberately declined**, not just genuinely unroutable ones. A book that is `Ready` and already
+  past a rotation's `Last Instrument Seq` refuses it by design, but refusing opened no route, so its
+  levels fell through the same branch as a lost `SnapshotBegin`. Publishers rotate snapshots
+  continuously, so once the books sync this is the steady state: measured against the live Lashay
+  perps groups, it was ~415 levels/s — 100% of the feed's snapshot-level rate — which buried the
+  anomaly the counter exists to surface. A declined rotation now holds the route with an `accepted:
+  false` marker (so its levels stay attributable and out of a neighbouring instrument's book) and is
+  counted by the new `dz_mbp_declined_rotation_levels_total`, leaving the orphan counter to mean what
+  its name says. With the noise removed, the live feed shows a genuine residual of ~2.6% of snapshot
+  levels arriving with no `SnapshotBegin` — independently reproduced by `marketbyprice-parser` on the
+  same groups, with zero host-side UDP or socket errors, so it is upstream loss or reordering rather
+  than a receive-side defect.
 - Five Hyperliquid publishers that had been live on `tiredsolid` since mid-June were missing from
   the feed registry, so the bridge bound 6 of 11 port blocks and ingested roughly a third of the
   group's datagrams — including none of the three highest-volume Top-of-Book blocks or the
@@ -24,7 +101,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning publisher is picked up on its first datagram, and the first `status: down` still fires
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
 
+### Changed
+- Trade-tape ownership is now a **runtime** decision instead of the static `Feed.emit_trades` flag. A venue's feeds can ride separate multicast groups with separate subscription codes, so a host may hold one and not the other and still needs a tape on the wire; both rows now claim trades and the reconciler ranks the running receivers (top of book over market-by-price) and flips an `AtomicBool` each processor reads per print. Ownership therefore moves **without respawning** the receiver that keeps it — a respawn would drop a healthy publisher's books and reference data every time a peer feed's subscription changed. `emit_trades` survives as the static capability claim, pinned against the ranking by a new agreement test in place of `at_most_one_trade_emitting_row_per_venue`. Within the owning row, a **per-venue tape leader** gates `Sticky` venues one level down: those arms share no trade-id space (one may stamp the `trade_id == 0` sentinel while its peer stamps a real venue id, a pair neither the sentinel latch nor the dedup window collapses), so the gate is id-independent: first arm to print leads, an arm the authority tracks displaces one it does not, the book-elected arm takes over once per election, and a silent incumbent yields after 5s so a dead trade stream never mutes the tape. Row ownership is likewise ordered liveness before rank, so a subscribed-but-dead row cannot hold the tape while its peer decodes prints and drops them. Together they preserve the invariant the sentinel bypass rests on: **at most one tape emitter per venue at any moment.** `dz_tape_owner_changes_total`, `dz_tape_arm_transfers_total` and `dz_tape_arm_dropped_total` report the moves and the drops. Every venue live today is `Coordinated`, so the arm gate changes nothing currently running. (#106)
+
 ### Added
+- The two Lashay perps feed rows: `lashay-1` top of book on `233.84.178.3:7576/7577` and `lashay-2` market-by-price on `233.84.178.4:31000/41000/51000`, both claiming the tape and both `ArbitrationMode::Sticky`, one publisher block each (the two arms share a block and are told apart by source IP). Both groups are live and activated, so a host subscribed to either code begins ingesting on upgrade. A `code` that does not match its live group fails silently — no warning, no failed bind, just a permanently-zero `dz_receiver_up` — so both rows are pinned against the deployment by a test. The group codes are transcribed verbatim from what the DoubleZero ledger registers today; they are scheduled to be re-registered under new names, and the rows must be updated in the same change that lands the ledger rename, never before it. (#106)
+- The incremental `book` product is arbitrated by the single-arm authority gate instead of passing through the arbiter undeduped: two arms' per-instrument delta series are unrelated by construction, so publishing both on one stream corrupts a consumer's book while every sequence check the producer ran still passes. It is gated in **both** arbitration modes on purpose — a `source_ts` tick can hold several deltas, so the quote floor's per-tick latch would interleave arms inside one logical event — and there is no mode branch. A change of serving arm (margin, silence, or the per-market health override) makes that market's next broadcast a re-baseline, a `clear` plus the new arm's complete current level set, emitted lazily on that arm's next *completed* logical event rather than as a venue-wide burst of clears; that is why the gate accumulates every eligible arm's book and not just the serving one. A re-baseline the gate cannot honestly complete — an arm that joined mid-stream holds only the levels that have moved since — degrades to a bare `clear` rather than claiming completeness, and the WS replay skips those markets for the same reason. Also wires the cross-arm trade matcher, the only producer of the matched-lead samples the speed re-election consumes (`--arb-match-window-secs`, `dz_arm_unmatched_trades_total`); it races **edge arms the authority already tracks** and nothing else, so the public backstop cannot win authority over a product it never publishes. Open question the matcher inherits: its key is the normalized `(venue, symbol, price, size, aggressor)`, and a wire `symbol` is a truncated 16-byte field, so on a sharded feed two colliding-symbol instruments can mis-pair systematically rather than merely losing a sample — `NormalizedTrade` carries no `instrument_id` to key on instead. Replays each market's accumulated book to a connecting WS client, and re-baselines a client that fell behind (an incremental product does not self-heal on the next message the way `quote`/`depth` do). Nothing exercises it in a running process yet: `MbpProcessor` emits `book` but no `FEEDS` row selects that kind, so behaviour is unchanged. (#105)
+- `MbpProcessor` and the `FeedKind::MarketByPrice` receiver arm (mktdata + refdata + snapshot ports), turning decoded market-by-price frames into `PriceBook` state and the incremental `book` product. One book per `(publisher, channel, instrument)` — two arms mirror one feed on unrelated per-instrument delta sequences and one group can be sharded across channels, so nothing coarser identifies a book. Snapshot levels route by the open group per channel rather than by `snapshot_id` (monotonic per instrument, so two instruments routinely share a value), `EndOfSession` and a `Reset Count` change are scoped to the emitting arm and channel, and a cross-instrument delta-buffer budget drops the largest instrument's buffer rather than the process when a cold start floods it. Seven `dz_mbp_*` counters cover resets, buffer and level overflows, orphaned snapshot levels, duplicate deltas, crossed books and publisher action-vs-quantity divergence — see `docs/metrics.md`, and `docs/input-sources.md` for the per-receiver-task memory caps. No `FEEDS` row selects the kind, so no running process behaves differently. (#104)
+- Single-arm arbitration for venues whose two redundant publishers stamp no comparable clock (`ingest::authority`, `ingest::arm_race`). Exactly one arm is authoritative and its stream is published verbatim. **Speed and silence are judged per arm, venue-wide** — latency is a property of an arm, so every sample from a source IP counts toward it whatever market carried it — while **health is the one per-market rule**, overriding the elected arm for a single market whose book is gapped and reverting when it recovers. Which arm is faster comes from `arm_race`, a cross-arm trade matcher keyed on content with a FIFO per signature (so identical repeats pair in order) that measures the two copies' arrival gap on our own receive clock; the venue's own timestamps are deliberately unused, because a publisher substitutes its own clock when the venue supplies none and an arm with no venue timestamp would look fastest by construction. Transfers need a median margin, a win rate and a sample floor to all hold (`--arb-*`). Nothing emits or consumes it yet — no processor wires a caller — so no running process behaves differently. (#98)
+- The incremental `book` message (PROTOCOL.md, still v1 — `book` is additive and `depth` is now marked deprecated-and-removed-in-v2): a batch of absolute price-level changes for one instrument, keyed on `(venue, channel, instrument_id)`. A re-baseline is structurally a batch led by a `clear` action rather than a separate type or a boolean, because the reference consumer's book dispatcher branches on the action alone and would silently ignore a snapshot flag; `last` is mandatory on the final batch, including a lone clear, or a buffering consumer wedges. Ships with `BookAccumulator`, the replay state a connecting client is bootstrapped from — an incremental product's last batch means nothing to a client holding no book, so the bridge accumulates and materializes a clear plus the full level set on demand. Nothing emits `book` yet: no processor and no feed row, so no running process behaves differently. (#99)
+- WebSocket subscription filters gain a `channel` dimension (the publisher's channel id) and a message-`type` dimension, so a consumer can take `book` without `quote`, or one channel's books without the rest. A message that carries no channel is excluded by an explicit `channel` filter — except `instrument`, since a client that cannot see a definition cannot scale the book it subscribed to. Both match paths (symbol-bearing and venue-level `status`) now route through the one `SubFilter::matches`, so a future dimension cannot silently exempt half the stream. Replay is also scoped: state is replayed on connect as before, and again on each `subscribe` for the filter just added, instead of only ever replaying every market at connect time. (#99)
+- Each `Feed` now declares an `ArbitrationMode` (`Coordinated`/`Sticky`), carried into the arbiter as a per-venue map. Behaviour-neutral: every existing venue is `Coordinated` — today's latch-to-leader staleness floor — and an unregistered venue defaults to it. The seam exists for venues whose redundant publishers stamp no comparable venue clock, which cannot be arbitrated by a per-tick floor. (#94)
+- `ingest::codec_mbp` — pure decoder for the Market-by-Price feed (frame magic `0x4442`): the frame
+  walk, the five message types inherited from the byte-validated Top-of-Book layout, the three
+  price-keyed payloads this feed defines (`LevelUpdate`, `BookClear`, `SnapshotLevel`), and the four
+  it shares byte-for-byte with Market-by-Order (`Snapshot{Begin,End}`, `BatchBoundary`,
+  `InstrumentReset`). Nothing ingests it yet — no `FEEDS` row, no processor. Two rules make it
+  stricter than the sibling codecs, and they depend on each other: a frame declaring an
+  unimplemented schema version is rejected whole, and within v1 a body length must equal the type's
+  declared size exactly. `SnapshotBegin` is a prefix-superset of Market-by-Order's, so a lenient
+  decode would read `depth_bound` from whatever follows the body — and the version gate is what
+  keeps the length rule from silently rejecting a v2 frame whose bodies legally grew. Offsets are
+  validated field-for-field against the Go reference decoder and against two committed real captures
+  of the live publisher — a sharded multi-channel set and a dense single-channel set. Four message
+  types appear in neither capture and stay offset-test-only; `tests/fixtures/PROVENANCE.md` records
+  that and the publisher deviations the captures contain. (#95)
+- `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
+  with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
+- `PriceBook` (`src/ingest/pricebook.rs`): the price-keyed L2 book and its snapshot+delta recovery
+  state machine for the market-by-price feed — a sibling of the order-keyed `book.rs`, since the
+  wire already carries absolute per-level quantities and has nothing to aggregate. Deltas apply only
+  in unbroken per-instrument sequence, a gap buffers until a snapshot re-anchors, and buffered
+  deltas past the snapshot's `anchor_seq` replay afterwards. Both the buffer and the level map are
+  capped, so an unauthenticated forged stream cannot grow them without limit. Internal only — no
+  codec, feed row or wire change yet, so no observable behaviour differs. (#96)
 - Multi-publisher feeds: a `Feed` now lists N `FeedPublisher` port blocks and the reconciler runs
   one receiver per `(venue, protocol, publisher)`. All eleven live Hyperliquid publishers are
   ingested (previously only the 9201 block), so the arbiter's cross-publisher race, lead-time
@@ -39,6 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label value is the base port. (#88)
 
 ### Changed
+- The wire `instrument` message carries the `(channel, instrument_id)` identity pair, so a consumer joins a `book` to its definition on the identity rather than on the colliding `symbol`. It is therefore now **channel-filterable** like every other channel-bearing message: the carve-out that sent every definition to a `{"channel":N}` client existed only because the message had no channel, and replay passes each definition's own channel so a channel-scoped client's bootstrap keeps its definitions. `status` remains the one venue-level carve-out. (#104)
 - `dz_datagrams_received_total`, `dz_datagram_bytes_total`, `dz_socket_errors_total` and
   `dz_idle_rejoin_total` gained `kind` and `publisher` labels. Aggregating queries are unaffected;
   exact-match selectors on the old label set now match one series per publisher. (#88)
@@ -91,6 +202,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `dz_ws_client_lagged_total`, so a global serializer stall is no longer hidden behind a
     single-slow-client signal; and the arbiter's `(winner, loser)` lead-histogram index formula is
     now pinned by a unit test.
+
+### Fixed
+- Reference-data state is now tracked per publisher (source IP) rather than once per receiver,
+  matching how sequence state is already keyed. `reset_count` is scoped to `(source_ip, group,
+  port)`, so under a shared port block one publisher's restart previously cleared every publisher's
+  instrument definitions — blanking the whole feed until the next reference-data burst, since all
+  emission gates on a known definition. (#97)
 
 ### Added
 - **Standalone `shred-proxy` binary** (new workspace member `shred-proxy/`): a lightweight service
@@ -542,6 +660,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`src/main.rs`) is now a thin wrapper, so dev tooling and tests can reuse the codecs.
 
 ### Fixed
+- Trades stamped `trade_id == 0` (the "no venue trade id" sentinel, emitted by FIX-sourced publishers) now bypass the cross-source dedup window instead of being keyed on it. Previously the second and every later such print was discarded as a same-publisher duplicate and `0` never aged out of the window, collapsing the tape to a single print per `(venue, symbol)` for the process's lifetime. A bypassed sentinel has no window to collapse against, so the bypass holds only while one publisher owns a venue's tape: `dz_trades_no_id_total{venue}` counts the sentinel prints and `dz_trades_no_id_conflict_total{venue}` reports a second *concurrent* publisher emitting one (a double-printed tape), which no feed does today. Inheriting a tape that has gone quiet for 5s is a failover, not a conflict, so the counter does not latch on across a legitimate ownership change. (#94)
 - Installer daemon head start bumped from 15s to 30s before `doublezero connect multicast`, so a
   cold daemon finishes device probing and no longer races the connect on slower hosts
   (`scripts/connect*.sh`).

@@ -214,6 +214,80 @@ struct Args {
         default_value_t = false
     )]
     subscription_gating_disable: bool,
+
+    /// Seconds between arm re-election samples for `Sticky` venues. Longer holds a slower arm
+    /// longer; shorter risks flapping authority, which re-baselines every consumer's book.
+    #[arg(
+        long = "arb-sample-interval-secs",
+        env = "DZ_ARB_SAMPLE_INTERVAL_SECS",
+        default_value_t = ARB.sample_interval_ns / 1_000_000_000
+    )]
+    arb_sample_interval_secs: u64,
+
+    /// Microseconds a challenger must beat the authoritative arm by, on median, to take authority.
+    #[arg(
+        long = "arb-transfer-margin-us",
+        env = "DZ_ARB_TRANSFER_MARGIN_US",
+        default_value_t = ARB.transfer_margin_ns / 1_000
+    )]
+    arb_transfer_margin_us: u64,
+
+    /// Fraction of a window's contested samples the challenger must also lead, 0.0-1.0.
+    /// Independent of the margin, so a heavy tail alone cannot carry a transfer.
+    #[arg(
+        long = "arb-transfer-win-rate",
+        env = "DZ_ARB_TRANSFER_WIN_RATE",
+        default_value_t = ARB.transfer_win_rate,
+        value_parser = parse_win_rate
+    )]
+    arb_transfer_win_rate: f64,
+
+    /// Seconds of leader silence after which a healthy challenger takes authority. Measured
+    /// venue-wide, against the leader's last message on any market — not per market, or a market
+    /// quieter than this would hand authority back and forth on every update.
+    #[arg(
+        long = "arb-leader-timeout-secs",
+        env = "DZ_ARB_LEADER_TIMEOUT_SECS",
+        default_value_t = ARB.leader_timeout_ns / 1_000_000_000
+    )]
+    arb_leader_timeout_secs: u64,
+
+    /// Matched cross-arm samples an arm needs in a window before its speed is judged at all. Below
+    /// this the window is ignored, so a handful of lucky matches cannot move a venue.
+    #[arg(
+        long = "arb-min-window-samples",
+        env = "DZ_ARB_MIN_WINDOW_SAMPLES",
+        default_value_t = ARB.min_window_samples as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_min_window_samples: u64,
+
+    /// Seconds an arm's trade waits for the peer arm's copy of the same print before it counts as
+    /// unmatched. Must exceed the worst plausible inter-arm lead and stay well under the interval
+    /// between repeats of one identical trade.
+    #[arg(
+        long = "arb-match-window-secs",
+        env = "DZ_ARB_MATCH_WINDOW_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_match_window_secs: u64,
+}
+
+/// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
+/// the ones `--help` advertises cannot drift apart.
+const ARB: ingest::authority::AuthorityConfig = ingest::authority::AuthorityConfig::DEFAULT;
+
+/// A win rate outside `0.0..=1.0` silently disables one of the two transfer conditions (above 1.0
+/// no challenger ever clears it, below 0.0 every one does), and `NaN` compares false against both.
+/// Reject it at startup rather than shipping a knob that reads as set but does nothing.
+fn parse_win_rate(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("`{s}` is outside 0.0-1.0"))
+    }
 }
 
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
@@ -343,12 +417,50 @@ async fn main() -> Result<()> {
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    let books: model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    // Single-arm authority tunables for `Sticky` venues, plus the cross-arm matcher's pairing window,
+    // validated here at startup and handed to the arbiter.
+    let authority_cfg = ingest::authority::AuthorityConfig {
+        leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
+        sample_interval_ns: args.arb_sample_interval_secs.saturating_mul(1_000_000_000),
+        transfer_margin_ns: args.arb_transfer_margin_us.saturating_mul(1_000),
+        transfer_win_rate: args.arb_transfer_win_rate,
+        min_window_samples: args.arb_min_window_samples as usize,
+    };
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
+        // Every registry venue, not just the selected ones: a message's venue comes from the wire
+        // SourceID, so a venue can reach the arbiter without its own feed being ingested.
+        for f in ingest::feeds::FEEDS {
+            a.set_mode(f.venue, f.arbitration);
+        }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
         a.set_depth_replay(depth.clone());
+        a.set_book_replay(books.clone());
+        a.set_authority(
+            authority_cfg,
+            args.arb_match_window_secs.saturating_mul(1_000_000_000),
+        );
         Arc::new(Mutex::new(a))
+    };
+
+    // The arm sampler: closes each elapsed re-election window (a margin transfer moves venue
+    // authority here), refreshes the O(markets × arms) gauges and drains the matcher's unmatched
+    // counts. Off the emit path entirely, so a slow sweep never touches ingest latency.
+    let sampler = {
+        let arbiter = arbiter.clone();
+        // A fraction of the window, not the window itself: the authority closes a window only once
+        // `sample_interval_ns` has really elapsed, so ticking at exactly that period lets ordinary
+        // scheduling jitter push a verdict a whole window late.
+        let period = std::time::Duration::from_secs((args.arb_sample_interval_secs / 4).max(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            loop {
+                tick.tick().await;
+                ingest::arbiter::lock(&arbiter).close_authority_windows();
+            }
+        })
     };
 
     // WebSocket sink config. The sink itself is activated by the subscription reconciler (below),
@@ -458,6 +570,7 @@ async fn main() -> Result<()> {
             arbiter,
             instruments,
             depth,
+            books,
             enabled,
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
@@ -470,10 +583,12 @@ async fn main() -> Result<()> {
         .run(),
     );
 
-    // The reconciler and the (independent, config-gated) public feeders + metrics endpoint all loop
-    // forever; the process exits only if one of them panics or the metrics server fails to bind.
+    // The reconciler, the arm sampler and the (independent, config-gated) public feeders + metrics
+    // endpoint all loop forever; the process exits only if one of them panics or the metrics server
+    // fails to bind.
     tokio::select! {
         r = reconciler => r??,
+        r = sampler => r?,
         r = async { match ws_input {
             Some(handle) => handle.await,
             None => std::future::pending().await,
@@ -509,8 +624,8 @@ mod tests {
 
     #[test]
     fn repeated_name_selects_same_as_single() {
-        let once = select_feeds(&["Hyperliquid".to_string()]).unwrap();
-        let twice = select_feeds(&["Hyperliquid".to_string(), "Hyperliquid".to_string()]).unwrap();
+        let once = select_feeds(&["HYPERLIQUID".to_string()]).unwrap();
+        let twice = select_feeds(&["HYPERLIQUID".to_string(), "HYPERLIQUID".to_string()]).unwrap();
         // Repeating a name must spawn the same receivers (same keys, same order) as passing it once.
         assert_eq!(keys(&once), keys(&twice));
         // Hyperliquid maps to >1 row (TOB + MBO), so this actually exercises multi-row dedup.
@@ -520,20 +635,20 @@ mod tests {
     #[test]
     fn distinct_names_union_without_dup() {
         let sel = select_feeds(&[
-            "Hyperliquid".to_string(),
-            "Phoenix".to_string(),
-            "Hyperliquid".to_string(),
+            "HYPERLIQUID".to_string(),
+            "PHOENIX".to_string(),
+            "HYPERLIQUID".to_string(),
         ])
         .unwrap();
         // Union of the two distinct venues' rows, each receiver once — no row spawned twice.
         let k = keys(&sel);
         let uniq: std::collections::HashSet<_> = k.iter().collect();
         assert_eq!(uniq.len(), k.len());
-        // The repeated "Hyperliquid" added nothing beyond the first: selecting both venues equals
+        // The repeated "HYPERLIQUID" added nothing beyond the first: selecting both venues equals
         // selecting each once.
         assert_eq!(
             k,
-            keys(&select_feeds(&["Hyperliquid".to_string(), "Phoenix".to_string()]).unwrap())
+            keys(&select_feeds(&["HYPERLIQUID".to_string(), "PHOENIX".to_string()]).unwrap())
         );
     }
 
@@ -547,14 +662,14 @@ mod tests {
         let all = filter_publishers(select_feeds(&[]).unwrap(), &[]).unwrap();
         let hl_tob = all
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
         // Compare against the registry, not a literal: this test is about the empty selection
         // being a no-op, and a hardcoded count silently turns it into a fleet-size assertion that
         // has to be edited every time a publisher is onboarded (`feeds.rs` already pins the set).
         let registry = feeds::FEEDS
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
         assert_eq!(hl_tob.publishers.len(), registry.publishers.len());
     }
@@ -564,7 +679,7 @@ mod tests {
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
         let hl_tob = sel
             .iter()
-            .find(|f| f.venue == "Hyperliquid" && f.kind == feeds::FeedKind::TopOfBook)
+            .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
         let ports: Vec<u16> = hl_tob.publishers.iter().map(|p| p.base_port()).collect();
         assert_eq!(ports, vec![9201, 9401]);
@@ -575,8 +690,8 @@ mod tests {
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
-        assert!(!sel.iter().any(|f| f.venue == "Phoenix"));
-        assert!(sel.iter().any(|f| f.venue == "Hyperliquid"));
+        assert!(!sel.iter().any(|f| f.venue == "PHOENIX"));
+        assert!(sel.iter().any(|f| f.venue == "HYPERLIQUID"));
     }
 
     /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
@@ -586,15 +701,15 @@ mod tests {
     fn base_ports_are_not_unique_across_feeds() {
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
         let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
-        assert!(venues.contains("Hyperliquid"));
-        assert!(venues.contains("Phoenix"));
+        assert!(venues.contains("HYPERLIQUID"));
+        assert!(venues.contains("PHOENIX"));
         assert!(sel
             .iter()
             .all(|f| f.publishers.iter().all(|p| p.base_port() == 9201)));
 
         let scoped =
-            filter_publishers(select_feeds(&["Phoenix".to_string()]).unwrap(), &[9201]).unwrap();
-        assert!(scoped.iter().all(|f| f.venue == "Phoenix"));
+            filter_publishers(select_feeds(&["PHOENIX".to_string()]).unwrap(), &[9201]).unwrap();
+        assert!(scoped.iter().all(|f| f.venue == "PHOENIX"));
     }
 
     #[test]

@@ -305,3 +305,97 @@ subscribed to the `edge-solana-*` groups, then re-run the extraction (curate dat
 variant bytes + multi-group keys into the record format, and build `shred_leaders.json` by inverting
 a current `getLeaderSchedule` for the captured slots). The leader schedule must be fetched while the
 captured epoch is still within the RPC's retention.
+
+## Market-by-price fixtures
+
+Real captures of the Lashay publisher, frame magic `0x4442`, taken 2026-08-07 from a host with the
+DoubleZero tunnel up. **These are an interim capture** — a longer one with publisher fixes is
+expected, and `tests/codec_mbp_fixtures.rs` asserts invariants rather than recorded counts so a
+re-capture drops in without editing a number. Two sets, because they cover different things.
+
+### `mbp_{refdata,mktdata,snapshot}.bin` — the sharded feed (primary)
+
+The deployment shape the code will actually ingest: **three `Channel ID`s on one group**, so this is
+the only fixture that exercises per-channel snapshot grouping. Delta stream is thin.
+
+| | |
+|---|---|
+| Source | market-by-price group `233.84.178.20`, publisher `148.51.120.6` |
+| Ports | `33010`/`33063`/`33120` mktdata, `43010`/`43063`/`43120` refdata, `53010`/`53063`/`53120` snapshot |
+| Channels | 10, 63, 120 (encoded in the port number; each an independent state machine) |
+| Capture | 2026-08-07 16:54:58 UTC, 39.6s, 12,535 market-by-price frames |
+| Whole feed | 1,238 instruments; 3,268/3,268 complete snapshot groups; `depth_bound == 0` on all |
+| Committed | filtered to `XNFLCOTY-27-BSCH` (channel 10) and `XNCAAFSEC-26-UGA` (channel 63) — 285 refdata, 24 snapshot, 143 mktdata frames |
+
+### `mbp_perps_{refdata,mktdata,snapshot}.bin` — the dense feed
+
+One channel, thousands of contiguous per-instrument deltas. This is what pins sequence handling; the
+sharded set above is too quiet to. **From the older publisher**, which is being retired — see the
+known deviations below before treating anything here as normative.
+
+| | |
+|---|---|
+| Source | market-by-price group `233.84.178.4`, publisher `148.51.121.69` |
+| Ports | `31000` mktdata, `41000` refdata, `51000` snapshot |
+| Capture | 2026-08-07 16:55:54 UTC, first 8s of a 39s capture, 2,712 frames |
+| Whole capture | 13 instruments; 101/101 complete snapshot groups; `depth_bound == 0` on all; `KXBTCPERP` ran 12,892 deltas over `1294579..1307470` with zero gaps and zero duplicates |
+| Committed | filtered to `KXBTCPERP` — 9 refdata, 20 snapshot, 997 mktdata frames; snapshot rotation is every 5s so the window holds 2 complete groups |
+
+### Known deviations in these captures
+
+Recorded so a later capture can be checked against them, and so nothing here is mistaken for the
+protocol's intent. All three are publisher-side, not decoder-side.
+
+1. **The two redundant arms of the older feed stamp different `Channel ID`s** (`1` and `2`) while
+   carrying an identical instrument set — same ids, same symbols. The spec defines `Channel ID` as
+   sharding *the active instrument set* across instances, which these two are not doing. It matters
+   beyond tidiness: a market key that includes the channel would put the two arms on separate keys,
+   so they would never arbitrate against each other. Treated as a defect of the publisher being
+   retired; the sharded feed above does channels correctly (zero instrument-id overlap between them).
+2. **Symbols overflow the 16-byte symbol field on the sharded feed.** 2,312 of its definitions carry
+   no NUL terminator, and `EAVE-27JAN01-YES` is the truncation of two *different* instrument ids.
+   `InstrumentSnapshot` and `DepthSnapshot` are keyed `(venue, symbol)`, so a collision makes two
+   markets clobber each other.
+3. **No `BookClear`, `InstrumentReset`, `BatchBoundary` or `EndOfSession`** in either capture, so
+   those four types remain offset-test-only — the status `codec_mbo`'s `InstrumentReset`/`Heartbeat`/
+   `EndOfSession` have. Three are exceptional events and a quiet window explaining their absence is
+   expected; `BatchBoundary` is not, so confirm whether the publisher emits it at all.
+
+### Measured: the two perps arms use disjoint `trade_id` conventions
+
+The arms split cleanly, and identically on both protocols. Measured 2026-08-07 with
+`examples/pcap2frames.rs`, which reports `zero_id_trades=` alongside `trades=`; `--src` selects one
+publisher, so one run per source IP gives the per-arm answer.
+
+| Arm | Protocol | trades | `zero_id_trades` |
+|---|---|---|---|
+| `148.51.121.69` | top-of-book | 102 | 102 (always) |
+| `148.51.120.6`  | top-of-book | 65  | 0 (never) |
+| `148.51.121.69` | market-by-price | 102 | 102 (always) |
+| `148.51.120.6`  | market-by-price | 65  | 0 (never) |
+
+**This is why the tape gate is `trade_id`-independent rather than a sentinel latch.** One arm's prints
+bypass the dedup window (the `0` sentinel means "no venue trade id"); the peer's carry real ids and
+route to `WindowedDedup`. The two copies of one fill therefore never meet in either mechanism, so a
+sentinel-only gate would collapse nothing and every print would double.
+
+Two limits on what this shows. The captures do not overlap in time, so this is disjoint id
+conventions on a shared group, not a captured duplicate — a simultaneous two-arm capture would
+demonstrate it outright. And it does not establish whether the two arms stamp *different real* ids
+for the same fill; that needs content-matched id sets across arms and is not measured here. The
+id-independent gate covers that case regardless.
+
+Also worth knowing: the two arms' captures do **not** overlap in time (the older feed's are ~16s
+apart), so no two-arm interleaved fixture can be cut from them — a future capture should run both
+publishers simultaneously. `--combined-with` is not implemented for `--protocol mbp` either.
+
+### Regenerating
+
+```
+sudo timeout 60 tcpdump -i doublezero1 -nn -s 0 -w mbp.pcap 'host <group> and udp'
+cargo run --example pcap2frames -- mbp.pcap --protocol mbp --group <group> \
+  --src <publisher-ip> --symbol <sym> -o tests/fixtures/mbp
+```
+
+Keep at least one multi-channel set and one dense-delta set; the fixture tests assert both shapes.
+Record the source IP, capture date, frame counts and observed `depth_bound` above.

@@ -5,16 +5,22 @@
 //! header, message header, little-endian readers and the generic frame-walker are shared with
 //! the sibling protocols in [`crate::ingest::codec_common`].
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
-use crate::ingest::codec_common::{cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le};
+use crate::ingest::codec_common::{
+    decode_frame_with, i64le, instrument_definition, u16le, u32le, u64le, u8le,
+};
 // Re-export the shared frame primitives under `codec::` so existing call sites
 // (`crate::ingest::codec::FrameHeader`, `apply_exponent`, ...) keep resolving here.
-pub use crate::ingest::codec_common::{apply_exponent, FrameHeader, MSG_HEADER_SIZE};
+pub use crate::ingest::codec_common::{
+    apply_exponent, FrameHeader, InstrumentDefinition, MSG_HEADER_SIZE,
+};
+use crate::ingest::codec_common::{SCHEMA_V1, SCHEMA_V3};
 
 pub const MAGIC: u16 = 0x445A;
+
+/// Wire generations this feed implements. `2` is deliberately absent — see [`SCHEMA_V1`].
+const SUPPORTED_VERSIONS: &[u8] = &[SCHEMA_V1, SCHEMA_V3];
 
 pub const MSG_HEARTBEAT: u8 = 0x01;
 pub const MSG_INSTRUMENT_DEFINITION: u8 = 0x02;
@@ -67,24 +73,6 @@ pub struct Trade {
     pub cumulative_volume_raw: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct InstrumentDefinition {
-    pub instrument_id: u32,
-    pub symbol: Arc<str>,
-    pub price_exponent: i8,
-    pub qty_exponent: i8,
-    pub manifest_seq: u16,
-}
-
-impl crate::ingest::subscriber::InstrumentDef for InstrumentDefinition {
-    fn id(&self) -> u32 {
-        self.instrument_id
-    }
-    fn manifest_seq(&self) -> u16 {
-        self.manifest_seq
-    }
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ManifestSummary {
@@ -110,33 +98,25 @@ pub enum Message {
     Other(#[allow(dead_code)] u8),
 }
 
-/// Map a `Quote.source_id` to its venue name per the edge-feed-spec source registry
-/// (https://github.com/malbeclabs/edge-feed-spec/blob/main/sources/spec.md). A SourceID
-/// identifies the venue a price was derived from; IDs are stable and never reused. Returns
-/// `None` for unassigned IDs so the caller can fall back to its configured label. Add a row
-/// here whenever the upstream registry assigns a new production ID (1-1023).
-pub fn source_name(source_id: u16) -> Option<&'static str> {
-    match source_id {
-        1 => Some("Hyperliquid"),
-        2 => Some("Phoenix"),
-        _ => None,
-    }
-}
+pub use crate::ingest::sources::source_name;
 
 /// Decode one UDP datagram (one frame) into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
-        decode_message(msg_type, b, o)
-    })
+    decode_frame_with(
+        buf,
+        MAGIC,
+        SUPPORTED_VERSIONS,
+        |msg_type, _flags, b, o, ver| decode_message(msg_type, b, o, ver),
+    )
 }
 
-fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
+fn decode_message(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Message {
     // A message shorter than its declared type's fields decodes to `None` -> `Other` (skipped),
     // never an out-of-bounds panic (the readers are bounds-checked; see `codec_common`).
-    decode_body(msg_type, b, o).unwrap_or(Message::Other(msg_type))
+    decode_body(msg_type, b, o, schema_version).unwrap_or(Message::Other(msg_type))
 }
 
-fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
+fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<Message> {
     let body = o + MSG_HEADER_SIZE;
     Some(match msg_type {
         MSG_QUOTE => Message::Quote(Quote {
@@ -162,13 +142,9 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
             trade_id: u64le(b, body + 32)?,
             cumulative_volume_raw: u64le(b, body + 40)?,
         }),
-        MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
-            instrument_id: u32le(b, body)?,
-            symbol: cstr(b, body + 4, 16)?.into(),
-            price_exponent: u8le(b, body + 37)? as i8,
-            qty_exponent: u8le(b, body + 38)? as i8,
-            manifest_seq: u16le(b, body + 74)?,
-        }),
+        MSG_INSTRUMENT_DEFINITION => {
+            Message::InstrumentDefinition(instrument_definition(b, o, schema_version)?)
+        }
         MSG_MANIFEST_SUMMARY => Message::ManifestSummary(ManifestSummary {
             channel_id: u8le(b, body)?,
             valid: u8le(b, body + 1)? != 0,
@@ -376,8 +352,8 @@ mod tests {
 
     #[test]
     fn source_registry_maps_known_ids() {
-        assert_eq!(source_name(1), Some("Hyperliquid"));
-        assert_eq!(source_name(2), Some("Phoenix"));
+        assert_eq!(source_name(1), Some("HYPERLIQUID"));
+        assert_eq!(source_name(2), Some("PHOENIX"));
         assert_eq!(source_name(0), None); // reserved, never on wire
         assert_eq!(source_name(999), None); // unassigned -> caller falls back
     }

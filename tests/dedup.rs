@@ -12,17 +12,21 @@
 mod common;
 
 use common::{assertions, replay as replay_helper};
-use doublezero_edge_connect::ingest::{
-    arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
-    codec,
-    processor::{MboProcessor, TobProcessor},
-    receiver::{FrameCtx, FrameProcessor, PortRole},
+use doublezero_edge_connect::{
+    ingest::{
+        arbiter::{Arbiter, Publisher, SharedArbiter, TRADE_DEDUP_WINDOW},
+        codec, codec_mbo,
+        feeds::{FeedKind, FEEDS},
+        processor::{MboProcessor, TobProcessor},
+        receiver::{FrameCtx, FrameProcessor, PortRole},
+    },
+    model::{BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook},
 };
 use serde_json::Value;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
@@ -47,10 +51,12 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
     let depth = Arc::new(Mutex::new(HashMap::new()));
-    let mut p = MboProcessor::new(depth, true);
+    // Trades off, as the live MBO row is (`feeds::FEEDS`): its `OrderExecute` prints carry no venue
+    // trade id, so they bypass the arbiter's dedup window — see `mbo_prints_carry_no_venue_trade_id`.
+    let mut p = MboProcessor::new(depth, Arc::new(AtomicBool::new(false)));
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
-            venue: "Hyperliquid",
+            venue: "HYPERLIQUID",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -111,10 +117,10 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let (tx, mut rx) = broadcast::channel(1 << 16);
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
-    let mut p = TobProcessor::new(true);
+    let mut p = TobProcessor::new(Arc::new(AtomicBool::new(true)));
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
-            venue: "Hyperliquid",
+            venue: "HYPERLIQUID",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -227,11 +233,27 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // The fixture carries 8788 raw BTC mktdata quotes split across two publishers mirroring the same
     // feed (417 distinct source_ts). Latch-to-leader emits the leader's distinct canonical BBOs at a
     // non-decreasing floor — the `bbo_hash` identity (px, sz, bid_n, ask_n), so a count-only change at
-    // an unchanged price/size is a distinct quote. Observed: 4540 (the 4468 px/sz-distinct BBOs plus
-    // 72 count-only changes the source-count identity now keeps; ~1.6%). Far above a strict
-    // one-per-tick watermark (~417, which over-drops real intra-tick changes).
+    // an unchanged price/size is a distinct quote. Far above a strict one-per-tick watermark (~417,
+    // which over-drops real intra-tick changes).
+    //
+    // 7508, up from 4521: the wire Source ID is now authoritative (no feed-row fallback), and this
+    // fixture's two publishers disagree about it. Confirmed by decoding the raw quotes directly:
+    // the first publisher stamps every one of its 4699 quotes with Source ID 1 (Hyperliquid, correct);
+    // the second publisher stamps every one of its 4133 quotes with Source ID 3 — the registry's row
+    // for a different registered venue, not Hyperliquid, as of the registry becoming strict. That is a
+    // real defect in the second publisher, not a decode issue: it is misreporting its own identity on
+    // every quote in this capture. Under the old `unwrap_or(ctx.venue)` fallback, id 3 was unmapped, so
+    // BOTH publishers' quotes fell back to this feed's static venue ("HYPERLIQUID") and competed on ONE
+    // dedup floor, silently merging the mislabeled arm into the correct one — exactly the "name it
+    // after the multicast group it arrived on" workaround the plan reversal exists to remove. With the
+    // fallback gone, the two arms are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
+    // for the other venue = 7508) and no longer share a floor, so the cross-arm duplication this
+    // fixture's two mirrors actually represent is no longer collapsed — each arm now only dedups
+    // against itself (4699 -> 4508, 4133 -> 3000). This is the correct, intended behavior of the new
+    // rule: the output is visibly wrong about which publisher this is, which is what surfaces the
+    // second publisher's defect instead of hiding it. The fix belongs at that publisher, not here.
     assert_eq!(
-        quotes, 4540,
+        quotes, 7508,
         "two-pub latch-to-leader quote count (leader's distinct canonical BBOs incl. bid_n/ask_n)"
     );
 }
@@ -439,18 +461,30 @@ fn duplicate_multicast_trade_packet_collapses() {
 /// Two-publisher **Market-by-Order** depth dedup over the real combined golden: two live HL
 /// publishers' interleaved BTC capture, each reconstructing its own book from a synthetic empty
 /// anchor + its independent delta stream. The cross-publisher contract:
-///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity) — the leader's
-///      book is served per `source_ts` tick, the redundant publisher's collapsed.
-///   2. The two identical synced-but-empty depths at `source_ts == 0` (one per publisher's anchor)
-///      collapse to exactly ONE — the deliberate no-`source_ts==0`-bypass for depth.
+///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity).
+///   2. Neither publisher's empty-book anchor (`source_ts == 0`) ever reaches the wire at all — an
+///      instrument is deferred (see `ingest::processor`) until a delta-carrying message reveals its
+///      Source ID, and the anchor alone carries none, so by the time either publisher's first
+///      `depth` is emitted it already reflects real post-reveal content, never the empty anchor.
 ///   3. Both publishers reconstruct independently: each replayed ALONE emits depth (its book syncs
 ///      from its own anchor + deltas — proving the per-`(publisher, instrument)` re-key).
-///   4. The combined emission collapses redundancy: fewer depths than the two publishers emit
-///      separately (the floor dropped the non-leader's mirror).
+///   4. **Not** cross-publisher collapse. This fixture's two publisher IPs are the same pair
+///      captured in the TOB dedup fixture (`two_publishers_latch_to_leader_no_stale_or_dupes`),
+///      and carry the SAME real defect there: the first publisher stamps every order/trade with wire
+///      Source ID 1 (Hyperliquid, correct); the second publisher stamps every one with 3, which the
+///      registry resolves to a different registered venue, not Hyperliquid. Honestly reported (no
+///      `ctx.venue` fallback), they are two different venues and never share a depth floor, so
+///      nothing here collapses across them — this is the intended visible symptom of the second
+///      publisher's defect, not a regression. (Real cross-publisher collapse — two arms honestly sharing one
+///      Source ID — is proven separately by `mbo_depth_mirror_from_second_publisher_collapses`,
+///      whose synthetic mirror is a byte-for-byte copy and so shares the original's id.)
 ///
-/// Falsifiable: with the depth floor bypassed (always-admit) the two anchors at `source_ts == 0`
-/// both emit and `no_business_duplicates` flags the identical `(0, [], [])` pair; sharing one book
-/// across publishers (the pre-#28 key) collides their delta sequence spaces and corrupts the book.
+/// Falsifiable: with deferral bypassed (always-emit on definition), the two anchors at
+/// `source_ts == 0` would both emit and `no_business_duplicates` would flag the identical
+/// `(0, [], [])` pair — the depth floor's own no-`source_ts==0`-bypass rule (arbiter.rs) is exercised
+/// directly by its own unit tests, not by this fixture, now that deferral keeps that state off the
+/// wire before the floor ever sees it; sharing one book across publishers (the pre-#28 key) collides
+/// their delta sequence spaces and corrupts the book.
 #[test]
 fn two_publishers_mbo_depth_dedup() {
     let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
@@ -470,11 +504,13 @@ fn two_publishers_mbo_depth_dedup() {
     let combined_depths = depths(&msgs).len();
     assert!(combined_depths > 0, "no depth emitted from the golden");
 
-    // (2) the two empty-book anchors at source_ts==0 collapse to one.
+    // (2) deferral keeps the empty-book anchor off the wire entirely: nothing ever reveals it
+    // (the snapshot machinery carries no Source ID), so no `depth` is ever emitted for it, by
+    // either publisher — not just deduped down to one, never present at all.
     assert_eq!(
         empty_anchor_depths(&msgs),
-        1,
-        "the two publishers' identical empty-book anchors at source_ts==0 must collapse to one"
+        0,
+        "the empty-book anchor is deferred, not merely deduped: it never reaches the wire"
     );
 
     // (3) each publisher independently reconstructs its book: replayed alone it still emits depth.
@@ -489,12 +525,13 @@ fn two_publishers_mbo_depth_dedup() {
         alone_total += n;
     }
 
-    // (4) redundancy collapsed: the combined run emits fewer depths than the two publishers do
-    // separately (the floor dropped the non-leader publisher's redundant book states).
-    assert!(
-        combined_depths < alone_total,
-        "combined depth {combined_depths} not below per-publisher sum {alone_total} — \
-         cross-publisher dedup collapsed nothing"
+    // (4) this fixture's two publishers are honestly reported as two different venues (see the
+    // doc comment above), so they share no depth floor and nothing collapses across them: the
+    // combined run is exactly the sum of the two alone.
+    assert_eq!(
+        combined_depths, alone_total,
+        "two publishers on two different (wire-honest) venues share no dedup floor, so the \
+         combined run must equal the per-publisher sum, not less"
     );
 }
 
@@ -538,6 +575,46 @@ fn mbo_depth_mirror_from_second_publisher_collapses() {
     );
 }
 
+/// Every print in the live Market-by-Order golden carries `trade_id == 0` — the venue stamps no
+/// trade id on `OrderExecute`. That is why the arbiter treats `0` as "no identity" rather than a
+/// dedup key, and why the Market-by-Order rows must stay `emit_trades: false`: two mirrored
+/// publishers' zero-id prints have no window to collapse against.
+#[test]
+fn mbo_prints_carry_no_venue_trade_id() {
+    let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
+    let mut prints = 0;
+    for (_ip, _role, frame) in &recs {
+        let Ok((_h, msgs)) = codec_mbo::decode_frame(frame) else {
+            continue;
+        };
+        for m in &msgs {
+            let id = match m {
+                codec_mbo::Message::OrderExecute(o) => o.trade_id,
+                codec_mbo::Message::Trade(t) => t.trade_id,
+                _ => continue,
+            };
+            prints += 1;
+            assert_eq!(
+                id, 0,
+                "golden carries a venue trade id — revisit the bypass"
+            );
+        }
+    }
+    assert!(
+        prints > 0,
+        "golden carried no prints — the fact is unpinned"
+    );
+
+    // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
+    // real trade ids, and that is its own row's call.
+    for f in FEEDS
+        .iter()
+        .filter(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::MarketByOrder)
+    {
+        assert!(!f.emit_trades, "{} would publish zero-id prints", f.venue);
+    }
+}
+
 /// The content-inclusive identity set of emitted depths (`venue|symbol|source_ts|bids|asks`), the
 /// same key the `no_business_duplicates` oracle uses — for comparing two runs' emitted depth sets.
 fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
@@ -554,6 +631,143 @@ fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
             )
         })
         .collect()
+}
+
+const BOOK_VENUE: &str = "BookArmsInterleave";
+const BOOK_CHANNEL: u32 = 2;
+const BOOK_INSTRUMENT: u32 = 41;
+
+fn arm(n: u8) -> Publisher {
+    Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+}
+
+fn level(side: BookSide, price: f64, size: f64) -> BookChange {
+    BookChange {
+        action: BookAction::Update,
+        side,
+        price,
+        size,
+    }
+}
+
+/// One `book` batch for the single market under test. `recv_ns` is the authority's arrival clock.
+fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage {
+    FeedMessage::Book(NormalizedBook {
+        venue: BOOK_VENUE.into(),
+        source: BOOK_VENUE.into(),
+        source_id: 0,
+        symbol: "BTC-PERP".into(),
+        channel: BOOK_CHANNEL,
+        instrument_id: BOOK_INSTRUMENT,
+        changes,
+        snapshot: false,
+        last,
+        source_ts_ns: recv_ns,
+        recv_ts_ns: recv_ns,
+        kernel_rx_ts_ns: 0,
+        ws_send_ts_ns: 0,
+    })
+}
+
+/// One arm's `(changes, last)` batch stream, parametrized on the arm's price/size base so two arms
+/// built from it publish divergent level sets. Batches 2 and 3 are one logical event.
+fn arm_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
+    vec![
+        (
+            vec![
+                level(BookSide::Bid, px, sz),
+                level(BookSide::Ask, px + 1.0, sz + 2.0),
+            ],
+            true,
+        ),
+        (vec![level(BookSide::Bid, px - 0.5, sz - 2.0)], false),
+        (
+            vec![
+                level(BookSide::Ask, px + 1.5, sz - 3.0),
+                BookChange {
+                    action: BookAction::Delete,
+                    side: BookSide::Bid,
+                    price: px,
+                    size: 0.0,
+                },
+            ],
+            true,
+        ),
+        (vec![level(BookSide::Bid, px - 0.5, sz - 1.0)], true),
+    ]
+}
+
+fn drain_books(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> Vec<NormalizedBook> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if let FeedMessage::Book(b) = &*m {
+            out.push(b.clone());
+        }
+    }
+    out
+}
+
+/// The single-arm authority gate for the incremental `book` product. Two arms mirror one venue and
+/// their per-instrument delta series are unrelated by construction, so interleaving both on one wire
+/// stream corrupts a consumer's book while every per-arm sequence check the producer ran still passes.
+/// Pinned: only the elected arm's batches reach the wire, and a `BookAccumulator` fed from the drained
+/// wire messages alone reproduces that arm's level set exactly. Against the pre-gate undeduped
+/// passthrough both fail — all eight batches go out, the challenger's levels enter the consumer's book,
+/// and its `last: false` batch folds into the leader's logical event.
+#[test]
+fn interleaved_book_arms_publish_one_coherent_stream() {
+    fn clear_both() -> BookChange {
+        BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+        }
+    }
+
+    let (tx, mut rx) = broadcast::channel(64);
+    let mut arb = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+    let (leader, challenger) = (arm_batches(100.0, 5.0), arm_batches(200.0, 50.0));
+    assert_ne!(
+        leader, challenger,
+        "identical arms would pass with the gate removed"
+    );
+
+    // Arm-by-arm, arrivals microseconds apart: past the 2s `leader_timeout_ns` authority would
+    // legitimately transfer on silence.
+    for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
+        let t = 1_000 + i as u64 * 2_000;
+        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1));
+        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2));
+    }
+
+    // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer
+    // re-baseline, so a bare `clear` leads the stream. Everything after it is the leader's, verbatim.
+    let published = drain_books(&mut rx);
+    let (first, rest) = published.split_first().expect("the re-baseline");
+    assert_eq!(first.changes, vec![clear_both()]);
+    assert_eq!(
+        rest.iter()
+            .map(|b| (b.changes.clone(), b.last))
+            .collect::<Vec<_>>(),
+        leader,
+        "the wire must carry the elected arm's batches verbatim and none of the challenger's"
+    );
+
+    let mut acc = BookAccumulator::new(published[0].symbol.clone());
+    for b in &published {
+        acc.apply(b);
+    }
+    let full = acc.to_book(&BOOK_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+    assert_eq!(
+        full.changes[1..].to_vec(), // [0] is the re-baseline `clear`
+        vec![
+            level(BookSide::Bid, 99.5, 4.0),
+            level(BookSide::Ask, 101.0, 7.0),
+            level(BookSide::Ask, 101.5, 2.0),
+        ],
+        "a consumer applying only what we published must hold the elected arm's book"
+    );
 }
 
 /// True if the frame carries a quote for `id` (used to build the DOGE-only subset; a TOB frame
