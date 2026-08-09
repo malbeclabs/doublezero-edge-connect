@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PerPublisher`'s eviction now, so an evicted publisher's books, revealed Source IDs, announced
   symbols and per-channel snapshot state go with it rather than outliving the reference data they
   depend on.
+- A `BookClear` whose `Clear Side` is *both* is now refused for **every** scope byte except the
+  recognized whole-side one, at the codec and in `PriceBook` alike. The guard tested `scope == 1`
+  while the apply path derives its behaviour from the complement, so an unassigned `2..=255` was
+  treated as price-bounded and `{ clear_side: 2, scope: 2 }` removed bids at/below and asks at/above
+  a single bound — the whole book — republished to every consumer as `Delete`s.
 - **Breaking:** a message is emitted for an instrument only once its Source ID has been observed. A
   publisher whose reference data carries no Source ID of its own can only reveal it through a price
   message, so an instrument that has received a definition but no price produces nothing at all, and

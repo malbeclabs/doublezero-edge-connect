@@ -353,7 +353,14 @@ fn decode_book_clear(b: &[u8], o: usize) -> Option<Message> {
     let scope = u8le(b, o + 7)?;
     // Malformed by spec: one price cannot bound both sides. Dropping it here rather than in the
     // book logic means a bad frame can never clear both sides from a single bound.
-    if scope == SCOPE_FROM_PRICE && clear_side == CLEAR_SIDE_BOTH {
+    //
+    // Tested against the recognized **whole-side** scope, never against `SCOPE_FROM_PRICE`: enums
+    // decode permissively by design, so an unassigned `2..=255` reaches here intact, and
+    // `PriceBook::clear_side_levels` derives its behaviour from this same complement
+    // (`entire = scope == SCOPE_ENTIRE_SIDE`) — every unrecognized byte therefore acts as a
+    // price-bounded clear down there. An `== SCOPE_FROM_PRICE` test would let those through to
+    // empty a live book from one bound.
+    if clear_side == CLEAR_SIDE_BOTH && scope != SCOPE_ENTIRE_SIDE {
         return None;
     }
     Some(Message::BookClear(BookClear {
@@ -922,6 +929,26 @@ pub(crate) mod tests {
             matches!(m[0], Message::Other(MSG_BOOK_CLEAR)),
             "must not decode as a clear"
         );
+    }
+
+    /// The guard must key on the one **recognized** whole-side scope, not on the one recognized
+    /// from-price scope. `PriceBook::clear_side_levels` derives its behaviour from the complement
+    /// (`entire = scope == SCOPE_ENTIRE_SIDE`), so every unassigned byte in `2..=255` behaves as
+    /// from-price down there. An exact `== SCOPE_FROM_PRICE` test therefore lets
+    /// `{ clear_side: 2, scope: 2 }` through to empty a live book from a single bound — exactly
+    /// what the malformed-clear rule exists to prevent.
+    #[test]
+    fn book_clear_on_both_sides_is_malformed_for_every_unrecognized_scope() {
+        for scope in [SCOPE_FROM_PRICE, 2, 3, 17, 255] {
+            let mut b = vec![0u8; 32];
+            b[6] = CLEAR_SIDE_BOTH;
+            b[7] = scope;
+            let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+            assert!(
+                matches!(m[0], Message::Other(MSG_BOOK_CLEAR)),
+                "scope {scope} with Clear Side = 2 must not decode as a clear"
+            );
+        }
     }
 
     /// ...but `Clear Side = 2` with `Scope = 0` (clear both sides entirely) is the normal case.

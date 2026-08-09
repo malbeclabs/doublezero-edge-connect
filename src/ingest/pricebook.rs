@@ -19,8 +19,7 @@
 use std::collections::BTreeMap;
 
 use crate::ingest::codec_mbp::{
-    CLEAR_SIDE_ASK, CLEAR_SIDE_BID, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, SCOPE_FROM_PRICE, SIDE_ASK,
-    SIDE_BID,
+    CLEAR_SIDE_ASK, CLEAR_SIDE_BID, CLEAR_SIDE_BOTH, SCOPE_ENTIRE_SIDE, SIDE_ASK, SIDE_BID,
 };
 
 /// `Action` values from the spec's enum — the one wire enum the decoder does not name, since it
@@ -484,9 +483,16 @@ impl PriceBook {
                 from_price_raw,
             } => {
                 self.advance(op.seq, op.ts);
-                if clear_side == CLEAR_SIDE_BOTH && scope == SCOPE_FROM_PRICE {
+                if clear_side == CLEAR_SIDE_BOTH && scope != SCOPE_ENTIRE_SIDE {
                     // Malformed: one price cannot bound both sides. Consume the sequence, clear
                     // nothing — a guess at what was meant would silently empty a live book.
+                    //
+                    // Tested against the recognized whole-side scope, so every unassigned
+                    // `2..=255` is refused too: [`clear_side_levels`] treats anything that is not
+                    // `SCOPE_ENTIRE_SIDE` as price-bounded, so an `== SCOPE_FROM_PRICE` test here
+                    // would clear bids at/below and asks at/above one bound — the whole book. The
+                    // codec refuses the same shape (`decode_book_clear`), so in practice this is
+                    // defence in depth for a caller that builds a `Clear` by hand.
                     return DeltaOutcome::Applied { divergence: None };
                 }
                 if clear_side == CLEAR_SIDE_BID || clear_side == CLEAR_SIDE_BOTH {
@@ -555,6 +561,9 @@ fn clear_side_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests name the from-price scope now: the apply path derives its behaviour from the
+    // whole-side one so that every unrecognized byte is refused (see the `Clear` arm of `on_delta`).
+    use crate::ingest::codec_mbp::SCOPE_FROM_PRICE;
 
     /// Action values from the spec's enum: 1=New, 2=Change, 3=Delete, 0=Unknown.
     const NEW: u8 = 1;
@@ -1056,6 +1065,29 @@ mod tests {
             ),
             "the malformed clear still consumed seq 6"
         );
+    }
+
+    /// The same rule for every scope byte the registry has not assigned. [`clear_side_levels`]
+    /// derives its behaviour from the complement (`entire = scope == SCOPE_ENTIRE_SIDE`), so
+    /// `2..=255` all act as from-price — which means a guard testing `== SCOPE_FROM_PRICE` lets
+    /// them through to clear bids at/below and asks at/above one bound: the whole book, republished
+    /// to every consumer as `Delete`s. Only the recognized whole-side scope may pass.
+    #[test]
+    fn clear_on_both_sides_with_an_unrecognized_scope_clears_nothing() {
+        for scope in [2u8, 3, 17, 255] {
+            let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10), (SIDE_ASK, 6300, 30)]);
+            let mut removed = Vec::new();
+            assert!(matches!(
+                b.on_delta(clear(6, 101, CLEAR_SIDE_BOTH, scope, 6250), &mut removed),
+                DeltaOutcome::Applied { .. }
+            ));
+            assert_eq!(bids_of(&b), vec![(6200, 10)], "scope {scope}");
+            assert_eq!(asks_of(&b), vec![(6300, 30)], "scope {scope}");
+            assert!(
+                removed.is_empty(),
+                "scope {scope} reported {removed:?} as removed"
+            );
+        }
     }
 
     /// A clear shares the delta sequence with level updates — both mutate the book and their
