@@ -423,9 +423,15 @@ async fn main() -> Result<()> {
 
     // Resolve the feed registry before anything reads it. The rows are data supplied to the
     // container, not compiled-in constants: which group carries which feed, on which ports, is the
-    // publisher's to change and it must not need a rebuild here. A fetch or read failure falls back
-    // to the built-in document with a warning; a document that parses but fails validation is fatal,
-    // because a wrong registry ingests the wrong feeds and says nothing.
+    // publisher's to change and it must not need a rebuild here.
+    //
+    // A rejected document degrades or refuses depending on where it came from. A `--feed-registry-url`
+    // failure of any kind — unreachable, malformed, a version this build predates, a validation error
+    // — warns and falls back to the built-in copy, which is by construction last-known-good: a remote
+    // registry is infrastructure that can move underneath a running fleet, and since this resolves
+    // only at startup, refusing would not kill the fleet when the document changed but each process
+    // at its next reschedule, far from the cause. A `--feed-registry` file is an operator's explicit
+    // instruction about this one container, so a document that was read but rejected is fatal here.
     feeds::init(ingest::registry::Source::from_flags(
         &args.feed_registry_url,
         &args.feed_registry,

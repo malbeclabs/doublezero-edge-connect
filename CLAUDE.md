@@ -138,7 +138,10 @@ Modules are grouped by role under `src/`:
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
   Validation covers the structural per-row rules (non-empty `code`/`category`, a `venue` that
   `sources::source_id_of` resolves, base ports unique within a row, a non-empty roster, no port
-  overflow) **and the four cross-row invariants** — `(venue, category, kind)` uniqueness,
+  overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
+  planes, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key from a
+  silently two-port block whose book never syncs into a startup error) **and the four cross-row
+  invariants** — `(venue, category, kind)` uniqueness,
   one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
   cannot resolve last-write-wins by document order), `emit_trades` agreeing with
   `reconcile::tape_rank_is_some`, and global `(group, port)` uniqueness. Those four used to be

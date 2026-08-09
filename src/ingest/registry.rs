@@ -31,10 +31,11 @@ const BUILT_IN: &str = include_str!("registry.json");
 
 /// The schema version this build understands.
 ///
-/// Checked rather than ignored: the row structs reject unknown fields, so a document written for a
-/// later schema would otherwise fail with a field-level error that reads like a typo. Adding a
-/// field upstream is a version bump, and an older binary refusing it loudly is the point — half a
-/// row applied silently is exactly the invisible drift this module exists to prevent.
+/// This is for a change that reinterprets what a field *means*, not for one that adds a field —
+/// additive changes are handled by ignoring and reporting unknown keys, so they never bump this and
+/// never reach a rejection. A document whose version this build does not know is one whose existing
+/// fields it may read wrongly, which is why it is refused rather than applied: under a URL source
+/// that refusal degrades to the built-in copy, under a file it is fatal (see [`load`]).
 const SUPPORTED_VERSION: u32 = 1;
 
 /// How long to wait on a registry fetch before falling back to the built-in document. Bounded
@@ -122,6 +123,15 @@ pub enum RegistryError {
         group: Ipv4Addr,
         port: u16,
     },
+    /// A publisher's port block does not match the plane count its protocol binds.
+    PortShape {
+        venue: String,
+        category: String,
+        kind: &'static str,
+        base_port: u16,
+        expected: u8,
+        found: u8,
+    },
 }
 
 impl std::fmt::Display for RegistryError {
@@ -181,6 +191,20 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "{venue}: two receivers would bind ({group}, {port}); the kernel would split that \
                  group's datagrams arbitrarily between them"
+            ),
+            RegistryError::PortShape {
+                venue,
+                category,
+                kind,
+                base_port,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{venue}/{category}: a `{kind}` publisher binds {expected} ports, but block \
+                 {base_port} lists {found}. A missing `snapshot` leaves the book in recovery \
+                 forever, so the feed connects and produces nothing; an unexpected one binds a \
+                 socket the protocol never fills"
             ),
         }
     }
@@ -506,6 +530,19 @@ fn report_unknown_keys(doc: &Document) {
 /// Checking them here puts the built-in document through the same path an operator's document takes;
 /// the tests that pin them still pass, now as coverage of this code rather than as a parallel
 /// assertion.
+/// How many ports one publisher of this protocol binds.
+///
+/// A real property of the protocols rather than a convention: market-by-order and market-by-price
+/// recover their books from an **in-band snapshot stream** on a dedicated port, and top-of-book and
+/// midpoint have no such stream — which is why the `5xxxx` slot is left unallocated for them rather
+/// than reused, so the leading digit keeps naming the traffic class.
+fn planes_for(kind: FeedKind) -> u8 {
+    match kind {
+        FeedKind::TopOfBook | FeedKind::Midpoint => 2,
+        FeedKind::MarketByOrder | FeedKind::MarketByPrice => 3,
+    }
+}
+
 fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     let mut triples = std::collections::HashSet::new();
     let mut modes: std::collections::HashMap<&str, ArbitrationMode> = std::collections::HashMap::new();
@@ -550,10 +587,29 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
             });
         }
 
-        // Two sockets on one `(group, port)` land in the same `SO_REUSEPORT` set, so the kernel
-        // splits that group's datagrams arbitrarily between them: each receiver sees a random
-        // subset of publishers, duplicating reference data and scrambling per-publisher metrics.
+        let expected_planes = planes_for(f.kind);
         for p in f.publishers {
+            // The plane count is a property of the protocol, so a block that does not match it is a
+            // wrong block. This is also what keeps a *typo* in an optional key from failing silently:
+            // with no `deny_unknown_fields`, a misspelled `snapshot` is absorbed into the unknown map
+            // and the block quietly becomes two-port — a market-by-price row that then binds no
+            // snapshot socket, never syncs its book, and serves nothing while reading healthy. That
+            // is the exact silent failure this registry exists to eliminate, so it dies at startup.
+            let found = if p.ports.snapshot().is_some() { 3 } else { 2 };
+            if found != expected_planes {
+                return Err(RegistryError::PortShape {
+                    venue: f.venue.to_string(),
+                    category: f.category.to_string(),
+                    kind: f.kind.label(),
+                    base_port: p.base_port(),
+                    expected: expected_planes,
+                    found,
+                });
+            }
+
+            // Two sockets on one `(group, port)` land in the same `SO_REUSEPORT` set, so the kernel
+            // splits that group's datagrams arbitrarily between them: each receiver sees a random
+            // subset of publishers, duplicating reference data and scrambling per-publisher metrics.
             let mut ports = vec![p.ports.mktdata(), p.ports.refdata()];
             if let Some(s) = p.ports.snapshot() {
                 ports.push(s);
@@ -829,11 +885,17 @@ mod tests {
     }
 
     /// No snapshot base means a two-port block, not a snapshot plane silently aliased onto another.
+    ///
+    /// On a **top-of-book** row, because that is the protocol the two-plane shape is legal for — the
+    /// derived form has to support it for the sibling row that arrives with its own publisher.
     #[test]
     fn a_derived_row_without_a_snapshot_base_binds_two_ports() {
-        let row = SPORTS_ROW.replace(r#","snapshot":53000"#, "");
+        let row = SPORTS_ROW
+            .replace(r#","snapshot":53000"#, "")
+            .replace(r#""kind":"MarketByPrice""#, r#""kind":"TopOfBook""#);
         let loaded = build(&doc_with(&row), "test").unwrap();
         assert_eq!(loaded.rows[0].publishers[0].ports.snapshot(), None);
+        assert_eq!(loaded.rows[0].publishers.len(), 4, "the row still expanded");
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1077,6 +1139,47 @@ mod tests {
         assert!(matches!(
             build(&doc_with(&format!("{SPORTS_ROW},{clash}")), "test"),
             Err(RegistryError::DuplicateGroupPort { port: 33010, .. })
+        ));
+    }
+
+    /// A book protocol without its snapshot port is refused at startup rather than binding a
+    /// two-port block that never syncs.
+    ///
+    /// This is the structural close on the one sharp edge of dropping `deny_unknown_fields`: a
+    /// *misspelled optional* key is absorbed into the unknown map and warned, so a typo'd `snapshot`
+    /// would otherwise silently produce this exact block — a feed that connects, reads healthy and
+    /// serves nothing, which is far harder to diagnose than a startup error.
+    #[test]
+    fn a_market_by_price_row_without_a_snapshot_port_is_fatal() {
+        let row = SPORTS_ROW.replace(r#","snapshot":53000"#, "");
+        assert!(matches!(
+            build(&doc_with(&row), "test"),
+            Err(RegistryError::PortShape {
+                kind: "mbp",
+                expected: 3,
+                found: 2,
+                base_port: 33010,
+                ..
+            })
+        ));
+    }
+
+    /// And the same typo the other way: a top-of-book row carries no in-band snapshot stream, so a
+    /// third port would bind a socket the protocol never fills.
+    #[test]
+    fn a_top_of_book_row_with_a_snapshot_port_is_fatal() {
+        let row = PERPS_ROW.replace(
+            r#"{"mktdata":7576,"refdata":7577}"#,
+            r#"{"mktdata":7576,"refdata":7577,"snapshot":7578}"#,
+        );
+        assert!(matches!(
+            build(&doc_with(&row), "test"),
+            Err(RegistryError::PortShape {
+                kind: "tob",
+                expected: 2,
+                found: 3,
+                ..
+            })
         ));
     }
 
