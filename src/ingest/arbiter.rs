@@ -1621,6 +1621,8 @@ mod tests {
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
             venue: "Hyperliquid".into(),
+            source: "Hyperliquid".into(),
+            source_id: 0,
             symbol: "BTC".into(),
             bid,
             ask,
@@ -1691,6 +1693,8 @@ mod tests {
         let trade = |id: u64| {
             FeedMessage::Trade(NormalizedTrade {
                 venue: "Hyperliquid".into(),
+                source: "Hyperliquid".into(),
+                source_id: 0,
                 symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
@@ -1720,6 +1724,8 @@ mod tests {
     fn trade(trade_id: u64) -> NormalizedTrade {
         NormalizedTrade {
             venue: "Lashay".into(),
+            source: "Lashay".into(),
+            source_id: 0,
             symbol: "KXBTCPERP".into(),
             price: 0.62,
             size: 100.0,
@@ -1894,6 +1900,8 @@ mod tests {
         let trade = || {
             FeedMessage::Trade(NormalizedTrade {
                 venue: "Hyperliquid".into(),
+                source: "Hyperliquid".into(),
+                source_id: 0,
                 symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
@@ -2065,6 +2073,8 @@ mod tests {
         let trade = |recv: u64| {
             FeedMessage::Trade(NormalizedTrade {
                 venue: venue.into(),
+                source: venue.into(),
+                source_id: 0,
                 symbol: "BTC".into(),
                 price: 100.0,
                 size: 1.0,
@@ -2096,6 +2106,8 @@ mod tests {
     fn depth(source_ts_ns: u64, bids: Vec<[f64; 2]>, asks: Vec<[f64; 2]>) -> NormalizedDepth {
         NormalizedDepth {
             venue: "Hyperliquid".into(),
+            source: "Hyperliquid".into(),
+            source_id: 0,
             symbol: "BTC".into(),
             bids,
             asks,
@@ -2621,6 +2633,8 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Instrument(crate::model::NormalizedInstrument {
             venue: "Hyperliquid".into(),
+            source: "Hyperliquid".into(),
+            source_id: 0,
             symbol: symbol.into(),
             channel: 0,
             instrument_id,
@@ -2733,6 +2747,8 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
             venue: venue.into(),
+            source: venue.into(),
+            source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: BOOK_CHANNEL,
             instrument_id,

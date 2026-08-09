@@ -52,10 +52,24 @@ pub fn venue_arc(venue: &'static str) -> Arc<str> {
         .clone()
 }
 
+/// Serde default for `source` on payloads written before the field existed. `Arc<str>` has no
+/// `Default`, so the field needs an explicit default function rather than `#[serde(default)]`.
+pub fn empty_source() -> Arc<str> {
+    Arc::from("")
+}
+
 /// A normalized two-sided top-of-book update from any venue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedQuote {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     pub symbol: Arc<str>,
     pub bid: f64,
     pub ask: f64,
@@ -92,6 +106,14 @@ pub struct NormalizedQuote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedTrade {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     pub symbol: Arc<str>,
     pub price: f64,
     pub size: f64,
@@ -118,6 +140,14 @@ pub struct NormalizedTrade {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedMidpoint {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     pub symbol: Arc<str>,
     pub mid: f64,
     /// How the mid was computed (0 = the instrument's default method).
@@ -145,6 +175,14 @@ pub struct NormalizedMidpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedDepth {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     pub symbol: Arc<str>,
     pub bids: Vec<[f64; 2]>,
     pub asks: Vec<[f64; 2]>,
@@ -207,6 +245,14 @@ pub struct BookChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedBook {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     /// Display label. Not unique in general — see the type docs.
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this feed carries. Filterable.
@@ -240,6 +286,14 @@ pub struct NormalizedBook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedInstrument {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this definition came from. Filterable.
     #[serde(default)]
@@ -258,6 +312,14 @@ pub struct NormalizedInstrument {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedStatus {
     pub venue: Arc<str>,
+    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
+    #[serde(default = "empty_source")]
+    pub source: Arc<str>,
+    /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
+    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    #[serde(default)]
+    pub source_id: u16,
     /// `"down"` when the quote feed has gone silent, `"ok"` once quotes flow again.
     pub state: String,
     /// Milliseconds the quote feed has been silent (0 when `state == "ok"`).
@@ -346,6 +408,10 @@ pub struct BookAccumulator {
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
     baselined: bool,
+    /// The producer's Source ID for this market, retained so `to_book` can stamp a materialized
+    /// re-baseline or replay with it. Not derivable here — `to_book`'s `venue` comes from the map
+    /// key, but the id is not part of that key.
+    source_id: u16,
 }
 
 /// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
@@ -364,6 +430,7 @@ impl BookAccumulator {
             pending_ts_ns: 0,
             source_ts_ns: 0,
             baselined: false,
+            source_id: 0,
         }
     }
 
@@ -385,6 +452,7 @@ impl BookAccumulator {
     /// producer's event size — the same one the consumer already pays.
     pub fn apply(&mut self, b: &NormalizedBook) {
         self.symbol = b.symbol.clone();
+        self.source_id = b.source_id;
         // 0 is the "unknown" sentinel, never a real time: a batch without one must not blank the
         // last known event time on every subsequent replay.
         if b.source_ts_ns != 0 {
@@ -481,6 +549,8 @@ impl BookAccumulator {
         }
         NormalizedBook {
             venue: venue.clone(),
+            source: venue.clone(),
+            source_id: self.source_id,
             symbol: self.symbol.clone(),
             channel,
             instrument_id,
@@ -544,6 +614,8 @@ mod tests {
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "Lashay".into(),
+            source: "Lashay".into(),
+            source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
@@ -673,6 +745,8 @@ mod tests {
         assert_eq!(b.channel(), Some(2));
         let q = FeedMessage::Status(FeedStatus {
             venue: "Lashay".into(),
+            source: "Lashay".into(),
+            source_id: 0,
             state: "ok".into(),
             stale_ms: 0,
             ts_ns: 1,
@@ -911,5 +985,85 @@ mod tests {
             acc.to_book(&venue, 2, 41).source_ts_ns,
             1_781_019_263_715_344_015
         );
+    }
+
+    #[test]
+    fn a_quote_serializes_both_the_new_and_the_deprecated_source_fields() {
+        let q = NormalizedQuote {
+            venue: Arc::from("Hyperliquid"),
+            source: Arc::from("Hyperliquid"),
+            source_id: 1,
+            symbol: Arc::from("SOL"),
+            bid: 1.0,
+            ask: 2.0,
+            bid_size: 3.0,
+            ask_size: 4.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 0,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        };
+        let v: serde_json::Value = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["venue"], "Hyperliquid");
+        assert_eq!(v["source"], "Hyperliquid");
+        assert_eq!(v["source_id"], 1);
+    }
+
+    /// A payload written before these fields existed must still deserialize, or every committed
+    /// fixture and every older consumer's round-trip breaks.
+    #[test]
+    fn a_payload_without_the_new_fields_still_deserializes() {
+        let json = r#"{"venue":"Phoenix","symbol":"SOL","bid":1.0,"ask":2.0,
+            "bid_size":3.0,"ask_size":4.0,"source_ts_ns":0,"recv_ts_ns":0}"#;
+        let q: NormalizedQuote = serde_json::from_str(json).unwrap();
+        assert_eq!(&*q.venue, "Phoenix");
+        assert_eq!(&*q.source, "");
+        assert_eq!(q.source_id, 0);
+    }
+
+    /// A re-baseline and a WS replay both materialize through `to_book`. Both must carry the source id
+    /// the producer resolved, not a placeholder — a consumer joining on `source_id` gets nothing from a
+    /// book that reports 0.
+    #[test]
+    fn a_materialized_book_carries_the_accumulated_source_id() {
+        let venue: Arc<str> = Arc::from("Hyperliquid");
+        let mut acc = BookAccumulator::new(Arc::from("SOL"));
+        acc.apply(&NormalizedBook {
+            venue: venue.clone(),
+            source: venue.clone(),
+            source_id: 1,
+            symbol: Arc::from("SOL"),
+            channel: 0,
+            instrument_id: 41,
+            changes: vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 5.0,
+                },
+            ],
+            snapshot: true,
+            last: true,
+            source_ts_ns: 7,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        });
+
+        let out = acc.to_book(&venue, 0, 41);
+        assert_eq!(
+            out.source_id, 1,
+            "the id the producer resolved, not a placeholder"
+        );
+        assert_eq!(out.source, venue);
     }
 }

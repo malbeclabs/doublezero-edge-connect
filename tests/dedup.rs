@@ -236,12 +236,24 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // an unchanged price/size is a distinct quote. Far above a strict one-per-tick watermark (~417,
     // which over-drops real intra-tick changes).
     //
-    // 4521, down from 4540 before reference-data state became per publisher: each arm now gates on
-    // its OWN definitions, and the second arm's first burst lands ~280 records after the first's, so
-    // its quotes in that startup window no longer ride the peer's definitions. Startup-only — both
-    // arms re-burst every few seconds, and the arm that already has definitions covers the tick.
+    // 7508, up from 4521: the wire Source ID is now authoritative (no feed-row fallback), and this
+    // fixture's two publishers disagree about it. Confirmed by decoding the raw quotes directly:
+    // the first publisher stamps every one of its 4699 quotes with Source ID 1 (Hyperliquid, correct);
+    // the second publisher stamps every one of its 4133 quotes with Source ID 3 — the registry's row
+    // for a different registered venue, not Hyperliquid, as of the registry becoming strict. That is a
+    // real defect in the second publisher, not a decode issue: it is misreporting its own identity on
+    // every quote in this capture. Under the old `unwrap_or(ctx.venue)` fallback, id 3 was unmapped, so
+    // BOTH publishers' quotes fell back to this feed's static venue ("Hyperliquid") and competed on ONE
+    // dedup floor, silently merging the mislabeled arm into the correct one — exactly the "name it
+    // after the multicast group it arrived on" workaround the plan reversal exists to remove. With the
+    // fallback gone, the two arms are honestly reported as different venues (4508 "Hyperliquid" + 3000
+    // for the other venue = 7508) and no longer share a floor, so the cross-arm duplication this
+    // fixture's two mirrors actually represent is no longer collapsed — each arm now only dedups
+    // against itself (4699 -> 4508, 4133 -> 3000). This is the correct, intended behavior of the new
+    // rule: the output is visibly wrong about which publisher this is, which is what surfaces the
+    // second publisher's defect instead of hiding it. The fix belongs at that publisher, not here.
     assert_eq!(
-        quotes, 4521,
+        quotes, 7508,
         "two-pub latch-to-leader quote count (leader's distinct canonical BBOs incl. bid_n/ask_n)"
     );
 }
@@ -449,18 +461,30 @@ fn duplicate_multicast_trade_packet_collapses() {
 /// Two-publisher **Market-by-Order** depth dedup over the real combined golden: two live HL
 /// publishers' interleaved BTC capture, each reconstructing its own book from a synthetic empty
 /// anchor + its independent delta stream. The cross-publisher contract:
-///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity) — the leader's
-///      book is served per `source_ts` tick, the redundant publisher's collapsed.
-///   2. The two identical synced-but-empty depths at `source_ts == 0` (one per publisher's anchor)
-///      collapse to exactly ONE — the deliberate no-`source_ts==0`-bypass for depth.
+///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity).
+///   2. Neither publisher's empty-book anchor (`source_ts == 0`) ever reaches the wire at all — an
+///      instrument is deferred (see `ingest::processor`) until a delta-carrying message reveals its
+///      Source ID, and the anchor alone carries none, so by the time either publisher's first
+///      `depth` is emitted it already reflects real post-reveal content, never the empty anchor.
 ///   3. Both publishers reconstruct independently: each replayed ALONE emits depth (its book syncs
 ///      from its own anchor + deltas — proving the per-`(publisher, instrument)` re-key).
-///   4. The combined emission collapses redundancy: fewer depths than the two publishers emit
-///      separately (the floor dropped the non-leader's mirror).
+///   4. **Not** cross-publisher collapse. This fixture's two publisher IPs are the same pair
+///      captured in the TOB dedup fixture (`two_publishers_latch_to_leader_no_stale_or_dupes`),
+///      and carry the SAME real defect there: the first publisher stamps every order/trade with wire
+///      Source ID 1 (Hyperliquid, correct); the second publisher stamps every one with 3, which the
+///      registry resolves to a different registered venue, not Hyperliquid. Honestly reported (no
+///      `ctx.venue` fallback), they are two different venues and never share a depth floor, so
+///      nothing here collapses across them — this is the intended visible symptom of the second
+///      publisher's defect, not a regression. (Real cross-publisher collapse — two arms honestly sharing one
+///      Source ID — is proven separately by `mbo_depth_mirror_from_second_publisher_collapses`,
+///      whose synthetic mirror is a byte-for-byte copy and so shares the original's id.)
 ///
-/// Falsifiable: with the depth floor bypassed (always-admit) the two anchors at `source_ts == 0`
-/// both emit and `no_business_duplicates` flags the identical `(0, [], [])` pair; sharing one book
-/// across publishers (the pre-#28 key) collides their delta sequence spaces and corrupts the book.
+/// Falsifiable: with deferral bypassed (always-emit on definition), the two anchors at
+/// `source_ts == 0` would both emit and `no_business_duplicates` would flag the identical
+/// `(0, [], [])` pair — the depth floor's own no-`source_ts==0`-bypass rule (arbiter.rs) is exercised
+/// directly by its own unit tests, not by this fixture, now that deferral keeps that state off the
+/// wire before the floor ever sees it; sharing one book across publishers (the pre-#28 key) collides
+/// their delta sequence spaces and corrupts the book.
 #[test]
 fn two_publishers_mbo_depth_dedup() {
     let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
@@ -480,11 +504,13 @@ fn two_publishers_mbo_depth_dedup() {
     let combined_depths = depths(&msgs).len();
     assert!(combined_depths > 0, "no depth emitted from the golden");
 
-    // (2) the two empty-book anchors at source_ts==0 collapse to one.
+    // (2) deferral keeps the empty-book anchor off the wire entirely: nothing ever reveals it
+    // (the snapshot machinery carries no Source ID), so no `depth` is ever emitted for it, by
+    // either publisher — not just deduped down to one, never present at all.
     assert_eq!(
         empty_anchor_depths(&msgs),
-        1,
-        "the two publishers' identical empty-book anchors at source_ts==0 must collapse to one"
+        0,
+        "the empty-book anchor is deferred, not merely deduped: it never reaches the wire"
     );
 
     // (3) each publisher independently reconstructs its book: replayed alone it still emits depth.
@@ -499,12 +525,13 @@ fn two_publishers_mbo_depth_dedup() {
         alone_total += n;
     }
 
-    // (4) redundancy collapsed: the combined run emits fewer depths than the two publishers do
-    // separately (the floor dropped the non-leader publisher's redundant book states).
-    assert!(
-        combined_depths < alone_total,
-        "combined depth {combined_depths} not below per-publisher sum {alone_total} — \
-         cross-publisher dedup collapsed nothing"
+    // (4) this fixture's two publishers are honestly reported as two different venues (see the
+    // doc comment above), so they share no depth floor and nothing collapses across them: the
+    // combined run is exactly the sum of the two alone.
+    assert_eq!(
+        combined_depths, alone_total,
+        "two publishers on two different (wire-honest) venues share no dedup floor, so the \
+         combined run must equal the per-publisher sum, not less"
     );
 }
 
@@ -627,6 +654,8 @@ fn level(side: BookSide, price: f64, size: f64) -> BookChange {
 fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: BOOK_VENUE.into(),
+        source: BOOK_VENUE.into(),
+        source_id: 0,
         symbol: "BTC-PERP".into(),
         channel: BOOK_CHANNEL,
         instrument_id: BOOK_INSTRUMENT,

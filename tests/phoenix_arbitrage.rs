@@ -3,9 +3,12 @@
 //! them correctly over the unchanged WS output contract.
 //!
 //! Two cases, both trades only (the Phoenix feeder backstops trades, not quotes):
-//!   1. **edge gap → public fills in** — with edge refdata only (the instrument is defined, no edge
-//!      trade prints), a public Phoenix fill opens its `(venue, symbol, trade_id)` and reaches the
-//!      wire, tagged `Phoenix`.
+//!   1. **edge gap → public fills in** — replay the full edge golden (SOL prints real quotes/trades,
+//!      revealing its Source ID — see `ingest::processor`'s per-instrument deferral, which holds a
+//!      `NormalizedInstrument`/price back until the edge has revealed it at least once; an edge that
+//!      never once goes live for an instrument is not backstoppable, only a mid-stream gap is), THEN
+//!      the edge goes quiet and a public Phoenix fill opens its `(venue, symbol, trade_id)` and
+//!      reaches the wire, tagged `Phoenix`.
 //!   2. **edge leads → public deduped** — replay a real edge Phoenix trade (`AMD`, `trade_id`
 //!      20418), then push the public copy of that same fill (same id, distinctive price). The
 //!      arbiter's windowed `trade_id` dedup drops the public copy, so `trade_id` 20418 reaches the
@@ -51,9 +54,16 @@ fn trades_for<'a>(
         .collect()
 }
 
-/// Edge gap → public fills in: replay Phoenix refdata only (so `SOL`'s precision is known but no
-/// edge trade ever prints), then push a public Phoenix fill. With nothing ahead of it in the trade
-/// dedup window, the public fill is emitted — the consumer keeps seeing prints through the gap.
+/// Edge gap → public fills in: replay the FULL Phoenix golden first (SOL prints real edge quotes
+/// and trades, revealing its Source ID and advancing past whatever the capture holds), THEN the edge
+/// goes quiet and a public Phoenix fill is pushed. With nothing ahead of it in the trade dedup
+/// window, the public fill is emitted — the consumer keeps seeing prints through the gap.
+///
+/// This is a mid-stream gap, not a cold start: `ingest::processor`'s per-instrument deferral holds
+/// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
+/// once (refdata alone never does — see the module docs), so an edge that never once goes live for
+/// an instrument has nothing for the public feeder to key its precision gate against either; that is
+/// a feed that was never live for the instrument, not a gap in one that was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn phoenix_edge_gap_public_trade_fills_in() {
@@ -81,16 +91,20 @@ async fn phoenix_edge_gap_public_trade_fills_in() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Edge refdata ONLY: SOL is defined, but the edge prints no trades (the gap).
+    // Edge refdata AND mktdata: SOL prints real quotes/trades (instrument_id 0), revealing its
+    // Source ID, before the edge goes quiet — the gap that follows is mid-stream.
     tokio::task::spawn_blocking(move || {
         replay::send_frames(replay::PHOENIX_GROUP, 9202, &refdata()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        replay::send_frames(replay::PHOENIX_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();
-    // Let refdata be processed (so the feeder's precision gate passes) and the feeder connect.
+    // Let refdata+mktdata be processed (SOL revealed) and the feeder connect.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Public Phoenix fill: bid (aggressing buy), price = quote/base = 300/2 = 150.
+    // Public Phoenix fill during the gap that follows: bid (aggressing buy),
+    // price = quote/base = 300/2 = 150.
     mock.send_phoenix_trade("SOL", PUBLIC_TID, "bid", 2.0, 300.0, 1_775_578_550);
 
     let msgs = collector.await.unwrap();

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- An instrument whose reference data carries its own Source ID (the newer feed-spec generation) is
+  now named the moment its definition is decoded, instead of waiting on a price. `instrument`
+  reaches the wire immediately — even for a symbol that never trades — and the connect-time replay
+  includes it. This applies to `TobProcessor`, `MboProcessor` and `MbpProcessor`; a publisher whose
+  reference data carries no Source ID of its own (the original generation) is unaffected and keeps
+  deferring exactly as before, as does Midpoint permanently (its own, narrower reference-data
+  message has no Source ID field at all, on any generation).
+- **Breaking:** the wire `Source ID` is now authoritative for naming a source. `source_id` carries it
+  verbatim and `source`/`venue` are its registry name. The bridge no longer substitutes its own
+  configured label for an unrecognised ID, so `venue` can hold a different string than before for a
+  publisher that stamps an incorrect Source ID. Re-check any consumer that filters or keys on `venue`.
+- **Breaking:** a message is emitted for an instrument only once its Source ID has been observed. A
+  publisher whose reference data carries no Source ID of its own can only reveal it through a price
+  message, so an instrument that has received a definition but no price produces nothing at all, and
+  the connect-time replay covers only symbols priced at least once. (A newer publisher generation
+  changes this — see above.)
+
+### Added
+- Every message now carries `source` and `source_id` alongside `venue`. The subscription filter
+  accepts `source` as an alias for `venue`; supplying both ANDs them.
+- `dz_source_id_changed_total{venue}` counts a publisher changing an instrument's Source ID
+  mid-stream, which triggers a fresh `instrument` announcement under the new name.
+
+### Deprecated
+- The `venue` field and the `venue` subscription filter key. Both still work and hold the same value
+  as `source`; read `source` instead. Removal will be announced separately.
+
 ### Fixed
 - `dz_mbp_orphan_snapshot_levels_total` counted every level of a snapshot rotation the book
   **deliberately declined**, not just genuinely unroutable ones. A book that is `Ready` and already

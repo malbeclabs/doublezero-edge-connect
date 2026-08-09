@@ -77,6 +77,17 @@ the publisher's **base port** (the market-data port of its block, e.g. `9201`), 
 >   and measures **inter-mirror skew**. The headline "DZ beats the public feed" margin remains
 >   `{winner="edge",loser="public"}` only.
 
+## Source ID resolution (`src/ingest/processor.rs`, `src/ingest/sources.rs`)
+
+Recorded while a processor resolves a message's wire Source ID to a registry venue name (any
+protocol — TOB, Midpoint, MBO, MBP all go through this), not by the arbiter's emit stage.
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `dz_source_id_changed_total` | counter | `venue` | A `(publisher, instrument)` already revealed under one wire Source ID named a different one on a later message — a publisher defect, not a decode issue. Labelled by the **new** (post-change) venue, which is also re-announced a fresh `instrument` under so the new venue's precision-before-price guarantee still holds. Should stay flat at zero; a nonzero rate means a publisher is relabeling an instrument's venue mid-stream. |
+| `dz_unregistered_sources_total` | counter | — | Distinct Source IDs seen with no registry row. |
+| `dz_unregistered_source_labels_capped_total` | counter | — | Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached. |
+
 ## Market-by-Price processor (per venue)
 
 Recorded by the Market-by-Price processor (`src/ingest/processor.rs`), which demultiplexes publishers by source IP and so carries no `publisher` label. Labelled by `venue`. **No `FEEDS` row selects `MarketByPrice` yet**, so a scrape today reports nothing here; do not read an empty result as a healthy book.

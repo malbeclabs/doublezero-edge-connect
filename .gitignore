@@ -3,3 +3,8 @@
 
 # Roadbike / Claude Code session artifacts
 .claude/
+
+# Internal planning artifacts (specs, implementation plans). Kept on disk and shared out of band;
+# not published with the source. They carry working names and deployment detail that the product
+# documentation deliberately does not.
+docs/superpowers/

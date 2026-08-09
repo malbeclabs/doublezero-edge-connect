@@ -117,6 +117,11 @@ pub struct WsConfig {
 struct SubFilter {
     #[serde(default)]
     venue: Option<String>,
+    /// Alias for `venue`, the preferred spelling. Both are accepted for the deprecation window; if
+    /// a client sends both they are ANDed, so a disagreeing pair matches nothing rather than
+    /// silently honouring one.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
     /// The wire `channel_id` — the competition, not the arm. Arm identity is deliberately not
@@ -130,10 +135,11 @@ struct SubFilter {
 }
 
 impl SubFilter {
-    /// The single match path. `symbol`/`channel` are `None` for a venue-level message (today only
-    /// `status`), and a `None` on the *message* side satisfies a filter on that dimension — a
-    /// venue-level message is about the whole venue, so a symbol- or channel-scoped subscriber must
-    /// still receive it. A filter dimension the message *does* carry is matched normally.
+    /// The single match path. `venue`/`source` are aliases and are ANDed. `symbol`/`channel` are
+    /// `None` for a venue-level message (today only `status`), and a `None` on the *message* side
+    /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
+    /// symbol- or channel-scoped subscriber must still receive it. A filter dimension the message
+    /// *does* carry is matched normally.
     fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u32>, kind: &str) -> bool {
         // Venue codes are registry identifiers, not free text - match case-insensitively so a
         // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol and
@@ -141,6 +147,10 @@ impl SubFilter {
         self.venue
             .as_deref()
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
+            && self
+                .source
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(venue))
             // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
             // one type asked for that type. Filters are a union, so wanting books plus definitions is
             // two subscriptions. `venue`/`symbol`/`channel` below are *scope* selectors — which
@@ -612,6 +622,8 @@ mod tests {
         use super::prepare;
         let b = FeedMessage::Book(NormalizedBook {
             venue: "Lashay".into(),
+            source: "Lashay".into(),
+            source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
@@ -638,6 +650,8 @@ mod tests {
         );
         let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
             venue: "Lashay".into(),
+            source: "Lashay".into(),
+            source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
@@ -676,6 +690,8 @@ mod tests {
     fn sample_quote() -> NormalizedQuote {
         NormalizedQuote {
             venue: "Hyperliquid".into(),
+            source: "Hyperliquid".into(),
+            source_id: 0,
             symbol: "BTC".into(),
             bid: 1.0,
             ask: 2.0,
@@ -847,6 +863,8 @@ mod tests {
                 (Arc::<str>::from("Hyperliquid"), arc.clone()),
                 NormalizedInstrument {
                     venue: "Hyperliquid".into(),
+                    source: "Hyperliquid".into(),
+                    source_id: 0,
                     symbol: arc,
                     channel: 0,
                     instrument_id: 1,
@@ -964,6 +982,8 @@ mod tests {
                 (Arc::<str>::from("Lashay"), arc.clone()),
                 NormalizedInstrument {
                     venue: "Lashay".into(),
+                    source: "Lashay".into(),
+                    source_id: 0,
                     symbol: arc,
                     channel,
                     instrument_id: 41,
@@ -1060,6 +1080,8 @@ mod tests {
     fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "Lashay".into(),
+            source: "Lashay".into(),
+            source_id: 0,
             symbol: symbol.into(),
             channel: 0,
             instrument_id: 0,
@@ -1254,6 +1276,8 @@ mod tests {
             (Arc::<str>::from("Lashay"), Arc::<str>::from("KXBTCPERP")),
             NormalizedInstrument {
                 venue: "Lashay".into(),
+                source: "Lashay".into(),
+                source_id: 0,
                 symbol: "KXBTCPERP".into(),
                 channel: 2,
                 instrument_id: 41,
@@ -1384,5 +1408,35 @@ mod tests {
         assert!(quote.contains(r#""type":"quote""#), "got {quote}");
 
         srv.abort();
+    }
+
+    #[test]
+    fn a_source_filter_selects_the_same_messages_as_a_venue_filter() {
+        let by_venue: SubFilter = serde_json::from_str(r#"{"venue":"Hyperliquid"}"#).unwrap();
+        let by_source: SubFilter = serde_json::from_str(r#"{"source":"Hyperliquid"}"#).unwrap();
+        for kind in ["quote", "trade", "status"] {
+            assert_eq!(
+                by_venue.matches("Hyperliquid", Some("SOL"), None, kind),
+                by_source.matches("Hyperliquid", Some("SOL"), None, kind),
+            );
+            assert!(!by_source.matches("Phoenix", Some("SOL"), None, kind));
+        }
+    }
+
+    /// The alias keeps the case-insensitivity the venue key already had.
+    #[test]
+    fn a_source_filter_is_case_insensitive() {
+        let f: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+        assert!(f.matches("Hyperliquid", Some("SOL"), None, "quote"));
+    }
+
+    /// Both keys present and disagreeing must match nothing — silently honouring one would make a
+    /// client's filter mean something it did not ask for.
+    #[test]
+    fn disagreeing_source_and_venue_keys_match_nothing() {
+        let f: SubFilter =
+            serde_json::from_str(r#"{"venue":"Hyperliquid","source":"Phoenix"}"#).unwrap();
+        assert!(!f.matches("Hyperliquid", Some("SOL"), None, "quote"));
+        assert!(!f.matches("Phoenix", Some("SOL"), None, "quote"));
     }
 }

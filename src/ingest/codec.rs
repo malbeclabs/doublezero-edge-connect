@@ -98,22 +98,7 @@ pub enum Message {
     Other(#[allow(dead_code)] u8),
 }
 
-/// Map a `Quote.source_id` to its venue name per the edge-feed-spec source registry
-/// (https://github.com/malbeclabs/edge-feed-spec/blob/main/sources/spec.md). A SourceID
-/// identifies the venue a price was derived from; IDs are stable and never reused. Returns
-/// `None` for unassigned IDs so the caller can fall back to its configured label. Add a row
-/// here whenever the upstream registry assigns a new production ID (1-1023).
-pub fn source_name(source_id: u16) -> Option<&'static str> {
-    match source_id {
-        1 => Some("Hyperliquid"),
-        2 => Some("Phoenix"),
-        // NOT 3: that ID is the Hyperliquid superset incl. the HIP-3 builder DEXs, and it must keep
-        // falling back to `ctx.venue` (see `processor.rs`). Lashay stamps 3 too and falls back to
-        // its own row's venue for the same reason; mapping it here would retag live builder-DEX
-        // quotes and trades as Lashay on the wire.
-        _ => None,
-    }
-}
+pub use crate::ingest::sources::source_name;
 
 /// Decode one UDP datagram (one frame) into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {

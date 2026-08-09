@@ -108,6 +108,12 @@ pub struct Metrics {
     /// Instrument definitions dropped as an exact content repeat of the last one broadcast for the
     /// `(venue, symbol)` - the mirrored publishers' identical refdata bursts collapsing.
     pub instruments_dropped: IntCounterVec,
+    /// A `(publisher, instrument)` already revealed under one wire Source ID named a DIFFERENT one
+    /// on a later message — a real publisher defect (this plan's own fixtures prove one exists), not
+    /// a decode issue. Counted, and re-announced under the new id rather than silently kept pinned
+    /// to the first one seen, or the new venue would never get a definition anywhere. Labelled by
+    /// the NEW (post-change) venue.
+    pub source_id_changed: IntCounterVec,
     /// Quote-tick *cross-source* contest lead time (ns): on a `source_ts` tick another publisher
     /// already led, how far ahead the leader was when this publisher's first copy arrived, labelled
     /// by the `winner` **and** `loser` (edge/public). Its `_count` is the head-to-head contest
@@ -282,6 +288,12 @@ pub struct Metrics {
     /// Bytes successfully forwarded to each destination, by `dest` (sum of datagram lengths on a
     /// successful send; a failed send delivers nothing and is not counted here).
     pub shred_bytes_sent: IntCounterVec,
+
+    // --- Source registry (`ingest::sources`) ---
+    /// Distinct Source IDs seen with no registry row.
+    pub unregistered_sources: IntCounter,
+    /// Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached.
+    pub unregistered_source_labels_capped: IntCounter,
 }
 
 /// Build an [`IntCounterVec`] and register it, panicking on a registration error (a duplicate name
@@ -433,6 +445,13 @@ impl Metrics {
                 &registry,
                 "dz_instruments_dropped_total",
                 "Instrument definitions dropped as an exact repeat of the last broadcast content",
+                &["venue"],
+            ),
+            source_id_changed: counter_vec(
+                &registry,
+                "dz_source_id_changed_total",
+                "A publisher named a different wire Source ID for an already-revealed instrument; \
+                 re-announced under the new id, labelled by it",
                 &["venue"],
             ),
             quote_lead_ns: histogram_vec(
@@ -796,6 +815,16 @@ impl Metrics {
                 "dz_shred_bytes_sent_total",
                 "Bytes successfully forwarded to each destination",
                 &["dest"],
+            ),
+            unregistered_sources: counter(
+                &registry,
+                "dz_unregistered_sources_total",
+                "Distinct Source IDs seen with no registry row",
+            ),
+            unregistered_source_labels_capped: counter(
+                &registry,
+                "dz_unregistered_source_labels_capped_total",
+                "Messages labelled UNREGISTERED because the distinct-unregistered-ID cap was reached",
             ),
             registry,
         }

@@ -5,8 +5,12 @@
 //!   1. **edge leads in steady state** — the edge feed advances the per-(venue, symbol) floor first,
 //!      so the public copies of those ticks lose the race and are dropped as no-ops (quote count is
 //!      exactly the edge-only count; `no_business_duplicates` green; `source_ts` non-decreasing).
-//!   2. **edge gap → public fills in** — with no edge quotes (refdata only), the public feed opens
-//!      each tick and is emitted, so a consumer keeps seeing top-of-book through the gap.
+//!   2. **edge gap → public fills in** — the edge feed prints its real quotes first (revealing BTC's
+//!      Source ID and advancing the floor to the golden's last tick — see `ingest::processor`'s
+//!      per-instrument deferral, which holds prices back until the edge has revealed the instrument
+//!      at least once; a cold start with no edge price at all isn't backstoppable, only a mid-stream
+//!      gap is), THEN goes quiet; the public feed opens each tick after that and is emitted, so a
+//!      consumer keeps seeing top-of-book through the gap.
 //!
 //! Both reuse the BTC single-publisher golden (`tob_refdata.bin` / `tob_marketdata.bin`, venue
 //! Hyperliquid) so the public coin `BTC` shares the edge feed's `(venue, symbol)` floor.
@@ -135,10 +139,16 @@ async fn edge_leads_steady_state_public_dropped() {
     );
 }
 
-/// Edge gap → public fills in: replay edge refdata only (so BTC's precision is known but no edge
-/// quote ever opens a tick), then have the public feed emit. With nothing ahead of it on the floor,
-/// each public update opens its tick and is emitted — the consumer keeps seeing top-of-book through
+/// Edge gap → public fills in: replay the FULL edge golden first (BTC prints its real quotes,
+/// revealing its Source ID and advancing the floor to the golden's last tick), THEN the edge goes
+/// quiet and the public feed opens ticks after that — the consumer keeps seeing top-of-book through
 /// the gap, with no health check anywhere in the path.
+///
+/// This is a mid-stream gap, not a cold start: `ingest::processor`'s per-instrument deferral holds
+/// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
+/// once (refdata alone never does), so an edge that never once goes live for an instrument gives the
+/// public feeder's precision gate nothing to key against either — that is a feed that was never live
+/// for the instrument, not a gap in one that was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn edge_gap_public_fills_in() {
@@ -151,28 +161,42 @@ async fn edge_gap_public_fills_in() {
     );
     let ws_addr = bridge.ws_addr.clone();
 
-    // Stop as soon as both a quote and a trade have arrived (or the window elapses).
+    // Stop once the public trade (trade_id 777, sent last, after both public quotes) has arrived —
+    // not just "any quote and any trade", which the edge's own golden alone could already satisfy
+    // now that it plays before the gap, racing ahead of the public sends below.
     let collector = tokio::spawn(async move {
         ws_client::collect(&ws_addr, Duration::from_secs(8), |m| {
-            !ws_client::by_type(m, "quote").is_empty() && !ws_client::by_type(m, "trade").is_empty()
+            ws_client::by_type(m, "trade")
+                .iter()
+                .any(|t| t.get("trade_id").and_then(|v| v.as_u64()) == Some(777))
         })
         .await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Edge refdata ONLY: BTC instrument is defined, but the edge sends no quotes (the gap).
+    // Edge refdata AND mktdata: BTC prints real quotes (revealing its Source ID and advancing the
+    // floor), before the edge goes quiet — the gap that follows is mid-stream.
     tokio::task::spawn_blocking(move || {
         replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();
-    // Let refdata be processed (so the feeder's precision gate passes) and the feeder connect.
+    // Let the edge mktdata be fully processed (BTC revealed, floor advanced to the max edge tick)
+    // and the feeder connect.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Public feed opens two successive ticks with a distinctive price, plus a trade.
-    mock.send_bbo("BTC", 1_700_000_000_000, 12345.0, 2.0, 12346.0, 3.0);
-    mock.send_bbo("BTC", 1_700_000_000_001, 12347.0, 2.0, 12348.0, 3.0);
-    mock.send_trade("BTC", "B", 12345.5, 0.5, 1_700_000_000_000, 777);
+    // Public feed opens two successive ticks AFTER the edge's last real tick (well clear of the
+    // floor's high-water, so neither is dropped as stale), with a distinctive price, plus a trade.
+    let max_edge_tick = edge_quote_ticks()
+        .into_iter()
+        .max()
+        .expect("fixture carries no edge quote source_ts");
+    let gap_ms = max_edge_tick / 1_000_000 + 1_000;
+    mock.send_bbo("BTC", gap_ms, 12345.0, 2.0, 12346.0, 3.0);
+    mock.send_bbo("BTC", gap_ms + 1, 12347.0, 2.0, 12348.0, 3.0);
+    mock.send_trade("BTC", "B", 12345.5, 0.5, gap_ms, 777);
 
     let msgs = collector.await.unwrap();
     let quotes = ws_client::by_type(&msgs, "quote");
@@ -182,10 +206,11 @@ async fn edge_gap_public_fills_in() {
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
 
-    // The public feed filled the edge gap: its quotes reached the wire, tagged Hyperliquid.
+    // The public feed filled the edge gap: more quotes reached the wire than the edge alone ever
+    // printed (`EDGE_ONLY_QUOTES`, pinned by the steady-state test above), tagged Hyperliquid.
     assert!(
-        !quotes.is_empty(),
-        "public feed produced no quotes to fill the edge gap"
+        quotes.len() > EDGE_ONLY_QUOTES,
+        "public feed produced no quotes beyond the edge-only baseline to fill the gap"
     );
     assert!(
         quotes

@@ -37,9 +37,19 @@ use crate::{
 /// Phoenix's public WebSocket endpoint.
 pub const DEFAULT_PHOENIX_WS_URL: &str = "wss://perp-api.phoenix.trade/v1/ws";
 
-/// The venue every emitted trade is tagged with (must match the edge Phoenix feed's venue so both
-/// land in the same arbiter dedup window).
-const PHOENIX_VENUE: &str = "Phoenix";
+/// This backstop's registry Source ID (`ingest::sources`). The label is derived from it rather than
+/// written out as a separate constant, so the edge path (which names a market from the wire Source
+/// ID, see `processor.rs`) and this backstop cannot drift into naming one market two different
+/// things — a split that would fork the arbiter's `(venue, symbol)` dedup floor and emit both
+/// copies to the wire as duplicates under two names.
+const PHOENIX_SOURCE_ID: u16 = 2;
+
+/// The venue every emitted trade is tagged with — always [`PHOENIX_SOURCE_ID`]'s registry name, so
+/// it matches whatever the edge Phoenix feed names the same market and both land in the same
+/// arbiter dedup window.
+fn phoenix_venue() -> &'static str {
+    crate::ingest::sources::source_label(PHOENIX_SOURCE_ID)
+}
 
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
 /// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
@@ -139,7 +149,7 @@ impl PhoenixVenue {
         // symbol the edge doesn't define is DROPPED here (the backstop silently stops for it) rather
         // than emitted under a mismatched key that would double-print alongside the edge copy. The
         // resolved market set is logged at startup (see `run`) so a divergence is at least visible.
-        if !instrument_known(instruments, PHOENIX_VENUE, symbol) {
+        if !instrument_known(instruments, phoenix_venue(), symbol) {
             return; // precision unknown / symbol not defined by the edge; drop
         }
         let Ok(trade_id) = fill.trade_sequence_number.parse::<u64>() else {
@@ -168,7 +178,9 @@ impl PhoenixVenue {
         // available" sentinel rather than dropping the trade.
         let source_ts_ns = unix_seconds_to_ns(&fill.timestamp);
         let trade = NormalizedTrade {
-            venue: venue_arc(PHOENIX_VENUE),
+            venue: venue_arc(phoenix_venue()),
+            source: venue_arc(phoenix_venue()),
+            source_id: PHOENIX_SOURCE_ID,
             symbol: symbol.into(),
             price,
             // `baseAmount` is the fill's base-asset quantity in the *same real units* the edge emits
@@ -190,7 +202,7 @@ impl PhoenixVenue {
         };
         metrics()
             .ws_feeder_messages
-            .with_label_values(&[PHOENIX_VENUE, "trade"])
+            .with_label_values(&[phoenix_venue(), "trade"])
             .inc();
         lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
     }
@@ -198,14 +210,14 @@ impl PhoenixVenue {
     fn decode_error(&self) {
         metrics()
             .ws_feeder_decode_errors
-            .with_label_values(&[PHOENIX_VENUE])
+            .with_label_values(&[phoenix_venue()])
             .inc();
     }
 }
 
 impl PublicVenue for PhoenixVenue {
     fn venue(&self) -> &str {
-        PHOENIX_VENUE
+        phoenix_venue()
     }
 
     fn url(&self) -> &str {
@@ -255,7 +267,7 @@ pub async fn run(
         // (edge `instrument_id == public assetId`) or its public fills are dropped at the precision
         // gate (no dedup, no backstop) — logging it makes an edge/public symbol divergence visible.
         tracing::info!(
-            venue = PHOENIX_VENUE,
+            venue = phoenix_venue(),
             markets = ?markets,
             "Phoenix public trade feeder backing markets (must match the edge Phoenix symbols verbatim)"
         );
@@ -278,9 +290,11 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (PHOENIX_VENUE.into(), symbol.into()),
+            (phoenix_venue().into(), symbol.into()),
             NormalizedInstrument {
-                venue: PHOENIX_VENUE.into(),
+                venue: phoenix_venue().into(),
+                source: phoenix_venue().into(),
+                source_id: 0,
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
@@ -340,6 +354,9 @@ mod tests {
                 assert_eq!(t.size, 10.0);
                 assert_eq!(t.aggressor_side, crate::model::Side::Buy);
                 assert_eq!(t.source_ts_ns, 1_775_578_550_000_000_000);
+                // The registry Source ID, not the `0` "unknown" sentinel: a consumer joining this
+                // backstop to the edge copy on `source_id` must see the same id both sides.
+                assert_eq!(t.source_id, PHOENIX_SOURCE_ID);
             }
             other => panic!("expected a trade, got {other:?}"),
         }
@@ -494,5 +511,21 @@ mod tests {
         );
         assert_eq!(unix_seconds_to_ns(""), 0);
         assert_eq!(unix_seconds_to_ns("notanumber"), 0);
+    }
+
+    /// The backstop must name itself the way the edge does, or one market becomes two keys in the
+    /// arbiter's `(venue, symbol)` dedup floor and both copies reach the wire.
+    #[test]
+    fn a_public_feeder_labels_itself_from_the_registry() {
+        let v = venue(&["SOL"]);
+        assert_eq!(
+            v.venue(),
+            crate::ingest::sources::source_label(PHOENIX_SOURCE_ID)
+        );
+        assert_eq!(
+            v.venue(),
+            "Phoenix",
+            "must match what the edge emits for this id"
+        );
     }
 }
