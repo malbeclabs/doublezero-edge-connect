@@ -183,7 +183,25 @@ Modules are grouped by role under `src/`:
   joins the right group and receives nothing, which reads as a dead publisher. Never argue that the
   universes are separate because their `channel_id` ranges do not overlap — the allocation is
   mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
-  only thing that separates them.
+  only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from
+  (`None` on an explicit block) — the fact the ingest floor below is built on.
+- **`ingest/floor.rs`** — the **ingest floor**: which channels of an activated feed this process
+  decodes (`--channels`/`DZ_CHANNELS`, e.g. `lashay-4=10,11`). Sits between the two filters either
+  side of it — `reconcile` picks which *feeds* run, `sinks::ws`'s `SubFilter` picks what one *client*
+  receives — and is process-global and ops-owned, since it scopes books, history and CPU for
+  everyone. It acts **only** where the publisher derives a port per channel: an excluded channel is
+  never bound and the kernel discards its traffic before userspace, which is why it costs nothing and
+  is the reason that derivation exists upstream. Narrowing a row whose publishers bind one base port
+  **flat** is **refused at startup**, not implemented as a frame-header test: there `channel_id`
+  identifies mirrors, so every publisher carries the complete universe and narrowing would give up
+  redundancy without reducing a single decoded message. Keyed **by group code, never globally** (one
+  global flag would filter to a league and silently half-blind an unrelated mirrored feed), and takes
+  **numeric ids only** — channel *names* live in the publisher's inventory by design and a copy here
+  would drift exactly as four superseded port allocations did. Every id is validated against the
+  **loaded document's** roster and an unknown id or code is fatal at startup, because a floor that
+  silently filters nothing is worse than one that refuses to start. Parsed once in `main`; the
+  reconciler consumes it as an *input* to the desired receiver set (`feed_keys`), so `reconcile`
+  remains the single activation authority and its spawn/abort diff is unchanged.
 - **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
   (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
   authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never
@@ -207,7 +225,8 @@ Modules are grouped by role under `src/`:
 - **`ingest/reconcile.rs`** — the **activation authority**. `Reconciler::run()` polls `detect()`
   every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
-  (spawn/abort). Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
+  (spawn/abort). The desired receiver set is the subscribed rows' publishers **narrowed by the
+  channel floor** (`ingest::floor`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
   one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
   per `(venue, category)` — one owner per *universe*, since rows sharing a Source ID can carry

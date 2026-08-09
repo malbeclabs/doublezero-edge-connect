@@ -677,9 +677,12 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
     })
 }
 
+/// An explicit block carries no channel id: its publishers share a base port and are separated
+/// in-band, which is exactly what [`FeedPublisher::channel`]'s `None` states.
 fn block_to_publisher(b: &PortBlock) -> FeedPublisher {
     FeedPublisher {
         ports: ports(b.mktdata, b.refdata, b.snapshot),
+        channel: None,
     }
 }
 
@@ -720,6 +723,10 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
                     plane(p.refdata)?,
                     p.snapshot.map(plane).transpose()?,
                 ),
+                // Recorded, not recomputed downstream: this is the one place the id and the block
+                // are both in hand, and it is what lets the ingest floor decline a channel by
+                // never binding its socket (see `ingest::floor`).
+                channel: Some(id),
             })
         })
         .collect()
@@ -881,6 +888,30 @@ mod tests {
                 (33012, 43012, Some(53012)),
                 (33049, 43049, Some(53049)),
             ]
+        );
+    }
+
+    /// A derived publisher records the channel its block came from, and an explicit one records
+    /// `None`. That distinction is the whole basis of the bind-time ingest floor: `Some` means one
+    /// socket per channel (declinable), `None` means a shared base port separated in-band (not).
+    /// Recomputing it downstream from the base port is impossible — the derived block's base does
+    /// not survive into the `'static` rows — so a slip here would silently make every row look flat.
+    #[test]
+    fn a_derived_publisher_records_its_channel_and_an_explicit_one_does_not() {
+        let loaded = build(&doc_with(&format!("{SPORTS_ROW},{PERPS_ROW}")), "test").unwrap();
+        let sports = loaded.rows.iter().find(|f| f.category == "sports").unwrap();
+        assert_eq!(
+            sports
+                .publishers
+                .iter()
+                .map(|p| p.channel)
+                .collect::<Vec<_>>(),
+            vec![Some(10), Some(11), Some(12), Some(49)]
+        );
+        let perps = loaded.rows.iter().find(|f| f.category == "perps").unwrap();
+        assert_eq!(
+            perps.publishers.iter().map(|p| p.channel).collect::<Vec<_>>(),
+            vec![None]
         );
     }
 

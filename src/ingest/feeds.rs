@@ -105,6 +105,20 @@ impl FeedPorts {
 pub struct FeedPublisher {
     /// The port block this publisher sends on.
     pub ports: FeedPorts,
+    /// The channel id this publisher's block was **derived** from (`port = base + channel_id`), or
+    /// `None` when the document wrote the block out verbatim.
+    ///
+    /// This is what makes the ingest floor ([`crate::ingest::floor`]) a bind-time filter rather than
+    /// a decode-time one: a row that derives its ports has one socket per channel, so declining a
+    /// channel means never binding it and the kernel discards its traffic before it reaches
+    /// userspace. `None` says the opposite — the publishers share a base port and are separated
+    /// in-band, so there is no socket to decline.
+    ///
+    /// Deliberately recorded here rather than recomputed from `base_port() - base`: the base is a
+    /// property of the document's derived block and is gone by the time these rows are `'static`,
+    /// and re-deriving it (by, say, taking the minimum base port) would silently produce a channel
+    /// id for a flat row too.
+    pub channel: Option<u8>,
 }
 
 impl FeedPublisher {

@@ -38,6 +38,7 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         feeds::{Feed, FeedKind},
+        floor::ChannelFloor,
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver,
         subscriptions::{self, Detected, HostSubs},
@@ -147,10 +148,17 @@ pub fn owns(owners: &HashMap<Universe, FeedKey>, key: &FeedKey) -> bool {
     owners.get(&(key.0, key.1)).is_some_and(|o| o.2 == key.2)
 }
 
-/// Every receiver key a feed contributes - one per publisher.
-fn feed_keys(f: &Feed) -> impl Iterator<Item = FeedKey> + '_ {
-    f.publishers
-        .iter()
+/// Every receiver key a feed contributes — one per publisher the [`ChannelFloor`] admits.
+///
+/// The floor is an **input** to the desired set, not a second activation authority: it narrows what
+/// this function yields and nothing else, so the spawn/abort diff below is unchanged and this module
+/// stays the only place that decides what runs. A publisher the floor drops is simply never a
+/// desired key, which means its socket is never bound and the kernel discards that channel's traffic
+/// before it reaches userspace.
+fn feed_keys<'a>(floor: &'a ChannelFloor, f: &'a Feed) -> impl Iterator<Item = FeedKey> + 'a {
+    floor
+        .publishers_for(f)
+        .into_iter()
         .map(|p| (f.venue, f.category, f.kind, p.base_port()))
 }
 
@@ -184,6 +192,9 @@ pub struct ReconcilerConfig {
     /// subscription). Owned rather than `&'static` because `--publisher-port` narrows each row's
     /// publisher list.
     pub enabled: Vec<Feed>,
+    /// Which channels of each row this process ingests (`--channels`), parsed and validated once in
+    /// `main`. Empty by default, which admits every channel of every row.
+    pub floor: ChannelFloor,
     pub iface: String,
     pub recv_buf: usize,
     pub refresh: Duration,
@@ -260,7 +271,8 @@ impl Reconciler {
         info!(
             refresh_secs = self.cfg.refresh.as_secs(),
             gating_disabled = self.cfg.gating_disabled,
-            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
+            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), self.cfg.floor.publishers_for(f).len())).collect::<Vec<_>>(),
+            channel_floor = ?self.cfg.floor.summary(),
             "subscription reconciler started"
         );
         loop {
@@ -314,7 +326,7 @@ impl Reconciler {
         let feeds: HashSet<FeedKey> = subs
             .market_data_feeds(&self.cfg.enabled)
             .into_iter()
-            .flat_map(feed_keys)
+            .flat_map(|f| feed_keys(&self.cfg.floor, f))
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
@@ -327,7 +339,12 @@ impl Reconciler {
     /// Fail-open / gating-disabled desired state: every enabled feed on, WS on if configured, shreds
     /// only via explicit sources (no CLI → no discovery).
     fn static_desired(&self) -> Desired {
-        let feeds: HashSet<FeedKey> = self.cfg.enabled.iter().flat_map(feed_keys).collect();
+        let feeds: HashSet<FeedKey> = self
+            .cfg
+            .enabled
+            .iter()
+            .flat_map(|f| feed_keys(&self.cfg.floor, f))
+            .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
             api_on: !self.cfg.api_bind.is_empty() && !feeds.is_empty(),
@@ -775,16 +792,18 @@ mod tests {
                     mktdata: 9101,
                     refdata: 9102,
                 },
+                channel: None,
             },
             FeedPublisher {
                 ports: FeedPorts::TwoPort {
                     mktdata: 9201,
                     refdata: 9202,
                 },
+                channel: None,
             },
         ];
         let feed = test_feed(PUBS);
-        let keys: Vec<FeedKey> = feed_keys(&feed).collect();
+        let keys: Vec<FeedKey> = feed_keys(&ChannelFloor::default(), &feed).collect();
         assert_eq!(
             keys,
             vec![
@@ -1003,6 +1022,7 @@ mod tests {
                 mktdata: 7576,
                 refdata: 7577,
             },
+            channel: None,
         }];
         static MBP_PUB: &[FeedPublisher] = &[FeedPublisher {
             ports: FeedPorts::ThreePort {
@@ -1010,6 +1030,7 @@ mod tests {
                 refdata: 41000,
                 snapshot: 51000,
             },
+            channel: None,
         }];
         // A venue label used by no other test, so the counter delta below is this test's alone.
         let venue = "TapeFlipVenue";
@@ -1054,9 +1075,42 @@ mod tests {
         assert_eq!(changes.get() - before, 1);
     }
 
+    /// The floor reaching the activation path: the desired receiver set for a narrowed row holds
+    /// exactly the admitted channels' publishers, so the excluded ones are never spawned and their
+    /// sockets are never bound.
+    ///
+    /// Asserted on the desired **keys** — which base ports this process will bind — rather than on
+    /// decoded output, which is empty for an excluded channel whether the floor works or not and so
+    /// could not fail. The unfiltered control run is what proves the narrowing is the floor's doing
+    /// and not a property of the fixture.
+    #[test]
+    fn the_floor_narrows_the_desired_receiver_set() {
+        let sports = *crate::ingest::feeds::feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row");
+        let floor = ChannelFloor::parse("lashay-4=10,11").unwrap();
+
+        let narrowed = test_reconciler_with_floor(vec![sports], floor);
+        let mut ports: Vec<u16> = narrowed.static_desired().feeds.iter().map(|k| k.3).collect();
+        ports.sort_unstable();
+        assert_eq!(ports, vec![33010, 33011]);
+
+        let wide = test_reconciler(vec![sports]);
+        assert_eq!(
+            wide.static_desired().feeds.len(),
+            sports.publishers.len(),
+            "an unnarrowed row must still desire every publisher"
+        );
+    }
+
     /// A `Reconciler` whose spawned receivers are never polled: `apply_feeds` is sync, so the tasks
     /// it creates bind no sockets before the test drops them.
     fn test_reconciler(enabled: Vec<Feed>) -> Reconciler {
+        test_reconciler_with_floor(enabled, ChannelFloor::default())
+    }
+
+    fn test_reconciler_with_floor(enabled: Vec<Feed>, floor: ChannelFloor) -> Reconciler {
         let (tx, _rx) = broadcast::channel(16);
         Reconciler::new(ReconcilerConfig {
             arbiter: Arc::new(std::sync::Mutex::new(crate::ingest::arbiter::Arbiter::new(
@@ -1068,6 +1122,7 @@ mod tests {
             depth: Default::default(),
             books: Default::default(),
             enabled,
+            floor,
             iface: "127.0.0.1".into(),
             recv_buf: 1 << 20,
             refresh: Duration::from_secs(30),

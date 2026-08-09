@@ -48,6 +48,19 @@ struct Args {
     )]
     publisher_ports: Vec<u16>,
 
+    /// Channels to ingest, scoped per group code: `lashay-4=10,11;lashay-1=2`. An unmentioned
+    /// row ingests every channel. Ids are the contract and are validated against the row's
+    /// roster at startup; channel *names* are not mirrored here — they live in the publisher's
+    /// inventory by design and have already moved once. Use `doublezero-edge channels list` to
+    /// see what a bound channel actually contains.
+    ///
+    /// Only rows whose publisher derives a port per channel can be narrowed: there the excluded
+    /// channel's socket is never bound and the kernel discards its traffic. Narrowing a row whose
+    /// publishers bind one base port flat is refused at startup — `channel_id` identifies mirrors
+    /// there, not markets (see `ingest::floor`).
+    #[arg(long, env = "DZ_CHANNELS", default_value = "")]
+    channels: String,
+
     /// URL to fetch the feed registry document from at startup. The precursor to reading it from
     /// the DoubleZero ledger. On failure the built-in document is used and a warning is logged — a
     /// container that will not boot because a registry host blipped is worse than one running a
@@ -439,8 +452,19 @@ async fn main() -> Result<()> {
     .await?;
 
     let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publisher_ports)?;
+
+    // The ingest floor, parsed once here against the registry that was just resolved and fatal on
+    // any error: a floor that silently filters nothing is worse than one that refuses to start,
+    // since the symptom is a process quietly ingesting markets nobody asked for. It is handed to
+    // the reconciler as an *input* to the desired receiver set — `reconcile` stays the single
+    // activation authority.
+    let floor = ingest::floor::ChannelFloor::parse(&args.channels)?;
+    if !floor.is_empty() {
+        info!(channels = ?floor.summary(), "channel floor active (excluded channels bind no socket)");
+    }
+
     info!(
-        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
+        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), floor.publishers_for(f).len())).collect::<Vec<_>>(),
         "ingesting feeds"
     );
 
@@ -617,6 +641,7 @@ async fn main() -> Result<()> {
             depth,
             books,
             enabled,
+            floor,
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
             refresh: std::time::Duration::from_secs(args.subscription_refresh_secs),
