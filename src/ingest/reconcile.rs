@@ -49,10 +49,19 @@ use crate::{
 };
 
 /// Identity of a market-data **receiver** in the active-task map: one per publisher of a feed.
-/// `(venue, kind)` identifies the feed row (unique across `FEEDS`, asserted by
-/// `feeds::tests::venue_kind_pairs_are_unique`) and the base port the block within it (unique per
-/// feed, asserted by `feeds::tests::publisher_base_ports_unique_within_a_feed`).
-pub type FeedKey = (&'static str, FeedKind, u16);
+/// `(venue, category, kind)` identifies the feed row (unique across `FEEDS`, asserted by
+/// `feeds::tests::venue_category_kind_triples_are_unique`) and the base port the block within it
+/// (unique per feed, asserted by `feeds::tests::publisher_base_ports_unique_within_a_feed`).
+///
+/// The category is what separates two disjoint universes riding one Source ID — without it,
+/// ownership below is contested across rows that mirror nothing and one universe's tape goes dark.
+/// It is also why `(venue, kind)` is no longer an identity: a venue may carry two rows of the same
+/// kind, one per universe.
+pub type FeedKey = (&'static str, &'static str, FeedKind, u16);
+
+/// The set of rows that mirror one another: a [`FeedKey`]'s `(venue, category)` prefix. One tape
+/// owner is elected per universe, never per venue — see [`tape_owners`].
+pub type Universe = (&'static str, &'static str);
 
 /// Whether a receiver currently owns its venue's `trade` tape. Read once per print by the
 /// processors; the reconciler flips it in place so ownership can move **without respawning** the
@@ -81,7 +90,14 @@ pub fn tape_rank_is_some(kind: FeedKind) -> bool {
     tape_rank(kind).is_some()
 }
 
-/// The tape-owning feed row per venue over a set of running receivers.
+/// The tape-owning feed row per **universe** — one owner per `(venue, category)`, not per venue —
+/// over a set of running receivers.
+///
+/// Scoped by category because rows sharing a venue can carry instrument universes that mirror
+/// nothing of each other (one Source ID, two markets). Ranked venue-wide, a top-of-book row on one
+/// universe outranks a book row on the other and mutes it entirely: the losing row's receiver
+/// decodes every print and drops it, and the venue's other market shows empty candles that look
+/// exactly like a market that did not trade.
 ///
 /// Ordered `(liveness, rank, base port)`, lowest wins: **liveness before rank**, base port breaking
 /// a tie so the result never depends on iteration order. Rank alone would let a subscribed-but-dead
@@ -100,36 +116,42 @@ pub fn tape_rank_is_some(kind: FeedKind) -> bool {
 pub fn tape_owners(
     active: impl IntoIterator<Item = FeedKey>,
     liveness: impl Fn(&FeedKey) -> TapeLiveness,
-) -> HashMap<&'static str, FeedKey> {
-    let mut best: HashMap<&'static str, ((TapeLiveness, u8, u16), FeedKey)> = HashMap::new();
+) -> HashMap<Universe, FeedKey> {
+    /// What the rows of one universe are ranked on, lowest wins. Named so the ordering is stated
+    /// once, in the order the tuple compares in: liveness, then kind rank, then base port.
+    type TapeOrder = (TapeLiveness, u8, u16);
+    let mut best: HashMap<Universe, (TapeOrder, FeedKey)> = HashMap::new();
     for key in active {
-        let Some(rank) = tape_rank(key.1) else {
+        let Some(rank) = tape_rank(key.2) else {
             continue;
         };
-        let order = (liveness(&key), rank, key.2);
-        match best.get(key.0) {
+        let order = (liveness(&key), rank, key.3);
+        let universe = (key.0, key.1);
+        match best.get(&universe) {
             Some(&(cur, _)) if cur <= order => {}
             _ => {
-                best.insert(key.0, (order, key));
+                best.insert(universe, (order, key));
             }
         }
     }
     best.into_iter()
-        .map(|(venue, (_, key))| (venue, key))
+        .map(|(universe, (_, key))| (universe, key))
         .collect()
 }
 
-/// Whether this receiver serves its venue's tape. Keyed on `(venue, kind)` and not the base port, so
-/// **every** publisher of the owning row emits — collapsing mirrored copies is the arbiter's job.
-pub fn owns(owners: &HashMap<&'static str, FeedKey>, key: &FeedKey) -> bool {
-    owners.get(key.0).is_some_and(|o| o.1 == key.1)
+/// Whether this receiver serves its universe's tape. Keyed on `(venue, category, kind)` and not the
+/// base port, so **every** publisher of the owning row emits — collapsing mirrored copies is the
+/// arbiter's job. The kind comparison alone is not enough once a venue can hold two rows of one
+/// kind: it would hand a sports book row the tape because the perps book row owns one.
+pub fn owns(owners: &HashMap<Universe, FeedKey>, key: &FeedKey) -> bool {
+    owners.get(&(key.0, key.1)).is_some_and(|o| o.2 == key.2)
 }
 
 /// Every receiver key a feed contributes - one per publisher.
 fn feed_keys(f: &Feed) -> impl Iterator<Item = FeedKey> + '_ {
     f.publishers
         .iter()
-        .map(|p| (f.venue, f.kind, p.base_port()))
+        .map(|p| (f.venue, f.category, f.kind, p.base_port()))
 }
 
 /// Static shred-forwarder parameters (everything except the source set, which the reconciler
@@ -337,8 +359,9 @@ impl Reconciler {
             if done {
                 warn!(
                     venue = k.0,
-                    kind = k.1.label(),
-                    publisher = k.2,
+                    category = k.1,
+                    kind = k.2.label(),
+                    publisher = k.3,
                     "market-data receiver exited; will respawn if still subscribed"
                 );
             }
@@ -387,8 +410,9 @@ impl Reconciler {
                 h.abort();
                 info!(
                     venue = key.0,
-                    kind = key.1.label(),
-                    publisher = key.2,
+                    category = key.1,
+                    kind = key.2.label(),
+                    publisher = key.3,
                     "deactivating market-data receiver (no longer subscribed)"
                 );
             }
@@ -409,14 +433,15 @@ impl Reconciler {
                 .find_map(|f| {
                     f.publishers
                         .iter()
-                        .find(|p| (f.venue, f.kind, p.base_port()) == key)
+                        .find(|p| (f.venue, f.category, f.kind, p.base_port()) == key)
                         .map(|p| (*f, *p))
                 })
                 .expect("desired feed key came from enabled");
             info!(
                 venue = key.0,
-                kind = key.1.label(),
-                publisher = key.2,
+                category = key.1,
+                kind = key.2.label(),
+                publisher = key.3,
                 group = %feed.group,
                 mktdata = publisher.ports.mktdata(),
                 "activating market-data receiver (subscribed)"
@@ -441,7 +466,7 @@ impl Reconciler {
     ///
     /// `Relaxed` throughout: the flag is advisory per-message policy, not a synchronization point,
     /// and the worst case at a subscription boundary is one duplicated or one dropped print.
-    fn publish_tape_owners(&self, owners: &HashMap<&'static str, FeedKey>) {
+    fn publish_tape_owners(&self, owners: &HashMap<Universe, FeedKey>) {
         for (key, (_, tape)) in &self.active {
             let want = owns(owners, key);
             if tape.swap(want, Ordering::Relaxed) != want {
@@ -451,8 +476,9 @@ impl Reconciler {
                     .inc();
                 info!(
                     venue = key.0,
-                    kind = key.1.label(),
-                    publisher = key.2,
+                    category = key.1,
+                    kind = key.2.label(),
+                    publisher = key.3,
                     owns_tape = want,
                     "trade-tape ownership changed"
                 );
@@ -762,12 +788,15 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                ("TestVenue", FeedKind::TopOfBook, 9101),
-                ("TestVenue", FeedKind::TopOfBook, 9201),
+                ("TestVenue", "testcategory", FeedKind::TopOfBook, 9101),
+                ("TestVenue", "testcategory", FeedKind::TopOfBook, 9201),
             ]
         );
     }
 
+    /// One category for every legacy ownership test: they predate the category dimension and must
+    /// keep behaving exactly as they did, which is the safety property of scoping by it.
+    const C: &str = "testcategory";
     const TOB: FeedKind = FeedKind::TopOfBook;
     const MBP: FeedKind = FeedKind::MarketByPrice;
     const MBO: FeedKind = FeedKind::MarketByOrder;
@@ -781,34 +810,34 @@ mod tests {
     /// book, the venue's primary tape.
     #[test]
     fn top_of_book_owns_the_tape_when_both_feeds_run() {
-        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], all_live);
-        assert_eq!(owners.get("V"), Some(&("V", TOB, 7576)));
-        assert!(owns(&owners, &("V", TOB, 7576)));
-        assert!(!owns(&owners, &("V", MBP, 31000)));
+        let owners = tape_owners([("V", C, TOB, 7576), ("V", C, MBP, 31000)], all_live);
+        assert_eq!(owners.get(&("V", C)), Some(&("V", C, TOB, 7576)));
+        assert!(owns(&owners, &("V", C, TOB, 7576)));
+        assert!(!owns(&owners, &("V", C, MBP, 31000)));
     }
 
     /// The case the static `emit_trades` rule got wrong: a host subscribed to the market-by-price
     /// group alone still has to serve a tape.
     #[test]
     fn market_by_price_owns_the_tape_alone() {
-        let owners = tape_owners([("V", MBP, 31000)], all_live);
-        assert!(owns(&owners, &("V", MBP, 31000)));
+        let owners = tape_owners([("V", C, MBP, 31000)], all_live);
+        assert!(owns(&owners, &("V", C, MBP, 31000)));
     }
 
     #[test]
     fn tape_ownership_is_per_venue() {
-        let owners = tape_owners([("A", MBP, 31000), ("B", TOB, 7576)], all_live);
-        assert!(owns(&owners, &("A", MBP, 31000)));
-        assert!(owns(&owners, &("B", TOB, 7576)));
+        let owners = tape_owners([("A", C, MBP, 31000), ("B", C, TOB, 7576)], all_live);
+        assert!(owns(&owners, &("A", C, MBP, 31000)));
+        assert!(owns(&owners, &("B", C, TOB, 7576)));
     }
 
     /// Market-by-order is depth-only, so a venue carried only by it has no tape owner at all —
     /// rather than one silently minted from a row that never prints.
     #[test]
     fn a_depth_only_venue_has_no_tape_owner() {
-        let owners = tape_owners([("V", MBO, 10001)], all_live);
+        let owners = tape_owners([("V", C, MBO, 10001)], all_live);
         assert!(owners.is_empty());
-        assert!(!owns(&owners, &("V", MBO, 10001)));
+        assert!(!owns(&owners, &("V", C, MBO, 10001)));
     }
 
     /// Ownership is keyed on `(venue, kind)`, so every publisher of the owning row emits and no
@@ -817,17 +846,17 @@ mod tests {
     fn every_publisher_of_the_owning_feed_emits() {
         let owners = tape_owners(
             [
-                ("V", TOB, 7576),
-                ("V", TOB, 7676),
-                ("V", MBP, 31000),
-                ("V", MBP, 31100),
+                ("V", C, TOB, 7576),
+                ("V", C, TOB, 7676),
+                ("V", C, MBP, 31000),
+                ("V", C, MBP, 31100),
             ],
             all_live,
         );
-        assert!(owns(&owners, &("V", TOB, 7576)));
-        assert!(owns(&owners, &("V", TOB, 7676)));
-        assert!(!owns(&owners, &("V", MBP, 31000)));
-        assert!(!owns(&owners, &("V", MBP, 31100)));
+        assert!(owns(&owners, &("V", C, TOB, 7576)));
+        assert!(owns(&owners, &("V", C, TOB, 7676)));
+        assert!(!owns(&owners, &("V", C, MBP, 31000)));
+        assert!(!owns(&owners, &("V", C, MBP, 31100)));
     }
 
     /// The group being subscribed and a publisher actually sending to it are independent facts, so
@@ -835,36 +864,40 @@ mod tests {
     /// decodes prints and drops them. Liveness outranks rank; with everything down it falls back.
     #[test]
     fn a_dead_row_yields_the_tape_to_a_live_peer() {
-        let keys = [("V", TOB, 7576), ("V", MBP, 31000)];
+        let keys = [("V", C, TOB, 7576), ("V", C, MBP, 31000)];
         let owners = tape_owners(keys, |k| {
-            if k.1 == TOB {
+            if k.2 == TOB {
                 TapeLiveness::Down
             } else {
                 TapeLiveness::Up
             }
         });
-        assert!(owns(&owners, &("V", MBP, 31000)));
-        assert!(!owns(&owners, &("V", TOB, 7576)));
+        assert!(owns(&owners, &("V", C, MBP, 31000)));
+        assert!(!owns(&owners, &("V", C, TOB, 7576)));
 
         let both_down = tape_owners(keys, |_| TapeLiveness::Down);
-        assert!(owns(&both_down, &("V", TOB, 7576)), "falls back to rank");
+        assert!(owns(&both_down, &("V", C, TOB, 7576)), "falls back to rank");
     }
 
     /// One live publisher makes its row live: liveness is per receiver but ownership is per row.
     #[test]
     fn one_live_publisher_keeps_the_row_owning() {
         let owners = tape_owners(
-            [("V", TOB, 7576), ("V", TOB, 7676), ("V", MBP, 31000)],
+            [
+                ("V", C, TOB, 7576),
+                ("V", C, TOB, 7676),
+                ("V", C, MBP, 31000),
+            ],
             |k| {
-                if *k == ("V", TOB, 7576) {
+                if *k == ("V", C, TOB, 7576) {
                     TapeLiveness::Down
                 } else {
                     TapeLiveness::Up
                 }
             },
         );
-        assert!(owns(&owners, &("V", TOB, 7676)));
-        assert!(!owns(&owners, &("V", MBP, 31000)));
+        assert!(owns(&owners, &("V", C, TOB, 7676)));
+        assert!(!owns(&owners, &("V", C, MBP, 31000)));
     }
 
     /// **The mute.** `tape_owners` ranks over `desired`, which includes rows not yet spawned, while
@@ -876,18 +909,18 @@ mod tests {
     /// still read healthy off that peer.
     #[test]
     fn a_never_registered_row_cannot_take_the_tape_from_a_live_peer() {
-        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], |k| {
-            if k.1 == TOB {
+        let owners = tape_owners([("V", C, TOB, 7576), ("V", C, MBP, 31000)], |k| {
+            if k.2 == TOB {
                 TapeLiveness::Unregistered
             } else {
                 TapeLiveness::Up
             }
         });
         assert!(
-            owns(&owners, &("V", MBP, 31000)),
+            owns(&owners, &("V", C, MBP, 31000)),
             "the streaming row keeps the tape until the newcomer actually registers"
         );
-        assert!(!owns(&owners, &("V", TOB, 7576)));
+        assert!(!owns(&owners, &("V", C, TOB, 7576)));
     }
 
     /// The property the three-state ordering must not break, and why "not registered yet" is not
@@ -896,10 +929,10 @@ mod tests {
     /// registered one unconditionally would leave a fresh process with no tape owner at all.
     #[test]
     fn a_cold_start_falls_back_to_rank() {
-        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], |_| {
+        let owners = tape_owners([("V", C, TOB, 7576), ("V", C, MBP, 31000)], |_| {
             TapeLiveness::Unregistered
         });
-        assert!(owns(&owners, &("V", TOB, 7576)));
+        assert!(owns(&owners, &("V", C, TOB, 7576)));
     }
 
     /// An incumbent that registered and then went down is worse than a newcomer that has not
@@ -908,28 +941,54 @@ mod tests {
     /// resumes — but it keeps the ordering a total one.
     #[test]
     fn an_unregistered_row_outranks_a_registered_dead_one() {
-        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], |k| {
-            if k.1 == TOB {
+        let owners = tape_owners([("V", C, TOB, 7576), ("V", C, MBP, 31000)], |k| {
+            if k.2 == TOB {
                 TapeLiveness::Unregistered
             } else {
                 TapeLiveness::Down
             }
         });
-        assert!(owns(&owners, &("V", TOB, 7576)));
+        assert!(owns(&owners, &("V", C, TOB, 7576)));
+    }
+
+    /// Two disjoint universes share one venue when they share a Source ID. Ownership is per
+    /// `(venue, category)`: the sports book row must hold its own tape even though a perps
+    /// top-of-book row outranks it on kind, because they mirror nothing.
+    #[test]
+    fn disjoint_categories_each_hold_their_own_tape() {
+        let perps_tob = ("KALSHI", "perps", TOB, 7576);
+        let sports_mbp = ("KALSHI", "sports", MBP, 33010);
+        let owners = tape_owners([perps_tob, sports_mbp], all_live);
+        assert!(owns(&owners, &perps_tob));
+        assert!(
+            owns(&owners, &sports_mbp),
+            "the sports row lost its tape to a perps row it mirrors nothing with"
+        );
+    }
+
+    /// Within one category the existing ranking is unchanged: top-of-book outranks
+    /// market-by-price and the losing row is muted. Category scoping must not weaken this.
+    #[test]
+    fn ranking_within_a_category_is_unchanged() {
+        let tob = ("KALSHI", "perps", TOB, 7576);
+        let mbp = ("KALSHI", "perps", MBP, 31000);
+        let owners = tape_owners([tob, mbp], all_live);
+        assert!(owns(&owners, &tob));
+        assert!(!owns(&owners, &mbp));
     }
 
     /// Distinct publishers of the same feed must not collide in the active-task map.
     #[test]
     fn plan_treats_publishers_as_independent() {
-        let current: HashSet<FeedKey> = [("V", FeedKind::TopOfBook, 9101)].into_iter().collect();
+        let current: HashSet<FeedKey> = [("V", C, FeedKind::TopOfBook, 9101)].into_iter().collect();
         let desired: HashSet<FeedKey> = [
-            ("V", FeedKind::TopOfBook, 9101),
-            ("V", FeedKind::TopOfBook, 9201),
+            ("V", C, FeedKind::TopOfBook, 9101),
+            ("V", C, FeedKind::TopOfBook, 9201),
         ]
         .into_iter()
         .collect();
         let (to_spawn, to_abort) = plan(&current, &desired);
-        assert_eq!(to_spawn, vec![("V", FeedKind::TopOfBook, 9201)]);
+        assert_eq!(to_spawn, vec![("V", C, FeedKind::TopOfBook, 9201)]);
         assert!(to_abort.is_empty());
     }
 
@@ -968,12 +1027,12 @@ mod tests {
                 ..test_feed(MBP_PUB)
             },
         ]);
-        let mbp_key = (venue, FeedKind::MarketByPrice, 31000u16);
+        let mbp_key = (venue, "testcategory", FeedKind::MarketByPrice, 31000u16);
         let changes = metrics().tape_owner_changes.with_label_values(&[venue]);
         let before = changes.get();
 
         r.apply_feeds(
-            &[(venue, FeedKind::TopOfBook, 7576), mbp_key]
+            &[(venue, "testcategory", FeedKind::TopOfBook, 7576), mbp_key]
                 .into_iter()
                 .collect(),
         );

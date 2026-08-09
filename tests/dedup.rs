@@ -57,6 +57,7 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "HYPERLIQUID",
+            category: "perps",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -121,6 +122,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "HYPERLIQUID",
+            category: "perps",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -737,8 +739,8 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
     // legitimately transfer on silence.
     for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
         let t = 1_000 + i as u64 * 2_000;
-        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1));
-        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2));
+        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1), "perps");
+        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2), "perps");
     }
 
     // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer

@@ -51,6 +51,12 @@ fn phoenix_venue() -> &'static str {
     crate::ingest::sources::source_label(PHOENIX_SOURCE_ID)
 }
 
+/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`.
+/// The arbiter's `Sticky` tape gate keys on `(venue, category)`, so a value disagreeing with the
+/// edge rows' would make this backstop a second universe rather than a second arm of the same one —
+/// and both copies of every fill would reach the wire. `category_matches_the_edge_rows` pins it.
+const PHOENIX_CATEGORY: &str = "spot";
+
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
 /// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
 /// no `channel` key at all) is ignored without counting as a decode error — so
@@ -210,7 +216,11 @@ impl PhoenixVenue {
             .ws_feeder_messages
             .with_label_values(&[phoenix_venue(), "trade"])
             .inc();
-        lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
+        lock(arbiter).emit(
+            FeedMessage::Trade(trade),
+            Publisher::PublicWs,
+            PHOENIX_CATEGORY,
+        );
     }
 
     fn decode_error(&self) {
@@ -291,6 +301,24 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// The backstop and the edge rows must name the **same** universe, or the arbiter's `Sticky`
+    /// tape gate treats them as two and stops collapsing their copies of one fill. Pinned against
+    /// the registry rather than restated, so onboarding a row under this venue with a different
+    /// category fails the build instead of quietly doubling the tape.
+    #[test]
+    fn category_matches_the_edge_rows() {
+        for f in crate::ingest::feeds::FEEDS
+            .iter()
+            .filter(|f| f.venue == phoenix_venue())
+        {
+            assert_eq!(
+                f.category, PHOENIX_CATEGORY,
+                "{} row {:?} carries a category this backstop does not mirror",
+                f.venue, f.kind
+            );
+        }
+    }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {

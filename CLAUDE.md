@@ -162,7 +162,9 @@ Modules are grouped by role under `src/`:
   (spawn/abort). Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
   one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
-  per venue (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
+  per `(venue, category)` — one owner per *universe*, since rows sharing a Source ID can carry
+  instrument sets that mirror nothing and a venue-wide rank mutes the loser's tape outright —
+  (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
   `apply_feeds` publishes the result onto a `TapeOwner` (`Arc<AtomicBool>`) each processor reads per
   print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
   and reference data whenever a *peer* feed's subscription changed. The flag is stored **with** the
@@ -186,7 +188,9 @@ Modules are grouped by role under `src/`:
   on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
   ticking when market data is wedged). `FrameCtx` carries the shared `arbiter` (not a raw `tx`);
   `ctx.emit(msg)` routes through it tagged `Publisher::Edge(src_ip)`.
-- **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, kind, base port)`,
+- **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
+  (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
+  universes),
   aggregated to the **venue**-level `status`/`dz_feed_up` PROTOCOL.md promises, so one wedged
   publisher never takes a venue down while a peer streams. Only quote-bearing kinds count
   (`carries_venue_status`; MBO is depth-only and must neither declare an outage nor mask one), with a
@@ -200,8 +204,8 @@ Modules are grouped by role under `src/`:
   the `Publisher` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
-  `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → the per-venue **tape leader** then the window, `book` → the
+  `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher, category)` (quotes → quote
+  floor, depth → depth floor, trades → the per-`(venue, category)` **tape leader** then the window, `book` → the
   single-arm authority gate below, `Instrument` → a rate limit on the precision pair per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
@@ -215,7 +219,9 @@ Modules are grouped by role under `src/`:
   `Contest{winner, lead_ns}` drops the losing cross-source copy and records the head-to-head
   lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
-  plain collapse. The **tape leader** (`tape_leader`, `Sticky` venues only) is the arm-level twin of
+  plain collapse. The **tape leader** (`tape_leader`, keyed `(venue, category)`, `Sticky` venues only —
+  the `category` `emit` parameter is the feed row's, never a wire field: PROTOCOL.md is a consumer
+  contract and this is producer-side keying) is the arm-level twin of
   the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
   sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
   venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
@@ -231,8 +237,11 @@ Modules are grouped by role under `src/`:
   `dz_tape_arm_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
-  no-dark-start already exposes for `book` — and the gate is venue-wide, so arms that *sharded* prints
-  rather than mirroring them would lose the non-serving arm's fills. `no_id_owner` is skipped entirely
+  no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
+  that *sharded* prints rather than mirroring them would lose the non-serving arm's fills (giving them
+  distinct categories is the registry's job). The two `books` lookups inside it are still venue-wide,
+  because `StickyAuthority` is: sound while a venue's universes are published by the same hosts (arm
+  identity is the source IP), not if they are ever published by disjoint ones. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
   `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`

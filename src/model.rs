@@ -38,17 +38,40 @@ impl Side {
 /// first time it is seen, not per message.
 pub fn venue_arc(venue: &'static str) -> Arc<str> {
     static INTERN: OnceLock<RwLock<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
-    let map = INTERN.get_or_init(|| RwLock::new(HashMap::new()));
-    // Steady state: the venue is already interned -> shared read lock, clone the cached `Arc`.
-    if let Some(arc) = map.read().unwrap_or_else(|e| e.into_inner()).get(venue) {
+    intern_static(&INTERN, venue)
+}
+
+/// The same interner for a feed **category** (`ingest::feeds::Feed::category`), which the arbiter's
+/// tape gate pairs with the venue to key one entry per *universe* rather than per venue. Interned
+/// for exactly the reason venues are: that key is built on the trade hot path, once per print, and
+/// `Arc::from(&str)` there would allocate and copy per message.
+///
+/// A separate map from [`venue_arc`]'s on purpose — the two namespaces overlap ("perps" is no
+/// venue, but nothing stops a future registry name colliding), and sharing one map would hand out
+/// the same `Arc` for both, quietly making a venue and a category equal by pointer for anything
+/// that ever compares them.
+pub fn category_arc(category: &'static str) -> Arc<str> {
+    static INTERN: OnceLock<RwLock<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
+    intern_static(&INTERN, category)
+}
+
+/// Shared body of the two interners above: a `&'static str` keyed cache of `Arc<str>`, read under a
+/// shared lock in steady state and written once per distinct string.
+fn intern_static(
+    intern: &OnceLock<RwLock<HashMap<&'static str, Arc<str>>>>,
+    s: &'static str,
+) -> Arc<str> {
+    let map = intern.get_or_init(|| RwLock::new(HashMap::new()));
+    // Steady state: already interned -> shared read lock, clone the cached `Arc`.
+    if let Some(arc) = map.read().unwrap_or_else(|e| e.into_inner()).get(s) {
         return arc.clone();
     }
-    // First sighting of this venue: take the write lock and insert (re-checking under the lock in
-    // case another task interned it in the race window).
+    // First sighting: take the write lock and insert (re-checking under the lock in case another
+    // task interned it in the race window).
     map.write()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(venue)
-        .or_insert_with(|| Arc::from(venue))
+        .entry(s)
+        .or_insert_with(|| Arc::from(s))
         .clone()
 }
 

@@ -46,6 +46,12 @@ fn hl_venue() -> &'static str {
     crate::ingest::sources::source_label(HL_SOURCE_ID)
 }
 
+/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`.
+/// The arbiter's `Sticky` tape gate keys on `(venue, category)`, so a value disagreeing with the
+/// edge rows' would make this backstop a second universe rather than a second arm of the same one —
+/// and both copies of every print would reach the wire. `category_matches_the_edge_rows` pins it.
+const HL_CATEGORY: &str = "perps";
+
 /// Hyperliquid documents a cap of 1000 subscriptions per WebSocket connection. We fan out two
 /// subscriptions (`bbo` + `trades`) per coin over a single connection and log if the configured coin
 /// set would exceed the cap.
@@ -237,7 +243,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         .ws_feeder_messages
         .with_label_values(&[hl_venue(), "quote"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs, HL_CATEGORY);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
@@ -280,7 +286,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         .ws_feeder_messages
         .with_label_values(&[hl_venue(), "trade"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs, HL_CATEGORY);
 }
 
 #[cfg(test)]
@@ -293,6 +299,24 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// The backstop and the edge rows must name the **same** universe, or the arbiter's `Sticky`
+    /// tape gate treats them as two and stops collapsing their copies of one fill. Pinned against
+    /// the registry rather than restated, so onboarding a row under this venue with a different
+    /// category fails the build instead of quietly doubling the tape.
+    #[test]
+    fn category_matches_the_edge_rows() {
+        for f in crate::ingest::feeds::FEEDS
+            .iter()
+            .filter(|f| f.venue == hl_venue())
+        {
+            assert_eq!(
+                f.category, HL_CATEGORY,
+                "{} row {:?} carries a category this backstop does not mirror",
+                f.venue, f.kind
+            );
+        }
+    }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {

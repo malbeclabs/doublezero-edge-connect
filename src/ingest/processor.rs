@@ -2895,6 +2895,7 @@ mod tests {
     ) -> FrameCtx<'a> {
         FrameCtx {
             venue: "TV",
+            category: "testcategory",
             arbiter,
             instruments,
             kernel_rx_ts_ns: 0,

@@ -53,8 +53,8 @@ use crate::{
     },
     metrics::metrics,
     model::{
-        self, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot, FeedMessage,
-        NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade,
+        self, category_arc, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot,
+        FeedMessage, NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade,
     },
 };
 
@@ -541,9 +541,15 @@ pub struct Arbiter {
     /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
     no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
-    /// Which **arm** serves each `Sticky` venue's tape. See [`Arbiter::tape_arm_admits`]. One entry
-    /// per `Sticky` venue that has ever printed.
-    tape_leader: HashMap<Arc<str>, TapeLead>,
+    /// Which **arm** serves each `Sticky` universe's tape, keyed on `(venue, category)`. See
+    /// [`Arbiter::tape_arm_admits`]. One entry per `Sticky` universe that has ever printed.
+    ///
+    /// Venue alone would let a publisher on one universe mute a publisher on a disjoint one: a
+    /// single Source ID can carry universes that mirror nothing, and the gate below drops every
+    /// print from an arm that is not the leader. That drop has no bound in practice — the silence
+    /// handover only fires once the incumbent stops, and an incumbent streaming its own universe
+    /// never does — so the loser's tape goes dark for the life of the process.
+    tape_leader: HashMap<(Arc<str>, Arc<str>), TapeLead>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
     /// Whether the "batches carry no `last`" warning has fired.
@@ -988,7 +994,18 @@ impl Arbiter {
         matches!(publisher, Publisher::Edge(_)) && self.books.tracks_arm(venue, publisher)
     }
 
-    /// Whether this arm currently serves a `Sticky` venue's tape.
+    /// Whether this arm currently serves a `Sticky` **universe**'s tape — one gate per
+    /// `(venue, category)`, never one per venue.
+    ///
+    /// Scope first, because it is what makes every rule below safe to state: a single Source ID can
+    /// carry instrument universes that mirror nothing of one another, and this gate exists to pick
+    /// one arm out of a set of *mirrors*. Keyed on the venue alone it would instead pick one arm
+    /// across disjoint universes and drop the other's whole stream — permanently, since the silence
+    /// handover needs the incumbent to stop and an incumbent streaming its own universe never does.
+    /// The symptom is empty candles for that universe, indistinguishable from a market that did not
+    /// trade. `Feed::category` is the registry's declaration of which rows mirror each other, and it
+    /// reaches here as an [`Arbiter::emit`] parameter rather than a wire field (PROTOCOL.md is a
+    /// consumer contract; this is producer-side keying).
     ///
     /// The reconciler's row ownership picks which *feed* prints; this picks which *arm* within it, and
     /// the `trade_id == 0` bypass below needs both. A sticky venue's arms share no trade-id space: one
@@ -1020,20 +1037,37 @@ impl Arbiter {
     /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged source that
     /// prints first holds the tape until it goes quiet for a window — the same primitive
     /// [`StickyAuthority::admit`]'s no-dark-start already exposes for the `book` product, and not
-    /// closable without an identity the wire does not carry. And the gate is **venue-wide**: it assumes
-    /// the owning row's arms mirror one tape, so if they instead sharded prints between them the
-    /// non-serving arm's exclusive fills would be dropped. `dz_tape_arm_dropped_total` is what makes
-    /// either visible — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose
-    /// steady state here is the challenger's whole stream.
+    /// closable without an identity the wire does not carry. And the gate spans a whole **category**:
+    /// it assumes the rows sharing one carry mirrored tapes, so if two of them instead sharded prints
+    /// between them the non-serving arm's exclusive fills would be dropped — the registry's job is to
+    /// give sharded rows distinct categories. `dz_tape_arm_dropped_total` is what makes either visible
+    /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
+    /// here is the challenger's whole stream.
+    ///
+    /// ⚠️ The two `books` lookups below are still **venue**-wide, because [`StickyAuthority`] is: the
+    /// election and the tracked-arm set span every category under the venue. Sound while a venue's
+    /// universes are published by the same hosts (arm identity is the source IP, shared across a
+    /// host's rows), which is what makes an election in one universe evidence about the same arm in
+    /// another. It is not sound if two universes are published by disjoint hosts — the elected arm
+    /// would then be a stranger to this category, and the deferral would hand it a tape it never
+    /// prints. Scoping the authority itself is the fix, and is a change to the `book` product, not
+    /// to this gate.
     ///
     /// Applies to every publisher class uniformly, [`Publisher::PublicWs`] included; no `Sticky` venue
     /// has a public backstop today, and adding one needs this revisited.
-    fn tape_arm_admits(&mut self, t: &NormalizedTrade, publisher: Publisher) -> bool {
+    fn tape_arm_admits(
+        &mut self,
+        t: &NormalizedTrade,
+        publisher: Publisher,
+        category: &'static str,
+    ) -> bool {
         let elected = self.books.venue_leader(&t.venue);
         let tracked = self.books.tracks_arm(&t.venue, publisher);
-        let Some(lead) = self.tape_leader.get_mut(&t.venue) else {
+        // Interned, so the per-print key is two refcount bumps rather than an allocation.
+        let key = (t.venue.clone(), category_arc(category));
+        let Some(lead) = self.tape_leader.get_mut(&key) else {
             self.tape_leader.insert(
-                t.venue.clone(),
+                key,
                 TapeLead {
                     arm: publisher,
                     last_ns: t.recv_ts_ns,
@@ -1152,9 +1186,15 @@ impl Arbiter {
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
     ///
+    /// `category` is the emitting source's instrument **universe** (`ingest::feeds::Feed::category`,
+    /// supplied by the caller because it is a property of the *row*, not of the message). Only the
+    /// `Sticky` trade gate reads it, and it is deliberately a parameter rather than a field on the
+    /// wire types: those serialize into the WebSocket JSON, which PROTOCOL.md fixes as a consumer
+    /// contract, and a consumer has no use for a producer-side arbitration key.
+    ///
     /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
     /// increments a cached handle rather than doing a label-map lookup for each counter.
-    pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
+    pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher, category: &'static str) {
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
@@ -1227,10 +1267,11 @@ impl Arbiter {
                 if self.race_eligible(&t.venue, publisher) {
                     self.observe_trade_race(t, publisher);
                 }
-                // Then the per-venue arm gate, for the same reason the `book` arm has one: a `Sticky`
-                // venue's two arms mirror one tape with no shared identity to collapse them on.
+                // Then the per-universe arm gate, for the same reason the `book` arm has one: a
+                // `Sticky` universe's two arms mirror one tape with no shared identity to collapse
+                // them on. Scoped by `(venue, category)`, not by venue — see `tape_arm_admits`.
                 let sticky = self.mode_for(&t.venue) == ArbitrationMode::Sticky;
-                if sticky && !self.tape_arm_admits(t, publisher) {
+                if sticky && !self.tape_arm_admits(t, publisher, category) {
                     metrics()
                         .tape_arm_dropped
                         .with_label_values(&[t.venue.as_ref()])
@@ -1504,6 +1545,11 @@ pub fn lock(arbiter: &SharedArbiter) -> std::sync::MutexGuard<'_, Arbiter> {
 mod tests {
     use super::*;
 
+    /// The category every test that is not *about* categories emits under. Sharing one is the point:
+    /// the whole suite must behave exactly as it did before the tape gate was scoped, which is what
+    /// makes the two category tests below evidence of the scope change and not of a rewrite.
+    const TEST_CATEGORY: &str = "testcategory";
+
     #[test]
     fn quote_first_sample_admits() {
         let mut f: StalenessFloor<&str, u8, u8> = StalenessFloor::new(64);
@@ -1655,9 +1701,21 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // exact repeat -> dropped
-        a.emit(FeedMessage::Quote(quote(1000, 100.5, 101.0)), edge); // new content same tick -> kept
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // exact repeat -> dropped
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.5, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // new content same tick -> kept
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1000, 100.5)]);
     }
 
@@ -1671,15 +1729,21 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         // Steady state: edge opens tick 1000, public's copy at the same tick is dropped.
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
         a.emit(
             FeedMessage::Quote(quote(1000, 100.0, 101.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         );
         // Edge gaps: the public feed opens the next tick and fills in.
         a.emit(
             FeedMessage::Quote(quote(1001, 100.2, 101.2)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         );
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1001, 100.2)]);
     }
@@ -1711,9 +1775,9 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(trade(7), edge);
-        a.emit(trade(7), Publisher::PublicWs); // same id from public -> dropped
-        a.emit(trade(8), Publisher::PublicWs);
+        a.emit(trade(7), edge, TEST_CATEGORY);
+        a.emit(trade(7), Publisher::PublicWs, TEST_CATEGORY); // same id from public -> dropped
+        a.emit(trade(8), Publisher::PublicWs, TEST_CATEGORY);
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
             if let FeedMessage::Trade(t) = &*m {
@@ -1752,7 +1816,7 @@ mod tests {
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         for _ in 0..5 {
-            a.emit(FeedMessage::Trade(trade(0)), p);
+            a.emit(FeedMessage::Trade(trade(0)), p, TEST_CATEGORY);
         }
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -1780,13 +1844,13 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let (m, p) = t(a1);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         let (m, p) = t(a1);
-        a.emit(m, p); // the owner's own repeat is not a conflict
+        a.emit(m, p, TEST_CATEGORY); // the owner's own repeat is not a conflict
         assert_eq!(conflicts.get(), 0);
 
         let (m, p) = t(a2);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(
             conflicts.get(),
             1,
@@ -1824,22 +1888,22 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let (m, p) = t(a1, 1_000);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
 
         // Exactly at the window: a2 is still a concurrent second emitter, and a rejected challenger
         // must not refresh the incumbent's clock (or a burst of them would hold the tape open).
         let (m, p) = t(a2, 1_000 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(conflicts.get(), 1, "not yet past the window");
 
         // Past it: a2 inherits the tape...
         let (m, p) = t(a2, 1_001 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(conflicts.get(), 1, "a quiet tape hands over");
 
         // ...and keeps it, so its own later prints are its own.
         let (m, p) = t(a2, 1_002 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(
             conflicts.get(),
             1,
@@ -1848,7 +1912,7 @@ mod tests {
 
         // The previous owner returning while a2 is live is a conflict again.
         let (m, p) = t(a1, 1_003 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(conflicts.get(), 2, "two live emitters still conflict");
     }
 
@@ -1859,7 +1923,7 @@ mod tests {
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         for _ in 0..5 {
-            a.emit(FeedMessage::Trade(trade(77)), p);
+            a.emit(FeedMessage::Trade(trade(77)), p, TEST_CATEGORY);
         }
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -1876,8 +1940,16 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // identical duplicate -> dropped
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // identical duplicate -> dropped
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
     }
 
@@ -1890,8 +1962,16 @@ mod tests {
         let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), pub_a); // A opens the tick -> emit
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), pub_b); // B's mirror -> non-leader, dropped
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            pub_a,
+            TEST_CATEGORY,
+        ); // A opens the tick -> emit
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            pub_b,
+            TEST_CATEGORY,
+        ); // B's mirror -> non-leader, dropped
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
     }
 
@@ -1922,8 +2002,8 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(trade(), edge);
-        a.emit(trade(), edge); // identical duplicate -> dropped
+        a.emit(trade(), edge, TEST_CATEGORY);
+        a.emit(trade(), edge, TEST_CATEGORY); // identical duplicate -> dropped
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
             if let FeedMessage::Trade(t) = &*m {
@@ -1947,9 +2027,14 @@ mod tests {
         a.emit(
             FeedMessage::Quote(quote(bogus_future, 1.0, 2.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         );
         // The real edge quote (at ~now) is not stale relative to the floor and still emits.
-        a.emit(FeedMessage::Quote(quote(now, 100.0, 101.0)), edge);
+        a.emit(
+            FeedMessage::Quote(quote(now, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
         assert_eq!(drain_quotes(&mut rx), vec![(now, 100.0)]);
     }
 
@@ -1960,12 +2045,21 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(0, 100.0, 101.0)), edge); // bypass -> emitted, floor untouched
+        a.emit(
+            FeedMessage::Quote(quote(0, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // bypass -> emitted, floor untouched
         a.emit(
             FeedMessage::Quote(quote(0, 100.5, 101.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // also bypass -> emitted
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // real tick still emits
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // real tick still emits
         assert_eq!(
             drain_quotes(&mut rx),
             vec![(0, 100.0), (0, 100.5), (1000, 100.0)]
@@ -2007,8 +2101,8 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         // Edge opens tick 1000 arriving at t=100; the public copy at the same tick arrives at t=150
         // -> contest, edge led the public copy by 50ns.
-        a.emit(mk(1000, 100, 100.0), edge);
-        a.emit(mk(1000, 150, 100.5), Publisher::PublicWs);
+        a.emit(mk(1000, 100, 100.0), edge, TEST_CATEGORY);
+        a.emit(mk(1000, 150, 100.5), Publisher::PublicWs, TEST_CATEGORY);
 
         let m = metrics();
         let edge_beats_public = m
@@ -2053,8 +2147,8 @@ mod tests {
         };
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk(100, 100.0), mirror_a); // A opens the tick
-        a.emit(mk(120, 100.0), mirror_b); // B's mirror copy loses by 20ns
+        a.emit(mk(100, 100.0), mirror_a, TEST_CATEGORY); // A opens the tick
+        a.emit(mk(120, 100.0), mirror_b, TEST_CATEGORY); // B's mirror copy loses by 20ns
 
         let m = metrics();
         let mirror_race = m.quote_lead_ns.with_label_values(&[venue, "edge", "edge"]);
@@ -2097,8 +2191,8 @@ mod tests {
         };
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(trade(100), edge); // edge delivers id 7 first at t=100
-        a.emit(trade(175), Publisher::PublicWs); // public's copy loses by 75ns
+        a.emit(trade(100), edge, TEST_CATEGORY); // edge delivers id 7 first at t=100
+        a.emit(trade(175), Publisher::PublicWs, TEST_CATEGORY); // public's copy loses by 75ns
 
         let m = metrics();
         let edge_beats_public = m
@@ -2147,12 +2241,21 @@ mod tests {
         let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Depth(depth(0, vec![], vec![])), pub_a); // A opens tick 0 -> emit
-        a.emit(FeedMessage::Depth(depth(0, vec![], vec![])), pub_b); // B's identical anchor -> dropped
-                                                                     // A real later event re-advances the floor (no wedge from the latched 0 tick).
+        a.emit(
+            FeedMessage::Depth(depth(0, vec![], vec![])),
+            pub_a,
+            TEST_CATEGORY,
+        ); // A opens tick 0 -> emit
+        a.emit(
+            FeedMessage::Depth(depth(0, vec![], vec![])),
+            pub_b,
+            TEST_CATEGORY,
+        ); // B's identical anchor -> dropped
+           // A real later event re-advances the floor (no wedge from the latched 0 tick).
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         );
         assert_eq!(drain_depths(&mut rx), vec![(0, 0.0), (1000, 100.0)]);
     }
@@ -2170,22 +2273,27 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         ); // A leads tick 1000
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B mirror -> dropped
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[99.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B divergent same tick -> still dropped (non-leader)
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[101.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         ); // A's own new content same tick -> kept
         a.emit(
             FeedMessage::Depth(depth(1001, vec![[102.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B opens the next tick -> leads, kept
         assert_eq!(
             drain_depths(&mut rx),
@@ -2204,10 +2312,12 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(2000, vec![[100.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         );
         a.emit(
             FeedMessage::Depth(depth(1999, vec![[99.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // older tick -> stale, dropped
         assert_eq!(drain_depths(&mut rx), vec![(2000, 100.0)]);
     }
@@ -2223,10 +2333,12 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(now + 3_600_000_000_000, vec![[1.0, 1.0]], vec![])),
             edge,
+            TEST_CATEGORY,
         ); // 1h ahead -> rejected
         a.emit(
             FeedMessage::Depth(depth(now, vec![[100.0, 1.0]], vec![])),
             edge,
+            TEST_CATEGORY,
         );
         assert_eq!(drain_depths(&mut rx), vec![(now, 100.0)]);
     }
@@ -2248,8 +2360,8 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         // A opens tick 1000 at t=200; B's copy of the same tick arrives at t=290 -> contest, A led 90.
-        a.emit(mk(200, 100.0), pub_a);
-        a.emit(mk(290, 100.5), pub_b);
+        a.emit(mk(200, 100.0), pub_a, TEST_CATEGORY);
+        a.emit(mk(290, 100.5), pub_b, TEST_CATEGORY);
 
         let m = metrics();
         let a_beats_b = m.depth_lead_ns.with_label_values(&[venue, "edge", "edge"]);
@@ -2274,10 +2386,12 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         ); // A leads tick 1000 -> admitted, recorded
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[99.0, 2.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
         let map = model::lock(&replay);
         let entry = map
@@ -2309,9 +2423,9 @@ mod tests {
         let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);
         a.set_depth_replay(replay.clone());
-        a.emit(mk("VenueA", "BTC"), edge);
-        a.emit(mk("VenueA", "ETH"), edge);
-        a.emit(mk("VenueB", "BTC"), edge);
+        a.emit(mk("VenueA", "BTC"), edge, TEST_CATEGORY);
+        a.emit(mk("VenueA", "ETH"), edge, TEST_CATEGORY);
+        a.emit(mk("VenueB", "BTC"), edge, TEST_CATEGORY);
         assert_eq!(model::lock(&replay).len(), 3);
 
         a.reset_depth_floor_for_symbol("VenueA", "BTC", "instrument_reset");
@@ -2352,10 +2466,10 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk(5000, 100.0), edge); // latches high_water at 5000
-        a.emit(mk(100, 99.0), edge); // post-restart lower tick -> stale, dropped (the wedge)
+        a.emit(mk(5000, 100.0), edge, TEST_CATEGORY); // latches high_water at 5000
+        a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // post-restart lower tick -> stale, dropped (the wedge)
         a.reset_depth_floor_for_venue(venue, "end_of_session");
-        a.emit(mk(100, 99.0), edge); // floor cleared -> re-opens the tick, admitted
+        a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // floor cleared -> re-opens the tick, admitted
         let ts: Vec<u64> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
@@ -2388,11 +2502,11 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk("VenueA", 5000), edge);
-        a.emit(mk("VenueB", 5000), edge);
+        a.emit(mk("VenueA", 5000), edge, TEST_CATEGORY);
+        a.emit(mk("VenueB", 5000), edge, TEST_CATEGORY);
         a.reset_depth_floor_for_venue("VenueA", "end_of_session");
-        a.emit(mk("VenueA", 100), edge); // cleared -> admitted
-        a.emit(mk("VenueB", 100), edge); // untouched -> still stale, dropped
+        a.emit(mk("VenueA", 100), edge, TEST_CATEGORY); // cleared -> admitted
+        a.emit(mk("VenueB", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
@@ -2425,11 +2539,11 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk("BTC", 5000), edge);
-        a.emit(mk("ETH", 5000), edge);
+        a.emit(mk("BTC", 5000), edge, TEST_CATEGORY);
+        a.emit(mk("ETH", 5000), edge, TEST_CATEGORY);
         a.reset_depth_floor_for_symbol("HYPERLIQUID", "BTC", "instrument_reset");
-        a.emit(mk("BTC", 100), edge); // cleared -> admitted
-        a.emit(mk("ETH", 100), edge); // untouched -> still stale, dropped
+        a.emit(mk("BTC", 100), edge, TEST_CATEGORY); // cleared -> admitted
+        a.emit(mk("ETH", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
@@ -2535,19 +2649,41 @@ mod tests {
         let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.0)), edge_a); // edge opens tick 1000
-        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.5)), edge_a); // in-tick content: no re-count
-        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.0)), edge_b); // mirror copy: no count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // edge opens tick 1000
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.5)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // in-tick content: no re-count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
+            edge_b,
+            TEST_CATEGORY,
+        ); // mirror copy: no count
         a.emit(
             FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // late public copy: no count
         a.emit(
             FeedMessage::Quote(quote_at(venue, 2000, 101.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // public opens tick 2000
-        a.emit(FeedMessage::Quote(quote_at(venue, 3000, 102.0)), edge_a); // walkover tick 3000
-        a.emit(FeedMessage::Quote(quote_at(venue, 0, 99.0)), edge_a); // sentinel: bypass, no count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 3000, 102.0)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // walkover tick 3000
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 0, 99.0)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // sentinel: bypass, no count
         let m = crate::metrics::metrics();
         assert_eq!(
             m.quote_ticks_won.with_label_values(&[venue, "edge"]).get(),
@@ -2575,15 +2711,25 @@ mod tests {
         let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Depth(depth_at(0, vec![])), edge_a); // A's empty anchor opens tick 0
-        a.emit(FeedMessage::Depth(depth_at(0, vec![])), edge_b); // B's identical anchor: no re-count
+        a.emit(
+            FeedMessage::Depth(depth_at(0, vec![])),
+            edge_a,
+            TEST_CATEGORY,
+        ); // A's empty anchor opens tick 0
+        a.emit(
+            FeedMessage::Depth(depth_at(0, vec![])),
+            edge_b,
+            TEST_CATEGORY,
+        ); // B's identical anchor: no re-count
         a.emit(
             FeedMessage::Depth(depth_at(1000, vec![[100.0, 1.0]])),
             edge_b,
+            TEST_CATEGORY,
         ); // B opens tick 1000
         a.emit(
             FeedMessage::Depth(depth_at(2000, vec![[100.0, 2.0]])),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // public opens tick 2000
         let m = crate::metrics::metrics();
         assert_eq!(
@@ -2672,12 +2818,12 @@ mod tests {
         let peer = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(instrument(1, "BTC", -2, -4), edge);
-        a.emit(instrument(1, "BTC", -2, -4), edge); // same publisher's next burst -> dropped
-        a.emit(instrument(1, "BTC", -2, -4), peer); // mirror's copy -> dropped
-        a.emit(instrument(2, "ETH", -2, -4), edge); // different symbol -> kept
-        a.emit(instrument(1, "BTC", -3, -4), peer); // real precision change -> kept
-        a.emit(instrument(1, "BTC", -3, -4), edge); // ...then deduped at the new content
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY); // same publisher's next burst -> dropped
+        a.emit(instrument(1, "BTC", -2, -4), peer, TEST_CATEGORY); // mirror's copy -> dropped
+        a.emit(instrument(2, "ETH", -2, -4), edge, TEST_CATEGORY); // different symbol -> kept
+        a.emit(instrument(1, "BTC", -3, -4), peer, TEST_CATEGORY); // real precision change -> kept
+        a.emit(instrument(1, "BTC", -3, -4), edge, TEST_CATEGORY); // ...then deduped at the new content
         assert_eq!(
             drain_instruments(&mut rx),
             vec![
@@ -2697,22 +2843,22 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(instrument(1, "BTC", -2, -4), edge);
-        a.emit(instrument(1, "BTC", -2, -4), edge); // inside the interval -> collapsed
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY); // inside the interval -> collapsed
         assert_eq!(drain_instruments(&mut rx).len(), 1);
 
         // Backdate the last-broadcast stamp past the interval rather than sleeping 30s.
         for (_, last) in a.instrument_defs.values_mut() {
             *last = last.saturating_sub(INSTRUMENT_REANNOUNCE_NS);
         }
-        a.emit(instrument(1, "BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
         assert_eq!(
             drain_instruments(&mut rx),
             vec![("BTC".to_string(), -2, -4)],
             "unchanged content must be re-announced once the interval elapses"
         );
         // ...and the clock restarts, so the next mirror copy collapses again.
-        a.emit(instrument(1, "BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
         assert!(drain_instruments(&mut rx).is_empty());
     }
 
@@ -2783,6 +2929,7 @@ mod tests {
         a.emit(
             book(venue, instrument_id, vec![clear_both()], true, recv_ns),
             publisher,
+            TEST_CATEGORY,
         );
     }
 
@@ -2818,8 +2965,8 @@ mod tests {
             t.recv_ts_ns = 10_000 + i * 1_000_000;
             let mut peer = t.clone();
             peer.recv_ts_ns = t.recv_ts_ns + 50_000;
-            a.emit(FeedMessage::Trade(t), fast);
-            a.emit(FeedMessage::Trade(peer), slow);
+            a.emit(FeedMessage::Trade(t), fast, TEST_CATEGORY);
+            a.emit(FeedMessage::Trade(peer), slow, TEST_CATEGORY);
         }
     }
 
@@ -2847,10 +2994,12 @@ mod tests {
             a.emit(
                 book("KALSHI", BOOK_INSTRUMENT, vec![bid(px, 10.0)], true, 1_100),
                 arm(1),
+                TEST_CATEGORY,
             );
             a.emit(
                 book("KALSHI", BOOK_INSTRUMENT, vec![bid(px, 99.0)], true, 1_101),
                 arm(2),
+                TEST_CATEGORY,
             );
         }
         let out = drain_books(&mut rx);
@@ -2878,6 +3027,7 @@ mod tests {
                         1_100,
                     ),
                     p,
+                    TEST_CATEGORY,
                 );
             }
         }
@@ -2894,12 +3044,20 @@ mod tests {
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         for id in [42, 43] {
             // The challenger speaks first for a market the leader has never sent for.
-            a.emit(book(venue, id, vec![bid(0.40, 99.0)], true, 1_100), arm(2));
+            a.emit(
+                book(venue, id, vec![bid(0.40, 99.0)], true, 1_100),
+                arm(2),
+                TEST_CATEGORY,
+            );
             assert!(
                 drain_books(&mut rx).is_empty(),
                 "market {id}: a challenger must not take a market by getting there first"
             );
-            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_101), arm(1));
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_101),
+                arm(1),
+                TEST_CATEGORY,
+            );
             // A market's first admitted batch re-baselines too, and this arm has sent no producer
             // re-baseline for it, so the honest re-baseline is a bare clear ahead of the batch.
             let out = drain_books(&mut rx);
@@ -2922,10 +3080,12 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 99.0)], true, 1_101),
             arm(2),
+            TEST_CATEGORY,
         );
         let guard = model::lock(&replay);
         let acc = guard
@@ -2949,6 +3109,7 @@ mod tests {
             a.emit(
                 book(venue, BOOK_INSTRUMENT, vec![bid(0.40, size)], true, 1_100),
                 arm(1),
+                TEST_CATEGORY,
             );
         }
         assert_eq!(
@@ -2980,10 +3141,12 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
             arm(2),
+            TEST_CATEGORY,
         );
         assert_eq!(drain_books(&mut rx).len(), 1);
 
@@ -2994,6 +3157,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 11.0)], true, 2_000),
             arm(1),
+            TEST_CATEGORY,
         );
         assert!(
             drain_books(&mut rx).is_empty(),
@@ -3003,6 +3167,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 66.0)], true, 2_100),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(out.len(), 1, "one re-baseline, not a batch plus a clear");
@@ -3034,10 +3199,12 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
             arm(2),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
 
@@ -3045,6 +3212,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 66.0)], true, 1_200),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(out.len(), 1);
@@ -3071,6 +3239,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
         a.set_book_health(&key, arm(1), false);
@@ -3078,6 +3247,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 20.0)], false, 1_200),
             arm(2),
+            TEST_CATEGORY,
         );
         assert!(
             drain_books(&mut rx).is_empty(),
@@ -3086,6 +3256,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 30.0)], true, 1_201),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(out.len(), 1);
@@ -3107,6 +3278,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
         a.set_book_health(&key, arm(1), false);
@@ -3121,6 +3293,7 @@ mod tests {
                     1_200,
                 ),
                 arm(2),
+                TEST_CATEGORY,
             );
         }
         let out = drain_books(&mut rx);
@@ -3146,6 +3319,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_100),
             arm(2),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
 
@@ -3153,6 +3327,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 66.0)], true, 1_200),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(
@@ -3190,7 +3365,7 @@ mod tests {
         for n in 20..40u8 {
             let mut t = trade(u64::from(n));
             t.venue = venue.into();
-            a.emit(FeedMessage::Trade(t), arm(n));
+            a.emit(FeedMessage::Trade(t), arm(n), TEST_CATEGORY);
         }
         a.close_authority_windows();
         for n in 20..40u8 {
@@ -3220,6 +3395,7 @@ mod tests {
         a.emit(
             book(venue, 777, vec![bid(0.40, 10.0)], true, 1_100),
             arm(200),
+            TEST_CATEGORY,
         );
         assert_eq!(a.book_markets.len(), before, "no market was tracked for it");
     }
@@ -3238,7 +3414,7 @@ mod tests {
         let mut t = trade(id);
         t.venue = venue.into();
         t.recv_ts_ns = recv_ts_ns;
-        a.emit(FeedMessage::Trade(t), p);
+        a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
     }
 
     fn drain_trades(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> usize {
@@ -3310,6 +3486,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
         let _ = drain_books(&mut rx);
@@ -3353,6 +3530,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
         let _ = drain_books(&mut rx);
@@ -3384,6 +3562,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         tape_print(&mut a, venue, arm(2), 0, 2_000); // opens the tape
         tape_print(&mut a, venue, arm(1), 0, 2_001); // the elected arm takes it over
@@ -3391,6 +3570,59 @@ mod tests {
             tape_print(&mut a, venue, arm(1), 0, 2_002 + i);
         }
         assert_eq!(conflicts.get(), before);
+    }
+
+    /// An `Arbiter` whose one `Sticky` venue is the venue both category tests print under. No book
+    /// traffic, so the authority elects nobody and the tape gate is on its own — the shape of a
+    /// deployment where one Source ID carries two universes.
+    fn arbiter() -> Arbiter {
+        let (tx, _rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_mode("KALSHI", ArbitrationMode::Sticky);
+        a
+    }
+
+    /// One print from `p` for `(venue, category)`, returning whether it reached the wire. The
+    /// receiver is subscribed immediately before the emit, so it observes this print alone.
+    fn tape_print_in(
+        a: &mut Arbiter,
+        venue: &str,
+        category: &'static str,
+        p: Publisher,
+        id: u64,
+        recv_ts_ns: u64,
+    ) -> bool {
+        let mut rx = a.sender().subscribe();
+        let mut t = trade(id);
+        t.venue = venue.into();
+        t.recv_ts_ns = recv_ts_ns;
+        a.emit(FeedMessage::Trade(t), p, category);
+        matches!(rx.try_recv(), Ok(m) if matches!(&*m, FeedMessage::Trade(_)))
+    }
+
+    /// The arm gate is per `(venue, category)`. Two publishers on disjoint universes are not
+    /// competing for one tape, so neither may mute the other — a venue-wide gate drops the
+    /// loser's prints forever, since a continuously-printing incumbent never goes silent.
+    #[test]
+    fn an_arm_on_another_category_does_not_take_the_tape() {
+        let mut a = arbiter();
+        tape_print_in(&mut a, "KALSHI", "perps", arm(1), 1, 1_000);
+        let admitted = tape_print_in(&mut a, "KALSHI", "sports", arm(2), 2, 1_001);
+        assert!(
+            admitted,
+            "a sports print was dropped by the perps tape leader"
+        );
+        // ...and the perps arm keeps its own tape rather than being displaced by the sports arm.
+        assert!(tape_print_in(&mut a, "KALSHI", "perps", arm(1), 3, 1_002));
+    }
+
+    /// Within one category the sticky single-arm gate is unchanged: the second arm is dropped
+    /// while the incumbent keeps printing.
+    #[test]
+    fn a_peer_arm_in_the_same_category_is_still_dropped() {
+        let mut a = arbiter();
+        assert!(tape_print_in(&mut a, "KALSHI", "perps", arm(1), 1, 1_000));
+        assert!(!tape_print_in(&mut a, "KALSHI", "perps", arm(2), 2, 1_001));
     }
 
     /// The gate is `Sticky`-only, so every `Coordinated` venue keeps the id-keyed behaviour: two arms'
@@ -3417,6 +3649,7 @@ mod tests {
             a.emit(
                 book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 99.0)], true, 1_100),
                 arm(2),
+                TEST_CATEGORY,
             );
         }
         assert_eq!(dropped.get(), before + 3);
@@ -3433,7 +3666,11 @@ mod tests {
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
         for id in 0..(MAX_BOOK_MARKETS as u32 + 64) {
-            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_000), arm(1));
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_000),
+                arm(1),
+                TEST_CATEGORY,
+            );
         }
         assert_eq!(a.book_markets.len(), MAX_BOOK_MARKETS);
         assert_eq!(a.book_order.len(), MAX_BOOK_MARKETS);
@@ -3466,6 +3703,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         assert_eq!(
             drain_books(&mut rx)[0].changes[0].action,
@@ -3484,7 +3722,11 @@ mod tests {
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         let fresh: MarketKey = (Arc::from(venue), BOOK_CHANNEL, 999);
         a.set_book_health(&fresh, arm(1), false);
-        a.emit(book(venue, 999, vec![bid(0.40, 10.0)], true, 1_100), arm(1));
+        a.emit(
+            book(venue, 999, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+            TEST_CATEGORY,
+        );
         assert!(
             drain_books(&mut rx).is_empty(),
             "an arm known gapped here must not serve this market"
@@ -3515,8 +3757,8 @@ mod tests {
             t.recv_ts_ns = 10_000 + i * 1_000_000;
             let mut peer = t.clone();
             peer.recv_ts_ns = t.recv_ts_ns + 50_000;
-            a.emit(FeedMessage::Trade(t), arm(2));
-            a.emit(FeedMessage::Trade(peer), arm(1));
+            a.emit(FeedMessage::Trade(t), arm(2), TEST_CATEGORY);
+            a.emit(FeedMessage::Trade(peer), arm(1), TEST_CATEGORY);
         }
         a.close_authority_windows();
         assert_eq!(

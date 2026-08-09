@@ -113,6 +113,12 @@ pub struct FrameCtx<'a> {
     /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
     /// venue ultimately comes from the `&'static` `FEEDS` registry.
     pub venue: &'static str,
+    /// The instrument **universe** this receiver's row carries (`Feed::category`), passed straight
+    /// through to the arbiter on every emit. Carried here rather than derived from the message
+    /// because it is a property of the row, and rows sharing a venue can carry universes that
+    /// mirror nothing: without it the arbiter's tape gate elects one arm across both and drops the
+    /// other universe's prints for good.
+    pub category: &'static str,
     /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
     pub arbiter: &'a SharedArbiter,
     pub instruments: &'a InstrumentSnapshot,
@@ -143,7 +149,7 @@ impl FrameCtx<'_> {
     pub fn emit(&self, msg: FeedMessage) {
         let (wire_venue, _) = msg.venue_symbol();
         record_revealed(self.venue, wire_venue);
-        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher));
+        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher), self.category);
     }
 }
 
@@ -629,6 +635,7 @@ async fn drive<P: FrameProcessor>(
     iface: String,
     recv_buf: usize,
     venue: &'static str,
+    category: &'static str,
     kind: FeedKind,
     publisher_port: u16,
     arbiter: SharedArbiter,
@@ -695,7 +702,7 @@ async fn drive<P: FrameProcessor>(
             ReceiverRegistration::new(
                 health.clone(),
                 arbiter.clone(),
-                (venue, kind, publisher_port),
+                (venue, category, kind, publisher_port),
                 m.receiver_up
                     .with_label_values(&[venue, kind_label, publisher_name]),
             )
@@ -762,6 +769,7 @@ async fn drive<P: FrameProcessor>(
 
             let ctx = FrameCtx {
                 venue,
+                category,
                 arbiter: &arbiter,
                 instruments: &instruments,
                 kernel_rx_ts_ns: kernel_ns,
@@ -811,6 +819,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
@@ -828,6 +837,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
@@ -861,6 +871,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
@@ -894,6 +905,7 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
@@ -924,7 +936,7 @@ mod tests {
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
         let health = FeedHealth::new();
-        health.register((venue, FeedKind::TopOfBook, 9101), |_| {});
+        health.register((venue, "testcategory", FeedKind::TopOfBook, 9101), |_| {});
         init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
@@ -1053,6 +1065,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let ctx = FrameCtx {
             venue: row_venue,
+            category: "testcategory",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -1109,7 +1122,7 @@ mod tests {
 
         let (arbiter, mut rx) = test_arbiter();
         let health = FeedHealth::new();
-        let key = (row_venue, FeedKind::TopOfBook, 9101);
+        let key = (row_venue, "testcategory", FeedKind::TopOfBook, 9101);
         let up_gauge = metrics()
             .receiver_up
             .with_label_values(&[row_venue, "tob", "9101"]);

@@ -896,7 +896,7 @@ mod tests {
             ("HYPERLIQUID".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
-        health.register(("HYPERLIQUID", FeedKind::TopOfBook, 9001), |_| {});
+        health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
 
         let base = spawn(instruments, depth, books, history, health).await;
         let resp = reqwest::get(format!("{base}/v1/products")).await.unwrap();
@@ -1008,6 +1008,7 @@ mod tests {
         let publisher = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
         let ctx = |role: PortRole| FrameCtx {
             venue: "TestLashay",
+            category: "testcategory",
             arbiter: &arbiter,
             instruments,
             kernel_rx_ts_ns: 0,
@@ -1651,7 +1652,7 @@ mod tests {
             ("PHOENIX".into(), 0u32, 7u32),
             inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
-        health.register(("PHOENIX", FeedKind::TopOfBook, 9201), |_| {});
+        health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
 
         let base = spawn(instruments, depth, books, history, health).await;
         let resp = reqwest::get(format!("{base}/v1/products/PHOENIX:SOL"))
@@ -1834,7 +1835,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_venue_health_and_history_counters() {
         let (instruments, depth, books, history, health) = empty_state();
-        health.register(("HYPERLIQUID", FeedKind::TopOfBook, 9001), |_| {});
+        health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
         {
             let mut store = history.lock().unwrap();
             let now = crate::model::now_ns() / 1_000_000_000;
