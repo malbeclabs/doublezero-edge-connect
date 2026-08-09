@@ -37,7 +37,7 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         feeds::{Feed, FeedKind},
-        health::{FeedHealth, SharedFeedHealth},
+        health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver,
         subscriptions::{self, Detected, HostSubs},
     },
@@ -81,24 +81,30 @@ pub fn tape_rank_is_some(kind: FeedKind) -> bool {
 
 /// The tape-owning feed row per venue over a set of running receivers.
 ///
-/// Ordered `(down, rank, base port)`, lowest wins: **liveness before rank**, base port breaking a tie
-/// so the result never depends on iteration order. Rank alone would let a subscribed-but-dead row
-/// hold the tape indefinitely while its peer decodes prints and drops them — the group being
-/// subscribed and a publisher actually sending to it are independent facts, which is the normal state
-/// during a rollout. `down` is the *registered and down* set only, never "not registered yet": a
-/// receiver spawned this tick has not bound its sockets, and demoting it would bounce the tape on
-/// every activation. With every row down the ordering falls back to rank, so nothing changes at
-/// startup.
+/// Ordered `(liveness, rank, base port)`, lowest wins: **liveness before rank**, base port breaking
+/// a tie so the result never depends on iteration order. Rank alone would let a subscribed-but-dead
+/// row hold the tape indefinitely while its peer decodes prints and drops them — the group being
+/// subscribed and a publisher actually sending to it are independent facts, which is the normal
+/// state during a rollout.
+///
+/// Liveness is [`TapeLiveness`], three states rather than a `down` flag, because this ranks over
+/// `desired` — which includes rows not yet spawned — while registration only follows a successful
+/// socket bind. A row that can never bind (the tunnel IP disappearing between resolve and join, say)
+/// returns `Err`, is reaped and respawned every tick without ever registering; treated as live it
+/// would hold rank 0 forever and mute the venue's tape while `status` still read healthy off the
+/// peer that is actually streaming. `Unregistered` therefore ranks below `Up` — an incumbent keeps
+/// the tape until the newcomer really registers — but above `Down`, so a cold start where nothing
+/// has bound yet still falls back to rank instead of leaving the venue with no owner.
 pub fn tape_owners(
     active: impl IntoIterator<Item = FeedKey>,
-    down: impl Fn(&FeedKey) -> bool,
+    liveness: impl Fn(&FeedKey) -> TapeLiveness,
 ) -> HashMap<&'static str, FeedKey> {
-    let mut best: HashMap<&'static str, ((bool, u8, u16), FeedKey)> = HashMap::new();
+    let mut best: HashMap<&'static str, ((TapeLiveness, u8, u16), FeedKey)> = HashMap::new();
     for key in active {
         let Some(rank) = tape_rank(key.1) else {
             continue;
         };
-        let order = (down(&key), rank, key.2);
+        let order = (liveness(&key), rank, key.2);
         match best.get(key.0) {
             Some(&(cur, _)) if cur <= order => {}
             _ => {
@@ -352,7 +358,7 @@ impl Reconciler {
         // off before its replacement is switched on, for the same reason as the abort above — and
         // each spawn then starts with the flag it will hold, so activating a feed is not also
         // counted as a tape *change*.
-        let owners = tape_owners(desired.iter().copied(), |k| self.health.is_down(k));
+        let owners = tape_owners(desired.iter().copied(), |k| self.health.liveness(k));
         self.publish_tape_owners(&owners);
         for key in to_spawn {
             let (feed, publisher) = self
@@ -575,9 +581,9 @@ mod tests {
     const MBP: FeedKind = FeedKind::MarketByPrice;
     const MBO: FeedKind = FeedKind::MarketByOrder;
 
-    /// The steady state: nothing registered down.
-    fn all_live(_: &FeedKey) -> bool {
-        false
+    /// The steady state: every row registered and up.
+    fn all_live(_: &FeedKey) -> TapeLiveness {
+        TapeLiveness::Up
     }
 
     /// Both of a venue's rows claim the tape, so with both up the ranking must pick one — top of
@@ -639,23 +645,86 @@ mod tests {
     #[test]
     fn a_dead_row_yields_the_tape_to_a_live_peer() {
         let keys = [("V", TOB, 7576), ("V", MBP, 31000)];
-        let owners = tape_owners(keys, |k| k.1 == TOB);
+        let owners = tape_owners(keys, |k| {
+            if k.1 == TOB {
+                TapeLiveness::Down
+            } else {
+                TapeLiveness::Up
+            }
+        });
         assert!(owns(&owners, &("V", MBP, 31000)));
         assert!(!owns(&owners, &("V", TOB, 7576)));
 
-        let both_down = tape_owners(keys, |_| true);
+        let both_down = tape_owners(keys, |_| TapeLiveness::Down);
         assert!(owns(&both_down, &("V", TOB, 7576)), "falls back to rank");
     }
 
-    /// One live publisher makes its row live: `down` is per receiver but ownership is per row.
+    /// One live publisher makes its row live: liveness is per receiver but ownership is per row.
     #[test]
     fn one_live_publisher_keeps_the_row_owning() {
         let owners = tape_owners(
             [("V", TOB, 7576), ("V", TOB, 7676), ("V", MBP, 31000)],
-            |k| *k == ("V", TOB, 7576),
+            |k| {
+                if *k == ("V", TOB, 7576) {
+                    TapeLiveness::Down
+                } else {
+                    TapeLiveness::Up
+                }
+            },
         );
         assert!(owns(&owners, &("V", TOB, 7676)));
         assert!(!owns(&owners, &("V", MBP, 31000)));
+    }
+
+    /// **The mute.** `tape_owners` ranks over `desired`, which includes rows not yet spawned, while
+    /// registration only happens after every socket binds. A row whose `bind_multicast` /
+    /// `join_multicast_v4` fails returns `Err`, is reaped, and respawns every tick **without ever
+    /// registering** — so its key never becomes registered-and-down and, ranked as if live, it held
+    /// rank 0 forever. Meanwhile `publish_tape_owners` cleared the streaming peer's flag every tick:
+    /// no `trade` reached the wire for the venue at all, indefinitely, while `status`/`dz_feed_up`
+    /// still read healthy off that peer.
+    #[test]
+    fn a_never_registered_row_cannot_take_the_tape_from_a_live_peer() {
+        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], |k| {
+            if k.1 == TOB {
+                TapeLiveness::Unregistered
+            } else {
+                TapeLiveness::Up
+            }
+        });
+        assert!(
+            owns(&owners, &("V", MBP, 31000)),
+            "the streaming row keeps the tape until the newcomer actually registers"
+        );
+        assert!(!owns(&owners, &("V", TOB, 7576)));
+    }
+
+    /// The property the three-state ordering must not break, and why "not registered yet" is not
+    /// simply folded into `Down`: at cold start no row has bound its sockets, so every row is
+    /// unregistered and the ordering has to fall back to rank. Demoting an unregistered row below a
+    /// registered one unconditionally would leave a fresh process with no tape owner at all.
+    #[test]
+    fn a_cold_start_falls_back_to_rank() {
+        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], |_| {
+            TapeLiveness::Unregistered
+        });
+        assert!(owns(&owners, &("V", TOB, 7576)));
+    }
+
+    /// An incumbent that registered and then went down is worse than a newcomer that has not
+    /// reported yet: the incumbent is known not to be delivering, while the newcomer may be about
+    /// to. Neither is serving prints, so this only decides which row is holding the flag when data
+    /// resumes — but it keeps the ordering a total one.
+    #[test]
+    fn an_unregistered_row_outranks_a_registered_dead_one() {
+        let owners = tape_owners([("V", TOB, 7576), ("V", MBP, 31000)], |k| {
+            if k.1 == TOB {
+                TapeLiveness::Unregistered
+            } else {
+                TapeLiveness::Down
+            }
+        });
+        assert!(owns(&owners, &("V", TOB, 7576)));
     }
 
     /// Distinct publishers of the same feed must not collide in the active-task map.

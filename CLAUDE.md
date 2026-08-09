@@ -154,10 +154,14 @@ Modules are grouped by role under `src/`:
   print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
   and reference data whenever a *peer* feed's subscription changed. The flag is stored **with** the
   `JoinHandle` in one `active` map so it cannot outlive its receiver on either the abort or the reap
-  path, and ownership is ordered **liveness before rank** (`FeedHealth::is_down` — a subscribed-but-
-  dead row must not hold the tape while its peer decodes prints and drops them; "not registered yet"
-  is not down, or activating a feed would bounce the tape). Changes are counted by
-  `dz_tape_owner_changes_total{venue}`.
+  path, and ownership is ordered **liveness before rank** (`FeedHealth::liveness` → `TapeLiveness`,
+  three states: a subscribed-but-dead row must not hold the tape while its peer decodes prints and
+  drops them, and a row that never *registers* must not either — registration follows the socket
+  bind, so a row that can never bind respawns every tick and, ranked as live, would hold rank 0
+  forever and mute the venue. `Unregistered` therefore sits **between** `Up` and `Down`: below a live
+  row, so an incumbent keeps the tape until the newcomer really registers rather than bouncing on
+  activation; above a dead one, so a cold start where nothing has bound falls back to rank instead of
+  leaving the venue ownerless). Changes are counted by `dz_tape_owner_changes_total{venue}`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**

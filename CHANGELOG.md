@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which clears the book — destroying the **live** book on the `Ready`-rebuild path and dropping the
   market to `AwaitingSnapshot` until the next rotation. A begin differing in any identifying field is
   still a new rotation and still replaces the group under assembly.
+- Trade-tape ownership now ranks over the **registered** receiver set rather than the desired one.
+  Registration follows a successful socket bind, so a row that can never bind returned `Err`, was
+  reaped and respawned every tick without ever registering — and, ranked as if live, held rank 0
+  indefinitely while `publish_tape_owners` cleared the streaming peer's flag each tick, so no `trade`
+  reached the wire for the venue at all while `status` and `dz_feed_up` still read healthy. Liveness
+  is now three-state: "not registered yet" ranks below a live row (an incumbent keeps the tape until
+  the newcomer really registers) but above a registered-and-dead one, so a cold start where nothing
+  has bound still falls back to feed-kind rank.
 - **Breaking:** a message is emitted for an instrument only once its Source ID has been observed. A
   publisher whose reference data carries no Source ID of its own can only reveal it through a price
   message, so an instrument that has received a definition but no price produces nothing at all, and

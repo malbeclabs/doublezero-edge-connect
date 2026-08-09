@@ -26,6 +26,24 @@ use crate::ingest::feeds::FeedKind;
 /// Identity of one receiver: `(venue, kind, base port)`. Same shape as `reconcile::FeedKey`.
 pub type ReceiverKey = (&'static str, FeedKind, u16);
 
+/// A receiver's liveness for the purpose of tape ownership, **ordered best first**: the derived
+/// `Ord` is what `reconcile::tape_owners` sorts on ahead of feed-kind rank, so the variant order
+/// here is load-bearing and not cosmetic.
+///
+/// `Unregistered` sits between the two on purpose. It is not `Up` — a row that never binds must not
+/// outrank the peer that is streaming — and it is not `Down` either, or a cold start (where nothing
+/// has bound yet) would demote every row at once and the fallback to rank would never happen. See
+/// [`FeedHealth::liveness`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TapeLiveness {
+    /// Registered and delivering.
+    Up,
+    /// Never registered: spawned but its sockets have not bound yet, or they never will.
+    Unregistered,
+    /// Registered and known silent.
+    Down,
+}
+
 /// Whether a receiver of this protocol counts toward the venue-level `status` / `dz_feed_up`.
 ///
 /// PROTOCOL.md's `status` is the health of the venue's **quote** stream (`stale_ms` is documented as
@@ -150,14 +168,22 @@ impl FeedHealth {
         venue_up_in(&self.lock(), venue)
     }
 
-    /// Whether this receiver is registered **and currently down** — what the reconciler's tape
-    /// ownership demotes on.
+    /// This receiver's liveness as the reconciler's tape ownership orders it — a **three**-state
+    /// answer, because "registered and down" and "never registered" are different facts and
+    /// collapsing either into the other breaks a different case.
     ///
-    /// Deliberately not the negation of "up": a receiver spawned this tick has not registered yet
-    /// (registration follows the socket bind), and demoting it would bounce the tape to a peer row on
-    /// every activation and back on the next tick.
-    pub fn is_down(&self, key: &ReceiverKey) -> bool {
-        self.lock().up.get(key) == Some(&false)
+    /// Folding `Unregistered` into `Up` (what a plain `is_down` did) lets a receiver that never
+    /// binds hold rank 0 forever: it returns `Err`, is reaped and respawned every tick without ever
+    /// registering, so its key never becomes `Some(false)` while it outranks the peer that is
+    /// actually streaming — and the venue's tape goes silent indefinitely. Folding it into `Down`
+    /// instead bounces the tape on every activation, and leaves a cold start — where no row has
+    /// bound yet — with no owner at all.
+    pub fn liveness(&self, key: &ReceiverKey) -> TapeLiveness {
+        match self.lock().up.get(key) {
+            Some(true) => TapeLiveness::Up,
+            Some(false) => TapeLiveness::Down,
+            None => TapeLiveness::Unregistered,
+        }
     }
 
     /// Record `key`'s liveness, publishing the venue edge if the aggregate flipped — so one
