@@ -1801,6 +1801,40 @@ impl MbpProcessor {
         }
     }
 
+    /// Drop every trace of `publisher` — the sibling of [`MboProcessor::forget_publisher`], called
+    /// only from the [`PerPublisher::take_evicted`] drain.
+    ///
+    /// MBP carries more per-publisher state than its siblings, and all of it is derived from the
+    /// reference data that was just evicted: the books keyed `(publisher, channel, instrument)`,
+    /// their `revealed`/`announced_symbol`/`health_reported` companions, and the per-`(publisher,
+    /// channel)` snapshot group and reset-count memos. Leaving any of it behind would strand a book
+    /// whose definition is gone — `exponents` can no longer resolve, so it can never emit again, but
+    /// it still holds its buffered deltas against [`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`] and its slot
+    /// against [`MAX_PRICE_BOOKS`]. Routed through [`Self::forget_book`] so `buffered_total` stays
+    /// in step, exactly as every other book-dropping path does.
+    fn forget_publisher(&mut self, publisher: IpAddr) {
+        let keys: Vec<PriceBookKey> = self
+            .books
+            .keys()
+            .filter(|(p, _, _)| *p == publisher)
+            .copied()
+            .collect();
+        for key in keys {
+            self.forget_book(&key);
+        }
+        self.books_order.retain(|(p, _, _)| *p != publisher);
+        // `forget_book` only clears an `open` group whose instrument matches the book it dropped; a
+        // group open for an instrument that never got a book needs this sweep.
+        self.open.retain(|(p, _), _| *p != publisher);
+        self.last_reset.retain(|(p, _), _| *p != publisher);
+        self.channel_order.retain(|(p, _)| *p != publisher);
+        // Belt and braces: `forget_book` already removed these for every key that had a book, but a
+        // reveal without a surviving book must not leave an orphan behind.
+        self.revealed.retain(|(p, _, _), _| *p != publisher);
+        self.announced_symbol.retain(|(p, _, _), _| *p != publisher);
+        self.health_reported.retain(|(p, _, _), _| *p != publisher);
+    }
+
     /// Run `f` against one book, keeping [`Self::buffered_total`] in step with that book's buffer.
     /// **Every** path that can change a buffer must go through here.
     fn with_book<R>(
@@ -2043,8 +2077,20 @@ impl FrameProcessor for MbpProcessor {
         // protocol-agnostic and would have to decode a header it has no magic for.
         let channel = header.channel_id;
 
-        if ctx.role.handles_refdata() {
+        let handle_refdata = ctx.role.handles_refdata();
+
+        if handle_refdata {
             self.state.get(ctx.publisher).on_frame(header.reset_count);
+            // The only `get()` this function makes that can evict a publisher: the
+            // `ManifestSummary`/`InstrumentDefinition` arms below are gated on this same
+            // `handle_refdata`, so they land on a publisher already inserted here and never
+            // trigger a fresh eviction of their own. Draining here is what keeps the derived
+            // per-publisher maps (`books`/`revealed`/`announced_symbol`/`open`/`last_reset`) from
+            // outliving the reference data they are meaningless without — see
+            // [`Self::forget_publisher`], and `MboProcessor`'s identical drain.
+            if let Some(evicted) = self.state.take_evicted() {
+                self.forget_publisher(evicted);
+            }
         }
         // §4.9: a reset is any CHANGE of `Reset Count` — `!=`, never `>`, so the `255 -> 0` wrap is
         // not silently ignored while deltas keep applying against discarded publisher state.
@@ -2085,7 +2131,7 @@ impl FrameProcessor for MbpProcessor {
 
         for msg in messages {
             match msg {
-                codec_mbp::Message::ManifestSummary(m) => {
+                codec_mbp::Message::ManifestSummary(m) if handle_refdata => {
                     // Same TEMP WORKAROUND as the sibling processors: a live publisher emitting
                     // `Valid=0` would keep `RefDataState` from ever resolving a definition, and
                     // every emission path gates on one — so the whole venue would go dark. Force
@@ -2104,7 +2150,7 @@ impl FrameProcessor for MbpProcessor {
                         m.instrument_count,
                     );
                 }
-                codec_mbp::Message::InstrumentDefinition(d) => {
+                codec_mbp::Message::InstrumentDefinition(d) if handle_refdata => {
                     // A v1 `InstrumentDefinition` carries no wire Source ID; deferred until the
                     // first `LevelUpdate`/`BookClear`/`Trade` reveals one (see `reveal_if_needed`).
                     // A v3 definition carries its own (`d.source_id`) and is named below, right
@@ -2504,6 +2550,11 @@ impl FrameProcessor for MbpProcessor {
                     }
                 }
                 codec_mbp::Message::Heartbeat(_) | codec_mbp::Message::Other(_) => {}
+                // Match guards don't count toward exhaustiveness, so this also catches
+                // `ManifestSummary`/`InstrumentDefinition` on a role that doesn't handle refdata
+                // (their guarded arms above fell through) — the same silent drop the
+                // `handle_refdata`-gated arms get in the three sibling processors.
+                _ => {}
             }
         }
 
@@ -5354,6 +5405,137 @@ mod tests {
         );
     }
 
+    /// `ManifestSummary`/`InstrumentDefinition` must be gated on `handle_refdata` exactly like the
+    /// three sibling processors' arms. Decode does not care what physical port a message type
+    /// arrives on, so before the gate one forged datagram to the **market-data** port — source IP
+    /// spoofed to the real publisher's, carrying `ManifestSummary { manifest_seq: latest + 1 }` —
+    /// reached `RefDataState::on_manifest` and cleared `defs`. Every MBP emission path gates on a
+    /// resolved definition (`ensure_book`/`send_book`/`exponents`), so the venue's `book` and tape
+    /// go dark until the next refdata burst.
+    #[test]
+    fn mbp_forged_manifest_on_the_mktdata_port_cannot_clear_definitions() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let _ = drain_books(&mut rx);
+
+        // The attacker's frame: same publisher IP, same channel, a manifest one seq ahead of the
+        // real one, delivered to the market-data port.
+        let forged = mbp_wire::frame(
+            0,
+            0,
+            50,
+            &[mbp_wire::enc_manifest_summary(
+                &codec_mbp::ManifestSummary {
+                    channel_id: 0,
+                    valid: true,
+                    manifest_seq: 2,
+                    instrument_count: 1,
+                    ts: 0,
+                },
+            )],
+        );
+        proc.on_datagram(
+            &forged,
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert!(
+            !drain_books(&mut rx).is_empty(),
+            "a refdata-shaped message on the market-data port must not clear the publisher's \
+             definitions — the venue's book would go dark until the next refdata burst"
+        );
+    }
+
+    /// The bounding half of the same gate, mirroring
+    /// `mbo_manifest_burst_via_mktdata_port_does_not_leak_pending_channel`: a role that does not
+    /// handle reference data must process no reference-data message at all, so a forged-source
+    /// burst to the market-data port mints no `PerPublisher` state whatsoever.
+    #[test]
+    fn mbp_manifest_burst_via_mktdata_port_mints_no_refdata_state() {
+        use super::MAX_PUBLISHERS;
+
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+
+        let burst = mbp_wire::frame(0, 0, 1, &mbp_refdata(&[0]));
+        for i in 0..(MAX_PUBLISHERS as u32) + 50 {
+            let mut ctx = mbp_ctx("MBPFORGE", &arbiter, &instruments, PortRole::Mktdata);
+            ctx.publisher = ip(i);
+            proc.on_datagram(&burst, &ctx);
+        }
+
+        assert!(
+            proc.state.states.is_empty(),
+            "a role that doesn't handle refdata must mint NO per-publisher state, got {}",
+            proc.state.states.len()
+        );
+    }
+
+    /// `PerPublisher` evicts the oldest publisher once `MAX_PUBLISHERS` is exceeded; the three
+    /// sibling processors drain `take_evicted()` and drop that publisher's derived state. MBP did
+    /// not, so an evicted publisher's books, revealed ids, announced symbols and channel state
+    /// outlived the reference data they depend on.
+    #[test]
+    fn mbp_an_evicted_publisher_leaves_no_derived_state_behind() {
+        use super::MAX_PUBLISHERS;
+
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        let first = ip(0);
+
+        // Give the first publisher a fully-built book, then push it out of the map.
+        for i in 0..(MAX_PUBLISHERS as u32) + 1 {
+            let mut refdata = mbp_ctx("MBPEVICT", &arbiter, &instruments, PortRole::Combined);
+            refdata.publisher = ip(i);
+            proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            if i == 0 {
+                let mut snap = mbp_ctx("MBPEVICT", &arbiter, &instruments, PortRole::Snapshot);
+                snap.publisher = first;
+                proc.on_datagram(
+                    &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+                    &snap,
+                );
+                let mut mkt = mbp_ctx("MBPEVICT", &arbiter, &instruments, PortRole::Mktdata);
+                mkt.publisher = first;
+                proc.on_datagram(
+                    &mbp_wire::frame(0, 0, 3, &[mbp_level(41, 2, MBP_BID, 6300, 5, 7_000)]),
+                    &mkt,
+                );
+                assert!(
+                    proc.books.keys().any(|(p, _, _)| *p == first),
+                    "precondition: the first publisher must have a book to lose"
+                );
+            }
+        }
+
+        assert!(
+            proc.state.state_mut(first).is_none(),
+            "precondition: the first publisher must have been evicted"
+        );
+        assert!(
+            !proc.books.keys().any(|(p, _, _)| *p == first),
+            "an evicted publisher's books must go with it"
+        );
+        assert!(
+            !proc.revealed.keys().any(|(p, _, _)| *p == first),
+            "and its revealed source ids"
+        );
+        assert!(
+            !proc.announced_symbol.keys().any(|(p, _, _)| *p == first),
+            "and its announced symbols"
+        );
+        assert!(
+            !proc.open.keys().any(|(p, _)| *p == first)
+                && !proc.last_reset.keys().any(|(p, _)| *p == first),
+            "and its per-channel snapshot/reset state"
+        );
+    }
     /// Emission gates per instrument on a known definition — precision before price, the same gate
     /// every other processor applies. A book for an undefined instrument is never even created.
     #[test]

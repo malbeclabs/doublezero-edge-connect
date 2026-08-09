@@ -350,7 +350,13 @@ Modules are grouped by role under `src/`:
   reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped arm
   over to its peer. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
   `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
-  whole-side clear would tell the consumer to drop levels this book still holds.
+  whole-side clear would tell the consumer to drop levels this book still holds. Its
+  `ManifestSummary`/`InstrumentDefinition` arms are `handle_refdata`-gated exactly like the three
+  siblings' — decode does not care which physical port a type arrives on, so without it one forged
+  datagram on the market-data or snapshot port clears a publisher's definitions and every emission
+  path (which all gate on a resolved definition) goes dark for the venue — and it drains
+  `PerPublisher::take_evicted` into `forget_publisher`, which drops the evicted publisher's books,
+  `revealed`/`announced_symbol` entries and per-channel snapshot/reset memos together.
 - **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs` / `codec_mbp.rs`** — pure decoders for each protocol's
   little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
   message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).

@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verbatim and `source`/`venue` are its registry name. The bridge no longer substitutes its own
   configured label for an unrecognised ID, so `venue` can hold a different string than before for a
   publisher that stamps an incorrect Source ID. Re-check any consumer that filters or keys on `venue`.
+- Reference-data messages arriving on a Market-by-Price **market-data or snapshot** port are now
+  dropped instead of applied, matching the three sibling processors' `handle_refdata` gate. Decode
+  does not care which physical port a message type arrives on, so a single forged datagram spoofing
+  a publisher's source IP with a `ManifestSummary` one sequence ahead cleared that publisher's
+  instrument definitions — and since every emission path gates on a resolved definition, the venue's
+  `book` and trade tape went dark until the next reference-data burst. `MbpProcessor` also drains
+  `PerPublisher`'s eviction now, so an evicted publisher's books, revealed Source IDs, announced
+  symbols and per-channel snapshot state go with it rather than outliving the reference data they
+  depend on.
 - **Breaking:** a message is emitted for an instrument only once its Source ID has been observed. A
   publisher whose reference data carries no Source ID of its own can only reveal it through a price
   message, so an instrument that has received a definition but no price produces nothing at all, and
