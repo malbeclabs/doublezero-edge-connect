@@ -48,7 +48,7 @@ use tracing::warn;
 use crate::{
     ingest::{
         arm_race::ArmRace,
-        authority::{AuthorityConfig, MarketKey, StickyAuthority, OTHER_ARM},
+        authority::{AuthorityConfig, MarketKey, ScopeKey, StickyAuthority, OTHER_ARM},
         feeds::ArbitrationMode,
     },
     metrics::metrics,
@@ -515,7 +515,7 @@ pub struct Arbiter {
     /// symbol-keyed rate limit would starve a `{"channel":N}` subscriber of a definition another
     /// channel announced first. Bounded by the distinct instrument count, like the
     /// `InstrumentSnapshot` `processor::upsert_instrument` maintains.
-    instrument_defs: HashMap<MarketKey, (InstrumentId, u64)>,
+    instrument_defs: HashMap<(Arc<str>, u32, u32), (InstrumentId, u64)>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -616,6 +616,13 @@ fn transfer_reason(
         return Some("health"); // the per-market override took this market
     }
     None
+}
+
+/// The WS-replay key for one market: its wire identity, with the arbitration scope stripped. The
+/// replay map is the consumer-facing one `sinks/ws.rs` serves and filters by, and the category is a
+/// producer-side arbitration key that never reaches the wire (see [`ScopeKey`]).
+fn replay_key(key: &MarketKey) -> (Arc<str>, u32, u32) {
+    (key.0.clone(), key.2, key.3)
 }
 
 /// A `clear`-only re-baseline for one market: what a consumer gets when the gate has no accumulated
@@ -794,7 +801,7 @@ impl Arbiter {
     /// Report one arm's book health for a market — the seam the MBP processor calls on every
     /// `PriceBook` status transition, since `books` is private here.
     ///
-    /// Health is a **per-market override** on venue-wide authority: an arm gapped on one market yields
+    /// Health is a **per-market override** on the universe's authority: an arm gapped on one market yields
     /// that market only, and takes it back on its own once the book recovers. Under incremental output
     /// a lost level does not self-heal until the next snapshot, so an unhealthy arm must not serve.
     pub fn set_book_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
@@ -922,7 +929,7 @@ impl Arbiter {
             };
             self.book_markets.remove(&old);
             if let Some(replay) = &self.book_replay {
-                model::lock(replay).remove(&old);
+                model::lock(replay).remove(&replay_key(&old));
             }
             self.books.forget_market(&old);
             self.vm(&old.0).book_markets_evicted.inc();
@@ -945,9 +952,9 @@ impl Arbiter {
             .and_then(|m| m.arms.get(&publisher))
             .cloned()?;
         if let Some(replay) = &self.book_replay {
-            model::lock(replay).insert(key.clone(), acc.clone());
+            model::lock(replay).insert(replay_key(key), acc.clone());
         }
-        acc.baselined().then(|| acc.to_book(&key.0, key.1, key.2))
+        acc.baselined().then(|| acc.to_book(&key.0, key.2, key.3))
     }
 
     /// Drop one market's tracked `book` state — the session-reset seam, mirroring
@@ -961,7 +968,7 @@ impl Arbiter {
         self.book_markets.remove(key);
         self.book_order.retain(|k| k != key);
         if let Some(replay) = &self.book_replay {
-            model::lock(replay).remove(key);
+            model::lock(replay).remove(&replay_key(key));
         }
         self.books.forget_market(key);
     }
@@ -976,7 +983,7 @@ impl Arbiter {
             return;
         }
         model::lock(replay)
-            .entry(key.clone())
+            .entry(replay_key(key))
             .or_insert_with(|| BookAccumulator::new(b.symbol.clone()))
             .apply(b);
     }
@@ -988,10 +995,10 @@ impl Arbiter {
     /// serves no `book` at all — matching it would poison `dz_arm_lead_ns` with edge-vs-public leads
     /// and could hand a venue's books to a source that publishes none. **Already tracked by the
     /// authority**: `observe_matched_lead` creates an arm entry for whatever it is handed, so an
-    /// untracked publisher (a peer feed row of the same venue, a forged source IP) would otherwise
-    /// spend one of the venue's eight admission slots and could displace a real mirror arm.
-    fn race_eligible(&self, venue: &str, publisher: Publisher) -> bool {
-        matches!(publisher, Publisher::Edge(_)) && self.books.tracks_arm(venue, publisher)
+    /// untracked publisher (a peer feed row of the same universe, a forged source IP) would otherwise
+    /// spend one of the universe's eight admission slots and could displace a real mirror arm.
+    fn race_eligible(&self, scope: &ScopeKey, publisher: Publisher) -> bool {
+        matches!(publisher, Publisher::Edge(_)) && self.books.tracks_arm(scope, publisher)
     }
 
     /// Whether this arm currently serves a `Sticky` **universe**'s tape — one gate per
@@ -1044,14 +1051,10 @@ impl Arbiter {
     /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
     /// here is the challenger's whole stream.
     ///
-    /// ⚠️ The two `books` lookups below are still **venue**-wide, because [`StickyAuthority`] is: the
-    /// election and the tracked-arm set span every category under the venue. Sound while a venue's
-    /// universes are published by the same hosts (arm identity is the source IP, shared across a
-    /// host's rows), which is what makes an election in one universe evidence about the same arm in
-    /// another. It is not sound if two universes are published by disjoint hosts — the elected arm
-    /// would then be a stranger to this category, and the deferral would hand it a tape it never
-    /// prints. Scoping the authority itself is the fix, and is a change to the `book` product, not
-    /// to this gate.
+    /// The two `books` lookups below read the authority at the **same** `(venue, category)` grain
+    /// this gate runs at, so the deferral can only ever name an arm elected on *this* universe. While
+    /// [`StickyAuthority`] was venue-wide they could name an arm elected on a disjoint universe — a
+    /// stranger to this tape — and hand it prints it never makes.
     ///
     /// Applies to every publisher class uniformly, [`Publisher::PublicWs`] included; no `Sticky` venue
     /// has a public backstop today, and adding one needs this revisited.
@@ -1061,10 +1064,11 @@ impl Arbiter {
         publisher: Publisher,
         category: &'static str,
     ) -> bool {
-        let elected = self.books.venue_leader(&t.venue);
-        let tracked = self.books.tracks_arm(&t.venue, publisher);
-        // Interned, so the per-print key is two refcount bumps rather than an allocation.
-        let key = (t.venue.clone(), category_arc(category));
+        // Interned, so the per-print key is two refcount bumps rather than an allocation. One key for
+        // the tape gate and the authority alike: they must not disagree about what a universe is.
+        let key: ScopeKey = (t.venue.clone(), category_arc(category));
+        let elected = self.books.scope_leader(&key);
+        let tracked = self.books.tracks_arm(&key, publisher);
         let Some(lead) = self.tape_leader.get_mut(&key) else {
             self.tape_leader.insert(
                 key,
@@ -1078,7 +1082,7 @@ impl Arbiter {
         };
         let transfer = lead.arm != publisher;
         if transfer {
-            let displaces_uncorroborated = tracked && !self.books.tracks_arm(&t.venue, lead.arm);
+            let displaces_uncorroborated = tracked && !self.books.tracks_arm(&key, lead.arm);
             let new_election = elected == Some(publisher) && lead.honored_election != elected;
             let silent = t.recv_ts_ns.saturating_sub(lead.last_ns) > NO_ID_TAPE_HANDOVER_NS;
             if !(displaces_uncorroborated || new_election || silent) {
@@ -1123,7 +1127,10 @@ impl Arbiter {
 
     /// Pair this trade with the peer arm's copy and hand the signed lead to the authority — the only
     /// producer of the evidence [`StickyAuthority::close_window`] elects on.
-    fn observe_trade_race(&mut self, t: &NormalizedTrade, publisher: Publisher) {
+    ///
+    /// `scope` is the emitting row's `(venue, category)`: the election it feeds is per universe, so a
+    /// lead measured between two of one universe's mirrors must not be filed against another's arms.
+    fn observe_trade_race(&mut self, scope: &ScopeKey, t: &NormalizedTrade, publisher: Publisher) {
         let Some(m) = self.race.on_trade(
             &t.venue,
             &t.symbol,
@@ -1135,14 +1142,13 @@ impl Arbiter {
         ) else {
             return;
         };
-        let Some(leader) = self.books.venue_leader(&t.venue) else {
+        let Some(leader) = self.books.scope_leader(scope) else {
             return;
         };
         let Some((challenger, lead_ns)) = m.lead_for(leader) else {
             return;
         };
-        self.books
-            .observe_matched_lead(&t.venue, challenger, lead_ns);
+        self.books.observe_matched_lead(scope, challenger, lead_ns);
         // A matched pair has a real winner either way, which is what makes `{winner="challenger"}`
         // reachable — unlike `Admit::Contest`'s structurally non-negative phase.
         self.vm(&t.venue).arm_lead[usize::from(lead_ns < 0)].observe(lead_ns.unsigned_abs() as f64);
@@ -1156,24 +1162,27 @@ impl Arbiter {
     /// admitted batch rather than in a burst of `O(markets)` clears for markets the new arm may not
     /// even speak for (93 of 1,239 instruments saw any update at all in 39 s on the live sports feed).
     pub fn close_authority_windows(&mut self) {
-        for (venue, _) in self.books.close_window(now_ns()) {
+        for ((venue, _category), _) in self.books.close_window(now_ns()) {
             metrics()
                 .arm_transfers
                 .with_label_values(&[venue.as_ref(), "margin"])
                 .inc();
         }
-        // `arm_label`, never `arm_ordinal`: labelling must not admit. `drain_unmatched`'s keys are
-        // every publisher that sent a trade for the venue, so minting here would spend the venue's
-        // admission slots on sources that never serve a book.
+        // `arm_label_in_venue`, never `arm_ordinal`: labelling must not admit. Both key sets here are
+        // venue-grained while the ordinals are per universe — `markets_held_all` sums a venue's
+        // universes and `drain_unmatched` never sees a category — and both metrics are labelled
+        // `{venue, arm}`, so the label is resolved across the venue's universes rather than inventing
+        // a dimension. Minting here would instead spend a universe's admission slots on sources that
+        // never serve a book.
         for (venue, arm, held) in self.books.markets_held_all() {
-            let label = self.books.arm_label(&venue, arm);
+            let label = self.books.arm_label_in_venue(&venue, arm);
             metrics()
                 .arm_markets_held
                 .with_label_values(&[venue.as_ref(), label])
                 .set(held as i64);
         }
         for ((venue, arm), n) in self.race.drain_unmatched() {
-            let label = self.books.arm_label(&venue, arm);
+            let label = self.books.arm_label_in_venue(&venue, arm);
             metrics()
                 .arm_unmatched_trades
                 .with_label_values(&[venue.as_ref(), label])
@@ -1264,8 +1273,9 @@ impl Arbiter {
                 // Feed the cross-arm matcher BEFORE the `trade_id == 0` bypass returns: that sentinel
                 // is exactly what a FIX-sourced arm prints, so a call below it would never see the arm
                 // the election exists to judge.
-                if self.race_eligible(&t.venue, publisher) {
-                    self.observe_trade_race(t, publisher);
+                let scope: ScopeKey = (t.venue.clone(), category_arc(category));
+                if self.race_eligible(&scope, publisher) {
+                    self.observe_trade_race(&scope, t, publisher);
                 }
                 // Then the per-universe arm gate, for the same reason the `book` arm has one: a
                 // `Sticky` universe's two arms mirror one tape with no shared identity to collapse
@@ -1431,11 +1441,15 @@ impl Arbiter {
             // are unrelated by construction — a consumer's book corrupts while every per-arm sequence
             // check the producer ran still passes.
             FeedMessage::Book(b) => {
-                let key: MarketKey = (b.venue.clone(), b.channel, b.instrument_id);
+                // The arbitration scope rides in on the key: one election per instrument universe,
+                // never one per venue (see `authority`'s module doc — a venue-wide election drops a
+                // disjoint universe's whole book stream).
+                let scope: ScopeKey = (b.venue.clone(), category_arc(category));
+                let key: MarketKey = (scope.0.clone(), scope.1.clone(), b.channel, b.instrument_id);
                 // Eligibility first, exactly as `admit` applies it: an arm past the authority's
-                // per-venue cap enters no map here either, so a forged source can neither be served
-                // nor evict a real market's state.
-                if self.books.arm_ordinal(&b.venue, publisher) == OTHER_ARM {
+                // per-universe cap enters no map here either, so a forged source can neither be
+                // served nor evict a real market's state.
+                if self.books.arm_ordinal(&scope, publisher) == OTHER_ARM {
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                     return;
                 }
@@ -1446,7 +1460,7 @@ impl Arbiter {
                     self.track_book_market(&key);
                 }
                 let prev = self.books.last_admitted(&key);
-                let leader_before = self.books.venue_leader(&b.venue);
+                let leader_before = self.books.scope_leader(&scope);
                 let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
                 // Accumulate the arm's stream whether or not it was admitted: a transfer republishes
                 // the new arm's current levels, which exist only if its copies were folded in all along.
@@ -1455,7 +1469,7 @@ impl Arbiter {
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                     return;
                 }
-                let leader_after = self.books.venue_leader(&b.venue);
+                let leader_after = self.books.scope_leader(&scope);
                 if let Some(reason) = transfer_reason(prev, leader_before, leader_after, publisher)
                 {
                     metrics()
@@ -2869,6 +2883,22 @@ mod tests {
     const BOOK_CHANNEL: u32 = 2;
     const BOOK_INSTRUMENT: u32 = 41;
 
+    /// The arbitration scope every book test runs in: one venue, one instrument universe.
+    fn bscope(venue: &str) -> ScopeKey {
+        (Arc::from(venue), TEST_CATEGORY.into())
+    }
+
+    /// The authority's key for `(venue, TEST_CATEGORY, BOOK_CHANNEL, instrument)` — what the gate
+    /// itself builds for a batch `book()` produces.
+    fn mkey(venue: &str, instrument_id: u32) -> MarketKey {
+        (
+            Arc::from(venue),
+            TEST_CATEGORY.into(),
+            BOOK_CHANNEL,
+            instrument_id,
+        )
+    }
+
     fn arm(n: u8) -> Publisher {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
@@ -3036,10 +3066,10 @@ mod tests {
         assert!(out.iter().all(|b| b.changes[0].size == 10.0));
     }
 
-    /// Authority is venue-wide (per the amended `StickyAuthority`), so the arm that won the venue
-    /// serves every market — including one a challenger got to first.
+    /// Authority spans a universe (per `StickyAuthority`), so the arm that won it serves every market
+    /// in that universe — including one a challenger got to first.
     #[test]
-    fn book_authority_is_venue_wide_across_markets() {
+    fn book_authority_spans_the_universe_across_markets() {
         let venue = "BookVenueWide";
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         for id in [42, 43] {
@@ -3194,7 +3224,7 @@ mod tests {
             .arm_transfers
             .with_label_values(&[venue, "health"]);
         let before = health.get();
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
@@ -3221,7 +3251,7 @@ mod tests {
             vec![clear_both(), bid(0.42, 66.0), bid(0.40, 55.0)]
         );
         assert_eq!(
-            a.books.venue_leader(venue),
+            a.books.scope_leader(&bscope(venue)),
             Some(arm(1)),
             "the venue is untouched"
         );
@@ -3234,7 +3264,7 @@ mod tests {
     #[test]
     fn a_rebaseline_waits_for_the_event_boundary() {
         let venue = "BookRebaselineBoundary";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
@@ -3273,7 +3303,7 @@ mod tests {
     #[test]
     fn an_unterminated_event_does_not_withhold_forever() {
         let venue = "BookUnterminated";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
@@ -3311,7 +3341,7 @@ mod tests {
     #[test]
     fn a_mid_stream_arm_rebaselines_with_a_bare_clear() {
         let venue = "BookMidStreamArm";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         synced(&mut a, venue, BOOK_INSTRUMENT, arm(1), 1_000);
@@ -3351,12 +3381,12 @@ mod tests {
         let (mut a, _rx) = gated(venue, sticky_cfg());
         race_trades(&mut a, venue, Publisher::PublicWs, arm(1), 20);
         a.close_authority_windows();
-        assert!(!a.books.tracks_arm(venue, Publisher::PublicWs));
-        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        assert!(!a.books.tracks_arm(&bscope(venue), Publisher::PublicWs));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(1)));
     }
 
     /// A trade publisher the authority does not track — a peer feed row of the same venue, or a forged
-    /// source IP — must not spend one of the venue's eight admission slots through the metrics path.
+    /// source IP — must not spend one of the universe's eight admission slots through the metrics path.
     /// Once they are gone a real mirror arm is ineligible and the venue can never fail over.
     #[test]
     fn an_untracked_trade_publisher_never_becomes_an_arm() {
@@ -3369,27 +3399,30 @@ mod tests {
         }
         a.close_authority_windows();
         for n in 20..40u8 {
-            assert!(!a.books.tracks_arm(venue, arm(n)), "arm {n} was admitted");
+            assert!(
+                !a.books.tracks_arm(&bscope(venue), arm(n)),
+                "arm {n} was admitted"
+            );
             assert_eq!(
-                a.books.arm_label(venue, arm(n)),
+                a.books.arm_label(&bscope(venue), arm(n)),
                 crate::ingest::authority::OTHER_ARM
             );
         }
         // ...and a third real arm still gets a slot.
         assert_ne!(
-            a.books.arm_ordinal(venue, arm(3)),
+            a.books.arm_ordinal(&bscope(venue), arm(3)),
             crate::ingest::authority::OTHER_ARM
         );
     }
 
-    /// An arm past the authority's per-venue cap enters no per-market map, so a forged source can
+    /// An arm past the authority's per-universe cap enters no per-market map, so a forged source can
     /// neither be served nor evict a real market's book state through the gate.
     #[test]
     fn an_ineligible_arm_creates_no_book_state() {
         let venue = "BookIneligibleArm";
         let (mut a, _rx) = gated(venue, AuthorityConfig::default());
         for n in 3..=8 {
-            a.books.arm_ordinal(venue, arm(n)); // fill the eight labelled slots
+            a.books.arm_ordinal(&bscope(venue), arm(n)); // fill the eight labelled slots
         }
         let before = a.book_markets.len();
         a.emit(
@@ -3488,7 +3521,7 @@ mod tests {
             arm(1),
             TEST_CATEGORY,
         );
-        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(1)));
         let _ = drain_books(&mut rx);
         let _ = drain_trades(&mut rx);
 
@@ -3507,8 +3540,8 @@ mod tests {
         let (mut a, mut rx) = gated(venue, sticky_cfg());
         a.set_mode(venue, ArbitrationMode::Sticky);
         let squatter = arm(200);
-        assert!(!a.books.tracks_arm(venue, squatter));
-        assert!(a.books.tracks_arm(venue, arm(1)));
+        assert!(!a.books.tracks_arm(&bscope(venue), squatter));
+        assert!(a.books.tracks_arm(&bscope(venue), arm(1)));
 
         tape_print(&mut a, venue, squatter, 1, 2_000);
         let _ = drain_trades(&mut rx);
@@ -3532,7 +3565,7 @@ mod tests {
             arm(1),
             TEST_CATEGORY,
         );
-        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(1)));
         let _ = drain_books(&mut rx);
         let _ = drain_trades(&mut rx);
 
@@ -3692,7 +3725,7 @@ mod tests {
     #[test]
     fn an_evicted_market_rebaselines_rather_than_resuming() {
         let venue = "BookEvictionRebaseline";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, _rx) = gated(venue, AuthorityConfig::default());
         assert_eq!(a.books.last_admitted(&key), Some(arm(1)));
 
@@ -3720,7 +3753,7 @@ mod tests {
     fn book_health_reaches_the_authority_before_the_first_batch() {
         let venue = "BookHealthEarly";
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
-        let fresh: MarketKey = (Arc::from(venue), BOOK_CHANNEL, 999);
+        let fresh: MarketKey = mkey(venue, 999);
         a.set_book_health(&fresh, arm(1), false);
         a.emit(
             book(venue, 999, vec![bid(0.40, 10.0)], true, 1_100),
@@ -3741,7 +3774,7 @@ mod tests {
         let (mut a, _rx) = gated(venue, sticky_cfg());
         race_trades(&mut a, venue, arm(2), arm(1), 6);
         a.close_authority_windows();
-        assert_eq!(a.books.venue_leader(venue), Some(arm(2)));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(2)));
     }
 
     /// The one placement error that would make the whole election inert for the venue it was built
@@ -3762,7 +3795,7 @@ mod tests {
         }
         a.close_authority_windows();
         assert_eq!(
-            a.books.venue_leader(venue),
+            a.books.scope_leader(&bscope(venue)),
             Some(arm(2)),
             "the zero-id tape must still be matched"
         );

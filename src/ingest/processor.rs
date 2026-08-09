@@ -37,8 +37,8 @@ use crate::{
     },
     metrics::metrics,
     model::{
-        venue_arc, BookAction, BookChange, BookSide, DepthSnapshot, FeedMessage, NormalizedBook,
-        NormalizedDepth, NormalizedInstrument, NormalizedMidpoint, NormalizedQuote,
+        category_arc, venue_arc, BookAction, BookChange, BookSide, DepthSnapshot, FeedMessage,
+        NormalizedBook, NormalizedDepth, NormalizedInstrument, NormalizedMidpoint, NormalizedQuote,
         NormalizedTrade, Side,
     },
 };
@@ -1894,7 +1894,14 @@ impl MbpProcessor {
         let Some(venue) = self.wire_venue(key) else {
             return;
         };
-        let market: MarketKey = (venue_arc(venue), key.1 as u32, key.2);
+        // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
+        // instrument universe, so a report filed without it targets nothing the gate ever admitted.
+        let market: MarketKey = (
+            venue_arc(venue),
+            category_arc(ctx.category),
+            key.1 as u32,
+            key.2,
+        );
         lock(ctx.arbiter).set_book_health(&market, Publisher::Edge(key.0), healthy);
     }
 
@@ -6222,7 +6229,12 @@ mod tests {
             ),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
-        let market = (crate::model::venue_arc("HYPERLIQUID"), 3u32, 41u32);
+        let market = (
+            crate::model::venue_arc("HYPERLIQUID"),
+            crate::model::category_arc("testcategory"),
+            3u32,
+            41u32,
+        );
         let arm = Publisher::Edge(TEST_PUB);
         let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, arm);
 
@@ -6489,7 +6501,12 @@ mod tests {
         assert!(
             !lock(&arbiter).authority().healthy(
                 // "SOURCE_0": every `mbp_level` delta above stamps wire Source ID 0.
-                &(crate::model::venue_arc("SOURCE_0"), 0u32, 0u32),
+                &(
+                    crate::model::venue_arc("SOURCE_0"),
+                    crate::model::category_arc("testcategory"),
+                    0u32,
+                    0u32,
+                ),
                 Publisher::Edge(TEST_PUB)
             ),
             "an evicted book leaves its market unhealthy for this arm"

@@ -288,6 +288,11 @@ mod tests {
         Arc::from("KXBTCPERP")
     }
 
+    /// The instrument universe the authority round-trip below elects in. The matcher itself is
+    /// category-blind — it pairs trades, which carry none — so this only names the scope the leads
+    /// are filed against.
+    const CATEGORY: &str = "perps";
+
     /// One trade, both arms: arm(1) 10us ahead.
     fn race() -> (ArmRace, Arc<str>) {
         (ArmRace::new(1_000_000_000), venue())
@@ -349,7 +354,8 @@ mod tests {
             min_window_samples: 5,
         };
         let mut auth = StickyAuthority::new(cfg);
-        let key = (v.clone(), 2, 41);
+        let scope = (v.clone(), CATEGORY.into());
+        let key = (v.clone(), CATEGORY.into(), 2, 41);
         auth.admit(key.clone(), arm(1), 1);
 
         // arm(2) is genuinely 10us faster on every one of ten trades, in true arrival order.
@@ -362,13 +368,13 @@ mod tests {
             let m = r
                 .on_trade(&v, &sym(), px, 150.0, Side::Buy, arm(1), t + 10_000)
                 .expect("the pair matches");
-            let leader = auth.venue_leader(&v).unwrap();
+            let leader = auth.scope_leader(&scope).unwrap();
             let (challenger, lead) = m.lead_for(leader).expect("leader is in the pair");
-            auth.observe_matched_lead(&v, challenger, lead);
+            auth.observe_matched_lead(&scope, challenger, lead);
         }
         assert_eq!(
             auth.close_window(20_000_000),
-            vec![(v.clone(), arm(2))],
+            vec![(scope.clone(), arm(2))],
             "the faster arm must take authority"
         );
     }

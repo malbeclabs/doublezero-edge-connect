@@ -239,9 +239,9 @@ Modules are grouped by role under `src/`:
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
   no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
   that *sharded* prints rather than mirroring them would lose the non-serving arm's fills (giving them
-  distinct categories is the registry's job). The two `books` lookups inside it are still venue-wide,
-  because `StickyAuthority` is: sound while a venue's universes are published by the same hosts (arm
-  identity is the source IP), not if they are ever published by disjoint ones. `no_id_owner` is skipped entirely
+  distinct categories is the registry's job). The two `books` lookups inside it read the authority at
+  the same `(venue, category)` grain, so the deferral can only ever name an arm elected on *this*
+  universe. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
   `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`
@@ -279,7 +279,11 @@ Modules are grouped by role under `src/`:
   deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
   arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
   every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
-  dropped (`dz_book_dropped_total`). **Speed and silence are per arm, venue-wide; health is per market**
+  dropped (`dz_book_dropped_total`). The gate is keyed on `(venue, category)` — `authority::ScopeKey`,
+  which also prefixes `MarketKey` — never on the venue alone: one Source ID can carry universes that
+  mirror nothing, and a venue-wide election drops the losing universe's whole book stream permanently
+  (the only escape is leader silence, and a leader streaming its own universe is never silent).
+  **Speed and silence are per arm, across that arm's universe; health is per market**
   (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
   overrides the elected arm for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the arm that last reached the wire for this market" re-baselines the consumer**: a
