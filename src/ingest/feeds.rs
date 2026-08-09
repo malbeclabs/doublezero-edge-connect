@@ -108,16 +108,29 @@ pub struct FeedPublisher {
     /// The channel id this publisher's block was **derived** from (`port = base + channel_id`), or
     /// `None` when the document wrote the block out verbatim.
     ///
-    /// This is what makes the ingest floor ([`crate::ingest::floor`]) a bind-time filter rather than
-    /// a decode-time one: a row that derives its ports has one socket per channel, so declining a
-    /// channel means never binding it and the kernel discards its traffic before it reaches
-    /// userspace. `None` says the opposite — the publishers share a base port and are separated
-    /// in-band, so there is no socket to decline.
+    /// **What it records is the document's *form*, not the feed's semantics.** `Some` means the row
+    /// used the `derived` shape and this block came from that channel; `None` means the row used
+    /// `explicit`. Nothing more.
     ///
-    /// Deliberately recorded here rather than recomputed from `base_port() - base`: the base is a
+    /// **What it is used for** is the ingest floor ([`crate::ingest::floor`]): `Some` is exactly the
+    /// condition under which declining a channel is free, because that channel has a socket of its
+    /// own and never binding it makes the kernel discard its traffic before userspace. That much the
+    /// form does license.
+    ///
+    /// ⚠️ **It is not the semantic discriminator, and the floor's refusal message assumes it is.**
+    /// The question the refusal actually answers — does `channel_id` partition markets, or identify
+    /// mirrors of one complete universe? — is a property of the *feed*, and this field only proxies
+    /// it. The schema permits an `explicit` row that writes per-channel blocks out at `base + id` by
+    /// hand: every publisher would get `None`, narrowing it would be refused, and the refusal would
+    /// tell the operator that "each publisher carries the complete instrument universe", which is
+    /// **false about that row**. The proper home for that fact is a field on the document row, which
+    /// is where it should move if such a row ever appears; recording it per publisher here is a
+    /// convenience that happens to coincide with the truth for every row published today.
+    ///
+    /// Deliberately recorded rather than recomputed from `base_port() - base`: the base is a
     /// property of the document's derived block and is gone by the time these rows are `'static`,
-    /// and re-deriving it (by, say, taking the minimum base port) would silently produce a channel
-    /// id for a flat row too.
+    /// and re-deriving it (by, say, taking the minimum base port) would mint a channel id for a flat
+    /// row too — turning the coincidence above into a guarantee of being wrong.
     pub channel: Option<u8>,
 }
 

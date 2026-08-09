@@ -58,6 +58,10 @@ struct Args {
     /// channel's socket is never bound and the kernel discards its traffic. Narrowing a row whose
     /// publishers bind one base port flat is refused at startup — `channel_id` identifies mirrors
     /// there, not markets (see `ingest::floor`).
+    ///
+    /// Validated against the whole registry, not against the `--feed`/`--publisher-port` selection:
+    /// a clause naming a row those already excluded is legal, filters nothing, and is warned about
+    /// at startup.
     #[arg(long, env = "DZ_CHANNELS", default_value = "")]
     channels: String,
 
@@ -461,6 +465,20 @@ async fn main() -> Result<()> {
     let floor = ingest::floor::ChannelFloor::parse(&args.channels)?;
     if !floor.is_empty() {
         info!(channels = ?floor.summary(), "channel floor active (excluded channels bind no socket)");
+        // The floor validates against the whole registry, but `--feed`/`--publisher-port` narrow
+        // what this process runs. A clause naming a row those already excluded is legal and filters
+        // nothing — not fatal, since the operator gave two explicit instructions and the narrower
+        // one simply wins, but it must not be silent: an unbound channel and an unbound row look
+        // identical from outside.
+        for code in floor.codes() {
+            if !enabled.iter().any(|f| f.code == code) {
+                warn!(
+                    code,
+                    "channel floor names a group code that --feed/--publisher-port already \
+                     excluded; the clause filters nothing"
+                );
+            }
+        }
     }
 
     info!(
