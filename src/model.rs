@@ -763,6 +763,33 @@ impl BookReplay {
     pub fn identity_index_len(&self) -> usize {
         self.by_identity.values().map(Vec::len).sum()
     }
+
+    /// Drop every market on `(venue, category, channel)` — every `instrument_id` under it —
+    /// through [`Self::remove`], so the identity index stays in step exactly as it does on any
+    /// other removal path.
+    ///
+    /// The channel-departure seam: a channel that leaves the ingest floor must not keep replaying a
+    /// frozen book (a `Clear` plus stale levels, or a full re-baseline on a new client's connect) to
+    /// anyone still asking. Scoped by `category` — unlike `history::Store::forget_channel`, whose
+    /// key carries no category (see that method's doc for the resulting over-drop risk) — because
+    /// [`BookKey`] already carries it: two universes sharing one Source ID and colliding on
+    /// `(channel, instrument_id)` are still distinguished here, so this purge cannot reach into a
+    /// live peer universe's market the way the history/catalog purges can.
+    pub fn forget_channel(&mut self, venue: &str, category: &str, channel: u32) -> usize {
+        let doomed: Vec<BookKey> = self
+            .books
+            .keys()
+            .filter(|k| k.0.as_ref() == venue && k.1.as_ref() == category && k.2 == channel)
+            .cloned()
+            .collect();
+        let mut dropped = 0usize;
+        for key in doomed {
+            if self.remove(&key).is_some() {
+                dropped += 1;
+            }
+        }
+        dropped
+    }
 }
 
 /// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
@@ -1256,5 +1283,48 @@ mod tests {
             "the id the producer resolved, not a placeholder"
         );
         assert_eq!(out.source, venue);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // BookReplay::forget_channel
+    // -----------------------------------------------------------------------------------------
+
+    fn book_key(venue: &str, category: &str, channel: u32, instrument_id: u32) -> BookKey {
+        (Arc::from(venue), Arc::from(category), channel, instrument_id)
+    }
+
+    /// Dropping a channel drops every market on it, and — because [`BookKey`] carries the
+    /// category, unlike `history::Store`'s key — leaves a **peer universe sharing the exact same
+    /// `(venue, channel, instrument_id)`** untouched. That collision is real (two categories under
+    /// one Source ID can share a `channel_id`/`instrument_id`), so a category-blind filter would
+    /// wrongly drop the peer; asserting its survival (not merely the drop) is what proves the scope
+    /// is precise.
+    #[test]
+    fn forgetting_a_channel_spares_a_peer_category_sharing_the_same_identity() {
+        let mut replay = BookReplay::default();
+        let doomed = book_key("KALSHI", "sports", 10, 41);
+        let peer_category = book_key("KALSHI", "perps", 10, 41); // same venue/channel/id, other category
+        let peer_channel = book_key("KALSHI", "sports", 11, 41); // same category, other channel
+        replay.insert(doomed.clone(), BookAccumulator::new("DOOMED".into()));
+        replay.insert(peer_category.clone(), BookAccumulator::new("PEER-CAT".into()));
+        replay.insert(peer_channel.clone(), BookAccumulator::new("PEER-CHAN".into()));
+
+        let dropped = replay.forget_channel("KALSHI", "sports", 10);
+
+        assert_eq!(dropped, 1, "exactly the one market on that (venue, category, channel)");
+        assert!(!replay.contains_key(&doomed), "the doomed market must be gone");
+        assert!(
+            replay.contains_key(&peer_category),
+            "a peer under a different category sharing the same channel/instrument id must survive"
+        );
+        assert!(
+            replay.contains_key(&peer_channel),
+            "a peer under a different channel must survive"
+        );
+        assert_eq!(
+            replay.identity_index_len(),
+            2,
+            "the identity index must drop the doomed market's entry along with the accumulator"
+        );
     }
 }

@@ -39,6 +39,11 @@ pub struct Request {
     pub path: String,
     /// `(key, value)` pairs from the query string, in wire order, percent-decoded.
     pub params: Vec<(String, String)>,
+    /// The `Content-Length` header value, `0` if absent or unparseable. This scaffolding never
+    /// reads a request body (every sink built on it takes its input from the query string), so this
+    /// exists only so a handler can **detect and refuse** one — see `sinks::admin`'s `POST`, which
+    /// must not silently ignore a caller's body while treating an empty one as "clear everything".
+    pub content_length: usize,
 }
 
 impl Request {
@@ -56,7 +61,8 @@ impl Request {
 /// malformed (no method, or no target).
 pub fn parse_request(buf: &[u8]) -> Option<Request> {
     let text = std::str::from_utf8(buf).ok()?;
-    let line = text.lines().next()?;
+    let mut lines = text.lines();
+    let line = lines.next()?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_ascii_uppercase();
     let target = parts.next()?;
@@ -66,11 +72,31 @@ pub fn parse_request(buf: &[u8]) -> Option<Request> {
         .next()
         .map(parse_query_params)
         .unwrap_or_default();
+    let content_length = content_length(lines);
     Some(Request {
         method,
         path,
         params,
+        content_length,
     })
+}
+
+/// `Content-Length`, scanned case-insensitively from the header lines (everything after the
+/// request line, up to the blank-line terminator or the end of what's buffered so far). `0` if
+/// absent or not a valid number — never treated as an error, since nothing here needs the exact
+/// value beyond "is there a body at all" (see `Request::content_length`'s doc).
+fn content_length<'a>(header_lines: impl Iterator<Item = &'a str>) -> usize {
+    for line in header_lines {
+        if line.is_empty() {
+            break; // the blank line ends the headers
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                return value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 /// Split a query string on `&` into percent-decoded `(key, value)` pairs. A pair with no `=` gets
@@ -255,5 +281,21 @@ mod tests {
     #[test]
     fn a_malformed_request_line_is_rejected() {
         assert!(parse_request(b"nonsense\r\n\r\n").is_none());
+    }
+
+    /// A `Content-Length` header is picked up case-insensitively — the one signal
+    /// `sinks::admin`'s `POST` handler needs to refuse a body-bearing request.
+    #[test]
+    fn a_content_length_header_is_parsed_case_insensitively() {
+        let r = parse_request(b"POST /admin/channels HTTP/1.1\r\ncontent-length: 11\r\n\r\n").unwrap();
+        assert_eq!(r.content_length, 11);
+    }
+
+    /// No header at all (the common case: every real sink here is `GET`-only, or a `POST` with
+    /// nothing but a query string) reads as zero, not an error.
+    #[test]
+    fn a_missing_content_length_header_reads_as_zero() {
+        let r = parse_request(b"GET /v1/products HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert_eq!(r.content_length, 0);
     }
 }

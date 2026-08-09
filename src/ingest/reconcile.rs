@@ -255,6 +255,12 @@ pub struct Reconciler {
     /// task's own liveness write, so the reconciler must not deregister on its behalf.
     health: SharedFeedHealth,
     cli_missing_logged: bool,
+    /// The full **desired** feed-key set as of the last completed tick — deliberately not derived
+    /// from `active`. A receiver that already self-exited (`reap_finished` runs *before*
+    /// `apply_feeds` computes `current` from `active`) is gone from `active` by the time a floor
+    /// change would otherwise abort it, so diffing consecutive `desired` sets — not `active` vs.
+    /// `desired` — is what still detects the departure. See `forget_departed_channels`.
+    last_desired_feeds: HashSet<FeedKey>,
 }
 
 impl Reconciler {
@@ -268,6 +274,7 @@ impl Reconciler {
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
+            last_desired_feeds: HashSet::new(),
         }
     }
 
@@ -295,6 +302,12 @@ impl Reconciler {
             return;
         };
         self.reap_finished();
+        // Driven by *a channel leaving the desired set*, not by *an abort happening* — see
+        // `forget_departed_channels` and `last_desired_feeds`'s doc. Must run before
+        // `last_desired_feeds` is updated below, and is independent of `apply_feeds`/`reap_finished`
+        // ordering since it never reads `active`.
+        self.forget_departed_channels(&desired.feeds);
+        self.last_desired_feeds = desired.feeds.clone();
         self.apply_feeds(&desired.feeds);
         self.apply_ws(desired.ws_on).await;
         self.apply_api(desired.api_on).await;
@@ -449,7 +462,6 @@ impl Reconciler {
                     publisher = key.3,
                     "deactivating market-data receiver (no longer subscribed)"
                 );
-                self.forget_departing_channel(&key);
             }
         }
         // Ownership over the post-apply running set, which `desired` already is: the aborts above
@@ -497,16 +509,53 @@ impl Reconciler {
         }
     }
 
-    /// A publisher whose `FeedKey` just left the desired set (aborted above) has stopped ingesting;
-    /// if its block was derived from a channel (`FeedPublisher::channel`), that channel's history is
-    /// now stale and is dropped with it — the "nothing stale ever served" rule for a channel drop,
-    /// whether the cause is the floor narrowing or the whole row losing its subscription.
+    /// Every channel that just left the desired set (present at the end of the last tick, absent
+    /// now) has its catalog/book/history state forgotten — see `forget_departing_channel`.
+    ///
+    /// Diffs `last_desired_feeds` against `desired`, **not** `self.active` against `desired`
+    /// (which is what `apply_feeds`'s own `to_abort` computes): `reap_finished` runs first each
+    /// tick and already drops a self-exited receiver's key from `active`, so by the time a floor
+    /// change removes that same key from `desired` it was never in `active` to diff against, and an
+    /// `active`-based check would silently miss the departure. Basing removal on *the channel
+    /// leaving the desired set* rather than *an abort actually happening* is what closes that
+    /// window.
+    fn forget_departed_channels(&self, desired: &HashSet<FeedKey>) {
+        for key in self.last_desired_feeds.difference(desired) {
+            self.forget_departing_channel(key);
+        }
+    }
+
+    /// `key` just left the desired set: if its publisher was derived from a channel
+    /// (`FeedPublisher::channel`), drop everything the query surface and a reconnecting WS client
+    /// would otherwise keep serving from it — the catalog entry, the accumulated book, and the
+    /// rolling trade history — so a departed channel goes fully dark rather than reading as "alive
+    /// but quiet" (a frozen `best_bid`/`best_ask` beside an empty trade list is worse than no data
+    /// at all: every live-looking field stays live while the one field that would reveal the
+    /// channel is dead goes empty).
     ///
     /// A flat publisher (`channel: None`) has no channel identity to forget — narrowing a flat row is
     /// refused at floor-parse time, so this only ever fires for a row a channel actually identifies.
-    /// The venue is resolved per aborted key (via this row's own `venue`), not assumed for the whole
-    /// group `code`: a code can span rows on different venues (`ingest::floor`'s docs), so each
-    /// abort event carries its own row's identity rather than guessing one venue for the code.
+    /// The venue/category are resolved from *this* departing key's own row, never assumed for the
+    /// whole group `code`: a code can span rows on different venues (`ingest::floor`'s docs), so
+    /// each departure carries its own row's identity rather than guessing one venue for the code.
+    ///
+    /// ⚠️ **Category-blind for the catalog and history, category-precise for the book.**
+    /// `history::Store::forget_channel`'s key (`source_id`, `channel`, `instrument_id`) and
+    /// `InstrumentSnapshot`'s key (`venue`, `channel`, `instrument_id`) both carry no `category` —
+    /// two disjoint universes sharing one Source ID/venue can collide on `(channel, instrument_id)`,
+    /// so this purge can over-drop a live peer universe's product sharing the departed channel id.
+    /// That is a pre-existing limitation of those two maps' key shapes (not introduced here — see
+    /// `history::Store::forget_channel`'s own doc), and the fix — a category-carrying identity — is
+    /// folded into the next task. `BookSnapshot`'s key (`model::BookKey`) already carries the
+    /// category, so `model::BookReplay::forget_channel` does not share this risk.
+    ///
+    /// `DepthSnapshot` (Market-by-Order's replay map) is deliberately left untouched: its key is
+    /// `(venue, symbol)` with no channel dimension at all, so a channel-scoped purge cannot be
+    /// expressed against it correctly, and it is unreachable in practice regardless — only a
+    /// channel-derived publisher (`channel: Some(_)`) ever reaches this method, and the loaded
+    /// registry's only `derived` rows are `MarketByPrice`; no `MarketByOrder` row is ever
+    /// channel-derived today, so `MboProcessor`'s writer of `DepthSnapshot` never runs behind a
+    /// narrowable publisher.
     fn forget_departing_channel(&self, key: &FeedKey) {
         let Some((feed, publisher)) = self.cfg.enabled.iter().find_map(|f| {
             f.publishers
@@ -519,18 +568,31 @@ impl Reconciler {
         let Some(channel) = publisher.channel else {
             return;
         };
-        let Some(source_id) = sources::source_id_of(feed.venue) else {
-            return;
+        let channel = u32::from(channel);
+
+        // The catalog: a bare HashMap<(venue, channel, instrument_id), _>, so a `retain` needs no
+        // seam of its own (see the category-blindness caveat above).
+        crate::model::lock(&self.cfg.instruments)
+            .retain(|k, _| !(k.0.as_ref() == feed.venue && k.1 == channel));
+
+        // The book: `BookKey` carries the category, so this purge cannot reach a peer universe's
+        // market the way the catalog/history purges below can.
+        let books_dropped =
+            crate::model::lock(&self.cfg.books).forget_channel(feed.venue, feed.category, channel);
+
+        let history_dropped = match sources::source_id_of(feed.venue) {
+            Some(source_id) => crate::model::lock(&self.cfg.history).forget_channel(source_id, channel),
+            None => 0,
         };
-        let dropped =
-            crate::model::lock(&self.cfg.history).forget_channel(source_id, u32::from(channel));
-        if dropped > 0 {
+
+        if history_dropped > 0 || books_dropped > 0 {
             info!(
                 venue = feed.venue,
                 category = feed.category,
                 channel,
-                dropped,
-                "channel left the desired set; dropped its history"
+                history_dropped,
+                books_dropped,
+                "channel left the desired set; dropped its catalog/book/history state"
             );
         }
     }
@@ -1160,14 +1222,15 @@ mod tests {
         );
     }
 
-    /// A channel that leaves the desired set (its publisher aborted, whether because the floor
-    /// narrowed further or its whole row lost its subscription) has its history forgotten along
-    /// with the receiver — `forget_departing_channel` is the seam `apply_feeds` calls on every
-    /// abort. Uses a derived publisher (`channel: Some(_)`) so this exercises the identity path a
-    /// flat row's `None` would skip entirely, and a venue `sources::source_id_of` actually resolves
-    /// so the resolution step isn't a silent no-op.
+    /// I1's exact regression: `reap_finished` runs (and, in a real tick, would have already dropped
+    /// a self-exited receiver from `active`) *before* the floor narrows the channel away, so a
+    /// departure check keyed on `active` (as `apply_feeds`'s own `to_abort` is) never sees it —
+    /// `active` no longer holds the key by the time `desired` stops naming it either. Diffing
+    /// `last_desired_feeds` against `desired` (`forget_departed_channels`), independent of `active`
+    /// entirely, is what still catches it. This test removes the entry from `active` directly
+    /// (bypassing `apply_feeds`'s own abort path) to simulate exactly that ordering.
     #[tokio::test]
-    async fn a_channel_that_leaves_the_desired_set_has_its_history_forgotten() {
+    async fn a_self_exited_receivers_channel_is_still_forgotten_when_it_leaves_the_desired_set() {
         static PUB: &[FeedPublisher] = &[FeedPublisher {
             ports: FeedPorts::ThreePort {
                 mktdata: 33007,
@@ -1195,7 +1258,7 @@ mod tests {
         );
 
         // Seed the shared store directly for channel 7 under Hyperliquid's Source ID (1) — this
-        // test is about the abort -> forget_channel plumbing, not real ingest.
+        // test is about the departure -> forget plumbing, not real ingest.
         let hist_key = history::Key {
             source_id: 1,
             channel: 7,
@@ -1219,14 +1282,32 @@ mod tests {
                 .unwrap()
                 .candles(&hist_key, 60, 10, 1_100)
                 .is_empty(),
-            "fixture sanity: the seeded print must be queryable before the abort"
+            "fixture sanity: the seeded print must be queryable before the departure"
         );
 
-        r.apply_feeds(&[key].into_iter().collect());
+        // Tick 1: the channel is desired.
+        let desired1: HashSet<FeedKey> = [key].into_iter().collect();
+        r.forget_departed_channels(&desired1);
+        r.last_desired_feeds = desired1.clone();
+        r.apply_feeds(&desired1);
         assert!(r.active.contains_key(&key));
 
-        r.apply_feeds(&HashSet::new()); // the channel leaves the desired set
-        assert!(!r.active.contains_key(&key));
+        // Simulate the receiver having already self-exited and been reaped BEFORE the floor
+        // narrows the channel away — removed from `active` directly, bypassing `apply_feeds`'s own
+        // abort path, exactly as `reap_finished` would for a task that died on its own.
+        let (h, tape) = r.active.remove(&key).expect("the receiver was running");
+        tape.store(false, std::sync::atomic::Ordering::Relaxed);
+        h.abort();
+        assert!(
+            !r.active.contains_key(&key),
+            "fixture sanity: already reaped before the departure"
+        );
+
+        // Tick 2: the channel leaves the desired set. `active` no longer holds the key at all, so a
+        // diff against `active` (the pre-fix behaviour) would find nothing to forget.
+        let desired2: HashSet<FeedKey> = HashSet::new();
+        r.forget_departed_channels(&desired2);
+        r.last_desired_feeds = desired2;
 
         assert!(
             r.cfg
@@ -1235,7 +1316,201 @@ mod tests {
                 .unwrap()
                 .candles(&hist_key, 60, 10, 1_100)
                 .is_empty(),
-            "the departing channel's history must be forgotten when its receiver is aborted"
+            "the departed channel's history must be forgotten even though its receiver had \
+             already exited on its own"
+        );
+    }
+
+    /// M2: two rows sharing one group `code` on different venues. Resolution from a departing
+    /// `FeedKey` to a `source_id` must be per-row — never "the code's first row's venue" — or one
+    /// venue's departure would misattribute to (or be silently skipped in favour of) the other. Both
+    /// rows share the exact same channel id, so a code-once resolution bug can't hide behind the
+    /// channel ids happening to differ.
+    #[tokio::test]
+    async fn departing_channels_on_a_shared_code_resolve_their_own_rows_source_id() {
+        static PUB_A: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 33020,
+                refdata: 43020,
+                snapshot: 53020,
+            },
+            channel: Some(20),
+        }];
+        static PUB_B: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 33021,
+                refdata: 43021,
+                snapshot: 53021,
+            },
+            channel: Some(20), // same channel id as PUB_A — only the venue/row differs
+        }];
+        let feed_a = Feed {
+            venue: "HYPERLIQUID", // source_id 1
+            category: "testcategory",
+            code: "shared-code",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 96),
+            publishers: PUB_A,
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let feed_b = Feed {
+            venue: "KALSHI", // source_id 3
+            category: "testcategory",
+            code: "shared-code",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 97),
+            publishers: PUB_B,
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let mut r = test_reconciler(vec![feed_a, feed_b]);
+        let key_a = (
+            "HYPERLIQUID",
+            "testcategory",
+            FeedKind::MarketByPrice,
+            33020u16,
+        );
+        let key_b = ("KALSHI", "testcategory", FeedKind::MarketByPrice, 33021u16);
+
+        let hist_a = history::Key {
+            source_id: 1,
+            channel: 20,
+            instrument_id: 1,
+        };
+        let hist_b = history::Key {
+            source_id: 3,
+            channel: 20,
+            instrument_id: 1,
+        };
+        {
+            let mut h = r.cfg.history.lock().unwrap();
+            h.ingest(
+                hist_a,
+                history::Print {
+                    ts_ns: 1_000 * 1_000_000_000,
+                    price: 1.0,
+                    size: 1.0,
+                },
+            );
+            h.ingest(
+                hist_b,
+                history::Print {
+                    ts_ns: 1_000 * 1_000_000_000,
+                    price: 2.0,
+                    size: 1.0,
+                },
+            );
+        }
+
+        let desired1: HashSet<FeedKey> = [key_a, key_b].into_iter().collect();
+        r.forget_departed_channels(&desired1);
+        r.last_desired_feeds = desired1.clone();
+        r.apply_feeds(&desired1);
+
+        // Both rows depart in the same tick.
+        let desired2: HashSet<FeedKey> = HashSet::new();
+        r.forget_departed_channels(&desired2);
+        r.last_desired_feeds = desired2.clone();
+        r.apply_feeds(&desired2);
+
+        let store = r.cfg.history.lock().unwrap();
+        assert!(
+            store.candles(&hist_a, 60, 10, 1_100).is_empty(),
+            "HYPERLIQUID's own history must be forgotten"
+        );
+        assert!(
+            store.candles(&hist_b, 60, 10, 1_100).is_empty(),
+            "KALSHI's history, under a different source_id sharing the code and channel id, must \
+             be forgotten independently — a code-once resolution would misattribute or skip it"
+        );
+    }
+
+    /// C1: after a channel departs, the **query surface** — not just an internal map — must reflect
+    /// it. A product still listed with a frozen `best_bid`/`best_ask` beside an empty trade list
+    /// reads as "alive but quiet," which is worse than nothing being served at all. Drives the real
+    /// `/v1` handler over the same shared `InstrumentSnapshot` the reconciler purges, so this fails
+    /// if the catalog purge (not just the history purge) is ever dropped.
+    #[tokio::test]
+    async fn a_departed_channels_product_is_invisible_to_the_query_surface() {
+        static PUB: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 33030,
+                refdata: 43030,
+                snapshot: 53030,
+            },
+            channel: Some(30),
+        }];
+        let feed = Feed {
+            venue: "HYPERLIQUID",
+            category: "testcategory",
+            code: "testcode-forget-query",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 95),
+            publishers: PUB,
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let mut r = test_reconciler(vec![feed]);
+        let key = (
+            "HYPERLIQUID",
+            "testcategory",
+            FeedKind::MarketByPrice,
+            33030u16,
+        );
+
+        r.cfg.instruments.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), 30u32, 1u32),
+            crate::model::NormalizedInstrument {
+                venue: "HYPERLIQUID".into(),
+                source: "HYPERLIQUID".into(),
+                source_id: 1,
+                symbol: "DEPARTED".into(),
+                channel: 30,
+                instrument_id: 1,
+                price_exponent: -2,
+                qty_exponent: -5,
+            },
+        );
+
+        let listener = api::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(api::serve(
+            listener,
+            r.cfg.instruments.clone(),
+            r.cfg.depth.clone(),
+            r.cfg.books.clone(),
+            r.cfg.history.clone(),
+            Arc::new(FeedHealth::new()),
+        ));
+        let base = format!("http://{addr}");
+
+        // Fixture sanity: the product resolves before the departure.
+        let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:DEPARTED"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "fixture sanity: the product must resolve before departure"
+        );
+
+        let desired1: HashSet<FeedKey> = [key].into_iter().collect();
+        r.forget_departed_channels(&desired1);
+        r.last_desired_feeds = desired1;
+
+        let desired2: HashSet<FeedKey> = HashSet::new();
+        r.forget_departed_channels(&desired2);
+        r.last_desired_feeds = desired2;
+
+        let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:DEPARTED"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "a departed channel's product must vanish from the query surface, not read as \
+             alive-but-quiet"
         );
     }
 

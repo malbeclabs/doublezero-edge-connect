@@ -424,6 +424,18 @@ impl Store {
     /// job (via `ingest::feeds::feeds()` + `ingest::sources::source_id_of`) — this store has no
     /// notion of a group code, only the wire `source_id` every `Key` already carries.
     ///
+    /// ⚠️ **Known over-drop risk, not fixed here.** [`Key`] carries no `category` — two disjoint
+    /// universes sharing one Source ID (a venue-wide `source_id`) can collide on `(channel,
+    /// instrument_id)`, and this filter cannot tell them apart. Shedding one universe's channel
+    /// therefore also wipes a live peer universe's window under the same channel id, if one
+    /// happens to exist. This is a real, not hypothetical, gap — never assume `channel_id` ranges
+    /// stay disjoint across universes, they are a mid-migration numbering convention owned
+    /// upstream and enforced nowhere in this code. The proper fix is a category-carrying identity
+    /// (mirroring `model::BookKey`, which already has one — see `model::BookReplay::forget_channel`,
+    /// which is therefore exempt from this risk), which ripples into `model.rs`/`products.rs`/
+    /// `sinks/api.rs` and is out of this method's scope; it is folded into the next task. Do not
+    /// paper over this by claiming a channel id is safe to shed — it is not, in general.
+    ///
     /// Keeps `buckets_total` in step (subtracting exactly the removed products' own bucket counts),
     /// the same discipline every other removal path in this module follows — see that field's doc.
     pub fn forget_channel(&mut self, source_id: u16, channel: u32) -> usize {
@@ -900,11 +912,14 @@ mod tests {
         );
     }
 
-    /// Only the named channel is dropped. A blanket clear would be indistinguishable from the test
-    /// above in a single-channel fixture, so the peer's own candle **count** (not merely its
-    /// presence) is what makes this assertion mean something: an implementation that cleared the
-    /// whole store would fail here even though a `.is_some()`/non-empty check on the peer alone
-    /// could still pass by coincidence of ordering.
+    /// Only the named channel is dropped. Two peers, each differing from the dropped key on
+    /// exactly one identity component: a **different channel, same source_id** (what a blanket
+    /// clear would also spare, so this alone would not distinguish `forget_channel` from clearing
+    /// everything) and — the fixture M3 exists for — a **different source_id, same channel id**.
+    /// A source-id-blind filter (matching on `channel` alone) would wrongly drop the latter, and a
+    /// blanket-clear implementation would drop both; only a correct `(source_id, channel)` filter
+    /// spares both. Candle **count** (not merely presence) is asserted for each, so a
+    /// coincidentally-non-empty peer can't paper over a partial over-drop.
     #[test]
     fn forgetting_a_channel_leaves_its_peers_intact() {
         let mut s = Store::new();
@@ -913,29 +928,45 @@ mod tests {
             channel: 10,
             instrument_id: 1,
         };
-        let peer_key = Key {
+        let peer_diff_channel = Key {
             source_id: 3,
             channel: 11,
             instrument_id: 1,
         };
+        let peer_diff_source = Key {
+            source_id: 7,
+            channel: 10,
+            instrument_id: 1,
+        };
         s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
-        s.ingest(peer_key, trade(1_000, 20.0, 1.0));
-        s.ingest(peer_key, trade(1_060, 21.0, 1.0));
+        s.ingest(peer_diff_channel, trade(1_000, 20.0, 1.0));
+        s.ingest(peer_diff_channel, trade(1_060, 21.0, 1.0));
+        s.ingest(peer_diff_source, trade(1_000, 30.0, 1.0));
+        s.ingest(peer_diff_source, trade(1_060, 31.0, 1.0));
+        s.ingest(peer_diff_source, trade(1_120, 32.0, 1.0));
 
         s.forget_channel(3, 10);
 
-        let peer_candles = s.candles(&peer_key, 60, 10, 1_200);
+        let peer_channel_candles = s.candles(&peer_diff_channel, 60, 10, 1_200);
         assert_eq!(
-            peer_candles.len(),
+            peer_channel_candles.len(),
             2,
             "the untouched channel's full candle count must survive the peer's drop"
+        );
+        let peer_source_candles = s.candles(&peer_diff_source, 60, 10, 1_200);
+        assert_eq!(
+            peer_source_candles.len(),
+            3,
+            "a peer sharing the channel id under a different source_id must survive — a \
+             source-id-blind filter would wrongly drop it"
         );
     }
 
     /// `buckets_total` is the accounting `enforce_bucket_budget`'s O(1) check rests on; every path
     /// that removes a product must keep it in step or the budget silently corrupts (see that
     /// field's doc). Drives `forget_channel` through the same recompute-and-compare discipline as
-    /// `buckets_total_matches_the_recomputed_sum_across_mutations`.
+    /// `buckets_total_matches_the_recomputed_sum_across_mutations`, with a peer sharing the channel
+    /// id under a different `source_id` so a source-id-blind filter would also miscount here.
     #[test]
     fn forget_channel_keeps_buckets_total_in_step() {
         let mut s = Store::new();
@@ -944,14 +975,20 @@ mod tests {
             channel: 10,
             instrument_id: 1,
         };
-        let peer_key = Key {
+        let peer_diff_channel = Key {
             source_id: 3,
             channel: 11,
             instrument_id: 1,
         };
+        let peer_diff_source = Key {
+            source_id: 7,
+            channel: 10,
+            instrument_id: 1,
+        };
         s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
         s.ingest(dropped_key, trade(1_100, 11.0, 1.0)); // a second bucket on the doomed product
-        s.ingest(peer_key, trade(1_000, 20.0, 1.0));
+        s.ingest(peer_diff_channel, trade(1_000, 20.0, 1.0));
+        s.ingest(peer_diff_source, trade(1_000, 30.0, 1.0)); // same channel id, different source_id
         let before = s.buckets_total;
 
         let dropped = s.forget_channel(3, 10);
