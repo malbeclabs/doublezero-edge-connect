@@ -538,7 +538,13 @@ esac
 # 6. run the container (detached, long-lived: daemon + bridge)
 # ----------------------------------------------------------------------------
 info "Pulling $DZ_IMAGE ..."
-$SUDO docker pull -q "$DZ_IMAGE" >/dev/null
+# A locally built image — testing a branch before it is published — has no registry to pull from,
+# so a failed pull is only fatal when there is also nothing local to run.
+if ! $SUDO docker pull -q "$DZ_IMAGE" >/dev/null 2>&1; then
+  $SUDO docker image inspect "$DZ_IMAGE" >/dev/null 2>&1 \
+    || die "Could not pull $DZ_IMAGE, and no local image by that name. Check the tag, or build it first: docker build -t $DZ_IMAGE ."
+  warn "Could not pull $DZ_IMAGE; using the local image of that name already present."
+fi
 
 info "Starting edge-connect bridge (env=$DZ_ENV)..."
 $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
