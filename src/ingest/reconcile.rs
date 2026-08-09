@@ -728,6 +728,7 @@ mod tests {
     fn test_feed(publishers: &'static [FeedPublisher]) -> Feed {
         Feed {
             venue: "TestVenue",
+            category: "testcategory",
             code: "testcode",
             kind: FeedKind::TopOfBook,
             group: std::net::Ipv4Addr::new(233, 84, 178, 15),

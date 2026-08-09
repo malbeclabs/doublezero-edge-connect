@@ -132,6 +132,15 @@ pub struct Feed {
     /// Venue name stamped on every instrument and message from this feed. Matches the
     /// edge-feed-spec source registry name (e.g. "HYPERLIQUID" for SourceID 1).
     pub venue: &'static str,
+    /// The instrument universe this row carries. Rows sharing a `(venue, category)` are mirrors
+    /// of one another and arbitrate as one; rows differing in it carry disjoint universes and
+    /// must never contest each other's tape or book. `topology.md` §2 calls this the category.
+    ///
+    /// Necessary because a single `Source ID` — and therefore a single `venue` — can span
+    /// universes that share no instrument. Without it, the venue-wide tape gate elects one
+    /// publisher across both and drops the other universe's prints entirely, which surfaces as
+    /// empty candles indistinguishable from a market that did not trade.
+    pub category: &'static str,
     /// The DoubleZero multicast group **code** for this feed's group (e.g. "tiredsolid",
     /// "scottsdale") — the identifier `doublezero status`/`multicast group list` report. The
     /// subscription reconciler matches this against the host's subscribed `S:<code>` entries to
@@ -193,6 +202,7 @@ pub const FEEDS: &[Feed] = &[
     // publisher gets its own receiver + reference-data state.
     Feed {
         venue: "HYPERLIQUID",
+        category: "perps",
         code: "tiredsolid",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 15),
@@ -285,6 +295,7 @@ pub const FEEDS: &[Feed] = &[
     // block (registry-only, never seen on the wire). Everything else was decoded from a capture.
     Feed {
         venue: "HYPERLIQUID",
+        category: "perps",
         code: "tiredsolid",
         kind: FeedKind::MarketByOrder,
         group: Ipv4Addr::new(233, 84, 178, 15),
@@ -377,6 +388,7 @@ pub const FEEDS: &[Feed] = &[
     },
     Feed {
         venue: "PHOENIX",
+        category: "spot",
         code: "scottsdale",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 18),
@@ -413,6 +425,7 @@ pub const FEEDS: &[Feed] = &[
     // block is spaced `+10000` / `+20000`, not the `+1` / `+2` the Hyperliquid publisher uses.
     Feed {
         venue: "KALSHI",
+        category: "perps",
         code: "lashay-1",
         kind: FeedKind::TopOfBook,
         group: Ipv4Addr::new(233, 84, 178, 3),
@@ -427,6 +440,7 @@ pub const FEEDS: &[Feed] = &[
     },
     Feed {
         venue: "KALSHI",
+        category: "perps",
         code: "lashay-2",
         kind: FeedKind::MarketByPrice,
         group: Ipv4Addr::new(233, 84, 178, 4),
@@ -442,17 +456,41 @@ pub const FEEDS: &[Feed] = &[
     },
 ];
 
+/// Every feed row known to the bridge. The one entry point — callers never touch the backing
+/// storage directly, so the roster derivation in Task 3 is not a breaking change for them.
+pub fn feeds() -> &'static [Feed] {
+    FEEDS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Rows sharing a `(venue, category)` are mirrors and arbitrate as one; rows differing in it
+    /// carry disjoint universes and must never contest each other. Uniqueness is on the triple —
+    /// `(venue, kind)` alone cannot express two universes under one Source ID.
     #[test]
-    fn venue_kind_pairs_are_unique() {
+    fn venue_category_kind_triples_are_unique() {
         let mut seen = std::collections::HashSet::new();
-        for f in FEEDS {
+        for f in feeds() {
             assert!(
-                seen.insert((f.venue, f.kind)),
-                "duplicate (venue, kind): {} {:?}",
+                seen.insert((f.venue, f.category, f.kind)),
+                "duplicate (venue, category, kind): {} {} {:?}",
+                f.venue,
+                f.category,
+                f.kind
+            );
+        }
+    }
+
+    /// Every row declares a category. An empty one would silently collapse into whatever other
+    /// row also left it empty, re-creating the venue-wide contest this field exists to prevent.
+    #[test]
+    fn every_feed_declares_a_category() {
+        for f in feeds() {
+            assert!(
+                !f.category.is_empty(),
+                "{} {:?} has no category",
                 f.venue,
                 f.kind
             );
@@ -463,17 +501,20 @@ mod tests {
     fn every_feed_has_a_group_code() {
         // The reconciler matches `code` against `doublezero status` subscriptions, so every row
         // must carry one. Both Hyperliquid rows share the group `tiredsolid`; Phoenix is `scottsdale`.
-        for f in FEEDS {
+        for f in feeds() {
             assert!(!f.code.is_empty(), "{} {:?} has no code", f.venue, f.kind);
         }
-        // Keyed on `(venue, kind)` and not on venue alone: Lashay's two rows ride *different*
-        // groups, which is what makes tape ownership a runtime decision in the first place.
-        for f in FEEDS {
-            let expected = match (f.venue, f.kind) {
-                ("HYPERLIQUID", FeedKind::TopOfBook | FeedKind::MarketByOrder) => "tiredsolid",
-                ("PHOENIX", FeedKind::TopOfBook) => "scottsdale",
-                ("KALSHI", FeedKind::TopOfBook) => "lashay-1",
-                ("KALSHI", FeedKind::MarketByPrice) => "lashay-2",
+        // Keyed on `(venue, category, kind)` and not on venue alone: Lashay's two rows ride
+        // *different* groups, which is what makes tape ownership a runtime decision in the first
+        // place.
+        for f in feeds() {
+            let expected = match (f.venue, f.category, f.kind) {
+                ("HYPERLIQUID", "perps", FeedKind::TopOfBook | FeedKind::MarketByOrder) => {
+                    "tiredsolid"
+                }
+                ("PHOENIX", "spot", FeedKind::TopOfBook) => "scottsdale",
+                ("KALSHI", "perps", FeedKind::TopOfBook) => "lashay-1",
+                ("KALSHI", "perps", FeedKind::MarketByPrice) => "lashay-2",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
@@ -482,7 +523,7 @@ mod tests {
 
     #[test]
     fn hyperliquid_has_tob_and_mbo() {
-        let kinds: std::collections::HashSet<FeedKind> = FEEDS
+        let kinds: std::collections::HashSet<FeedKind> = feeds()
             .iter()
             .filter(|f| f.venue.eq_ignore_ascii_case("hyperliquid"))
             .map(|f| f.kind)
@@ -493,7 +534,7 @@ mod tests {
 
     #[test]
     fn hyperliquid_tob_emits_trades() {
-        let hl = FEEDS
+        let hl = feeds()
             .iter()
             .find(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::TopOfBook)
             .unwrap();
@@ -515,7 +556,7 @@ mod tests {
     /// with `dz_tape_owner_changes_total` / `dz_tape_arm_transfers_total` reporting the moves.
     #[test]
     fn emit_trades_agrees_with_the_tape_ownership_rule() {
-        for f in FEEDS {
+        for f in feeds() {
             assert_eq!(
                 f.emit_trades,
                 crate::ingest::reconcile::tape_rank_is_some(f.kind),
@@ -532,7 +573,7 @@ mod tests {
     #[test]
     fn arbitration_mode_agrees_across_a_venues_rows() {
         let mut modes = std::collections::HashMap::new();
-        for f in FEEDS {
+        for f in feeds() {
             if let Some(prev) = modes.insert(f.venue, f.arbitration) {
                 assert_eq!(
                     prev, f.arbitration,
@@ -549,7 +590,7 @@ mod tests {
     /// no shared clock can declare it; a new such venue is the feature working, not a regression.
     #[test]
     fn existing_venues_are_coordinated() {
-        for f in FEEDS.iter().filter(|f| f.venue != "KALSHI") {
+        for f in feeds().iter().filter(|f| f.venue != "KALSHI") {
             assert_eq!(f.arbitration, ArbitrationMode::Coordinated, "{}", f.venue);
         }
     }
@@ -578,7 +619,7 @@ mod tests {
     /// contribute no data.
     #[test]
     fn every_feed_has_at_least_one_publisher() {
-        for f in FEEDS {
+        for f in feeds() {
             assert!(
                 !f.publishers.is_empty(),
                 "{} {:?} lists no publishers",
@@ -593,7 +634,7 @@ mod tests {
     /// merge their metrics).
     #[test]
     fn publisher_base_ports_unique_within_a_feed() {
-        for f in FEEDS {
+        for f in feeds() {
             let mut seen = std::collections::HashSet::new();
             for p in f.publishers {
                 assert!(
@@ -615,7 +656,7 @@ mod tests {
     #[test]
     fn group_port_pairs_are_globally_unique() {
         let mut seen = std::collections::HashSet::new();
-        for f in FEEDS {
+        for f in feeds() {
             for p in f.publishers {
                 let mut ports = vec![p.ports.mktdata(), p.ports.refdata()];
                 if let Some(s) = p.ports.snapshot() {
@@ -643,7 +684,7 @@ mod tests {
     #[test]
     fn hyperliquid_lists_the_whole_publisher_fleet() {
         let base_ports = |kind: FeedKind| -> Vec<u16> {
-            let f = FEEDS
+            let f = feeds()
                 .iter()
                 .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
                 .unwrap();
@@ -675,7 +716,7 @@ mod tests {
     #[test]
     fn publisher_blocks_use_a_known_layout() {
         const SCHEMES: [u16; 2] = [1, 10_000];
-        for f in FEEDS {
+        for f in feeds() {
             let mut feed_scheme = None;
             for p in f.publishers {
                 let mkt = p.ports.mktdata();
@@ -708,7 +749,7 @@ mod tests {
     /// deployment exactly so a transcription slip fails the build instead.
     #[test]
     fn lashay_rows_match_the_deployment() {
-        let row = |kind| FEEDS.iter().find(|f| f.venue == "KALSHI" && f.kind == kind);
+        let row = |kind| feeds().iter().find(|f| f.venue == "KALSHI" && f.kind == kind);
 
         let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
         assert_eq!(tob.code, "lashay-1");
@@ -746,7 +787,7 @@ mod tests {
     #[test]
     fn both_hyperliquid_feeds_list_every_publisher() {
         let count = |kind: FeedKind| -> usize {
-            FEEDS
+            feeds()
                 .iter()
                 .find(|f| f.venue == "HYPERLIQUID" && f.kind == kind)
                 .unwrap()
