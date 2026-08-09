@@ -552,10 +552,13 @@ mount_args=()
 # Relay bridge env vars to the container. The bridge reads every flag from an env var, so this is
 # the only wiring needed to tune the WS sink, narrow feeds, or raise log level — no per-feature
 # logic here. Only non-empty values are forwarded, with one exception (WS_BIND, below).
+# This is an allowlist, not a wildcard: a bridge env var absent from it is silently NOT relayed,
+# and the bridge falls back to its compiled default. Add new ones here.
 PASSTHROUGH=(
   DZ_FEEDS DZ_IFACE DZ_RECV_BUF
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
+  DZ_API_BIND
   DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
   DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
   RUST_LOG
