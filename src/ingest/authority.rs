@@ -384,6 +384,8 @@ impl StickyAuthority {
             .iter()
             .filter(|((v, _), _)| v.as_ref() == venue)
             .filter_map(|(_, arms)| arms.get(&publisher).copied())
+            // Lexicographic, which is ordinal order only while [`MAX_LABELLED_ARMS`] <= 10
+            // ("arm10" < "arm2"). Raising the cap past ten means parsing the suffix here.
             .min()
             .unwrap_or(OTHER_ARM)
     }

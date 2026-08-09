@@ -618,13 +618,6 @@ fn transfer_reason(
     None
 }
 
-/// The WS-replay key for one market: its wire identity, with the arbitration scope stripped. The
-/// replay map is the consumer-facing one `sinks/ws.rs` serves and filters by, and the category is a
-/// producer-side arbitration key that never reaches the wire (see [`ScopeKey`]).
-fn replay_key(key: &MarketKey) -> (Arc<str>, u32, u32) {
-    (key.0.clone(), key.2, key.3)
-}
-
 /// A `clear`-only re-baseline for one market: what a consumer gets when the gate has no accumulated
 /// levels to republish (an evicted market). Legal on its own, and `last` is why that field is
 /// mandatory.
@@ -929,7 +922,7 @@ impl Arbiter {
             };
             self.book_markets.remove(&old);
             if let Some(replay) = &self.book_replay {
-                model::lock(replay).remove(&replay_key(&old));
+                model::lock(replay).remove(&old);
             }
             self.books.forget_market(&old);
             self.vm(&old.0).book_markets_evicted.inc();
@@ -952,7 +945,7 @@ impl Arbiter {
             .and_then(|m| m.arms.get(&publisher))
             .cloned()?;
         if let Some(replay) = &self.book_replay {
-            model::lock(replay).insert(replay_key(key), acc.clone());
+            model::lock(replay).insert(key.clone(), acc.clone());
         }
         acc.baselined().then(|| acc.to_book(&key.0, key.2, key.3))
     }
@@ -968,7 +961,7 @@ impl Arbiter {
         self.book_markets.remove(key);
         self.book_order.retain(|k| k != key);
         if let Some(replay) = &self.book_replay {
-            model::lock(replay).remove(&replay_key(key));
+            model::lock(replay).remove(key);
         }
         self.books.forget_market(key);
     }
@@ -983,7 +976,7 @@ impl Arbiter {
             return;
         }
         model::lock(replay)
-            .entry(replay_key(key))
+            .entry(key.clone())
             .or_insert_with(|| BookAccumulator::new(b.symbol.clone()))
             .apply(b);
     }
@@ -1023,7 +1016,7 @@ impl Arbiter {
     /// Four rules, each load-bearing:
     ///
     /// - **No dark start.** With no entry the first arm to print leads. A top-of-book-only deployment
-    ///   carries no `book` traffic, so `venue_leader` is `None` forever and electing first would drop
+    ///   carries no `book` traffic, so `scope_leader` is `None` forever and electing first would drop
     ///   the venue's whole tape.
     /// - **Corroborated beats uncorroborated.** A challenger the authority tracks displaces an
     ///   incumbent it does not, immediately. The incumbent slot is filled by whoever prints first, and
@@ -1132,7 +1125,7 @@ impl Arbiter {
     /// lead measured between two of one universe's mirrors must not be filed against another's arms.
     fn observe_trade_race(&mut self, scope: &ScopeKey, t: &NormalizedTrade, publisher: Publisher) {
         let Some(m) = self.race.on_trade(
-            &t.venue,
+            scope,
             &t.symbol,
             t.price,
             t.size,
@@ -1168,12 +1161,13 @@ impl Arbiter {
                 .with_label_values(&[venue.as_ref(), "margin"])
                 .inc();
         }
-        // `arm_label_in_venue`, never `arm_ordinal`: labelling must not admit. Both key sets here are
-        // venue-grained while the ordinals are per universe — `markets_held_all` sums a venue's
-        // universes and `drain_unmatched` never sees a category — and both metrics are labelled
-        // `{venue, arm}`, so the label is resolved across the venue's universes rather than inventing
-        // a dimension. Minting here would instead spend a universe's admission slots on sources that
-        // never serve a book.
+        // Never `arm_ordinal` on either loop: labelling must not admit. `drain_unmatched`'s keys are
+        // every publisher that sent a trade for the scope, so minting here would spend that scope's
+        // eight admission slots on sources that never serve a book.
+        //
+        // The two lookups differ because their key sets do. `markets_held_all` is summed per venue
+        // (the gauge is labelled `{venue, arm}`), so its label is resolved across the venue's
+        // universes; the matcher is scope-keyed, so its label is the exact per-scope ordinal.
         for (venue, arm, held) in self.books.markets_held_all() {
             let label = self.books.arm_label_in_venue(&venue, arm);
             metrics()
@@ -1181,11 +1175,11 @@ impl Arbiter {
                 .with_label_values(&[venue.as_ref(), label])
                 .set(held as i64);
         }
-        for ((venue, arm), n) in self.race.drain_unmatched() {
-            let label = self.books.arm_label_in_venue(&venue, arm);
+        for ((scope, arm), n) in self.race.drain_unmatched() {
+            let label = self.books.arm_label(&scope, arm);
             metrics()
                 .arm_unmatched_trades
-                .with_label_values(&[venue.as_ref(), label])
+                .with_label_values(&[scope.0.as_ref(), label])
                 .inc_by(n);
         }
     }
@@ -3119,7 +3113,7 @@ mod tests {
         );
         let guard = model::lock(&replay);
         let acc = guard
-            .get(&(Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT))
+            .get(&mkey(venue, BOOK_INSTRUMENT))
             .expect("the admitted market is in the replay map");
         let full = acc.to_book(&Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
         assert_eq!(
@@ -3716,6 +3710,73 @@ mod tests {
             a.books.markets_held_all(),
             vec![(Arc::from(venue), arm(1), MAX_BOOK_MARKETS)],
             "the authority's per-market map is evicted in step"
+        );
+    }
+
+    /// The WS-replay map is keyed at the **same grain** as the market key, and eviction is what makes
+    /// that load-bearing rather than cosmetic. Two universes under one Source ID have independent id
+    /// spaces, so they can carry the same `(channel, instrument_id)`. Under a venue-grained replay key
+    /// they share one entry, and evicting one universe's market deletes the **other's live** entry
+    /// while its `book_markets` and `last_admitted` survive — so it never re-baselines, its rebuilt
+    /// entry stays `!baselined()`, and it is invisible to every client that connects from then on.
+    #[test]
+    fn evicting_one_universes_market_spares_the_others_replay_entry() {
+        let venue = "BookEvictionAcrossUniverses";
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+
+        // The same wire identity in two universes, each with a producer re-baseline of its own so
+        // both replay entries are complete.
+        let doomed: MarketKey = (
+            Arc::from(venue),
+            "perps".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        let kept: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        for category in ["perps", "sports"] {
+            // The producer's opening re-baseline, in this universe (`synced` is TEST_CATEGORY-bound).
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000),
+                arm(1),
+                category,
+            );
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_001),
+                arm(1),
+                category,
+            );
+        }
+        assert!(
+            model::lock(&replay)
+                .get(&kept)
+                .is_some_and(|acc| acc.baselined()),
+            "both universes start with a complete replay entry"
+        );
+
+        // Fill to the cap and one past it. `doomed` was tracked first, so it is the single eviction.
+        for id in 0..(MAX_BOOK_MARKETS as u32 - 1) {
+            a.emit(
+                book(venue, 1_000 + id, vec![bid(0.40, 10.0)], true, 1_100),
+                arm(1),
+                "perps",
+            );
+        }
+        let guard = model::lock(&replay);
+        assert!(
+            !guard.contains_key(&doomed),
+            "the oldest market was evicted, replay entry included"
+        );
+        assert!(
+            guard.get(&kept).is_some_and(|acc| acc.baselined()),
+            "the peer universe's live, complete replay entry must survive that eviction"
         );
     }
 

@@ -348,8 +348,15 @@ where
             // A market accumulated mid-stream holds only the levels that have moved since, so
             // replaying it as full state would tell the client to discard the ones it never saw.
             .filter(|(_, acc)| acc.baselined())
-            .filter(|((venue, channel, _), acc)| pass(venue, acc.symbol(), Some(*channel), "book"))
-            .map(|((venue, channel, id), acc)| FeedMessage::Book(acc.to_book(venue, *channel, *id)))
+            // The key's second element is the producer-side arbitration scope (`Feed::category`,
+            // which keeps two universes' colliding instrument ids apart in the map); it is not a
+            // filter dimension and never reaches the wire.
+            .filter(|((venue, _, channel, _), acc)| {
+                pass(venue, acc.symbol(), Some(*channel), "book")
+            })
+            .map(|((venue, _, channel, id), acc)| {
+                FeedMessage::Book(acc.to_book(venue, *channel, *id))
+            })
             .collect()
     };
     for m in snapshot.into_iter().chain(depths).chain(rebaselines) {
@@ -1125,7 +1132,7 @@ mod tests {
     /// the caller for the lifetime of the test.
     async fn spawn_server(
         instruments: HashMap<(Arc<str>, u32, u32), NormalizedInstrument>,
-        books: HashMap<(Arc<str>, u32, u32), BookAccumulator>,
+        books: HashMap<(Arc<str>, Arc<str>, u32, u32), BookAccumulator>,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         broadcast::Sender<std::sync::Arc<FeedMessage>>,
@@ -1186,7 +1193,12 @@ mod tests {
     async fn connect_replays_the_accumulated_book_rebaseline() {
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1223,11 +1235,21 @@ mod tests {
     async fn subscribe_scopes_the_book_replay_by_channel() {
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         books.insert(
-            (Arc::<str>::from("KALSHI"), 3u32, 7u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                3u32,
+                7u32,
+            ),
             accumulator("KXETHPERP", 0.41, 0.43),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1288,7 +1310,12 @@ mod tests {
         );
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(defs, books).await;
@@ -1327,9 +1354,22 @@ mod tests {
         assert!(!mid_stream.baselined(), "no Clear was folded in");
 
         let mut books = HashMap::new();
-        books.insert((Arc::<str>::from("KALSHI"), 3u32, 7u32), mid_stream);
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                3u32,
+                7u32,
+            ),
+            mid_stream,
+        );
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1369,7 +1409,12 @@ mod tests {
 
         let mut books = HashMap::new();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let cfg = WsConfig {

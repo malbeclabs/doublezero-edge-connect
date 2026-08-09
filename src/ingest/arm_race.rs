@@ -18,8 +18,19 @@
 //! The pair key is the [`crate::model::NormalizedTrade`]'s own fields, so `symbol` — a truncated
 //! 16-byte wire field — stands in for the instrument id and can collide across instruments on a
 //! sharded feed. A mis-pair then needs two colliding-symbol instruments to trade at an identical
-//! price *and* size *and* aggressor side inside the window; venue scoping and the FIFO per signature
+//! price *and* size *and* aggressor side inside the window; the scope key and the FIFO per signature
 //! still hold. That is the recorded cost of matching on normalized rather than wire fields.
+//!
+//! # Why pairs form within one scope
+//!
+//! The scope is `(venue, category)` — the emitting row's instrument universe — and not the venue,
+//! because this matcher is the sole producer of the evidence
+//! [`crate::ingest::authority::StickyAuthority::close_window`] elects on, and that election is per
+//! universe. A cross-universe pair would hand `observe_matched_lead` a publisher that is a stranger
+//! to the scope it is filed under: `arm_ordinal` mints it into that scope's eight admission slots,
+//! its samples accumulate there, and a margin transfer can elect an arm that serves no `book` in
+//! that universe at all. Trades carry no category — the emitting row supplies it, exactly as it does
+//! for the tape gate.
 //!
 //! # Why the venue timestamp is not used
 //!
@@ -43,7 +54,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{ingest::arbiter::Publisher, model::Side};
+use crate::{
+    ingest::{arbiter::Publisher, authority::ScopeKey},
+    model::Side,
+};
 
 /// A trade's cross-arm identity. Price and size key on `f64::to_bits` — **exact**, no rounding step,
 /// which holds only for arms sharing one decode path ([`ArmRace::on_trade`]'s precondition); a
@@ -52,7 +66,12 @@ use crate::{ingest::arbiter::Publisher, model::Side};
 /// lost sample.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Signature {
-    venue: Arc<str>,
+    /// `(venue, category)`, never the venue alone. The authority elects per instrument universe, and
+    /// this matcher is the sole producer of that election's evidence: a pair formed across two
+    /// universes would file a lead against arms that publish nothing for each other, mint a foreign
+    /// publisher into the scope's eight admission slots, and can elect an arm that serves no `book`
+    /// there at all. Trades carry no category, so it is supplied by the emitting row.
+    scope: ScopeKey,
     symbol: Arc<str>,
     price_bits: u64,
     size_bits: u64,
@@ -69,7 +88,7 @@ struct Arrival {
 /// A matched pair: both arms delivered the same trade.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    pub venue: Arc<str>,
+    pub scope: ScopeKey,
     /// The arm that delivered it first.
     pub first: Publisher,
     /// The arm that delivered the same trade second.
@@ -112,7 +131,7 @@ const MAX_PENDING: usize = 1 << 16;
 /// arbiter lock, so one arm repeating one signature must not be able to lengthen it.
 const MAX_PER_SIGNATURE: usize = 8;
 
-/// Cap on distinct `(venue, arm)` counter keys. A [`Publisher`] is a spoofable source IP, so past the
+/// Cap on distinct `(scope, arm)` counter keys. A [`Publisher`] is a spoofable source IP, so past the
 /// cap a new key is refused rather than grown into.
 const MAX_UNMATCHED_KEYS: usize = 1024;
 
@@ -127,7 +146,7 @@ pub struct ArmRace {
     live: usize,
     /// Window evictions since the last drain. Only those: the cap paths are overload, not a one-sided
     /// print, and merging them would blur what the counter means.
-    unmatched: HashMap<(Arc<str>, Publisher), u64>,
+    unmatched: HashMap<(ScopeKey, Publisher), u64>,
 }
 
 impl Default for ArmRace {
@@ -158,7 +177,7 @@ impl ArmRace {
     #[allow(clippy::too_many_arguments)]
     pub fn on_trade(
         &mut self,
-        venue: &Arc<str>,
+        scope: &ScopeKey,
         symbol: &Arc<str>,
         price: f64,
         size: f64,
@@ -168,7 +187,7 @@ impl ArmRace {
     ) -> Option<Match> {
         self.evict_stale(recv_ns);
         let sig = Signature {
-            venue: venue.clone(),
+            scope: scope.clone(),
             symbol: symbol.clone(),
             price_bits: price.to_bits(),
             size_bits: size.to_bits(),
@@ -184,7 +203,7 @@ impl ArmRace {
                 }
                 self.live = self.live.saturating_sub(1); // its `order` entry is now a tombstone
                 return Some(Match {
-                    venue: venue.clone(),
+                    scope: scope.clone(),
                     first: peer.arm,
                     second: arm,
                     delta_ns: recv_ns.saturating_sub(peer.recv_ns),
@@ -200,10 +219,10 @@ impl ArmRace {
         self.live
     }
 
-    /// Take the per-`(venue, arm)` window-eviction counts accumulated since the last drain — the
+    /// Take the per-`(scope, arm)` window-eviction counts accumulated since the last drain — the
     /// "seen only on this arm" signal, which is a drop or a genuine one-sided print. Accumulated
     /// rather than returned by [`Self::evict_stale`], which [`Self::on_trade`] calls mid-burst.
-    pub fn drain_unmatched(&mut self) -> Vec<((Arc<str>, Publisher), u64)> {
+    pub fn drain_unmatched(&mut self) -> Vec<((ScopeKey, Publisher), u64)> {
         std::mem::take(&mut self.unmatched).into_iter().collect()
     }
 
@@ -219,14 +238,14 @@ impl ArmRace {
             self.order.pop_front();
             if let Some(arm) = self.drop_arrival(&sig, at) {
                 *dropped.entry(arm).or_default() += 1;
-                self.record_unmatched(&sig.venue, arm);
+                self.record_unmatched(&sig.scope, arm);
             }
         }
         dropped.into_iter().collect()
     }
 
-    fn record_unmatched(&mut self, venue: &Arc<str>, arm: Publisher) {
-        let key = (venue.clone(), arm);
+    fn record_unmatched(&mut self, scope: &ScopeKey, arm: Publisher) {
+        let key = (scope.clone(), arm);
         if let Some(n) = self.unmatched.get_mut(&key) {
             *n += 1;
         } else if self.unmatched.len() < MAX_UNMATCHED_KEYS {
@@ -280,25 +299,29 @@ mod tests {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, (n >> 8) as u8, n as u8)))
     }
 
-    fn venue() -> Arc<str> {
-        Arc::from("KALSHI")
-    }
-
     fn sym() -> Arc<str> {
         Arc::from("KXBTCPERP")
     }
 
-    /// The instrument universe the authority round-trip below elects in. The matcher itself is
-    /// category-blind — it pairs trades, which carry none — so this only names the scope the leads
-    /// are filed against.
+    /// The instrument universe every test that is not *about* universes runs in.
     const CATEGORY: &str = "perps";
 
-    /// One trade, both arms: arm(1) 10us ahead.
-    fn race() -> (ArmRace, Arc<str>) {
-        (ArmRace::new(1_000_000_000), venue())
+    /// One venue, one universe: the scope a pair has to share to form.
+    fn scope() -> ScopeKey {
+        (Arc::from("KALSHI"), Arc::from(CATEGORY))
     }
 
-    fn trade(r: &mut ArmRace, v: &Arc<str>, a: Publisher, recv_ns: u64) -> Option<Match> {
+    /// A second universe under the **same** Source ID, publishing an unrelated instrument set.
+    fn other_scope() -> ScopeKey {
+        (Arc::from("KALSHI"), Arc::from("sports"))
+    }
+
+    /// One trade, both arms: arm(1) 10us ahead.
+    fn race() -> (ArmRace, ScopeKey) {
+        (ArmRace::new(1_000_000_000), scope())
+    }
+
+    fn trade(r: &mut ArmRace, v: &ScopeKey, a: Publisher, recv_ns: u64) -> Option<Match> {
         r.on_trade(v, &sym(), 6_200.0, 150.0, Side::Buy, a, recv_ns)
     }
 
@@ -313,7 +336,7 @@ mod tests {
         assert_eq!(
             trade(&mut r, &v, arm(2), 11_000),
             Some(Match {
-                venue: v.clone(),
+                scope: v.clone(),
                 first: arm(1),
                 second: arm(2),
                 delta_ns: 10_000,
@@ -327,7 +350,7 @@ mod tests {
     #[test]
     fn lead_for_is_negative_when_the_challenger_led() {
         let m = Match {
-            venue: venue(),
+            scope: scope(),
             first: arm(2),
             second: arm(1),
             delta_ns: 10_000,
@@ -354,8 +377,7 @@ mod tests {
             min_window_samples: 5,
         };
         let mut auth = StickyAuthority::new(cfg);
-        let scope = (v.clone(), CATEGORY.into());
-        let key = (v.clone(), CATEGORY.into(), 2, 41);
+        let key = (v.0.clone(), v.1.clone(), 2, 41);
         auth.admit(key.clone(), arm(1), 1);
 
         // arm(2) is genuinely 10us faster on every one of ten trades, in true arrival order.
@@ -368,13 +390,13 @@ mod tests {
             let m = r
                 .on_trade(&v, &sym(), px, 150.0, Side::Buy, arm(1), t + 10_000)
                 .expect("the pair matches");
-            let leader = auth.scope_leader(&scope).unwrap();
+            let leader = auth.scope_leader(&v).unwrap();
             let (challenger, lead) = m.lead_for(leader).expect("leader is in the pair");
-            auth.observe_matched_lead(&scope, challenger, lead);
+            auth.observe_matched_lead(&v, challenger, lead);
         }
         assert_eq!(
             auth.close_window(20_000_000),
-            vec![(scope.clone(), arm(2))],
+            vec![(v.clone(), arm(2))],
             "the faster arm must take authority"
         );
     }
@@ -428,7 +450,7 @@ mod tests {
     /// Different trades never match each other, on any one distinguishing field.
     #[test]
     fn distinct_trades_do_not_match() {
-        let v = venue();
+        let v = scope();
         let other: Arc<str> = Arc::from("KXETHPERP");
         for (s, px, size, side) in [
             (other, 6_200.0, 150.0, Side::Buy),
@@ -446,11 +468,36 @@ mod tests {
         }
     }
 
-    /// Two venues sharing a symbol and a price never cross-match.
+    /// Two **universes of one venue** sharing a symbol and a price never cross-match either. This
+    /// matcher is the sole producer of the election's evidence, and that election is per universe: a
+    /// pair formed across them hands `observe_matched_lead` a publisher that is a stranger to the
+    /// scope it is filed under, minting it into that scope's eight admission slots — and a margin
+    /// transfer can then elect an arm that serves no `book` in that universe at all.
+    #[test]
+    fn universes_of_one_venue_do_not_cross_match() {
+        let mut r = ArmRace::new(1_000_000_000);
+        r.on_trade(&scope(), &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
+        assert_eq!(
+            r.on_trade(
+                &other_scope(),
+                &sym(),
+                6_200.0,
+                150.0,
+                Side::Buy,
+                arm(2),
+                2_000
+            ),
+            None,
+            "a trade in another universe must not pair with this one"
+        );
+        assert_eq!(r.pending_len(), 2, "both are still waiting for a real peer");
+    }
+
+    /// The control for the test above: two venues sharing a symbol and a price never cross-match.
     #[test]
     fn venues_do_not_cross_match() {
         let mut r = ArmRace::new(1_000_000_000);
-        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("KALSHI"), Arc::from("Other"));
+        let (a, b): (ScopeKey, ScopeKey) = (scope(), (Arc::from("Other"), Arc::from(CATEGORY)));
         r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
         assert_eq!(
             r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, arm(2), 2_000),
@@ -463,7 +510,7 @@ mod tests {
     #[test]
     fn pending_arrivals_are_bounded() {
         let mut r = ArmRace::new(u64::MAX); // no time-based eviction, so only the cap can bound it
-        let v = venue();
+        let v = scope();
         for i in 0..(MAX_PENDING + 500) {
             r.on_trade(&v, &sym(), i as f64, 150.0, Side::Buy, arm(1), 1_000);
         }
@@ -484,7 +531,7 @@ mod tests {
     #[test]
     fn the_order_index_stays_consistent_with_the_queues() {
         let mut r = ArmRace::new(1_000_000_000);
-        let v = venue();
+        let v = scope();
         for i in 0..50 {
             r.on_trade(
                 &v,
@@ -517,7 +564,7 @@ mod tests {
     #[test]
     fn a_repeated_signature_cannot_grow_its_queue() {
         let mut r = ArmRace::new(u64::MAX); // no time-based eviction
-        let v = venue();
+        let v = scope();
         for i in 0..(MAX_PER_SIGNATURE * 100) {
             trade(&mut r, &v, arm(1), 1_000 + i as u64);
         }
@@ -544,7 +591,7 @@ mod tests {
     #[test]
     fn the_unmatched_counter_map_is_bounded() {
         let mut r = ArmRace::new(0); // every arrival is stale by the next call
-        let v = venue();
+        let v = scope();
         for n in 0..(MAX_UNMATCHED_KEYS + 8) {
             r.on_trade(
                 &v,
@@ -573,11 +620,11 @@ mod tests {
         );
     }
 
-    /// Evictions are attributed per `(venue, arm)`, and a drain leaves the accumulator empty.
+    /// Evictions are attributed per `(scope, arm)`, and a drain leaves the accumulator empty.
     #[test]
-    fn unmatched_evictions_are_attributed_per_venue_and_arm() {
+    fn unmatched_evictions_are_attributed_per_scope_and_arm() {
         let mut r = ArmRace::new(1_000_000_000);
-        let (a, b): (Arc<str>, Arc<str>) = (Arc::from("KALSHI"), Arc::from("Other"));
+        let (a, b): (ScopeKey, ScopeKey) = (scope(), (Arc::from("Other"), Arc::from(CATEGORY)));
         r.on_trade(&a, &sym(), 6_200.0, 150.0, Side::Buy, arm(1), 1_000);
         r.on_trade(&a, &sym(), 6_201.0, 150.0, Side::Buy, arm(1), 1_000);
         r.on_trade(&b, &sym(), 6_200.0, 150.0, Side::Buy, arm(2), 1_000);

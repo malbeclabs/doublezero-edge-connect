@@ -226,7 +226,7 @@ Modules are grouped by role under `src/`:
   sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
   venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
   **id-independent**. Four rules: first arm to print leads (a TOB-only deployment carries no `book`
-  traffic, so `venue_leader()` is `None` forever and electing first would mute the tape); an arm the
+  traffic, so `scope_leader()` is `None` forever and electing first would mute the tape); an arm the
   authority *tracks* displaces one it does not (the slot is first-come on an unauthenticated wire);
   the book-*elected* arm takes over, **once per election** rather than per print (arm identity is
   shared across a venue's rows — one source IP per publisher host, both protocols — and re-honouring
@@ -283,7 +283,11 @@ Modules are grouped by role under `src/`:
   which also prefixes `MarketKey` — never on the venue alone: one Source ID can carry universes that
   mirror nothing, and a venue-wide election drops the losing universe's whole book stream permanently
   (the only escape is leader silence, and a leader streaming its own universe is never silent).
-  **Speed and silence are per arm, across that arm's universe; health is per market**
+  **Speed and silence are per arm, across that arm's universe; health is per market**. The arm-ordinal
+  cap (`MAX_LABELLED_ARMS`, 8) is likewise **per scope**, so a venue carrying N universes admits up to
+  `8 x N` arms — the forged-flood bound still holds per universe, which is the grain that decides
+  anything, and the metric label set stays `{venue, arm}` (`dz_arm_markets_held` sums a venue's
+  universes; two universes' `arm0` are different publishers)
   (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
   overrides the elected arm for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the arm that last reached the wire for this market" re-baselines the consumer**: a
@@ -302,14 +306,23 @@ Modules are grouped by role under `src/`:
   Per-market state is capped by `MAX_BOOK_MARKETS` (`dz_book_markets_evicted_total`) and eviction drops
   the accumulators, the replay entry **and** `StickyAuthority`'s own per-market entry together — that
   pairing is what makes eviction safe rather than a corruption primitive, since losing `last_admitted` is
-  what forces the re-baseline. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
+  what forces the re-baseline. All three are keyed at the **same grain** (`MarketKey`, scope included);
+  a narrower replay key would break exactly that pairing, because two universes with independent id
+  spaces can share a `(channel, instrument_id)` — evicting one would delete the other's *live* entry
+  while its `last_admitted` survived, so it would never re-baseline and would stay invisible to new
+  clients (`arbiter::tests::evicting_one_universes_market_spares_the_others_replay_entry`).
+  `sinks/ws.rs` and `sinks/api.rs` skip the scope element: it is a producer-side key that never
+  reaches the wire. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
   processor scopes `EndOfSession` per arm and channel, handing those markets to the peer). `arm_race` is the **only** producer of the matched-lead
   samples the speed re-election consumes: it pairs the two arms' copies of the same **trade** by content
-  (`(venue, symbol, price bits, size bits, aggressor)`, FIFO per signature so identical repeats pair in
-  order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time. Trades only — a
+  (`((venue, category), symbol, price bits, size bits, aggressor)`, FIFO per signature so identical
+  repeats pair in order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time.
+  Pairs form **within one scope**: it is the sole producer of the election's evidence and that election
+  is per universe, so a cross-universe pair would mint a foreign publisher into a scope's admission
+  slots and could elect an arm serving no `book` there. Trades only — a
   level update's cross-arm-common fields recur on a coarse price grid and would mis-pair constantly — and
   **edge arms the authority already tracks only** (`Arbiter::race_eligible`): the public backstop decodes
-  from parsed JSON and serves no `book`, and an untracked publisher would spend one of the venue's eight
+  from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
   non-negative). The only `FEEDS` row of that kind is `lashay-2`, whose group is live, so these series
@@ -453,8 +466,10 @@ Modules are grouped by role under `src/`:
   the sink only once a market-data feed is subscribed.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
-  `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` and `BookSnapshot` are both keyed by
-  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label
+  `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by
+  **`(venue, channel, instrument_id)`** and `BookSnapshot` by that **prefixed with the arbitration
+  scope** (`(venue, category, channel, instrument_id)` — exactly `authority::MarketKey`) — a
+  market-by-price `symbol` is a truncated display label
   that collides across markets (confirmed against a real capture — two distinct instrument_ids
   sharing one truncated symbol, see `tests/fixtures/PROVENANCE.md`), so it is not an identity; a
   `(venue, symbol)`-keyed map would have the second market's insert silently destroy the first's

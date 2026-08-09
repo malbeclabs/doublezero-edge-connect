@@ -621,14 +621,29 @@ impl BookAccumulator {
     }
 }
 
-/// Accumulated book state per `(venue, channel, instrument_id)`, replayed on connect and on each
-/// subscribe. Written by the arbiter on the authority gate's admit decision, so it always holds the
-/// authoritative arm's book rather than a discarded arm's copy.
+/// Accumulated book state per market, replayed on connect and on each subscribe. Written by the
+/// arbiter on the authority gate's admit decision, so it always holds the authoritative arm's book
+/// rather than a discarded arm's copy.
+///
+/// Keyed identically to `ingest::authority::MarketKey` — `(venue, category, channel, instrument_id)`
+/// — and that shared grain is load-bearing, not incidental. The gate's own per-market state
+/// (`BookMarket`, `StickyAuthority::markets`) carries the arbitration scope because two instrument
+/// universes under one Source ID have independent id spaces and can collide on
+/// `(channel, instrument_id)`. A narrower key here would (a) merge two unrelated markets into one
+/// accumulator, which the replay path then serves to every new client as full state, and (b) break
+/// the invariant that a market's accumulators, its replay entry and its authority state are dropped
+/// **together** — evicting one universe's market would delete the other's live entry while its
+/// `last_admitted` survived, so it would never re-baseline and would stay `!baselined()`, invisible
+/// to new clients for the life of the process. The `category` is never serialized: readers
+/// destructure the key (`sinks/ws.rs`) and the wire carries only what PROTOCOL.md defines.
 ///
 /// The writer owns two obligations the `depth` replay map already discharges (`arbiter.rs`): purge a
 /// market's entry on session reset, or an ended session's book is replayed to a new client as an
 /// authoritative re-baseline; and bound the entry count, since the key is wire-supplied.
-pub type BookSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), BookAccumulator>>>;
+pub type BookSnapshot = Arc<Mutex<BookMap>>;
+
+/// The map behind [`BookSnapshot`], named so a reader can borrow it without respelling the key.
+pub type BookMap = HashMap<(Arc<str>, Arc<str>, u32, u32), BookAccumulator>;
 
 /// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
 ///

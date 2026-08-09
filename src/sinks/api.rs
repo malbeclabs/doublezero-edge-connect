@@ -305,6 +305,30 @@ fn decimal_string(value: f64, exponent: i8) -> String {
     format!("{value:.decimals$}")
 }
 
+/// The `book` replay entry for one wire identity, or `None`.
+///
+/// `model::BookSnapshot` is keyed on the producer-side arbitration scope as well
+/// (`(venue, category, channel, instrument_id)`), because two instrument universes under one Source
+/// ID have independent id spaces and would otherwise share one accumulator. This REST surface
+/// addresses a market by its wire identity alone — a `NormalizedInstrument` carries no category, and
+/// PROTOCOL.md never exposes one — so the scope element is skipped and the first matching entry wins.
+/// On a venue whose universes genuinely collide on `(channel, instrument_id)` that choice is
+/// arbitrary; the same ambiguity is already in `InstrumentSnapshot`, which is what supplied `i`.
+///
+/// A scan, not a lookup: the map is bounded by the arbiter's `MAX_BOOK_MARKETS` and this is a
+/// per-request REST path, never the ingest hot path.
+fn book_entry<'a>(
+    books: &'a crate::model::BookMap,
+    i: &NormalizedInstrument,
+) -> Option<&'a crate::model::BookAccumulator> {
+    books
+        .iter()
+        .find(|((venue, _, channel, id), _)| {
+            *venue == i.venue && *channel == i.channel && *id == i.instrument_id
+        })
+        .map(|(_, acc)| acc)
+}
+
 /// Best-effort feed-kind label for one instrument, derived from which snapshot actually holds data
 /// for its exact identity — never fabricated. A `BookSnapshot` entry for `(venue, channel,
 /// instrument_id)` means the serving row speaks Market-by-Price; failing that, a `DepthSnapshot`
@@ -317,7 +341,7 @@ fn decimal_string(value: f64, exponent: i8) -> String {
 fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     {
         let books = crate::model::lock(&state.books);
-        if books.contains_key(&(i.venue.clone(), i.channel, i.instrument_id)) {
+        if book_entry(&books, i).is_some() {
             return "market_by_price";
         }
     }
@@ -477,7 +501,7 @@ type Level = Option<(f64, f64)>;
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) {
     {
         let books = crate::model::lock(&state.books);
-        if let Some(acc) = books.get(&(inst.venue.clone(), inst.channel, inst.instrument_id)) {
+        if let Some(acc) = book_entry(&books, inst) {
             return (acc.best_bid(), acc.best_ask());
         }
     }
@@ -507,14 +531,12 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // Prefer the incremental market-by-price accumulator when this identity has one.
     let mbp = {
         let books = crate::model::lock(&state.books);
-        books
-            .get(&(inst.venue.clone(), inst.channel, inst.instrument_id))
-            .map(|acc| {
-                (
-                    acc.baselined(),
-                    acc.to_book(&inst.venue, inst.channel, inst.instrument_id),
-                )
-            })
+        book_entry(&books, inst).map(|acc| {
+            (
+                acc.baselined(),
+                acc.to_book(&inst.venue, inst.channel, inst.instrument_id),
+            )
+        })
     };
     if let Some((baselined, materialized)) = mbp {
         let mut bids = Vec::new();
@@ -1458,7 +1480,7 @@ mod tests {
                 true,
             ));
             assert!(baselined.baselined());
-            map.insert(("KALSHI".into(), 2, 41), baselined);
+            map.insert(("KALSHI".into(), "perps".into(), 2, 41), baselined);
 
             // A market accumulated mid-stream: no `Clear` has ever been folded in, so this holds
             // only the levels that moved since accumulation started.
@@ -1472,7 +1494,7 @@ mod tests {
                 true,
             ));
             assert!(!mid_stream.baselined());
-            map.insert(("KALSHI".into(), 3, 7), mid_stream);
+            map.insert(("KALSHI".into(), "perps".into(), 3, 7), mid_stream);
         }
 
         let base = spawn(instruments, depth, books, history, health).await;
@@ -1531,7 +1553,7 @@ mod tests {
                 acc.baselined(),
                 "fixture sanity: this book IS fully re-baselined"
             );
-            map.insert(("KALSHI".into(), 5, 1), acc);
+            map.insert(("KALSHI".into(), "perps".into(), 5, 1), acc);
         }
 
         let base = spawn(instruments, depth, books, history, health).await;
@@ -1773,32 +1795,35 @@ mod tests {
                 ws_send_ts_ns: 0,
             },
         );
-        books.lock().unwrap().insert(("KALSHI".into(), 9, 1), {
-            let mut acc = BookAccumulator::new("KXBTCPERP".into());
-            acc.apply(&book_batch(
-                "KALSHI",
-                "KXBTCPERP",
-                9,
-                1,
-                vec![
-                    BookChange {
-                        action: BookAction::Clear,
-                        side: BookSide::Both,
-                        price: 0.0,
-                        size: 0.0,
-                    },
-                    // Two levels per side, deliberately: with only one, "best" and "worst"
-                    // would be indistinguishable and a swapped best_bid()/best_ask() (highest
-                    // vs. lowest) would go uncaught.
-                    level_update(BookSide::Bid, 0.61, 10.0),
-                    level_update(BookSide::Bid, 0.59, 30.0),
-                    level_update(BookSide::Ask, 0.63, 20.0),
-                    level_update(BookSide::Ask, 0.65, 40.0),
-                ],
-                true,
-            ));
-            acc
-        });
+        books
+            .lock()
+            .unwrap()
+            .insert(("KALSHI".into(), "perps".into(), 9, 1), {
+                let mut acc = BookAccumulator::new("KXBTCPERP".into());
+                acc.apply(&book_batch(
+                    "KALSHI",
+                    "KXBTCPERP",
+                    9,
+                    1,
+                    vec![
+                        BookChange {
+                            action: BookAction::Clear,
+                            side: BookSide::Both,
+                            price: 0.0,
+                            size: 0.0,
+                        },
+                        // Two levels per side, deliberately: with only one, "best" and "worst"
+                        // would be indistinguishable and a swapped best_bid()/best_ask() (highest
+                        // vs. lowest) would go uncaught.
+                        level_update(BookSide::Bid, 0.61, 10.0),
+                        level_update(BookSide::Bid, 0.59, 30.0),
+                        level_update(BookSide::Ask, 0.63, 20.0),
+                        level_update(BookSide::Ask, 0.65, 40.0),
+                    ],
+                    true,
+                ));
+                acc
+            });
 
         let base = spawn(instruments, depth, books, history, health).await;
         let resp = reqwest::get(format!("{base}/v1/best_bid_ask"))
@@ -1900,7 +1925,7 @@ mod tests {
             );
         }
         books.lock().unwrap().insert(
-            ("KALSHI".into(), 9, 1),
+            ("KALSHI".into(), "perps".into(), 9, 1),
             BookAccumulator::new("BOOKED".into()),
         );
         depth.lock().unwrap().insert(
