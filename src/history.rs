@@ -412,6 +412,36 @@ impl Store {
         };
         product.ring.iter().rev().take(limit).copied().collect()
     }
+
+    /// Drop every product belonging to `(source_id, channel)` — every `instrument_id` tracked under
+    /// that channel — regardless of the other identity components. Returns the number of products
+    /// dropped, so a caller can tell "nothing was there" from "the drop happened".
+    ///
+    /// The seam a caller (the reconciler) uses when a channel leaves the ingest floor: a channel
+    /// that no longer ingests must not keep answering `/candles`/`/ticker` from a frozen window that
+    /// looks live, so its buckets and print ring are removed with it rather than left to age out of
+    /// the window on their own. `(group code, channel_id) -> source_id` resolution is the caller's
+    /// job (via `ingest::feeds::feeds()` + `ingest::sources::source_id_of`) — this store has no
+    /// notion of a group code, only the wire `source_id` every `Key` already carries.
+    ///
+    /// Keeps `buckets_total` in step (subtracting exactly the removed products' own bucket counts),
+    /// the same discipline every other removal path in this module follows — see that field's doc.
+    pub fn forget_channel(&mut self, source_id: u16, channel: u32) -> usize {
+        let doomed: Vec<Key> = self
+            .products
+            .keys()
+            .copied()
+            .filter(|k| k.source_id == source_id && k.channel == channel)
+            .collect();
+        let mut dropped = 0usize;
+        for key in doomed {
+            if let Some(product) = self.products.remove(&key) {
+                self.buckets_total -= product.buckets.len();
+                dropped += 1;
+            }
+        }
+        dropped
+    }
 }
 
 #[cfg(test)]
@@ -838,5 +868,122 @@ mod tests {
             s.buckets_total, recomputed,
             "accounting matches after the overflow eviction"
         );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // forget_channel
+    // -------------------------------------------------------------------------------------------
+
+    /// Dropping a channel drops its history with it: a later `candles` query must come back empty,
+    /// not serve a frozen window that looks live. Asserts a named survivor count too (below), not
+    /// merely the drop itself — see that test for why a bare `is_empty()` here would not be enough
+    /// on its own to prove `forget_channel` is scoped correctly.
+    #[test]
+    fn forgetting_a_channel_drops_its_history() {
+        let mut s = Store::new();
+        let dropped_key = Key {
+            source_id: 3,
+            channel: 10,
+            instrument_id: 1,
+        };
+        s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
+        assert!(
+            !s.candles(&dropped_key, 60, 10, 1_100).is_empty(),
+            "fixture sanity: the print must be queryable before the drop"
+        );
+
+        let dropped = s.forget_channel(3, 10);
+        assert_eq!(dropped, 1, "exactly the one product on that channel");
+        assert!(
+            s.candles(&dropped_key, 60, 10, 1_100).is_empty(),
+            "history survived its channel being dropped"
+        );
+    }
+
+    /// Only the named channel is dropped. A blanket clear would be indistinguishable from the test
+    /// above in a single-channel fixture, so the peer's own candle **count** (not merely its
+    /// presence) is what makes this assertion mean something: an implementation that cleared the
+    /// whole store would fail here even though a `.is_some()`/non-empty check on the peer alone
+    /// could still pass by coincidence of ordering.
+    #[test]
+    fn forgetting_a_channel_leaves_its_peers_intact() {
+        let mut s = Store::new();
+        let dropped_key = Key {
+            source_id: 3,
+            channel: 10,
+            instrument_id: 1,
+        };
+        let peer_key = Key {
+            source_id: 3,
+            channel: 11,
+            instrument_id: 1,
+        };
+        s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
+        s.ingest(peer_key, trade(1_000, 20.0, 1.0));
+        s.ingest(peer_key, trade(1_060, 21.0, 1.0));
+
+        s.forget_channel(3, 10);
+
+        let peer_candles = s.candles(&peer_key, 60, 10, 1_200);
+        assert_eq!(
+            peer_candles.len(),
+            2,
+            "the untouched channel's full candle count must survive the peer's drop"
+        );
+    }
+
+    /// `buckets_total` is the accounting `enforce_bucket_budget`'s O(1) check rests on; every path
+    /// that removes a product must keep it in step or the budget silently corrupts (see that
+    /// field's doc). Drives `forget_channel` through the same recompute-and-compare discipline as
+    /// `buckets_total_matches_the_recomputed_sum_across_mutations`.
+    #[test]
+    fn forget_channel_keeps_buckets_total_in_step() {
+        let mut s = Store::new();
+        let dropped_key = Key {
+            source_id: 3,
+            channel: 10,
+            instrument_id: 1,
+        };
+        let peer_key = Key {
+            source_id: 3,
+            channel: 11,
+            instrument_id: 1,
+        };
+        s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
+        s.ingest(dropped_key, trade(1_100, 11.0, 1.0)); // a second bucket on the doomed product
+        s.ingest(peer_key, trade(1_000, 20.0, 1.0));
+        let before = s.buckets_total;
+
+        let dropped = s.forget_channel(3, 10);
+        assert_eq!(dropped, 1);
+
+        assert_eq!(
+            s.buckets_total,
+            before - 2,
+            "exactly the dropped product's two buckets must leave the budget"
+        );
+        let recomputed: usize = s.products.values().map(|p| p.buckets.len()).sum();
+        assert_eq!(
+            s.buckets_total, recomputed,
+            "accounting must match the true sum after forgetting a channel"
+        );
+    }
+
+    /// Forgetting a channel nothing tracks is a harmless no-op, reported honestly as zero rather
+    /// than as an error — the reconciler calls this for every departing publisher, and a departing
+    /// channel with no history yet (nothing traded) is the common case, not a fault.
+    #[test]
+    fn forgetting_an_untracked_channel_drops_nothing() {
+        let mut s = Store::new();
+        s.ingest(
+            Key {
+                source_id: 3,
+                channel: 11,
+                instrument_id: 1,
+            },
+            trade(1_000, 10.0, 1.0),
+        );
+        assert_eq!(s.forget_channel(3, 10), 0);
+        assert_eq!(s.len(), 1, "the untouched product is still there");
     }
 }

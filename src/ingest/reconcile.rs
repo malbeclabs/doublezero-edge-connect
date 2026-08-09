@@ -41,6 +41,7 @@ use crate::{
         floor::ChannelFloor,
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver,
+        sources,
         subscriptions::{self, Detected, HostSubs},
     },
     metrics::metrics,
@@ -194,7 +195,12 @@ pub struct ReconcilerConfig {
     pub enabled: Vec<Feed>,
     /// Which channels of each row this process ingests (`--channels`), parsed and validated once in
     /// `main`. Empty by default, which admits every channel of every row.
-    pub floor: ChannelFloor,
+    ///
+    /// Shared and mutable: the admin surface (`sinks::admin`, off unless `--admin-bind` is set) can
+    /// replace it at runtime, and this reconciler reads it fresh every tick — a lock acquisition per
+    /// tick is free at `--subscription-refresh-secs` granularity, and this is the only change needed
+    /// for a runtime floor swap to reach the existing spawn/abort diff.
+    pub floor: Arc<Mutex<ChannelFloor>>,
     pub iface: String,
     pub recv_buf: usize,
     pub refresh: Duration,
@@ -268,11 +274,12 @@ impl Reconciler {
     /// The poll loop. Never returns; if it ever did (it can't), the process would exit via `main`'s
     /// `select!`. Mirrors `shred::leader`'s refresher shape.
     pub async fn run(mut self) -> Result<()> {
+        let floor = self.floor();
         info!(
             refresh_secs = self.cfg.refresh.as_secs(),
             gating_disabled = self.cfg.gating_disabled,
-            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), self.cfg.floor.publishers_for(f).len())).collect::<Vec<_>>(),
-            channel_floor = ?self.cfg.floor.summary(),
+            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), floor.publishers_for(f).len())).collect::<Vec<_>>(),
+            channel_floor = ?floor.summary(),
             "subscription reconciler started"
         );
         loop {
@@ -321,12 +328,21 @@ impl Reconciler {
         }
     }
 
+    /// A per-tick snapshot of the runtime-mutable floor. Cloned rather than held locked across the
+    /// tick's spawn/abort work — `ChannelFloor` is one small `HashMap` entry per narrowed row, so
+    /// the lock is held only for the `clone()` itself, and every caller this tick sees one
+    /// consistent floor even if the admin surface swaps it in between.
+    fn floor(&self) -> ChannelFloor {
+        crate::model::lock(&self.cfg.floor).clone()
+    }
+
     /// Desired state from a successful subscription read.
     fn desired_from_subs(&self, subs: &HostSubs) -> Desired {
+        let floor = self.floor();
         let feeds: HashSet<FeedKey> = subs
             .market_data_feeds(&self.cfg.enabled)
             .into_iter()
-            .flat_map(|f| feed_keys(&self.cfg.floor, f))
+            .flat_map(|f| feed_keys(&floor, f))
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
@@ -339,11 +355,12 @@ impl Reconciler {
     /// Fail-open / gating-disabled desired state: every enabled feed on, WS on if configured, shreds
     /// only via explicit sources (no CLI → no discovery).
     fn static_desired(&self) -> Desired {
+        let floor = self.floor();
         let feeds: HashSet<FeedKey> = self
             .cfg
             .enabled
             .iter()
-            .flat_map(|f| feed_keys(&self.cfg.floor, f))
+            .flat_map(|f| feed_keys(&floor, f))
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
@@ -432,6 +449,7 @@ impl Reconciler {
                     publisher = key.3,
                     "deactivating market-data receiver (no longer subscribed)"
                 );
+                self.forget_departing_channel(&key);
             }
         }
         // Ownership over the post-apply running set, which `desired` already is: the aborts above
@@ -476,6 +494,44 @@ impl Reconciler {
                 tape.clone(),
             ));
             self.active.insert(key, (h, tape));
+        }
+    }
+
+    /// A publisher whose `FeedKey` just left the desired set (aborted above) has stopped ingesting;
+    /// if its block was derived from a channel (`FeedPublisher::channel`), that channel's history is
+    /// now stale and is dropped with it — the "nothing stale ever served" rule for a channel drop,
+    /// whether the cause is the floor narrowing or the whole row losing its subscription.
+    ///
+    /// A flat publisher (`channel: None`) has no channel identity to forget — narrowing a flat row is
+    /// refused at floor-parse time, so this only ever fires for a row a channel actually identifies.
+    /// The venue is resolved per aborted key (via this row's own `venue`), not assumed for the whole
+    /// group `code`: a code can span rows on different venues (`ingest::floor`'s docs), so each
+    /// abort event carries its own row's identity rather than guessing one venue for the code.
+    fn forget_departing_channel(&self, key: &FeedKey) {
+        let Some((feed, publisher)) = self.cfg.enabled.iter().find_map(|f| {
+            f.publishers
+                .iter()
+                .find(|p| (f.venue, f.category, f.kind, p.base_port()) == *key)
+                .map(|p| (*f, *p))
+        }) else {
+            return;
+        };
+        let Some(channel) = publisher.channel else {
+            return;
+        };
+        let Some(source_id) = sources::source_id_of(feed.venue) else {
+            return;
+        };
+        let dropped =
+            crate::model::lock(&self.cfg.history).forget_channel(source_id, u32::from(channel));
+        if dropped > 0 {
+            info!(
+                venue = feed.venue,
+                category = feed.category,
+                channel,
+                dropped,
+                "channel left the desired set; dropped its history"
+            );
         }
     }
 
@@ -1104,6 +1160,85 @@ mod tests {
         );
     }
 
+    /// A channel that leaves the desired set (its publisher aborted, whether because the floor
+    /// narrowed further or its whole row lost its subscription) has its history forgotten along
+    /// with the receiver — `forget_departing_channel` is the seam `apply_feeds` calls on every
+    /// abort. Uses a derived publisher (`channel: Some(_)`) so this exercises the identity path a
+    /// flat row's `None` would skip entirely, and a venue `sources::source_id_of` actually resolves
+    /// so the resolution step isn't a silent no-op.
+    #[tokio::test]
+    async fn a_channel_that_leaves_the_desired_set_has_its_history_forgotten() {
+        static PUB: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 33007,
+                refdata: 43007,
+                snapshot: 53007,
+            },
+            channel: Some(7),
+        }];
+        let feed = Feed {
+            venue: "HYPERLIQUID",
+            category: "testcategory",
+            code: "testcode-forget",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 99),
+            publishers: PUB,
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let mut r = test_reconciler(vec![feed]);
+        let key = (
+            "HYPERLIQUID",
+            "testcategory",
+            FeedKind::MarketByPrice,
+            33007u16,
+        );
+
+        // Seed the shared store directly for channel 7 under Hyperliquid's Source ID (1) — this
+        // test is about the abort -> forget_channel plumbing, not real ingest.
+        let hist_key = history::Key {
+            source_id: 1,
+            channel: 7,
+            instrument_id: 1,
+        };
+        {
+            let mut h = r.cfg.history.lock().unwrap();
+            h.ingest(
+                hist_key,
+                history::Print {
+                    ts_ns: 1_000 * 1_000_000_000,
+                    price: 1.0,
+                    size: 1.0,
+                },
+            );
+        }
+        assert!(
+            !r.cfg
+                .history
+                .lock()
+                .unwrap()
+                .candles(&hist_key, 60, 10, 1_100)
+                .is_empty(),
+            "fixture sanity: the seeded print must be queryable before the abort"
+        );
+
+        r.apply_feeds(&[key].into_iter().collect());
+        assert!(r.active.contains_key(&key));
+
+        r.apply_feeds(&HashSet::new()); // the channel leaves the desired set
+        assert!(!r.active.contains_key(&key));
+
+        assert!(
+            r.cfg
+                .history
+                .lock()
+                .unwrap()
+                .candles(&hist_key, 60, 10, 1_100)
+                .is_empty(),
+            "the departing channel's history must be forgotten when its receiver is aborted"
+        );
+    }
+
     /// A `Reconciler` whose spawned receivers are never polled: `apply_feeds` is sync, so the tasks
     /// it creates bind no sockets before the test drops them.
     fn test_reconciler(enabled: Vec<Feed>) -> Reconciler {
@@ -1122,7 +1257,7 @@ mod tests {
             depth: Default::default(),
             books: Default::default(),
             enabled,
-            floor,
+            floor: Arc::new(Mutex::new(floor)),
             iface: "127.0.0.1".into(),
             recv_buf: 1 << 20,
             refresh: Duration::from_secs(30),

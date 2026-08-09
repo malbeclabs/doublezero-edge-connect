@@ -232,6 +232,17 @@ struct Args {
     )]
     api_bind: String,
 
+    /// Admin surface bind address (`GET`/`POST /admin/channels`) — the one mutation path in this
+    /// crate: it lets `--channels`/`DZ_CHANNELS` be replaced at runtime. **Off by default** (empty
+    /// disables it outright), unlike `--api-bind`: a mutation path that defaulted to on is a
+    /// mutation path someone gets by accident. This surface carries **no authentication** and — like
+    /// `--api-bind` — under host networking a wildcard bind is genuinely network-reachable, so the
+    /// recommendation if you enable it at all is a loopback bind (e.g. `127.0.0.1:9098`), never a
+    /// bare wildcard. Deliberately separate from `--api-bind`'s `/v1`, which must stay provably
+    /// read-only.
+    #[arg(long = "admin-bind", env = "DZ_ADMIN_BIND", default_value = "")]
+    admin_bind: String,
+
     /// How often (seconds) the subscription reconciler re-reads `doublezero status` and reconciles
     /// which market-data receivers, the WebSocket sink, and shred sources are active. Subscriptions
     /// change rarely, so the default is coarse.
@@ -486,6 +497,12 @@ async fn main() -> Result<()> {
         "ingesting feeds"
     );
 
+    // Wrapped here (after the plain-value startup logging above, which wants a snapshot, not a
+    // guard) so the reconciler and the admin surface (below) share one instance to swap at runtime:
+    // a `POST /admin/channels` replaces its contents in place, and the reconciler reads a fresh
+    // clone every tick (see `ingest::reconcile::Reconciler::floor`).
+    let floor: Arc<Mutex<ingest::floor::ChannelFloor>> = Arc::new(Mutex::new(floor));
+
     // Force the metrics registry to initialize up front (registering the process collector and all
     // metric families) so the very first recorded sample lands in a ready registry, whether or not
     // the scrape endpoint below is enabled.
@@ -647,6 +664,32 @@ async fn main() -> Result<()> {
         )))
     };
 
+    // Admin surface: the one mutation path in this crate, off unless `--admin-bind` is set. Unlike
+    // the WS sink and the query API, it is **not** subscription-gated — an operator must be able to
+    // inspect or change the floor even with nothing currently subscribed — so it is spawned once
+    // here, gated only on the bind being non-empty. A taken port is non-fatal, exactly like
+    // `ws`/`api`: it disables this surface without taking the tunnel down.
+    let admin_srv = if args.admin_bind.is_empty() {
+        info!("admin surface disabled (empty --admin-bind)");
+        None
+    } else {
+        match sinks::admin::bind(&args.admin_bind).await {
+            Ok(listener) => {
+                info!(bind = %args.admin_bind, "admin surface enabled (mutating — no authentication)");
+                Some(tokio::spawn(sinks::admin::serve(
+                    listener,
+                    floor.clone(),
+                    enabled.clone(),
+                )))
+            }
+            Err(e) => {
+                warn!(bind = %args.admin_bind, %e,
+                    "admin surface failed to bind (port in use?); staying off");
+                None
+            }
+        }
+    };
+
     // The subscription reconciler owns market-data receivers, the WebSocket sink, and the shred
     // forwarder: it polls `doublezero status` and activates/deactivates them as the host's
     // subscriptions change (default-on with fail-open; `--subscription-gating-disable` forces the
@@ -693,6 +736,12 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
+        // The admin surface (when enabled) loops forever; its arm resolves only on a task panic or a
+        // fatal accept error (a bind failure was already handled non-fatally above).
+        r = async { match admin_srv {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
     }
     Ok(())
 }
@@ -712,6 +761,14 @@ mod tests {
         registry();
         let all = select_feeds(&[]).unwrap();
         assert_eq!(all.len(), feeds::feeds().len());
+    }
+
+    /// The admin surface is off unless explicitly bound. A mutation path that defaults to on is a
+    /// mutation path someone gets by accident — unlike `--api-bind`, which is loopback-on by
+    /// default because `/v1` is read-only.
+    #[test]
+    fn the_admin_surface_is_off_by_default() {
+        assert!(Args::parse_from(["x"]).admin_bind.is_empty());
     }
 
     // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`). Includes the

@@ -2062,4 +2062,33 @@ mod tests {
             "a nonexistent suffixed identity must never fall back to a bare-symbol match"
         );
     }
+
+    // -----------------------------------------------------------------------------------------
+    // /v1 is provably read-only (Task 5).
+    // -----------------------------------------------------------------------------------------
+
+    /// `/v1` never mutates: every non-GET method is refused before any routing happens. This is the
+    /// guarantee that lets an agent hold a `/v1` URL safely — see `sinks::admin` for where mutation
+    /// actually lives — so it is asserted directly against the real `handle`, not merely assumed
+    /// from the guard's presence in `handle`'s source.
+    #[test]
+    fn the_query_surface_refuses_every_mutating_method() {
+        let (instruments, depth, books, history, health) = empty_state();
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+        };
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let req = Request {
+                method: method.to_string(),
+                path: "/v1/products".to_string(),
+                params: Vec::new(),
+            };
+            let (status, _, _) = handle(&state, &req);
+            assert_eq!(status, "405 Method Not Allowed", "{method} was not refused by /v1");
+        }
+    }
 }
