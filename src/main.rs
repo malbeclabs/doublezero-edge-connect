@@ -678,12 +678,19 @@ mod tests {
     fn a_venue_with_two_rows_of_one_kind_selects_both() {
         registry();
         let sel = select_feeds(&["KALSHI".to_string()]).unwrap();
-        let mbp: Vec<&str> = sel
+        let mut mbp: Vec<&str> = sel
             .iter()
             .filter(|f| f.kind == feeds::FeedKind::MarketByPrice)
             .map(|f| f.category)
             .collect();
-        assert_eq!(mbp.len(), 2, "one universe was dropped: {mbp:?}");
+        mbp.sort_unstable();
+        // The categories themselves, not a count: a count of 2 would also be satisfied by the same
+        // universe selected twice, which is the opposite failure and equally wrong.
+        assert_eq!(
+            mbp,
+            vec!["perps", "sports"],
+            "both universes must be selected, each once"
+        );
     }
 
     #[test]

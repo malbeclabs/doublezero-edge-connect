@@ -125,18 +125,31 @@ Modules are grouped by role under `src/`:
   port base or group `code` as a Rust constant.** Those numbers live in a publisher inventory that
   changes without our involvement (the same allocation was decided four times upstream in dated
   specs, each reversing the last), and compiling them in makes every upstream change a rebuild while
-  making a stale copy invisible — a wrong port binds a socket that stays silent. A fetch/read failure
-  falls back to the built-in document **with a warning** (a registry-host blip must not stop the
-  container booting, and the built-in copy is last-known-good); a document that parses but fails
-  validation is **fatal**, because a wrong registry is a wrong answer. Validation enforces only what
-  is structural — non-empty `code`/`category`, a `venue` that `sources::source_id_of` resolves, base
-  ports unique within a row, a non-empty roster, no port overflow — the rest is upstream policy this
-  process cannot verify. `publishers` is a tagged union: `explicit` lists port blocks verbatim,
-  `derived` carries a channel roster plus per-plane bases and expands to `base + channel_id` on every
-  plane (one channel is an independent state machine — its own `Reset Count`, sequence series,
-  manifest seq and snapshot cycle — so one channel is one `FeedPublisher` and one receiver task).
-  Unknown fields and unknown `version`s are rejected rather than half-applied. There is **no hot
-  reload**: books and reference data are keyed to the topology in effect when they were built.
+  making a stale copy invisible — a wrong port binds a socket that stays silent. **A rejected document
+  degrades or refuses depending on where it came from, and the asymmetry is the point:** a `Url`
+  failure of *any* kind (unreachable, malformed, a `version` this build predates, a validation error)
+  warns and falls back to the built-in copy, because a remote registry is infrastructure that moves
+  underneath a running fleet and — since resolution is startup-only — refusing would not kill the
+  fleet when the document changed but each process at its next reschedule, far from the cause; a host
+  that is *up* serving one new field must never be worse than one that is down. A `File` (an
+  operator's explicit instruction about this one container) or the built-in copy is **fatal**.
+  There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
+  `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
+  `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
+  Validation covers the structural per-row rules (non-empty `code`/`category`, a `venue` that
+  `sources::source_id_of` resolves, base ports unique within a row, a non-empty roster, no port
+  overflow) **and the four cross-row invariants** — `(venue, category, kind)` uniqueness,
+  one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
+  cannot resolve last-write-wins by document order), `emit_trades` agreeing with
+  `reconcile::tape_rank_is_some`, and global `(group, port)` uniqueness. Those four used to be
+  `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
+  document could be supplied at runtime. The rest is upstream policy this process cannot verify.
+  `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a channel
+  roster plus per-plane bases and expands to `base + channel_id` on every plane (one channel is an
+  independent state machine — its own `Reset Count`, sequence series, manifest seq and snapshot cycle
+  — so one channel is one `FeedPublisher` and one receiver task); a roster that repeats an id
+  collapses it and says so. There is **no hot reload**: books and reference data are keyed to the
+  topology in effect when they were built.
 - **`ingest/feeds.rs`** — the registry **types** plus the one accessor. `feeds()` returns the rows
   installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
   `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error

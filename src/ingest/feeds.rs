@@ -10,6 +10,8 @@
 
 use std::{net::Ipv4Addr, sync::OnceLock};
 
+use tracing::warn;
+
 use crate::ingest::registry;
 
 /// Which edge-feed-spec protocol a feed speaks. Selects the frame magic + decoder + receiver
@@ -185,9 +187,21 @@ static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
 /// Called once from `main` before any receiver spawns. A repeat call is ignored rather than
 /// swapping the set under running receivers — books and reference data are keyed to the topology
 /// in effect when they were built.
+///
+/// The resolved registry is announced **after** the install wins, never before: a losing install
+/// that had already logged "feed registry resolved" would leave a breadcrumb naming a document the
+/// process then discarded, which is worse than no breadcrumb at all. A loser's rows stay leaked —
+/// a one-off in a case that should not happen, and cheaper than making the install fallible.
 pub async fn init(source: registry::Source) -> Result<(), registry::RegistryError> {
-    let rows = registry::load(source).await?;
-    let _ = FEEDS.set(rows);
+    let loaded = registry::load(source).await?;
+    if FEEDS.set(loaded.rows).is_ok() {
+        loaded.log_resolved();
+    } else {
+        warn!(
+            source = loaded.origin(),
+            "feed registry was already installed; this document was discarded"
+        );
+    }
     Ok(())
 }
 
@@ -197,7 +211,9 @@ pub async fn init(source: registry::Source) -> Result<(), registry::RegistryErro
 /// compiled-in document is itself invalid, which is a build-time defect.
 pub fn init_built_in() {
     let _ = FEEDS.get_or_init(|| {
-        registry::load_built_in().expect("the built-in feed registry document is valid")
+        registry::load_built_in()
+            .expect("the built-in feed registry document is valid")
+            .rows
     });
 }
 
