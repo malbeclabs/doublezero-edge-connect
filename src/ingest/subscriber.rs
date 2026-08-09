@@ -107,6 +107,7 @@ mod tests {
     fn defn(iid: u32, seq: u16) -> InstrumentDefinition {
         InstrumentDefinition {
             instrument_id: iid,
+            source_id: None,
             symbol: format!("SYM{iid}").into(),
             price_exponent: -2,
             qty_exponent: -2,

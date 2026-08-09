@@ -41,19 +41,21 @@
 //! codecs. The third, schema version, is checked here rather than left to the walker, because only
 //! this codec's body rule depends on it.
 
-use std::sync::Arc;
+use anyhow::Result;
 
-use anyhow::{bail, Result};
-
+pub use crate::ingest::codec_common::InstrumentDefinition;
 use crate::ingest::codec_common::{
-    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader, MSG_HEADER_SIZE,
+    decode_frame_with, i64le, instrument_definition, u16le, u32le, u64le, u8le, FrameHeader,
+    MSG_HEADER_SIZE, SCHEMA_V1, SCHEMA_V3,
 };
 
 pub const MAGIC: u16 = 0x4442; // "BD"
 
-/// The only schema this decoder implements. A frame declaring anything else is discarded whole —
-/// see [`decode_frame`] for why that is load-bearing here and nowhere else.
-pub const SCHEMA_VERSION: u8 = 1;
+/// Wire generations this feed implements. `2` is deliberately absent — see [`SCHEMA_V1`].
+///
+/// This gate used to live in [`decode_frame`] because it was the only codec that had one; it now
+/// rides the shared walker with its siblings, so a codec cannot ship without it.
+const SUPPORTED_VERSIONS: &[u8] = &[SCHEMA_V1, SCHEMA_V3];
 
 // Shared with the top-of-book feed (byte-identical layouts).
 pub const MSG_HEARTBEAT: u8 = 0x01;
@@ -112,25 +114,6 @@ pub mod sizes {
     pub const LEVEL_UPDATE: usize = 48;
     pub const BOOK_CLEAR: usize = 36;
     pub const SNAPSHOT_LEVEL: usize = 32;
-}
-
-/// 80-byte instrument definition — the top-of-book layout verbatim.
-#[derive(Debug, Clone)]
-pub struct InstrumentDefinition {
-    pub instrument_id: u32,
-    pub symbol: Arc<str>,
-    pub price_exponent: i8,
-    pub qty_exponent: i8,
-    pub manifest_seq: u16,
-}
-
-impl crate::ingest::subscriber::InstrumentDef for InstrumentDefinition {
-    fn id(&self) -> u32 {
-        self.instrument_id
-    }
-    fn manifest_seq(&self) -> u16 {
-        self.manifest_seq
-    }
 }
 
 /// 52-byte trade print. `trade_id == 0` means the upstream had no venue trade id (a FIX source has
@@ -266,17 +249,7 @@ pub enum Message {
 /// module doc's `Depth Bound` case). Without the version gate the length rule would apply v1 sizes
 /// to a v2 frame whose bodies legally grew, and the whole feed would decode to `Other` in silence.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    // Ahead of the walk, not after it: under a bumped schema every message is rejected anyway, so
-    // decoding the frame first is pure waste at exactly the moment it is 100% of datagrams. Gated on
-    // the magic so a sibling protocol's frame still reports its magic rather than a version it does
-    // not use; `buf[2]` is in bounds because the read above returned `Some`.
-    if u16le(buf, 0) == Some(MAGIC) && u8le(buf, 2).is_some_and(|v| v != SCHEMA_VERSION) {
-        bail!(
-            "unsupported mbp schema version {} (expected {SCHEMA_VERSION})",
-            buf[2]
-        );
-    }
-    decode_frame_with(buf, MAGIC, |ty, _flags, b, off| {
+    decode_frame_with(buf, MAGIC, SUPPORTED_VERSIONS, |ty, _flags, b, off, ver| {
         // In bounds: the walker breaks before calling this unless `off + MSG_HEADER_SIZE` fits.
         let msg_len = b[off + 1] as usize;
         let body = off + MSG_HEADER_SIZE;
@@ -285,9 +258,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
             MSG_HEARTBEAT if exact(sizes::HEARTBEAT) => {
                 decode_heartbeat(b, body).unwrap_or(Message::Other(ty))
             }
-            MSG_INSTRUMENT_DEFINITION if exact(sizes::INSTRUMENT_DEFINITION) => {
-                decode_instrument_definition(b, body).unwrap_or(Message::Other(ty))
-            }
+            // The one type whose size is version-dependent (80 at v1, 130 at v3), so the exact
+            // rule cannot apply; `instrument_definition` does its own version-aware length check.
+            MSG_INSTRUMENT_DEFINITION => instrument_definition(b, off, ver)
+                .map(Message::InstrumentDefinition)
+                .unwrap_or(Message::Other(ty)),
             MSG_TRADE if exact(sizes::TRADE) => decode_trade(b, body).unwrap_or(Message::Other(ty)),
             MSG_END_OF_SESSION if exact(sizes::END_OF_SESSION) => u64le(b, body)
                 .map(Message::EndOfSession)
@@ -325,16 +300,6 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
 
 fn decode_heartbeat(b: &[u8], o: usize) -> Option<Message> {
     Some(Message::Heartbeat(u64le(b, o + 4)?))
-}
-
-fn decode_instrument_definition(b: &[u8], o: usize) -> Option<Message> {
-    Some(Message::InstrumentDefinition(InstrumentDefinition {
-        instrument_id: u32le(b, o)?,
-        symbol: Arc::from(cstr(b, o + 4, 16)?.as_str()),
-        price_exponent: u8le(b, o + 37)? as i8,
-        qty_exponent: u8le(b, o + 38)? as i8,
-        manifest_seq: u16le(b, o + 74)?,
-    }))
 }
 
 fn decode_trade(b: &[u8], o: usize) -> Option<Message> {
@@ -464,7 +429,7 @@ pub(crate) mod tests {
         let body: Vec<u8> = messages.concat();
         let mut f = vec![0u8; 24];
         f[0..2].copy_from_slice(&MAGIC.to_le_bytes());
-        f[2] = SCHEMA_VERSION;
+        f[2] = SCHEMA_V1;
         f[3] = channel_id;
         f[4..12].copy_from_slice(&sequence.to_le_bytes());
         f[12..20].copy_from_slice(&1_700_000_000_000_000_000u64.to_le_bytes());
@@ -647,7 +612,7 @@ pub(crate) mod tests {
     #[test]
     fn rejects_an_unimplemented_schema_version() {
         let mut f = one(MSG_HEARTBEAT, 0, &[0u8; 12]);
-        f[2] = SCHEMA_VERSION + 1;
+        f[2] = SCHEMA_V1 + 1;
         assert!(decode_frame(&f).is_err());
     }
 
@@ -784,13 +749,18 @@ pub(crate) mod tests {
     }
 
     /// Exact length equality, not `>=`. The forward-compat "ignore trailing bytes" rule applies
-    /// across a Schema Version bump; within v1 an unexpected body length is malformed. Matches the
-    /// Go oracle's `TestNewBodies_ExactLengthOnly` / `TestInheritedBodies_ExactLengthOnly`.
+    /// across a Schema Version bump; within one generation an unexpected body length is malformed.
+    /// Matches the Go oracle's `TestNewBodies_ExactLengthOnly` /
+    /// `TestInheritedBodies_ExactLengthOnly`.
+    ///
+    /// `InstrumentDefinition` is deliberately absent: it is the one type whose size is
+    /// version-dependent (80 bytes at v1, 130 at v3), so it is length-checked per version by
+    /// `codec_common::instrument_definition` instead — see
+    /// [`an_over_long_instrument_definition_still_decodes`].
     #[test]
     fn wrong_body_length_does_not_decode() {
         for (ty, correct) in [
             (MSG_HEARTBEAT, 12usize),
-            (MSG_INSTRUMENT_DEFINITION, 76),
             (MSG_TRADE, 48),
             (MSG_END_OF_SESSION, 8),
             (MSG_MANIFEST_SUMMARY, 20),
@@ -803,6 +773,32 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// The definition's length rule is a **minimum**, so a body longer than this generation's
+    /// layout still decodes — that is a conformant `3.x` publisher appending a field, which the
+    /// spec says must keep working and which exact equality would take the feed dark on.
+    ///
+    /// Short still fails, so the direction that matters — a v1-sized body claiming a later
+    /// generation, whose fields would otherwise be read from the following message — is unaffected.
+    #[test]
+    fn an_over_long_instrument_definition_still_decodes() {
+        let mut long = vec![0u8; 76 + 8];
+        long[0..4].copy_from_slice(&41u32.to_le_bytes());
+        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_DEFINITION, 0, &long)).unwrap();
+        assert!(
+            matches!(&m[0], Message::InstrumentDefinition(d) if d.instrument_id == 41),
+            "a v1 definition with trailing bytes must still decode: {:?}",
+            m[0]
+        );
+
+        let short = vec![0u8; 75];
+        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_DEFINITION, 0, &short)).unwrap();
+        assert!(
+            matches!(m[0], Message::Other(MSG_INSTRUMENT_DEFINITION)),
+            "a short definition is still rejected: {:?}",
+            m[0]
+        );
     }
 
     /// spec: LevelUpdate 0x40, 48 bytes. Body: id @0, source @4, side @6, action @7, seq @8,
@@ -1094,7 +1090,8 @@ pub(crate) mod tests {
     fn builders_round_trip_through_the_decoder() {
         let def = InstrumentDefinition {
             instrument_id: 41,
-            symbol: Arc::from("KXBTCPERP"),
+            source_id: None,
+            symbol: "KXBTCPERP".into(),
             price_exponent: -4,
             qty_exponent: -2,
             manifest_seq: 3,

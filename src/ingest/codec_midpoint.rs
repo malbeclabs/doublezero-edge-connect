@@ -18,10 +18,17 @@ use anyhow::Result;
 
 pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
 use crate::ingest::codec_common::{
-    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader,
+    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader, SCHEMA_V1,
 };
 
 pub const MAGIC: u16 = 0x4D44; // "DM"
+
+/// Wire generations this feed implements — `1` alone.
+///
+/// Midpoint kept its slimmed 64-byte `InstrumentDefinition` when its five siblings widened `Symbol`
+/// and then took `Source ID`, so it never left generation 1. The version byte is per-feed, not
+/// global: a `3` on this magic is a misrouted or misconfigured publisher, not a newer midpoint.
+const SUPPORTED_VERSIONS: &[u8] = &[SCHEMA_V1];
 
 pub const MSG_HEARTBEAT: u8 = 0x01;
 pub const MSG_INSTRUMENT_DEFINITION: u8 = 0x02;
@@ -100,9 +107,12 @@ pub enum Message {
 
 /// Decode one Midpoint-feed UDP datagram into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
-        decode_message(msg_type, b, o)
-    })
+    decode_frame_with(
+        buf,
+        MAGIC,
+        SUPPORTED_VERSIONS,
+        |msg_type, _flags, b, o, _ver| decode_message(msg_type, b, o),
+    )
 }
 
 fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {

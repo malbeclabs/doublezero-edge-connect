@@ -34,16 +34,18 @@
 //! `reason`/`*_flags` bytes are opaque pass-through (no decoder branches on them), so a value
 //! mismatch cannot corrupt the decode. Per-field offset citations live on the matching tests.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
-pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
 use crate::ingest::codec_common::{
-    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader,
+    decode_frame_with, i64le, instrument_definition, u16le, u32le, u64le, u8le, FrameHeader,
+    SCHEMA_V1, SCHEMA_V3,
 };
+pub use crate::ingest::codec_common::{InstrumentDefinition, MSG_HEADER_SIZE};
 
 pub const MAGIC: u16 = 0x4444; // "DD"
+
+/// Wire generations this feed implements. `2` is deliberately absent — see [`SCHEMA_V1`].
+const SUPPORTED_VERSIONS: &[u8] = &[SCHEMA_V1, SCHEMA_V3];
 
 // Shared / reference-data message types (same wire layout as Top-of-Book).
 pub const MSG_HEARTBEAT: u8 = 0x01;
@@ -84,26 +86,6 @@ pub mod sizes {
     pub const SNAPSHOT_END: u8 = 20;
     pub const INSTRUMENT_DEFINITION: u8 = 80;
     pub const TRADE: u8 = 52;
-}
-
-/// 80-byte instrument definition (same layout as Top-of-Book). Only the fields the bridge needs.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct InstrumentDefinition {
-    pub instrument_id: u32,
-    pub symbol: Arc<str>,
-    pub price_exponent: i8,
-    pub qty_exponent: i8,
-    pub manifest_seq: u16,
-}
-
-impl crate::ingest::subscriber::InstrumentDef for InstrumentDefinition {
-    fn id(&self) -> u32 {
-        self.instrument_id
-    }
-    fn manifest_seq(&self) -> u16 {
-        self.manifest_seq
-    }
 }
 
 /// A new resting order (`OrderAdd`, 0x10).
@@ -242,21 +224,24 @@ pub enum Message {
 
 /// Decode one Market-by-Order UDP datagram into a header and its application messages.
 pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
-        decode_message(msg_type, b, o)
-    })
+    decode_frame_with(
+        buf,
+        MAGIC,
+        SUPPORTED_VERSIONS,
+        |msg_type, _flags, b, o, ver| decode_message(msg_type, b, o, ver),
+    )
 }
 
-fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
+fn decode_message(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Message {
     // A message shorter than its declared type's fields decodes to `None` -> `Other` (skipped),
     // never an out-of-bounds panic (the readers are bounds-checked; see `codec_common`).
-    decode_body(msg_type, b, o).unwrap_or(Message::Other(msg_type))
+    decode_body(msg_type, b, o, schema_version).unwrap_or(Message::Other(msg_type))
 }
 
 // Field offsets per arm are validated against the authorities documented in the module header and
 // asserted by the offset-independent tests below (e.g. `order_add_offsets_match_authority`, which
 // carries the OrderAdd field map). Do not change an offset without updating its matching test.
-fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
+fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<Message> {
     let body = o + MSG_HEADER_SIZE;
     Some(match msg_type {
         MSG_ORDER_ADD => Message::OrderAdd(OrderAdd {
@@ -330,13 +315,9 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
             trade_id: u64le(b, body + 32)?,
             cumulative_volume_raw: u64le(b, body + 40)?,
         }),
-        MSG_INSTRUMENT_DEFINITION => Message::InstrumentDefinition(InstrumentDefinition {
-            instrument_id: u32le(b, body)?,
-            symbol: cstr(b, body + 4, 16)?.into(),
-            price_exponent: u8le(b, body + 37)? as i8,
-            qty_exponent: u8le(b, body + 38)? as i8,
-            manifest_seq: u16le(b, body + 74)?,
-        }),
+        MSG_INSTRUMENT_DEFINITION => {
+            Message::InstrumentDefinition(instrument_definition(b, o, schema_version)?)
+        }
         MSG_MANIFEST_SUMMARY => Message::ManifestSummary(ManifestSummary {
             channel_id: u8le(b, body)?,
             valid: u8le(b, body + 1)? != 0,

@@ -2975,6 +2975,7 @@ mod tests {
         out.extend(ids.iter().map(|id| {
             mbp_wire::enc_instrument_definition(&codec_mbp::InstrumentDefinition {
                 instrument_id: *id,
+                source_id: None,
                 symbol: format!("INST-{id}").into(),
                 price_exponent: 0,
                 qty_exponent: 0,
