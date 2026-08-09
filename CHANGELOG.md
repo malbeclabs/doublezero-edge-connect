@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the apply path derives its behaviour from the complement, so an unassigned `2..=255` was
   treated as price-bounded and `{ clear_side: 2, scope: 2 }` removed bids at/below and asks at/above
   a single bound — the whole book — republished to every consumer as `Delete`s.
+- A duplicated `SnapshotBegin` datagram is now a no-op instead of restarting assembly. Mid-rotation
+  the status is `BuildingSnapshot`, which no decline rule covered, so an identical re-begin zeroed
+  the open group; `on_snapshot_end` then failed its level count and took the incomplete-group path,
+  which clears the book — destroying the **live** book on the `Ready`-rebuild path and dropping the
+  market to `AwaitingSnapshot` until the next rotation. A begin differing in any identifying field is
+  still a new rotation and still replaces the group under assembly.
 - **Breaking:** a message is emitted for an instrument only once its Source ID has been observed. A
   publisher whose reference data carries no Source ID of its own can only reveal it through a price
   message, so an instrument that has received a definition but no price produces nothing at all, and

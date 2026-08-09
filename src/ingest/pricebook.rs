@@ -273,6 +273,26 @@ impl PriceBook {
             // discarding it would strand `status` at `BuildingSnapshot` with no group to end.
             return false;
         }
+        // A duplicated datagram, which a multicast wire produces routinely: every identifying field
+        // matches the group already assembling, so this is the begin we have, not a new rotation.
+        // Restarting assembly here would zero `received_levels` and discard every level received so
+        // far; `on_snapshot_end` would then fail its `received_levels != total_levels` test and take
+        // the incomplete-group path, which clears `bids`/`asks` — destroying the **live** book on
+        // the `Ready`-rebuild path and dropping the market to `AwaitingSnapshot` until the next
+        // rotation. Declining leaves the group and its levels exactly as they are.
+        //
+        // Compared field-for-field rather than on `snapshot_id` alone: the id is monotonic per
+        // `(channel, instrument)` and a begin that differs anywhere else is a genuinely new group
+        // that must still replace this one, or a rotation whose end was lost would pin the book.
+        if self.open.as_ref().is_some_and(|b| {
+            b.snapshot_id == snapshot_id
+                && b.anchor_seq == anchor_seq
+                && b.total_levels == total_levels
+                && b.last_instrument_seq == last_instrument_seq
+                && b.depth_bound == depth_bound
+        }) {
+            return false;
+        }
         self.open = Some(Building {
             snapshot_id,
             anchor_seq,
@@ -786,6 +806,74 @@ mod tests {
         assert!(b.on_snapshot_end(500, 2));
         assert_eq!(asks_of(&b), vec![(6300, 77)]);
         assert!(bids_of(&b).is_empty(), "the snapshot REPLACES the book");
+    }
+
+    /// A duplicated `SnapshotBegin` datagram must not restart assembly. On a multicast wire a
+    /// duplicate is expected, and this module already guards it for levels
+    /// (`a_duplicated_snapshot_level_does_not_satisfy_the_count`) — but the decline set
+    /// (`required_anchor_seq` / `Ready` / oversized `total_levels`) does not cover it: while a group
+    /// assembles the status is `BuildingSnapshot`, so an identical re-begin was accepted and
+    /// overwrote the open group with `received_levels = 0`.
+    ///
+    /// The damage lands two steps later. `on_snapshot_end` fails its `received_levels !=
+    /// total_levels` test and takes the incomplete-group path, which clears `bids`/`asks` — so on
+    /// the `Ready`-rebuild path a single duplicated datagram destroys the **live** book and drops
+    /// the market to `AwaitingSnapshot` until the next rotation.
+    #[test]
+    fn a_duplicated_snapshot_begin_does_not_restart_assembly() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(
+            b.on_snapshot_begin(2, 500, 2, 9, 0),
+            "K=9 > 5, we are behind"
+        );
+        b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
+
+        assert!(
+            !b.on_snapshot_begin(2, 500, 2, 9, 0),
+            "the duplicate must be declined, not accepted as a fresh group"
+        );
+
+        b.on_snapshot_level(2, SIDE_ASK, 6400, 88, Some(1), 0);
+        assert!(
+            b.on_snapshot_end(500, 2),
+            "both levels arrived exactly once, so the group is complete"
+        );
+        assert_eq!(asks_of(&b), vec![(6300, 77), (6400, 88)]);
+        assert_eq!(b.status(), Status::Ready);
+    }
+
+    /// The same duplicate on the **first** build of a book, where there is no live book to lose but
+    /// the group must still not lose the levels it has already assembled.
+    #[test]
+    fn a_duplicated_snapshot_begin_from_cold_keeps_the_assembled_levels() {
+        let mut b = PriceBook::new();
+        assert!(b.on_snapshot_begin(1, 100, 2, 5, 0));
+        b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0);
+        assert!(!b.on_snapshot_begin(1, 100, 2, 5, 0), "duplicate declined");
+        b.on_snapshot_level(1, SIDE_BID, 6100, 20, Some(1), 0);
+        assert!(b.on_snapshot_end(100, 1));
+        assert_eq!(bids_of(&b), vec![(6200, 10), (6100, 20)]);
+    }
+
+    /// A begin that differs from the open group in any identifying field is a genuinely new
+    /// rotation, not a duplicate, and must still replace the group under assembly — otherwise a
+    /// group whose end was lost would pin the book until an `InstrumentReset`.
+    #[test]
+    fn a_new_snapshot_begin_still_replaces_a_group_under_assembly() {
+        let mut b = PriceBook::new();
+        assert!(b.on_snapshot_begin(1, 100, 2, 5, 0));
+        b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0);
+        assert!(
+            b.on_snapshot_begin(2, 140, 1, 6, 0),
+            "a different snapshot_id is a new rotation"
+        );
+        b.on_snapshot_level(2, SIDE_ASK, 6300, 30, Some(1), 0);
+        assert!(b.on_snapshot_end(140, 2));
+        assert_eq!(asks_of(&b), vec![(6300, 30)]);
+        assert!(
+            bids_of(&b).is_empty(),
+            "the abandoned group installed nothing"
+        );
     }
 
     /// `K <= last_applied_instrument_seq` is the ordinary case: deltas routinely arrive between the

@@ -5536,6 +5536,57 @@ mod tests {
             "and its per-channel snapshot/reset state"
         );
     }
+
+    /// The wire-level form of `a_duplicated_snapshot_begin_does_not_restart_assembly`: a duplicated
+    /// **datagram** carrying the rotation's `SnapshotBegin`, which is routine on multicast. Before
+    /// the `PriceBook` guard, the re-begin restarted assembly, the group then ended one level short,
+    /// and the incomplete-group path cleared the live book — so a market that was `Ready` and
+    /// serving dropped to `AwaitingSnapshot` on one duplicated packet.
+    #[test]
+    fn mbp_a_duplicated_snapshot_begin_datagram_keeps_the_live_book() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        // Give the live book a level, so there is something to lose.
+        proc.on_datagram(
+            &mbp_wire::frame(0, 0, 10, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "precondition: the market is serving"
+        );
+
+        // A rebuild rotation, split across datagrams so the duplicate lands mid-assembly.
+        let rotation = mbp_snapshot(41, 2, 500, 9, &[(MBP_BID, 6300, 20), (MBP_ASK, 6400, 30)]);
+        let (begin, rest) = rotation.split_first().unwrap();
+        let snap = || make_ctx(&arbiter, &instruments, PortRole::Snapshot);
+        let begins = std::slice::from_ref(begin);
+        proc.on_datagram(&mbp_wire::frame(0, 0, 11, begins), &snap());
+        proc.on_datagram(&mbp_wire::frame(0, 0, 12, &rest[..1]), &snap());
+        // The duplicate: the very same begin datagram, redelivered.
+        proc.on_datagram(&mbp_wire::frame(0, 0, 11, begins), &snap());
+        proc.on_datagram(&mbp_wire::frame(0, 0, 13, &rest[1..]), &snap());
+
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "the rotation completed; a duplicated begin must not have stranded it"
+        );
+        let books = drain_books(&mut rx);
+        let last = books.last().expect("the rebuild re-baselines the market");
+        assert_eq!(
+            shape(last)
+                .iter()
+                .filter(|(a, _, _, _)| *a != BookAction::Clear)
+                .count(),
+            2,
+            "both snapshot levels installed, got {:?}",
+            shape(last)
+        );
+    }
+
     /// Emission gates per instrument on a known definition — precision before price, the same gate
     /// every other processor applies. A book for an undefined instrument is never even created.
     #[test]
