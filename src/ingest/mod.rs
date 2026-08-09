@@ -22,6 +22,7 @@ pub mod processor;
 pub mod public_feeder;
 pub mod receiver;
 pub mod reconcile;
+pub mod registry;
 pub mod sources;
 pub mod subscriber;
 pub mod subscriptions;

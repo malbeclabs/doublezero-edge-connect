@@ -48,6 +48,18 @@ struct Args {
     )]
     publisher_ports: Vec<u16>,
 
+    /// URL to fetch the feed registry document from at startup. The precursor to reading it from
+    /// the DoubleZero ledger. On failure the built-in document is used and a warning is logged — a
+    /// container that will not boot because a registry host blipped is worse than one running a
+    /// slightly stale document. A document that *parses* but fails validation is fatal.
+    #[arg(long, env = "DZ_FEED_REGISTRY_URL", default_value = "")]
+    feed_registry_url: String,
+
+    /// Path to a feed registry document, for a bind-mounted file. Ignored when
+    /// `--feed-registry-url` is set.
+    #[arg(long, env = "DZ_FEED_REGISTRY", default_value = "")]
+    feed_registry: String,
+
     /// Interface to join the groups on - a name (e.g. "doublezero1") or an IPv4 address.
     /// Names are resolved to their IPv4 (as in edge-multicast-ref).
     #[arg(long, env = "DZ_IFACE", default_value = "doublezero1")]
@@ -302,25 +314,27 @@ fn parse_win_rate(s: &str) -> Result<f64, String> {
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
 fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
     if selection.is_empty() {
-        return Ok(feeds::FEEDS.iter().collect());
+        return Ok(feeds::feeds().iter().collect());
     }
     let mut chosen = Vec::new();
-    // Dedup on `(venue, kind)` — the identity of a FEED ROW, unique across `FEEDS` (see
-    // `feeds::tests::venue_kind_pairs_are_unique`), so a repeated `--feed` name selects each row
-    // once. The reconciler's own key is finer (`(venue, kind, publisher)`); narrowing the
-    // publisher set is `filter_publishers`'s job, not this function's.
+    // Dedup on `(venue, category, kind)` — the identity of a FEED ROW, unique across the registry
+    // (see `feeds::tests::venue_category_kind_triples_are_unique`), so a repeated `--feed` name
+    // selects each row once. The category is load-bearing, not decoration: one venue can carry two
+    // rows of the same kind on disjoint universes, and dedup on `(venue, kind)` would drop the
+    // second of them silently. The reconciler's own key is finer (it adds the publisher);
+    // narrowing the publisher set is `filter_publishers`'s job, not this function's.
     let mut seen = std::collections::HashSet::new();
     for name in selection {
-        let matches: Vec<&'static feeds::Feed> = feeds::FEEDS
+        let matches: Vec<&'static feeds::Feed> = feeds::feeds()
             .iter()
             .filter(|f| f.venue.eq_ignore_ascii_case(name))
             .collect();
         if matches.is_empty() {
-            let known: Vec<&str> = feeds::FEEDS.iter().map(|f| f.venue).collect();
+            let known: Vec<&str> = feeds::feeds().iter().map(|f| f.venue).collect();
             bail!("unknown feed '{name}'; known feeds: {}", known.join(", "));
         }
         for f in matches {
-            if seen.insert((f.venue, f.kind)) {
+            if seen.insert((f.venue, f.category, f.kind)) {
                 chosen.push(f);
             }
         }
@@ -365,7 +379,7 @@ fn filter_publishers(
         });
     }
     if !unmatched.is_empty() {
-        let mut known: Vec<u16> = feeds::FEEDS
+        let mut known: Vec<u16> = feeds::feeds()
             .iter()
             .flat_map(|f| f.publishers.iter().map(|p| p.base_port()))
             .collect();
@@ -407,6 +421,17 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!(?args, "starting doublezero-edge-connect");
 
+    // Resolve the feed registry before anything reads it. The rows are data supplied to the
+    // container, not compiled-in constants: which group carries which feed, on which ports, is the
+    // publisher's to change and it must not need a rebuild here. A fetch or read failure falls back
+    // to the built-in document with a warning; a document that parses but fails validation is fatal,
+    // because a wrong registry ingests the wrong feeds and says nothing.
+    feeds::init(ingest::registry::Source::from_flags(
+        &args.feed_registry_url,
+        &args.feed_registry,
+    ))
+    .await?;
+
     let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publisher_ports)?;
     info!(
         feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
@@ -445,7 +470,7 @@ async fn main() -> Result<()> {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
         // Every registry venue, not just the selected ones: a message's venue comes from the wire
         // SourceID, so a venue can reach the arbiter without its own feed being ingested.
-        for f in ingest::feeds::FEEDS {
+        for f in ingest::feeds::feeds() {
             a.set_mode(f.venue, f.arbitration);
         }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
@@ -627,19 +652,43 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_selection_is_all_feeds() {
-        let all = select_feeds(&[]).unwrap();
-        assert_eq!(all.len(), feeds::FEEDS.len());
+    /// `main` installs the registry before anything reads it; a unit test has no `main`, so it
+    /// installs the built-in document itself. Idempotent, so every test can call it.
+    fn registry() {
+        feeds::init_built_in();
     }
 
-    // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`).
-    fn keys(sel: &[&feeds::Feed]) -> Vec<(&'static str, feeds::FeedKind)> {
-        sel.iter().map(|f| (f.venue, f.kind)).collect()
+    #[test]
+    fn empty_selection_is_all_feeds() {
+        registry();
+        let all = select_feeds(&[]).unwrap();
+        assert_eq!(all.len(), feeds::feeds().len());
+    }
+
+    // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`). Includes the
+    // category: a venue can carry two rows of one kind on disjoint universes, so `(venue, kind)`
+    // would collapse them and hide exactly the dedup bug this checks for.
+    fn keys(sel: &[&feeds::Feed]) -> Vec<(&'static str, &'static str, feeds::FeedKind)> {
+        sel.iter().map(|f| (f.venue, f.category, f.kind)).collect()
+    }
+
+    /// Selecting a venue must select **every** row it owns, including two rows of one kind on
+    /// disjoint universes — dedup on `(venue, kind)` would silently drop the second.
+    #[test]
+    fn a_venue_with_two_rows_of_one_kind_selects_both() {
+        registry();
+        let sel = select_feeds(&["KALSHI".to_string()]).unwrap();
+        let mbp: Vec<&str> = sel
+            .iter()
+            .filter(|f| f.kind == feeds::FeedKind::MarketByPrice)
+            .map(|f| f.category)
+            .collect();
+        assert_eq!(mbp.len(), 2, "one universe was dropped: {mbp:?}");
     }
 
     #[test]
     fn repeated_name_selects_same_as_single() {
+        registry();
         let once = select_feeds(&["HYPERLIQUID".to_string()]).unwrap();
         let twice = select_feeds(&["HYPERLIQUID".to_string(), "HYPERLIQUID".to_string()]).unwrap();
         // Repeating a name must spawn the same receivers (same keys, same order) as passing it once.
@@ -650,6 +699,7 @@ mod tests {
 
     #[test]
     fn distinct_names_union_without_dup() {
+        registry();
         let sel = select_feeds(&[
             "HYPERLIQUID".to_string(),
             "PHOENIX".to_string(),
@@ -670,11 +720,13 @@ mod tests {
 
     #[test]
     fn unknown_name_still_errors() {
+        registry();
         assert!(select_feeds(&["Nope".to_string()]).is_err());
     }
 
     #[test]
     fn empty_publisher_selection_keeps_every_publisher() {
+        registry();
         let all = filter_publishers(select_feeds(&[]).unwrap(), &[]).unwrap();
         let hl_tob = all
             .iter()
@@ -683,7 +735,7 @@ mod tests {
         // Compare against the registry, not a literal: this test is about the empty selection
         // being a no-op, and a hardcoded count silently turns it into a fleet-size assertion that
         // has to be edited every time a publisher is onboarded (`feeds.rs` already pins the set).
-        let registry = feeds::FEEDS
+        let registry = feeds::feeds()
             .iter()
             .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
@@ -692,6 +744,7 @@ mod tests {
 
     #[test]
     fn publisher_selection_narrows_by_base_port() {
+        registry();
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
         let hl_tob = sel
             .iter()
@@ -705,6 +758,7 @@ mod tests {
     /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201).
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
+        registry();
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
         assert!(!sel.iter().any(|f| f.venue == "PHOENIX"));
         assert!(sel.iter().any(|f| f.venue == "HYPERLIQUID"));
@@ -715,6 +769,7 @@ mod tests {
     /// venue is `--feed`'s job.
     #[test]
     fn base_ports_are_not_unique_across_feeds() {
+        registry();
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
         let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
         assert!(venues.contains("HYPERLIQUID"));
@@ -730,6 +785,7 @@ mod tests {
 
     #[test]
     fn unknown_publisher_base_port_is_an_error() {
+        registry();
         assert!(filter_publishers(select_feeds(&[]).unwrap(), &[1234]).is_err());
     }
 }

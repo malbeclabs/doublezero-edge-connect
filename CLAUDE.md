@@ -116,15 +116,39 @@ Modules are grouped by role under `src/`:
     `--shred-dedup-window-slots`.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
-- **`ingest/feeds.rs`** — the hardcoded feed registry: each `Feed` is one multicast group mapped to one
+- **`ingest/registry.rs` + `ingest/registry.json`** — the feed registry as **data**. The rows are a
+  JSON document resolved once at startup from one of three sources in precedence order —
+  `--feed-registry-url` (the precursor to reading the DoubleZero ledger, which drops in as a fourth
+  `Source`), `--feed-registry <path>` (a bind-mounted file), else the `include_str!`-ed built-in copy
+  — parsed, validated, expanded and **leaked into `'static`**, which is what keeps `FeedKey`, the
+  metric labels and every `&'static str` field unchanged downstream. ⚠️ **Never add a channel roster,
+  port base or group `code` as a Rust constant.** Those numbers live in a publisher inventory that
+  changes without our involvement (the same allocation was decided four times upstream in dated
+  specs, each reversing the last), and compiling them in makes every upstream change a rebuild while
+  making a stale copy invisible — a wrong port binds a socket that stays silent. A fetch/read failure
+  falls back to the built-in document **with a warning** (a registry-host blip must not stop the
+  container booting, and the built-in copy is last-known-good); a document that parses but fails
+  validation is **fatal**, because a wrong registry is a wrong answer. Validation enforces only what
+  is structural — non-empty `code`/`category`, a `venue` that `sources::source_id_of` resolves, base
+  ports unique within a row, a non-empty roster, no port overflow — the rest is upstream policy this
+  process cannot verify. `publishers` is a tagged union: `explicit` lists port blocks verbatim,
+  `derived` carries a channel roster plus per-plane bases and expands to `base + channel_id` on every
+  plane (one channel is an independent state machine — its own `Reset Count`, sequence series,
+  manifest seq and snapshot cycle — so one channel is one `FeedPublisher` and one receiver task).
+  Unknown fields and unknown `version`s are rejected rather than half-applied. There is **no hot
+  reload**: books and reference data are keyed to the topology in effect when they were built.
+- **`ingest/feeds.rs`** — the registry **types** plus the one accessor. `feeds()` returns the rows
+  installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
+  `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
+  rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
   venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
   identity is its **base port** (`FeedPublisher::base_port()`, the block's mktdata port) — the
   `publisher` metric label, the log field and the reconciler/health task-key component; there are
-  deliberately no host names in the registry. `FEEDS` is the built-in list; add a row to ingest
-  another venue (sibling-protocol rows are added once their live endpoints are known). `--feed
+  deliberately no host names in the registry. Add a row to the **document** to ingest another venue
+  (sibling-protocol rows are added once their live endpoints are known). `--feed
   <venue>` selects a subset of venues and `--publisher-port <port>` narrows the publishers within
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
   the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
@@ -135,7 +159,15 @@ Modules are grouped by role under `src/`:
   mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
   that does not match its live group fails **silently** — no warning, no failed bind, just a
   permanently-zero `dz_receiver_up`; `feeds::tests::lashay_rows_match_the_deployment` pins both rows
-  against the deployment so a transcription slip fails the build instead.
+  against the deployment so a transcription slip fails the build instead. A third **Lashay** row
+  (`lashay-4`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
+  under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
+  (ids 10-29, 39-48, 49) expanded to `33000`/`43000`/`53000 + id`. Those bases are the **wire**
+  allocation; the target (`34000`/`44000`/`54000 + id`) has **not** migrated, and a row built from it
+  joins the right group and receives nothing, which reads as a dead publisher. Never argue that the
+  universes are separate because their `channel_id` ranges do not overlap — the allocation is
+  mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
+  only thing that separates them.
 - **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
   (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
   authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never

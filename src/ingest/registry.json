@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "notes": [
+    "The feed registry as data. Which group carries which feed, on which ports, with which channel",
+    "roster, is the publisher's to decide and it changes without our involvement. This document is",
+    "supplied to the container at runtime (--feed-registry-url, --feed-registry) and this copy is",
+    "only the compiled-in fallback, so the container runs standalone and has a last-known-good to",
+    "fall back to when a fetch fails.",
+    "",
+    "The authoritative fleet list is the feed-capture recorder inventory in the private infra repo,",
+    "NOT the publisher deployment inventory - the latter covers only a subset of the hosts on the",
+    "group. Sourcing this table from the deployment inventory alone is what left five blocks unbound",
+    "and the bridge ingesting about a third of the group's datagrams.",
+    "",
+    "The venue is resolved per message from the wire SourceID (see processor.rs), so the `venue`",
+    "below is only the default for SourceIDs the registry does not assign. The wire value is",
+    "authoritative: a publisher stamping an ID that is not its own is a publisher defect and is",
+    "corrected at the publisher, never remapped here.",
+    "",
+    "A `code` that does not match the live group fails silently: `doublezero status --json` reports",
+    "no match, the reconciler never activates the row, and there is no warning and no failed bind -",
+    "just a receiver that never starts. A wrong port fails the same way, one layer down.",
+    "",
+    "`publishers` is a tagged union. `explicit` carries port blocks verbatim; `derived` carries a",
+    "channel roster plus per-plane bases and expands to `base + id` per channel, one publisher per",
+    "channel. Adding a field to this schema is a version bump: an older binary must reject a document",
+    "it does not fully understand rather than silently ignore half of it."
+  ],
+  "feeds": [
+    {
+      "venue": "HYPERLIQUID",
+      "category": "perps",
+      "code": "tiredsolid",
+      "kind": "TopOfBook",
+      "group": "233.84.178.15",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "notes": [
+        "Confirmed on-wire (group-bound capture) plus the publisher fleet's port blocks: eleven",
+        "publishers - six DoubleZero hosts, four partners and one unattributed.",
+        "",
+        "Base ports follow no arithmetic rule. The v0.7 publisher takes an arbitrary mkt_port per",
+        "channel, so a block can sit anywhere (9011 is base+10, not base+N*100). The one guarantee",
+        "is the spacing within a block: +1/+2 for this publisher role. Derive a block from its",
+        "market-data port; never derive the market-data port from an index."
+      ],
+      "publishers": {
+        "explicit": [
+          { "mktdata": 9001, "refdata": 9002 },
+          {
+            "mktdata": 9011,
+            "refdata": 9012,
+            "notes": "On the wire but in no inventory; its MBO peer is the group's highest-volume depth publisher. Owner still to be established - do not drop the row."
+          },
+          { "mktdata": 9101, "refdata": 9102 },
+          { "mktdata": 9201, "refdata": 9202 },
+          { "mktdata": 9301, "refdata": 9302 },
+          { "mktdata": 9401, "refdata": 9402 },
+          { "mktdata": 9501, "refdata": 9502 },
+          { "mktdata": 9601, "refdata": 9602 },
+          {
+            "mktdata": 9701,
+            "refdata": 9702,
+            "notes": "Registry-only: silent across every capture taken so far."
+          },
+          { "mktdata": 9801, "refdata": 9802 },
+          { "mktdata": 9901, "refdata": 9902 }
+        ]
+      }
+    },
+    {
+      "venue": "HYPERLIQUID",
+      "category": "perps",
+      "code": "tiredsolid",
+      "kind": "MarketByOrder",
+      "group": "233.84.178.15",
+      "emit_trades": false,
+      "arbitration": "Coordinated",
+      "notes": [
+        "Market-by-Order on the same group, one port block per publisher (paired with the",
+        "top-of-book row above). Depth-only: top of book owns this venue's trades.",
+        "",
+        "Unconfirmed ports and how each one fails, since the failure is NOT uniform: dz_receiver_up",
+        "is driven by the idle watchdog, which tracks the mktdata port only.",
+        "  - wrong mktdata  -> no datagrams -> dz_receiver_up == 0. Visible.",
+        "  - wrong refdata  -> RefDataState never resolves a definition and every processor gates",
+        "                      emission on one, so the receiver reads healthy and emits nothing.",
+        "  - wrong snapshot -> books stay Recovering forever, so the publisher contributes no depth",
+        "                      while still reading healthy.",
+        "The only signal for the latter two is dz_datagrams_received_total{role} pinned at 0.",
+        "",
+        "Both feeds must list the same publishers: a publisher onboarded to one and forgotten on the",
+        "other shows up in production as a venue missing depth for one mirror."
+      ],
+      "publishers": {
+        "explicit": [
+          { "mktdata": 10001, "refdata": 10002, "snapshot": 10003 },
+          {
+            "mktdata": 10011,
+            "refdata": 10012,
+            "snapshot": 10013,
+            "notes": "Wire-confirmed. Peer of top-of-book 9011 (owner still to be established)."
+          },
+          { "mktdata": 10101, "refdata": 10102, "snapshot": 10103 },
+          { "mktdata": 10201, "refdata": 10202, "snapshot": 10203 },
+          { "mktdata": 10301, "refdata": 10302, "snapshot": 10303 },
+          { "mktdata": 10401, "refdata": 10402, "snapshot": 10403 },
+          {
+            "mktdata": 10501,
+            "refdata": 10502,
+            "snapshot": 10503,
+            "notes": "Wire-confirmed."
+          },
+          { "mktdata": 10601, "refdata": 10602, "snapshot": 10603 },
+          {
+            "mktdata": 10701,
+            "refdata": 10702,
+            "snapshot": 10703,
+            "notes": "Registry-only: not yet seen on the wire."
+          },
+          {
+            "mktdata": 10801,
+            "refdata": 10802,
+            "snapshot": 10803,
+            "notes": "Wire-confirmed."
+          },
+          {
+            "mktdata": 10901,
+            "refdata": 10902,
+            "snapshot": 10903,
+            "notes": "Only the refdata port was seen; mktdata/snapshot derived from the block layout."
+          }
+        ]
+      }
+    },
+    {
+      "venue": "PHOENIX",
+      "category": "spot",
+      "code": "scottsdale",
+      "kind": "TopOfBook",
+      "group": "233.84.178.18",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "notes": ["A single publisher on 9201/9202."],
+      "publishers": {
+        "explicit": [{ "mktdata": 9201, "refdata": 9202 }]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "perps",
+      "code": "lashay-1",
+      "kind": "TopOfBook",
+      "group": "233.84.178.3",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "notes": [
+        "Perps, two separately-gated groups: lashay-1 carries top of book and lashay-2 the",
+        "market-by-price book. Both claim the tape - a host holding only lashay-2 must still serve",
+        "`trade` - and which of them prints is the reconciler's runtime decision.",
+        "",
+        "`code` is transcribed verbatim from what the DoubleZero ledger registers today, never from",
+        "what reads better here: it is matched against what `doublezero status --json` reports, so a",
+        "prettier code matches nothing and activates nothing. These carry the venue's pre-launch",
+        "codename and are scheduled to be re-registered as edge-kalshi-{perps,sports}-{tob,mbp};",
+        "update these rows in the same change that lands the ledger rename, never before it.",
+        "",
+        "`venue` is independent of `code` - it is the source-registry name for the Source ID these",
+        "rows carry, and sources::source_id_of also accepts the codename, so ledger-facing strings",
+        "keep resolving while only the registry name is ever emitted.",
+        "",
+        "Both groups are live on testnet and mainnet as of 2026-08-07; a permanently-zero",
+        "dz_receiver_up here means a transcription slip, not a quiet feed.",
+        "",
+        "One publisher per row: the two arms share a port block and are distinguished only by",
+        "datagram source IP."
+      ],
+      "publishers": {
+        "explicit": [{ "mktdata": 7576, "refdata": 7577 }]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "perps",
+      "code": "lashay-2",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.4",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "notes": [
+        "The market-by-price block is spaced +10000 / +20000, not the +1 / +2 the Hyperliquid",
+        "publisher role uses."
+      ],
+      "publishers": {
+        "explicit": [{ "mktdata": 31000, "refdata": 41000, "snapshot": 51000 }]
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "sports",
+      "code": "lashay-4",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.20",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "notes": [
+        "A disjoint universe under the same Source ID as the perps rows, which is exactly what",
+        "`category` exists to express: these markets mirror nothing of the perps ones, so the two",
+        "must never contest each other's tape or book. Never argue that separation from channel-id",
+        "ranges - the upstream allocation is mid-migration and any numeric gap between the universes",
+        "is a coincidence of current numbering, owned upstream and enforced nowhere in our code.",
+        "",
+        "ROSTER. One channel is a league or a sport, and each is an independent state machine with",
+        "its own Reset Count, sequence series, Manifest Seq and snapshot cycle - so one channel maps",
+        "to one publisher and therefore one receiver task with its own processor state and books.",
+        "Ids are permanent from first publication: promoting a competition out of a tag channel takes",
+        "a free id rather than renumbering. 30-38 are reserved for exactly those promotions and are",
+        "not published. 63 and 120 were retired on 2026-08-08 and are never reissued (120",
+        "additionally falls inside the second publisher's +100 range). An id listed here that the",
+        "publisher does not send binds a socket that stays silent, which reads as a dead publisher.",
+        "",
+        "PORTS. base + channel_id on all three planes - the property the publisher's own",
+        "validate_port_scheme asserts. A subscriber that computes it differently joins the right",
+        "group and hears silence.",
+        "",
+        "These bases are the WIRE allocation as it stands today. The target allocation is",
+        "34000/44000/54000 + id and has NOT migrated; a row provisioned from the target joins the",
+        "right group and receives nothing, which is indistinguishable from a dead publisher. Move",
+        "these three numbers when the publisher moves, not before. The same allocation has been",
+        "decided four times upstream in dated specs, each reversing the last, which is why it lives",
+        "here and not in compiled code.",
+        "",
+        "DEPLOYMENT. The sports lanes run on a perps host today; dedicated sports hosts do not exist",
+        "yet, so this feed has one publisher per channel and no failover. The top-of-book sibling on",
+        "group 233.84.178.17 is not yet published, which is why this document carries no row for it."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [{ "range": [10, 29] }, { "range": [39, 48] }, { "id": 49 }],
+          "ports": { "mktdata": 33000, "refdata": 43000, "snapshot": 53000 }
+        }
+      }
+    }
+  ]
+}

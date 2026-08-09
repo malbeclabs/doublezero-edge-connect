@@ -16,7 +16,7 @@ use doublezero_edge_connect::{
     ingest::{
         arbiter::{Arbiter, Publisher, SharedArbiter, TRADE_DEDUP_WINDOW},
         codec, codec_mbo,
-        feeds::{FeedKind, FEEDS},
+        feeds::{feeds, init_built_in, FeedKind},
         processor::{MboProcessor, TobProcessor},
         receiver::{FrameCtx, FrameProcessor, PortRole},
     },
@@ -609,7 +609,8 @@ fn mbo_prints_carry_no_venue_trade_id() {
 
     // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
     // real trade ids, and that is its own row's call.
-    for f in FEEDS
+    init_built_in();
+    for f in feeds()
         .iter()
         .filter(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::MarketByOrder)
     {

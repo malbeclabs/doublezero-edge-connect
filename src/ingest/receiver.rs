@@ -57,7 +57,7 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher, FEEDS},
+        feeds::{feeds, Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
         processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor},
         reconcile::TapeOwner,
@@ -359,7 +359,7 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
         .with_label_values(&[venue])
         .set(stale_ms as i64);
     for wire_venue in revealed_venues_for(venue) {
-        if wire_venue.as_ref() != venue && FEEDS.iter().any(|f| f.venue == wire_venue.as_ref()) {
+        if wire_venue.as_ref() != venue && feeds().iter().any(|f| f.venue == wire_venue.as_ref()) {
             continue; // that venue has its own row(s) and its own aggregate; it speaks for itself
         }
         let source_id = sources::source_id_of(wire_venue.as_ref()).unwrap_or(0);

@@ -1,12 +1,16 @@
-//! Hardcoded registry of DoubleZero Edge feeds the bridge ingests.
+//! The registry of DoubleZero Edge feeds the bridge ingests — the **types**; the rows themselves
+//! are data, loaded at startup from a document (see [`crate::ingest::registry`]).
 //!
 //! Each feed is one multicast group mapped to exactly one venue, plus the **protocol** it speaks
 //! ([`FeedKind`]) and the **publishers** mirroring it ([`FeedPublisher`]), each with its own port
-//! block. The bridge spawns one receiver per `(venue, kind, publisher)`; consumers then filter by
-//! `venue` over the WebSocket (see PROTOCOL.md subscriptions). To ingest another venue's feed, add
-//! a `Feed` row below - no other code changes are needed.
+//! block. The bridge spawns one receiver per `(venue, category, kind, publisher)`; consumers then
+//! filter by `venue` over the WebSocket (see PROTOCOL.md subscriptions). To ingest another venue's
+//! feed, add a row to `registry.json` (or to the document the deployment supplies) — no code
+//! changes are needed, and no rebuild if the document is supplied at runtime.
 
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, sync::OnceLock};
+
+use crate::ingest::registry;
 
 /// Which edge-feed-spec protocol a feed speaks. Selects the frame magic + decoder + receiver
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
@@ -168,303 +172,129 @@ pub struct Feed {
     pub arbitration: ArbitrationMode,
 }
 
-/// All feeds known to the bridge: DZ Edge feeds, one multicast group per venue, each mirrored by
-/// one or more publishers ([`FeedPublisher`]).
+/// Every feed row known to the bridge, resolved once at startup from the registry document.
 ///
-/// Group, ports **and publisher count** all vary per venue. Hyperliquid mirrors one group across
-/// eleven publishers, each with its own port block; Phoenix runs a single publisher. Don't assume
-/// any of it - confirm against the venue's deployment.
+/// Deliberately **not** `pub`: a consumer reading the backing storage directly would pin itself to
+/// whatever set happened to be compiled in, and a row that only ever arrives from a supplied
+/// document would go missing with nothing to show for it. Keeping this private turns that into a
+/// compile error and leaves [`feeds()`] the one entry point.
+static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
+
+/// Resolve the registry document from `source` and install it.
 ///
-/// **Base ports follow no arithmetic rule.** The v0.7 publisher takes an arbitrary `mkt_port` per
-/// channel, so a block can sit anywhere (9011 is base+10, not base+N*100). The one guarantee is the
-/// spacing *within* a block, which follows the publisher implementation: `+1`/`+2` for the
-/// Hyperliquid role, `+10000`/`+20000` for the Lashay one. `publisher_blocks_use_a_known_layout`
-/// pins both. Derive a block from its market-data port; never derive the market-data port from an
-/// index.
+/// Called once from `main` before any receiver spawns. A repeat call is ignored rather than
+/// swapping the set under running receivers — books and reference data are keyed to the topology
+/// in effect when they were built.
+pub async fn init(source: registry::Source) -> Result<(), registry::RegistryError> {
+    let rows = registry::load(source).await?;
+    let _ = FEEDS.set(rows);
+    Ok(())
+}
+
+/// Install the compiled-in document if nothing is installed yet. Idempotent and synchronous.
 ///
-/// Sibling-protocol feeds (Midpoint) are added here once their live multicast groups/ports are
-/// known; until then they are absent rather than carrying guessed endpoints.
-pub const FEEDS: &[Feed] = &[
-    // Confirmed on-wire (group-bound capture) plus the publisher fleet's port blocks:
-    //
-    //   - `tiredsolid` 233.84.178.15 -> Hyperliquid, eleven publishers.
-    //   - `scottsdale` 233.84.178.18 -> Phoenix, a single publisher on 9201/9202.
-    //
-    // The authoritative fleet list is the feed-capture recorder inventory in the private infra
-    // repo, NOT the publisher deployment inventory - the latter covers only a subset of the hosts
-    // on the group. Sourcing this table from the deployment inventory alone is what left five
-    // blocks unbound and the bridge ingesting about a third of the group's datagrams.
-    //
-    // The venue is resolved per message from the wire SourceID (see processor.rs), so the `venue`
-    // below is only the default for SourceIDs the registry does not assign. All three production
-    // IDs are assigned, and the wire value is authoritative: a publisher stamping an ID that is not
-    // its own is a publisher defect and is corrected at the publisher, never remapped here. Each
-    // publisher gets its own receiver + reference-data state.
-    Feed {
-        venue: "HYPERLIQUID",
-        category: "perps",
-        code: "tiredsolid",
-        kind: FeedKind::TopOfBook,
-        group: Ipv4Addr::new(233, 84, 178, 15),
-        publishers: &[
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9001,
-                    refdata: 9002,
-                },
-            },
-            // On the wire but in no inventory; its MBO peer is the group's highest-volume
-            // depth publisher. Owner still to be established - do not drop the row.
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9011,
-                    refdata: 9012,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9101,
-                    refdata: 9102,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9201,
-                    refdata: 9202,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9301,
-                    refdata: 9302,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9401,
-                    refdata: 9402,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9501,
-                    refdata: 9502,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9601,
-                    refdata: 9602,
-                },
-            },
-            // Registry-only: silent across every capture taken so far.
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9701,
-                    refdata: 9702,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9801,
-                    refdata: 9802,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::TwoPort {
-                    mktdata: 9901,
-                    refdata: 9902,
-                },
-            },
-        ],
-        emit_trades: true,
-        arbitration: ArbitrationMode::Coordinated,
-    },
-    // Hyperliquid Market-by-Order on the same `tiredsolid` group, one port block per publisher
-    // (paired with the TOB row above). Depth-only: TOB owns this venue's trades.
-    //
-    // Unconfirmed ports and how each one fails, since the failure is NOT uniform: `dz_receiver_up`
-    // is driven by the idle watchdog, which tracks the **mktdata** port only.
-    //   - wrong mktdata  -> no datagrams -> `dz_receiver_up == 0`. Visible.
-    //   - wrong refdata  -> `RefDataState` never resolves a definition and every processor gates
-    //                       emission on one, so the receiver reads healthy and emits nothing.
-    //   - wrong snapshot -> books stay `Recovering` forever, so the publisher contributes no depth
-    //                       while still reading healthy.
-    // The only signal for the latter two is `dz_datagrams_received_total{role}` pinned at 0.
-    // Silently-failing ports here: 10903 (derived from an observed 10902) and the whole 10701
-    // block (registry-only, never seen on the wire). Everything else was decoded from a capture.
-    Feed {
-        venue: "HYPERLIQUID",
-        category: "perps",
-        code: "tiredsolid",
-        kind: FeedKind::MarketByOrder,
-        group: Ipv4Addr::new(233, 84, 178, 15),
-        publishers: &[
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10001,
-                    refdata: 10002,
-                    snapshot: 10003,
-                },
-            },
-            // Wire-confirmed. Peer of TOB 9011 (owner still to be established).
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10011,
-                    refdata: 10012,
-                    snapshot: 10013,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10101,
-                    refdata: 10102,
-                    snapshot: 10103,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10201,
-                    refdata: 10202,
-                    snapshot: 10203,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10301,
-                    refdata: 10302,
-                    snapshot: 10303,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10401,
-                    refdata: 10402,
-                    snapshot: 10403,
-                },
-            },
-            // Wire-confirmed.
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10501,
-                    refdata: 10502,
-                    snapshot: 10503,
-                },
-            },
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10601,
-                    refdata: 10602,
-                    snapshot: 10603,
-                },
-            },
-            // Registry-only: not yet seen on the wire.
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10701,
-                    refdata: 10702,
-                    snapshot: 10703,
-                },
-            },
-            // Wire-confirmed.
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10801,
-                    refdata: 10802,
-                    snapshot: 10803,
-                },
-            },
-            // Only the refdata port was seen; mktdata/snapshot derived from the block layout.
-            FeedPublisher {
-                ports: FeedPorts::ThreePort {
-                    mktdata: 10901,
-                    refdata: 10902,
-                    snapshot: 10903,
-                },
-            },
-        ],
-        emit_trades: false,
-        arbitration: ArbitrationMode::Coordinated,
-    },
-    Feed {
-        venue: "PHOENIX",
-        category: "spot",
-        code: "scottsdale",
-        kind: FeedKind::TopOfBook,
-        group: Ipv4Addr::new(233, 84, 178, 18),
-        publishers: &[FeedPublisher {
-            ports: FeedPorts::TwoPort {
-                mktdata: 9201,
-                refdata: 9202,
-            },
-        }],
-        emit_trades: true,
-        arbitration: ArbitrationMode::Coordinated,
-    },
-    // Lashay perps, two separately-gated groups: `lashay-1` carries top of book and `lashay-2` the
-    // market-by-price book. Both claim the tape — a host holding only `lashay-2` must still serve
-    // `trade` — and which of them prints is the reconciler's runtime decision (see `Feed::emit_trades`).
-    //
-    // `code` is transcribed verbatim from what the DoubleZero ledger registers today, never from
-    // what reads better here: it is matched against what `doublezero status --json` reports, so a
-    // prettier code matches nothing and activates nothing. These carry the venue's pre-launch
-    // codename and are scheduled to be re-registered as `edge-kalshi-{perps,sports}-{tob,mbp}`;
-    // update these rows in the same change that lands the ledger rename, never before it.
-    //
-    // `venue` is independent of `code` — it is the source-registry name for the Source ID these rows
-    // carry (`sources::source_name(3)`), and `sources::source_id_of` also accepts the codename, so
-    // ledger-facing strings keep resolving while only the registry name is ever emitted.
-    //
-    // ⚠️ A `code` that does not match the live group fails **silently**: `doublezero status --json`
-    // reports no match, the reconciler never activates the row, and there is no warning and no failed
-    // bind — just a receiver that never starts. Both groups are live on testnet and mainnet as of
-    // 2026-08-07; a permanently-zero `dz_receiver_up` here means a transcription slip, not a quiet feed.
-    //
-    // One `FeedPublisher` per row: the two arms share a port block and are distinguished only by
-    // datagram source IP (the shared-block model in `FeedPublisher`'s docs). The market-by-price
-    // block is spaced `+10000` / `+20000`, not the `+1` / `+2` the Hyperliquid publisher uses.
-    Feed {
-        venue: "KALSHI",
-        category: "perps",
-        code: "lashay-1",
-        kind: FeedKind::TopOfBook,
-        group: Ipv4Addr::new(233, 84, 178, 3),
-        publishers: &[FeedPublisher {
-            ports: FeedPorts::TwoPort {
-                mktdata: 7576,
-                refdata: 7577,
-            },
-        }],
-        emit_trades: true,
-        arbitration: ArbitrationMode::Sticky,
-    },
-    Feed {
-        venue: "KALSHI",
-        category: "perps",
-        code: "lashay-2",
-        kind: FeedKind::MarketByPrice,
-        group: Ipv4Addr::new(233, 84, 178, 4),
-        publishers: &[FeedPublisher {
-            ports: FeedPorts::ThreePort {
-                mktdata: 31000,
-                refdata: 41000,
-                snapshot: 51000,
-            },
-        }],
-        emit_trades: true,
-        arbitration: ArbitrationMode::Sticky,
-    },
-];
+/// The entry point for tests and for any embedding with no document to supply. Panics only if the
+/// compiled-in document is itself invalid, which is a build-time defect.
+pub fn init_built_in() {
+    let _ = FEEDS.get_or_init(|| {
+        registry::load_built_in().expect("the built-in feed registry document is valid")
+    });
+}
 
 /// Every feed row known to the bridge. The one entry point — callers never touch the backing
-/// storage directly, so the roster derivation in Task 3 is not a breaking change for them.
+/// storage directly.
+///
+/// Reading before [`init`] is a programming error, not a runtime condition: silently falling back
+/// to the built-in document would let a misordered startup ingest a different feed set than the
+/// operator supplied, with nothing to show for it.
+///
+/// **In this crate's own test build only**, the built-in document installs itself on first read.
+/// A unit test has no `main` to call [`init`], and requiring every test that *transitively* reaches
+/// this to install it first is an ordering dependency waiting to break — the offending test passes
+/// for exactly as long as some other test in the same binary happens to run before it, and fails
+/// the day someone runs it alone. Those tests therefore pin the **built-in document**, which is the
+/// right subject: it is the copy every deployment falls back to when a fetch fails, so a slip in it
+/// is a production defect and not a fixture typo. The binary and the integration tests link this
+/// without `cfg(test)` and keep the strict rule.
 pub fn feeds() -> &'static [Feed] {
-    FEEDS
+    #[cfg(test)]
+    init_built_in();
+    FEEDS.get().copied().expect("feeds::init was not called")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::registry::sports_channel_ids;
+
+    /// Leagues 10-29, sport channels 39-48, catch-all 49 — 31 in total. 30-38 are reserved for
+    /// promoting a competition out of a tag channel and are not published; 63 and 120 were
+    /// retired on 2026-08-08 and are never reissued. An id here that the publisher does not
+    /// send binds a socket that stays silent, which reads as a dead publisher.
+    #[test]
+    fn the_sports_roster_is_the_published_thirty_one() {
+        let ids = sports_channel_ids();
+        assert_eq!(ids.len(), 31, "roster size changed: {ids:?}");
+        assert_eq!(ids.first().copied(), Some(10));
+        assert_eq!(ids.last().copied(), Some(49));
+        for reserved in 30..=38 {
+            assert!(!ids.contains(&reserved), "reserved id {reserved} is published");
+        }
+        for retired in [63u8, 120] {
+            assert!(!ids.contains(&retired), "retired id {retired} was reissued");
+        }
+    }
+
+    /// A sports port is exactly `base + channel_id` on all three planes. This is the property the
+    /// publisher's own `validate_port_scheme` asserts, and the one a subscriber must match exactly
+    /// or it joins the right group and hears silence.
+    ///
+    /// The bases are the **wire** allocation. The target allocation (34000/44000/54000) has not
+    /// migrated, and a row built from it joins the right group and receives nothing — which reads
+    /// as a dead publisher, not as a misconfiguration.
+    #[test]
+    fn sports_ports_are_the_base_plus_the_channel_id() {
+        let row = feeds()
+            .iter()
+            .find(|f| f.venue == "KALSHI" && f.category == "sports")
+            .expect("no sports row");
+        assert_eq!(row.code, "lashay-4");
+        assert_eq!(row.group, Ipv4Addr::new(233, 84, 178, 20));
+        assert_eq!(row.kind, FeedKind::MarketByPrice);
+        assert_eq!(row.publishers.len(), 31);
+
+        for (p, id) in row.publishers.iter().zip(sports_channel_ids()) {
+            let FeedPorts::ThreePort {
+                mktdata,
+                refdata,
+                snapshot,
+            } = p.ports
+            else {
+                panic!("sports publishers bind three ports");
+            };
+            assert_eq!(mktdata, 33000 + u16::from(id), "mktdata for channel {id}");
+            assert_eq!(refdata, 43000 + u16::from(id), "refdata for channel {id}");
+            assert_eq!(snapshot, 53000 + u16::from(id), "snapshot for channel {id}");
+        }
+    }
+
+    /// Base ports identify a receiver task, so a collision would silently merge two channels'
+    /// state machines into one task key.
+    #[test]
+    fn every_base_port_is_unique_within_a_feed() {
+        for f in feeds() {
+            let mut seen = std::collections::HashSet::new();
+            for p in f.publishers {
+                assert!(
+                    seen.insert(p.base_port()),
+                    "{} {:?} repeats base port {}",
+                    f.venue,
+                    f.kind,
+                    p.base_port()
+                );
+            }
+        }
+    }
 
     /// Rows sharing a `(venue, category)` are mirrors and arbitrate as one; rows differing in it
     /// carry disjoint universes and must never contest each other. Uniqueness is on the triple —
@@ -515,6 +345,7 @@ mod tests {
                 ("PHOENIX", "spot", FeedKind::TopOfBook) => "scottsdale",
                 ("KALSHI", "perps", FeedKind::TopOfBook) => "lashay-1",
                 ("KALSHI", "perps", FeedKind::MarketByPrice) => "lashay-2",
+                ("KALSHI", "sports", FeedKind::MarketByPrice) => "lashay-4",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
@@ -749,7 +580,14 @@ mod tests {
     /// deployment exactly so a transcription slip fails the build instead.
     #[test]
     fn lashay_rows_match_the_deployment() {
-        let row = |kind| feeds().iter().find(|f| f.venue == "KALSHI" && f.kind == kind);
+        // Scoped by category as well as kind: the venue now carries two market-by-price rows on
+        // disjoint universes, so `find` on the kind alone would silently pick whichever the
+        // document happens to list first.
+        let row = |kind| {
+            feeds()
+                .iter()
+                .find(|f| f.venue == "KALSHI" && f.category == "perps" && f.kind == kind)
+        };
 
         let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
         assert_eq!(tob.code, "lashay-1");

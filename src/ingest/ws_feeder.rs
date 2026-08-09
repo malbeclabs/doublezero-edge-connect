@@ -316,7 +316,7 @@ mod tests {
     /// if the constant drifts, because then no row matches it.
     #[test]
     fn category_names_the_row_this_backstop_mirrors() {
-        let mirrored = crate::ingest::feeds::FEEDS.iter().find(|f| {
+        let mirrored = crate::ingest::feeds::feeds().iter().find(|f| {
             f.venue == hl_venue()
                 && f.category == HL_CATEGORY
                 && f.kind == crate::ingest::feeds::FeedKind::TopOfBook

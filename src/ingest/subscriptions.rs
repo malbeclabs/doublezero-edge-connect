@@ -185,7 +185,7 @@ fn run_cli(args: &[&str]) -> CliOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingest::feeds::FEEDS;
+    use crate::ingest::feeds::feeds;
 
     // A real `doublezero status --json` capture from a host subscribed to both shred and
     // market-data groups (the field that matters is `multicast_groups`).
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn market_data_feeds_match_by_code() {
-        let enabled: &[Feed] = FEEDS;
+        let enabled: &[Feed] = feeds();
 
         // Subscribed to Hyperliquid's group only -> both HL rows (TOB + MBO), not Phoenix.
         let hl = subs(&["tiredsolid", "edge-solana-shreds"], &[]);
