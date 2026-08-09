@@ -31,12 +31,17 @@ FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# The repo is a Cargo workspace: `shred-proxy/` is a sibling member crate. Cargo needs every
-# member's manifest present to resolve the workspace, so we copy only the member's manifest — not
-# its sources, which the scoped `-p doublezero-edge-connect` build never compiles. Leaving the
-# sources out keeps edits to shred-proxy from busting this image's build cache; the shred-proxy
-# binary is released separately.
+# The repo is a Cargo workspace: `shred-proxy/` and `doublezero-edge/` are sibling member crates.
+# Cargo needs every member's manifest present to resolve the workspace, so we copy only each
+# member's manifest — not its sources, which the scoped `-p doublezero-edge-connect` build never
+# compiles. Leaving the sources out keeps edits to those crates from busting this image's build
+# cache; both binaries are released separately.
+#
+# A new workspace member MUST be added here. Without its manifest the workspace fails to resolve and
+# the build dies with a bare "No such file or directory" — and nothing else catches it, because the
+# test suites bind-mount the whole tree rather than exercising this selective copy.
 COPY shred-proxy/Cargo.toml ./shred-proxy/Cargo.toml
+COPY doublezero-edge/Cargo.toml ./doublezero-edge/Cargo.toml
 # Cache the cargo registry and the target dir across builds (BuildKit cache mounts) for fast
 # rebuilds. The target dir lives in the cache mount (not in the image layer), so the binary
 # must be copied out within this same RUN before the mount goes away.
