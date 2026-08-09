@@ -374,11 +374,11 @@ impl StickyAuthority {
     }
 
     /// An arm's label under **any** universe of `venue` — for the one caller that cannot name one.
-    /// `ArmRace`'s unmatched counter is keyed on the venue alone (the matcher pairs trades, which
-    /// carry no category), and the metric it feeds is labelled `{venue, arm}`, so neither end of that
-    /// path has a scope to offer. Deterministic — lowest ordinal wins — rather than `HashMap`-order
-    /// dependent, so a host publishing two universes reports one stable label instead of alternating
-    /// between them.
+    /// [`Self::markets_held_all`] sums a venue's universes because `dz_arm_markets_held` is labelled
+    /// `{venue, arm}`, so its rows have a venue and no scope. Deterministic — lowest ordinal wins —
+    /// rather than `HashMap`-order dependent, so a host publishing two universes reports one stable
+    /// label instead of alternating between them. Every other metrics path is scope-keyed and uses
+    /// [`Self::arm_label`].
     pub fn arm_label_in_venue(&self, venue: &str, publisher: Publisher) -> &'static str {
         self.ordinals
             .iter()

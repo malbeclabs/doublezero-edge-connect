@@ -49,7 +49,7 @@ use super::http::{self, Request, Response};
 use crate::{
     history,
     ingest::{
-        feeds::{FeedKind, FEEDS},
+        feeds::{feeds, FeedKind},
         health::SharedFeedHealth,
         processor::DEPTH_LEVELS,
         sources::source_label,
@@ -305,30 +305,6 @@ fn decimal_string(value: f64, exponent: i8) -> String {
     format!("{value:.decimals$}")
 }
 
-/// The `book` replay entry for one wire identity, or `None`.
-///
-/// `model::BookSnapshot` is keyed on the producer-side arbitration scope as well
-/// (`(venue, category, channel, instrument_id)`), because two instrument universes under one Source
-/// ID have independent id spaces and would otherwise share one accumulator. This REST surface
-/// addresses a market by its wire identity alone — a `NormalizedInstrument` carries no category, and
-/// PROTOCOL.md never exposes one — so the scope element is skipped and the first matching entry wins.
-/// On a venue whose universes genuinely collide on `(channel, instrument_id)` that choice is
-/// arbitrary; the same ambiguity is already in `InstrumentSnapshot`, which is what supplied `i`.
-///
-/// A scan, not a lookup: the map is bounded by the arbiter's `MAX_BOOK_MARKETS` and this is a
-/// per-request REST path, never the ingest hot path.
-fn book_entry<'a>(
-    books: &'a crate::model::BookMap,
-    i: &NormalizedInstrument,
-) -> Option<&'a crate::model::BookAccumulator> {
-    books
-        .iter()
-        .find(|((venue, _, channel, id), _)| {
-            *venue == i.venue && *channel == i.channel && *id == i.instrument_id
-        })
-        .map(|(_, acc)| acc)
-}
-
 /// Best-effort feed-kind label for one instrument, derived from which snapshot actually holds data
 /// for its exact identity — never fabricated. A `BookSnapshot` entry for `(venue, channel,
 /// instrument_id)` means the serving row speaks Market-by-Price; failing that, a `DepthSnapshot`
@@ -341,7 +317,10 @@ fn book_entry<'a>(
 fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     {
         let books = crate::model::lock(&state.books);
-        if book_entry(&books, i).is_some() {
+        if books
+            .by_identity(&i.venue, i.channel, i.instrument_id)
+            .is_some()
+        {
             return "market_by_price";
         }
     }
@@ -351,7 +330,7 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
             return "market_by_order";
         }
     }
-    let kinds: HashSet<FeedKind> = FEEDS
+    let kinds: HashSet<FeedKind> = feeds()
         .iter()
         .filter(|f| f.venue == i.venue.as_ref())
         .map(|f| f.kind)
@@ -501,7 +480,7 @@ type Level = Option<(f64, f64)>;
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) {
     {
         let books = crate::model::lock(&state.books);
-        if let Some(acc) = book_entry(&books, inst) {
+        if let Some(acc) = books.by_identity(&inst.venue, inst.channel, inst.instrument_id) {
             return (acc.best_bid(), acc.best_ask());
         }
     }
@@ -531,12 +510,14 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // Prefer the incremental market-by-price accumulator when this identity has one.
     let mbp = {
         let books = crate::model::lock(&state.books);
-        book_entry(&books, inst).map(|acc| {
-            (
-                acc.baselined(),
-                acc.to_book(&inst.venue, inst.channel, inst.instrument_id),
-            )
-        })
+        books
+            .by_identity(&inst.venue, inst.channel, inst.instrument_id)
+            .map(|acc| {
+                (
+                    acc.baselined(),
+                    acc.to_book(&inst.venue, inst.channel, inst.instrument_id),
+                )
+            })
     };
     if let Some((baselined, materialized)) = mbp {
         let mut bids = Vec::new();
@@ -712,7 +693,7 @@ fn best_bid_ask(state: &ApiState) -> Response {
 // ---------------------------------------------------------------------------------------------
 
 fn status(state: &ApiState) -> Response {
-    let mut venues: Vec<&'static str> = FEEDS.iter().map(|f| f.venue).collect();
+    let mut venues: Vec<&'static str> = feeds().iter().map(|f| f.venue).collect();
     venues.sort_unstable();
     venues.dedup();
     let venues_json: Vec<Value> = venues
@@ -883,7 +864,7 @@ mod tests {
         (
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(crate::model::BookReplay::default())),
             Arc::new(Mutex::new(Store::new())),
             Arc::new(FeedHealth::new()),
         )

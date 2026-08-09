@@ -519,8 +519,8 @@ mod tests {
     use crate::{
         metrics::metrics,
         model::{
-            BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook,
-            NormalizedInstrument, NormalizedQuote,
+            BookAccumulator, BookAction, BookChange, BookReplay, BookSide, FeedMessage,
+            NormalizedBook, NormalizedInstrument, NormalizedQuote,
         },
     };
 
@@ -738,7 +738,7 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let books = Arc::new(Mutex::new(HashMap::new()));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
@@ -802,7 +802,7 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let books = Arc::new(Mutex::new(HashMap::new()));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws1, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
@@ -890,7 +890,7 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let books = Arc::new(Mutex::new(HashMap::new()));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
@@ -1015,7 +1015,7 @@ mod tests {
             tx.clone(),
             instruments,
             depth,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(BookReplay::default())),
             cfg,
         ));
 
@@ -1132,7 +1132,7 @@ mod tests {
     /// the caller for the lifetime of the test.
     async fn spawn_server(
         instruments: HashMap<(Arc<str>, u32, u32), NormalizedInstrument>,
-        books: HashMap<(Arc<str>, Arc<str>, u32, u32), BookAccumulator>,
+        books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         broadcast::Sender<std::sync::Arc<FeedMessage>>,
@@ -1191,7 +1191,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn connect_replays_the_accumulated_book_rebaseline() {
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),
@@ -1233,7 +1233,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn subscribe_scopes_the_book_replay_by_channel() {
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),
@@ -1308,7 +1308,7 @@ mod tests {
                 qty_exponent: -2,
             },
         );
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),
@@ -1353,7 +1353,7 @@ mod tests {
         ));
         assert!(!mid_stream.baselined(), "no Clear was folded in");
 
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),
@@ -1407,7 +1407,7 @@ mod tests {
             assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
         }
 
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),

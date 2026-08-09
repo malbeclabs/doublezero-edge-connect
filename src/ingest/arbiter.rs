@@ -976,8 +976,7 @@ impl Arbiter {
             return;
         }
         model::lock(replay)
-            .entry(key.clone())
-            .or_insert_with(|| BookAccumulator::new(b.symbol.clone()))
+            .entry_or_insert_with(key, || BookAccumulator::new(b.symbol.clone()))
             .apply(b);
     }
 
@@ -1670,7 +1669,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::{NormalizedQuote, NormalizedTrade, Side};
+    use crate::model::{BookReplay, NormalizedQuote, NormalizedTrade, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
@@ -3096,7 +3095,7 @@ mod tests {
     #[test]
     fn book_replay_accumulates_the_authoritative_arm() {
         let venue = "BookReplayLeader";
-        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
@@ -3689,7 +3688,7 @@ mod tests {
     fn book_markets_are_bounded() {
         let venue = "BookMarketCap";
         let (tx, _rx) = broadcast::channel(1);
-        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
         for id in 0..(MAX_BOOK_MARKETS as u32 + 64) {
@@ -3723,7 +3722,7 @@ mod tests {
     fn evicting_one_universes_market_spares_the_others_replay_entry() {
         let venue = "BookEvictionAcrossUniverses";
         let (tx, _rx) = broadcast::channel(1);
-        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
 
@@ -3777,6 +3776,54 @@ mod tests {
         assert!(
             guard.get(&kept).is_some_and(|acc| acc.baselined()),
             "the peer universe's live, complete replay entry must survive that eviction"
+        );
+        // ...and the wire-identity index went with the evicted market rather than outliving it. The
+        // REST surface resolves markets through this lookup and has no key to fall back on, so an
+        // index entry pointing at an evicted market makes the surviving one invisible — the same
+        // together-or-not-at-all rule the accumulator and the authority entry follow.
+        assert!(
+            guard
+                .by_identity(&Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT)
+                .is_some_and(|acc| acc.baselined()),
+            "the identity index must resolve the surviving market, not the evicted one"
+        );
+    }
+
+    /// The index is also dropped when the market it names is, with nothing left behind: a stale entry
+    /// would have `/v1/products` report a `market_by_price` book for a market that no longer exists.
+    #[test]
+    fn an_evicted_market_leaves_no_identity_index_entry() {
+        let venue = "BookEvictionIndex";
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+        for id in 0..(MAX_BOOK_MARKETS as u32 + 1) {
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_000),
+                arm(1),
+                TEST_CATEGORY,
+            );
+        }
+        let guard = model::lock(&replay);
+        assert_eq!(guard.len(), MAX_BOOK_MARKETS, "one market was evicted");
+        assert_eq!(
+            guard.identity_index_len(),
+            guard.len(),
+            "the index must hold exactly the live markets — an entry outliving its market both \
+             grows without bound and, where two universes share an identity, hides the survivor"
+        );
+        assert!(
+            guard
+                .by_identity(&Arc::from(venue), BOOK_CHANNEL, 0)
+                .is_none(),
+            "the evicted market must not still be reachable by wire identity"
+        );
+        assert!(
+            guard
+                .by_identity(&Arc::from(venue), BOOK_CHANNEL, MAX_BOOK_MARKETS as u32)
+                .is_some(),
+            "...while a live one still is"
         );
     }
 

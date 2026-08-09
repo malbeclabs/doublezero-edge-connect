@@ -426,7 +426,7 @@ async fn main() -> Result<()> {
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-    let books: model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    let books: model::BookSnapshot = Arc::new(Mutex::new(model::BookReplay::default()));
     // Rolling one-hour trade history behind the `/v1` query API. Built once here (like the three
     // snapshot maps above) so it survives the API sink's own activate/deactivate cycles - a
     // subscription blip that briefly takes the sink down must not reset the window it comes back up

@@ -640,10 +640,130 @@ impl BookAccumulator {
 /// The writer owns two obligations the `depth` replay map already discharges (`arbiter.rs`): purge a
 /// market's entry on session reset, or an ended session's book is replayed to a new client as an
 /// authoritative re-baseline; and bound the entry count, since the key is wire-supplied.
-pub type BookSnapshot = Arc<Mutex<BookMap>>;
+pub type BookSnapshot = Arc<Mutex<BookReplay>>;
 
-/// The map behind [`BookSnapshot`], named so a reader can borrow it without respelling the key.
-pub type BookMap = HashMap<(Arc<str>, Arc<str>, u32, u32), BookAccumulator>;
+/// A market's replay key: the arbitration scope plus the wire identity. Structurally
+/// `ingest::authority::MarketKey`, and required to stay so — see [`BookSnapshot`].
+pub type BookKey = (Arc<str>, Arc<str>, u32, u32);
+
+/// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
+pub type BookMap = HashMap<BookKey, BookAccumulator>;
+
+/// The wire identity alone — all a consumer-facing reader can name, since neither PROTOCOL.md nor
+/// the REST surface exposes the arbitration scope.
+type BookIdentity = (Arc<str>, u32, u32);
+
+fn book_identity(key: &BookKey) -> BookIdentity {
+    (key.0.clone(), key.2, key.3)
+}
+
+/// The replay state behind [`BookSnapshot`]: every market's accumulated book, plus a secondary index
+/// from **wire identity** to full key.
+///
+/// The index exists because the two readers name markets differently. `sinks/ws.rs` iterates, so it
+/// needs nothing; `sinks/api.rs` resolves a market from a `NormalizedInstrument`, which carries
+/// `(venue, channel, instrument_id)` and no category — and its `/v1/products` and `/v1/best_bid_ask`
+/// handlers do that **once per instrument**, so a linear scan of this map turns those endpoints into
+/// O(instruments x markets). At the tens of thousands of markets a single feed can carry, that is
+/// hundreds of millions of comparisons per request. The index keeps it a hash hit.
+///
+/// The two maps are mutated **only** through this type's methods, so the index cannot drift from the
+/// books it indexes: an eviction drops the accumulator and the index entry in one step, exactly as
+/// the arbiter drops the replay entry and the authority's per-market state together. That
+/// together-or-not-at-all property is the whole reason this is a struct and not a second map kept
+/// beside the first.
+///
+/// ⚠️ **Residual ambiguity, deliberately not resolved here.** Two universes under one Source ID can
+/// carry the same `(channel, instrument_id)`, so one identity can index several keys; the lookup
+/// returns the first one indexed. The REST surface has no way to say which universe it means, and
+/// **the category is what would resolve it** — a change to that surface, tracked separately. Do not
+/// reason from today's `channel_id` ranges happening not to overlap: that separation is a numbering
+/// convention owned upstream, it is mid-migration, and nothing here enforces it.
+#[derive(Default)]
+pub struct BookReplay {
+    books: BookMap,
+    by_identity: HashMap<BookIdentity, Vec<BookKey>>,
+}
+
+impl BookReplay {
+    /// Replace one market's accumulator (the re-baseline path).
+    pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) {
+        self.index(&key);
+        self.books.insert(key, acc);
+    }
+
+    /// The accumulator for `key`, created with `f` when the market is new (the streaming path).
+    pub fn entry_or_insert_with(
+        &mut self,
+        key: &BookKey,
+        f: impl FnOnce() -> BookAccumulator,
+    ) -> &mut BookAccumulator {
+        self.index(key);
+        self.books.entry(key.clone()).or_insert_with(f)
+    }
+
+    /// Drop one market: accumulator and index entry together. The eviction and session-reset path.
+    pub fn remove(&mut self, key: &BookKey) -> Option<BookAccumulator> {
+        let id = book_identity(key);
+        if let Some(keys) = self.by_identity.get_mut(&id) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.by_identity.remove(&id);
+            }
+        }
+        self.books.remove(key)
+    }
+
+    pub fn get(&self, key: &BookKey) -> Option<&BookAccumulator> {
+        self.books.get(key)
+    }
+
+    pub fn contains_key(&self, key: &BookKey) -> bool {
+        self.books.contains_key(key)
+    }
+
+    /// One market by wire identity, in O(1) — the REST surface's lookup. Reads the *first* key
+    /// indexed for that identity and does not fall back to a later one, so a stale index entry shows
+    /// up as a missing book rather than being silently papered over.
+    pub fn by_identity(
+        &self,
+        venue: &Arc<str>,
+        channel: u32,
+        instrument_id: u32,
+    ) -> Option<&BookAccumulator> {
+        let keys = self
+            .by_identity
+            .get(&(venue.clone(), channel, instrument_id))?;
+        self.books.get(keys.first()?)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&BookKey, &BookAccumulator)> {
+        self.books.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.books.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.books.is_empty()
+    }
+
+    fn index(&mut self, key: &BookKey) {
+        let keys = self.by_identity.entry(book_identity(key)).or_default();
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+
+    /// Distinct wire identities currently indexed, so a test can assert the index holds exactly the
+    /// live markets. An entry that outlives its market is both an unbounded leak and — where two
+    /// universes collide on one identity — what makes the survivor unreachable.
+    #[cfg(test)]
+    pub fn identity_index_len(&self) -> usize {
+        self.by_identity.values().map(Vec::len).sum()
+    }
+}
 
 /// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
 ///
