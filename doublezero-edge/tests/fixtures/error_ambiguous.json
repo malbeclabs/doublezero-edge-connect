@@ -1,0 +1,6 @@
+{
+  "error": "ambiguous_product",
+  "message": "\"LASHAY:EAVE-27JAN01-YES\" matches more than one market: LASHAY:EAVE-27JAN01-YES#120.1165, LASHAY:EAVE-27JAN01-YES#120.1403.",
+  "remediation": "Disambiguate using one of the listed candidates.",
+  "candidates": ["LASHAY:EAVE-27JAN01-YES#120.1165", "LASHAY:EAVE-27JAN01-YES#120.1403"]
+}

@@ -197,6 +197,15 @@ served feed shows up on the arbiter counters above, attributed to `publisher="pu
 | `dz_ws_feeder_decode_errors_total` | counter | `venue` | Public WS frames that failed to decode (dropped best-effort). |
 | `dz_ws_feeder_messages_total` | counter | `venue`, `kind` | Business messages decoded from the public WS and emitted, by `kind` (quote/trade). |
 
+## Query API history feeder
+
+Recorded by the feeder that keeps the query API's rolling history store fed (`ingest::reconcile::feed_history`), active only while the query API sink is.
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `dz_history_unattributable_trades_total` | counter | `venue` | A trade dropped rather than stored because the instrument catalog carries no definition for the exact `(venue, channel, instrument_id)` the message names — belt-and-braces for a definition race (or, on the unauthenticated wire, a forged identity). Should stay flat at zero. |
+| `dz_history_feed_lagged_total` | counter | — | Times the feeder fell behind the post-arbiter broadcast and dropped messages (`Lagged`) — a hole in the rolling window, not a crash. |
+
 ## Shred forwarder
 
 Recorded by the Solana shred forwarder (`src/shred/mod.rs`); see

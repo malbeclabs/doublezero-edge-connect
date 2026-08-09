@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, finite_non_negative, instrument_known, PublicVenue},
+        public_feeder::{self, finite_non_negative, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedTrade, Side},
@@ -149,9 +149,13 @@ impl PhoenixVenue {
         // symbol the edge doesn't define is DROPPED here (the backstop silently stops for it) rather
         // than emitted under a mismatched key that would double-print alongside the edge copy. The
         // resolved market set is logged at startup (see `run`) so a divergence is at least visible.
-        if !instrument_known(instruments, phoenix_venue(), symbol) {
+        // Resolves precision AND the (channel, instrument_id) identity in one scan — see
+        // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
+        let Some((channel, instrument_id)) =
+            resolve_instrument(instruments, phoenix_venue(), symbol)
+        else {
             return; // precision unknown / symbol not defined by the edge; drop
-        }
+        };
         let Ok(trade_id) = fill.trade_sequence_number.parse::<u64>() else {
             self.decode_error();
             return;
@@ -182,6 +186,8 @@ impl PhoenixVenue {
             source: venue_arc(phoenix_venue()),
             source_id: PHOENIX_SOURCE_ID,
             symbol: symbol.into(),
+            channel,
+            instrument_id,
             price,
             // `baseAmount` is the fill's base-asset quantity in the *same real units* the edge emits
             // (edge `trade_qty_raw * 10^qty_exponent`) — verified equal on all 257 shared fills in the
@@ -290,7 +296,7 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (phoenix_venue().into(), symbol.into()),
+            (phoenix_venue().into(), 0u32, 1u32),
             NormalizedInstrument {
                 venue: phoenix_venue().into(),
                 source: phoenix_venue().into(),
@@ -357,6 +363,11 @@ mod tests {
                 // The registry Source ID, not the `0` "unknown" sentinel: a consumer joining this
                 // backstop to the edge copy on `source_id` must see the same id both sides.
                 assert_eq!(t.source_id, PHOENIX_SOURCE_ID);
+                // Resolved from the edge catalog (`instruments_with`'s (channel=0, instrument_id=1)
+                // entry), not left at the zero default — this is the identity `history::Key` groups
+                // trades on downstream.
+                assert_eq!(t.channel, 0);
+                assert_eq!(t.instrument_id, 1);
             }
             other => panic!("expected a trade, got {other:?}"),
         }

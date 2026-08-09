@@ -8,17 +8,18 @@ sink can't stall ingest. Every flag also reads from the env var shown.
 | Sink | Default | Enable / disable | Config flags (env) |
 |------|---------|------------------|--------------------|
 | **WebSocket** (`sinks::ws`) | **on when subscribed** | configured unless `--ws-bind` is empty (`--ws-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed | `--ws-bind` (`WS_BIND`, default `0.0.0.0:8081`) + the `--ws-*` limits |
+| **Query API** (`sinks::api`) | **on when subscribed** | configured unless `--api-bind` is empty (`--api-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed — same condition as the WebSocket sink | `--api-bind` (`DZ_API_BIND`, default `127.0.0.1:9099`) |
 | **Metrics** (`sinks::metrics`) | **off** | on when `--metrics-bind` is non-empty | `--metrics-bind` (`METRICS_BIND`, default empty) |
 
-The metrics endpoint is active when its key config value is non-empty. The WebSocket sink ships a
-non-empty default bind (so it's *configured* unless you clear it), but the **subscription
-reconciler** only *activates* it once this host is actually subscribed to a market-data feed —
-so a shreds-only host serves no WebSocket and can't collide with an existing `:8081` service, with
-no manual config. Its listener is bound non-fatally: a taken port disables the sink for that cycle
-(retried on the next reconcile) but never crash-loops the process or the DoubleZero tunnel. Running
-from source without the `doublezero` CLI, gating falls open and the sink is active whenever
-configured. See the main README for the reconciler flags (`--subscription-refresh-secs`,
-`--subscription-gating-disable`).
+The metrics endpoint is active when its key config value is non-empty. The WebSocket sink and the
+query API both ship a non-empty default bind (so each is *configured* unless you clear it), but the
+**subscription reconciler** only *activates* either one once this host is actually subscribed to a
+market-data feed — so a shreds-only host serves neither and can't collide with an existing `:8081`
+or `:9099` service, with no manual config. Both listeners are bound non-fatally: a taken port
+disables the sink for that cycle (retried on the next reconcile) but never crash-loops the process
+or the DoubleZero tunnel. Running from source without the `doublezero` CLI, gating falls open and
+both sinks are active whenever configured. See the main README for the reconciler flags
+(`--subscription-refresh-secs`, `--subscription-gating-disable`).
 
 ## Metrics (Prometheus)
 
@@ -57,3 +58,53 @@ heartbeat/limit enforcement.
 > host-side port preflight that flags a taken WS port before starting the container. A taken port
 > is non-fatal regardless: the bridge logs the bind failure and runs without the sink. See
 > [Configure](../README.md#configure-override-the-one-liner).
+
+## Query API (`/v1`)
+
+A read-only, JSON-over-HTTP query API (`sinks::api`) sits beside the WebSocket and metrics sinks. It
+answers from state the bridge already maintains — the instrument catalog, a rolling one-hour history
+of OHLCV candles and recent prints, the MBO/MBP book replay state, and per-venue feed health — and
+never mutates anything: every route is a `GET`.
+
+```bash
+./target/release/doublezero-edge-connect --iface doublezero1 --api-bind 127.0.0.1:9099
+curl -s localhost:9099/v1/products | jq .
+```
+
+Routes: `GET /v1/products` (catalog), `GET /v1/products/{id}` (one product's identity/registry
+fields), `GET /v1/products/{id}/ticker` (recent trades + best bid/ask), `GET
+/v1/products/{id}/candles` (OHLCV, `granularity`/`limit` query params), `GET /v1/products/{id}/book`
+(order book), `GET /v1/best_bid_ask` (best bid/ask across every product), and `GET /v1/status`
+(per-venue feed health plus history-store stats). `{id}` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`),
+with an `#<channel>.<instrument_id>` suffix needed only where a bare symbol collides across markets.
+The [`doublezero-edge`](../README.md#query-market-data-the-doublezero-edge-cli) CLI is a thin client
+over this surface.
+
+**Candles cover a rolling one hour, in memory, and do not survive a restart.** The history buffer
+(`src/history.rs`) is a bounded per-product set of 1-second OHLCV buckets plus a ring of recent
+prints, fed from the post-arbiter broadcast — so every print arriving here is already deduplicated on
+`trade_id` and gated by the tape leader, one copy per print — with **no persistence of any kind**: the
+window is gone the moment the process restarts. Every `candles` response carries its own `retention`
+block (`window_seconds`, `oldest`/`newest`, `truncated`), so a caller can tell a full window from a
+`limit`-truncated one without guessing, and every `book`/depth response carries a `coverage` block
+with the same honesty (`complete: false` rather than a guess whenever the served levels might not be
+all of them).
+
+**The catalog is not necessarily every instrument the feed defines.** A product is listed in
+`/v1/products` once its source is known: immediately, for a publisher whose reference data carries
+its own Source ID; only after its first price, for a publisher whose reference data carries no Source
+ID of its own (see PROTOCOL.md's [*A symbol appears only once its source is
+known*](../PROTOCOL.md#a-symbol-appears-only-once-its-source-is-known)). Both publisher generations
+can be live on the same host at once, so a defined-but-never-traded instrument on the latter kind of
+publisher is legitimately absent from the catalog while every instrument from the former kind appears
+up front.
+
+**Loopback (`127.0.0.1:9099`) by default, and that default is load-bearing.** The container runs host
+networking, so a wildcard bind here would be genuinely reachable off the host — and this surface has
+**no authentication and no TLS**, same as the rest of the service surface. Terminate at a reverse
+proxy if it must be exposed beyond a trusted network.
+
+Activation mirrors the WebSocket sink exactly: *configured* by a non-empty `--api-bind`
+(`--api-bind ""` disables it outright), *activated* by the subscription reconciler only once this
+host is subscribed to ≥1 market-data feed, and bound non-fatally — a taken port disables the API for
+that reconcile cycle rather than crash-looping the tunnel.

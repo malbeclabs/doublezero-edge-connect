@@ -24,7 +24,7 @@ use std::{
     net::{SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -34,6 +34,7 @@ use tokio::{sync::broadcast, task::JoinHandle};
 use tracing::{info, warn};
 
 use crate::{
+    history::{self, Store},
     ingest::{
         arbiter::SharedArbiter,
         feeds::{Feed, FeedKind},
@@ -44,6 +45,7 @@ use crate::{
     metrics::metrics,
     model::{BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
     shred::{self, DedupMode, ShredConfig},
+    sinks::api,
 };
 
 /// Identity of a market-data **receiver** in the active-task map: one per publisher of a feed.
@@ -168,6 +170,13 @@ pub struct ReconcilerConfig {
     /// WS bind address; empty disables the sink outright (never activated).
     pub ws_bind: String,
     pub ws_cfg: crate::sinks::ws::WsConfig,
+    /// Query API bind address; empty disables the sink outright (never activated) - mirrors
+    /// `ws_bind`.
+    pub api_bind: String,
+    /// The shared rolling trade history the reconciler's history feeder writes into and the query
+    /// API reads from. Built once in `main` (like `instruments`/`depth`/`books`) so the window
+    /// survives the sink's own activate/deactivate cycles.
+    pub history: Arc<Mutex<Store>>,
     pub shred: ShredParams,
 }
 
@@ -176,6 +185,10 @@ pub struct ReconcilerConfig {
 struct Desired {
     feeds: HashSet<FeedKey>,
     ws_on: bool,
+    /// Same condition as `ws_on`, parameterized on `api_bind` instead of `ws_bind`: the query API
+    /// comes up only when it's configured *and* at least one market-data feed is subscribed. There's
+    /// no point accumulating history for a query path nobody can reach.
+    api_on: bool,
     /// Sorted; empty means the shred forwarder should be off.
     shred_sources: Vec<SocketAddrV4>,
 }
@@ -187,6 +200,12 @@ pub struct Reconciler {
     /// missing either leaks a flag for a receiver that is gone.
     active: HashMap<FeedKey, (JoinHandle<Result<()>>, TapeOwner)>,
     ws_task: Option<JoinHandle<Result<()>>>,
+    /// The query API sink task and the history feeder that keeps its store fed, treated as one
+    /// coupled unit by `apply_api`/`reap_finished`: both come up and go down together, since running
+    /// one without the other either buffers history nobody can query or serves a query API with a
+    /// stalled window.
+    api_task: Option<JoinHandle<Result<()>>>,
+    history_feeder: Option<JoinHandle<()>>,
     /// The running shred forwarder plus the (sorted) source set it was started with, so a changed
     /// set triggers a restart.
     shred_task: Option<(Vec<SocketAddrV4>, JoinHandle<Result<()>>)>,
@@ -205,6 +224,8 @@ impl Reconciler {
             cfg,
             active: HashMap::new(),
             ws_task: None,
+            api_task: None,
+            history_feeder: None,
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
@@ -235,6 +256,7 @@ impl Reconciler {
         self.reap_finished();
         self.apply_feeds(&desired.feeds);
         self.apply_ws(desired.ws_on).await;
+        self.apply_api(desired.api_on).await;
         self.apply_shred(desired.shred_sources);
     }
 
@@ -274,6 +296,7 @@ impl Reconciler {
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
+            api_on: !self.cfg.api_bind.is_empty() && !feeds.is_empty(),
             shred_sources: self.desired_shred_sources(Some(subs)),
             feeds,
         }
@@ -285,6 +308,7 @@ impl Reconciler {
         let feeds: HashSet<FeedKey> = self.cfg.enabled.iter().flat_map(feed_keys).collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
+            api_on: !self.cfg.api_bind.is_empty() && !feeds.is_empty(),
             shred_sources: self.desired_shred_sources(None),
             feeds,
         }
@@ -323,6 +347,23 @@ impl Reconciler {
         if self.ws_task.as_ref().is_some_and(|h| h.is_finished()) {
             warn!("WebSocket sink task exited; will re-activate if still desired");
             self.ws_task = None;
+        }
+        // Reaped as one pair: if either the API sink or its history feeder exited on its own, tear
+        // both down so the next `apply_api` respawns a fresh matched pair instead of layering a new
+        // feeder alongside one that's still running (which would double-count every trade).
+        if self.api_task.as_ref().is_some_and(|h| h.is_finished())
+            || self
+                .history_feeder
+                .as_ref()
+                .is_some_and(|h| h.is_finished())
+        {
+            warn!("query API (or its history feeder) exited; will re-activate if still desired");
+            if let Some(h) = self.api_task.take() {
+                h.abort();
+            }
+            if let Some(h) = self.history_feeder.take() {
+                h.abort();
+            }
         }
         if self
             .shred_task
@@ -446,6 +487,45 @@ impl Reconciler {
         }
     }
 
+    /// Mirrors `apply_ws`: bind first so a taken port is non-fatal (staying off rather than taking
+    /// the tunnel down), then spawn the serve loop *and* the history feeder together - the feeder
+    /// exists only to keep this sink's store fed, so it has no reason to run without it, and running
+    /// it without the sink would silently buffer history nobody can reach.
+    async fn apply_api(&mut self, on: bool) {
+        match (on, self.api_task.is_some()) {
+            (true, false) => match api::bind(&self.cfg.api_bind).await {
+                Ok(listener) => {
+                    info!(bind = %self.cfg.api_bind, "activating query API (market-data feed subscribed)");
+                    self.api_task = Some(tokio::spawn(api::serve(
+                        listener,
+                        self.cfg.instruments.clone(),
+                        self.cfg.depth.clone(),
+                        self.cfg.books.clone(),
+                        self.cfg.history.clone(),
+                        self.health.clone(),
+                    )));
+                    self.history_feeder = Some(tokio::spawn(feed_history(
+                        self.cfg.tx.subscribe(),
+                        self.cfg.history.clone(),
+                        self.cfg.instruments.clone(),
+                    )));
+                }
+                Err(e) => warn!(bind = %self.cfg.api_bind, %e,
+                    "query API failed to bind (port in use?); staying off, will retry next reconcile"),
+            },
+            (false, true) => {
+                if let Some(h) = self.api_task.take() {
+                    h.abort();
+                }
+                if let Some(h) = self.history_feeder.take() {
+                    h.abort();
+                }
+                info!("deactivating query API (no market-data feed subscribed)");
+            }
+            _ => {}
+        }
+    }
+
     fn apply_shred(&mut self, sources: Vec<SocketAddrV4>) {
         let current = self
             .shred_task
@@ -484,9 +564,119 @@ fn plan<K: Eq + Hash + Clone>(current: &HashSet<K>, desired: &HashSet<K>) -> (Ve
     (to_spawn, to_abort)
 }
 
+/// A `source_ts_ns` more than this far ahead of the same print's own `recv_ts_ns` is implausible - a
+/// venue clock error, or (the wire is unauthenticated) a forged one - and is treated the same as the
+/// `0` sentinel: fall back to `recv_ts_ns`. Generous against any real venue/host clock skew (at most
+/// low milliseconds) while still catching a stamp that is seconds, minutes, or years ahead.
+const MAX_PLAUSIBLE_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
+
+/// Resolve one trade's bucket timestamp, clamping an implausible venue time at this feeder seam
+/// rather than trusting it into `history::Store` - the same seam that already resolves the
+/// `source_ts_ns == 0` sentinel, and for the same reason `history.rs` refuses to know about clocks
+/// (see its module doc): that decision belongs to the caller, which knows what a plausible time looks
+/// like and the store does not.
+///
+/// This exists because `Store::ingest`'s late-drop compares a print's bucket only against the
+/// *product's own* high-water mark (`newest_seen`), which the store never resets on its own. One
+/// print stamped far in the future latches that mark there permanently: every later, correctly-timed
+/// print is then late-dropped forever - and since the drop happens before the ring push, `/ticker`
+/// empties right along with `/candles`, with no reset path on an unauthenticated wire. Falling back
+/// to `recv_ts_ns` (this bridge's own receive clock, which cannot run away from itself) keeps a single
+/// bad print from wedging its product's history rather than merely widening one bucket.
+///
+/// Two conditions, either sufficient: more than `MAX_PLAUSIBLE_FUTURE_SKEW_NS` ahead of `recv_ts_ns`,
+/// or older than the store's own rolling window relative to it (a print that far in the past cannot
+/// usefully extend the window either way, and treating it as "now" via `recv_ts_ns` is more honest
+/// than trusting an implausible venue clock).
+fn resolve_ts_ns(source_ts_ns: u64, recv_ts_ns: u64) -> u64 {
+    if source_ts_ns == 0 {
+        return recv_ts_ns; // the "not available" sentinel - never a real epoch time
+    }
+    let too_far_future = source_ts_ns > recv_ts_ns.saturating_add(MAX_PLAUSIBLE_FUTURE_SKEW_NS);
+    let window_ns = history::WINDOW_SECS.saturating_mul(1_000_000_000);
+    let too_old = source_ts_ns.saturating_add(window_ns) < recv_ts_ns;
+    if too_far_future || too_old {
+        recv_ts_ns
+    } else {
+        source_ts_ns
+    }
+}
+
+/// Forward broadcast trades into the shared history store, for as long as the query API sink is
+/// active (see [`Reconciler::apply_api`]) - there is no point accumulating history for a query path
+/// nobody can reach. Reads the **post-arbiter** broadcast (the same bus the WS sink subscribes to),
+/// so every print arriving here is already deduplicated on `trade_id` and gated by the venue's tape
+/// owner: one copy of each real print, never a cross-publisher double.
+///
+/// Keys straight off the message: `NormalizedTrade` now carries `channel`/`instrument_id` itself (the
+/// identity `history::Key` groups on), populated at every emission site alongside the `symbol` a
+/// price-aggregated venue's mirrored arms can share. There is deliberately no symbol lookup here
+/// anymore - matching by `(venue, symbol)` against the instrument catalog is exactly what dropped
+/// every trade on a venue whose two arms carry an identical instrument set under distinct `channel`s
+/// (see `history::Key`'s docs), because every symbol on such a venue matched more than once.
+async fn feed_history(
+    mut rx: broadcast::Receiver<Arc<FeedMessage>>,
+    history: Arc<Mutex<Store>>,
+    instruments: InstrumentSnapshot,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if let FeedMessage::Trade(t) = msg.as_ref() {
+                    // Belt-and-braces for a definition race: the catalog carries no `instrument` for
+                    // this exact (venue, channel, instrument_id) yet (or no longer does). Keying
+                    // straight off the message means this should be rare-to-never for an edge trade -
+                    // its own processor gates emission on already holding that definition - but the
+                    // prior failure this whole fix replaces was a venue going silently unattributable,
+                    // invisible in both the API and Prometheus, so it is counted and dropped rather
+                    // than trusted blind.
+                    let known = crate::model::lock(&instruments).contains_key(&(
+                        t.venue.clone(),
+                        t.channel,
+                        t.instrument_id,
+                    ));
+                    if !known {
+                        metrics()
+                            .history_unattributable_trades
+                            .with_label_values(&[t.venue.as_ref()])
+                            .inc();
+                        continue;
+                    }
+                    let ts_ns = resolve_ts_ns(t.source_ts_ns, t.recv_ts_ns);
+                    let key = history::Key {
+                        source_id: t.source_id,
+                        channel: t.channel,
+                        instrument_id: t.instrument_id,
+                    };
+                    let print = history::Print {
+                        ts_ns,
+                        price: t.price,
+                        size: t.size,
+                    };
+                    crate::model::lock(&history).ingest(key, print);
+                }
+            }
+            // A slow feeder can fall behind the broadcast; the window is a best-effort rolling one,
+            // not a promise of every print, so skip the gap rather than exit over it - but count it,
+            // like every other broadcast consumer in this bridge (see `sinks::ws`), so a feeder that
+            // is punching holes in the window is visible rather than silently thinner.
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                metrics().history_feed_lagged.inc();
+                warn!(
+                    skipped = n,
+                    "history feeder lagged the broadcast; window has a gap"
+                );
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NormalizedTrade;
 
     fn set(items: &[&str]) -> HashSet<&'static str> {
         // Leak to get 'static &str for the test set; fine in a test.
@@ -831,6 +1021,8 @@ mod tests {
                 max_inbound_per_min: 1,
                 broadcast_capacity: 1,
             },
+            api_bind: String::new(),
+            history: Arc::new(Mutex::new(Store::new())),
             shred: ShredParams {
                 disabled: true,
                 explicit_sources: Vec::new(),
@@ -842,5 +1034,448 @@ mod tests {
                 dedup_window_slots: 1,
             },
         })
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // History feeder + query API activation
+    // ---------------------------------------------------------------------------------------------
+
+    fn test_instrument(
+        venue: &'static str,
+        source_id: u16,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+    ) -> crate::model::NormalizedInstrument {
+        crate::model::NormalizedInstrument {
+            venue: venue.into(),
+            source: venue.into(),
+            source_id,
+            symbol: symbol.into(),
+            channel,
+            instrument_id,
+            price_exponent: -2,
+            qty_exponent: -5,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_trade(
+        venue: &'static str,
+        source_id: u16,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+        price: f64,
+        source_ts_ns: u64,
+        recv_ts_ns: u64,
+    ) -> NormalizedTrade {
+        NormalizedTrade {
+            venue: venue.into(),
+            source: venue.into(),
+            source_id,
+            symbol: symbol.into(),
+            channel,
+            instrument_id,
+            price,
+            size: 1.0,
+            aggressor_side: crate::model::Side::Buy,
+            trade_id: 1,
+            cumulative_volume: 0.0,
+            source_ts_ns,
+            recv_ts_ns,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        }
+    }
+
+    /// End-to-end: a trade published on the broadcast is picked up by `feed_history`, lands in the
+    /// shared store, and is readable back out through the query API's HTTP surface (`/ticker`, which
+    /// reports the raw print ring with no time-window filtering, so this test is purely about the
+    /// trade reaching the store, not about bucket/window timing).
+    ///
+    /// Revert-verify: commenting out this feeder's `history.ingest(...)` call (a no-op stand-in for
+    /// "forgot to wire the feeder into the store") makes this test hang the polling loop and fail —
+    /// confirmed by hand before landing this test.
+    #[tokio::test]
+    async fn a_trade_on_the_broadcast_reaches_the_store_and_is_queryable_through_the_api() {
+        let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
+        let instruments: InstrumentSnapshot = Default::default();
+        instruments.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), 0u32, 41u32),
+            test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
+        );
+        let history = Arc::new(Mutex::new(Store::new()));
+        let health: SharedFeedHealth = Arc::new(FeedHealth::new());
+
+        let listener = api::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(api::serve(
+            listener,
+            instruments.clone(),
+            Default::default(),
+            Default::default(),
+            history.clone(),
+            health,
+        ));
+        tokio::spawn(feed_history(
+            tx.subscribe(),
+            history.clone(),
+            instruments.clone(),
+        ));
+
+        let now = crate::model::now_ns();
+        tx.send(Arc::new(FeedMessage::Trade(test_trade(
+            "HYPERLIQUID",
+            1,
+            "BTC",
+            0,
+            41,
+            12345.0,
+            now,
+            now,
+        ))))
+        .unwrap();
+
+        let base = format!("http://{addr}");
+        for _ in 0..100 {
+            let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:BTC/ticker"))
+                .await
+                .unwrap();
+            let body: serde_json::Value = resp.json().await.unwrap();
+            if let Some(trades) = body["trades"].as_array() {
+                if !trades.is_empty() {
+                    assert_eq!(trades[0]["price"], "12345.00");
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("trade never reached the store via the API");
+    }
+
+    /// The sentinel case Task 4/5's docs call out by name: `source_ts_ns == 0` must bucket by
+    /// `recv_ts_ns`, never by the sentinel itself — a print bucketed at the epoch would silently
+    /// vanish from every window query. Checked directly against the stored `Print`, which is why
+    /// this doesn't need an API round-trip: `recent_trades` returns the raw ring, ts_ns included.
+    ///
+    /// Revert-verify: replacing the feeder's `if t.source_ts_ns != 0 { .. } else { .. }` with a bare
+    /// `t.source_ts_ns` (always trusting the wire value, sentinel included) makes this test fail —
+    /// confirmed by hand before landing this test.
+    #[tokio::test]
+    async fn a_zero_source_ts_is_bucketed_by_recv_ts_not_by_the_sentinel() {
+        let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
+        let instruments: InstrumentSnapshot = Default::default();
+        instruments.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), 0u32, 41u32),
+            test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
+        );
+        let history = Arc::new(Mutex::new(Store::new()));
+        tokio::spawn(feed_history(
+            tx.subscribe(),
+            history.clone(),
+            instruments.clone(),
+        ));
+
+        let recv_ts_ns = crate::model::now_ns();
+        tx.send(Arc::new(FeedMessage::Trade(test_trade(
+            "HYPERLIQUID",
+            1,
+            "BTC",
+            0,
+            41,
+            12345.0,
+            0, // source_ts_ns: "not available"
+            recv_ts_ns,
+        ))))
+        .unwrap();
+
+        let key = history::Key {
+            source_id: 1,
+            channel: 0,
+            instrument_id: 41,
+        };
+        for _ in 0..100 {
+            let trades = crate::model::lock(&history).recent_trades(&key, 1);
+            if let Some(p) = trades.first() {
+                assert_eq!(
+                    p.ts_ns, recv_ts_ns,
+                    "must fall back to recv_ts_ns, not the 0 sentinel"
+                );
+                assert_ne!(p.ts_ns, 0);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("trade never reached the store");
+    }
+
+    /// The headline test, and the inverse of the defect: a price-aggregated venue's two mirrored
+    /// arms carry an identical instrument set (same symbol, same `instrument_id`) under distinct
+    /// `channel`s. Before this fix, `feed_history` resolved a trade's identity by matching
+    /// `(venue, symbol)` against the catalog, and a mirrored-arm symbol always matched twice - so
+    /// every trade on such a venue was silently dropped as ambiguous. Keying straight off the
+    /// message's own `channel`/`instrument_id` instead means a trade for one arm lands only in that
+    /// arm's product, never merged with (or blocked by) its mirror.
+    ///
+    /// Revert-verify: reintroducing a `(venue, symbol)` catalog match in place of reading
+    /// `t.channel`/`t.instrument_id` directly (i.e. restoring the deleted `trade_identity`) makes
+    /// this test fail — both catalog entries match the trade's symbol, so it is dropped instead of
+    /// reaching either arm's product. Confirmed by hand before landing this test.
+    #[tokio::test]
+    async fn a_mirrored_arm_trade_is_attributed_to_its_own_product() {
+        let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
+        let instruments: InstrumentSnapshot = Default::default();
+        {
+            let mut map = instruments.lock().unwrap();
+            // Two arms of one price-aggregated venue: identical symbol and instrument_id, distinct
+            // channel - exactly the shape `tests/fixtures/PROVENANCE.md` records for the live feed.
+            map.insert(
+                ("KALSHI".into(), 1u32, 99u32),
+                test_instrument("KALSHI", 3, "KXBTCPERP", 1, 99),
+            );
+            map.insert(
+                ("KALSHI".into(), 2u32, 99u32),
+                test_instrument("KALSHI", 3, "KXBTCPERP", 2, 99),
+            );
+        }
+        let history = Arc::new(Mutex::new(Store::new()));
+        let health: SharedFeedHealth = Arc::new(FeedHealth::new());
+
+        let listener = api::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(api::serve(
+            listener,
+            instruments.clone(),
+            Default::default(),
+            Default::default(),
+            history.clone(),
+            health,
+        ));
+        tokio::spawn(feed_history(
+            tx.subscribe(),
+            history.clone(),
+            instruments.clone(),
+        ));
+
+        // A trade for arm 2 only.
+        let now = crate::model::now_ns();
+        tx.send(Arc::new(FeedMessage::Trade(test_trade(
+            "KALSHI",
+            3,
+            "KXBTCPERP",
+            2,
+            99,
+            0.62,
+            now,
+            now,
+        ))))
+        .unwrap();
+
+        let base = format!("http://{addr}");
+        for _ in 0..100 {
+            let resp = reqwest::get(format!("{base}/v1/products/KALSHI:KXBTCPERP%232.99/ticker"))
+                .await
+                .unwrap();
+            let body: serde_json::Value = resp.json().await.unwrap();
+            if let Some(trades) = body["trades"].as_array() {
+                if !trades.is_empty() {
+                    assert_eq!(trades[0]["price"], "0.62");
+                    // The mirror arm's own product must stay empty - the trade landed in exactly
+                    // one product, not both and not neither.
+                    let other =
+                        reqwest::get(format!("{base}/v1/products/KALSHI:KXBTCPERP%231.99/ticker"))
+                            .await
+                            .unwrap();
+                    let other_body: serde_json::Value = other.json().await.unwrap();
+                    assert!(
+                        other_body["trades"]
+                            .as_array()
+                            .is_some_and(|t| t.is_empty()),
+                        "the peer arm's product must not also see this trade"
+                    );
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the mirrored-arm trade never reached its product via the API");
+    }
+
+    /// An implausible venue clock must not permanently wedge a product's history. Without the clamp,
+    /// a print stamped years in the future latches `history::Store`'s per-product high-water mark
+    /// there forever, and every later, correctly-timed print is late-dropped before it ever reaches
+    /// the ring - so `/ticker` (and `/candles`) empty out and stay empty, with no reset path.
+    ///
+    /// Revert-verify: replacing `resolve_ts_ns`'s implausibility checks with a bare passthrough of
+    /// `source_ts_ns` (trusting the wire value unconditionally, same as before this fix - the `== 0`
+    /// sentinel case aside) makes this test time out and fail: the second, normal print never becomes
+    /// queryable, wedged behind the first print's runaway high-water mark. Confirmed by hand before
+    /// landing this test.
+    #[tokio::test]
+    async fn an_implausible_future_timestamp_does_not_wedge_the_product() {
+        let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
+        let instruments: InstrumentSnapshot = Default::default();
+        instruments.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), 0u32, 41u32),
+            test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
+        );
+        let history = Arc::new(Mutex::new(Store::new()));
+        tokio::spawn(feed_history(
+            tx.subscribe(),
+            history.clone(),
+            instruments.clone(),
+        ));
+
+        let now = crate::model::now_ns();
+        // Ten years ahead of `now` - nowhere near a real venue/host clock skew, and far past
+        // `MAX_PLAUSIBLE_FUTURE_SKEW_NS`.
+        let implausible_future = now + 10 * 365 * 24 * 3_600 * 1_000_000_000u64;
+        tx.send(Arc::new(FeedMessage::Trade(test_trade(
+            "HYPERLIQUID",
+            1,
+            "BTC",
+            0,
+            41,
+            11_111.0,
+            implausible_future,
+            now,
+        ))))
+        .unwrap();
+
+        // A normal, correctly-timed print right after.
+        let now2 = crate::model::now_ns();
+        tx.send(Arc::new(FeedMessage::Trade(test_trade(
+            "HYPERLIQUID",
+            1,
+            "BTC",
+            0,
+            41,
+            22_222.0,
+            now2,
+            now2,
+        ))))
+        .unwrap();
+
+        let key = history::Key {
+            source_id: 1,
+            channel: 0,
+            instrument_id: 41,
+        };
+        for _ in 0..100 {
+            let trades = crate::model::lock(&history).recent_trades(&key, 10);
+            if trades.iter().any(|p| p.price == 22_222.0) {
+                return; // the normal print is queryable - the implausible one did not wedge it
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the normal print never became queryable - the future timestamp wedged the product");
+    }
+
+    /// The belt-and-braces counter fires on a genuine drop: a trade naming a `(venue, channel,
+    /// instrument_id)` the catalog has no definition for at all is dropped rather than stored under
+    /// an unconfirmed identity.
+    ///
+    /// Revert-verify: removing the `known` gate (always falling through to `history.ingest`) makes
+    /// this test fail on its second assertion - the trade would reach the store despite naming an
+    /// identity nothing defines. Confirmed by hand before landing this test.
+    #[tokio::test]
+    async fn an_unattributable_trade_is_dropped_and_counted() {
+        let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
+        // Deliberately empty: no `instrument` anywhere names (venue, channel=0, instrument_id=41).
+        let instruments: InstrumentSnapshot = Default::default();
+        let history = Arc::new(Mutex::new(Store::new()));
+        tokio::spawn(feed_history(
+            tx.subscribe(),
+            history.clone(),
+            instruments.clone(),
+        ));
+
+        // A venue name unique to this test - the metrics registry is a process-global shared by
+        // every test binary, so a shared label would race with other tests touching it.
+        let venue = "UnattributableTradeTest";
+        let before = metrics()
+            .history_unattributable_trades
+            .with_label_values(&[venue])
+            .get();
+
+        let now = crate::model::now_ns();
+        tx.send(Arc::new(FeedMessage::Trade(test_trade(
+            venue, 1, "BTC", 0, 41, 1.0, now, now,
+        ))))
+        .unwrap();
+
+        for _ in 0..100 {
+            if metrics()
+                .history_unattributable_trades
+                .with_label_values(&[venue])
+                .get()
+                > before
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            metrics()
+                .history_unattributable_trades
+                .with_label_values(&[venue])
+                .get(),
+            before + 1,
+            "the unattributable counter must increment exactly once"
+        );
+
+        let key = history::Key {
+            source_id: 1,
+            channel: 0,
+            instrument_id: 41,
+        };
+        assert!(
+            crate::model::lock(&history)
+                .recent_trades(&key, 1)
+                .is_empty(),
+            "an unattributable trade must be dropped, not stored"
+        );
+    }
+
+    /// The bind failure contract `apply_api` shares with `apply_ws`: a port already in use must
+    /// leave the API off (and the process alive) rather than propagating an error.
+    ///
+    /// Revert-verify: changing `apply_api`'s `Err(e) => warn!(..)` arm to `Err(e) => panic!(..)`
+    /// makes this test fail — confirmed by hand before landing this test.
+    #[tokio::test]
+    async fn an_occupied_port_disables_the_api_without_crashing() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap().to_string();
+
+        let mut r = test_reconciler(vec![]);
+        r.cfg.api_bind = addr;
+        r.apply_api(true).await;
+
+        assert!(
+            r.api_task.is_none(),
+            "bind failure must not activate the sink"
+        );
+        assert!(
+            r.history_feeder.is_none(),
+            "the feeder must not run without its sink"
+        );
+        drop(occupied);
+    }
+
+    /// `apply_api` treats the sink and its feeder as one unit: both come up together, and
+    /// `reap_finished` tears both down if either exits on its own (see the doc comment there) so a
+    /// later reconcile never layers a second feeder onto a store an old one is still writing to.
+    #[tokio::test]
+    async fn activating_the_api_starts_both_the_sink_and_its_feeder() {
+        let mut r = test_reconciler(vec![]);
+        r.cfg.api_bind = "127.0.0.1:0".into();
+        r.apply_api(true).await;
+        assert!(r.api_task.is_some());
+        assert!(r.history_feeder.is_some());
+
+        r.apply_api(false).await;
+        assert!(r.api_task.is_none());
+        assert!(r.history_feeder.is_none());
     }
 }

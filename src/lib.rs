@@ -6,8 +6,10 @@
 //! same `ingest::codec` the bridge uses (so the converter doubles as a codec-offset validator
 //! against the live feed).
 
+pub mod history;
 pub mod ingest;
 pub mod metrics;
 pub mod model;
+pub mod products;
 pub mod shred;
 pub mod sinks;

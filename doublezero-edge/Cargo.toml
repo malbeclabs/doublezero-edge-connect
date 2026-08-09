@@ -1,0 +1,22 @@
+[package]
+name = "doublezero-edge"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only agent-facing CLI over a running doublezero-edge-connect container's /v1 market-data API"
+license = "Apache-2.0"
+
+[[bin]]
+name = "doublezero-edge"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately minimal — no path dependency on the bridge crate (`doublezero-edge-connect`). This
+# crate shares no types with it; response shapes are duplicated here as small `serde` structs that
+# ignore unknown fields (see `src/types.rs`), so a version-skewed container still parses.
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking client: there is no concurrency requirement here (one request per invocation), and it
+# avoids pulling an async runtime into a simple CLI. Same major version + rustls-tls as the bridge's
+# own `reqwest` dependency, so this adds no new transitive dependency tree to the workspace lockfile.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

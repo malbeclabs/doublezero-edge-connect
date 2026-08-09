@@ -353,9 +353,10 @@ protocol's intent. All three are publisher-side, not decoder-side.
    so they would never arbitrate against each other. Treated as a defect of the publisher being
    retired; the sharded feed above does channels correctly (zero instrument-id overlap between them).
 2. **Symbols overflow the 16-byte symbol field on the sharded feed.** 2,312 of its definitions carry
-   no NUL terminator, and `EAVE-27JAN01-YES` is the truncation of two *different* instrument ids.
-   `InstrumentSnapshot` and `DepthSnapshot` are keyed `(venue, symbol)`, so a collision makes two
-   markets clobber each other.
+   no NUL terminator, and `EAVE-27JAN01-YES` is the truncation of two *different* instrument ids
+   (1165 and 1403, both channel 120). `InstrumentSnapshot` is now keyed on the `(venue, channel,
+   instrument_id)` identity rather than this display label, so both markets survive; `DepthSnapshot`
+   (Market-by-Order only, unaffected by this feed) is still keyed `(venue, symbol)`.
 3. **No `BookClear`, `InstrumentReset`, `BatchBoundary` or `EndOfSession`** in either capture, so
    those four types remain offset-test-only — the status `codec_mbo`'s `InstrumentReset`/`Heartbeat`/
    `EndOfSession` have. Three are exceptional events and a quiet window explaining their absence is

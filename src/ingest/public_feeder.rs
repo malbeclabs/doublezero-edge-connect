@@ -25,10 +25,7 @@
 //! decode/socket error is logged and swallowed, so neither a reconnect storm nor a malformed frame
 //! can ever wedge the multicast hot path.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -161,8 +158,48 @@ where
 /// only once it has revealed that instrument's Source ID (see `ingest::processor`'s deferral), so
 /// this stays closed for an instrument the edge has never once gone live for — a cold start, not a
 /// gap.
+///
+/// `InstrumentSnapshot` is keyed on the `(venue, channel, instrument_id)` identity, not `(venue,
+/// symbol)` — this caller only ever knows a bare `(venue, symbol)` pair (Hyperliquid/Phoenix name
+/// their public WS instruments by symbol, not by the edge's channel/instrument_id), so this is a
+/// scan over the shared catalog's *values* rather than a map lookup. Measured (release build,
+/// worst case — no match, so every call scans the whole map) against a synthetic 2,000-entry
+/// catalog — above any real deployment's instrument count, Lashay's ~1,300 real markets included:
+/// 100,000 calls in ~339ms, ~3.4µs/call. That is negligible next to this caller's own per-frame
+/// JSON decode (called once per public WS text frame, for two venues), so no secondary
+/// `HashSet<(venue, symbol)>` is added.
 pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &str) -> bool {
-    crate::model::lock(instruments).contains_key(&(Arc::from(venue), Arc::from(symbol)))
+    crate::model::lock(instruments)
+        .values()
+        .any(|i| i.venue.as_ref() == venue && i.symbol.as_ref() == symbol)
+}
+
+/// Resolve the `(channel, instrument_id)` identity a trade built here must carry, from the same
+/// shared catalog [`instrument_known`] gates on. The public JSON these feeders decode has no
+/// channel/instrument_id of its own — only a bare symbol — so a `NormalizedTrade` built at this
+/// seam needs this lookup to carry the identity `history::Key` groups trades on downstream; without
+/// it every symbol from a given public feeder would collapse onto one history product the moment its
+/// trade won a floor tick.
+///
+/// Same scan, same cost, same gate as `instrument_known` (`None` until the edge has revealed this
+/// instrument at least once) — this only additionally reads off the matching entry's identity rather
+/// than just its existence. A plain scan against the live `InstrumentSnapshot`, not a cached index, so
+/// it can never drift out of step with an `upsert_instrument`/`remove_instrument` the way a
+/// separately-maintained symbol→identity map would.
+///
+/// First match wins. Safe here because neither venue this module backstops presents one symbol under
+/// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored arms
+/// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-arm venue of its own,
+/// this would need the same disambiguation `products::resolve` applies instead of a bare first match.
+pub fn resolve_instrument(
+    instruments: &InstrumentSnapshot,
+    venue: &str,
+    symbol: &str,
+) -> Option<(u32, u32)> {
+    crate::model::lock(instruments)
+        .values()
+        .find(|i| i.venue.as_ref() == venue && i.symbol.as_ref() == symbol)
+        .map(|i| (i.channel, i.instrument_id))
 }
 
 /// Parse a non-negative, finite `f64` from a decimal string, or `None`. Rejects `NaN`/`±inf`

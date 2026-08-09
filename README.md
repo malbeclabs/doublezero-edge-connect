@@ -171,6 +171,50 @@ Any engine that speaks WebSocket + JSON consumes it with a thin (~50-100 line) a
 wire contract is in **[PROTOCOL.md](PROTOCOL.md)** (see
 [Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine)).
 
+## Query market data (the `doublezero-edge` CLI)
+
+Prefer polling a candle or the current book over consuming the WebSocket stream? The bridge also
+serves a read-only `/v1` HTTP API (on by default at `127.0.0.1:9099`, activated whenever a
+market-data feed is — see [Output sinks](docs/output-sinks.md#query-api-v1)), and
+**[`doublezero-edge`](doublezero-edge/)** is a small CLI client for it, built for scripting and for
+an agent to drive directly.
+
+```bash
+cargo build --release -p doublezero-edge
+./target/release/doublezero-edge products list
+./target/release/doublezero-edge products candles HYPERLIQUID:BTC granularity==ONE_MINUTE
+```
+
+Seven commands, all `GET`s:
+
+| Command | What it returns |
+|---|---|
+| `products list` | The product catalog |
+| `products get <id>` | One product's identity and registry-derived fields |
+| `products ticker <id>` | Recent trades plus best bid/ask |
+| `products candles <id>` | OHLCV candles (`granularity`/`limit` query params) |
+| `products book <id>` | The order book |
+| `products best_bid_ask` | Best bid/ask across every product |
+| `status` | Per-venue feed health plus history-store stats |
+
+`<id>` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`); add `#<channel>.<instrument_id>` only if a bare
+symbol collides across markets — the CLI reports the candidates when it does. Point it at a
+non-default or remote container with `--url` (env `DOUBLEZERO_EDGE_URL`; default
+`http://127.0.0.1:9099`):
+
+```bash
+doublezero-edge --url http://edge-host:9099 products ticker HYPERLIQUID:BTC
+```
+
+**Read-only, with no exception.** There is no order-placement or mutation path anywhere in
+edge-connect for this tool to reach, so unlike the trading CLI its surface is modelled on, no
+command here ever needs a confirmation prompt. **Candles and tickers cover a rolling one hour, held
+in memory** — the window does not survive a bridge restart and nothing here is ever written to disk.
+
+The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
+`doublezero-edge` builds and runs on macOS as well as Linux; the bridge itself does not (it uses
+`SO_TIMESTAMPNS` via `nix` with no `cfg` gate), which is why the CLI is a separate workspace member.
+
 ## Standalone shred-proxy
 
 Shreds-only host and don't need the market-data bridge? The **[`shred-proxy/`](shred-proxy/)**

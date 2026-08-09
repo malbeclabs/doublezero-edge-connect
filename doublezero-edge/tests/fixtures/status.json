@@ -1,0 +1,13 @@
+{
+  "venues": [
+    { "venue": "Hyperliquid", "status": "online" },
+    { "venue": "Lashay", "status": "online" },
+    { "venue": "Phoenix", "status": "offline" }
+  ],
+  "history": {
+    "products_tracked": 128,
+    "late_drops": 4,
+    "evicted": 0,
+    "window_seconds": 3600
+  }
+}

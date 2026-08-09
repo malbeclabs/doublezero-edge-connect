@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, instrument_known, parse_decimal, PublicVenue},
+        public_feeder::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
@@ -242,9 +242,12 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
 fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
-    if !instrument_known(instruments, hl_venue(), &t.coin) {
+    // Resolves precision AND the (channel, instrument_id) identity in one scan — see
+    // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
+    let Some((channel, instrument_id)) = resolve_instrument(instruments, hl_venue(), &t.coin)
+    else {
         return;
-    }
+    };
     let (Some(price), Some(size)) = (parse_decimal(&t.px), parse_decimal(&t.sz)) else {
         return;
     };
@@ -256,6 +259,8 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         source: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: t.coin.into(),
+        channel,
+        instrument_id,
         price,
         size,
         // HL trade side: "B" = aggressing buy, "A" = aggressing sell.
@@ -293,7 +298,7 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (hl_venue().into(), symbol.into()),
+            (hl_venue().into(), 0u32, 1u32),
             NormalizedInstrument {
                 venue: hl_venue().into(),
                 source: hl_venue().into(),
@@ -425,6 +430,11 @@ mod tests {
                 assert_eq!(t.aggressor_side, crate::model::Side::Buy);
                 assert_eq!(t.trade_id, 42);
                 assert_eq!(t.source_id, HL_SOURCE_ID);
+                // Resolved from the edge catalog (`instruments_with`'s (channel=0, instrument_id=1)
+                // entry), not left at the zero default — this is the identity `history::Key` groups
+                // trades on downstream.
+                assert_eq!(t.channel, 0);
+                assert_eq!(t.instrument_id, 1);
             }
             other => panic!("expected a trade, got {other:?}"),
         }

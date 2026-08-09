@@ -857,17 +857,17 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
 
         let mut defs = HashMap::new();
-        for sym in ["SOL", "BTC"] {
+        for (n, sym) in ["SOL", "BTC"].into_iter().enumerate() {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("HYPERLIQUID"), arc.clone()),
+                (Arc::<str>::from("HYPERLIQUID"), 0u32, n as u32),
                 NormalizedInstrument {
                     venue: "HYPERLIQUID".into(),
                     source: "HYPERLIQUID".into(),
                     source_id: 0,
                     symbol: arc,
                     channel: 0,
-                    instrument_id: 1,
+                    instrument_id: n as u32,
                     price_exponent: -2,
                     qty_exponent: -2,
                 },
@@ -965,8 +965,9 @@ mod tests {
     }
 
     /// A `{"channel":N}` subscriber's replay is scoped by the instrument's own channel, so it is
-    /// bootstrapped with the definitions it can use and not another channel's. The two markets use
-    /// different symbols because the snapshot is keyed `(venue, symbol)`. `#[serial]` for the shared
+    /// bootstrapped with the definitions it can use and not another channel's. The two markets
+    /// differ by channel (the snapshot's actual identity component); distinct symbols are used too,
+    /// purely so the assertions below can tell them apart by content. `#[serial]` for the shared
     /// `dz_ws_clients` gauge.
     #[tokio::test]
     #[serial]
@@ -979,7 +980,7 @@ mod tests {
         for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("KALSHI"), arc.clone()),
+                (Arc::<str>::from("KALSHI"), channel, 41u32),
                 NormalizedInstrument {
                     venue: "KALSHI".into(),
                     source: "KALSHI".into(),
@@ -1123,7 +1124,7 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, Arc<str>), NormalizedInstrument>,
+        instruments: HashMap<(Arc<str>, u32, u32), NormalizedInstrument>,
         books: HashMap<(Arc<str>, u32, u32), BookAccumulator>,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1273,7 +1274,7 @@ mod tests {
     async fn instrument_is_replayed_before_the_book() {
         let mut defs = HashMap::new();
         defs.insert(
-            (Arc::<str>::from("KALSHI"), Arc::<str>::from("KXBTCPERP")),
+            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
             NormalizedInstrument {
                 venue: "KALSHI".into(),
                 source: "KALSHI".into(),

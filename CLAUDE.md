@@ -440,10 +440,13 @@ Modules are grouped by role under `src/`:
   the sink only once a market-data feed is subscribed.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
-  `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
-  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other; `BookSnapshot` is keyed by
-  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label and
-  collides across markets, so it is not an identity.
+  `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` and `BookSnapshot` are both keyed by
+  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label
+  that collides across markets (confirmed against a real capture — two distinct instrument_ids
+  sharing one truncated symbol, see `tests/fixtures/PROVENANCE.md`), so it is not an identity; a
+  `(venue, symbol)`-keyed map would have the second market's insert silently destroy the first's
+  entry. `DepthSnapshot` (Market-by-Order only) is still keyed **`(venue, symbol)`** — unconfirmed
+  whether that feed's own truncated symbols can collide the same way; not addressed here.
   `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
   absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
   reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`

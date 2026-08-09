@@ -43,8 +43,10 @@ use crate::{
     },
 };
 
-/// How many price levels per side a `depth` snapshot carries.
-const DEPTH_LEVELS: usize = 10;
+/// How many price levels per side a `depth` snapshot carries. `pub(crate)` so a reader of
+/// `NormalizedDepth` (the query API sink) can tell a top-N slice that happens to be the whole book
+/// from one that isn't, rather than a second, hand-copied constant silently drifting from this one.
+pub(crate) const DEPTH_LEVELS: usize = 10;
 
 /// Minimum gap between two decode-error log lines from one processor.
 const DECODE_WARN_INTERVAL: Duration = Duration::from_secs(30);
@@ -196,32 +198,34 @@ impl<D: InstrumentDef> PerPublisher<D> {
 }
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
-/// entry for the same `(venue, symbol)` carries different exponents. When one venue is served by
-/// multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same key; they are expected to
-/// agree on precision, so a disagreement is a publisher inconsistency worth surfacing rather than
-/// silently clobbering.
+/// entry for the same `(venue, channel, instrument_id)` carries different exponents. When one
+/// venue is served by multiple feeds sharing a channel/instrument id (e.g. Hyperliquid TOB + MBO,
+/// both `channel=0`), both write the same key; they are expected to agree on precision, so a
+/// disagreement is a publisher inconsistency worth surfacing rather than silently clobbering.
 fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
-    let key = (inst.venue.clone(), inst.symbol.clone());
+    let key = (inst.venue.clone(), inst.channel, inst.instrument_id);
     let mut map = crate::model::lock(instruments);
     if let Some(prev) = map.get(&key) {
         if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
             warn!(
                 venue = %inst.venue,
                 symbol = %inst.symbol,
+                channel = inst.channel,
+                instrument_id = inst.instrument_id,
                 prev_price_exp = prev.price_exponent,
                 new_price_exp = inst.price_exponent,
                 prev_qty_exp = prev.qty_exponent,
                 new_qty_exp = inst.qty_exponent,
-                "conflicting instrument definitions for the same (venue, symbol) across feeds; last writer wins"
+                "conflicting instrument definitions for the same (venue, channel, instrument_id) across feeds; last writer wins"
             );
         }
     }
     map.insert(key, inst.clone());
 }
 
-/// Remove one `(venue, symbol)` entry from the shared snapshot — the inverse of
+/// Remove one `(venue, channel, instrument_id)` entry from the shared snapshot — the inverse of
 /// [`upsert_instrument`], which only ever inserts. There is no other removal path for this map in
-/// the crate, so anything that stops naming a `(venue, symbol)` pair (chiefly a Source ID change:
+/// the crate, so anything that stops naming an identity (chiefly a Source ID change:
 /// `reveal_if_needed`'s `previous.is_some()` branch) must call this explicitly, or the stale entry
 /// sits in the connect-time replay snapshot for the life of the process — describing a source
 /// that no longer carries this data, alongside the correct one, with nothing on the wire saying
@@ -229,9 +233,10 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 fn remove_instrument(
     instruments: &crate::model::InstrumentSnapshot,
     venue: &Arc<str>,
-    symbol: &Arc<str>,
+    channel: u32,
+    instrument_id: u32,
 ) {
-    crate::model::lock(instruments).remove(&(venue.clone(), symbol.clone()));
+    crate::model::lock(instruments).remove(&(venue.clone(), channel, instrument_id));
 }
 
 /// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata stream
@@ -262,19 +267,15 @@ pub struct TobProcessor {
     /// `Trade` for the key (both carry one). See the module-level deferral note on
     /// [`MboProcessor::revealed`] for the full design; this is TOB's instance of the same pattern.
     revealed: HashMap<(IpAddr, u32), u16>,
-    /// The exact `(venue, symbol)` a `NormalizedInstrument` was last announced under for
-    /// `(publisher, instrument)` — i.e. the key `upsert_instrument` was actually called with the
-    /// last time `reveal_if_needed` announced this key. Needed to purge the stale entry on a
-    /// Source ID change: the venue is recoverable from the OLD id via `source_label`, but the
-    /// symbol is not — the definition can change symbol and id in the same burst, so the CURRENT
-    /// definition's symbol is not guaranteed to be the one the old venue was actually announced
-    /// under. Same bound reasoning as `revealed` (a subset of it: every key here has one there).
-    announced_symbol: HashMap<(IpAddr, u32), Arc<str>>,
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
     /// remembered because the deferred `NormalizedInstrument`, emitted once a price message
     /// reveals the instrument, is built outside that definition's own frame and so no longer has
     /// its `header.channel_id` in scope. Refreshed on every definition burst (last-definition-wins,
     /// matching how `RefDataState.defs` itself already treats a same-`instrument_id` redefinition).
+    /// Also what a Source ID change purges the stale `InstrumentSnapshot` entry by: the identity
+    /// key is `(old_venue, channel, instrument_id)`, and `channel`/`instrument_id` don't change
+    /// with the Source ID, so no separate "what was it last announced under" memo is needed the
+    /// way a mutable `symbol` key used to require.
     pending_channel: HashMap<(IpAddr, u32), u32>,
 }
 
@@ -289,7 +290,6 @@ impl TobProcessor {
             tape,
             seq_events: SeqEvents::default(),
             revealed: HashMap::new(),
-            announced_symbol: HashMap::new(),
             pending_channel: HashMap::new(),
         }
     }
@@ -307,12 +307,13 @@ impl TobProcessor {
     /// public feeder's precision gate — while quotes/trades kept naming themselves correctly from
     /// their own verbatim field. Counted in `dz_source_id_changed_total{venue}` (the new venue).
     ///
-    /// A Source ID change also PURGES the stale `(old_venue, old_symbol)` entry from
+    /// A Source ID change also PURGES the stale `(old_venue, channel, instrument_id)` entry from
     /// `InstrumentSnapshot`: `upsert_instrument` only ever inserts, so without this the old entry
     /// would sit in the connect-time replay for the life of the process, describing a source that
-    /// no longer carries this data. Purges by `announced_symbol` (what was actually announced under
-    /// the old id), not this call's `def.symbol` (the CURRENT definition) — the two can differ if
-    /// the publisher changed both id and symbol in the same burst.
+    /// no longer carries this data. `channel`/`instrument_id` are unaffected by the Source ID
+    /// change, so the current `pending_channel` value and this call's own `instrument_id` are
+    /// exactly what the old entry was filed under — unlike the display `symbol`, the identity
+    /// needs no separate "what was it last announced under" memo.
     fn reveal_if_needed(&mut self, ctx: &FrameCtx, instrument_id: u32, source_id: u16) {
         let key = (ctx.publisher, instrument_id);
         let previous = self.revealed.get(&key).copied();
@@ -322,21 +323,20 @@ impl TobProcessor {
         let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
             return;
         };
+        let channel = self.pending_channel.get(&key).copied().unwrap_or(0);
         if let Some(old_id) = previous {
             metrics()
                 .source_id_changed
                 .with_label_values(&[source_label(source_id)])
                 .inc();
-            if let Some(old_symbol) = self.announced_symbol.get(&key) {
-                remove_instrument(
-                    ctx.instruments,
-                    &venue_arc(source_label(old_id)),
-                    old_symbol,
-                );
-            }
+            remove_instrument(
+                ctx.instruments,
+                &venue_arc(source_label(old_id)),
+                channel,
+                instrument_id,
+            );
         }
         self.revealed.insert(key, source_id);
-        let channel = self.pending_channel.get(&key).copied().unwrap_or(0);
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -348,24 +348,21 @@ impl TobProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
         };
-        self.announced_symbol.insert(key, inst.symbol.clone());
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
     }
 
-    /// Drop every `revealed`/`announced_symbol`/`pending_channel` entry for `publisher`. All three
-    /// are keyed by the same spoofable `(source_ip, instrument_id)` pair `MAX_PUBLISHERS` exists to
-    /// bound, but none has an eviction path of its own — called both when [`PerPublisher::get`]
-    /// evicts `publisher` (see [`PerPublisher::take_evicted`]) and when a `ChannelReset` discards
-    /// its whole definition set (the same remap risk `InstrumentReset` already guards in MBO/MBP:
-    /// the old Source ID must not survive to misdescribe whatever this publisher's ids mean under
-    /// the new epoch). Does NOT purge `InstrumentSnapshot`: that map is shared across every
-    /// publisher of every venue, and a publisher going away (evicted, or reset) says nothing about
-    /// whether its last-announced `(venue, symbol)` is still current — unlike a Source ID change,
-    /// which does.
+    /// Drop every `revealed`/`pending_channel` entry for `publisher`. Both are keyed by the same
+    /// spoofable `(source_ip, instrument_id)` pair `MAX_PUBLISHERS` exists to bound, but neither has
+    /// an eviction path of its own — called both when [`PerPublisher::get`] evicts `publisher` (see
+    /// [`PerPublisher::take_evicted`]) and when a `ChannelReset` discards its whole definition set
+    /// (the same remap risk `InstrumentReset` already guards in MBO/MBP: the old Source ID must not
+    /// survive to misdescribe whatever this publisher's ids mean under the new epoch). Does NOT
+    /// purge `InstrumentSnapshot`: that map is shared across every publisher of every venue, and a
+    /// publisher going away (evicted, or reset) says nothing about whether its last-announced
+    /// identity is still current — unlike a Source ID change, which does.
     fn forget_publisher(&mut self, publisher: IpAddr) {
         self.revealed.retain(|(p, _), _| *p != publisher);
-        self.announced_symbol.retain(|(p, _), _| *p != publisher);
         self.pending_channel.retain(|(p, _), _| *p != publisher);
     }
 
@@ -510,7 +507,6 @@ impl FrameProcessor for TobProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                             };
-                            self.announced_symbol.insert(key, inst.symbol.clone());
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
                         }
@@ -597,6 +593,14 @@ impl FrameProcessor for TobProcessor {
                     let symbol = def.symbol.clone();
                     let (price_exponent, qty_exponent) = (def.price_exponent, def.qty_exponent);
                     self.reveal_if_needed(ctx, t.instrument_id, t.source_id);
+                    // Same identity `reveal_if_needed` announced this instrument's `instrument` under
+                    // — see `pending_channel`'s doc. Read after the reveal call above so a trade that
+                    // is itself the reveal still carries the channel that call just resolved.
+                    let channel = self
+                        .pending_channel
+                        .get(&(ctx.publisher, t.instrument_id))
+                        .copied()
+                        .unwrap_or(0);
                     let venue: &'static str = source_label(t.source_id);
                     let source = venue_arc(venue);
                     let trade = NormalizedTrade {
@@ -604,6 +608,8 @@ impl FrameProcessor for TobProcessor {
                         source: source.clone(),
                         source_id: t.source_id,
                         symbol,
+                        channel,
+                        instrument_id: t.instrument_id,
                         price: apply_exponent(t.trade_price_raw, price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, qty_exponent),
                         aggressor_side: Side::from_code(t.aggressor_side),
@@ -643,11 +649,9 @@ pub struct MidpointProcessor {
     /// The wire Source ID revealed for `(publisher, instrument)` — absent until the first
     /// `Midpoint` for the key. See [`MboProcessor::revealed`] for the full deferral design.
     revealed: HashMap<(IpAddr, u32), u16>,
-    /// The exact `(venue, symbol)` a `NormalizedInstrument` was last announced under — see
-    /// [`TobProcessor::announced_symbol`].
-    announced_symbol: HashMap<(IpAddr, u32), Arc<str>>,
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
-    /// see [`TobProcessor::pending_channel`].
+    /// see [`TobProcessor::pending_channel`], including why a Source ID change's
+    /// `InstrumentSnapshot` purge reads its current value directly rather than a separate memo.
     pending_channel: HashMap<(IpAddr, u32), u32>,
 }
 
@@ -665,7 +669,6 @@ impl MidpointProcessor {
             decode_warn: WarnRateLimit::default(),
             seq_events: SeqEvents::default(),
             revealed: HashMap::new(),
-            announced_symbol: HashMap::new(),
             pending_channel: HashMap::new(),
         }
     }
@@ -683,21 +686,20 @@ impl MidpointProcessor {
         let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
             return;
         };
+        let channel = self.pending_channel.get(&key).copied().unwrap_or(0);
         if let Some(old_id) = previous {
             metrics()
                 .source_id_changed
                 .with_label_values(&[source_label(source_id)])
                 .inc();
-            if let Some(old_symbol) = self.announced_symbol.get(&key) {
-                remove_instrument(
-                    ctx.instruments,
-                    &venue_arc(source_label(old_id)),
-                    old_symbol,
-                );
-            }
+            remove_instrument(
+                ctx.instruments,
+                &venue_arc(source_label(old_id)),
+                channel,
+                instrument_id,
+            );
         }
         self.revealed.insert(key, source_id);
-        let channel = self.pending_channel.get(&key).copied().unwrap_or(0);
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -712,17 +714,15 @@ impl MidpointProcessor {
             // unconditional emission.
             qty_exponent: 0,
         };
-        self.announced_symbol.insert(key, inst.symbol.clone());
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
     }
 
-    /// Drop every `revealed`/`announced_symbol`/`pending_channel` entry for `publisher` — see
+    /// Drop every `revealed`/`pending_channel` entry for `publisher` — see
     /// [`TobProcessor::forget_publisher`]. Midpoint has no `ChannelReset` message of its own, so
     /// this is called only from [`PerPublisher::take_evicted`].
     fn forget_publisher(&mut self, publisher: IpAddr) {
         self.revealed.retain(|(p, _), _| *p != publisher);
-        self.announced_symbol.retain(|(p, _), _| *p != publisher);
         self.pending_channel.retain(|(p, _), _| *p != publisher);
     }
 }
@@ -793,7 +793,6 @@ impl FrameProcessor for MidpointProcessor {
                             price_exponent: d.price_exponent,
                             qty_exponent: 0,
                         };
-                        self.announced_symbol.insert(key, inst.symbol.clone());
                         upsert_instrument(ctx.instruments, &inst);
                         ctx.emit(FeedMessage::Instrument(inst));
                     }
@@ -891,19 +890,12 @@ pub struct MboProcessor {
     /// map's cardinality can never exceed `defs`'s, so it is not a new unbounded vector, only a
     /// companion of an existing one.
     revealed: HashMap<(IpAddr, u32), u16>,
-    /// The exact `(venue, symbol)` a `NormalizedInstrument` was last announced under for
-    /// `(publisher, instrument)` — see [`TobProcessor::announced_symbol`]. Deliberately NOT
-    /// `emitted_symbol`: that memo is written from `emit_depth` (whether/whatever `depth` last
-    /// latched the arbiter's floor under), a different write path at a different time — an eager
-    /// v3 reveal can announce an instrument with no `depth` ever emitted for it, so `emitted_symbol`
-    /// may hold nothing (or something stale from a since-superseded book) at the moment a Source ID
-    /// change needs to know what was actually written to `InstrumentSnapshot`.
-    announced_symbol: HashMap<(IpAddr, u32), Arc<str>>,
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
     /// remembered because MBO's book key carries no channel dimension, so it isn't otherwise in
     /// scope when a market-data message reveals the instrument. Refreshed on every definition burst
     /// (last-definition-wins, matching `RefDataState.defs`'s own per-`instrument_id` semantics).
-    /// Same bound reasoning as `revealed` above.
+    /// Same bound reasoning as `revealed` above. Also what a Source ID change's `InstrumentSnapshot`
+    /// purge reads its current value from directly — see [`TobProcessor::pending_channel`].
     pending_channel: HashMap<(IpAddr, u32), u32>,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
@@ -923,7 +915,6 @@ impl MboProcessor {
             last_top: HashMap::new(),
             emitted_symbol: HashMap::new(),
             revealed: HashMap::new(),
-            announced_symbol: HashMap::new(),
             pending_channel: HashMap::new(),
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
@@ -942,9 +933,8 @@ impl MboProcessor {
     /// Also re-announces if a LATER message names a DIFFERENT Source ID for a key already revealed
     /// — see [`TobProcessor::reveal_if_needed`] for why pinning the first id forever is wrong.
     /// Counted in `dz_source_id_changed_total{venue}` (the new venue), and purges the stale
-    /// `(old_venue, old_symbol)` `InstrumentSnapshot` entry (see
-    /// [`TobProcessor::reveal_if_needed`]'s doc comment; `announced_symbol`, not `emitted_symbol`,
-    /// supplies the old symbol — see the field doc).
+    /// `(old_venue, channel, instrument_id)` `InstrumentSnapshot` entry (see
+    /// [`TobProcessor::reveal_if_needed`]'s doc comment).
     fn reveal_if_needed(&mut self, ctx: &FrameCtx, instrument_id: u32, source_id: u16) -> bool {
         let key = (ctx.publisher, instrument_id);
         let previous = self.revealed.get(&key).copied();
@@ -954,6 +944,7 @@ impl MboProcessor {
         let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
             return false;
         };
+        let channel = self.pending_channel.get(&key).copied().unwrap_or(0);
         if let Some(old_id) = previous {
             metrics()
                 .source_id_changed
@@ -969,16 +960,14 @@ impl MboProcessor {
             // same map for the identical reason (a remapped id must not inherit a stale suppression
             // memo); a Source ID change is the same case at the reveal layer instead of the id layer.
             self.last_top.remove(&key);
-            if let Some(old_symbol) = self.announced_symbol.get(&key) {
-                remove_instrument(
-                    ctx.instruments,
-                    &venue_arc(source_label(old_id)),
-                    old_symbol,
-                );
-            }
+            remove_instrument(
+                ctx.instruments,
+                &venue_arc(source_label(old_id)),
+                channel,
+                instrument_id,
+            );
         }
         self.revealed.insert(key, source_id);
-        let channel = self.pending_channel.get(&key).copied().unwrap_or(0);
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -990,19 +979,17 @@ impl MboProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
         };
-        self.announced_symbol.insert(key, inst.symbol.clone());
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
         true
     }
 
-    /// Drop every `revealed`/`announced_symbol`/`pending_channel` entry for `publisher` — see
+    /// Drop every `revealed`/`pending_channel` entry for `publisher` — see
     /// [`TobProcessor::forget_publisher`]. MBO has no `ChannelReset` message of its own (per-
     /// instrument `InstrumentReset` already drops its own key's entry), so this is called only from
     /// [`PerPublisher::take_evicted`].
     fn forget_publisher(&mut self, publisher: IpAddr) {
         self.revealed.retain(|(p, _), _| *p != publisher);
-        self.announced_symbol.retain(|(p, _), _| *p != publisher);
         self.pending_channel.retain(|(p, _), _| *p != publisher);
     }
 
@@ -1072,7 +1059,6 @@ impl MboProcessor {
                         // purge).
                         let evicted_venue = self.wire_venue(&old);
                         self.revealed.remove(&old);
-                        self.announced_symbol.remove(&old);
                         // NOT `pending_channel` here: it mirrors `RefDataState.defs`'s lifecycle
                         // (populated straight from refdata, independent of whether a book was ever
                         // built), not `books`'s — removing it on a `books` eviction would zero the
@@ -1258,7 +1244,6 @@ impl FrameProcessor for MboProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                             };
-                            self.announced_symbol.insert(key, inst.symbol.clone());
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
                         }
@@ -1370,11 +1355,20 @@ impl FrameProcessor for MboProcessor {
                     if let Some(def) = self.state.def(ctx.publisher, o.instrument_id) {
                         let venue: &'static str = source_label(o.source_id);
                         let source = venue_arc(venue);
+                        // Same identity `reveal_if_needed` above just announced (or already holds)
+                        // this instrument's `instrument` under — see `pending_channel`'s doc.
+                        let channel = self
+                            .pending_channel
+                            .get(&(ctx.publisher, o.instrument_id))
+                            .copied()
+                            .unwrap_or(0);
                         let trade = NormalizedTrade {
                             venue: source.clone(),
                             source: source.clone(),
                             source_id: o.source_id,
                             symbol: def.symbol.clone(),
+                            channel,
+                            instrument_id: o.instrument_id,
                             price: apply_exponent(o.exec_price_raw, def.price_exponent),
                             size: apply_exponent(o.exec_qty_raw as i64, def.qty_exponent),
                             aggressor_side: Side::from_code(o.aggressor_side),
@@ -1402,6 +1396,13 @@ impl FrameProcessor for MboProcessor {
                     if self.reveal_if_needed(ctx, t.instrument_id, t.source_id) {
                         changed.insert(t.instrument_id);
                     }
+                    // Same identity `reveal_if_needed` above just announced (or already holds) this
+                    // instrument's `instrument` under — see `pending_channel`'s doc.
+                    let channel = self
+                        .pending_channel
+                        .get(&(ctx.publisher, t.instrument_id))
+                        .copied()
+                        .unwrap_or(0);
                     let venue: &'static str = source_label(t.source_id);
                     let source = venue_arc(venue);
                     let trade = NormalizedTrade {
@@ -1409,6 +1410,8 @@ impl FrameProcessor for MboProcessor {
                         source: source.clone(),
                         source_id: t.source_id,
                         symbol,
+                        channel,
+                        instrument_id: t.instrument_id,
                         price: apply_exponent(t.trade_price_raw, price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, qty_exponent),
                         aggressor_side: Side::from_code(t.aggressor_side),
@@ -1439,7 +1442,6 @@ impl FrameProcessor for MboProcessor {
                     // it must not survive past this reset either.
                     let latched_venue = self.wire_venue(&key);
                     self.revealed.remove(&key);
-                    self.announced_symbol.remove(&key);
                     // The re-snapshot may anchor at a `source_ts` below the latched floor (e.g. the
                     // venue reset this instrument's clock); clear the `(venue, symbol)` floor entry
                     // so the post-reset depth re-opens the tick. The symbol is resolved in
@@ -1631,10 +1633,6 @@ pub struct MbpProcessor {
     /// exists without, a matching `books` entry, and stays bounded exactly as tightly as
     /// [`MAX_PRICE_BOOKS`] already bounds `books`.
     revealed: HashMap<PriceBookKey, u16>,
-    /// The exact `(venue, symbol)` a `NormalizedInstrument` was last announced under for a book
-    /// key — see [`TobProcessor::announced_symbol`]. Same eviction lockstep as `revealed` (via
-    /// [`Self::forget_book`]).
-    announced_symbol: HashMap<PriceBookKey, Arc<str>>,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
     /// Rate limit for the per-datagram decode-error warning.
@@ -1656,7 +1654,6 @@ impl MbpProcessor {
             health_reported: HashMap::new(),
             cleared: Vec::new(),
             revealed: HashMap::new(),
-            announced_symbol: HashMap::new(),
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
             tape,
@@ -1672,7 +1669,8 @@ impl MbpProcessor {
     /// Also re-announces if a LATER message names a DIFFERENT Source ID for a key already revealed
     /// — see [`TobProcessor::reveal_if_needed`] for why pinning the first id forever is wrong.
     /// Counted in `dz_source_id_changed_total{venue}` (the new venue), and purges the stale
-    /// `(old_venue, old_symbol)` `InstrumentSnapshot` entry the same way (see there).
+    /// `(old_venue, channel, instrument_id)` `InstrumentSnapshot` entry the same way (see there) —
+    /// `key.1`/`key.2` are unaffected by the Source ID change, so no separate memo is needed.
     fn reveal_if_needed(&mut self, ctx: &FrameCtx, key: PriceBookKey, source_id: u16) -> bool {
         let previous = self.revealed.get(&key).copied();
         if previous == Some(source_id) {
@@ -1686,13 +1684,12 @@ impl MbpProcessor {
                 .source_id_changed
                 .with_label_values(&[source_label(source_id)])
                 .inc();
-            if let Some(old_symbol) = self.announced_symbol.get(&key) {
-                remove_instrument(
-                    ctx.instruments,
-                    &venue_arc(source_label(old_id)),
-                    old_symbol,
-                );
-            }
+            remove_instrument(
+                ctx.instruments,
+                &venue_arc(source_label(old_id)),
+                key.1 as u32,
+                key.2,
+            );
         }
         self.revealed.insert(key, source_id);
         let source = venue_arc(source_label(source_id));
@@ -1706,7 +1703,6 @@ impl MbpProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
         };
-        self.announced_symbol.insert(key, inst.symbol.clone());
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
         true
@@ -1791,7 +1787,6 @@ impl MbpProcessor {
         }
         self.health_reported.remove(key);
         self.revealed.remove(key);
-        self.announced_symbol.remove(key);
         if self
             .open
             .get(&(key.0, key.1))
@@ -1806,7 +1801,7 @@ impl MbpProcessor {
     ///
     /// MBP carries more per-publisher state than its siblings, and all of it is derived from the
     /// reference data that was just evicted: the books keyed `(publisher, channel, instrument)`,
-    /// their `revealed`/`announced_symbol`/`health_reported` companions, and the per-`(publisher,
+    /// their `revealed`/`health_reported` companions, and the per-`(publisher,
     /// channel)` snapshot group and reset-count memos. Leaving any of it behind would strand a book
     /// whose definition is gone — `exponents` can no longer resolve, so it can never emit again, but
     /// it still holds its buffered deltas against [`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`] and its slot
@@ -1831,7 +1826,6 @@ impl MbpProcessor {
         // Belt and braces: `forget_book` already removed these for every key that had a book, but a
         // reveal without a surviving book must not leave an orphan behind.
         self.revealed.retain(|(p, _, _), _| *p != publisher);
-        self.announced_symbol.retain(|(p, _, _), _| *p != publisher);
         self.health_reported.retain(|(p, _, _), _| *p != publisher);
     }
 
@@ -2085,7 +2079,7 @@ impl FrameProcessor for MbpProcessor {
             // `ManifestSummary`/`InstrumentDefinition` arms below are gated on this same
             // `handle_refdata`, so they land on a publisher already inserted here and never
             // trigger a fresh eviction of their own. Draining here is what keeps the derived
-            // per-publisher maps (`books`/`revealed`/`announced_symbol`/`open`/`last_reset`) from
+            // per-publisher maps (`books`/`revealed`/`open`/`last_reset`) from
             // outliving the reference data they are meaningless without — see
             // [`Self::forget_publisher`], and `MboProcessor`'s identical drain.
             if let Some(evicted) = self.state.take_evicted() {
@@ -2174,7 +2168,6 @@ impl FrameProcessor for MbpProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                             };
-                            self.announced_symbol.insert(key, inst.symbol.clone());
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
                         }
@@ -2460,7 +2453,6 @@ impl FrameProcessor for MbpProcessor {
                         // Source ID would then misdescribe the new one. Drop it too, so the
                         // post-reset market is deferred again until a fresh delta reveals it.
                         self.revealed.remove(&key);
-                        self.announced_symbol.remove(&key);
                     }
                     // The book dropped any group it was assembling, so the route goes with it.
                     if self
@@ -2532,6 +2524,14 @@ impl FrameProcessor for MbpProcessor {
                         source: source.clone(),
                         source_id: t.source_id,
                         symbol,
+                        // `channel` is this frame's header channel id (u8 on the wire; widened to
+                        // match the `instrument`/`book` identity's u32) — the same value `ensure_book`
+                        // just keyed this instrument's book under. This is the field a price-aggregated
+                        // venue's mirrored arms disagree on (identical instrument set, distinct
+                        // `channel` per arm), so it must ride the message rather than be re-derived
+                        // downstream by a `symbol` match that can't tell the two arms apart.
+                        channel: channel as u32,
+                        instrument_id: t.instrument_id,
                         price: apply_exponent(t.trade_price_raw, price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, qty_exponent),
                         aggressor_side: Side::from_code(t.aggressor_side),
@@ -3090,11 +3090,11 @@ mod tests {
             map.keys().collect::<Vec<_>>()
         );
         assert!(
-            !map.contains_key(&(venue_arc("HYPERLIQUID"), Arc::<str>::from("INST-41"))),
+            !map.contains_key(&(venue_arc("HYPERLIQUID"), 0, 41)),
             "the stale entry under the OLD source must be purged, not merely superseded"
         );
         assert!(
-            map.contains_key(&(venue_arc("PHOENIX"), Arc::<str>::from("INST-41"))),
+            map.contains_key(&(venue_arc("PHOENIX"), 0, 41)),
             "the entry under the CURRENT source must remain"
         );
     }
@@ -4184,7 +4184,7 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1);
-            let entry = map.get(&("TestVenue".into(), "BTC".into())).unwrap();
+            let entry = map.get(&("TestVenue".into(), 0u32, 1u32)).unwrap();
             assert_eq!(entry.price_exponent, -2);
             assert_eq!(entry.qty_exponent, -4);
         }
@@ -4204,7 +4204,7 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1, "still one entry after conflicting write");
-            let entry = map.get(&("TestVenue".into(), "BTC".into())).unwrap();
+            let entry = map.get(&("TestVenue".into(), 0u32, 1u32)).unwrap();
             assert_eq!(
                 entry.price_exponent, -3,
                 "last writer's price_exponent wins"
@@ -4480,10 +4480,7 @@ mod tests {
         );
         let snapshot = crate::model::lock(&instruments);
         let reannounced = snapshot
-            .get(&(
-                std::sync::Arc::<str>::from("SOURCE_0"),
-                std::sync::Arc::<str>::from("INST-0"),
-            ))
+            .get(&(std::sync::Arc::<str>::from("SOURCE_0"), 7, 0))
             .expect("instrument 0 must have been re-revealed under SOURCE_0/INST-0");
         assert_eq!(
             reannounced.channel, 7,
@@ -5478,8 +5475,8 @@ mod tests {
 
     /// `PerPublisher` evicts the oldest publisher once `MAX_PUBLISHERS` is exceeded; the three
     /// sibling processors drain `take_evicted()` and drop that publisher's derived state. MBP did
-    /// not, so an evicted publisher's books, revealed ids, announced symbols and channel state
-    /// outlived the reference data they depend on.
+    /// not, so an evicted publisher's books, revealed ids, and channel state outlived the reference
+    /// data they depend on.
     #[test]
     fn mbp_an_evicted_publisher_leaves_no_derived_state_behind() {
         use super::MAX_PUBLISHERS;
@@ -5525,10 +5522,6 @@ mod tests {
         assert!(
             !proc.revealed.keys().any(|(p, _, _)| *p == first),
             "and its revealed source ids"
-        );
-        assert!(
-            !proc.announced_symbol.keys().any(|(p, _, _)| *p == first),
-            "and its announced symbols"
         );
         assert!(
             !proc.open.keys().any(|(p, _)| *p == first)

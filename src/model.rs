@@ -115,6 +115,18 @@ pub struct NormalizedTrade {
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
+    /// The publisher's `channel_id`: the instrument set this feed carries. Filterable. `0` for a
+    /// source whose wire has no channel concept of its own (the public WS backstops) — see
+    /// `ingest::public_feeder::resolve_instrument`, which resolves the real value from the edge
+    /// catalog instead where one exists.
+    #[serde(default)]
+    pub channel: u32,
+    /// Instrument id, unique within `channel`. Additive alongside `channel` (see its doc): together
+    /// they are the identity `history::Key` groups on, closing the gap that let a price-aggregated
+    /// venue's mirrored arms (identical instrument set, distinct `channel`) drop every trade rather
+    /// than risk misattributing one to the wrong arm.
+    #[serde(default)]
+    pub instrument_id: u32,
     pub price: f64,
     pub size: f64,
     /// `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.
@@ -369,17 +381,23 @@ impl FeedMessage {
     }
 }
 
-/// Latest known instrument definitions, keyed by `(venue, symbol)`, shared between the
-/// receivers (which update it) and the WebSocket server (which replays it to each new
+/// Latest known instrument definitions, keyed by `(venue, channel, instrument_id)`, shared between
+/// the receivers (which update it) and the WebSocket server (which replays it to each new
 /// subscriber so reference data arrives before quotes - otherwise a client that connects
 /// mid-stream sees a quote first and has to guess the price/qty precision).
 ///
-/// The `(venue, symbol)` key disambiguates the same symbol across *different* venues (e.g.
-/// `SOL-PERP` on Hyperliquid vs. Phoenix). It does NOT distinguish by protocol/feed: when one
-/// venue is served by multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same entry
-/// (last-writer-wins). Those feeds are expected to agree on precision; `upsert_instrument` in
-/// `processor.rs` warns if their exponents diverge.
-pub type InstrumentSnapshot = Arc<Mutex<HashMap<(Arc<str>, Arc<str>), NormalizedInstrument>>>;
+/// The key is the same identity triple [`NormalizedBook`] and [`NormalizedInstrument`] already carry
+/// (see their docs) — **not** `(venue, symbol)`. `symbol` is a display label: on the price-aggregated
+/// protocol it is a fixed 16-byte wire field the publisher fills by keeping a ticker's rightmost 16
+/// bytes with no hash and no length check, so two genuinely different markets on a venue with a long
+/// ticker can and do collide on it (confirmed against a real capture — see
+/// `tests/fixtures/PROVENANCE.md`). Keying this map on that label meant the second market's insert
+/// silently destroyed the first's entry; the identity triple is unique per market by construction, so
+/// both survive. It does NOT distinguish by protocol/feed within one venue: when one venue is served
+/// by multiple feeds sharing a channel/instrument id (e.g. Hyperliquid TOB + MBO both reporting
+/// `channel=0`), both write the same entry (last-writer-wins). Those feeds are expected to agree on
+/// precision; `upsert_instrument` in `processor.rs` warns if their exponents diverge.
+pub type InstrumentSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
@@ -517,6 +535,21 @@ impl BookAccumulator {
     /// The market's display label, as last seen on the wire.
     pub fn symbol(&self) -> &Arc<str> {
         &self.symbol
+    }
+
+    /// The current best bid (highest price), as `(price, size)`. Cheap — reads the top of the
+    /// accumulator's own tree rather than materializing the whole book via [`Self::to_book`], which
+    /// a caller that only wants the inside market (e.g. a `best_bid_ask`-style query) should never
+    /// have to pay for. Available regardless of [`Self::baselined`]: reporting only the touched top
+    /// level as "the best currently known" does not claim completeness the way replaying the whole
+    /// book as a re-baseline would.
+    pub fn best_bid(&self) -> Option<(f64, f64)> {
+        self.bids.values().next_back().copied()
+    }
+
+    /// The current best ask (lowest price), as `(price, size)`. See [`Self::best_bid`].
+    pub fn best_ask(&self) -> Option<(f64, f64)> {
+        self.asks.values().next().copied()
     }
 
     /// Materialize the current state as a re-baseline: `clear` first, then every level best-first.

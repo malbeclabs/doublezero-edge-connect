@@ -17,7 +17,7 @@ use clap::Parser;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use doublezero_edge_connect::{ingest, metrics, model, shred, sinks};
+use doublezero_edge_connect::{history, ingest, metrics, model, shred, sinks};
 use ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
     feeds,
@@ -193,6 +193,15 @@ struct Args {
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
     #[arg(long = "metrics-bind", env = "METRICS_BIND", default_value = "")]
     metrics_bind: String,
+
+    /// Query API bind address (`GET /v1/...`). Loopback by default: under host networking a wildcard
+    /// bind is genuinely network-reachable and this API has no authentication. Empty disables it.
+    #[arg(
+        long = "api-bind",
+        env = "DZ_API_BIND",
+        default_value = "127.0.0.1:9099"
+    )]
+    api_bind: String,
 
     /// How often (seconds) the subscription reconciler re-reads `doublezero status` and reconciles
     /// which market-data receivers, the WebSocket sink, and shred sources are active. Subscriptions
@@ -418,6 +427,11 @@ async fn main() -> Result<()> {
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let books: model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    // Rolling one-hour trade history behind the `/v1` query API. Built once here (like the three
+    // snapshot maps above) so it survives the API sink's own activate/deactivate cycles - a
+    // subscription blip that briefly takes the sink down must not reset the window it comes back up
+    // to. The reconciler owns feeding it (only while the sink is up) and reading it (the API sink).
+    let history: Arc<Mutex<history::Store>> = Arc::new(Mutex::new(history::Store::new()));
     // Single-arm authority tunables for `Sticky` venues, plus the cross-arm matcher's pairing window,
     // validated here at startup and handed to the arbiter.
     let authority_cfg = ingest::authority::AuthorityConfig {
@@ -578,6 +592,8 @@ async fn main() -> Result<()> {
             gating_disabled: args.subscription_gating_disable,
             ws_bind: args.ws_bind.clone(),
             ws_cfg,
+            api_bind: args.api_bind.clone(),
+            history,
             shred: shred_params,
         })
         .run(),

@@ -1,8 +1,12 @@
 # The bridge crate is the workspace root; `shred-proxy/` is a lightweight member binary that reuses
-# this crate's library (the shred forwarder + multicast plumbing) as a path dependency. A single
-# workspace-level Cargo.lock keeps the `--locked` Docker build reproducible across both members.
+# this crate's library (the shred forwarder + multicast plumbing) as a path dependency.
+# `doublezero-edge/` is the host-side query CLI: a separate member (not a bin in this package)
+# because the bridge uses `SO_TIMESTAMPNS` via `nix` with no `cfg` gate and so cannot build on
+# macOS, while the CLI (clap + serde + a JSON HTTP client) must — it shares no types with the
+# bridge and carries no path dependency on it. A single workspace-level Cargo.lock keeps the
+# `--locked` Docker build reproducible across all three members.
 [workspace]
-members = [".", "shred-proxy"]
+members = [".", "shred-proxy", "doublezero-edge"]
 resolver = "2"
 
 [package]

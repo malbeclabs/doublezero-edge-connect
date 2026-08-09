@@ -135,6 +135,7 @@ source_ts_ns --> kernel_rx_ts_ns --> recv_ts_ns --> ws_send_ts_ns --> (consumer 
 
 ```json
 {"type":"trade","venue":"Hyperliquid","source":"Hyperliquid","source_id":1,"symbol":"SOL",
+ "channel":0,"instrument_id":1234,
  "price":184.20,"size":3.5,"aggressor_side":"buy","trade_id":987654,"cumulative_volume":12500.0,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -150,6 +151,8 @@ venue precision, same convention as `quote`).
 | `source`            | string  | The source's registry name. **Preferred.**                           |
 | `source_id`         | number  | The wire Source ID, verbatim.                                        |
 | `symbol`            | string  | Symbol (matches an `instrument`'s `symbol`).                         |
+| `channel`           | uint32  | The publisher's channel id: the instrument set this feed carries. `0` for a source with no channel concept of its own. Filterable. |
+| `instrument_id`     | uint32  | Instrument id, unique within `channel`.                              |
 | `price`             | number  | Trade price (decimal).                                               |
 | `size`              | number  | Trade size (decimal).                                                |
 | `aggressor_side`    | string  | `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.      |
@@ -164,6 +167,12 @@ The same four timestamps as `quote` ride every trade (see *Why four timestamps*)
 a trade is a **point-in-time event, not full state**: it is not replayed on connect, and a trade
 dropped under backpressure is simply a missed print (it does not leave a stale book). A consumer
 that only wants top-of-book may ignore `trade` per the forward-compatibility rule.
+
+`channel`/`instrument_id` are additive (forward-compatible: an older consumer that ignores unknown
+fields is unaffected) and carry the same identity `instrument`/`book` do — see *Identity* under
+[`book`](#book). They exist so a consumer can join a trade to its market on the identity rather than
+`symbol` alone, which is not unique on a venue whose publisher shards the same instrument set across
+more than one `channel`.
 
 ### `midpoint`
 
@@ -507,6 +516,9 @@ on connect:
 - There is no `v` field on the wire; the contract is this spec plus the
   **forward-compatibility rule**: consumers ignore unknown message types and unknown fields,
   so additive changes are non-breaking. A future revision may add an explicit `v` field.
+- **`trade` gained `channel`/`instrument_id`.** Purely additive - existing fields are unchanged and
+  a consumer ignoring unknown fields is unaffected - carrying the same identity `instrument`/`book`
+  already do, so a trade can be joined to its market on the identity rather than `symbol` alone.
 
 ### Not in v1 (candidate extensions)
 
