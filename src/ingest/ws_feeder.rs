@@ -46,10 +46,17 @@ fn hl_venue() -> &'static str {
     crate::ingest::sources::source_label(HL_SOURCE_ID)
 }
 
-/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`.
-/// The arbiter's `Sticky` tape gate keys on `(venue, category)`, so a value disagreeing with the
-/// edge rows' would make this backstop a second universe rather than a second arm of the same one —
-/// and both copies of every print would reach the wire. `category_matches_the_edge_rows` pins it.
+/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`,
+/// handed to the arbiter on every emit.
+///
+/// **Inert on this venue today**, and the comment should not pretend otherwise: `category` is read
+/// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
+/// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
+/// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
+/// backstop its own universe rather than another arm of the same one, and the gate would stop
+/// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
+/// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
+/// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.
 const HL_CATEGORY: &str = "perps";
 
 /// Hyperliquid documents a cap of 1000 subscriptions per WebSocket connection. We fan out two
@@ -300,22 +307,26 @@ mod tests {
 
     use super::*;
 
-    /// The backstop and the edge rows must name the **same** universe, or the arbiter's `Sticky`
-    /// tape gate treats them as two and stops collapsing their copies of one fill. Pinned against
-    /// the registry rather than restated, so onboarding a row under this venue with a different
-    /// category fails the build instead of quietly doubling the tape.
+    /// [`HL_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
+    /// venue's top-of-book row, the source of both the quotes and the prints it emits.
+    ///
+    /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
+    /// universes is the case `Feed::category` exists to express, so that assertion would fail a
+    /// legitimate registry change and leave deleting the test as the only fix. This one still fails
+    /// if the constant drifts, because then no row matches it.
     #[test]
-    fn category_matches_the_edge_rows() {
-        for f in crate::ingest::feeds::FEEDS
-            .iter()
-            .filter(|f| f.venue == hl_venue())
-        {
-            assert_eq!(
-                f.category, HL_CATEGORY,
-                "{} row {:?} carries a category this backstop does not mirror",
-                f.venue, f.kind
-            );
-        }
+    fn category_names_the_row_this_backstop_mirrors() {
+        let mirrored = crate::ingest::feeds::FEEDS.iter().find(|f| {
+            f.venue == hl_venue()
+                && f.category == HL_CATEGORY
+                && f.kind == crate::ingest::feeds::FeedKind::TopOfBook
+        });
+        assert!(
+            mirrored.is_some(),
+            "no {} top-of-book row carries category {HL_CATEGORY:?}: this backstop claims to \
+             mirror a universe the registry does not publish",
+            hl_venue()
+        );
     }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
