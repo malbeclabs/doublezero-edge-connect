@@ -54,10 +54,11 @@ pub struct HostSubs {
 /// Modeled as `Option<Option<String>>` so the **key being absent entirely** (the outer
 /// `Option::None`, supplied by `#[serde(default)]`) can never collapse into the **same value** as
 /// the key being present with an explicit JSON `null` (`Some(None)`). That distinction is
-/// load-bearing: a session with no multicast groups (e.g. IBRL) reports the key present, as `null`
-/// or `""` — a real zero-subscription signal — while the key being missing from the object
-/// altogether is a shape this process does not recognize (an upstream rename/removal of the
-/// field), and must not be read as "zero subscriptions" (see `parse_status_codes`'s F1 note).
+/// load-bearing: the key present but empty (`null` or `""`) is a real zero-subscription signal,
+/// while a document in which **no** entry carries the key at all is a shape this process does not
+/// recognize (an upstream rename/removal of the field) and must not be read as "zero
+/// subscriptions" (see `parse_status_codes`'s F1 note for why the rule is per-document, not
+/// per-entry).
 ///
 /// ⚠️ Naive `Option<Option<T>>` with a bare `#[serde(default)]` does **not** achieve this: serde's
 /// `Option<T>` deserializer intercepts a JSON `null` at the *outer* layer and short-circuits
@@ -107,9 +108,23 @@ where
 /// entirely (the field is optional) and would, with a plain `Option<String>`, quietly land on
 /// `None` → `Some(vec![])` here: a field rename reading as "this host subscribes to nothing,"
 /// fleet-wide, the instant the CLI ships it — silently discarding every channel's catalog, books
-/// and history via the reconciler's departure purge. An entry whose `multicast_groups` key is
-/// missing entirely is therefore treated exactly like a top-level parse failure: `None`, not an
-/// empty list.
+/// and history via the reconciler's departure purge. A document with **at least one entry** in
+/// which **no** entry carries the key is therefore treated exactly like a top-level parse failure:
+/// `None`, not an empty list. (A zero-entry document — `[]` — is a real "this host has no
+/// sessions" answer and stays `Some(vec![])`.)
+///
+/// The rule is deliberately per-**document**, not per-entry. ⚠️ **Unverified:** we do not know
+/// whether the CLI emits `multicast_groups` for a session that has none (an IBRL session, say);
+/// there is no capture of one in this repo, and the shape is an *array*, so a host can report a
+/// Multicast session beside an IBRL one. Aborting the whole read on the first entry lacking the
+/// key would, if that guess is wrong, return `Unavailable` on **every** tick of such a host — a
+/// freshly-started process would then never activate a receiver, never bring up the WS sink and
+/// never serve the query API, forever. Skipping the entry instead is safe whichever way the guess
+/// falls: an entry that legitimately has no groups contributes no codes either way, and the
+/// fleet-wide rename this guards against removes the key from *every* entry at once, which the
+/// per-document rule still catches. The one residual case — a host whose *only* entry omits the
+/// key legitimately — reports `Unavailable`, i.e. keeps current activations; on such a host there
+/// are no market-data subscriptions to activate anyway.
 pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
     let entries: Vec<StatusEntry> = match serde_json::from_slice(stdout) {
         Ok(e) => e,
@@ -118,20 +133,18 @@ pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
             return None;
         }
     };
+    let entry_count = entries.len();
+    let mut key_seen = 0usize;
     let mut out = Vec::new();
     for entry in entries {
-        // The outer `None` is the key-absent case (F1): report the whole read as unparseable
-        // rather than silently treating a missing/renamed field as zero subscriptions.
+        // The outer `None` is the key-absent case (F1). Skip this entry; whether the *document*
+        // is unrecognizable is decided after the loop, once it is known that no entry had the key.
         let Some(groups_present) = entry.multicast_groups else {
-            warn!(
-                "doublezero status --json entry has no multicast_groups key at all; reporting \
-                 Unavailable (not zero subscriptions) — a renamed/removed field, not a legitimate \
-                 empty session"
-            );
-            return None;
+            continue;
         };
+        key_seen += 1;
         // The inner `None` is the key present as explicit JSON `null` — a genuine "no groups"
-        // signal once the key exists at all (e.g. an IBRL session).
+        // signal once the key exists at all.
         let Some(groups) = groups_present else {
             continue;
         };
@@ -152,6 +165,15 @@ pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
                 out.push(code.to_string());
             }
         }
+    }
+    if entry_count > 0 && key_seen == 0 {
+        warn!(
+            entries = entry_count,
+            "no `doublezero status --json` entry carries a multicast_groups key; reporting \
+             Unavailable (not zero subscriptions) — a renamed/removed field, not a legitimate \
+             empty session"
+        );
+        return None;
     }
     Some(out)
 }
@@ -315,12 +337,13 @@ mod tests {
     }
 
     /// A well-formed response reporting no multicast groups at all — the key **present** as an
-    /// explicit `null` or empty string (an IBRL session reports the key, it just has nothing in
-    /// it) — is a **real** zero-subscription state: `Some(vec![])`, never `None`. Distinct from
-    /// both `a_missing_multicast_groups_key_reports_none_not_zero_subscriptions` (the key present
-    /// vs. absent — F1) and `unparseable_json_reports_none_not_an_empty_list` (malformed JSON)
-    /// below on purpose — a test covering only one of these cannot tell a `None`-vs-`Some(empty)`
-    /// regression apart, which is exactly the bug this group of tests exists to catch.
+    /// explicit `null` or empty string — is a **real** zero-subscription state: `Some(vec![])`,
+    /// never `None`. Distinct from both
+    /// `no_entry_carrying_a_multicast_groups_key_reports_none_not_zero_subscriptions` (the key
+    /// present vs. absent — F1) and `unparseable_json_reports_none_not_an_empty_list` (malformed
+    /// JSON) below on purpose — a test covering only one of these cannot tell a
+    /// `None`-vs-`Some(empty)` regression apart, which is exactly the bug this group of tests
+    /// exists to catch.
     #[test]
     fn a_well_formed_response_with_no_groups_reports_some_empty_not_none() {
         assert_eq!(
@@ -341,6 +364,13 @@ mod tests {
             Some(Vec::new()),
             "an empty array of entries is also a legitimate zero-subscription response"
         );
+        // The key present as `null` is what makes the document recognized, even when a sibling
+        // entry has no key at all: "present" is the key existing, not the value being non-empty.
+        assert_eq!(
+            parse_status_codes(br#"[{"response":{"user_type":"IBRL"}},{"multicast_groups":null}]"#),
+            Some(Vec::new()),
+            "one entry carrying the key as null is enough for the document to be recognized"
+        );
     }
 
     /// The other branch: the JSON does not even parse as the expected array-of-entries shape — an
@@ -357,25 +387,36 @@ mod tests {
         assert_eq!(parse_status_codes(b"{\"multicast_groups\":\"S:x\"}"), None);
     }
 
-    /// F1, the finding this round exists for: an entry whose JSON *object parses fine* but whose
-    /// `multicast_groups` **key is entirely absent** — modeling an upstream field rename or removal
-    /// — must report `None`, exactly like `unparseable_json_reports_none_not_an_empty_list` above,
-    /// and must NOT be conflated with `a_well_formed_response_with_no_groups_reports_some_empty_not_none`,
-    /// whose fixtures all carry the key (as `null` or `""`). A fixture that only ever omits the key
-    /// entirely could not tell "the field was renamed" apart from "the field legitimately holds
-    /// nothing" — these two tests, one per case, are what make that distinction real.
+    /// F1, the finding this round exists for: a document whose entries *parse fine* but in which
+    /// **no entry carries the `multicast_groups` key** — modeling an upstream field rename or
+    /// removal, which hits every entry at once — must report `None`, exactly like
+    /// `unparseable_json_reports_none_not_an_empty_list` above, and must NOT be conflated with
+    /// `a_well_formed_response_with_no_groups_reports_some_empty_not_none`, whose fixtures all
+    /// carry the key (as `null` or `""`). A fixture that only ever omits the key entirely could not
+    /// tell "the field was renamed" apart from "the field legitimately holds nothing" — these two
+    /// tests, one per case, are what make that distinction real.
+    ///
+    /// The multi-entry fixture is the one that pins the rule as **per document**: it is the shape
+    /// that separates this from
+    /// `a_mixed_document_parses_and_returns_the_carrying_entrys_codes` below, where an entry
+    /// without the key sits beside one that has it.
     #[test]
-    fn a_missing_multicast_groups_key_reports_none_not_zero_subscriptions() {
+    fn no_entry_carrying_a_multicast_groups_key_reports_none_not_zero_subscriptions() {
         // Well-formed JSON, valid entry object, but the key itself is not present at all.
         assert_eq!(
             parse_status_codes(br#"[{"response":{"user_type":"IBRL"}}]"#),
             None,
-            "an entry with no multicast_groups key at all must not silently read as zero \
-             subscriptions"
+            "a document whose only entry has no multicast_groups key must not silently read as \
+             zero subscriptions"
         );
+        // Two entries, neither carrying the key — the fleet-wide rename shape, where *every*
+        // session's entry loses the field at once.
         assert_eq!(
-            parse_status_codes(br#"[{"current_device":"tyo002-dz002"}]"#),
-            None
+            parse_status_codes(
+                br#"[{"current_device":"tyo002-dz002"},{"response":{"user_type":"IBRL"}}]"#
+            ),
+            None,
+            "no entry carrying the key is an unrecognized document, however many entries it has"
         );
         // The specific real-world shape this guards against: the field renamed rather than absent
         // outright — its replacement present under a different name changes nothing, since the
@@ -384,6 +425,46 @@ mod tests {
             parse_status_codes(br#"[{"multicastGroups":"S:tiredsolid"}]"#),
             None,
             "a renamed multicast_groups field must not silently parse as zero subscriptions"
+        );
+    }
+
+    /// The narrowing that keeps the rule above from hard-downing a host: `doublezero status --json`
+    /// reports an **array** of sessions, and it is unverified whether a session with no multicast
+    /// groups emits the key at all. So one entry lacking the key must not abort the read — the
+    /// entry is skipped and the carrying entry's codes are returned. Aborting on the first
+    /// key-less entry instead makes such a host report `Unavailable` on every tick, so a freshly
+    /// started process never activates a receiver, the WS sink or the query API.
+    ///
+    /// Asserts the **codes**, not merely that no error came back: reading the carrying entry but
+    /// dropping its groups would be just as wrong, and both orderings are covered so an
+    /// implementation that only inspects the first entry fails too.
+    #[test]
+    fn a_mixed_document_parses_and_returns_the_carrying_entrys_codes() {
+        let expect: HashSet<String> = ["tiredsolid", "scottsdale"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Key-less entry first — the ordering the abort-on-first-entry rule got wrong.
+        assert_eq!(
+            parse_status_codes(
+                br#"[{"response":{"user_type":"IBRL"}},{"response":{"user_type":"Multicast"},"multicast_groups":"S:tiredsolid,S:scottsdale"}]"#
+            )
+            .expect("a key-less entry beside a carrying one must not abort the read")
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            expect,
+            "the carrying entry's codes must survive an entry that has no key"
+        );
+        // ...and the other way round, so an implementation that only consults the first entry
+        // fails here too.
+        assert_eq!(
+            parse_status_codes(
+                br#"[{"multicast_groups":"S:tiredsolid,S:scottsdale"},{"current_device":"tyo002-dz002"}]"#
+            )
+            .expect("a key-less entry beside a carrying one must not abort the read")
+            .into_iter()
+            .collect::<HashSet<_>>(),
+            expect
         );
     }
 

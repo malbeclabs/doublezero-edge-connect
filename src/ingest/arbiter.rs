@@ -920,11 +920,12 @@ impl Arbiter {
             let Some(old) = self.book_order.pop_front() else {
                 break;
             };
-            self.book_markets.remove(&old);
-            if let Some(replay) = &self.book_replay {
-                model::lock(replay).remove(&old);
-            }
-            self.books.forget_market(&old);
+            // The same pairing every other drop path uses — `pop_front` above has already taken
+            // this key out of `book_order`, which is why eviction calls the leg-dropper directly
+            // rather than going through [`Self::reset_books_for_markets`]: that would add a full
+            // `book_order` scan per evicted market, on the ingest hot path, to remove a key that
+            // is already gone.
+            self.drop_market_state(&old);
             self.vm(&old.0).book_markets_evicted.inc();
         }
         self.book_order.push_back(key.clone());
@@ -958,45 +959,64 @@ impl Arbiter {
     /// emitting arm and channel and reports those markets unhealthy, which hands them to the peer arm
     /// rather than tearing down a live arm's published book.
     pub fn reset_book_for_market(&mut self, key: &MarketKey) {
-        self.book_markets.remove(key);
-        self.book_order.retain(|k| k != key);
-        if let Some(replay) = &self.book_replay {
-            model::lock(replay).remove(key);
-        }
-        self.books.forget_market(key);
+        // Delegated, not re-implemented: [`Self::reset_books_for_markets`] is the single expression
+        // of the drop, so the pairing cannot drift between a single-key and a batch path. The cost
+        // is unchanged — this path always scanned `book_order` once (`retain`) — plus one
+        // one-element `HashSet`, which is not on any hot path (this is the session-reset seam).
+        self.reset_books_for_markets(std::slice::from_ref(key));
     }
 
-    /// The same three-way drop as [`Self::reset_book_for_market`], for a **batch** of keys at once —
-    /// `book_order`'s cleanup is one linear scan over the whole queue, not one scan per key.
+    /// The single expression of the **three-way drop**: the per-arm accumulators (`book_markets`),
+    /// the shared replay entry (and with it the `by_identity` index prune) and `StickyAuthority`'s
+    /// `last_admitted`, for a batch of keys — [`Self::reset_book_for_market`] is one key through
+    /// here and [`Self::forget_channel_books`] is a channel's worth.
     ///
-    /// [`Self::reset_book_for_market`] is O(`book_order.len()`) per call: `book_order` is a
-    /// `VecDeque`, and eviction (its only other caller) only ever drops one market at a time, so a
-    /// per-call scan was never the wrong cost model there. Calling it in a loop for N keys is
-    /// O(`N * book_order.len()`), which is real money at [`MAX_BOOK_MARKETS`] scale — shedding most
-    /// of a channel's markets (the common floor-narrowing case: a handful of channels admitted out
-    /// of dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for
-    /// tens of milliseconds to seconds. This is the seam [`Self::forget_channel_books`] uses
-    /// instead: identical per-market work, `book_order` filtered once.
+    /// The three legs **must** drop together: losing `last_admitted` is what forces the consumer
+    /// re-baseline, so a replay entry deleted without it leaves a market that never re-baselines and
+    /// stays invisible to every new client. Adding a fourth leg is an edit here (and in
+    /// [`Self::drop_market_state`], which eviction shares) rather than a thing to remember in three
+    /// places.
+    ///
+    /// `book_order`'s cleanup is one linear scan over the whole queue, not one scan per key: a
+    /// per-key `retain` is O(`book_order.len()`), so a loop over N keys is O(`N *
+    /// book_order.len()`), which is real money at [`MAX_BOOK_MARKETS`] scale — shedding most of a
+    /// channel's markets (the common floor-narrowing case: a handful of channels admitted out of
+    /// dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for tens
+    /// of milliseconds to seconds.
     fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
         if keys.is_empty() {
             return;
         }
         let doomed: HashSet<&MarketKey> = keys.iter().collect();
         for key in keys {
-            self.book_markets.remove(key);
-            if let Some(replay) = &self.book_replay {
-                model::lock(replay).remove(key);
-            }
-            self.books.forget_market(key);
+            self.drop_market_state(key);
         }
         self.book_order.retain(|k| !doomed.contains(k));
+    }
+
+    /// Drop one market's three paired legs — accumulators, replay entry, `last_admitted` — and
+    /// nothing else. Every path that discards a market's `book` state goes through here (batch
+    /// reset, single reset via the batch, and eviction), which is what keeps the pairing written
+    /// once.
+    ///
+    /// `book_order` is deliberately **not** touched: it is the eviction queue, not one of the paired
+    /// legs, and its callers remove from it differently (eviction has already `pop_front`ed the key;
+    /// the reset paths filter the queue once for the whole batch). A residual entry there costs one
+    /// wasted `pop_front` at eviction time — [`Self::track_book_market`] tolerates a key that is
+    /// already gone — never corruption.
+    fn drop_market_state(&mut self, key: &MarketKey) {
+        self.book_markets.remove(key);
+        if let Some(replay) = &self.book_replay {
+            model::lock(replay).remove(key);
+        }
+        self.books.forget_market(key);
     }
 
     /// Drop **every** tracked `book` market on `(venue, category, channel)` — every
     /// `instrument_id` under it — through [`Self::reset_books_for_markets`], so each one's
     /// accumulator, replay entry and `StickyAuthority::last_admitted` drop together exactly as a
-    /// single-market reset does, without the O(n²) `book_order` cost a per-key loop over
-    /// [`Self::reset_book_for_market`] would pay (see that method's doc).
+    /// single-market reset does — one batch, so `book_order` is filtered once rather than once per
+    /// key (see that method's doc).
     ///
     /// The channel-departure seam (`ingest::reconcile`'s ingest-floor narrowing/removal) — a
     /// different reason from `reset_book_for_market`'s "no venue-wide variant" note above, which is
@@ -4044,6 +4064,187 @@ mod tests {
             model::lock(&replay).identity_index_len(),
             2,
             "the index must hold exactly the two surviving markets"
+        );
+    }
+
+    /// A `book` batch on an explicit `channel` (the `book()` helper always stamps `BOOK_CHANNEL`).
+    fn book_ch(
+        venue: &str,
+        channel: u32,
+        instrument_id: u32,
+        changes: Vec<BookChange>,
+    ) -> FeedMessage {
+        FeedMessage::Book(NormalizedBook {
+            venue: venue.into(),
+            source: venue.into(),
+            source_id: 0,
+            symbol: "KXBTCPERP".into(),
+            channel,
+            instrument_id,
+            changes,
+            snapshot: false,
+            last: true,
+            source_ts_ns: 1_000,
+            recv_ts_ns: 1_000,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        })
+    }
+
+    /// Every leg of the book-market pairing, plus the eviction queue, in one comparable value.
+    #[derive(Debug, PartialEq)]
+    struct BookLegs {
+        /// `book_markets` keys, sorted (the per-arm accumulators).
+        markets: Vec<MarketKey>,
+        /// `book_order` in queue order — not one of the paired legs, but a divergence here would
+        /// change which market a later eviction drops.
+        order: Vec<MarketKey>,
+        /// `StickyAuthority::last_admitted` per seeded key.
+        admitted: Vec<(MarketKey, Option<Publisher>)>,
+        /// The replay entry per seeded key: present-and-`baselined`, present-and-not, or absent.
+        replay: Vec<(MarketKey, Option<bool>)>,
+        /// Keys held by the replay map's `by_identity` index (a stale one hides a live market).
+        identity_index: usize,
+    }
+
+    fn book_legs(a: &Arbiter, replay: &crate::model::BookSnapshot, keys: &[MarketKey]) -> BookLegs {
+        let mut markets: Vec<MarketKey> = a.book_markets.keys().cloned().collect();
+        markets.sort();
+        let guard = model::lock(replay);
+        BookLegs {
+            markets,
+            order: a.book_order.iter().cloned().collect(),
+            admitted: keys
+                .iter()
+                .map(|k| (k.clone(), a.books.last_admitted(k)))
+                .collect(),
+            replay: keys
+                .iter()
+                .map(|k| (k.clone(), guard.get(k).map(|acc| acc.baselined())))
+                .collect(),
+            identity_index: guard.identity_index_len(),
+        }
+    }
+
+    /// Four markets under one venue, each fully re-baselined by `arm(1)`: two on
+    /// `(venue, "sports", BOOK_CHANNEL)`, one on a peer **category** colliding with the first on
+    /// `(channel, instrument_id)`, one on a peer **channel**. Returns the arbiter, its replay map
+    /// and the four keys in that order.
+    fn seeded_books(venue: &str) -> (Arbiter, crate::model::BookSnapshot, Vec<MarketKey>) {
+        const OTHER_CHANNEL: u32 = BOOK_CHANNEL + 1;
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+
+        for (category, channel, id) in [
+            ("sports", BOOK_CHANNEL, BOOK_INSTRUMENT),
+            ("sports", BOOK_CHANNEL, BOOK_INSTRUMENT + 1),
+            ("perps", BOOK_CHANNEL, BOOK_INSTRUMENT),
+            ("sports", OTHER_CHANNEL, BOOK_INSTRUMENT),
+        ] {
+            a.emit(
+                book_ch(venue, channel, id, vec![clear_both()]),
+                arm(1),
+                category,
+            );
+            a.emit(
+                book_ch(venue, channel, id, vec![bid(0.40, 10.0)]),
+                arm(1),
+                category,
+            );
+        }
+
+        let keys: Vec<MarketKey> = vec![
+            (
+                Arc::from(venue),
+                "sports".into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT,
+            ),
+            (
+                Arc::from(venue),
+                "sports".into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT + 1,
+            ),
+            (
+                Arc::from(venue),
+                "perps".into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT,
+            ),
+            (
+                Arc::from(venue),
+                "sports".into(),
+                OTHER_CHANNEL,
+                BOOK_INSTRUMENT,
+            ),
+        ];
+        (a, replay, keys)
+    }
+
+    /// The three legs of the book-market drop are expressed **once**: `reset_book_for_market`
+    /// delegates to `reset_books_for_markets`. This is the test that keeps them from drifting apart
+    /// again — the single-key path and the batch path are run against identical seeded state and
+    /// their results must match on every leg (accumulators, `last_admitted`, replay entry + its
+    /// identity index) plus the eviction queue. Re-implementing either path so it drops a strict
+    /// subset (the historical failure: a replay entry deleted while `last_admitted` survives, so the
+    /// market never re-baselines and is invisible to new clients) fails here.
+    #[test]
+    fn the_single_key_and_the_batch_reset_leave_identical_state() {
+        let venue = "BookResetPathAgreement";
+        let (mut single, single_replay, keys) = seeded_books(venue);
+        let (mut batch, batch_replay, _) = seeded_books(venue);
+        let doomed = keys[0].clone();
+
+        // Fixture sanity: the two seeds start identical, and the market about to be dropped really
+        // holds all three legs (otherwise the agreement below could be two no-ops agreeing).
+        assert_eq!(
+            book_legs(&single, &single_replay, &keys),
+            book_legs(&batch, &batch_replay, &keys),
+            "the two seeds must start identical"
+        );
+        assert!(single.book_markets.contains_key(&doomed));
+        assert_eq!(single.books.last_admitted(&doomed), Some(arm(1)));
+        assert!(model::lock(&single_replay).contains_key(&doomed));
+
+        single.reset_book_for_market(&doomed);
+        batch.reset_books_for_markets(std::slice::from_ref(&doomed));
+
+        let after_single = book_legs(&single, &single_replay, &keys);
+        let after_batch = book_legs(&batch, &batch_replay, &keys);
+        assert_eq!(
+            after_single, after_batch,
+            "the single-key reset and the batch reset must leave identical state on all three legs"
+        );
+
+        // ...and the drop actually happened: the doomed market is gone from all three legs and from
+        // the eviction queue, while the three untouched peers survive complete.
+        assert_eq!(
+            after_single.markets.len(),
+            3,
+            "exactly one market dropped, three survive"
+        );
+        assert!(!after_single.markets.contains(&doomed));
+        assert!(!after_single.order.contains(&doomed));
+        assert_eq!(
+            after_single.admitted,
+            keys.iter()
+                .map(|k| (k.clone(), (k != &doomed).then(|| arm(1))))
+                .collect::<Vec<_>>(),
+            "only the doomed market's last_admitted may drop"
+        );
+        assert_eq!(
+            after_single.replay,
+            keys.iter()
+                .map(|k| (k.clone(), (k != &doomed).then_some(true)))
+                .collect::<Vec<_>>(),
+            "only the doomed market's replay entry may drop, and the peers stay baselined"
+        );
+        assert_eq!(
+            after_single.identity_index, 3,
+            "the identity index must drop exactly the doomed market's key"
         );
     }
 
