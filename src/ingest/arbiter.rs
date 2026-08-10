@@ -54,7 +54,7 @@ use crate::{
     metrics::metrics,
     model::{
         self, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot, FeedMessage,
-        NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade,
+        NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade, ReplayScope,
     },
 };
 
@@ -942,7 +942,11 @@ impl Arbiter {
         if let Some(replay) = &self.book_replay {
             model::lock(replay).insert(key.clone(), acc.clone());
         }
-        acc.baselined().then(|| acc.to_book(&key.0, key.1, key.2))
+        // `Orders` scope: this re-baselines the live stream, so it must carry whatever granularity that
+        // stream carries, or an order-level consumer is handed levels and then cancels for ids it never
+        // saw. A price-aggregated market holds no orders, so the two scopes render identically for it.
+        acc.baselined()
+            .then(|| acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders))
     }
 
     /// Drop one market's tracked `book` state — the session-reset seam, mirroring
@@ -2926,7 +2930,12 @@ mod tests {
         let acc = guard
             .get(&(Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT))
             .expect("the admitted market is in the replay map");
-        let full = acc.to_book(&Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let full = acc.to_book(
+            &Arc::from(venue),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+            ReplayScope::Orders,
+        );
         assert_eq!(
             full.changes[1..].to_vec(),
             vec![bid(0.40, 10.0)],
