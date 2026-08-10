@@ -11,7 +11,9 @@
 //! `codec_mbo` messages into these calls and scales the raw prices/sizes by the instrument's
 //! exponents when emitting `depth`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+
+use crate::metrics::metrics;
 
 /// Cap on resting orders held per instrument book — both the synced population and the in-flight
 /// snapshot under assembly. A real instrument's book is far smaller; this only bounds a forged or
@@ -26,9 +28,25 @@ const MAX_ORDERS_PER_BOOK: usize = 1 << 18;
 /// regardless of which buffered deltas survived.
 const MAX_PENDING_DELTAS: usize = 1 << 18;
 
+/// Cap on remembered removed order ids. The wire is unauthenticated, so this cannot be unbounded;
+/// past the cap the oldest id is forgotten, which reopens the resurrection path only for a copy
+/// arriving later than this many removals. Counted by `dz_mbo_removed_evicted_total`.
+const MAX_REMOVED_ORDERS: usize = 1 << 20;
+
 /// One aggregated price level as `(price_raw, qty_raw)` - raw integers in the instrument's
 /// price/qty exponents (the caller scales them).
 pub type Level = (i64, u64);
+
+/// One order-level change, in raw wire integers. The processor scales these with the instrument's
+/// exponents; this module stays codec- and precision-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderChange {
+    pub order_id: u64,
+    pub is_bid: bool,
+    pub price_raw: i64,
+    /// Absolute resulting quantity. `0` means the order is gone.
+    pub qty_raw: u64,
+}
 
 /// One resting order's mutable state.
 #[derive(Debug, Clone)]
@@ -107,6 +125,11 @@ pub struct BookState {
     building: Option<Building>,
     /// Deltas buffered while `Recovering`, replayed after the next snapshot.
     pending: Vec<DeltaOp>,
+    /// Order ids this book has removed. A venue never reuses one, so an `Add` naming an id in here is
+    /// a stale racing copy and must not resurrect the order.
+    removed: HashSet<u64>,
+    /// `removed` in removal order, oldest first, so the set can be bounded.
+    removed_order: VecDeque<u64>,
     /// Timestamp of the most recent applied event (for the emitted depth's `source_ts_ns`).
     last_event_ts: u64,
 }
@@ -143,12 +166,24 @@ impl BookState {
             last_applied_mktdata_seq: 0,
             building: None,
             pending: Vec::new(),
+            removed: HashSet::new(),
+            removed_order: VecDeque::new(),
             last_event_ts: 0,
         }
     }
 
     pub fn is_synced(&self) -> bool {
         self.state == SyncState::Synced
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_order(&self, order_id: u64) -> bool {
+        self.orders.contains_key(&order_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn removed_len(&self) -> usize {
+        self.removed.len()
     }
 
     pub fn last_event_ts(&self) -> u64 {
@@ -171,6 +206,7 @@ impl BookState {
         self.asks.clear();
         self.building = None;
         self.pending.clear();
+        self.clear_removed();
         self.state = SyncState::Recovering;
         self.last_instr_seq = 0;
         self.last_applied_mktdata_seq = 0;
@@ -186,6 +222,7 @@ impl BookState {
         self.asks.clear();
         self.building = None;
         self.pending.retain(|d| d.mktdata_seq > new_anchor_seq);
+        self.clear_removed();
         self.state = SyncState::Recovering;
         // The dropped book's event clock goes with it: the re-synced book must not stamp its first
         // depth with the pre-reset time, or (after a venue clock restart) that stale stamp would
@@ -278,14 +315,17 @@ impl BookState {
         self.last_instr_seq = b.last_instrument_seq;
         self.last_applied_mktdata_seq = b.anchor_seq;
         self.state = SyncState::Synced;
+        self.clear_removed(); // a snapshot is a fresh id space
 
         // Replay buffered deltas in mktdata-seq order; those at/below the anchor are already
         // included in the snapshot and dropped, per the spec's "discard mktdata_seq <= S" rule.
         let mut pending = std::mem::take(&mut self.pending);
         pending.retain(|d| d.mktdata_seq > b.anchor_seq);
         pending.sort_by_key(|d| d.mktdata_seq);
+        // The caller re-materializes the whole book via `order_set`, so replayed changes go nowhere.
+        let mut discard = Vec::new();
         for d in pending {
-            self.apply_or_recover(d);
+            self.apply_or_recover(d, &mut discard);
             if self.state == SyncState::Recovering {
                 break; // a gap in the buffered deltas; await the next snapshot
             }
@@ -298,6 +338,13 @@ impl BookState {
     /// contiguous one is applied, and a forward gap drops to `Recovering`. Returns whether the
     /// top-of-book-bearing levels may have changed (i.e. a delta was actually applied).
     pub fn on_delta(&mut self, op: DeltaOp) -> bool {
+        self.on_delta_reporting(op, &mut Vec::new())
+    }
+
+    /// [`Self::on_delta`], additionally appending the order-level change each applied event
+    /// produced. Reports nothing for an event the book rejects, so a caller cannot publish a change
+    /// the book did not make.
+    pub fn on_delta_reporting(&mut self, op: DeltaOp, out: &mut Vec<OrderChange>) -> bool {
         match self.state {
             SyncState::Recovering => {
                 if self.pending.len() < MAX_PENDING_DELTAS {
@@ -306,11 +353,11 @@ impl BookState {
                 // else: drop; the book re-anchors on the next snapshot regardless.
                 false
             }
-            SyncState::Synced => self.apply_or_recover(op),
+            SyncState::Synced => self.apply_or_recover(op, out),
         }
     }
 
-    fn apply_or_recover(&mut self, op: DeltaOp) -> bool {
+    fn apply_or_recover(&mut self, op: DeltaOp, out: &mut Vec<OrderChange>) -> bool {
         if op.seq <= self.last_instr_seq {
             return false; // duplicate or already-applied
         }
@@ -324,11 +371,11 @@ impl BookState {
         self.last_instr_seq = op.seq;
         self.last_applied_mktdata_seq = op.mktdata_seq;
         self.last_event_ts = op.ts;
-        self.apply(op.kind);
-        true
+        self.apply(op.kind, out)
     }
 
-    fn apply(&mut self, kind: DeltaKind) {
+    /// Mutate the book, appending the resulting order-level change; returns whether it applied.
+    fn apply(&mut self, kind: DeltaKind, out: &mut Vec<OrderChange>) -> bool {
         match kind {
             DeltaKind::Add {
                 order_id,
@@ -336,6 +383,11 @@ impl BookState {
                 price_raw,
                 qty_raw,
             } => {
+                // Refused here rather than before the sequence bookkeeping: the rejected event still
+                // consumes its sequence number, or the next contiguous delta reads as a gap.
+                if self.removed.contains(&order_id) {
+                    return false;
+                }
                 if self.orders.len() >= MAX_ORDERS_PER_BOOK && !self.orders.contains_key(&order_id)
                 {
                     // Oversized book — only reachable via a flood of forged adds. Drop it to
@@ -345,7 +397,7 @@ impl BookState {
                     self.bids.clear();
                     self.asks.clear();
                     self.state = SyncState::Recovering;
-                    return;
+                    return true;
                 }
                 self.orders.insert(
                     order_id,
@@ -361,6 +413,13 @@ impl BookState {
                     &mut self.asks
                 };
                 level_add(levels, price_raw, qty_raw);
+                out.push(OrderChange {
+                    order_id,
+                    is_bid,
+                    price_raw,
+                    qty_raw,
+                });
+                true
             }
             DeltaKind::Cancel { order_id } => {
                 if let Some(o) = self.orders.remove(&order_id) {
@@ -370,7 +429,15 @@ impl BookState {
                         &mut self.asks
                     };
                     level_remove(levels, o.price_raw, o.qty_raw);
+                    out.push(OrderChange {
+                        order_id,
+                        is_bid: o.is_bid,
+                        price_raw: o.price_raw,
+                        qty_raw: 0,
+                    });
+                    self.note_removed(order_id);
                 }
+                true
             }
             DeltaKind::Execute {
                 order_id,
@@ -382,6 +449,7 @@ impl BookState {
                     let price = o.price_raw;
                     let filled = exec_qty_raw.min(o.qty_raw);
                     o.qty_raw -= filled;
+                    let remaining = o.qty_raw;
                     let remove = full_fill || o.qty_raw == 0;
                     if remove {
                         self.orders.remove(&order_id);
@@ -392,9 +460,64 @@ impl BookState {
                         &mut self.asks
                     };
                     level_remove(levels, price, filled);
+                    out.push(OrderChange {
+                        order_id,
+                        is_bid,
+                        price_raw: price,
+                        qty_raw: if remove { 0 } else { remaining },
+                    });
+                    if remove {
+                        self.note_removed(order_id);
+                    }
                 }
+                true
             }
         }
+    }
+
+    /// Remember a removed order id, forgetting the oldest past [`MAX_REMOVED_ORDERS`].
+    fn note_removed(&mut self, order_id: u64) {
+        if !self.removed.insert(order_id) {
+            return;
+        }
+        self.removed_order.push_back(order_id);
+        while self.removed_order.len() > MAX_REMOVED_ORDERS {
+            if let Some(oldest) = self.removed_order.pop_front() {
+                self.removed.remove(&oldest);
+                metrics().mbo_removed_evicted.inc();
+            }
+        }
+    }
+
+    fn clear_removed(&mut self) {
+        self.removed.clear();
+        self.removed_order.clear();
+    }
+
+    /// Every resting order, bids best-first then asks best-first, ties broken by order id. The
+    /// ordering is deterministic on purpose: two publishers materializing the same book must produce
+    /// identical lists, or the arbiter's content comparison flags map iteration order as a
+    /// disagreement.
+    pub fn order_set(&self, out: &mut Vec<OrderChange>) {
+        out.clear();
+        out.extend(self.orders.iter().map(|(&order_id, o)| OrderChange {
+            order_id,
+            is_bid: o.is_bid,
+            price_raw: o.price_raw,
+            qty_raw: o.qty_raw,
+        }));
+        out.sort_unstable_by(|a, b| {
+            b.is_bid
+                .cmp(&a.is_bid)
+                .then_with(|| {
+                    if a.is_bid {
+                        b.price_raw.cmp(&a.price_raw)
+                    } else {
+                        a.price_raw.cmp(&b.price_raw)
+                    }
+                })
+                .then_with(|| a.order_id.cmp(&b.order_id))
+        });
     }
 
     /// Top-`n` price levels per side as `(price_raw, qty_raw)`, best first: bids high→low, asks
@@ -432,6 +555,28 @@ mod tests {
         }
     }
 
+    fn cancel_op(seq: u32, order_id: u64) -> DeltaOp {
+        DeltaOp {
+            seq,
+            mktdata_seq: seq as u64,
+            ts: seq as u64,
+            kind: DeltaKind::Cancel { order_id },
+        }
+    }
+
+    fn exec_op(seq: u32, order_id: u64, exec_qty_raw: u64, full_fill: bool) -> DeltaOp {
+        DeltaOp {
+            seq,
+            mktdata_seq: seq as u64,
+            ts: seq as u64,
+            kind: DeltaKind::Execute {
+                order_id,
+                exec_qty_raw,
+                full_fill,
+            },
+        }
+    }
+
     /// A fully-recovered book: begin, two orders, end (anchor seq = 0 so deltas start at 1).
     fn synced_book() -> BookState {
         let mut b = BookState::new();
@@ -442,6 +587,204 @@ mod tests {
         assert!(b.on_snapshot_end(0, 1)); // anchor_seq=0, snapshot_id=1
         assert!(b.is_synced());
         b
+    }
+
+    /// A synced book with no resting orders, so deltas start from a clean id space at seq 1.
+    fn synced_empty_book() -> BookState {
+        let mut b = BookState::new();
+        b.on_snapshot_begin(1, 0, 0, 0);
+        assert!(b.on_snapshot_end(0, 1));
+        b
+    }
+
+    #[test]
+    fn deltas_report_the_order_they_touched() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+
+        assert!(b.on_delta_reporting(add(1, 7, true, 18_400, 5), &mut out));
+        assert_eq!(
+            out,
+            vec![OrderChange {
+                order_id: 7,
+                is_bid: true,
+                price_raw: 18_400,
+                qty_raw: 5,
+            }]
+        );
+
+        out.clear();
+        assert!(b.on_delta_reporting(exec_op(2, 7, 2, false), &mut out));
+        assert_eq!(
+            out,
+            vec![OrderChange {
+                order_id: 7,
+                is_bid: true,
+                price_raw: 18_400,
+                qty_raw: 3, // remaining, not the executed amount
+            }]
+        );
+
+        out.clear();
+        assert!(b.on_delta_reporting(cancel_op(3, 7), &mut out));
+        assert_eq!(
+            out,
+            vec![OrderChange {
+                order_id: 7,
+                is_bid: true,
+                price_raw: 18_400,
+                qty_raw: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rejected_delta_reports_nothing() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+        assert!(b.on_delta_reporting(add(1, 7, true, 18_400, 5), &mut out));
+
+        out.clear();
+        assert!(!b.on_delta_reporting(add(1, 8, true, 18_401, 1), &mut out));
+        assert!(out.is_empty());
+    }
+
+    /// A venue never reuses an order id, so an `Add` naming a removed one is a stale racing copy: the
+    /// order must not come back, nothing may be reported, and the *next* legitimate contiguous delta
+    /// must still apply (the refusal consumed its sequence number).
+    #[test]
+    fn a_removed_order_is_never_resurrected() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+        assert!(b.on_delta_reporting(add(1, 7, true, 18_400, 5), &mut out));
+        assert!(b.on_delta_reporting(cancel_op(2, 7), &mut out));
+
+        out.clear();
+        assert!(!b.on_delta_reporting(add(3, 7, true, 18_400, 5), &mut out));
+        assert!(out.is_empty());
+        assert!(!b.has_order(7));
+
+        assert!(b.on_delta_reporting(add(4, 8, true, 18_390, 1), &mut out));
+        assert!(b.is_synced());
+        assert!(b.has_order(8));
+    }
+
+    #[test]
+    fn a_fully_executed_order_is_never_resurrected() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+        assert!(b.on_delta_reporting(add(1, 7, true, 18_400, 5), &mut out));
+        assert!(b.on_delta_reporting(exec_op(2, 7, 5, true), &mut out));
+
+        out.clear();
+        assert!(!b.on_delta_reporting(add(3, 7, true, 18_400, 5), &mut out));
+        assert!(out.is_empty());
+        assert!(!b.has_order(7));
+
+        assert!(b.on_delta_reporting(add(4, 8, true, 18_390, 1), &mut out));
+        assert!(b.is_synced());
+        assert!(b.has_order(8));
+    }
+
+    /// The resurrection guard's memory is bounded: the wire is unauthenticated, so a churn of
+    /// add/cancel pairs must not grow it without limit.
+    #[test]
+    fn the_removed_set_is_bounded() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+        let mut seq = 0u32;
+        for order_id in 0..(MAX_REMOVED_ORDERS as u64 + 1_000) {
+            seq += 1;
+            assert!(b.on_delta_reporting(add(seq, order_id, true, 100, 1), &mut out));
+            seq += 1;
+            assert!(b.on_delta_reporting(cancel_op(seq, order_id), &mut out));
+            out.clear();
+        }
+        assert!(
+            b.removed_len() <= MAX_REMOVED_ORDERS,
+            "removed ids must stay bounded, got {}",
+            b.removed_len()
+        );
+    }
+
+    /// A session end or instrument reset restarts the venue's id space, so a previously removed id
+    /// must be addable again.
+    #[test]
+    fn a_session_reset_reopens_the_id_space() {
+        for end_of_session in [true, false] {
+            let mut b = synced_empty_book();
+            let mut out = Vec::new();
+            assert!(b.on_delta_reporting(add(1, 7, true, 18_400, 5), &mut out));
+            assert!(b.on_delta_reporting(cancel_op(2, 7), &mut out));
+
+            if end_of_session {
+                b.on_end_of_session();
+            } else {
+                b.on_instrument_reset(0);
+            }
+            assert_eq!(b.removed_len(), 0);
+
+            b.on_snapshot_begin(2, 0, 0, 0);
+            assert!(b.on_snapshot_end(0, 2));
+            out.clear();
+            assert!(b.on_delta_reporting(add(1, 7, true, 18_400, 5), &mut out));
+            assert!(b.has_order(7), "end_of_session={end_of_session}");
+        }
+    }
+
+    #[test]
+    fn order_set_is_complete_and_deterministically_ordered() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+        assert!(b.on_delta_reporting(add(1, 10, true, 101, 1), &mut out));
+        assert!(b.on_delta_reporting(add(2, 20, false, 105, 2), &mut out));
+        assert!(b.on_delta_reporting(add(3, 30, true, 100, 3), &mut out));
+        assert!(b.on_delta_reporting(add(4, 40, true, 100, 4), &mut out));
+
+        b.order_set(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                OrderChange {
+                    order_id: 10,
+                    is_bid: true,
+                    price_raw: 101,
+                    qty_raw: 1,
+                },
+                OrderChange {
+                    order_id: 30,
+                    is_bid: true,
+                    price_raw: 100,
+                    qty_raw: 3,
+                },
+                OrderChange {
+                    order_id: 40,
+                    is_bid: true,
+                    price_raw: 100,
+                    qty_raw: 4,
+                },
+                OrderChange {
+                    order_id: 20,
+                    is_bid: false,
+                    price_raw: 105,
+                    qty_raw: 2,
+                },
+            ]
+        );
+    }
+
+    /// A forged extreme `price_raw` must not panic the ordering (negating `i64::MIN` overflows).
+    #[test]
+    fn order_set_tolerates_extreme_prices() {
+        let mut b = synced_empty_book();
+        let mut out = Vec::new();
+        assert!(b.on_delta_reporting(add(1, 1, true, i64::MIN, 1), &mut out));
+        assert!(b.on_delta_reporting(add(2, 2, true, i64::MAX, 1), &mut out));
+        assert!(b.on_delta_reporting(add(3, 3, false, i64::MIN, 1), &mut out));
+
+        b.order_set(&mut out);
+        let ids: Vec<u64> = out.iter().map(|c| c.order_id).collect();
+        assert_eq!(ids, vec![2, 1, 3]); // bids high→low, then the ask
     }
 
     /// `EndOfSession` drops everything — book, sequences, buffered deltas, event clock — so the
