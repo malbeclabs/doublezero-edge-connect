@@ -170,7 +170,9 @@ Modules are grouped by role under `src/`:
   the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
   venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
   ride separate groups with separate codes. The two **Lashay** perps rows (`lashay-1` TOB
-  `233.84.178.3:7576/7577`, `lashay-2` MBP `233.84.178.4:31000/41000/51000`, both `Sticky`, both
+  `233.84.178.3:7576/7577` (⚠️ unconfirmed against the wire — the publishers' inventory says
+  `31000/41000` for this row), `lashay-2` MBP `233.84.178.4:32000/42000/52000` (confirmed on the wire
+  2026-08-09), both `Sticky`, both
   claiming the tape) are exactly that case. Both groups are **live and activated** (testnet and
   mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
   that does not match its live group fails **silently** — no warning, no failed bind, just a

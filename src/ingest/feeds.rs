@@ -645,9 +645,9 @@ mod tests {
         assert_eq!(mbp.code, "lashay-2");
         assert_eq!(mbp.group, Ipv4Addr::new(233, 84, 178, 4));
         assert_eq!(mbp.publishers.len(), 1);
-        assert_eq!(mbp.publishers[0].ports.mktdata(), 31000);
-        assert_eq!(mbp.publishers[0].ports.refdata(), 41000);
-        assert_eq!(mbp.publishers[0].ports.snapshot(), Some(51000));
+        assert_eq!(mbp.publishers[0].ports.mktdata(), 32000);
+        assert_eq!(mbp.publishers[0].ports.refdata(), 42000);
+        assert_eq!(mbp.publishers[0].ports.snapshot(), Some(52000));
 
         // Both claim the tape (each group is gated on its own), and both race stickily.
         for f in [tob, mbp] {

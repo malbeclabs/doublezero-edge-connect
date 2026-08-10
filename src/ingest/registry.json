@@ -192,7 +192,7 @@
         "publisher role uses."
       ],
       "publishers": {
-        "explicit": [{ "mktdata": 31000, "refdata": 41000, "snapshot": 51000 }]
+        "explicit": [{ "mktdata": 32000, "refdata": 42000, "snapshot": 52000 }]
       }
     },
     {
