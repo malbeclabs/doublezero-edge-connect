@@ -85,7 +85,9 @@ Modules are grouped by role under `src/`:
   `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
-  (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
+  (WebSocket, on by default), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
+  off by default) and `admin` (the one mutation path in this crate — see below). A new feature is a
+  sibling module here + a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
   market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
@@ -207,7 +209,11 @@ Modules are grouped by role under `src/`:
   **loaded document's** roster and an unknown id or code is fatal at startup, because a floor that
   silently filters nothing is worse than one that refuses to start. Parsed once in `main`; the
   reconciler consumes it as an *input* to the desired receiver set (`feed_keys`), so `reconcile`
-  remains the single activation authority and its spawn/abort diff is unchanged.
+  remains the single activation authority and its spawn/abort diff is unchanged. **Two mechanisms,
+  one validator:** `--channels`/`DZ_CHANNELS` only sets the *initial* value of a shared
+  `Arc<Mutex<ChannelFloor>>`; `sinks::admin`'s `POST /admin/channels` can replace it at runtime
+  through the identical `ChannelFloor::parse`, so nothing reachable after startup can admit a row
+  startup itself would have refused.
 - **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
   (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
   authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never
@@ -250,6 +256,15 @@ Modules are grouped by role under `src/`:
   row, so an incumbent keeps the tape until the newcomer really registers rather than bouncing on
   activation; above a dead one, so a cold start where nothing has bound falls back to rank instead of
   leaving the venue ownerless). Changes are counted by `dz_tape_owner_changes_total{venue}`.
+  `forget_departing_channel` is the other half of a floor narrowing (static at startup, or via
+  `sinks::admin`'s `POST /admin/channels` at runtime): once a channel's receiver key actually leaves
+  `plan()`'s desired set — never before, per the `N1` `debug_assert!` guarding reordering — it purges
+  that departing row's own `(venue, category, channel)` slice from all three: the catalog
+  (`InstrumentSnapshot`, a `retain`), the book (routed through `Arbiter::forget_channel_books`, never
+  a direct replay-map delete, so the accumulator/replay/`StickyAuthority` triple drops together), and
+  `history::Store::forget_channel`. Category-precise throughout so a departing channel can never
+  over-drop a live peer universe sharing the same numeric id — see `ingest/feeds.rs`'s
+  mid-migration warning on `channel_id`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
@@ -537,6 +552,47 @@ Modules are grouped by role under `src/`:
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
+- **`sinks/api.rs`**'s `GET /v1/status` carries three accounting blocks beyond per-venue
+  `online`/`offline`: `history` (`history::Store::stats()` verbatim — products tracked/at cap,
+  buckets, bucket budget, estimated bytes, window, evictions, late drops), `channels` (per enabled
+  row that carries a channel id — every row but a flat one, see `ingest/floor.rs` — its full roster
+  with `floor_admits` from the floor alone, `bound` from **real** receiver liveness
+  (`SharedFeedHealth::liveness`, keyed exactly as the reconciler's own receiver map — an
+  admitted-but-unsubscribed channel reads `Unregistered`/`Down` here rather than a false "bound",
+  the exact field the admin surface's own `GET` had to caveat instead of fix, since it has no
+  liveness handle at all), `products` from `history::products_for` at the same `(venue, category,
+  channel)` grain, plus `label` (registry-supplied, display-only) or, failing that, live-derived
+  `symbol_prefixes` — one linear pass over the whole instrument catalog per request (not per
+  channel), capped at 8 distinct prefixes with a `_truncated` flag, both omitted rather than sent
+  empty/null so a bare channel id reads as "no signal yet," never an error), and `process`
+  (resident memory + cumulative CPU time read straight off the Prometheus **process collector**,
+  deliberately independent of `--metrics-bind` so it still answers over `--url` against a remote
+  host with neither the metrics endpoint nor `/proc` access enabled; `None`, never a fabricated `0`,
+  when the collector isn't registered — it's Linux-only, see `metrics::Metrics::new`).
+- **`sinks/admin.rs`** — the **one mutation path** in this crate, entirely separate from `/v1`
+  (which must stay provably read-only) and off unless `--admin-bind`/`DZ_ADMIN_BIND` is set — empty
+  by default, unlike `--api-bind`: a mutation surface that defaulted on is one an operator gets by
+  accident. **No authentication**, and under host networking a wildcard bind is genuinely
+  network-reachable, so the documented recommendation is a loopback bind (`127.0.0.1:9098`), never a
+  bare wildcard. Two routes, both `/admin/channels`: `GET` reports the floor in force plus, per
+  enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver set
+  (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
+  field says so rather than the response naming the field "bound" and inviting the exact mistake
+  `sinks/api.rs`'s own `channels` block above had to fix); `POST ?channels=<spec>` replaces the
+  shared `Arc<Mutex<ChannelFloor>>` through the identical `ChannelFloor::parse` the startup path
+  uses — so nothing here can admit a row startup would have refused — taking effect on the
+  reconciler's *next* tick via the existing spawn/abort diff, which is also what purges a departing
+  channel's catalog/book/history state (`reconcile::forget_departing_channel`, above), not the
+  instant the handler returns. The spec travels as a **query parameter, not a body**: this crate's
+  hand-rolled `sinks::http` scaffolding never reads one, so `POST` refuses two distinct caller
+  mistakes rather than silently misfiring on the natural instinct to `POST` a body — a **missing**
+  `channels` parameter (400, distinct from present-and-empty, which is how an operator explicitly
+  clears the floor) and a **non-empty request body** (400, detected via `Content-Length` — otherwise
+  silently ignored, which is how `curl -d` or a library's default `post(url, data=...)` would
+  quietly widen the floor to admit-everything while looking, to the caller, like it worked). Bind/
+  serve split exactly as `ws`/`api` (a taken port disables this surface without taking the tunnel
+  down) but deliberately **not** subscription-gated — an operator must be able to inspect or narrow
+  the floor before anything is subscribed at all.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
   `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by

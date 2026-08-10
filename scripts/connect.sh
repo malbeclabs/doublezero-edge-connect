@@ -30,8 +30,22 @@
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, DZ_IFACE, DZ_SHRED_*, RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
+# (WS_*, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
+# RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect | bash
+#
+# Two of those need a second look before you set them:
+#   DZ_FEED_REGISTRY=<path>  is read INSIDE the container. This script requires an absolute path
+#                            that also exists on THIS host, and bind-mounts it read-only at that
+#                            identical container-side path -- an unreadable path aborts before any
+#                            container starts, rather than being passed through to silently resolve
+#                            to nothing.
+#   DZ_ADMIN_BIND=<host:port> turns on GET/POST /admin/channels, the one runtime-MUTATION path in
+#                            the bridge (lets DZ_CHANNELS be replaced without a restart). It has NO
+#                            authentication, and under this container's --network host a wildcard
+#                            bind is genuinely reachable from the network. Bind loopback, e.g.
+#                            DZ_ADMIN_BIND=127.0.0.1:9098; a non-loopback value is only warned about,
+#                            never blocked.
 #
 # A DZ_-token-derived keypair is injected straight into the container and is never
 # written to the host disk; a keypair supplied as a file path is bind-mounted
@@ -515,6 +529,40 @@ preflight_ws_port() {
 preflight_ws_port
 
 # ----------------------------------------------------------------------------
+# 4c. feed registry bind-mount (host-side)
+# ----------------------------------------------------------------------------
+# DZ_FEED_REGISTRY names a path the BRIDGE reads *inside the container* (--feed-registry). Passing
+# the env var through with no matching mount would have the bridge look for a file that was never
+# copied in -- it resolves to nothing, and the bridge treats a missing/unreadable File source as
+# FATAL (an operator's explicit instruction about this one container), so the container would just
+# crash-loop. Wire the mount here instead: require an absolute path (the only kind `docker -v` can
+# bind at an identical container-side path) and bind-mount it read-only at that exact path, so the
+# value the bridge sees is always backed by a real file. Fail fast, before any Docker pull.
+REGISTRY_MOUNT=()
+if [ -n "${DZ_FEED_REGISTRY:-}" ]; then
+  case "$DZ_FEED_REGISTRY" in
+    /*) : ;;
+    *) die "DZ_FEED_REGISTRY must be an absolute path (it is read INSIDE the container at this exact path, bind-mounted from the same path on this host). Got: $DZ_FEED_REGISTRY" ;;
+  esac
+  [ -f "$DZ_FEED_REGISTRY" ] || die "DZ_FEED_REGISTRY=$DZ_FEED_REGISTRY does not exist on this host. It names a path read *inside* the container; without a matching file here to bind-mount, the bridge would start looking for a file that was never copied in and refuse to start (a File registry source is fatal on failure). Fix the path, or unset DZ_FEED_REGISTRY to use the built-in registry."
+  REGISTRY_MOUNT=(-v "$DZ_FEED_REGISTRY":"$DZ_FEED_REGISTRY":"$MNT_OPT")
+  info "Bind-mounting feed registry: $DZ_FEED_REGISTRY (read-only)"
+fi
+
+# ----------------------------------------------------------------------------
+# 4d. admin surface warning (host-side)
+# ----------------------------------------------------------------------------
+# GET/POST /admin/channels (DZ_ADMIN_BIND) is the one runtime-MUTATION path in the bridge, and it
+# carries NO authentication. Under this container's --network host, a wildcard bind is genuinely
+# reachable from the network -- warn loudly (the script can't enforce a bind choice, only flag one).
+if [ -n "${DZ_ADMIN_BIND:-}" ]; then
+  case "$DZ_ADMIN_BIND" in
+    127.*|localhost:*) : ;;
+    *) warn "DZ_ADMIN_BIND=$DZ_ADMIN_BIND is not a loopback address. GET/POST /admin/channels has NO authentication -- under --network host this bind is reachable from the network, and POST can change what this process ingests. Recommended: DZ_ADMIN_BIND=127.0.0.1:9098 (or another loopback port), unless you have your own network-level access control in front of it." ;;
+  esac
+fi
+
+# ----------------------------------------------------------------------------
 # 5. cloud detection -> warn about provider-level firewall (script can't fix)
 # ----------------------------------------------------------------------------
 detect_cloud() {
@@ -555,6 +603,9 @@ $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
 # independent of the host daemon's default driver — and `docker logs` still works.
 mount_args=()
 [ "$KEY_SRC" = file ] && mount_args=(-v "$KEYFILE":"$KEYPAIR_DEST":"$MNT_OPT")
+# Feed registry, if DZ_FEED_REGISTRY was set (see 4c above): bind-mounted read-only at the
+# identical container-side path the bridge was told to read.
+mount_args+=("${REGISTRY_MOUNT[@]}")
 # Relay bridge env vars to the container. The bridge reads every flag from an env var, so this is
 # the only wiring needed to tune the WS sink, narrow feeds, or raise log level — no per-feature
 # logic here. Only non-empty values are forwarded, with one exception (WS_BIND, below).
@@ -564,7 +615,8 @@ PASSTHROUGH=(
   DZ_FEEDS DZ_IFACE DZ_RECV_BUF
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
-  DZ_API_BIND
+  DZ_API_BIND METRICS_BIND
+  DZ_CHANNELS DZ_ADMIN_BIND DZ_FEED_REGISTRY DZ_FEED_REGISTRY_URL
   DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
   DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
   RUST_LOG

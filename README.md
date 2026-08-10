@@ -85,7 +85,10 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_NAME` | `doublezero-edge-connect` | Container name. |
 | `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion. Does **not** affect Solana shred forwarding. |
 | `DZ_PUBLISHER_PORTS` | *(all)* | Comma-separated publisher **base ports** (the market-data port of each block, e.g. `9201`) to narrow which mirrors of each selected feed are ingested. One receiver runs per publisher, so this caps ingest cost on a multi-publisher venue. Base ports are unique within a feed but not across feeds — pair with `DZ_FEEDS` to scope to one venue. |
-| `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned row ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a row whose publishers share one base port, is refused rather than silently filtering nothing. |
+| `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned row ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a row whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
+| `DZ_FEED_REGISTRY_URL` | *(none)* | URL to fetch the feed registry document from at startup. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used and a warning is logged — never fatal. |
+| `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, ignored when `DZ_FEED_REGISTRY_URL` is set. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
+| `DZ_ADMIN_BIND` | *(off)* | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). Off by default; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you enable it, bind to loopback (e.g. `127.0.0.1:9098`) — never a bare wildcard. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
 | `DZ_CLIENT_IP` | *(auto-detected)* | Override the host public IP used by the access-pass pre-check (set if auto-detection is wrong). |
@@ -96,10 +99,14 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 **Bridge variables.** The installer relays **any** non-empty bridge env var straight through to
 the container, so the bridge is tuned entirely from the one-liner. Common ones: `DZ_IFACE`,
 `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `METRICS_BIND` (turn on the Prometheus `/metrics`
-endpoint — off by default), `RUST_LOG`, the shred forwarder's `DZ_SHRED_*` (notably
-`DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`), and the reconciler's `DZ_SUBSCRIPTION_REFRESH_SECS`
-/ `DZ_SUBSCRIPTION_GATING_DISABLE`. The full list with defaults is the `Args`
-struct in [`src/main.rs`](src/main.rs); per-feature config lives in the [docs](docs/) (see below).
+endpoint — off by default), `DZ_API_BIND` (the read-only `/v1` query API), `DZ_ADMIN_BIND` and
+`DZ_CHANNELS` (the runtime-mutable ingest floor — see [Admin
+surface](#admin-surface-runtime-channel-changes)), `DZ_FEED_REGISTRY`/`DZ_FEED_REGISTRY_URL` (the
+feed registry document sources — see the table above), `RUST_LOG`, the shred forwarder's
+`DZ_SHRED_*` (notably `DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`), and the reconciler's
+`DZ_SUBSCRIPTION_REFRESH_SECS` / `DZ_SUBSCRIPTION_GATING_DISABLE`. The full list with defaults is
+the `Args` struct in [`src/main.rs`](src/main.rs); per-feature config lives in the
+[docs](docs/) (see below).
 
 > **Subscription-driven activation.** The bridge only runs the feeds this host is actually
 > subscribed to: a reconciler polls `doublezero status` every `DZ_SUBSCRIPTION_REFRESH_SECS`
@@ -186,7 +193,7 @@ cargo build --release -p doublezero-edge
 ./target/release/doublezero-edge products candles HYPERLIQUID:BTC granularity==ONE_MINUTE
 ```
 
-Seven commands, all `GET`s:
+Six commands read `/v1` (all `GET`s), plus a `channels` group that talks to a **separate** surface:
 
 | Command | What it returns |
 |---|---|
@@ -196,7 +203,9 @@ Seven commands, all `GET`s:
 | `products candles <id>` | OHLCV candles (`granularity`/`limit` query params) |
 | `products book <id>` | The order book |
 | `products best_bid_ask` | Best bid/ask across every product |
-| `status` | Per-venue feed health plus history-store stats |
+| `status` | Per-venue feed health, plus `history` (history-store occupancy), `channels` (per-row floor admission, real bound state and product counts) and `process` (resident memory, CPU time) blocks |
+| `channels list` | The ingest channel floor in force, and what it admits/binds per row (talks to the admin surface, not `/v1`) |
+| `channels set <spec>` | Replace the floor (same syntax as `--channels`/`DZ_CHANNELS`); previews what would be dropped and asks for confirmation unless `--force` (talks to the admin surface, not `/v1`) |
 
 `<id>` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`); add `#<channel>.<instrument_id>` only if a bare
 symbol collides across markets — the CLI reports the candidates when it does. Point it at a
@@ -207,10 +216,39 @@ non-default or remote container with `--url` (env `DOUBLEZERO_EDGE_URL`; default
 doublezero-edge --url http://edge-host:9099 products ticker HYPERLIQUID:BTC
 ```
 
-**Read-only, with no exception.** There is no order-placement or mutation path anywhere in
-edge-connect for this tool to reach, so unlike the trading CLI its surface is modelled on, no
-command here ever needs a confirmation prompt. **Candles and tickers cover a rolling one hour, held
+**`products`/`status` are read-only, with no exception.** There is no order-placement or mutation
+path anywhere in edge-connect for `/v1` to reach, so unlike the trading CLI its surface is modelled
+on, neither ever needs a confirmation prompt. **Candles and tickers cover a rolling one hour, held
 in memory** — the window does not survive a bridge restart and nothing here is ever written to disk.
+
+**`channels` is the one exception**, and talks to a different, off-by-default surface entirely — see
+[Admin surface](#admin-surface-runtime-channel-changes) below.
+
+### Admin surface (runtime channel changes)
+
+Beyond `/v1`, the bridge optionally serves an **admin** surface — `GET`/`POST /admin/channels` — the
+one runtime-mutation path in edge-connect, letting the ingest channel floor (`--channels`/
+`DZ_CHANNELS`) be replaced without a restart. It is **off by default** (`--admin-bind`/
+`DZ_ADMIN_BIND` empty) and deliberately separate from `/v1`, which stays provably read-only.
+
+```bash
+./target/release/doublezero-edge-connect --iface doublezero1 --admin-bind 127.0.0.1:9098
+doublezero-edge channels list
+doublezero-edge channels set 'lashay-4=10,11'
+```
+
+`GET` reports the floor in force and, per row, which publishers/channels it admits (not necessarily
+**bound** — a row's group must also be subscribed for an admitted publisher to actually receive
+traffic; `status` above reports real liveness). `POST ?channels=<spec>` validates through the exact
+same parser `--channels`/`DZ_CHANNELS` uses at startup, so nothing here can admit a row startup
+would have refused, and it takes effect on the reconciler's next pass — which is also what drops a
+departing channel's catalog, book and history state, so narrowing the floor at runtime is
+irreversible within the history window.
+
+> **No authentication.** This surface has none, and under the container's `--network host`, a
+> wildcard bind is genuinely reachable from the network, same as `/v1`. **Bind it to loopback**
+> (`127.0.0.1:9098`, `doublezero-edge`'s own default), never a bare wildcard, unless you have your
+> own network-level access control in front of it.
 
 The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
 `doublezero-edge` builds and runs on macOS as well as Linux; the bridge itself does not (it uses

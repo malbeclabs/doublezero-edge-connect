@@ -98,7 +98,10 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/bridge-entrypoint.sh
 # default in src/main.rs); override with `-e RUST_LOG=debug` to get verbose output.
 ENV RUST_LOG=warn,doublezero_edge_connect=info
 
-# Documentational: host networking ignores published ports, but this records the WS port (8081).
-EXPOSE 8081
+# Documentational: host networking ignores published ports (EXPOSE opens nothing by itself), but
+# this records the surfaces a default config can listen on. Always-on: 8081 (WS, --ws-bind) and
+# 9099 (query API, --api-bind). Off unless configured: 9090 (metrics, --metrics-bind, empty
+# default) and 9098 (admin, --admin-bind, empty default — no authentication; bind loopback only).
+EXPOSE 8081 9099 9090 9098
 
 ENTRYPOINT ["bridge-entrypoint.sh"]
