@@ -49,12 +49,41 @@ pub struct HostSubs {
 }
 
 /// One entry of `doublezero status --json`. Only `multicast_groups` is read; every other field
-/// (`response`, `current_device`, …) is ignored. A session with no multicast groups (e.g. IBRL)
-/// simply has the field absent/null → treated as no subscriptions.
+/// (`response`, `current_device`, …) is ignored.
+///
+/// Modeled as `Option<Option<String>>` so the **key being absent entirely** (the outer
+/// `Option::None`, supplied by `#[serde(default)]`) can never collapse into the **same value** as
+/// the key being present with an explicit JSON `null` (`Some(None)`). That distinction is
+/// load-bearing: a session with no multicast groups (e.g. IBRL) reports the key present, as `null`
+/// or `""` — a real zero-subscription signal — while the key being missing from the object
+/// altogether is a shape this process does not recognize (an upstream rename/removal of the
+/// field), and must not be read as "zero subscriptions" (see `parse_status_codes`'s F1 note).
+///
+/// ⚠️ Naive `Option<Option<T>>` with a bare `#[serde(default)]` does **not** achieve this: serde's
+/// `Option<T>` deserializer intercepts a JSON `null` at the *outer* layer and short-circuits
+/// straight to the outer `None` (`visit_none`) without ever consulting the inner `Option<String>`
+/// — so `null` and "key absent" collapse to the identical outer `None` regardless of nesting depth
+/// (a well-known serde gotcha, see serde-rs/serde#984). `deserialize_with = "present_and_null_ok"`
+/// is what actually separates them: it only runs at all when the key is present (`#[serde(default)]`
+/// supplies the outer `None` before the deserializer is ever invoked otherwise), and it explicitly
+/// wraps whatever `Option<String>` the value deserializes to (`null` → `None`, a string → `Some`) in
+/// an outer `Some(..)` — so "present" is encoded by the act of the deserializer having run, not by
+/// what the value happened to be.
 #[derive(Debug, Deserialize)]
 struct StatusEntry {
-    #[serde(default)]
-    multicast_groups: Option<String>,
+    #[serde(default, deserialize_with = "present_and_null_ok")]
+    multicast_groups: Option<Option<String>>,
+}
+
+/// Deserialize a present field's value as `T` and wrap it in `Some` unconditionally — the seam that
+/// makes "the key was present at all" a fact recorded independently of the value itself (`null`
+/// included). Only ever invoked when the key exists, via `#[serde(default, deserialize_with = ...)]`
+/// on [`StatusEntry::multicast_groups`] above.
+fn present_and_null_ok<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Parse the subscribed group **codes** from `doublezero status --json`. Each `multicast_groups`
@@ -72,6 +101,15 @@ struct StatusEntry {
 /// `Some(codes)` — `codes` possibly empty — is the honest, structurally-parsed answer: an IBRL
 /// session, or any host truly holding no multicast subscriptions, is a *real* zero-subscription
 /// state and must proceed as such, not be conflated with a parse failure.
+///
+/// **F1:** the likeliest real-world way this parse "fails" is not malformed JSON at all — it is an
+/// upstream rename of `multicast_groups` itself, which `serde_json::from_slice` shrugs off
+/// entirely (the field is optional) and would, with a plain `Option<String>`, quietly land on
+/// `None` → `Some(vec![])` here: a field rename reading as "this host subscribes to nothing,"
+/// fleet-wide, the instant the CLI ships it — silently discarding every channel's catalog, books
+/// and history via the reconciler's departure purge. An entry whose `multicast_groups` key is
+/// missing entirely is therefore treated exactly like a top-level parse failure: `None`, not an
+/// empty list.
 pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
     let entries: Vec<StatusEntry> = match serde_json::from_slice(stdout) {
         Ok(e) => e,
@@ -82,7 +120,19 @@ pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
     };
     let mut out = Vec::new();
     for entry in entries {
-        let Some(groups) = entry.multicast_groups else {
+        // The outer `None` is the key-absent case (F1): report the whole read as unparseable
+        // rather than silently treating a missing/renamed field as zero subscriptions.
+        let Some(groups_present) = entry.multicast_groups else {
+            warn!(
+                "doublezero status --json entry has no multicast_groups key at all; reporting \
+                 Unavailable (not zero subscriptions) — a renamed/removed field, not a legitimate \
+                 empty session"
+            );
+            return None;
+        };
+        // The inner `None` is the key present as explicit JSON `null` — a genuine "no groups"
+        // signal once the key exists at all (e.g. an IBRL session).
+        let Some(groups) = groups_present else {
             continue;
         };
         for tok in groups.split(',') {
@@ -264,16 +314,19 @@ mod tests {
         );
     }
 
-    /// A well-formed response reporting no multicast groups at all (an IBRL session, or an empty
-    /// `multicast_groups` field) is a **real** zero-subscription state: `Some(vec![])`, never
-    /// `None`. Distinct from `unparseable_json_reports_none_not_an_empty_list` below on purpose — a
-    /// test covering only one of the two branches cannot tell a `None`-vs-`Some(empty)` regression
-    /// apart, which is exactly the bug this pair of tests exists to catch.
+    /// A well-formed response reporting no multicast groups at all — the key **present** as an
+    /// explicit `null` or empty string (an IBRL session reports the key, it just has nothing in
+    /// it) — is a **real** zero-subscription state: `Some(vec![])`, never `None`. Distinct from
+    /// both `a_missing_multicast_groups_key_reports_none_not_zero_subscriptions` (the key present
+    /// vs. absent — F1) and `unparseable_json_reports_none_not_an_empty_list` (malformed JSON)
+    /// below on purpose — a test covering only one of these cannot tell a `None`-vs-`Some(empty)`
+    /// regression apart, which is exactly the bug this group of tests exists to catch.
     #[test]
     fn a_well_formed_response_with_no_groups_reports_some_empty_not_none() {
         assert_eq!(
-            parse_status_codes(br#"[{"response":{"user_type":"IBRL"}}]"#),
-            Some(Vec::new())
+            parse_status_codes(br#"[{"response":{"user_type":"IBRL"},"multicast_groups":null}]"#),
+            Some(Vec::new()),
+            "the key present as null is a legitimate empty session"
         );
         assert_eq!(
             parse_status_codes(br#"[{"multicast_groups":""}]"#),
@@ -302,6 +355,36 @@ mod tests {
         assert_eq!(parse_status_codes(b"not json"), None);
         // A JSON object, not an array — the same "wrong shape" case, just a different flavor of it.
         assert_eq!(parse_status_codes(b"{\"multicast_groups\":\"S:x\"}"), None);
+    }
+
+    /// F1, the finding this round exists for: an entry whose JSON *object parses fine* but whose
+    /// `multicast_groups` **key is entirely absent** — modeling an upstream field rename or removal
+    /// — must report `None`, exactly like `unparseable_json_reports_none_not_an_empty_list` above,
+    /// and must NOT be conflated with `a_well_formed_response_with_no_groups_reports_some_empty_not_none`,
+    /// whose fixtures all carry the key (as `null` or `""`). A fixture that only ever omits the key
+    /// entirely could not tell "the field was renamed" apart from "the field legitimately holds
+    /// nothing" — these two tests, one per case, are what make that distinction real.
+    #[test]
+    fn a_missing_multicast_groups_key_reports_none_not_zero_subscriptions() {
+        // Well-formed JSON, valid entry object, but the key itself is not present at all.
+        assert_eq!(
+            parse_status_codes(br#"[{"response":{"user_type":"IBRL"}}]"#),
+            None,
+            "an entry with no multicast_groups key at all must not silently read as zero \
+             subscriptions"
+        );
+        assert_eq!(
+            parse_status_codes(br#"[{"current_device":"tyo002-dz002"}]"#),
+            None
+        );
+        // The specific real-world shape this guards against: the field renamed rather than absent
+        // outright — its replacement present under a different name changes nothing, since the
+        // *old* name is still the one this process reads.
+        assert_eq!(
+            parse_status_codes(br#"[{"multicastGroups":"S:tiredsolid"}]"#),
+            None,
+            "a renamed multicast_groups field must not silently parse as zero subscriptions"
+        );
     }
 
     fn subs(codes: &[&str], code_ip: &[(&str, Ipv4Addr)]) -> HostSubs {

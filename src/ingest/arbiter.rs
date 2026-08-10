@@ -966,10 +966,37 @@ impl Arbiter {
         self.books.forget_market(key);
     }
 
+    /// The same three-way drop as [`Self::reset_book_for_market`], for a **batch** of keys at once —
+    /// `book_order`'s cleanup is one linear scan over the whole queue, not one scan per key.
+    ///
+    /// [`Self::reset_book_for_market`] is O(`book_order.len()`) per call: `book_order` is a
+    /// `VecDeque`, and eviction (its only other caller) only ever drops one market at a time, so a
+    /// per-call scan was never the wrong cost model there. Calling it in a loop for N keys is
+    /// O(`N * book_order.len()`), which is real money at [`MAX_BOOK_MARKETS`] scale — shedding most
+    /// of a channel's markets (the common floor-narrowing case: a handful of channels admitted out
+    /// of dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for
+    /// tens of milliseconds to seconds. This is the seam [`Self::forget_channel_books`] uses
+    /// instead: identical per-market work, `book_order` filtered once.
+    fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let doomed: HashSet<&MarketKey> = keys.iter().collect();
+        for key in keys {
+            self.book_markets.remove(key);
+            if let Some(replay) = &self.book_replay {
+                model::lock(replay).remove(key);
+            }
+            self.books.forget_market(key);
+        }
+        self.book_order.retain(|k| !doomed.contains(k));
+    }
+
     /// Drop **every** tracked `book` market on `(venue, category, channel)` — every
-    /// `instrument_id` under it — through [`Self::reset_book_for_market`], so each one's
+    /// `instrument_id` under it — through [`Self::reset_books_for_markets`], so each one's
     /// accumulator, replay entry and `StickyAuthority::last_admitted` drop together exactly as a
-    /// single-market reset does.
+    /// single-market reset does, without the O(n²) `book_order` cost a per-key loop over
+    /// [`Self::reset_book_for_market`] would pay (see that method's doc).
     ///
     /// The channel-departure seam (`ingest::reconcile`'s ingest-floor narrowing/removal) — a
     /// different reason from `reset_book_for_market`'s "no venue-wide variant" note above, which is
@@ -992,9 +1019,7 @@ impl Arbiter {
             .cloned()
             .collect();
         let dropped = doomed.len();
-        for key in doomed {
-            self.reset_book_for_market(&key);
-        }
+        self.reset_books_for_markets(&doomed);
         dropped
     }
 
@@ -3893,22 +3918,65 @@ mod tests {
     /// `contains_key` check on the replay map alone cannot catch — so this asserts `last_admitted`
     /// directly, not just replay-map absence.
     #[test]
-    fn forget_channel_books_drops_the_full_pairing_and_spares_a_peer_category() {
+    fn forget_channel_books_drops_the_full_pairing_and_spares_untouched_peers() {
         let venue = "BookForgetChannel";
         let (tx, _rx) = broadcast::channel(1);
         let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
 
+        // A second channel, same venue/category as the doomed markets — a still-running sibling
+        // channel. `book()` always stamps `BOOK_CHANNEL`, so this batch is built by hand.
+        const OTHER_CHANNEL: u32 = BOOK_CHANNEL + 1;
+        let book_on_channel = |channel: u32, instrument_id: u32, changes: Vec<BookChange>| {
+            FeedMessage::Book(NormalizedBook {
+                venue: venue.into(),
+                source: venue.into(),
+                source_id: 0,
+                symbol: "KXBTCPERP".into(),
+                channel,
+                instrument_id,
+                changes,
+                snapshot: false,
+                last: true,
+                source_ts_ns: 1_000,
+                recv_ts_ns: 1_000,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+
         // Two instruments on the doomed (venue, "sports", BOOK_CHANNEL), each fully re-baselined.
         for id in [BOOK_INSTRUMENT, BOOK_INSTRUMENT + 1] {
             a.emit(book(venue, id, vec![clear_both()], true, 1_000), arm(1), "sports");
             a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_001), arm(1), "sports");
         }
-        // A peer instrument on a different category, same venue/channel/instrument_id as the first
-        // doomed market — the exact collision this crate's docs warn about.
-        a.emit(book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000), arm(1), "perps");
-        a.emit(book(venue, BOOK_INSTRUMENT, vec![bid(0.50, 5.0)], true, 1_001), arm(1), "perps");
+        // Peer 1: a different **category**, same venue/channel/instrument_id as the first doomed
+        // market — the exact collision this crate's docs warn about. Deleting the category term
+        // from `forget_channel_books`'s filter would wrongly sweep this one up too.
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000),
+            arm(1),
+            "perps",
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.50, 5.0)], true, 1_001),
+            arm(1),
+            "perps",
+        );
+        // Peer 2: a different **channel**, same venue/category as the doomed markets. Deleting the
+        // channel term from the filter would wrongly sweep this still-running sibling channel up
+        // too — the failure mode a single-channel fixture cannot express.
+        a.emit(
+            book_on_channel(OTHER_CHANNEL, BOOK_INSTRUMENT, vec![clear_both()]),
+            arm(1),
+            "sports",
+        );
+        a.emit(
+            book_on_channel(OTHER_CHANNEL, BOOK_INSTRUMENT, vec![bid(0.60, 7.0)]),
+            arm(1),
+            "sports",
+        );
 
         let doomed_a: MarketKey = (Arc::from(venue), "sports".into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
         let doomed_b: MarketKey = (
@@ -3917,12 +3985,23 @@ mod tests {
             BOOK_CHANNEL,
             BOOK_INSTRUMENT + 1,
         );
-        let peer: MarketKey = (Arc::from(venue), "perps".into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let peer_category: MarketKey =
+            (Arc::from(venue), "perps".into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let peer_channel: MarketKey =
+            (Arc::from(venue), "sports".into(), OTHER_CHANNEL, BOOK_INSTRUMENT);
+
         assert_eq!(a.books.last_admitted(&doomed_a), Some(arm(1)), "fixture sanity");
-        assert_eq!(a.books.last_admitted(&peer), Some(arm(1)), "fixture sanity");
+        assert_eq!(a.books.last_admitted(&doomed_b), Some(arm(1)), "fixture sanity");
+        assert_eq!(a.books.last_admitted(&peer_category), Some(arm(1)), "fixture sanity");
+        assert_eq!(a.books.last_admitted(&peer_channel), Some(arm(1)), "fixture sanity");
+        assert_eq!(
+            model::lock(&replay).identity_index_len(),
+            4,
+            "fixture sanity: four distinct markets indexed"
+        );
 
         let dropped = a.forget_channel_books(venue, "sports", BOOK_CHANNEL);
-        assert_eq!(dropped, 2, "both sports instruments on that channel");
+        assert_eq!(dropped, 2, "exactly the two sports instruments on that channel");
 
         // All three legs, for both doomed markets.
         assert!(!a.book_markets.contains_key(&doomed_a));
@@ -3935,16 +4014,36 @@ mod tests {
             assert!(!guard.contains_key(&doomed_b));
         }
 
-        // The peer category's market survives in all three, untouched.
-        assert!(a.book_markets.contains_key(&peer), "the peer market must survive");
+        // Both peers survive in all three, checked by name so a category-blind purge and a
+        // channel-blind purge each fail on their own peer rather than one masking the other.
+        for (name, peer) in [
+            ("peer_category", &peer_category),
+            ("peer_channel", &peer_channel),
+        ] {
+            assert!(
+                a.book_markets.contains_key(peer),
+                "{name} must survive in book_markets"
+            );
+            assert_eq!(
+                a.books.last_admitted(peer),
+                Some(arm(1)),
+                "{name}'s authority record must survive"
+            );
+            assert!(
+                model::lock(&replay).get(peer).is_some_and(|acc| acc.baselined()),
+                "{name}'s replay entry must survive, complete"
+            );
+        }
+
+        // F4: the identity index must drop exactly the two doomed markets' entries and nothing
+        // else (the coverage `model::BookReplay::forget_channel`'s own test carried before this
+        // seam moved to the arbiter). An entry outliving its market both leaks and, where two
+        // universes collide on one identity (`peer_category` here), makes the survivor unreachable
+        // by wire identity until a stale entry happens to be overwritten.
         assert_eq!(
-            a.books.last_admitted(&peer),
-            Some(arm(1)),
-            "the peer's authority record must survive"
-        );
-        assert!(
-            model::lock(&replay).get(&peer).is_some_and(|acc| acc.baselined()),
-            "the peer's replay entry must survive, complete"
+            model::lock(&replay).identity_index_len(),
+            2,
+            "the index must hold exactly the two surviving markets"
         );
     }
 
