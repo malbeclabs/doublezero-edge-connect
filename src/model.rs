@@ -81,6 +81,13 @@ pub fn empty_source() -> Arc<str> {
     Arc::from("")
 }
 
+/// Default for the producer-side-only `category` field carried by [`NormalizedInstrument`] and
+/// [`NormalizedTrade`] (`#[serde(skip)]` — see their docs for why it must never reach the wire).
+/// `Arc<str>` has no `Default`, so this needs the same explicit function [`empty_source`] does.
+pub fn empty_category() -> Arc<str> {
+    Arc::from("")
+}
+
 /// A normalized two-sided top-of-book update from any venue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedQuote {
@@ -150,6 +157,16 @@ pub struct NormalizedTrade {
     /// than risk misattributing one to the wrong arm.
     #[serde(default)]
     pub instrument_id: u32,
+    /// The instrument **universe** this trade's row carries (`ingest::feeds::Feed::category`),
+    /// stamped by the emitting processor from its `FrameCtx::category` and read back by
+    /// `ingest::reconcile::feed_history` to key `history::Key` on the same grain
+    /// `model::BookKey`/`authority::MarketKey` already use. Producer-side only: two disjoint
+    /// universes under one Source ID can share `(channel, instrument_id)`, so without this a
+    /// history lookup or a channel purge cannot tell which universe a trade or a stored product
+    /// belongs to. Never serialized — PROTOCOL.md carries no category, and a consumer has no use
+    /// for a producer-side arbitration key.
+    #[serde(skip, default = "empty_category")]
+    pub category: Arc<str>,
     pub price: f64,
     pub size: f64,
     /// `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.
@@ -336,6 +353,16 @@ pub struct NormalizedInstrument {
     /// Instrument id, unique within `channel`.
     #[serde(default)]
     pub instrument_id: u32,
+    /// The instrument **universe** this definition's row carries
+    /// (`ingest::feeds::Feed::category`), stamped by the emitting processor from its
+    /// `FrameCtx::category`. Part of `InstrumentSnapshot`'s key (see there) for the same reason
+    /// `BookKey` already carries it: two disjoint universes under one Source ID can share
+    /// `(channel, instrument_id)`, and a category-blind catalog either overwrites one universe's
+    /// definition with the other's or, on lookup, resolves the wrong one. Never serialized —
+    /// PROTOCOL.md carries no category, and a consumer has no use for a producer-side
+    /// arbitration key.
+    #[serde(skip, default = "empty_category")]
+    pub category: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
 }
@@ -404,23 +431,34 @@ impl FeedMessage {
     }
 }
 
-/// Latest known instrument definitions, keyed by `(venue, channel, instrument_id)`, shared between
-/// the receivers (which update it) and the WebSocket server (which replays it to each new
-/// subscriber so reference data arrives before quotes - otherwise a client that connects
+/// Latest known instrument definitions, keyed by `(venue, category, channel, instrument_id)`,
+/// shared between the receivers (which update it) and the WebSocket server (which replays it to
+/// each new subscriber so reference data arrives before quotes - otherwise a client that connects
 /// mid-stream sees a quote first and has to guess the price/qty precision).
 ///
-/// The key is the same identity triple [`NormalizedBook`] and [`NormalizedInstrument`] already carry
-/// (see their docs) — **not** `(venue, symbol)`. `symbol` is a display label: on the price-aggregated
-/// protocol it is a fixed 16-byte wire field the publisher fills by keeping a ticker's rightmost 16
-/// bytes with no hash and no length check, so two genuinely different markets on a venue with a long
-/// ticker can and do collide on it (confirmed against a real capture — see
-/// `tests/fixtures/PROVENANCE.md`). Keying this map on that label meant the second market's insert
-/// silently destroyed the first's entry; the identity triple is unique per market by construction, so
-/// both survive. It does NOT distinguish by protocol/feed within one venue: when one venue is served
-/// by multiple feeds sharing a channel/instrument id (e.g. Hyperliquid TOB + MBO both reporting
-/// `channel=0`), both write the same entry (last-writer-wins). Those feeds are expected to agree on
-/// precision; `upsert_instrument` in `processor.rs` warns if their exponents diverge.
-pub type InstrumentSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), NormalizedInstrument>>>;
+/// The key is [`NormalizedBook`]/[`NormalizedInstrument`]'s wire identity triple **prefixed with
+/// the arbitration scope** (`category`), exactly [`BookKey`]/`ingest::authority::MarketKey` —
+/// and, as there, that shared grain is load-bearing, not incidental: two disjoint instrument
+/// universes under one Source ID have independent id spaces and can collide on `(channel,
+/// instrument_id)`. A category-blind key (the triple alone) let one universe's `upsert_instrument`
+/// silently overwrite the other's definition, and — since only one survived — no lookup fix on
+/// top could have recovered it: `sinks/api.rs`'s market resolution would return whichever universe
+/// happened to write last, for every request, regardless of which one the caller actually meant.
+/// `category` is never serialized (see [`NormalizedInstrument::category`]) — readers destructure
+/// the key exactly as [`BookReplay`] does.
+///
+/// Within one category the key is still not `(venue, symbol)`: `symbol` is a display label — on
+/// the price-aggregated protocol a fixed 16-byte wire field the publisher fills by keeping a
+/// ticker's rightmost 16 bytes with no hash and no length check, so two genuinely different
+/// markets on a venue with a long ticker can and do collide on it (confirmed against a real
+/// capture — see `tests/fixtures/PROVENANCE.md`). It also does NOT distinguish by protocol/feed
+/// *within* one category: when one venue is served by multiple feeds of the same universe sharing
+/// a channel/instrument id (e.g. Hyperliquid TOB + MBO both reporting `channel=0`, both the
+/// registry's default category), both write the same entry (last-writer-wins). Those feeds are
+/// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
+/// diverge.
+pub type InstrumentSnapshot =
+    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
@@ -660,25 +698,24 @@ fn book_identity(key: &BookKey) -> BookIdentity {
 /// The replay state behind [`BookSnapshot`]: every market's accumulated book, plus a secondary index
 /// from **wire identity** to full key.
 ///
-/// The index exists because the two readers name markets differently. `sinks/ws.rs` iterates, so it
-/// needs nothing; `sinks/api.rs` resolves a market from a `NormalizedInstrument`, which carries
-/// `(venue, channel, instrument_id)` and no category — and its `/v1/products` and `/v1/best_bid_ask`
-/// handlers do that **once per instrument**, so a linear scan of this map turns those endpoints into
-/// O(instruments x markets). At the tens of thousands of markets a single feed can carry, that is
-/// hundreds of millions of comparisons per request. The index keeps it a hash hit.
+/// `sinks/ws.rs` iterates, so it needs nothing from the index. `sinks/api.rs` now resolves a market
+/// from a `NormalizedInstrument`, which carries `category` (see its doc) alongside the wire
+/// identity, so its `feed_kind_for`/`best_levels`/`book` handlers build the full `BookKey` directly
+/// and look it up with [`get`](Self::get) in one hash hit — no ambiguity, no scan, and no use for
+/// [`by_identity`](Self::by_identity) at all. That method is kept for a caller that genuinely has
+/// only the wire identity and no category to disambiguate with (as `sinks/api.rs` once did): it
+/// resolves the *first* key indexed for that identity, which is correct only when a single
+/// universe actually holds it — two universes under one Source ID can carry the same `(channel,
+/// instrument_id)`, so a caller reaching for it instead of the category-precise `get` can silently
+/// name the wrong universe's market. Do not reason from today's `channel_id` ranges happening not
+/// to overlap: that separation is a numbering convention owned upstream, it is mid-migration, and
+/// nothing here enforces it.
 ///
 /// The two maps are mutated **only** through this type's methods, so the index cannot drift from the
 /// books it indexes: an eviction drops the accumulator and the index entry in one step, exactly as
 /// the arbiter drops the replay entry and the authority's per-market state together. That
 /// together-or-not-at-all property is the whole reason this is a struct and not a second map kept
 /// beside the first.
-///
-/// ⚠️ **Residual ambiguity, deliberately not resolved here.** Two universes under one Source ID can
-/// carry the same `(channel, instrument_id)`, so one identity can index several keys; the lookup
-/// returns the first one indexed. The REST surface has no way to say which universe it means, and
-/// **the category is what would resolve it** — a change to that surface, tracked separately. Do not
-/// reason from today's `channel_id` ranges happening not to overlap: that separation is a numbering
-/// convention owned upstream, it is mid-migration, and nothing here enforces it.
 #[derive(Default)]
 pub struct BookReplay {
     books: BookMap,

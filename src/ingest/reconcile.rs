@@ -45,7 +45,7 @@ use crate::{
         subscriptions::{self, Detected, HostSubs},
     },
     metrics::metrics,
-    model::{BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
+    model::{category_arc, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
     shred::{self, DedupMode, ShredConfig},
     sinks::api,
 };
@@ -545,15 +545,13 @@ impl Reconciler {
     /// whole group `code`: a code can span rows on different venues (`ingest::floor`'s docs), so
     /// each departure carries its own row's identity rather than guessing one venue for the code.
     ///
-    /// ⚠️ **Category-blind for the catalog and history, category-precise for the book.**
-    /// `history::Store::forget_channel`'s key (`source_id`, `channel`, `instrument_id`) and
-    /// `InstrumentSnapshot`'s key (`venue`, `channel`, `instrument_id`) both carry no `category` —
-    /// two disjoint universes sharing one Source ID/venue can collide on `(channel, instrument_id)`,
-    /// so this purge can over-drop a live peer universe's product sharing the departed channel id.
-    /// That is a pre-existing limitation of those two maps' key shapes (not introduced here — see
-    /// `history::Store::forget_channel`'s own doc), and the fix — a category-carrying identity — is
-    /// folded into the next task. `BookSnapshot`'s key (`authority::MarketKey`) already carries the
-    /// category, so `Arbiter::forget_channel_books` does not share this risk.
+    /// **Category-precise for the catalog, the history, and the book.** `history::Store::
+    /// forget_channel` and `InstrumentSnapshot`'s key both now carry `category` (mirroring
+    /// `BookSnapshot`'s `authority::MarketKey`, which already did), so this purge names the
+    /// departing row's own universe on all three and cannot over-drop a live peer universe's
+    /// product sharing the departed channel id — never assume `channel_id` ranges stay disjoint
+    /// across universes; that separation is a numbering convention owned upstream, mid-migration,
+    /// and enforced nowhere in this code.
     ///
     /// `DepthSnapshot` (Market-by-Order's replay map) is deliberately left untouched: its key is
     /// `(venue, symbol)` with no channel dimension at all, so a channel-scoped purge cannot be
@@ -590,10 +588,11 @@ impl Reconciler {
             feed.category,
         );
 
-        // The catalog: a bare HashMap<(venue, channel, instrument_id), _>, so a `retain` needs no
-        // seam of its own (see the category-blindness caveat above).
+        // The catalog: a bare HashMap<(venue, category, channel, instrument_id), _>, keyed on this
+        // departing row's own universe — see the doc above.
+        let category = category_arc(feed.category);
         crate::model::lock(&self.cfg.instruments)
-            .retain(|k, _| !(k.0.as_ref() == feed.venue && k.1 == channel));
+            .retain(|k, _| !(k.0.as_ref() == feed.venue && k.1 == category && k.2 == channel));
 
         // The book: routed through the arbiter, never hand-deleted from the replay map directly, so
         // the accumulator, the replay entry and `StickyAuthority::last_admitted` drop together —
@@ -605,7 +604,9 @@ impl Reconciler {
         );
 
         let history_dropped = match sources::source_id_of(feed.venue) {
-            Some(source_id) => crate::model::lock(&self.cfg.history).forget_channel(source_id, channel),
+            Some(source_id) => {
+                crate::model::lock(&self.cfg.history).forget_channel(source_id, &category, channel)
+            }
             None => 0,
         };
 
@@ -793,12 +794,15 @@ fn resolve_ts_ns(source_ts_ns: u64, recv_ts_ns: u64) -> u64 {
 /// so every print arriving here is already deduplicated on `trade_id` and gated by the venue's tape
 /// owner: one copy of each real print, never a cross-publisher double.
 ///
-/// Keys straight off the message: `NormalizedTrade` now carries `channel`/`instrument_id` itself (the
-/// identity `history::Key` groups on), populated at every emission site alongside the `symbol` a
-/// price-aggregated venue's mirrored arms can share. There is deliberately no symbol lookup here
-/// anymore - matching by `(venue, symbol)` against the instrument catalog is exactly what dropped
-/// every trade on a venue whose two arms carry an identical instrument set under distinct `channel`s
-/// (see `history::Key`'s docs), because every symbol on such a venue matched more than once.
+/// Keys straight off the message: `NormalizedTrade` now carries `channel`/`instrument_id` *and*
+/// `category` itself (the identity `history::Key` groups on), populated at every emission site
+/// alongside the `symbol` a price-aggregated venue's mirrored arms can share. There is
+/// deliberately no symbol lookup here anymore - matching by `(venue, symbol)` against the
+/// instrument catalog is exactly what dropped every trade on a venue whose two arms carry an
+/// identical instrument set under distinct `channel`s (see `history::Key`'s docs), because every
+/// symbol on such a venue matched more than once. `category` closes the companion gap: two
+/// disjoint universes under one Source ID can share `(channel, instrument_id)`, and without it
+/// this seam could not tell which universe's product a trade belongs to.
 async fn feed_history(
     mut rx: broadcast::Receiver<Arc<FeedMessage>>,
     history: Arc<Mutex<Store>>,
@@ -809,14 +813,15 @@ async fn feed_history(
             Ok(msg) => {
                 if let FeedMessage::Trade(t) = msg.as_ref() {
                     // Belt-and-braces for a definition race: the catalog carries no `instrument` for
-                    // this exact (venue, channel, instrument_id) yet (or no longer does). Keying
-                    // straight off the message means this should be rare-to-never for an edge trade -
-                    // its own processor gates emission on already holding that definition - but the
-                    // prior failure this whole fix replaces was a venue going silently unattributable,
-                    // invisible in both the API and Prometheus, so it is counted and dropped rather
-                    // than trusted blind.
+                    // this exact (venue, category, channel, instrument_id) yet (or no longer does).
+                    // Keying straight off the message means this should be rare-to-never for an
+                    // edge trade - its own processor gates emission on already holding that
+                    // definition - but the prior failure this whole fix replaces was a venue going
+                    // silently unattributable, invisible in both the API and Prometheus, so it is
+                    // counted and dropped rather than trusted blind.
                     let known = crate::model::lock(&instruments).contains_key(&(
                         t.venue.clone(),
+                        t.category.clone(),
                         t.channel,
                         t.instrument_id,
                     ));
@@ -830,6 +835,7 @@ async fn feed_history(
                     let ts_ns = resolve_ts_ns(t.source_ts_ns, t.recv_ts_ns);
                     let key = history::Key {
                         source_id: t.source_id,
+                        category: t.category.clone(),
                         channel: t.channel,
                         instrument_id: t.instrument_id,
                     };
@@ -1356,11 +1362,12 @@ mod tests {
 
         let hist_key = history::Key {
             source_id: 3,
+            category: "sports".into(),
             channel: 10,
             instrument_id: 1,
         };
         r.cfg.history.lock().unwrap().ingest(
-            hist_key,
+            hist_key.clone(),
             history::Print {
                 ts_ns: 1_000 * 1_000_000_000,
                 price: 1.0,
@@ -1472,18 +1479,20 @@ mod tests {
 
         let hist_a = history::Key {
             source_id: 1,
+            category: "testcategory".into(),
             channel: 20,
             instrument_id: 1,
         };
         let hist_b = history::Key {
             source_id: 3,
+            category: "testcategory".into(),
             channel: 20,
             instrument_id: 1,
         };
         {
             let mut h = r.cfg.history.lock().unwrap();
             h.ingest(
-                hist_a,
+                hist_a.clone(),
                 history::Print {
                     ts_ns: 1_000 * 1_000_000_000,
                     price: 1.0,
@@ -1491,7 +1500,7 @@ mod tests {
                 },
             );
             h.ingest(
-                hist_b,
+                hist_b.clone(),
                 history::Print {
                     ts_ns: 1_000 * 1_000_000_000,
                     price: 2.0,
@@ -1515,6 +1524,80 @@ mod tests {
         );
     }
 
+    /// The catalog-purge counterpart of the over-drop this fix closes: two rows on the SAME venue
+    /// (so the same Source ID) but different `category` — the shape two disjoint instrument
+    /// universes actually take — both use channel `10`. Never assume `channel_id` ranges stay
+    /// disjoint across universes; that separation is a numbering convention owned upstream and
+    /// enforced nowhere in this code. Departing the "perps" row must purge exactly its own
+    /// `InstrumentSnapshot` entry and leave the "sports" row's entry on the identical channel id
+    /// fully intact — asserted by symbol survival, not merely a count, so a category-blind filter
+    /// (which would drop both) can't hide behind an empty diff.
+    #[test]
+    fn forget_departing_channel_spares_a_peer_categorys_catalog_entry_sharing_the_channel_id() {
+        static PUB_PERPS: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 33030,
+                refdata: 43030,
+                snapshot: 53030,
+            },
+            channel: Some(10),
+        }];
+        static PUB_SPORTS: &[FeedPublisher] = &[FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: 33031,
+                refdata: 43031,
+                snapshot: 53031,
+            },
+            channel: Some(10), // same channel id as PUB_PERPS — only the category differs
+        }];
+        let feed_perps = Feed {
+            venue: "KALSHI",
+            category: "perps",
+            code: "shared-category-code",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 98),
+            publishers: PUB_PERPS,
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let feed_sports = Feed {
+            venue: "KALSHI",
+            category: "sports",
+            code: "shared-category-code",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 99),
+            publishers: PUB_SPORTS,
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let r = test_reconciler(vec![feed_perps, feed_sports]);
+        let key_perps = ("KALSHI", "perps", FeedKind::MarketByPrice, 33030u16);
+
+        r.cfg.instruments.lock().unwrap().insert(
+            ("KALSHI".into(), "perps".into(), 10u32, 1u32),
+            test_instrument_in("perps", "KALSHI", 3, "KXBTCPERP", 10, 1),
+        );
+        r.cfg.instruments.lock().unwrap().insert(
+            ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+            test_instrument_in("sports", "KALSHI", 3, "LAKERSWIN", 10, 1),
+        );
+
+        r.forget_departing_channel(&key_perps);
+
+        let map = r.cfg.instruments.lock().unwrap();
+        assert!(
+            !map.contains_key(&("KALSHI".into(), "perps".into(), 10u32, 1u32)),
+            "the departing perps row's own catalog entry must be purged"
+        );
+        let peer = map
+            .get(&("KALSHI".into(), "sports".into(), 10u32, 1u32))
+            .expect(
+                "the sports row's catalog entry, sharing channel 10 under the same venue, must \
+                 survive — a category-blind filter would have dropped it too",
+            );
+        assert_eq!(peer.symbol.as_ref(), "LAKERSWIN");
+    }
+
     /// C1: after a channel departs, the **query surface** — not just an internal map — must reflect
     /// it. A product still listed with a frozen `best_bid`/`best_ask` beside an empty trade list
     /// reads as "alive but quiet," which is worse than nothing being served at all. Seeds **all
@@ -1530,7 +1613,7 @@ mod tests {
         );
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), 10u32, 1u32),
+            ("KALSHI".into(), "sports".into(), 10u32, 1u32),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
                 source: "KALSHI".into(),
@@ -1538,6 +1621,7 @@ mod tests {
                 symbol: "DEPARTED".into(),
                 channel: 10,
                 instrument_id: 1,
+                category: "sports".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
             },
@@ -1545,6 +1629,7 @@ mod tests {
         seed_book(&r, "KALSHI", 3, "DEPARTED", "sports", 10, 1);
         let hist_key = history::Key {
             source_id: 3,
+            category: "sports".into(),
             channel: 10,
             instrument_id: 1,
         };
@@ -1627,11 +1712,13 @@ mod tests {
         let mut r =
             test_reconciler_with_floor(vec![feed], ChannelFloor::parse("lashay-4=10,11").unwrap());
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 33010u16);
-        let catalog_key: (Arc<str>, u32, u32) = ("KALSHI".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
+            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
         let book_key: crate::ingest::authority::MarketKey =
             (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
         let hist_key = history::Key {
             source_id: 3,
+            category: "sports".into(),
             channel: 10,
             instrument_id: 1,
         };
@@ -1653,13 +1740,14 @@ mod tests {
                 symbol: "NARROWED".into(),
                 channel: 10,
                 instrument_id: 1,
+                category: "sports".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
             },
         );
         seed_book(&r, "KALSHI", 3, "NARROWED", "sports", 10, 1);
         r.cfg.history.lock().unwrap().ingest(
-            hist_key,
+            hist_key.clone(),
             history::Print {
                 ts_ns: 1_000 * 1_000_000_000,
                 price: 1.0,
@@ -1770,6 +1858,18 @@ mod tests {
         channel: u32,
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
+        test_instrument_in("default", venue, source_id, symbol, channel, instrument_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_instrument_in(
+        category: &'static str,
+        venue: &'static str,
+        source_id: u16,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+    ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
             venue: venue.into(),
             source: venue.into(),
@@ -1777,6 +1877,7 @@ mod tests {
             symbol: symbol.into(),
             channel,
             instrument_id,
+            category: category.into(),
             price_exponent: -2,
             qty_exponent: -5,
         }
@@ -1793,6 +1894,31 @@ mod tests {
         source_ts_ns: u64,
         recv_ts_ns: u64,
     ) -> NormalizedTrade {
+        test_trade_in(
+            "default",
+            venue,
+            source_id,
+            symbol,
+            channel,
+            instrument_id,
+            price,
+            source_ts_ns,
+            recv_ts_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_trade_in(
+        category: &'static str,
+        venue: &'static str,
+        source_id: u16,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+        price: f64,
+        source_ts_ns: u64,
+        recv_ts_ns: u64,
+    ) -> NormalizedTrade {
         NormalizedTrade {
             venue: venue.into(),
             source: venue.into(),
@@ -1800,6 +1926,7 @@ mod tests {
             symbol: symbol.into(),
             channel,
             instrument_id,
+            category: category.into(),
             price,
             size: 1.0,
             aggressor_side: crate::model::Side::Buy,
@@ -1825,7 +1952,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -1890,7 +2017,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -1915,6 +2042,7 @@ mod tests {
 
         let key = history::Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 41,
         };
@@ -1954,11 +2082,11 @@ mod tests {
             // Two arms of one price-aggregated venue: identical symbol and instrument_id, distinct
             // channel - exactly the shape `tests/fixtures/PROVENANCE.md` records for the live feed.
             map.insert(
-                ("KALSHI".into(), 1u32, 99u32),
+                ("KALSHI".into(), "default".into(), 1u32, 99u32),
                 test_instrument("KALSHI", 3, "KXBTCPERP", 1, 99),
             );
             map.insert(
-                ("KALSHI".into(), 2u32, 99u32),
+                ("KALSHI".into(), "default".into(), 2u32, 99u32),
                 test_instrument("KALSHI", 3, "KXBTCPERP", 2, 99),
             );
         }
@@ -2040,7 +2168,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -2082,6 +2210,7 @@ mod tests {
 
         let key = history::Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 41,
         };
@@ -2150,6 +2279,7 @@ mod tests {
 
         let key = history::Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 41,
         };

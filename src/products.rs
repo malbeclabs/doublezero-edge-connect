@@ -19,6 +19,12 @@ pub struct ProductId {
     pub symbol: Arc<str>,
     pub channel: u32,
     pub instrument_id: u32,
+    /// The instrument universe this market belongs to (`ingest::feeds::Feed::category`) —
+    /// producer-side only, carried so a caller holding a `ProductId` can look the market back up
+    /// in `InstrumentSnapshot`/`BookSnapshot` (both keyed on it) without re-resolving. Deliberately
+    /// **not** rendered by [`Self::render`] and not accepted by [`parse`]: it never reaches the
+    /// wire, so it cannot be part of the consumer-facing product-id syntax.
+    pub category: Arc<str>,
 }
 
 impl ProductId {
@@ -74,6 +80,7 @@ pub fn parse(s: &str) -> Option<ParsedId> {
 }
 
 /// What matching a [`ParsedId`] against the catalog found.
+#[derive(Debug)]
 pub enum Resolution {
     One(ProductId),
     /// The bare symbol matched more than one market. Carries the candidates, rendered, so the caller
@@ -83,6 +90,15 @@ pub enum Resolution {
 }
 
 /// Match a parsed id against the instrument snapshot.
+///
+/// `instruments` is now keyed `(venue, category, channel, instrument_id)` — two disjoint universes
+/// under one Source ID can share `(channel, instrument_id)`, so filtering by source+symbol alone
+/// can legitimately produce hits from more than one category. That is not a defect to paper over:
+/// each hit already carries the category its own `NormalizedInstrument` entry was stored under (no
+/// cross-category merge ever happens upstream any more), so genuinely distinct markets surface as
+/// `Ambiguous` exactly as a same-category symbol collision already does, and the `#<channel>.
+/// <instrument_id>` suffix disambiguates them the same way — without a category ever entering the
+/// wire syntax.
 pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
     let map = crate::model::lock(instruments);
     let mut hits: Vec<ProductId> = map
@@ -96,6 +112,7 @@ pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
             symbol: i.symbol.clone(),
             channel: i.channel,
             instrument_id: i.instrument_id,
+            category: i.category.clone(),
         })
         .collect();
 
@@ -113,6 +130,7 @@ pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NormalizedInstrument;
 
     #[test]
     fn a_unique_symbol_renders_as_source_and_symbol() {
@@ -121,11 +139,13 @@ mod tests {
             symbol: "BTC".into(),
             channel: 0,
             instrument_id: 41,
+            category: "default".into(),
         };
         assert_eq!(p.render(false), "HYPERLIQUID:BTC");
     }
 
     /// A symbol that collides within its source must carry the identity that does not collide.
+    /// `category` plays no part in the rendered form — it never reaches the wire.
     #[test]
     fn a_colliding_symbol_renders_with_its_identity_suffix() {
         let p = ProductId {
@@ -133,6 +153,7 @@ mod tests {
             symbol: "BTC".into(),
             channel: 2,
             instrument_id: 41,
+            category: "perps".into(),
         };
         assert_eq!(p.render(true), "HYPERLIQUID:BTC#2.41");
     }
@@ -188,5 +209,75 @@ mod tests {
             parse("HYPERLIQUID:BTC#2").is_none(),
             "identity needs both parts"
         );
+    }
+
+    fn instrument(
+        category: &str,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+    ) -> NormalizedInstrument {
+        NormalizedInstrument {
+            venue: "HYPERLIQUID".into(),
+            source: "HYPERLIQUID".into(),
+            source_id: 1,
+            symbol: symbol.into(),
+            channel,
+            instrument_id,
+            category: category.into(),
+            price_exponent: -2,
+            qty_exponent: -4,
+        }
+    }
+
+    fn snapshot(defs: Vec<NormalizedInstrument>) -> InstrumentSnapshot {
+        let mut map = std::collections::HashMap::new();
+        for d in defs {
+            map.insert(
+                (
+                    d.venue.clone(),
+                    d.category.clone(),
+                    d.channel,
+                    d.instrument_id,
+                ),
+                d,
+            );
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(map))
+    }
+
+    /// Two disjoint universes ("perps" and "sports") under one Source ID both happen to use
+    /// `channel=5, instrument_id=41` — the exact scenario `channel_id` ranges are never safe to
+    /// assume disjoint (see this module's docs). Each names a genuinely different market there, so
+    /// resolving one's product id by its own symbol must return *that* market's identity — not the
+    /// peer's — even though the map holds two entries at the same `(channel, instrument_id)` pair.
+    /// Before `InstrumentSnapshot` carried `category` in its key, one of these two entries would
+    /// never even have survived `upsert_instrument`'s last-writer-wins overwrite; this pins that
+    /// both now coexist and resolve independently.
+    #[test]
+    fn resolving_one_universes_symbol_does_not_return_its_peers_market() {
+        let snap = snapshot(vec![
+            instrument("perps", "BTC-PERP", 5, 41),
+            instrument("sports", "LAKERS-WIN", 5, 41),
+        ]);
+
+        let perps = parse("HYPERLIQUID:BTC-PERP").unwrap();
+        match resolve(&snap, &perps) {
+            Resolution::One(p) => {
+                assert_eq!(p.category.as_ref(), "perps");
+                assert_eq!(p.channel, 5);
+                assert_eq!(p.instrument_id, 41);
+            }
+            other => panic!(
+                "expected exactly the perps market, got a resolution that would serve \
+                              the wrong universe: {other:?}"
+            ),
+        }
+
+        let sports = parse("HYPERLIQUID:LAKERS-WIN").unwrap();
+        match resolve(&snap, &sports) {
+            Resolution::One(p) => assert_eq!(p.category.as_ref(), "sports"),
+            other => panic!("expected exactly the sports market: {other:?}"),
+        }
     }
 }

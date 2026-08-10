@@ -18,7 +18,10 @@
 //! candle for its own newest group, since "one second closed" and "one 60-second group closed" are
 //! different claims.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::Arc,
+};
 
 /// Rolling window, in seconds.
 pub const WINDOW_SECS: u64 = 3_600;
@@ -47,9 +50,17 @@ pub const MAX_BUCKETS_ACROSS_PRODUCTS: usize = 1 << 20;
 
 /// One market's identity within the history store — the identity, not the display symbol (a
 /// price-aggregated `symbol` can collide across markets; see `products::ProductId`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `category` (`ingest::feeds::Feed::category`, carried producer-side on `NormalizedTrade` —
+/// never serialized to the wire) prefixes the wire identity for the same reason `model::BookKey`
+/// carries it: two disjoint instrument universes sharing one Source ID have independent
+/// `channel`/`instrument_id` spaces and can collide on that pair. Without it, `forget_channel`
+/// (and any other channel-scoped operation) cannot tell a departing universe's product from a
+/// live peer universe's product sharing the same channel id — see that method's doc.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Key {
     pub source_id: u16,
+    pub category: Arc<str>,
     pub channel: u32,
     pub instrument_id: u32,
 }
@@ -289,7 +300,7 @@ impl Store {
                 .products
                 .iter()
                 .min_by_key(|(_, p)| p.last_touch)
-                .map(|(k, _)| *k)
+                .map(|(k, _)| k.clone())
             {
                 if let Some(removed) = self.products.remove(&oldest) {
                     self.buckets_total -= removed.buckets.len();
@@ -298,7 +309,7 @@ impl Store {
             }
         }
 
-        let product = self.products.entry(*key).or_default();
+        let product = self.products.entry(key.clone()).or_default();
         product.last_touch = clock;
     }
 
@@ -311,7 +322,7 @@ impl Store {
                 .products
                 .iter()
                 .min_by_key(|(_, p)| p.last_touch)
-                .map(|(k, _)| *k)
+                .map(|(k, _)| k.clone())
             else {
                 break; // Nothing left to evict; stop rather than spin.
             };
@@ -413,9 +424,10 @@ impl Store {
         product.ring.iter().rev().take(limit).copied().collect()
     }
 
-    /// Drop every product belonging to `(source_id, channel)` — every `instrument_id` tracked under
-    /// that channel — regardless of the other identity components. Returns the number of products
-    /// dropped, so a caller can tell "nothing was there" from "the drop happened".
+    /// Drop every product belonging to `(source_id, category, channel)` — every `instrument_id`
+    /// tracked under that channel, in that universe — regardless of the other identity
+    /// components. Returns the number of products dropped, so a caller can tell "nothing was
+    /// there" from "the drop happened".
     ///
     /// The seam a caller (the reconciler) uses when a channel leaves the ingest floor: a channel
     /// that no longer ingests must not keep answering `/candles`/`/ticker` from a frozen window that
@@ -424,26 +436,22 @@ impl Store {
     /// job (via `ingest::feeds::feeds()` + `ingest::sources::source_id_of`) — this store has no
     /// notion of a group code, only the wire `source_id` every `Key` already carries.
     ///
-    /// ⚠️ **Known over-drop risk, not fixed here.** [`Key`] carries no `category` — two disjoint
-    /// universes sharing one Source ID (a venue-wide `source_id`) can collide on `(channel,
-    /// instrument_id)`, and this filter cannot tell them apart. Shedding one universe's channel
-    /// therefore also wipes a live peer universe's window under the same channel id, if one
-    /// happens to exist. This is a real, not hypothetical, gap — never assume `channel_id` ranges
-    /// stay disjoint across universes, they are a mid-migration numbering convention owned
-    /// upstream and enforced nowhere in this code. The proper fix is a category-carrying identity
-    /// (mirroring `model::BookKey`, which already has one — see `model::BookReplay::forget_channel`,
-    /// which is therefore exempt from this risk), which ripples into `model.rs`/`products.rs`/
-    /// `sinks/api.rs` and is out of this method's scope; it is folded into the next task. Do not
-    /// paper over this by claiming a channel id is safe to shed — it is not, in general.
+    /// `category` is what makes this filter safe across two disjoint universes sharing one Source
+    /// ID: their `(channel, instrument_id)` spaces are independent and can collide, so a filter on
+    /// `(source_id, channel)` alone would also wipe a live peer universe's window under the same
+    /// channel id. This mirrors `model::BookKey`/`Arbiter::forget_channel_books`, which already
+    /// carry the same scope for the book replay map — never reason from today's `channel_id`
+    /// ranges happening not to overlap; that separation is a numbering convention owned upstream,
+    /// it is mid-migration, and nothing here enforces it.
     ///
     /// Keeps `buckets_total` in step (subtracting exactly the removed products' own bucket counts),
     /// the same discipline every other removal path in this module follows — see that field's doc.
-    pub fn forget_channel(&mut self, source_id: u16, channel: u32) -> usize {
+    pub fn forget_channel(&mut self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
         let doomed: Vec<Key> = self
             .products
             .keys()
-            .copied()
-            .filter(|k| k.source_id == source_id && k.channel == channel)
+            .filter(|k| k.source_id == source_id && k.category == *category && k.channel == channel)
+            .cloned()
             .collect();
         let mut dropped = 0usize;
         for key in doomed {
@@ -463,6 +471,7 @@ mod tests {
     fn key() -> Key {
         Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 41,
         }
@@ -603,6 +612,7 @@ mod tests {
         for i in 0..(MAX_PRODUCTS + 10) {
             let k = Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: i as u32,
             };
@@ -612,6 +622,7 @@ mod tests {
         assert_eq!(s.evicted(), 10);
         let oldest = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 0,
         };
@@ -707,14 +718,16 @@ mod tests {
         let mut s = Store::new();
         let active = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 0,
         };
-        s.ingest(active, trade(10_000, 10.0, 1.0)); // active becomes the very first (coldest) product
+        s.ingest(active.clone(), trade(10_000, 10.0, 1.0)); // active becomes the very first (coldest) product
 
         for i in 1..MAX_PRODUCTS {
             let k = Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: i as u32,
             };
@@ -725,7 +738,7 @@ mod tests {
         // Feed `active` nothing but late (rejected) prints. If these bumped its LRU position it
         // would no longer be the coldest by the time the cap forces the eviction below.
         for _ in 0..5 {
-            s.ingest(active, trade(10_000 - WINDOW_SECS - 100, 1.0, 1.0));
+            s.ingest(active.clone(), trade(10_000 - WINDOW_SECS - 100, 1.0, 1.0));
         }
         assert_eq!(s.late_drops(), 5);
 
@@ -733,6 +746,7 @@ mod tests {
         // by the stale contact above) must be the one that goes.
         let extra = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: MAX_PRODUCTS as u32,
         };
@@ -760,21 +774,23 @@ mod tests {
         // Fresh inserts across a couple of products.
         let a = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 1,
         };
         let b = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 2,
         };
-        s.ingest(a, trade(100, 10.0, 1.0));
-        s.ingest(a, trade(101, 10.0, 1.0));
+        s.ingest(a.clone(), trade(100, 10.0, 1.0));
+        s.ingest(a.clone(), trade(101, 10.0, 1.0));
         s.ingest(b, trade(100, 10.0, 1.0));
         assert_eq!(s.buckets_total, recomputed(&s), "after fresh inserts");
 
         // Widening an existing bucket must not change the count.
-        s.ingest(a, trade(100, 11.0, 1.0));
+        s.ingest(a.clone(), trade(100, 11.0, 1.0));
         assert_eq!(s.buckets_total, recomputed(&s), "after widening");
 
         // This product's own window eviction.
@@ -789,6 +805,7 @@ mod tests {
         for i in 0..MAX_PRODUCTS {
             let k = Key {
                 source_id: 2,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: i as u32,
             };
@@ -816,6 +833,7 @@ mod tests {
         for i in 0..n {
             let k = Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: i as u32,
             };
@@ -850,11 +868,13 @@ mod tests {
 
         let coldest = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: 0,
         };
         let new_key = Key {
             source_id: 1,
+            category: "default".into(),
             channel: 0,
             instrument_id: n as u32,
         };
@@ -895,16 +915,17 @@ mod tests {
         let mut s = Store::new();
         let dropped_key = Key {
             source_id: 3,
+            category: "default".into(),
             channel: 10,
             instrument_id: 1,
         };
-        s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
+        s.ingest(dropped_key.clone(), trade(1_000, 10.0, 1.0));
         assert!(
             !s.candles(&dropped_key, 60, 10, 1_100).is_empty(),
             "fixture sanity: the print must be queryable before the drop"
         );
 
-        let dropped = s.forget_channel(3, 10);
+        let dropped = s.forget_channel(3, &"default".into(), 10);
         assert_eq!(dropped, 1, "exactly the one product on that channel");
         assert!(
             s.candles(&dropped_key, 60, 10, 1_100).is_empty(),
@@ -925,27 +946,30 @@ mod tests {
         let mut s = Store::new();
         let dropped_key = Key {
             source_id: 3,
+            category: "default".into(),
             channel: 10,
             instrument_id: 1,
         };
         let peer_diff_channel = Key {
             source_id: 3,
+            category: "default".into(),
             channel: 11,
             instrument_id: 1,
         };
         let peer_diff_source = Key {
             source_id: 7,
+            category: "default".into(),
             channel: 10,
             instrument_id: 1,
         };
         s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
-        s.ingest(peer_diff_channel, trade(1_000, 20.0, 1.0));
-        s.ingest(peer_diff_channel, trade(1_060, 21.0, 1.0));
-        s.ingest(peer_diff_source, trade(1_000, 30.0, 1.0));
-        s.ingest(peer_diff_source, trade(1_060, 31.0, 1.0));
-        s.ingest(peer_diff_source, trade(1_120, 32.0, 1.0));
+        s.ingest(peer_diff_channel.clone(), trade(1_000, 20.0, 1.0));
+        s.ingest(peer_diff_channel.clone(), trade(1_060, 21.0, 1.0));
+        s.ingest(peer_diff_source.clone(), trade(1_000, 30.0, 1.0));
+        s.ingest(peer_diff_source.clone(), trade(1_060, 31.0, 1.0));
+        s.ingest(peer_diff_source.clone(), trade(1_120, 32.0, 1.0));
 
-        s.forget_channel(3, 10);
+        s.forget_channel(3, &"default".into(), 10);
 
         let peer_channel_candles = s.candles(&peer_diff_channel, 60, 10, 1_200);
         assert_eq!(
@@ -972,26 +996,29 @@ mod tests {
         let mut s = Store::new();
         let dropped_key = Key {
             source_id: 3,
+            category: "default".into(),
             channel: 10,
             instrument_id: 1,
         };
         let peer_diff_channel = Key {
             source_id: 3,
+            category: "default".into(),
             channel: 11,
             instrument_id: 1,
         };
         let peer_diff_source = Key {
             source_id: 7,
+            category: "default".into(),
             channel: 10,
             instrument_id: 1,
         };
-        s.ingest(dropped_key, trade(1_000, 10.0, 1.0));
+        s.ingest(dropped_key.clone(), trade(1_000, 10.0, 1.0));
         s.ingest(dropped_key, trade(1_100, 11.0, 1.0)); // a second bucket on the doomed product
         s.ingest(peer_diff_channel, trade(1_000, 20.0, 1.0));
         s.ingest(peer_diff_source, trade(1_000, 30.0, 1.0)); // same channel id, different source_id
         let before = s.buckets_total;
 
-        let dropped = s.forget_channel(3, 10);
+        let dropped = s.forget_channel(3, &"default".into(), 10);
         assert_eq!(dropped, 1);
 
         assert_eq!(
@@ -1015,12 +1042,58 @@ mod tests {
         s.ingest(
             Key {
                 source_id: 3,
+                category: "default".into(),
                 channel: 11,
                 instrument_id: 1,
             },
             trade(1_000, 10.0, 1.0),
         );
-        assert_eq!(s.forget_channel(3, 10), 0);
+        assert_eq!(s.forget_channel(3, &"default".into(), 10), 0);
         assert_eq!(s.len(), 1, "the untouched product is still there");
+    }
+
+    /// The over-drop this method's doc warns about: two disjoint universes ("perps" and "sports")
+    /// under one Source ID both use channel `10` — never assume `channel_id` ranges stay disjoint
+    /// across universes. Shedding the departing category's channel must drop exactly its own
+    /// product and leave the peer category's product on the *same* channel id fully intact —
+    /// asserted by name and by candle count, not merely `is_empty()`, so a category-blind filter
+    /// (which would drop both) or an over-broad one (which would drop neither) both fail this.
+    #[test]
+    fn forgetting_a_channel_spares_a_peer_category_sharing_the_same_channel_id() {
+        let mut s = Store::new();
+        let dropped = Key {
+            source_id: 3,
+            category: "perps".into(),
+            channel: 10,
+            instrument_id: 1,
+        };
+        let peer_diff_category = Key {
+            source_id: 3,
+            category: "sports".into(),
+            channel: 10,
+            instrument_id: 1,
+        };
+        s.ingest(dropped.clone(), trade(1_000, 10.0, 1.0));
+        s.ingest(peer_diff_category.clone(), trade(1_000, 20.0, 1.0));
+        s.ingest(peer_diff_category.clone(), trade(1_060, 21.0, 1.0));
+        s.ingest(peer_diff_category.clone(), trade(1_120, 22.0, 1.0));
+
+        let dropped_count = s.forget_channel(3, &"perps".into(), 10);
+        assert_eq!(
+            dropped_count, 1,
+            "only the perps universe's product on channel 10"
+        );
+
+        assert!(
+            s.candles(&dropped, 60, 10, 1_200).is_empty(),
+            "the departing category's own history must be gone"
+        );
+        let peer_candles = s.candles(&peer_diff_category, 60, 10, 1_200);
+        assert_eq!(
+            peer_candles.len(),
+            3,
+            "the peer category sharing channel 10 must survive with its full candle count — \
+             a category-blind filter would have wrongly dropped it too"
+        );
     }
 }

@@ -186,6 +186,7 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
     let Some(inst) = lookup_instrument(
         state,
         resolved.source_id,
+        &resolved.category,
         resolved.channel,
         resolved.instrument_id,
     ) else {
@@ -208,18 +209,24 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
 }
 
 /// Re-fetch the full instrument record for an identity `resolve()` already matched.
-/// `InstrumentSnapshot` is keyed exactly on this identity (`(venue, channel, instrument_id)`), so
-/// this is a direct lookup, not a scan — `venue` is rederived from `source_id` the same way
-/// `ingest::processor` resolved it when it wrote the entry (`venue_arc(source_label(source_id))`).
+/// `InstrumentSnapshot` is keyed exactly on this identity (`(venue, category, channel,
+/// instrument_id)`), so this is a direct lookup, not a scan — `venue` is rederived from
+/// `source_id` the same way `ingest::processor` resolved it when it wrote the entry
+/// (`venue_arc(source_label(source_id))`). `category` must come from the same resolved
+/// `ProductId` `resolve()` returned: two disjoint universes under one Source ID can share
+/// `(channel, instrument_id)`, and a lookup keyed on the wire identity alone would silently name
+/// whichever universe's entry happened to occupy that slot.
 fn lookup_instrument(
     state: &ApiState,
     source_id: u16,
+    category: &Arc<str>,
     channel: u32,
     instrument_id: u32,
 ) -> Option<NormalizedInstrument> {
     let venue = venue_arc(source_label(source_id));
     let map = crate::model::lock(&state.instruments);
-    map.get(&(venue, channel, instrument_id)).cloned()
+    map.get(&(venue, category.clone(), channel, instrument_id))
+        .cloned()
 }
 
 /// Whether more than one instrument shares `(source_id, symbol)` — what decides whether a
@@ -276,6 +283,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         symbol: i.symbol.clone(),
         channel: i.channel,
         instrument_id: i.instrument_id,
+        category: i.category.clone(),
     };
     json!({
         "product_id": pid.render(ambiguous),
@@ -318,7 +326,12 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     {
         let books = crate::model::lock(&state.books);
         if books
-            .by_identity(&i.venue, i.channel, i.instrument_id)
+            .get(&(
+                i.venue.clone(),
+                i.category.clone(),
+                i.channel,
+                i.instrument_id,
+            ))
             .is_some()
         {
             return "market_by_price";
@@ -373,6 +386,7 @@ fn candles(state: &ApiState, inst: &NormalizedInstrument, req: &Request) -> Resp
     let now_secs = crate::model::now_ns() / 1_000_000_000;
     let key = history::Key {
         source_id: inst.source_id,
+        category: inst.category.clone(),
         channel: inst.channel,
         instrument_id: inst.instrument_id,
     };
@@ -436,6 +450,7 @@ fn invalid_granularity(got: &str) -> Response {
 fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     let key = history::Key {
         source_id: inst.source_id,
+        category: inst.category.clone(),
         channel: inst.channel,
         instrument_id: inst.instrument_id,
     };
@@ -480,7 +495,12 @@ type Level = Option<(f64, f64)>;
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) {
     {
         let books = crate::model::lock(&state.books);
-        if let Some(acc) = books.by_identity(&inst.venue, inst.channel, inst.instrument_id) {
+        if let Some(acc) = books.get(&(
+            inst.venue.clone(),
+            inst.category.clone(),
+            inst.channel,
+            inst.instrument_id,
+        )) {
             return (acc.best_bid(), acc.best_ask());
         }
     }
@@ -504,14 +524,23 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         symbol: inst.symbol.clone(),
         channel: inst.channel,
         instrument_id: inst.instrument_id,
+        category: inst.category.clone(),
     }
     .render(ambiguous);
 
-    // Prefer the incremental market-by-price accumulator when this identity has one.
+    // Prefer the incremental market-by-price accumulator when this identity has one. Looked up by
+    // the full category-carrying key (not `BookReplay::by_identity`, which is category-blind and
+    // would return whichever universe's market happened to be indexed first — see its doc) since
+    // `inst.category` names exactly the universe this instrument belongs to.
     let mbp = {
         let books = crate::model::lock(&state.books);
         books
-            .by_identity(&inst.venue, inst.channel, inst.instrument_id)
+            .get(&(
+                inst.venue.clone(),
+                inst.category.clone(),
+                inst.channel,
+                inst.instrument_id,
+            ))
             .map(|acc| {
                 (
                     acc.baselined(),
@@ -677,6 +706,7 @@ fn best_bid_ask(state: &ApiState) -> Response {
             symbol: i.symbol.clone(),
             channel: i.channel,
             instrument_id: i.instrument_id,
+            category: i.category.clone(),
         }
         .render(ambiguous);
         pricebooks.push(json!({
@@ -842,6 +872,29 @@ mod tests {
         price_exponent: i8,
         qty_exponent: i8,
     ) -> NormalizedInstrument {
+        inst_in(
+            "default",
+            source_id,
+            venue,
+            symbol,
+            channel,
+            instrument_id,
+            price_exponent,
+            qty_exponent,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inst_in(
+        category: &str,
+        source_id: u16,
+        venue: &str,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+        price_exponent: i8,
+        qty_exponent: i8,
+    ) -> NormalizedInstrument {
         NormalizedInstrument {
             venue: venue.into(),
             source: venue.into(),
@@ -849,6 +902,7 @@ mod tests {
             symbol: symbol.into(),
             channel,
             instrument_id,
+            category: category.into(),
             price_exponent,
             qty_exponent,
         }
@@ -896,7 +950,7 @@ mod tests {
     async fn products_list_carries_discrete_identity_fields() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
@@ -927,7 +981,7 @@ mod tests {
     async fn an_unknown_product_404s_with_a_remedy() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
@@ -1122,7 +1176,7 @@ mod tests {
     async fn candles_carry_a_retention_block() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -1136,12 +1190,13 @@ mod tests {
             let mut store = history.lock().unwrap();
             let key = crate::history::Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: 41,
             };
             for i in 0..5u64 {
                 store.ingest(
-                    key,
+                    key.clone(),
                     Print {
                         ts_ns: (base_ts + i * 60) * 1_000_000_000,
                         price: 100.0 + i as f64,
@@ -1218,7 +1273,7 @@ mod tests {
     async fn granularity_names_map_to_the_documented_bucket_width() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -1226,11 +1281,12 @@ mod tests {
             let mut store = history.lock().unwrap();
             let key = crate::history::Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: 41,
             };
             store.ingest(
-                key,
+                key.clone(),
                 Print {
                     ts_ns: (now - 300) * 1_000_000_000,
                     price: 100.0,
@@ -1278,7 +1334,7 @@ mod tests {
     async fn a_granularity_coarser_than_the_window_returns_a_partial_candle() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -1286,6 +1342,7 @@ mod tests {
             let mut store = history.lock().unwrap();
             let key = crate::history::Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: 41,
             };
@@ -1321,7 +1378,7 @@ mod tests {
     async fn an_unrecognised_granularity_is_rejected_with_the_accepted_values() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
@@ -1365,7 +1422,7 @@ mod tests {
     async fn malformed_limit_is_rejected_with_a_remedy() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
@@ -1429,12 +1486,12 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), 2u32, 41u32),
-                inst(3, "KALSHI", "BASELINED", 2, 41, -4, -2),
+                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                inst_in("perps", 3, "KALSHI", "BASELINED", 2, 41, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), 3u32, 7u32),
-                inst(3, "KALSHI", "MIDSTREAM", 3, 7, -4, -2),
+                ("KALSHI".into(), "perps".into(), 3u32, 7u32),
+                inst_in("perps", 3, "KALSHI", "MIDSTREAM", 3, 7, -4, -2),
             );
         }
         {
@@ -1513,8 +1570,8 @@ mod tests {
     async fn book_caps_levels_per_side_and_reports_the_cap_as_incomplete() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("KALSHI".into(), 5u32, 1u32),
-            inst(3, "KALSHI", "BIGBOOK", 5, 1, -4, -2),
+            ("KALSHI".into(), "perps".into(), 5u32, 1u32),
+            inst_in("perps", 3, "KALSHI", "BIGBOOK", 5, 1, -4, -2),
         );
         {
             let mut map = books.lock().unwrap();
@@ -1557,13 +1614,126 @@ mod tests {
         );
     }
 
+    /// The headline regression: two disjoint universes ("perps" and "sports") under one Source ID
+    /// (KALSHI) both use `channel=9, instrument_id=1` — never assume `channel_id` ranges stay
+    /// disjoint across universes, see this module's docs. Each market has its own catalog entry and
+    /// its own `BookAccumulator` with visibly different content. Before `InstrumentSnapshot` carried
+    /// `category` and `book`/`ticker` looked the market up by the category-precise key, this
+    /// identity collision meant `BookReplay::by_identity`'s first-match returned whichever universe
+    /// happened to be indexed first for *both* products — one of the two book/ticker responses below
+    /// would silently serve the peer universe's price levels. Asserting the exact price on both
+    /// sides for both markets is what a bare "some response came back" could not catch: a
+    /// first-match bug still returns 200 with plausible-looking numbers, just the wrong universe's.
+    #[tokio::test]
+    async fn book_and_ticker_do_not_cross_universes_sharing_a_channel_and_instrument_id() {
+        let (instruments, depth, books, history, health) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 9u32, 1u32),
+                inst_in("perps", 3, "KALSHI", "PERPMKT", 9, 1, -4, -2),
+            );
+            map.insert(
+                ("KALSHI".into(), "sports".into(), 9u32, 1u32),
+                inst_in("sports", 3, "KALSHI", "SPORTSMKT", 9, 1, -4, -2),
+            );
+        }
+        {
+            let mut map = books.lock().unwrap();
+
+            let mut perps_acc = BookAccumulator::new("PERPMKT".into());
+            perps_acc.apply(&book_batch(
+                "KALSHI",
+                "PERPMKT",
+                9,
+                1,
+                vec![
+                    BookChange {
+                        action: BookAction::Clear,
+                        side: BookSide::Both,
+                        price: 0.0,
+                        size: 0.0,
+                    },
+                    level_update(BookSide::Bid, 0.61, 10.0),
+                    level_update(BookSide::Ask, 0.63, 20.0),
+                ],
+                true,
+            ));
+            map.insert(("KALSHI".into(), "perps".into(), 9, 1), perps_acc);
+
+            let mut sports_acc = BookAccumulator::new("SPORTSMKT".into());
+            sports_acc.apply(&book_batch(
+                "KALSHI",
+                "SPORTSMKT",
+                9,
+                1,
+                vec![
+                    BookChange {
+                        action: BookAction::Clear,
+                        side: BookSide::Both,
+                        price: 0.0,
+                        size: 0.0,
+                    },
+                    level_update(BookSide::Bid, 0.11, 100.0),
+                    level_update(BookSide::Ask, 0.13, 200.0),
+                ],
+                true,
+            ));
+            map.insert(("KALSHI".into(), "sports".into(), 9, 1), sports_acc);
+        }
+
+        let base = spawn(instruments, depth, books, history, health).await;
+
+        let perps_book = reqwest::get(format!("{base}/v1/products/KALSHI:PERPMKT/book"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(
+            perps_book["pricebook"]["bids"][0][0], "0.6100",
+            "PERPMKT's book must be its own, not SPORTSMKT's: {perps_book}"
+        );
+        assert_eq!(perps_book["pricebook"]["asks"][0][0], "0.6300");
+
+        let sports_book = reqwest::get(format!("{base}/v1/products/KALSHI:SPORTSMKT/book"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(
+            sports_book["pricebook"]["bids"][0][0], "0.1100",
+            "SPORTSMKT's book must be its own, not PERPMKT's: {sports_book}"
+        );
+        assert_eq!(sports_book["pricebook"]["asks"][0][0], "0.1300");
+
+        let perps_ticker = reqwest::get(format!("{base}/v1/products/KALSHI:PERPMKT/ticker"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(perps_ticker["best_bid"], "0.6100");
+        assert_eq!(perps_ticker["best_ask"], "0.6300");
+
+        let sports_ticker = reqwest::get(format!("{base}/v1/products/KALSHI:SPORTSMKT/ticker"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(sports_ticker["best_bid"], "0.1100");
+        assert_eq!(sports_ticker["best_ask"], "0.1300");
+    }
+
     /// Not one of the seven named cases, but exercises the market-by-order fallback path (no
     /// `BookSnapshot` entry, a `DepthSnapshot` one instead) with the same coverage contract.
     #[tokio::test]
     async fn book_falls_back_to_market_by_order_depth_when_no_accumulator_exists() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         depth.lock().unwrap().insert(
@@ -1606,7 +1776,7 @@ mod tests {
     async fn book_market_by_order_depth_at_the_wire_cap_is_not_reported_complete() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let bids: Vec<[f64; 2]> = (0..DEPTH_LEVELS).map(|i| [100.0 - i as f64, 1.0]).collect();
@@ -1652,7 +1822,7 @@ mod tests {
     async fn product_detail_returns_the_full_entry() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("PHOENIX".into(), 0u32, 7u32),
+            ("PHOENIX".into(), "default".into(), 0u32, 7u32),
             inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
         health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
@@ -1680,7 +1850,7 @@ mod tests {
     async fn ticker_returns_recent_trades_and_best_levels() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -1688,11 +1858,12 @@ mod tests {
             let mut store = history.lock().unwrap();
             let key = crate::history::Key {
                 source_id: 1,
+                category: "default".into(),
                 channel: 0,
                 instrument_id: 41,
             };
             store.ingest(
-                key,
+                key.clone(),
                 Print {
                     ts_ns: (now - 10) * 1_000_000_000,
                     price: 100.0,
@@ -1744,16 +1915,16 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("HYPERLIQUID".into(), 0u32, 41u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
                 inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), 0u32, 7u32),
+                ("PHOENIX".into(), "default".into(), 0u32, 7u32),
                 inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
             );
             map.insert(
-                ("KALSHI".into(), 9u32, 1u32),
-                inst(3, "KALSHI", "KXBTCPERP", 9, 1, -4, -2),
+                ("KALSHI".into(), "perps".into(), 9u32, 1u32),
+                inst_in("perps", 3, "KALSHI", "KXBTCPERP", 9, 1, -4, -2),
             );
         }
         // Hyperliquid:BTC has a depth entry (a derivable best level); Phoenix:SOL has neither a
@@ -1848,6 +2019,7 @@ mod tests {
             store.ingest(
                 crate::history::Key {
                     source_id: 1,
+                    category: "default".into(),
                     channel: 0,
                     instrument_id: 41,
                 },
@@ -1889,19 +2061,19 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), 9u32, 1u32),
-                inst(3, "KALSHI", "BOOKED", 9, 1, -4, -2),
+                ("KALSHI".into(), "perps".into(), 9u32, 1u32),
+                inst_in("perps", 3, "KALSHI", "BOOKED", 9, 1, -4, -2),
             );
             map.insert(
-                ("HYPERLIQUID".into(), 0u32, 2u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 2u32),
                 inst(1, "HYPERLIQUID", "DEPTHED", 0, 2, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), 0u32, 3u32),
+                ("PHOENIX".into(), "default".into(), 0u32, 3u32),
                 inst(2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
             );
             map.insert(
-                ("KALSHI".into(), 9u32, 4u32),
+                ("KALSHI".into(), "default".into(), 9u32, 4u32),
                 inst(3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
             );
         }
@@ -1981,7 +2153,7 @@ mod tests {
     async fn unknown_subresource_404s_with_a_remedy() {
         let (instruments, depth, books, history, health) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let base = spawn(instruments, depth, books, history, health).await;
@@ -2009,11 +2181,11 @@ mod tests {
     fn colliding_snapshot() -> InstrumentSnapshot {
         let mut map = HashMap::new();
         map.insert(
-            ("KALSHI".into(), 2u32, 41u32),
+            ("KALSHI".into(), "default".into(), 2u32, 41u32),
             inst(3, "KALSHI", "KXBTCPERP", 2, 41, -4, -2),
         );
         map.insert(
-            ("KALSHI".into(), 3u32, 99u32),
+            ("KALSHI".into(), "default".into(), 3u32, 99u32),
             inst(3, "KALSHI", "KXBTCPERP", 3, 99, -4, -2),
         );
         Arc::new(Mutex::new(map))

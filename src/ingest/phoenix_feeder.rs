@@ -31,7 +31,9 @@ use crate::{
         public_feeder::{self, finite_non_negative, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
-    model::{now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedTrade, Side},
+    model::{
+        category_arc, now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedTrade, Side,
+    },
 };
 
 /// Phoenix's public WebSocket endpoint.
@@ -202,6 +204,7 @@ impl PhoenixVenue {
             symbol: symbol.into(),
             channel,
             instrument_id,
+            category: category_arc(PHOENIX_CATEGORY),
             price,
             // `baseAmount` is the fill's base-asset quantity in the *same real units* the edge emits
             // (edge `trade_qty_raw * 10^qty_exponent`) — verified equal on all 257 shared fills in the
@@ -336,7 +339,7 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (phoenix_venue().into(), 0u32, 1u32),
+            (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u32, 1u32),
             NormalizedInstrument {
                 venue: phoenix_venue().into(),
                 source: phoenix_venue().into(),
@@ -344,6 +347,7 @@ mod tests {
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
+                category: PHOENIX_CATEGORY.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },

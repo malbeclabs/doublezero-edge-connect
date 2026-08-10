@@ -662,12 +662,17 @@ mod tests {
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
+            category: "default".into(),
             price_exponent: -2,
             qty_exponent: -2,
         }))
         .expect("serializes");
         assert_eq!(i.kind, "instrument");
         assert_eq!(i.channel, Some(2));
+        assert!(
+            !i.payload.contains("category"),
+            "category is producer-side only and must never reach the wire"
+        );
 
         assert_eq!(
             prepare(&FeedMessage::Quote(sample_quote()))
@@ -867,7 +872,12 @@ mod tests {
         for (n, sym) in ["SOL", "BTC"].into_iter().enumerate() {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("HYPERLIQUID"), 0u32, n as u32),
+                (
+                    Arc::<str>::from("HYPERLIQUID"),
+                    Arc::<str>::from("default"),
+                    0u32,
+                    n as u32,
+                ),
                 NormalizedInstrument {
                     venue: "HYPERLIQUID".into(),
                     source: "HYPERLIQUID".into(),
@@ -875,6 +885,7 @@ mod tests {
                     symbol: arc,
                     channel: 0,
                     instrument_id: n as u32,
+                    category: "default".into(),
                     price_exponent: -2,
                     qty_exponent: -2,
                 },
@@ -987,7 +998,12 @@ mod tests {
         for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("KALSHI"), channel, 41u32),
+                (
+                    Arc::<str>::from("KALSHI"),
+                    Arc::<str>::from("default"),
+                    channel,
+                    41u32,
+                ),
                 NormalizedInstrument {
                     venue: "KALSHI".into(),
                     source: "KALSHI".into(),
@@ -995,6 +1011,7 @@ mod tests {
                     symbol: arc,
                     channel,
                     instrument_id: 41,
+                    category: "default".into(),
                     price_exponent: -2,
                     qty_exponent: -2,
                 },
@@ -1131,7 +1148,7 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, u32, u32), NormalizedInstrument>,
+        instruments: HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>,
         books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1296,7 +1313,12 @@ mod tests {
     async fn instrument_is_replayed_before_the_book() {
         let mut defs = HashMap::new();
         defs.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             NormalizedInstrument {
                 venue: "KALSHI".into(),
                 source: "KALSHI".into(),
@@ -1304,6 +1326,7 @@ mod tests {
                 symbol: "KXBTCPERP".into(),
                 channel: 2,
                 instrument_id: 41,
+                category: "perps".into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },

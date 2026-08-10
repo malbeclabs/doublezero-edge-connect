@@ -26,7 +26,8 @@ use crate::{
     },
     metrics::metrics,
     model::{
-        now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade, Side,
+        category_arc, now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote,
+        NormalizedTrade, Side,
     },
 };
 
@@ -274,6 +275,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         symbol: t.coin.into(),
         channel,
         instrument_id,
+        category: category_arc(HL_CATEGORY),
         price,
         size,
         // HL trade side: "B" = aggressing buy, "A" = aggressing sell.
@@ -333,7 +335,7 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (hl_venue().into(), 0u32, 1u32),
+            (hl_venue().into(), HL_CATEGORY.into(), 0u32, 1u32),
             NormalizedInstrument {
                 venue: hl_venue().into(),
                 source: hl_venue().into(),
@@ -341,6 +343,7 @@ mod tests {
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
+                category: HL_CATEGORY.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },

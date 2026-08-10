@@ -198,17 +198,26 @@ impl<D: InstrumentDef> PerPublisher<D> {
 }
 
 /// Insert or replace an instrument definition in the shared snapshot, warning if an existing
-/// entry for the same `(venue, channel, instrument_id)` carries different exponents. When one
-/// venue is served by multiple feeds sharing a channel/instrument id (e.g. Hyperliquid TOB + MBO,
-/// both `channel=0`), both write the same key; they are expected to agree on precision, so a
-/// disagreement is a publisher inconsistency worth surfacing rather than silently clobbering.
+/// entry for the same `(venue, category, channel, instrument_id)` carries different exponents.
+/// When one universe is served by multiple feeds sharing a channel/instrument id (e.g. Hyperliquid
+/// TOB + MBO, both `channel=0`, both the registry's default category), both write the same key;
+/// they are expected to agree on precision, so a disagreement is a publisher inconsistency worth
+/// surfacing rather than silently clobbering. `category` is part of the key precisely so this
+/// never fires across two *different* universes that legitimately disagree on precision — see
+/// `InstrumentSnapshot`'s doc.
 fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
-    let key = (inst.venue.clone(), inst.channel, inst.instrument_id);
+    let key = (
+        inst.venue.clone(),
+        inst.category.clone(),
+        inst.channel,
+        inst.instrument_id,
+    );
     let mut map = crate::model::lock(instruments);
     if let Some(prev) = map.get(&key) {
         if prev.price_exponent != inst.price_exponent || prev.qty_exponent != inst.qty_exponent {
             warn!(
                 venue = %inst.venue,
+                category = %inst.category,
                 symbol = %inst.symbol,
                 channel = inst.channel,
                 instrument_id = inst.instrument_id,
@@ -216,16 +225,16 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
                 new_price_exp = inst.price_exponent,
                 prev_qty_exp = prev.qty_exponent,
                 new_qty_exp = inst.qty_exponent,
-                "conflicting instrument definitions for the same (venue, channel, instrument_id) across feeds; last writer wins"
+                "conflicting instrument definitions for the same (venue, category, channel, instrument_id) across feeds; last writer wins"
             );
         }
     }
     map.insert(key, inst.clone());
 }
 
-/// Remove one `(venue, channel, instrument_id)` entry from the shared snapshot — the inverse of
-/// [`upsert_instrument`], which only ever inserts. There is no other removal path for this map in
-/// the crate, so anything that stops naming an identity (chiefly a Source ID change:
+/// Remove one `(venue, category, channel, instrument_id)` entry from the shared snapshot — the
+/// inverse of [`upsert_instrument`], which only ever inserts. There is no other removal path for
+/// this map in the crate, so anything that stops naming an identity (chiefly a Source ID change:
 /// `reveal_if_needed`'s `previous.is_some()` branch) must call this explicitly, or the stale entry
 /// sits in the connect-time replay snapshot for the life of the process — describing a source
 /// that no longer carries this data, alongside the correct one, with nothing on the wire saying
@@ -233,10 +242,16 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 fn remove_instrument(
     instruments: &crate::model::InstrumentSnapshot,
     venue: &Arc<str>,
+    category: &Arc<str>,
     channel: u32,
     instrument_id: u32,
 ) {
-    crate::model::lock(instruments).remove(&(venue.clone(), channel, instrument_id));
+    crate::model::lock(instruments).remove(&(
+        venue.clone(),
+        category.clone(),
+        channel,
+        instrument_id,
+    ));
 }
 
 /// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata stream
@@ -332,6 +347,7 @@ impl TobProcessor {
             remove_instrument(
                 ctx.instruments,
                 &venue_arc(source_label(old_id)),
+                &category_arc(ctx.category),
                 channel,
                 instrument_id,
             );
@@ -345,6 +361,7 @@ impl TobProcessor {
             symbol: def.symbol.clone(),
             channel,
             instrument_id,
+            category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
         };
@@ -504,6 +521,7 @@ impl FrameProcessor for TobProcessor {
                                 symbol: d.symbol.clone(),
                                 channel: header.channel_id as u32,
                                 instrument_id: d.instrument_id,
+                                category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                             };
@@ -610,6 +628,7 @@ impl FrameProcessor for TobProcessor {
                         symbol,
                         channel,
                         instrument_id: t.instrument_id,
+                        category: category_arc(ctx.category),
                         price: apply_exponent(t.trade_price_raw, price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, qty_exponent),
                         aggressor_side: Side::from_code(t.aggressor_side),
@@ -695,6 +714,7 @@ impl MidpointProcessor {
             remove_instrument(
                 ctx.instruments,
                 &venue_arc(source_label(old_id)),
+                &category_arc(ctx.category),
                 channel,
                 instrument_id,
             );
@@ -708,6 +728,7 @@ impl MidpointProcessor {
             symbol: def.symbol.clone(),
             channel,
             instrument_id,
+            category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             // A mid price has no size, so there is no qty exponent on the Midpoint feed; report 0
             // in the shared snapshot (consumers ignore it for mids) — same as the previous
@@ -790,6 +811,7 @@ impl FrameProcessor for MidpointProcessor {
                             symbol: d.symbol.clone(),
                             channel: header.channel_id as u32,
                             instrument_id: d.instrument_id,
+                            category: category_arc(ctx.category),
                             price_exponent: d.price_exponent,
                             qty_exponent: 0,
                         };
@@ -963,6 +985,7 @@ impl MboProcessor {
             remove_instrument(
                 ctx.instruments,
                 &venue_arc(source_label(old_id)),
+                &category_arc(ctx.category),
                 channel,
                 instrument_id,
             );
@@ -976,6 +999,7 @@ impl MboProcessor {
             symbol: def.symbol.clone(),
             channel,
             instrument_id,
+            category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
         };
@@ -1241,6 +1265,7 @@ impl FrameProcessor for MboProcessor {
                                 symbol: d.symbol.clone(),
                                 channel: header.channel_id as u32,
                                 instrument_id: d.instrument_id,
+                                category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                             };
@@ -1369,6 +1394,7 @@ impl FrameProcessor for MboProcessor {
                             symbol: def.symbol.clone(),
                             channel,
                             instrument_id: o.instrument_id,
+                            category: category_arc(ctx.category),
                             price: apply_exponent(o.exec_price_raw, def.price_exponent),
                             size: apply_exponent(o.exec_qty_raw as i64, def.qty_exponent),
                             aggressor_side: Side::from_code(o.aggressor_side),
@@ -1412,6 +1438,7 @@ impl FrameProcessor for MboProcessor {
                         symbol,
                         channel,
                         instrument_id: t.instrument_id,
+                        category: category_arc(ctx.category),
                         price: apply_exponent(t.trade_price_raw, price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, qty_exponent),
                         aggressor_side: Side::from_code(t.aggressor_side),
@@ -1687,6 +1714,7 @@ impl MbpProcessor {
             remove_instrument(
                 ctx.instruments,
                 &venue_arc(source_label(old_id)),
+                &category_arc(ctx.category),
                 key.1 as u32,
                 key.2,
             );
@@ -1700,6 +1728,7 @@ impl MbpProcessor {
             symbol: def.symbol.clone(),
             channel: key.1 as u32,
             instrument_id: key.2,
+            category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
         };
@@ -2172,6 +2201,7 @@ impl FrameProcessor for MbpProcessor {
                                 symbol: d.symbol.clone(),
                                 channel: channel as u32,
                                 instrument_id: d.instrument_id,
+                                category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                             };
@@ -2539,6 +2569,7 @@ impl FrameProcessor for MbpProcessor {
                         // downstream by a `symbol` match that can't tell the two arms apart.
                         channel: channel as u32,
                         instrument_id: t.instrument_id,
+                        category: category_arc(ctx.category),
                         price: apply_exponent(t.trade_price_raw, price_exponent),
                         size: apply_exponent(t.trade_qty_raw as i64, qty_exponent),
                         aggressor_side: Side::from_code(t.aggressor_side),
@@ -2639,8 +2670,8 @@ mod tests {
         },
         metrics::metrics,
         model::{
-            venue_arc, BookAction, BookSide, DepthSnapshot, FeedMessage, NormalizedBook,
-            NormalizedInstrument,
+            category_arc, venue_arc, BookAction, BookSide, DepthSnapshot, FeedMessage,
+            NormalizedBook, NormalizedInstrument,
         },
     };
 
@@ -3098,11 +3129,16 @@ mod tests {
             map.keys().collect::<Vec<_>>()
         );
         assert!(
-            !map.contains_key(&(venue_arc("HYPERLIQUID"), 0, 41)),
+            !map.contains_key(&(
+                venue_arc("HYPERLIQUID"),
+                category_arc("testcategory"),
+                0,
+                41
+            )),
             "the stale entry under the OLD source must be purged, not merely superseded"
         );
         assert!(
-            map.contains_key(&(venue_arc("PHOENIX"), 0, 41)),
+            map.contains_key(&(venue_arc("PHOENIX"), category_arc("testcategory"), 0, 41)),
             "the entry under the CURRENT source must remain"
         );
     }
@@ -4183,6 +4219,7 @@ mod tests {
             symbol: "BTC".into(),
             channel: 0,
             instrument_id: 1,
+            category: "default".into(),
             price_exponent: -2,
             qty_exponent: -4,
         };
@@ -4192,7 +4229,9 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1);
-            let entry = map.get(&("TestVenue".into(), 0u32, 1u32)).unwrap();
+            let entry = map
+                .get(&("TestVenue".into(), "default".into(), 0u32, 1u32))
+                .unwrap();
             assert_eq!(entry.price_exponent, -2);
             assert_eq!(entry.qty_exponent, -4);
         }
@@ -4212,7 +4251,9 @@ mod tests {
         {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1, "still one entry after conflicting write");
-            let entry = map.get(&("TestVenue".into(), 0u32, 1u32)).unwrap();
+            let entry = map
+                .get(&("TestVenue".into(), "default".into(), 0u32, 1u32))
+                .unwrap();
             assert_eq!(
                 entry.price_exponent, -3,
                 "last writer's price_exponent wins"
@@ -4488,7 +4529,12 @@ mod tests {
         );
         let snapshot = crate::model::lock(&instruments);
         let reannounced = snapshot
-            .get(&(std::sync::Arc::<str>::from("SOURCE_0"), 7, 0))
+            .get(&(
+                std::sync::Arc::<str>::from("SOURCE_0"),
+                category_arc("testcategory"),
+                7,
+                0,
+            ))
             .expect("instrument 0 must have been re-revealed under SOURCE_0/INST-0");
         assert_eq!(
             reannounced.channel, 7,
