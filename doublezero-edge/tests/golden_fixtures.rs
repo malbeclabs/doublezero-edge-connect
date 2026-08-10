@@ -116,7 +116,35 @@ fn status_table_lists_venues_and_the_history_summary() {
     assert!(out.contains("Hyperliquid"), "{out}");
     assert!(out.contains("Phoenix"), "{out}");
     assert!(
-        out.contains("history: products_tracked=128 late_drops=4 evicted=0 window_seconds=3600"),
+        out.contains(
+            "history: products=128  buckets=612440/1048576 (58%)  est_bytes=57623897  \
+             window_seconds=3600  evicted=0  late_drops=4"
+        ),
+        "{out}"
+    );
+    // Below cap: no "AT CAP" marker (the pair to `the_table_marks_a_store_at_cap` in render.rs).
+    assert!(!out.contains("AT CAP"), "{out}");
+}
+
+/// The `channels` block: the wire-supplied `label` must win over the bare id, and `bound`/
+/// `floor_admits` must read as visibly distinct columns (channel 11 is admitted but not bound).
+#[test]
+fn status_table_shows_the_channels_block_with_the_servers_label() {
+    let body = fixture("status.json");
+    let out = render::render_table(Endpoint::Status, &body).unwrap();
+    assert!(out.contains("lashay-4"), "{out}");
+    assert!(out.contains("sports.nfl"), "{out}");
+    assert!(out.contains("412"), "{out}");
+    assert!(out.contains("(29 channels excluded by floor)"), "{out}");
+}
+
+/// The `process` block: real numbers, not omitted.
+#[test]
+fn status_table_shows_the_process_block() {
+    let body = fixture("status.json");
+    let out = render::render_table(Endpoint::Status, &body).unwrap();
+    assert!(
+        out.contains("process: resident_memory_bytes=193200128  cpu_seconds_total=412.7"),
         "{out}"
     );
 }

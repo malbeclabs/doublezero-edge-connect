@@ -1,32 +1,39 @@
-//! `doublezero-edge`: an agent-facing, READ-ONLY CLI over a running `doublezero-edge-connect`
-//! container's `/v1` HTTP market-data API. Command surface and JSON envelopes are modelled on the
-//! Coinbase Advanced Trade CLI (`key==value` query parameters, `--jq`, `--template`) so an agent
-//! already fluent in that tool needs no new vocabulary here.
+//! `doublezero-edge`: an agent-facing CLI over a running `doublezero-edge-connect` container's
+//! `/v1` HTTP market-data API. Command surface and JSON envelopes are modelled on the Coinbase
+//! Advanced Trade CLI (`key==value` query parameters, `--jq`, `--template`) so an agent already
+//! fluent in that tool needs no new vocabulary here.
 //!
-//! There is no order-placement or mutation path anywhere in `edge-connect` for this tool to reach
-//! — every command is a `GET` — so unlike the tool it emulates, no command here ever needs a
-//! confirmation prompt.
+//! Every `products`/`status` command is READ-ONLY (a `GET` against `/v1`, which has no
+//! order-placement or mutation path anywhere in `edge-connect` for it to reach) and never needs a
+//! confirmation prompt. `channels` is the one exception: it is a distinct command group over a
+//! distinct, off-by-default admin surface (`--admin-url` / `DZ_ADMIN_BIND`), and `channels set` is
+//! this tool's only mutating command — it changes what the shared process ingests, so it prints
+//! what it would drop and requires confirmation unless `--force`.
 
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use doublezero_edge::{client, endpoint::Endpoint, jq, params, render};
+use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
 use serde_json::Value;
 
-/// doublezero-edge: an agent-facing, READ-ONLY CLI over a running edge-connect container's /v1
-/// market-data API.
+/// doublezero-edge: an agent-facing CLI over a running edge-connect container's /v1 market-data
+/// API (plus its off-by-default admin surface, for `channels`).
 #[derive(Parser)]
 #[command(
     name = "doublezero-edge",
     version,
-    about = "Read-only market-data client for a running doublezero-edge-connect container.",
+    about = "Market-data client for a running doublezero-edge-connect container.",
     long_about = "doublezero-edge queries a running doublezero-edge-connect container's /v1 HTTP \
 API for market data: products, tickers, candles, order books, best bid/ask, and feed health.\n\n\
-This tool is READ-ONLY. Every command is a GET against the API; there is no order-placement or \
-mutation path anywhere in edge-connect for it to reach. That means no command here ever needs a \
+`products` and `status` are READ-ONLY: every one of those is a GET against /v1, which has no \
+order-placement or mutation path anywhere in edge-connect for it to reach, so neither ever needs a \
 confirmation prompt — a real difference from the Coinbase Advanced Trade CLI this tool's surface \
 is modelled on, where blast-radius containment (accidentally placing a real order) drives much of \
 the design.\n\n\
+`channels` is separate: it talks to edge-connect's off-by-default admin surface (--admin-url / \
+DZ_ADMIN_BIND) rather than /v1, and `channels set` is this tool's one mutating command — it \
+replaces which channels this process ingests, which drops books/history/catalog state for \
+anything it excludes. It prints what would be dropped and requires confirmation unless --force.\n\n\
 Trailing arguments to a products subcommand are either the product id (a bare positional, e.g. \
 HYPERLIQUID:BTC) or a key==value query parameter (e.g. granularity==ONE_MINUTE); the two are told \
 apart by the presence of '==', matched before anything is treated as positional, so a query value \
@@ -78,6 +85,46 @@ enum Command {
         #[arg(num_args = 0.., value_name = "ARGS")]
         args: Vec<String>,
     },
+    /// Inspect or change which channels of an enabled feed this process ingests. Talks to
+    /// edge-connect's off-by-default admin surface (`--admin-url` / `DZ_ADMIN_BIND`), not `/v1` —
+    /// see the top-level `--help` for why this command group is separate.
+    Channels {
+        #[command(subcommand)]
+        action: ChannelsCommand,
+    },
+}
+
+/// The admin surface's base URL. `9098` is edge-connect's own documented example bind
+/// (`docs/superpowers/specs/2026-08-09-channel-floor-and-history-accounting-design.md`); the
+/// surface itself is off unless the container sets `DZ_ADMIN_BIND`, so this default is only ever a
+/// starting point, never a promise the surface is listening.
+const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
+
+#[derive(Subcommand)]
+enum ChannelsCommand {
+    /// List each enabled row's channels: floor admission, real bound state, product count.
+    List {
+        /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
+        /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
+        /// since that is otherwise indistinguishable from a wrong port.
+        #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
+        admin_url: String,
+    },
+    /// Replace the channel floor (same spec syntax as `--channels`/`DZ_CHANNELS`:
+    /// `<code>=<id>[,<id>...][;<code>=...]`). Prints what would be dropped and requires
+    /// confirmation unless `--force` — the drop is irreversible within the history window.
+    Set {
+        /// The new floor spec. An empty string clears every restriction.
+        spec: String,
+        /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
+        /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
+        /// since that is otherwise indistinguishable from a wrong port.
+        #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
+        admin_url: String,
+        /// Skip the drop preview's confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +175,11 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
             ProductsCommand::Book { args } => (Endpoint::Book, args.clone()),
             ProductsCommand::BestBidAsk { args } => (Endpoint::BestBidAsk, args.clone()),
         },
+        Command::Channels { .. } => {
+            unreachable!(
+                "Command::Channels is dispatched directly by run(), never through resolve()"
+            )
+        }
     }
 }
 
@@ -149,6 +201,11 @@ fn build_path(endpoint: Endpoint, positionals: &[String]) -> Result<String, Stri
         Endpoint::Ticker => format!("/v1/products/{}/ticker", require_id()?),
         Endpoint::Candles => format!("/v1/products/{}/candles", require_id()?),
         Endpoint::Book => format!("/v1/products/{}/book", require_id()?),
+        Endpoint::ChannelsList | Endpoint::ChannelsSet => {
+            unreachable!(
+                "channels commands are dispatched directly by run(), never through build_path"
+            )
+        }
     })
 }
 
@@ -161,6 +218,12 @@ fn run() -> i32 {
         Ok(cli) => cli,
         Err(e) => return handle_clap_error(&e),
     };
+
+    if let Command::Channels { action } = &cli.command {
+        // A distinct command group over a distinct surface (`--admin-url`, never `cli.url`) with
+        // its own confirmation flow — handled entirely separately from the /v1 GET pipeline below.
+        return run_channels(&cli, action);
+    }
 
     let (endpoint, raw_args) = resolve(&cli.command);
     let (params, positionals) = params::split(&raw_args);
@@ -177,20 +240,162 @@ fn run() -> i32 {
         }
     };
 
-    let client = match reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
+    let client = match build_http_client() {
         Ok(client) => client,
-        Err(e) => {
-            eprintln!("error: failed to build HTTP client: {e}");
+        Err(msg) => {
+            eprintln!("error: {msg}");
             return 1;
         }
     };
 
     match client::get(&client, &cli.url, &path, &params) {
         client::Outcome::Ok { body } => emit(&cli, endpoint, &body),
+        client::Outcome::Failed { status, body } => {
+            print_error(&body);
+            exit_code_for_status(status)
+        }
+        client::Outcome::Unreachable { body } => {
+            print_error(&body);
+            3
+        }
+    }
+}
+
+/// Build the one HTTP client every command (`/v1` and admin alike) shares.
+fn build_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))
+}
+
+/// `channels list` / `channels set`. Both talk to the admin surface (`--admin-url`), never
+/// `cli.url` alone — though `list` additionally reads `cli.url`'s `/v1/status` for the real
+/// per-channel bound state and product counts the admin surface itself does not report (see
+/// `channels::render_channels_list`'s docs), and `set` reads it for the drop preview.
+fn run_channels(cli: &Cli, action: &ChannelsCommand) -> i32 {
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
+    };
+
+    match action {
+        ChannelsCommand::List { admin_url } => run_channels_list(cli, &client, admin_url),
+        ChannelsCommand::Set {
+            spec,
+            admin_url,
+            force,
+        } => run_channels_set(cli, &client, admin_url, spec, *force),
+    }
+}
+
+/// `channels list`: confirm the admin surface answers (naming `DZ_ADMIN_BIND` if it doesn't), then
+/// merge its floor summary with `/v1/status`'s real per-channel liveness into one JSON value so
+/// `--jq`/`--output`/`--template` behave exactly as they do for every other command.
+fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &str) -> i32 {
+    if cli.template {
+        return emit_template(cli, &Endpoint::ChannelsList.template());
+    }
+
+    let admin_body = match client::admin_get(client, admin_url, "/admin/channels") {
+        client::Outcome::Ok { body } => body,
+        client::Outcome::Failed { status, body } => {
+            print_error(&body);
+            return exit_code_for_status(status);
+        }
+        client::Outcome::Unreachable { body } => {
+            print_error(&body);
+            return 3;
+        }
+    };
+
+    let status_body = match client::get(client, &cli.url, "/v1/status", &[]) {
+        client::Outcome::Ok { body } => body,
+        client::Outcome::Failed { status, body } => {
+            print_error(&body);
+            return exit_code_for_status(status);
+        }
+        client::Outcome::Unreachable { body } => {
+            print_error(&body);
+            return 3;
+        }
+    };
+
+    let combined = serde_json::json!({ "admin": admin_body, "status": status_body });
+    emit(cli, Endpoint::ChannelsList, &combined)
+}
+
+/// `channels set`: preview what the new floor would drop (best-effort, from `/v1/status`), require
+/// confirmation unless `--force`, then `POST` the spec to the admin surface.
+fn run_channels_set(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    admin_url: &str,
+    spec: &str,
+    force: bool,
+) -> i32 {
+    if cli.template {
+        return emit_template(cli, &Endpoint::ChannelsSet.template());
+    }
+
+    let preview = match client::get(client, &cli.url, "/v1/status", &[]) {
+        client::Outcome::Ok { body } => match channels::compute_drops(&body, spec) {
+            Ok(drops) => Some(drops),
+            Err(msg) => {
+                eprintln!("warning: could not compute the drop preview: {msg}");
+                None
+            }
+        },
+        client::Outcome::Failed { body, .. } => {
+            eprintln!(
+                "warning: could not fetch current status for the drop preview: {}",
+                serde_json::to_string(&body).unwrap_or_default()
+            );
+            None
+        }
+        client::Outcome::Unreachable { body } => {
+            eprintln!(
+                "warning: could not fetch current status for the drop preview: {}",
+                serde_json::to_string(&body).unwrap_or_default()
+            );
+            None
+        }
+    };
+
+    match &preview {
+        Some(drops) => println!("{}", channels::render_drop_preview(drops)),
+        None => println!("(drop preview unavailable; proceeding on the spec alone)"),
+    }
+
+    if !force {
+        if preview.is_none() {
+            eprintln!(
+                "error: cannot confirm this change without a drop preview. Pass --force to apply \
+                 anyway, or fix --url so the preview can be computed."
+            );
+            return 1;
+        }
+        print!(
+            "Apply this floor? Dropped channels' books/history/catalog entries are not \
+                recoverable within the window. Type 'yes' to continue: "
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        let confirmed = std::io::stdin().read_line(&mut input).is_ok()
+            && input.trim().eq_ignore_ascii_case("yes");
+        if !confirmed {
+            eprintln!("aborted; the channel floor was not changed.");
+            return 1;
+        }
+    }
+
+    match client::admin_post_channels(client, admin_url, spec) {
+        client::Outcome::Ok { body } => emit(cli, Endpoint::ChannelsSet, &body),
         client::Outcome::Failed { status, body } => {
             print_error(&body);
             exit_code_for_status(status)

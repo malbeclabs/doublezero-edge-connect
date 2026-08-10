@@ -13,6 +13,13 @@ pub enum Endpoint {
     Book,
     BestBidAsk,
     Status,
+    /// `channels list`'s synthetic body: `{"admin": <GET /admin/channels body>, "status": <GET
+    /// /v1/status body>}` — two responses from two different binds (`--url` / `--admin-url`)
+    /// merged into one value so `--jq`/`--output`/`--template` work the same way they do for
+    /// every other command, over one JSON value.
+    ChannelsList,
+    /// `channels set`'s success body: `POST /admin/channels`'s own `{"applied": [...]}`.
+    ChannelsSet,
 }
 
 impl Endpoint {
@@ -34,7 +41,9 @@ impl Endpoint {
             | Endpoint::Ticker
             | Endpoint::Book
             | Endpoint::BestBidAsk
-            | Endpoint::Status => json!({}),
+            | Endpoint::Status
+            | Endpoint::ChannelsList
+            | Endpoint::ChannelsSet => json!({}),
         }
     }
 }

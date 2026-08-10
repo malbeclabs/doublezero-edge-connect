@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 /// What a request against the API produced, already classified into the three shapes the rest of
 /// this crate cares about. `status` on the two response-bearing variants is the raw HTTP status
 /// code — the exit-code mapping in `main.rs` is the only other place that needs it.
+#[derive(Debug)]
 pub enum Outcome {
     /// A `2xx` response with a JSON body.
     Ok { body: Value },
@@ -68,6 +69,89 @@ pub fn unreachable_envelope(base_url: &str) -> Value {
     })
 }
 
+/// The admin-surface twin of [`unreachable_envelope`]. It exists as a separate message because a
+/// connection-refused against the admin surface has a genuinely different likely cause: the admin
+/// surface is **off by default** (unlike `/v1`), so a wrong `--admin-url` and a container that
+/// simply never set `DZ_ADMIN_BIND` are otherwise indistinguishable failures with different fixes.
+/// Naming the env var here is what lets a caller tell them apart without guessing.
+pub fn admin_unreachable_envelope(admin_url: &str) -> Value {
+    json!({
+        "error": "admin_api_unreachable",
+        "message": format!("No response at {admin_url}."),
+        "remediation": "The admin surface is off unless DZ_ADMIN_BIND is set in the edge-connect \
+            container (it is not the same bind as the read-only /v1 API). Confirm DZ_ADMIN_BIND \
+            is set there, or pass the correct --admin-url.",
+    })
+}
+
+/// `GET {admin_url}{path}` — the admin-surface counterpart of [`get`], differing only in which
+/// unreachable envelope it synthesizes (see [`admin_unreachable_envelope`]) and in taking no query
+/// parameters (`GET /admin/channels` takes none).
+pub fn admin_get(client: &reqwest::blocking::Client, admin_url: &str, path: &str) -> Outcome {
+    let full = format!("{}{}", admin_url.trim_end_matches('/'), path);
+    let resp = match client.get(&full).send() {
+        Ok(r) => r,
+        Err(_e) => {
+            return Outcome::Unreachable {
+                body: admin_unreachable_envelope(admin_url),
+            }
+        }
+    };
+    classify(resp)
+}
+
+/// `POST {admin_url}/admin/channels?channels={spec}` — the one mutation this crate ever performs.
+///
+/// Two things matter here, both forced by the server (`sinks::admin::post_channels`):
+/// - The spec travels as a **query parameter**, not a request body — the server 400s a
+///   non-zero `Content-Length` outright, specifically to catch a body-bearing client rather than
+///   silently ignoring it. `reqwest`'s query serializer percent-encodes the value (`,`/`;`/`=` all
+///   need it — the spec syntax is `<code>=<id>[,<id>...][;<code>=...]`), and issuing the request
+///   via `.query(&[...])` with **no** `.body(...)` call sends no request body and no
+///   `Content-Length` header at all — pinned by
+///   `client::tests::a_channels_post_sends_no_body_and_percent_encodes_the_query`, which reads the
+///   raw bytes off the wire rather than trusting `reqwest`'s behaviour by assumption.
+/// - An empty `spec` is a legitimate "clear the floor" (still sent as `?channels=`), distinct from
+///   omitting the parameter altogether (which the server 400s) — `reqwest` always includes a
+///   `key=value` pair for `.query(&[(k, v)])` even when `v` is `""`, so that distinction is
+///   preserved without this function doing anything special.
+pub fn admin_post_channels(
+    client: &reqwest::blocking::Client,
+    admin_url: &str,
+    spec: &str,
+) -> Outcome {
+    let full = format!("{}/admin/channels", admin_url.trim_end_matches('/'));
+    let resp = match client.post(&full).query(&[("channels", spec)]).send() {
+        Ok(r) => r,
+        Err(_e) => {
+            return Outcome::Unreachable {
+                body: admin_unreachable_envelope(admin_url),
+            }
+        }
+    };
+    classify(resp)
+}
+
+/// Shared response classification for the admin-surface calls above — identical to the tail of
+/// [`get`], factored out so both admin functions apply it the same way.
+fn classify(resp: reqwest::blocking::Response) -> Outcome {
+    let status = resp.status().as_u16();
+    let full = resp.url().to_string();
+    let body: Value = match resp.json() {
+        Ok(v) => v,
+        Err(_e) => json!({
+            "error": "invalid_response",
+            "message": format!("Response from {full} was not valid JSON."),
+            "remediation": "Check --admin-url points at an edge-connect instance's admin surface.",
+        }),
+    };
+    if (200..300).contains(&status) {
+        Outcome::Ok { body }
+    } else {
+        Outcome::Failed { status, body }
+    }
+}
+
 /// Percent-encode one path segment (e.g. a product id) for use directly after a `/` in a URL path.
 /// Hand-rolled rather than pulled from a dependency: this crate already depends on `reqwest`
 /// (which pulls in a URL encoder transitively), but reaching into its private internals isn't a
@@ -122,5 +206,131 @@ mod tests {
     #[test]
     fn a_literal_percent_sign_is_itself_escaped() {
         assert_eq!(encode_path_segment("100%"), "100%25");
+    }
+
+    #[test]
+    fn the_admin_unreachable_envelope_names_dz_admin_bind() {
+        let body = admin_unreachable_envelope("http://127.0.0.1:9098");
+        let msg = body["remediation"].as_str().unwrap();
+        assert!(
+            msg.contains("DZ_ADMIN_BIND"),
+            "a connection-refused against the admin surface must name DZ_ADMIN_BIND, since it is \
+             otherwise indistinguishable from a wrong --admin-url: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Raw-wire checks for the one POST this crate makes. These read the literal bytes off a real
+    // TCP socket rather than trusting reqwest's behaviour by assumption — the server-side 400 on
+    // any nonzero Content-Length exists specifically to catch a body-bearing client, so this must
+    // be verified, not assumed.
+    // -----------------------------------------------------------------------------------------
+
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    /// Bind an ephemeral listener, capture the raw bytes of exactly one request, answer it with a
+    /// canned `200 {"applied":[]}`, and hand the captured request text back over a channel.
+    fn capture_one_request() -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(text);
+                let body = br#"{"applied":[]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// The load-bearing test from the task brief: verify, against real bytes on the wire, that
+    /// `admin_post_channels` sends the spec as a percent-encoded query parameter and attaches
+    /// **no** request body — not even an explicit `Content-Length: 0` — since the server 400s any
+    /// nonzero `Content-Length` specifically to catch a body-bearing client rather than silently
+    /// ignoring it.
+    #[test]
+    fn a_channels_post_sends_no_body_and_percent_encodes_the_query() {
+        let (base, rx) = capture_one_request();
+        let client = reqwest::blocking::Client::new();
+        let outcome = admin_post_channels(&client, &base, "lashay-4=10,11;lashay-2=5");
+        assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
+
+        let raw = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the server thread must have captured a request");
+
+        let request_line = raw.lines().next().unwrap_or_default().to_string();
+        assert!(
+            request_line.starts_with("POST /admin/channels?channels="),
+            "the spec must travel as a query parameter on POST: {request_line}"
+        );
+
+        let query = request_line
+            .split("channels=")
+            .nth(1)
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        // The spec syntax's own reserved bytes (`,` `;` `=`) must not survive literally in the
+        // query string — left unescaped they would be ambiguous with query-string delimiters.
+        assert!(
+            !query.contains(','),
+            "comma must be percent-encoded: {query}"
+        );
+        assert!(
+            !query.contains(';'),
+            "semicolon must be percent-encoded: {query}"
+        );
+        assert!(!query.contains('='), "'=' must be percent-encoded: {query}");
+        let upper = query.to_uppercase();
+        assert!(upper.contains("%2C"), "comma must encode to %2C: {query}");
+        assert!(
+            upper.contains("%3B"),
+            "semicolon must encode to %3B: {query}"
+        );
+        assert!(upper.contains("%3D"), "'=' must encode to %3D: {query}");
+
+        // The header block (everything up to the blank line) must carry no Content-Length at
+        // all: a bodyless POST that still sent "Content-Length: 0" would technically satisfy the
+        // server's `content_length > 0` check, but the task brief calls this out as a real defect
+        // to catch rather than assume away, so it is pinned here explicitly.
+        let head = raw.split("\r\n\r\n").next().unwrap_or(&raw);
+        assert!(
+            !head.to_lowercase().contains("content-length"),
+            "a bodyless POST must not send a Content-Length header at all: {head}"
+        );
+    }
+
+    /// `admin_get` issues a plain `GET` with no query string at all.
+    #[test]
+    fn admin_get_sends_a_plain_get_with_no_query_string() {
+        let (base, rx) = capture_one_request();
+        let client = reqwest::blocking::Client::new();
+        let outcome = admin_get(&client, &base, "/admin/channels");
+        assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
+        let raw = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let request_line = raw.lines().next().unwrap_or_default();
+        assert_eq!(request_line, "GET /admin/channels HTTP/1.1");
     }
 }

@@ -23,17 +23,34 @@ pub fn render_table(endpoint: Endpoint, body: &Value) -> Result<String, String> 
         Endpoint::Book => render_book(body),
         Endpoint::BestBidAsk => render_best_bid_ask(body),
         Endpoint::Status => render_status(body),
+        Endpoint::ChannelsList => crate::channels::render_channels_list(body),
+        Endpoint::ChannelsSet => render_channels_set(body),
     }
 }
 
-fn parse<T: serde::de::DeserializeOwned>(body: &Value) -> Result<T, String> {
+fn render_channels_set(body: &Value) -> Result<String, String> {
+    let parsed: AdminApplyResponse = parse(body)?;
+    if parsed.applied.is_empty() {
+        Ok("applied: (unrestricted — every enabled row's channels are admitted)".to_string())
+    } else {
+        Ok(format!("applied: {}", parsed.applied.join(", ")))
+    }
+}
+
+/// Deserialize `body` into `T`, tolerantly (no type in `types.rs` uses
+/// `#[serde(deny_unknown_fields)]`). `pub(crate)` so `channels.rs` — which renders the same
+/// `/v1/status` and `/admin/channels` shapes for `doublezero-edge channels list` — can reuse it
+/// rather than hand-rolling a second JSON-to-struct step.
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(body: &Value) -> Result<T, String> {
     serde_json::from_value(body.clone())
         .map_err(|e| format!("response did not match the expected shape: {e}"))
 }
 
 /// Build an aligned text table. Every column but the last is padded to its widest cell; the last
-/// column is left unpadded so no row ends in trailing whitespace.
-fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+/// column is left unpadded so no row ends in trailing whitespace. `pub(crate)` so `channels.rs`
+/// renders its own tables (the drop preview, the merged `channels list` view) in the same visual
+/// style as every other command here rather than duplicating a second table builder.
+pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -219,15 +236,86 @@ fn render_status(body: &Value) -> Result<String, String> {
         .map(|v| vec![v.venue.clone(), v.status.clone()])
         .collect();
     let mut out = table(&headers, &rows);
+
     out.push_str("\n\n");
-    out.push_str(&format!(
-        "history: products_tracked={} late_drops={} evicted={} window_seconds={}",
-        parsed.history.products_tracked,
-        parsed.history.late_drops,
-        parsed.history.evicted,
-        parsed.history.window_seconds
-    ));
+    out.push_str(&render_history_line(&parsed.history));
+
+    if !parsed.channels.rows.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&render_channels_block(&parsed.channels));
+    }
+
+    out.push_str("\n\n");
+    out.push_str(&render_process_line(&parsed.process));
     Ok(out)
+}
+
+/// The `history` summary line. Rule: the at-cap marker (`AT CAP`) is its own explicit token, never
+/// left to be inferred from `products` happening to equal some hardcoded cap — `products_at_cap`
+/// is the server's own honest signal (a bucket-budget eviction can hold `products` well below any
+/// cap-looking number while still discarding markets), so this function trusts that flag alone.
+fn render_history_line(h: &HistoryStatus) -> String {
+    let products = if h.products > 0 {
+        h.products
+    } else {
+        h.products_tracked
+    };
+    let cap_marker = if h.products_at_cap { " AT CAP" } else { "" };
+    let pct = if h.bucket_budget > 0 {
+        (h.buckets as f64 / h.bucket_budget as f64) * 100.0
+    } else {
+        0.0
+    };
+    format!(
+        "history: products={products}{cap_marker}  buckets={}/{} ({pct:.0}%)  est_bytes={}  \
+         window_seconds={}  evicted={}  late_drops={}",
+        h.buckets, h.bucket_budget, h.est_bytes, h.window_seconds, h.evicted, h.late_drops
+    )
+}
+
+/// The `channels` block, shared verbatim between `status`'s table view and `channels list`
+/// (`channels.rs`) — one row per enabled feed row, one line per channel with its floor admission,
+/// real bound state and product count kept as visibly distinct columns (never collapsed into one
+/// "admitted" notion — see the module-level rule this guards).
+pub(crate) fn render_channels_block(channels: &ChannelsBlock) -> String {
+    let mut sections = Vec::new();
+    for row in &channels.rows {
+        let mut out = format!("channels: {} ({}/{})\n", row.code, row.venue, row.category);
+        let headers = ["CHANNEL", "NAME", "FLOOR_ADMITS", "BOUND", "PRODUCTS"];
+        let table_rows: Vec<Vec<String>> = row
+            .channels
+            .iter()
+            .map(|c| {
+                vec![
+                    c.channel.to_string(),
+                    c.display_name(),
+                    c.floor_admits.to_string(),
+                    c.bound.to_string(),
+                    c.products.to_string(),
+                ]
+            })
+            .collect();
+        out.push_str(&table(&headers, &table_rows));
+        out.push_str(&format!("\n({} channels excluded by floor)", row.excluded));
+        sections.push(out);
+    }
+    sections.push(format!(
+        "total channels excluded by floor: {}",
+        channels.excluded_by_floor
+    ));
+    sections.join("\n\n")
+}
+
+fn render_process_line(p: &ProcessBlock) -> String {
+    let rss = p
+        .resident_memory_bytes
+        .map(|v| format!("{v:.0}"))
+        .unwrap_or_else(|| "-".to_string());
+    let cpu = p
+        .cpu_seconds_total
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "-".to_string());
+    format!("process: resident_memory_bytes={rss}  cpu_seconds_total={cpu}")
 }
 
 #[cfg(test)]
@@ -268,6 +356,115 @@ mod tests {
         assert!(
             out.contains("coverage: levels_returned=1 levels_capped_at=50 complete=false"),
             "{out}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `status`'s at-cap marker (task brief Step 1). Two genuinely different fixture documents —
+    // one with `products_at_cap: true` and a nonzero `evicted`, one with `products_at_cap: false`
+    // and no evictions — never one fixture reused both ways.
+    // -----------------------------------------------------------------------------------------
+
+    fn fixture_status_at_cap() -> Value {
+        serde_json::json!({
+            "venues": [{"venue": "KALSHI", "status": "online"}],
+            "history": {
+                "products": 1024,
+                "products_at_cap": true,
+                "buckets": 900000,
+                "bucket_budget": 1048576,
+                "est_bytes": 90000000,
+                "window_seconds": 3600,
+                "evicted": 8214,
+                "late_drops": 0
+            }
+        })
+    }
+
+    fn fixture_status_healthy() -> Value {
+        serde_json::json!({
+            "venues": [{"venue": "KALSHI", "status": "online"}],
+            "history": {
+                "products": 4,
+                "products_at_cap": false,
+                "buckets": 12,
+                "bucket_budget": 1048576,
+                "est_bytes": 1200,
+                "window_seconds": 3600,
+                "evicted": 0,
+                "late_drops": 0
+            }
+        })
+    }
+
+    /// The at-cap marker is the operator's signal to narrow the floor, so it must be rendered
+    /// distinctly rather than left to be inferred from two numbers being equal.
+    #[test]
+    fn the_table_marks_a_store_at_cap() {
+        let out = render_status(&fixture_status_at_cap()).unwrap();
+        assert!(out.contains("AT CAP"), "at-cap was not surfaced: {out}");
+    }
+
+    /// Below cap there is no warning — otherwise the marker means nothing.
+    #[test]
+    fn the_table_does_not_cry_wolf_below_cap() {
+        let out = render_status(&fixture_status_healthy()).unwrap();
+        assert!(!out.contains("AT CAP"), "{out}");
+    }
+
+    /// `bound` and `floor_admits` must read as visibly distinct columns, not be collapsed into one
+    /// "admitted" notion — an admitted-but-not-bound channel (11 here) is the interesting case this
+    /// project already shipped once as a single conflated field.
+    #[test]
+    fn the_channels_block_distinguishes_bound_from_floor_admits() {
+        let body = serde_json::json!({
+            "venues": [],
+            "history": {
+                "products": 2, "products_at_cap": false, "buckets": 2, "bucket_budget": 100,
+                "est_bytes": 10, "window_seconds": 3600, "evicted": 0, "late_drops": 0
+            },
+            "channels": {
+                "rows": [{
+                    "venue": "KALSHI", "category": "sports", "code": "lashay-4", "excluded": 29,
+                    "channels": [
+                        {"channel": 10, "floor_admits": true, "bound": true, "products": 2},
+                        {"channel": 11, "floor_admits": true, "bound": false, "products": 0},
+                        {"channel": 12, "floor_admits": false, "bound": false, "products": 0}
+                    ]
+                }],
+                "excluded_by_floor": 29
+            }
+        });
+        let out = render_status(&body).unwrap();
+        // Locate each channel's row text and check its own two columns independently — this must
+        // fail if `bound` and `floor_admits` were rendered as the same value.
+        let line_10 = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("10 "))
+            .unwrap();
+        assert!(
+            line_10.contains("true") && line_10.matches("true").count() >= 2,
+            "{line_10}"
+        );
+        let line_11 = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("11 "))
+            .unwrap();
+        assert!(
+            line_11.contains("true"),
+            "channel 11 must still read floor_admits=true: {line_11}"
+        );
+        assert!(
+            line_11.contains("false"),
+            "channel 11 must read bound=false: {line_11}"
+        );
+        let line_12 = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("12 "))
+            .unwrap();
+        assert!(
+            line_12.matches("false").count() >= 2,
+            "channel 12 is excluded and unbound, both false: {line_12}"
         );
     }
 }

@@ -6,6 +6,7 @@
 //! module directly (golden-fixture rendering, `--jq`, `key==value` parsing) without shelling out
 //! to the built binary for everything — `main.rs` stays a thin wrapper over these modules.
 
+pub mod channels;
 pub mod client;
 pub mod endpoint;
 pub mod jq;

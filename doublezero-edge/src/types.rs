@@ -128,6 +128,14 @@ pub struct StatusResponse {
     #[serde(default)]
     pub venues: Vec<VenueStatus>,
     pub history: HistoryStatus,
+    /// Absent on an older server that predates the channel floor — default to empty rather than
+    /// fail the whole response.
+    #[serde(default)]
+    pub channels: ChannelsBlock,
+    /// Absent on an older server, or when the process collector isn't registered for this
+    /// build/platform (Linux-only) — default rather than fail the whole response.
+    #[serde(default)]
+    pub process: ProcessBlock,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,10 +146,139 @@ pub struct VenueStatus {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistoryStatus {
+    /// Superseded by `products` (kept for a server old enough to only send this name).
+    #[serde(default)]
     pub products_tracked: usize,
-    pub late_drops: u64,
-    pub evicted: u64,
+    #[serde(default)]
+    pub products: usize,
+    /// The one figure a raw memory number can't tell you: the bucket budget holds RSS flat while
+    /// silently evicting products, so a healthy-looking RSS is exactly what an over-wide floor
+    /// produces. This flag (not an inferred "products == some hardcoded cap") is the honest
+    /// signal, and the table renderer must show it as its own marker rather than leave a caller to
+    /// notice two numbers are equal.
+    #[serde(default)]
+    pub products_at_cap: bool,
+    #[serde(default)]
+    pub buckets: u64,
+    #[serde(default)]
+    pub bucket_budget: u64,
+    #[serde(default)]
+    pub est_bytes: u64,
     pub window_seconds: u64,
+    pub evicted: u64,
+    pub late_drops: u64,
+}
+
+/// The `channels` block of `/v1/status`: per enabled row, its channels' floor admission, real
+/// receiver liveness and current product count.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChannelsBlock {
+    #[serde(default)]
+    pub rows: Vec<ChannelRow>,
+    #[serde(default)]
+    pub excluded_by_floor: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelRow {
+    pub venue: String,
+    pub category: String,
+    pub code: String,
+    #[serde(default)]
+    pub channels: Vec<ChannelEntry>,
+    #[serde(default)]
+    pub excluded: usize,
+}
+
+/// One channel of one row. `label`/`symbol_prefixes` are **display-only** derived names — see
+/// [`ChannelEntry::display_name`]. Neither is a wire identity: the channel **id** is the only
+/// contract this crate resolves anything by (see `ingest/floor.rs`'s docs for why a name here
+/// would drift). Both are optional: today's server sends neither, a channel with no reference
+/// data yet (a normal startup state, not an error) sends neither either, and a future server may
+/// send one or both — this type must keep parsing regardless.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelEntry {
+    pub channel: u32,
+    pub floor_admits: bool,
+    pub bound: bool,
+    pub products: u64,
+    /// A short human label for the channel (e.g. `sports.nfl`), owned by the upstream deployment
+    /// inventory and passed through verbatim when the server has one. Never used for lookup,
+    /// matching or filtering — display only.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The distinct symbol prefixes (the portion of each instrument symbol before its first `-`)
+    /// seen on this channel, derived live from reference data — small and stable, unlike full
+    /// symbols, which are per-event and churn as contracts expire. Never used for lookup, matching
+    /// or filtering — display only.
+    #[serde(default)]
+    pub symbol_prefixes: Vec<String>,
+}
+
+/// How many symbol prefixes [`ChannelEntry::display_name`] shows before eliding the rest with a
+/// `+N more` marker — never silently dropping entries with no indication there were more.
+const MAX_PREFIXES_SHOWN: usize = 3;
+
+impl ChannelEntry {
+    /// The name to show a human for this channel. **Display only** — never resolve, filter or
+    /// match on this. Precedence: `label` (an upstream human name, when the server supplies one)
+    /// wins; else the channel's `symbol_prefixes` (truncated with a `+N more` marker if there are
+    /// more than a few); else the bare channel id, which is the only real contract. All three
+    /// shapes must render cleanly, since which the server sends varies by deployment, by how new
+    /// the server is, and by whether this channel has reference data yet.
+    pub fn display_name(&self) -> String {
+        if let Some(label) = self.label.as_deref() {
+            if !label.trim().is_empty() {
+                return label.to_string();
+            }
+        }
+        if !self.symbol_prefixes.is_empty() {
+            return render_symbol_prefixes(&self.symbol_prefixes);
+        }
+        self.channel.to_string()
+    }
+}
+
+fn render_symbol_prefixes(prefixes: &[String]) -> String {
+    let shown: Vec<&str> = prefixes
+        .iter()
+        .take(MAX_PREFIXES_SHOWN)
+        .map(String::as_str)
+        .collect();
+    let mut out = shown.join(", ");
+    let remaining = prefixes.len().saturating_sub(MAX_PREFIXES_SHOWN);
+    if remaining > 0 {
+        out.push_str(&format!(" +{remaining} more"));
+    }
+    out
+}
+
+/// The `process` block of `/v1/status`: resident memory and cumulative CPU seconds, read off the
+/// process collector. Both fields are `None` (rather than a fabricated `0`) when the collector
+/// isn't registered for this build/platform.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProcessBlock {
+    #[serde(default)]
+    pub resident_memory_bytes: Option<f64>,
+    #[serde(default)]
+    pub cpu_seconds_total: Option<f64>,
+}
+
+/// `GET /admin/channels`'s response shape — only the field `channels list` needs (the floor spec
+/// currently in force, as `ChannelFloor::summary` renders it). Other fields on that response
+/// (`rows`, `note`) are read straight off the raw JSON where needed rather than typed here, since
+/// this crate's only use for them is display.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdminChannelsResponse {
+    #[serde(default)]
+    pub summary: Vec<String>,
+}
+
+/// `POST /admin/channels`'s success response shape: the floor spec that is now in force.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdminApplyResponse {
+    #[serde(default)]
+    pub applied: Vec<String>,
 }
 
 #[cfg(test)]
@@ -184,5 +321,64 @@ mod tests {
         let r: ProductsListResponse =
             serde_json::from_str(body).expect("unknown top-level fields must not reject parsing");
         assert!(r.products.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // ChannelEntry::display_name — label / symbol_prefixes precedence. Four genuinely distinct
+    // documents (never one parameterised fixture reused four ways — that exact failure mode has
+    // recurred on this plan): a channel with only `label`, one with only `symbol_prefixes`, one
+    // with both (label must win), and one with neither (must fall back to the bare id).
+    // -----------------------------------------------------------------------------------------
+
+    fn channel_entry(json: &str) -> ChannelEntry {
+        serde_json::from_str(json).expect("fixture must parse as a ChannelEntry")
+    }
+
+    #[test]
+    fn a_channel_with_only_a_label_shows_the_label() {
+        let c = channel_entry(
+            r#"{"channel": 10, "floor_admits": true, "bound": true, "products": 412, "label": "sports.nfl"}"#,
+        );
+        assert_eq!(c.display_name(), "sports.nfl");
+    }
+
+    #[test]
+    fn a_channel_with_only_symbol_prefixes_shows_them() {
+        let c = channel_entry(
+            r#"{"channel": 11, "floor_admits": true, "bound": true, "products": 287, "symbol_prefixes": ["KXNFLGAME", "KXNFLSPREAD"]}"#,
+        );
+        assert_eq!(c.display_name(), "KXNFLGAME, KXNFLSPREAD");
+    }
+
+    /// Both present: `label` wins outright, `symbol_prefixes` must not leak into the output.
+    #[test]
+    fn a_label_wins_over_symbol_prefixes_when_both_are_present() {
+        let c = channel_entry(
+            r#"{"channel": 43, "floor_admits": true, "bound": true, "products": 9, "label": "sports.combat", "symbol_prefixes": ["KXUFC"]}"#,
+        );
+        let name = c.display_name();
+        assert_eq!(name, "sports.combat");
+        assert!(!name.contains("KXUFC"), "label must win outright: {name}");
+    }
+
+    /// Neither present — a channel bound but with no reference data yet is a normal startup
+    /// state, not an error, and must still render using the one real contract: the id.
+    #[test]
+    fn a_channel_with_neither_field_falls_back_to_the_bare_id() {
+        let c = channel_entry(
+            r#"{"channel": 49, "floor_admits": true, "bound": false, "products": 0}"#,
+        );
+        assert_eq!(c.display_name(), "49");
+    }
+
+    /// A long prefix list is truncated with an explicit `+N more` rather than silently dropping
+    /// entries or letting the column blow out.
+    #[test]
+    fn a_long_symbol_prefix_list_is_truncated_with_a_visible_count() {
+        let c = channel_entry(
+            r#"{"channel": 20, "floor_admits": true, "bound": true, "products": 5,
+                "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
+        );
+        assert_eq!(c.display_name(), "A, B, C +2 more");
     }
 }
