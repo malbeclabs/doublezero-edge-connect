@@ -353,7 +353,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(setup.status(), 200, "fixture sanity: the setup POST must apply");
+        assert_eq!(
+            setup.status(),
+            200,
+            "fixture sanity: the setup POST must apply"
+        );
         let before = crate::model::lock(&floor).clone();
         assert!(before.admits("lashay-4", 10) && before.admits("lashay-4", 11));
         assert!(!before.admits("lashay-4", 12));
@@ -441,7 +445,10 @@ mod tests {
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["error"], "unsupported_request_body");
         assert!(
-            body["remediation"].as_str().unwrap().contains("query parameter"),
+            body["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("query parameter"),
             "the remedy must name the query-parameter form: {body}"
         );
 
@@ -462,13 +469,21 @@ mod tests {
         let base = spawn(floor, vec![]).await;
         let client = reqwest::Client::new();
 
-        for method in [reqwest::Method::PUT, reqwest::Method::PATCH, reqwest::Method::DELETE] {
+        for method in [
+            reqwest::Method::PUT,
+            reqwest::Method::PATCH,
+            reqwest::Method::DELETE,
+        ] {
             let resp = client
                 .request(method.clone(), format!("{base}/admin/channels"))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 405, "{method} was not refused by /admin/channels");
+            assert_eq!(
+                resp.status(),
+                405,
+                "{method} was not refused by /admin/channels"
+            );
         }
     }
 }

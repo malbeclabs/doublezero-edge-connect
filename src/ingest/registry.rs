@@ -579,7 +579,8 @@ fn planes_for(kind: FeedKind) -> u8 {
 
 fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     let mut triples = std::collections::HashSet::new();
-    let mut modes: std::collections::HashMap<&str, ArbitrationMode> = std::collections::HashMap::new();
+    let mut modes: std::collections::HashMap<&str, ArbitrationMode> =
+        std::collections::HashMap::new();
     let mut group_ports = std::collections::HashSet::new();
 
     for f in rows {
@@ -988,7 +989,11 @@ mod tests {
         );
         let perps = loaded.rows.iter().find(|f| f.category == "perps").unwrap();
         assert_eq!(
-            perps.publishers.iter().map(|p| p.channel).collect::<Vec<_>>(),
+            perps
+                .publishers
+                .iter()
+                .map(|p| p.channel)
+                .collect::<Vec<_>>(),
             vec![None]
         );
     }
@@ -1017,7 +1022,10 @@ mod tests {
     #[test]
     fn an_unrecognised_key_is_ignored_at_every_level() {
         let row = SPORTS_ROW
-            .replace(r#""venue":"KALSHI""#, r#""venue":"KALSHI","future_row_field":1"#)
+            .replace(
+                r#""venue":"KALSHI""#,
+                r#""venue":"KALSHI","future_row_field":1"#,
+            )
             .replace(
                 r#""ports":{"mktdata":33000"#,
                 r#""ports":{"future_port_field":true,"mktdata":33000"#,
@@ -1049,7 +1057,9 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_url_document_falls_back() {
         let url = serve("this is not json").await;
-        let loaded = load(Source::Url(url)).await.expect("fallback, not an error");
+        let loaded = load(Source::Url(url))
+            .await
+            .expect("fallback, not an error");
         assert_fell_back(&loaded);
     }
 
@@ -1058,7 +1068,9 @@ mod tests {
     #[tokio::test]
     async fn a_future_version_from_a_url_falls_back() {
         let url = serve(r#"{"version":99,"feeds":[]}"#).await;
-        let loaded = load(Source::Url(url)).await.expect("fallback, not an error");
+        let loaded = load(Source::Url(url))
+            .await
+            .expect("fallback, not an error");
         assert_fell_back(&loaded);
     }
 
@@ -1066,7 +1078,9 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_url_document_falls_back() {
         let url = serve(r#"{"version":1,"feeds":[]}"#).await;
-        let loaded = load(Source::Url(url)).await.expect("fallback, not an error");
+        let loaded = load(Source::Url(url))
+            .await
+            .expect("fallback, not an error");
         assert_fell_back(&loaded);
     }
 
@@ -1271,7 +1285,10 @@ mod tests {
     /// disagreement resolves last-write-wins and the venue's mode depends on document order.
     #[test]
     fn disagreeing_arbitration_within_a_venue_is_fatal() {
-        let other = PERPS_ROW.replace(r#""arbitration":"Sticky""#, r#""arbitration":"Coordinated""#);
+        let other = PERPS_ROW.replace(
+            r#""arbitration":"Sticky""#,
+            r#""arbitration":"Coordinated""#,
+        );
         assert!(matches!(
             build(&doc_with(&format!("{SPORTS_ROW},{other}")), "test"),
             Err(RegistryError::ArbitrationDisagreement { .. })
@@ -1295,7 +1312,10 @@ mod tests {
     fn a_reused_group_port_across_rows_is_fatal() {
         let clash = PERPS_ROW
             .replace(r#""group":"233.84.178.3""#, r#""group":"233.84.178.20""#)
-            .replace(r#"{"mktdata":7576,"refdata":7577}"#, r#"{"mktdata":33010,"refdata":7577}"#);
+            .replace(
+                r#"{"mktdata":7576,"refdata":7577}"#,
+                r#"{"mktdata":33010,"refdata":7577}"#,
+            );
         assert!(matches!(
             build(&doc_with(&format!("{SPORTS_ROW},{clash}")), "test"),
             Err(RegistryError::DuplicateGroupPort { port: 33010, .. })

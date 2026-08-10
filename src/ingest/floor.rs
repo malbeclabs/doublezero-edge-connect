@@ -480,7 +480,11 @@ mod tests {
         row(code, category, PUBS)
     }
 
-    fn row(code: &'static str, category: &'static str, publishers: &'static [FeedPublisher]) -> Feed {
+    fn row(
+        code: &'static str,
+        category: &'static str,
+        publishers: &'static [FeedPublisher],
+    ) -> Feed {
         Feed {
             venue: "KALSHI",
             category,

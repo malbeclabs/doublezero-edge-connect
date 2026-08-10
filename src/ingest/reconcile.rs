@@ -40,8 +40,7 @@ use crate::{
         feeds::{Feed, FeedKind},
         floor::ChannelFloor,
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
-        receiver,
-        sources,
+        receiver, sources,
         subscriptions::{self, Detected, HostSubs},
     },
     metrics::metrics,
@@ -1246,7 +1245,12 @@ mod tests {
         let floor = ChannelFloor::parse("lashay-4=10,11").unwrap();
 
         let narrowed = test_reconciler_with_floor(vec![sports], floor);
-        let mut ports: Vec<u16> = narrowed.static_desired().feeds.iter().map(|k| k.3).collect();
+        let mut ports: Vec<u16> = narrowed
+            .static_desired()
+            .feeds
+            .iter()
+            .map(|k| k.3)
+            .collect();
         ports.sort_unstable();
         assert_eq!(ports, vec![34010, 34011]);
 

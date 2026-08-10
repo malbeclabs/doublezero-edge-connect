@@ -2497,7 +2497,10 @@ mod tests {
                 content_length: 0,
             };
             let (status, _, _) = handle(&state, &req);
-            assert_eq!(status, "405 Method Not Allowed", "{method} was not refused by /v1");
+            assert_eq!(
+                status, "405 Method Not Allowed",
+                "{method} was not refused by /v1"
+            );
         }
     }
 

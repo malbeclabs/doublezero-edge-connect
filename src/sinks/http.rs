@@ -290,7 +290,8 @@ mod tests {
         // The capitalised form (`Content-Length:`) is what real clients send (`curl -d`, browsers,
         // every HTTP library's default) — a lowercase fixture would also satisfy a case-*sensitive*
         // `==` comparison, so it could never fail on the bug this test is named for.
-        let r = parse_request(b"POST /admin/channels HTTP/1.1\r\nContent-Length: 11\r\n\r\n").unwrap();
+        let r =
+            parse_request(b"POST /admin/channels HTTP/1.1\r\nContent-Length: 11\r\n\r\n").unwrap();
         assert_eq!(r.content_length, 11);
     }
 

@@ -3973,8 +3973,16 @@ mod tests {
 
         // Two instruments on the doomed (venue, "sports", BOOK_CHANNEL), each fully re-baselined.
         for id in [BOOK_INSTRUMENT, BOOK_INSTRUMENT + 1] {
-            a.emit(book(venue, id, vec![clear_both()], true, 1_000), arm(1), "sports");
-            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_001), arm(1), "sports");
+            a.emit(
+                book(venue, id, vec![clear_both()], true, 1_000),
+                arm(1),
+                "sports",
+            );
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_001),
+                arm(1),
+                "sports",
+            );
         }
         // Peer 1: a different **category**, same venue/channel/instrument_id as the first doomed
         // market — the exact collision this crate's docs warn about. Deleting the category term
@@ -4003,22 +4011,51 @@ mod tests {
             "sports",
         );
 
-        let doomed_a: MarketKey = (Arc::from(venue), "sports".into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let doomed_a: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
         let doomed_b: MarketKey = (
             Arc::from(venue),
             "sports".into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT + 1,
         );
-        let peer_category: MarketKey =
-            (Arc::from(venue), "perps".into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
-        let peer_channel: MarketKey =
-            (Arc::from(venue), "sports".into(), OTHER_CHANNEL, BOOK_INSTRUMENT);
+        let peer_category: MarketKey = (
+            Arc::from(venue),
+            "perps".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        let peer_channel: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            OTHER_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
 
-        assert_eq!(a.books.last_admitted(&doomed_a), Some(arm(1)), "fixture sanity");
-        assert_eq!(a.books.last_admitted(&doomed_b), Some(arm(1)), "fixture sanity");
-        assert_eq!(a.books.last_admitted(&peer_category), Some(arm(1)), "fixture sanity");
-        assert_eq!(a.books.last_admitted(&peer_channel), Some(arm(1)), "fixture sanity");
+        assert_eq!(
+            a.books.last_admitted(&doomed_a),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            a.books.last_admitted(&doomed_b),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            a.books.last_admitted(&peer_category),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            a.books.last_admitted(&peer_channel),
+            Some(arm(1)),
+            "fixture sanity"
+        );
         assert_eq!(
             model::lock(&replay).identity_index_len(),
             4,
@@ -4026,13 +4063,24 @@ mod tests {
         );
 
         let dropped = a.forget_channel_books(venue, "sports", BOOK_CHANNEL);
-        assert_eq!(dropped, 2, "exactly the two sports instruments on that channel");
+        assert_eq!(
+            dropped, 2,
+            "exactly the two sports instruments on that channel"
+        );
 
         // All three legs, for both doomed markets.
         assert!(!a.book_markets.contains_key(&doomed_a));
         assert!(!a.book_markets.contains_key(&doomed_b));
-        assert_eq!(a.books.last_admitted(&doomed_a), None, "last_admitted must drop too");
-        assert_eq!(a.books.last_admitted(&doomed_b), None, "last_admitted must drop too");
+        assert_eq!(
+            a.books.last_admitted(&doomed_a),
+            None,
+            "last_admitted must drop too"
+        );
+        assert_eq!(
+            a.books.last_admitted(&doomed_b),
+            None,
+            "last_admitted must drop too"
+        );
         {
             let guard = model::lock(&replay);
             assert!(!guard.contains_key(&doomed_a));
@@ -4055,7 +4103,9 @@ mod tests {
                 "{name}'s authority record must survive"
             );
             assert!(
-                model::lock(&replay).get(peer).is_some_and(|acc| acc.baselined()),
+                model::lock(&replay)
+                    .get(peer)
+                    .is_some_and(|acc| acc.baselined()),
                 "{name}'s replay entry must survive, complete"
             );
         }

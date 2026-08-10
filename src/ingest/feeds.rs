@@ -294,7 +294,10 @@ mod tests {
         assert_eq!(ids.first().copied(), Some(10));
         assert_eq!(ids.last().copied(), Some(49));
         for reserved in 30..=38 {
-            assert!(!ids.contains(&reserved), "reserved id {reserved} is published");
+            assert!(
+                !ids.contains(&reserved),
+                "reserved id {reserved} is published"
+            );
         }
         for retired in [63u8, 120] {
             assert!(!ids.contains(&retired), "retired id {retired} was reissued");
