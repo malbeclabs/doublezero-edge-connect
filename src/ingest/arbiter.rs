@@ -622,6 +622,7 @@ fn clear_only(b: &NormalizedBook) -> NormalizedBook {
             side: model::BookSide::Both,
             price: 0.0,
             size: 0.0,
+            order_id: 0,
         }],
         snapshot: true,
         last: true,
@@ -2725,6 +2726,7 @@ mod tests {
             side: BookSide::Bid,
             price,
             size,
+            order_id: 0,
         }
     }
 
@@ -2734,6 +2736,7 @@ mod tests {
             side: BookSide::Both,
             price: 0.0,
             size: 0.0,
+            order_id: 0,
         }
     }
 

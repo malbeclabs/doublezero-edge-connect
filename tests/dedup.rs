@@ -647,6 +647,7 @@ fn level(side: BookSide, price: f64, size: f64) -> BookChange {
         side,
         price,
         size,
+        order_id: 0,
     }
 }
 
@@ -689,6 +690,7 @@ fn arm_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
                     side: BookSide::Bid,
                     price: px,
                     size: 0.0,
+                    order_id: 0,
                 },
             ],
             true,
@@ -722,6 +724,7 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
             side: BookSide::Both,
             price: 0.0,
             size: 0.0,
+            order_id: 0,
         }
     }
 

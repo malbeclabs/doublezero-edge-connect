@@ -224,15 +224,20 @@ pub enum BookSide {
     Both,
 }
 
-/// One price-level change. `size` is the level's **absolute** resulting quantity, never a delta, so
-/// a consumer that misses nothing needs no arithmetic: set it, or remove it when the action is
-/// `Delete`.
+/// One book change. `size` is the **absolute** resulting quantity — of the level for a
+/// price-aggregated change, of the order for an order-level one — never a delta, so a consumer that
+/// misses nothing needs no arithmetic: set it, or remove it when the action is `Delete`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BookChange {
     pub action: BookAction,
     pub side: BookSide,
     pub price: f64,
     pub size: f64,
+    /// The venue's own order id for an order-level (L3) change, or `0` when the change is
+    /// price-aggregated and carries no order identity. Never `0` on a Market-by-Order feed: a
+    /// consumer that keys an L3 book by id reads `0` as "aggregate me", silently degrading to L2.
+    #[serde(default)]
+    pub order_id: u64,
 }
 
 /// A batch of price-level changes for one instrument — the incremental order-book product, derived
@@ -529,6 +534,7 @@ impl BookAccumulator {
             side: BookSide::Both,
             price: 0.0,
             size: 0.0,
+            order_id: 0,
         });
         // Bids descend, asks ascend, so the first of each is the inside market.
         for &(price, size) in self.bids.values().rev() {
@@ -537,6 +543,7 @@ impl BookAccumulator {
                 side: BookSide::Bid,
                 price,
                 size,
+                order_id: 0,
             });
         }
         for &(price, size) in self.asks.values() {
@@ -545,6 +552,7 @@ impl BookAccumulator {
                 side: BookSide::Ask,
                 price,
                 size,
+                order_id: 0,
             });
         }
         NormalizedBook {
@@ -611,6 +619,29 @@ pub fn now_mono_ns() -> u64 {
 mod tests {
     use super::*;
 
+    /// `order_id` is additive: a payload written before the field still parses, and an order-level
+    /// change round-trips its id. Zero is the price-aggregated sentinel — what Market-by-Price emits
+    /// and what a consumer reads as "no order identity".
+    #[test]
+    fn book_change_order_id_is_additive_and_round_trips() {
+        let legacy = r#"{"action":"update","side":"bid","price":1.5,"size":2.0}"#;
+        let parsed: BookChange = serde_json::from_str(legacy).expect("legacy payload must parse");
+        assert_eq!(
+            parsed.order_id, 0,
+            "an absent id defaults to the no-identity sentinel"
+        );
+
+        let c = BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price: 1.5,
+            size: 2.0,
+            order_id: 42,
+        };
+        let round: BookChange = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(round.order_id, 42);
+    }
+
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "KALSHI".into(),
@@ -640,12 +671,14 @@ mod tests {
                     side: BookSide::Bid,
                     price: 0.62,
                     size: 150.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Delete,
                     side: BookSide::Ask,
                     price: 0.63,
                     size: 0.0,
+                    order_id: 0,
                 },
             ],
             false,
@@ -663,6 +696,7 @@ mod tests {
         assert_eq!(v["changes"][0]["side"], "bid");
         assert_eq!(v["changes"][0]["price"], 0.62);
         assert_eq!(v["changes"][0]["size"], 150.0);
+        assert_eq!(v["changes"][0]["order_id"], 0);
         assert_eq!(v["changes"][1]["action"], "delete");
         assert_eq!(v["changes"][1]["side"], "ask");
         assert!(v["source_ts_ns"].is_u64() && v["kernel_rx_ts_ns"].is_u64());
@@ -681,12 +715,14 @@ mod tests {
                     side: BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: 0.62,
                     size: 150.0,
+                    order_id: 0,
                 },
             ],
             true,
@@ -709,6 +745,7 @@ mod tests {
                 side: BookSide::Both,
                 price: 0.0,
                 size: 0.0,
+                order_id: 0,
             }],
             true,
             true,
@@ -726,6 +763,7 @@ mod tests {
                 side: BookSide::Ask,
                 price: 0.63,
                 size: 7.5,
+                order_id: 0,
             }],
             false,
             false,
@@ -776,24 +814,28 @@ mod tests {
                     side: BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: 0.61,
                     size: 10.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: 0.62,
                     size: 20.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Ask,
                     price: 0.63,
                     size: 30.0,
+                    order_id: 0,
                 },
             ],
             true,
@@ -806,12 +848,14 @@ mod tests {
                     side: BookSide::Bid,
                     price: 0.62,
                     size: 25.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Delete,
                     side: BookSide::Ask,
                     price: 0.63,
                     size: 0.0,
+                    order_id: 0,
                 },
             ],
             false,
@@ -828,20 +872,23 @@ mod tests {
                     action: BookAction::Clear,
                     side: BookSide::Both,
                     price: 0.0,
-                    size: 0.0
+                    size: 0.0,
+                    order_id: 0,
                 },
                 // Bids descend: the inside market first.
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: 0.62,
-                    size: 25.0
+                    size: 25.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: 0.61,
-                    size: 10.0
+                    size: 10.0,
+                    order_id: 0,
                 },
             ],
             "the deleted ask must not be replayed"
@@ -859,6 +906,7 @@ mod tests {
             side: BookSide::Bid,
             price,
             size,
+            order_id: 0,
         };
 
         acc.apply(&book(vec![bid(0.61, 10.0)], false, true));
@@ -872,6 +920,7 @@ mod tests {
                     side: BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 },
                 bid(0.70, 1.0),
             ],
@@ -886,7 +935,8 @@ mod tests {
                     action: BookAction::Clear,
                     side: BookSide::Both,
                     price: 0.0,
-                    size: 0.0
+                    size: 0.0,
+                    order_id: 0,
                 },
                 bid(0.61, 10.0),
             ],
@@ -902,7 +952,8 @@ mod tests {
                     action: BookAction::Clear,
                     side: BookSide::Both,
                     price: 0.0,
-                    size: 0.0
+                    size: 0.0,
+                    order_id: 0,
                 },
                 bid(0.71, 2.0),
                 bid(0.70, 1.0),
@@ -923,24 +974,28 @@ mod tests {
                     side: BookSide::Bid,
                     price: f64::NAN,
                     size: 1.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: f64::INFINITY,
                     size: 1.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Ask,
                     price: 0.63,
                     size: f64::NAN,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Ask,
                     price: 0.64,
                     size: 5.0,
+                    order_id: 0,
                 },
             ],
             false,
@@ -954,13 +1009,15 @@ mod tests {
                     action: BookAction::Clear,
                     side: BookSide::Both,
                     price: 0.0,
-                    size: 0.0
+                    size: 0.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Ask,
                     price: 0.64,
-                    size: 5.0
+                    size: 5.0,
+                    order_id: 0,
                 },
             ]
         );
@@ -1043,12 +1100,14 @@ mod tests {
                     side: BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 },
                 BookChange {
                     action: BookAction::Update,
                     side: BookSide::Bid,
                     price: 100.0,
                     size: 5.0,
+                    order_id: 0,
                 },
             ],
             snapshot: true,
