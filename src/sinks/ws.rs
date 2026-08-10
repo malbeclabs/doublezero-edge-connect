@@ -632,6 +632,7 @@ mod tests {
                 side: BookSide::Bid,
                 price: 0.62,
                 size: 150.0,
+                order_id: 0,
             }],
             snapshot: false,
             last: true,
@@ -1074,6 +1075,7 @@ mod tests {
             side,
             price,
             size,
+            order_id: 0,
         }
     }
 
@@ -1107,6 +1109,7 @@ mod tests {
                     side: BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 },
                 level_update(BookSide::Bid, bid, 10.0),
             ],

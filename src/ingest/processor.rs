@@ -1967,12 +1967,14 @@ impl MbpProcessor {
             side,
             price: apply_exponent(price_raw, price_exp),
             size: scaled_qty(qty_raw, qty_exp),
+            order_id: 0,
         };
         let mut changes = vec![BookChange {
             action: BookAction::Clear,
             side: BookSide::Both,
             price: 0.0,
             size: 0.0,
+            order_id: 0,
         }];
         changes.extend(book.bids().map(|(p, l)| level(BookSide::Bid, p, l.qty_raw)));
         changes.extend(book.asks().map(|(p, l)| level(BookSide::Ask, p, l.qty_raw)));
@@ -2237,6 +2239,7 @@ impl FrameProcessor for MbpProcessor {
                             } else {
                                 scaled_qty(l.qty_raw, qty_exp)
                             },
+                            order_id: 0,
                         });
                     }
                 }
@@ -2282,6 +2285,7 @@ impl FrameProcessor for MbpProcessor {
                                 side,
                                 price: 0.0,
                                 size: 0.0,
+                                order_id: 0,
                             });
                         }
                     } else {
@@ -2294,6 +2298,7 @@ impl FrameProcessor for MbpProcessor {
                             side: book_side(side),
                             price: apply_exponent(price_raw, price_exp),
                             size: 0.0,
+                            order_id: 0,
                         }));
                     }
                 }
