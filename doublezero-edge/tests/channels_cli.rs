@@ -72,7 +72,7 @@ fn channels_set_names_dz_admin_bind_when_the_admin_surface_is_unreachable() {
     // force past the confirmation gate straight to the POST.
     let status_url = mock_server(
         "200 OK",
-        r#"{"venues":[],"history":{"products":0,"products_at_cap":false,"buckets":0,"bucket_budget":100,"est_bytes":0,"window_seconds":3600,"evicted":0,"late_drops":0},"channels":{"rows":[],"excluded_by_floor":0}}"#,
+        r#"{"venues":[],"history":{"products":0,"products_at_cap":false,"buckets":0,"bucket_budget":100,"est_bytes":0,"window_seconds":3600,"evicted":0,"late_drops":0},"channels":{"rows":[],"excluded_by_filter":0}}"#,
     );
     let admin_url = unreachable_url();
     let r = run_with_stdin(
@@ -97,11 +97,11 @@ fn channels_set_names_dz_admin_bind_when_the_admin_surface_is_unreachable() {
 }
 
 // -------------------------------------------------------------------------------------------
-// channels list: merges the admin floor summary with /v1/status's real per-channel state.
+// channels list: merges the admin channel-filter summary with /v1/status's real per-channel state.
 // -------------------------------------------------------------------------------------------
 
 #[test]
-fn channels_list_merges_the_admin_floor_summary_with_status_liveness() {
+fn channels_list_merges_the_admin_filter_summary_with_status_liveness() {
     let admin_url = mock_server(
         "200 OK",
         r#"{"summary":["lashay-4=2 of 31"],"rows":[],"note":"..."}"#,
@@ -110,8 +110,8 @@ fn channels_list_merges_the_admin_floor_summary_with_status_liveness() {
         "200 OK",
         r#"{"venues":[],"history":{"products":2,"products_at_cap":false,"buckets":2,"bucket_budget":100,"est_bytes":10,"window_seconds":3600,"evicted":0,"late_drops":0},
             "channels":{"rows":[{"venue":"KALSHI","category":"sports","code":"lashay-4","excluded":29,
-            "channels":[{"channel":10,"floor_admits":true,"bound":true,"products":412,"label":"sports.nfl"},
-                        {"channel":11,"floor_admits":true,"bound":false,"products":0}]}],"excluded_by_floor":29}}"#,
+            "channels":[{"channel":10,"allowed":true,"bound":true,"products":412,"label":"sports.nfl"},
+                        {"channel":11,"allowed":true,"bound":false,"products":0}]}],"excluded_by_filter":29}}"#,
     );
     let r = run_with_stdin(
         &[
@@ -147,7 +147,7 @@ fn channels_set_aborts_without_force_and_never_posts() {
         "200 OK",
         r#"{"venues":[],"history":{"products":1,"products_at_cap":false,"buckets":1,"bucket_budget":100,"est_bytes":10,"window_seconds":3600,"evicted":0,"late_drops":0},
             "channels":{"rows":[{"venue":"KALSHI","category":"sports","code":"lashay-4","excluded":29,
-            "channels":[{"channel":11,"floor_admits":true,"bound":true,"products":287}]}],"excluded_by_floor":29}}"#,
+            "channels":[{"channel":11,"allowed":true,"bound":true,"products":287}]}],"excluded_by_filter":29}}"#,
     );
     let admin_url = unreachable_url();
     let r = run_with_stdin(
@@ -183,7 +183,7 @@ fn channels_set_with_force_skips_confirmation_and_applies() {
     let status_url = mock_server(
         "200 OK",
         r#"{"venues":[],"history":{"products":1,"products_at_cap":false,"buckets":1,"bucket_budget":100,"est_bytes":10,"window_seconds":3600,"evicted":0,"late_drops":0},
-            "channels":{"rows":[],"excluded_by_floor":0}}"#,
+            "channels":{"rows":[],"excluded_by_filter":0}}"#,
     );
     let admin_url = mock_server("200 OK", r#"{"applied":["lashay-4=1 of 31"]}"#);
     let r = run_with_stdin(
@@ -210,11 +210,11 @@ fn channels_set_surfaces_a_400_from_the_admin_surface_verbatim() {
     let status_url = mock_server(
         "200 OK",
         r#"{"venues":[],"history":{"products":0,"products_at_cap":false,"buckets":0,"bucket_budget":100,"est_bytes":0,"window_seconds":3600,"evicted":0,"late_drops":0},
-            "channels":{"rows":[],"excluded_by_floor":0}}"#,
+            "channels":{"rows":[],"excluded_by_filter":0}}"#,
     );
     let admin_url = mock_server(
         "400 Bad Request",
-        r#"{"error":"invalid_channel_floor","message":"channel floor narrows `perps1` (LASHAY/perps), whose publishers bind one base port flat.","remediation":"..."}"#,
+        r#"{"error":"invalid_channel_filter","message":"channel filter narrows `perps1` (LASHAY/perps), whose publishers bind one base port flat.","remediation":"..."}"#,
     );
     let r = run_with_stdin(
         &[
@@ -230,6 +230,6 @@ fn channels_set_surfaces_a_400_from_the_admin_surface_verbatim() {
         "",
     );
     assert_eq!(r.status, 1, "stdout: {} stderr: {}", r.stdout, r.stderr);
-    assert!(r.stderr.contains("invalid_channel_floor"), "{}", r.stderr);
+    assert!(r.stderr.contains("invalid_channel_filter"), "{}", r.stderr);
     assert!(r.stderr.contains("bind one base port flat"), "{}", r.stderr);
 }

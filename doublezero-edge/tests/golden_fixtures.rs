@@ -127,7 +127,7 @@ fn status_table_lists_venues_and_the_history_summary() {
 }
 
 /// The `channels` block: the wire-supplied `label` must win over the bare id, and `bound`/
-/// `floor_admits` must read as visibly distinct columns (channel 11 is admitted but not bound).
+/// `allowed` must read as visibly distinct columns (channel 11 is admitted but not bound).
 #[test]
 fn status_table_shows_the_channels_block_with_the_servers_label() {
     let body = fixture("status.json");
@@ -135,7 +135,10 @@ fn status_table_shows_the_channels_block_with_the_servers_label() {
     assert!(out.contains("lashay-4"), "{out}");
     assert!(out.contains("sports.nfl"), "{out}");
     assert!(out.contains("412"), "{out}");
-    assert!(out.contains("(29 channels excluded by floor)"), "{out}");
+    assert!(
+        out.contains("(29 channels excluded by channel filter)"),
+        "{out}"
+    );
 }
 
 /// The `process` block: real numbers, not omitted.

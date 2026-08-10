@@ -111,7 +111,7 @@ pub fn admin_get(client: &reqwest::blocking::Client, admin_url: &str, path: &str
 ///   `Content-Length` header at all — pinned by
 ///   `client::tests::a_channels_post_sends_no_body_and_percent_encodes_the_query`, which reads the
 ///   raw bytes off the wire rather than trusting `reqwest`'s behaviour by assumption.
-/// - An empty `spec` is a legitimate "clear the floor" (still sent as `?channels=`), distinct from
+/// - An empty `spec` is a legitimate "clear the channel filter" (still sent as `?channels=`), distinct from
 ///   omitting the parameter altogether (which the server 400s) — `reqwest` always includes a
 ///   `key=value` pair for `.query(&[(k, v)])` even when `v` is `""`, so that distinction is
 ///   preserved without this function doing anything special.

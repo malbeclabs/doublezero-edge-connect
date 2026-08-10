@@ -762,8 +762,8 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
                     p.snapshot.map(plane).transpose()?,
                 ),
                 // Recorded, not recomputed downstream: this is the one place the id and the block
-                // are both in hand, and it is what lets the ingest floor decline a channel by
-                // never binding its socket (see `ingest::floor`).
+                // are both in hand, and it is what lets the channel filter decline a channel by
+                // never binding its socket (see `ingest::channel_filter`).
                 channel: Some(id),
                 // Leaked alongside every other `'static` field this row produces (see `leak`);
                 // display-only downstream, never a lookup key.
@@ -983,7 +983,7 @@ mod tests {
     }
 
     /// A derived publisher records the channel its block came from, and an explicit one records
-    /// `None`. That distinction is the whole basis of the bind-time ingest floor: `Some` means one
+    /// `None`. That distinction is the whole basis of the bind-time channel filter: `Some` means one
     /// socket per channel (declinable), `None` means a shared base port separated in-band (not).
     /// Recomputing it downstream from the base port is impossible — the derived block's base does
     /// not survive into the `'static` rows — so a slip here would silently make every row look flat.

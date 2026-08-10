@@ -87,8 +87,8 @@ pub struct Stats {
     pub products: usize,
     /// Whether `products` is at [`MAX_PRODUCTS`] — the cardinality cap, not the aggregate bucket
     /// budget below. Products at cap with a rising [`Stats::evicted`] is the signal an over-wide
-    /// floor produces: RSS stays flat (the budget below holds it there) while occupancy silently
-    /// churns, which is invisible in memory alone.
+    /// channel filter produces: RSS stays flat (the budget below holds it there) while occupancy
+    /// silently churns, which is invisible in memory alone.
     pub products_at_cap: bool,
     /// The running total of 1-second buckets held across every product (`Store::buckets_total`),
     /// not a recount.
@@ -243,7 +243,7 @@ impl Store {
     /// p.buckets.len()).sum()` — the whole reason that running total is maintained in step by every
     /// mutation path (see its own doc) is so a caller asking "how full is the store right now" never
     /// pays an O(products) scan to find out; `/v1/status` is exactly that caller, and it is what an
-    /// operator polls to answer "is my floor narrow enough."
+    /// operator polls to answer "is my channel filter narrow enough."
     ///
     /// `est_bytes` is the same back-of-envelope arithmetic `MAX_BUCKETS_ACROSS_PRODUCTS`'s doc
     /// derives by hand (measured ~93 B/bucket, plus each product's fixed `TRADE_RING` print ring) —
@@ -273,7 +273,7 @@ impl Store {
     /// ID can share a channel id, and a count blind to `category` would attribute a peer universe's
     /// occupancy to this one). Used by the `/v1/status` `channels` block to answer, per channel,
     /// "how much of the store does an admitted channel actually hold" — the number that turns a
-    /// flat RSS reading into an answer to "is my floor narrow enough."
+    /// flat RSS reading into an answer to "is my channel filter narrow enough."
     pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
         self.products
             .keys()
@@ -507,7 +507,7 @@ impl Store {
     /// components. Returns the number of products dropped, so a caller can tell "nothing was
     /// there" from "the drop happened".
     ///
-    /// The seam a caller (the reconciler) uses when a channel leaves the ingest floor: a channel
+    /// The seam a caller (the reconciler) uses when a channel leaves the channel filter: a channel
     /// that no longer ingests must not keep answering `/candles`/`/ticker` from a frozen window that
     /// looks live, so its buckets and print ring are removed with it rather than left to age out of
     /// the window on their own. `(group code, channel_id) -> source_id` resolution is the caller's
@@ -1179,7 +1179,7 @@ mod tests {
     // stats / products_for — the `/v1/status` `history` and `channels` blocks' data source
     // -------------------------------------------------------------------------------------------
 
-    /// The signal an over-wide floor produces is products at cap with a rising eviction count —
+    /// The signal an over-wide channel filter produces is products at cap with a rising eviction count —
     /// memory stays flat (the bucket budget holds it there), so it is invisible in RSS alone.
     /// Reporting it is the whole point of `stats()`.
     #[test]

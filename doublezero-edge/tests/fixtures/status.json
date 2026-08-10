@@ -23,12 +23,12 @@
         "code": "lashay-4",
         "excluded": 29,
         "channels": [
-          { "channel": 10, "floor_admits": true, "bound": true, "products": 412, "label": "sports.nfl" },
-          { "channel": 11, "floor_admits": true, "bound": false, "products": 0 }
+          { "channel": 10, "allowed": true, "bound": true, "products": 412, "label": "sports.nfl" },
+          { "channel": 11, "allowed": true, "bound": false, "products": 0 }
         ]
       }
     ],
-    "excluded_by_floor": 29
+    "excluded_by_filter": 29
   },
   "process": {
     "resident_memory_bytes": 193200128.0,

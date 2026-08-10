@@ -128,7 +128,7 @@ pub struct StatusResponse {
     #[serde(default)]
     pub venues: Vec<VenueStatus>,
     pub history: HistoryStatus,
-    /// Absent on an older server that predates the channel floor — default to empty rather than
+    /// Absent on an older server that predates the channel filter — default to empty rather than
     /// fail the whole response.
     #[serde(default)]
     pub channels: ChannelsBlock,
@@ -152,8 +152,8 @@ pub struct HistoryStatus {
     #[serde(default)]
     pub products: usize,
     /// The one figure a raw memory number can't tell you: the bucket budget holds RSS flat while
-    /// silently evicting products, so a healthy-looking RSS is exactly what an over-wide floor
-    /// produces. This flag (not an inferred "products == some hardcoded cap") is the honest
+    /// silently evicting products, so a healthy-looking RSS is exactly what an over-wide channel
+    /// filter produces. This flag (not an inferred "products == some hardcoded cap") is the honest
     /// signal, and the table renderer must show it as its own marker rather than leave a caller to
     /// notice two numbers are equal.
     #[serde(default)]
@@ -169,14 +169,14 @@ pub struct HistoryStatus {
     pub late_drops: u64,
 }
 
-/// The `channels` block of `/v1/status`: per enabled row, its channels' floor admission, real
-/// receiver liveness and current product count.
+/// The `channels` block of `/v1/status`: per enabled row, its channels' admission by the channel
+/// filter, real receiver liveness and current product count.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChannelsBlock {
     #[serde(default)]
     pub rows: Vec<ChannelRow>,
     #[serde(default)]
-    pub excluded_by_floor: usize,
+    pub excluded_by_filter: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,14 +192,14 @@ pub struct ChannelRow {
 
 /// One channel of one row. `label`/`symbol_prefixes` are **display-only** derived names — see
 /// [`ChannelEntry::display_name`]. Neither is a wire identity: the channel **id** is the only
-/// contract this crate resolves anything by (see `ingest/floor.rs`'s docs for why a name here
+/// contract this crate resolves anything by (see `ingest/channel_filter.rs`'s docs for why a name here
 /// would drift). Both are optional: today's server sends neither, a channel with no reference
 /// data yet (a normal startup state, not an error) sends neither either, and a future server may
 /// send one or both — this type must keep parsing regardless.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelEntry {
     pub channel: u32,
-    pub floor_admits: bool,
+    pub allowed: bool,
     pub bound: bool,
     pub products: u64,
     /// A short human label for the channel (e.g. `sports.nfl`), owned by the upstream deployment
@@ -283,8 +283,8 @@ pub struct ProcessBlock {
     pub cpu_seconds_total: Option<f64>,
 }
 
-/// `GET /admin/channels`'s response shape — only the field `channels list` needs (the floor spec
-/// currently in force, as `ChannelFloor::summary` renders it). Other fields on that response
+/// `GET /admin/channels`'s response shape — only the field `channels list` needs (the channel
+/// filter spec currently in force, as `ChannelFilter::summary` renders it). Other fields on that response
 /// (`rows`, `note`) are read straight off the raw JSON where needed rather than typed here, since
 /// this crate's only use for them is display.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -293,7 +293,7 @@ pub struct AdminChannelsResponse {
     pub summary: Vec<String>,
 }
 
-/// `POST /admin/channels`'s success response shape: the floor spec that is now in force.
+/// `POST /admin/channels`'s success response shape: the channel filter spec that is now in force.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AdminApplyResponse {
     #[serde(default)]
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn a_channel_with_only_a_label_shows_the_label() {
         let c = channel_entry(
-            r#"{"channel": 10, "floor_admits": true, "bound": true, "products": 412, "label": "sports.nfl"}"#,
+            r#"{"channel": 10, "allowed": true, "bound": true, "products": 412, "label": "sports.nfl"}"#,
         );
         assert_eq!(c.display_name(), "sports.nfl");
     }
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn a_channel_with_only_symbol_prefixes_shows_them() {
         let c = channel_entry(
-            r#"{"channel": 11, "floor_admits": true, "bound": true, "products": 287, "symbol_prefixes": ["KXNFLGAME", "KXNFLSPREAD"]}"#,
+            r#"{"channel": 11, "allowed": true, "bound": true, "products": 287, "symbol_prefixes": ["KXNFLGAME", "KXNFLSPREAD"]}"#,
         );
         assert_eq!(c.display_name(), "KXNFLGAME, KXNFLSPREAD");
     }
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn a_label_wins_over_symbol_prefixes_when_both_are_present() {
         let c = channel_entry(
-            r#"{"channel": 43, "floor_admits": true, "bound": true, "products": 9, "label": "sports.combat", "symbol_prefixes": ["KXUFC"]}"#,
+            r#"{"channel": 43, "allowed": true, "bound": true, "products": 9, "label": "sports.combat", "symbol_prefixes": ["KXUFC"]}"#,
         );
         let name = c.display_name();
         assert_eq!(name, "sports.combat");
@@ -384,9 +384,7 @@ mod tests {
     /// state, not an error, and must still render using the one real contract: the id.
     #[test]
     fn a_channel_with_neither_field_falls_back_to_the_bare_id() {
-        let c = channel_entry(
-            r#"{"channel": 49, "floor_admits": true, "bound": false, "products": 0}"#,
-        );
+        let c = channel_entry(r#"{"channel": 49, "allowed": true, "bound": false, "products": 0}"#);
         assert_eq!(c.display_name(), "49");
     }
 
@@ -395,7 +393,7 @@ mod tests {
     #[test]
     fn a_long_symbol_prefix_list_is_truncated_with_a_visible_count() {
         let c = channel_entry(
-            r#"{"channel": 20, "floor_admits": true, "bound": true, "products": 5,
+            r#"{"channel": 20, "allowed": true, "bound": true, "products": 5,
                 "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
         );
         assert_eq!(c.display_name(), "A, B, C +2 more");
@@ -408,14 +406,14 @@ mod tests {
     #[test]
     fn a_server_capped_prefix_list_is_marked_as_a_lower_bound() {
         let capped = channel_entry(
-            r#"{"channel": 21, "floor_admits": true, "bound": true, "products": 5,
+            r#"{"channel": 21, "allowed": true, "bound": true, "products": 5,
                 "symbol_prefixes": ["A", "B", "C", "D", "E"],
                 "symbol_prefixes_truncated": true}"#,
         );
         assert_eq!(capped.display_name(), "A, B, C +2 more (capped)");
 
         let complete = channel_entry(
-            r#"{"channel": 21, "floor_admits": true, "bound": true, "products": 5,
+            r#"{"channel": 21, "allowed": true, "bound": true, "products": 5,
                 "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
         );
         assert_eq!(complete.display_name(), "A, B, C +2 more");
@@ -432,7 +430,7 @@ mod tests {
     #[test]
     fn a_short_capped_prefix_list_is_still_marked() {
         let c = channel_entry(
-            r#"{"channel": 22, "floor_admits": true, "bound": true, "products": 5,
+            r#"{"channel": 22, "allowed": true, "bound": true, "products": 5,
                 "symbol_prefixes": ["A", "B"], "symbol_prefixes_truncated": true}"#,
         );
         assert_eq!(c.display_name(), "A, B (capped)");
@@ -443,7 +441,7 @@ mod tests {
     #[test]
     fn an_absent_truncation_flag_means_the_list_is_complete() {
         let c = channel_entry(
-            r#"{"channel": 23, "floor_admits": true, "bound": true, "products": 1,
+            r#"{"channel": 23, "allowed": true, "bound": true, "products": 1,
                 "symbol_prefixes": ["A"]}"#,
         );
         assert!(!c.symbol_prefixes_truncated);

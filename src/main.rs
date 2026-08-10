@@ -49,18 +49,18 @@ struct Args {
     publisher_ports: Vec<u16>,
 
     /// Channels to ingest, scoped per group code: `lashay-4=10,11;lashay-1=2`. An unmentioned
-    /// row ingests every channel. Ids are the contract and are validated against the row's
+    /// feed ingests every channel. Ids are the contract and are validated against the feed's
     /// roster at startup; channel *names* are not mirrored here — they live in the publisher's
     /// inventory by design and have already moved once. Use `doublezero-edge channels list` to
     /// see what a bound channel actually contains.
     ///
-    /// Only rows whose publisher derives a port per channel can be narrowed: there the excluded
-    /// channel's socket is never bound and the kernel discards its traffic. Narrowing a row whose
+    /// Only feeds whose publisher derives a port per channel can be narrowed: there the excluded
+    /// channel's socket is never bound and the kernel discards its traffic. Narrowing a feed whose
     /// publishers bind one base port flat is refused at startup — `channel_id` identifies mirrors
-    /// there, not markets (see `ingest::floor`).
+    /// there, not markets (see `ingest::channel_filter`).
     ///
     /// Validated against the whole registry, not against the `--feed`/`--publisher-port` selection:
-    /// a clause naming a row those already excluded is legal, filters nothing, and is warned about
+    /// a clause naming a feed those already excluded is legal, filters nothing, and is warned about
     /// at startup.
     #[arg(long, env = "DZ_CHANNELS", default_value = "")]
     channels: String,
@@ -468,24 +468,24 @@ async fn main() -> Result<()> {
 
     let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publisher_ports)?;
 
-    // The ingest floor, parsed once here against the registry that was just resolved and fatal on
-    // any error: a floor that silently filters nothing is worse than one that refuses to start,
-    // since the symptom is a process quietly ingesting markets nobody asked for. It is handed to
-    // the reconciler as an *input* to the desired receiver set — `reconcile` stays the single
-    // activation authority.
-    let floor = ingest::floor::ChannelFloor::parse(&args.channels)?;
-    if !floor.is_empty() {
-        info!(channels = ?floor.summary(), "channel floor active (excluded channels bind no socket)");
-        // The floor validates against the whole registry, but `--feed`/`--publisher-port` narrow
-        // what this process runs. A clause naming a row those already excluded is legal and filters
-        // nothing — not fatal, since the operator gave two explicit instructions and the narrower
-        // one simply wins, but it must not be silent: an unbound channel and an unbound row look
-        // identical from outside.
-        for code in floor.codes() {
+    // The channel filter, parsed once here against the registry that was just resolved and fatal
+    // on any error: a channel filter that silently filters nothing is worse than one that refuses
+    // to start, since the symptom is a process quietly ingesting markets nobody asked for. It is
+    // handed to the reconciler as an *input* to the desired receiver set — `reconcile` stays the
+    // single activation authority.
+    let filter = ingest::channel_filter::ChannelFilter::parse(&args.channels)?;
+    if !filter.is_empty() {
+        info!(channels = ?filter.summary(), "channel filter active (excluded channels bind no socket)");
+        // The channel filter validates against the whole registry, but `--feed`/`--publisher-port`
+        // narrow what this process runs. A clause naming a feed those already excluded is legal and
+        // filters nothing — not fatal, since the operator gave two explicit instructions and the
+        // narrower one simply wins, but it must not be silent: an unbound channel and an unbound
+        // feed look identical from outside.
+        for code in filter.codes() {
             if !enabled.iter().any(|f| f.code == code) {
                 warn!(
                     code,
-                    "channel floor names a group code that --feed/--publisher-port already \
+                    "channel filter names a group code that --feed/--publisher-port already \
                      excluded; the clause filters nothing"
                 );
             }
@@ -493,15 +493,15 @@ async fn main() -> Result<()> {
     }
 
     info!(
-        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), floor.publishers_for(f).len())).collect::<Vec<_>>(),
+        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), filter.publishers_for(f).len())).collect::<Vec<_>>(),
         "ingesting feeds"
     );
 
     // Wrapped here (after the plain-value startup logging above, which wants a snapshot, not a
     // guard) so the reconciler and the admin surface (below) share one instance to swap at runtime:
     // a `POST /admin/channels` replaces its contents in place, and the reconciler reads a fresh
-    // clone every tick (see `ingest::reconcile::Reconciler::floor`).
-    let floor: Arc<Mutex<ingest::floor::ChannelFloor>> = Arc::new(Mutex::new(floor));
+    // clone every tick (see `ingest::reconcile::Reconciler::filter`).
+    let filter: Arc<Mutex<ingest::channel_filter::ChannelFilter>> = Arc::new(Mutex::new(filter));
 
     // Force the metrics registry to initialize up front (registering the process collector and all
     // metric families) so the very first recorded sample lands in a ready registry, whether or not
@@ -666,9 +666,9 @@ async fn main() -> Result<()> {
 
     // Admin surface: the one mutation path in this crate, off unless `--admin-bind` is set. Unlike
     // the WS sink and the query API, it is **not** subscription-gated — an operator must be able to
-    // inspect or change the floor even with nothing currently subscribed — so it is spawned once
-    // here, gated only on the bind being non-empty. A taken port is non-fatal, exactly like
-    // `ws`/`api`: it disables this surface without taking the tunnel down.
+    // inspect or change the channel filter even with nothing currently subscribed — so it is
+    // spawned once here, gated only on the bind being non-empty. A taken port is non-fatal, exactly
+    // like `ws`/`api`: it disables this surface without taking the tunnel down.
     let admin_srv = if args.admin_bind.is_empty() {
         info!("admin surface disabled (empty --admin-bind)");
         None
@@ -678,7 +678,7 @@ async fn main() -> Result<()> {
                 info!(bind = %args.admin_bind, "admin surface enabled (mutating — no authentication)");
                 Some(tokio::spawn(sinks::admin::serve(
                     listener,
-                    floor.clone(),
+                    filter.clone(),
                     enabled.clone(),
                 )))
             }
@@ -702,7 +702,7 @@ async fn main() -> Result<()> {
             depth,
             books,
             enabled,
-            floor,
+            filter,
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
             refresh: std::time::Duration::from_secs(args.subscription_refresh_secs),

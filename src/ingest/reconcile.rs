@@ -37,8 +37,8 @@ use crate::{
     history::{self, Store},
     ingest::{
         arbiter::SharedArbiter,
+        channel_filter::ChannelFilter,
         feeds::{Feed, FeedKind},
-        floor::ChannelFloor,
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver, sources,
         subscriptions::{self, Detected, HostSubs},
@@ -148,15 +148,15 @@ pub fn owns(owners: &HashMap<Universe, FeedKey>, key: &FeedKey) -> bool {
     owners.get(&(key.0, key.1)).is_some_and(|o| o.2 == key.2)
 }
 
-/// Every receiver key a feed contributes — one per publisher the [`ChannelFloor`] admits.
+/// Every receiver key a feed contributes — one per publisher the [`ChannelFilter`] admits.
 ///
-/// The floor is an **input** to the desired set, not a second activation authority: it narrows what
-/// this function yields and nothing else, so the spawn/abort diff below is unchanged and this module
-/// stays the only place that decides what runs. A publisher the floor drops is simply never a
-/// desired key, which means its socket is never bound and the kernel discards that channel's traffic
-/// before it reaches userspace.
-fn feed_keys<'a>(floor: &'a ChannelFloor, f: &'a Feed) -> impl Iterator<Item = FeedKey> + 'a {
-    floor
+/// The channel filter is an **input** to the desired set, not a second activation authority: it
+/// narrows what this function yields and nothing else, so the spawn/abort diff below is unchanged
+/// and this module stays the only place that decides what runs. A publisher the channel filter
+/// drops is simply never a desired key, which means its socket is never bound and the kernel
+/// discards that channel's traffic before it reaches userspace.
+fn feed_keys<'a>(filter: &'a ChannelFilter, f: &'a Feed) -> impl Iterator<Item = FeedKey> + 'a {
+    filter
         .publishers_for(f)
         .into_iter()
         .map(|p| (f.venue, f.category, f.kind, p.base_port()))
@@ -192,14 +192,14 @@ pub struct ReconcilerConfig {
     /// subscription). Owned rather than `&'static` because `--publisher-port` narrows each row's
     /// publisher list.
     pub enabled: Vec<Feed>,
-    /// Which channels of each row this process ingests (`--channels`), parsed and validated once in
-    /// `main`. Empty by default, which admits every channel of every row.
+    /// Which channels of each feed this process ingests (`--channels`), parsed and validated once in
+    /// `main`. Empty by default, which admits every channel of every feed.
     ///
     /// Shared and mutable: the admin surface (`sinks::admin`, off unless `--admin-bind` is set) can
     /// replace it at runtime, and this reconciler reads it fresh every tick — a lock acquisition per
     /// tick is free at `--subscription-refresh-secs` granularity, and this is the only change needed
-    /// for a runtime floor swap to reach the existing spawn/abort diff.
-    pub floor: Arc<Mutex<ChannelFloor>>,
+    /// for a runtime channel filter swap to reach the existing spawn/abort diff.
+    pub filter: Arc<Mutex<ChannelFilter>>,
     pub iface: String,
     pub recv_buf: usize,
     pub refresh: Duration,
@@ -256,9 +256,9 @@ pub struct Reconciler {
     cli_missing_logged: bool,
     /// The full **desired** feed-key set as of the last completed tick — deliberately not derived
     /// from `active`. A receiver that already self-exited (`reap_finished` runs *before*
-    /// `apply_feeds` computes `current` from `active`) is gone from `active` by the time a floor
-    /// change would otherwise abort it, so diffing consecutive `desired` sets — not `active` vs.
-    /// `desired` — is what still detects the departure. See `forget_departed_channels`.
+    /// `apply_feeds` computes `current` from `active`) is gone from `active` by the time a channel
+    /// filter change would otherwise abort it, so diffing consecutive `desired` sets — not `active`
+    /// vs. `desired` — is what still detects the departure. See `forget_departed_channels`.
     last_desired_feeds: HashSet<FeedKey>,
 }
 
@@ -280,12 +280,12 @@ impl Reconciler {
     /// The poll loop. Never returns; if it ever did (it can't), the process would exit via `main`'s
     /// `select!`. Mirrors `shred::leader`'s refresher shape.
     pub async fn run(mut self) -> Result<()> {
-        let floor = self.floor();
+        let filter = self.filter();
         info!(
             refresh_secs = self.cfg.refresh.as_secs(),
             gating_disabled = self.cfg.gating_disabled,
-            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), floor.publishers_for(f).len())).collect::<Vec<_>>(),
-            channel_floor = ?floor.summary(),
+            feeds = ?self.cfg.enabled.iter().map(|f| (f.venue, f.kind.label(), filter.publishers_for(f).len())).collect::<Vec<_>>(),
+            channel_filter = ?filter.summary(),
             "subscription reconciler started"
         );
         loop {
@@ -347,21 +347,21 @@ impl Reconciler {
         }
     }
 
-    /// A per-tick snapshot of the runtime-mutable floor. Cloned rather than held locked across the
-    /// tick's spawn/abort work — `ChannelFloor` is one small `HashMap` entry per narrowed row, so
-    /// the lock is held only for the `clone()` itself, and every caller this tick sees one
-    /// consistent floor even if the admin surface swaps it in between.
-    fn floor(&self) -> ChannelFloor {
-        crate::model::lock(&self.cfg.floor).clone()
+    /// A per-tick snapshot of the runtime-mutable channel filter. Cloned rather than held locked
+    /// across the tick's spawn/abort work — `ChannelFilter` is one small `HashMap` entry per
+    /// narrowed feed, so the lock is held only for the `clone()` itself, and every caller this tick
+    /// sees one consistent channel filter even if the admin surface swaps it in between.
+    fn filter(&self) -> ChannelFilter {
+        crate::model::lock(&self.cfg.filter).clone()
     }
 
     /// Desired state from a successful subscription read.
     fn desired_from_subs(&self, subs: &HostSubs) -> Desired {
-        let floor = self.floor();
+        let filter = self.filter();
         let feeds: HashSet<FeedKey> = subs
             .market_data_feeds(&self.cfg.enabled)
             .into_iter()
-            .flat_map(|f| feed_keys(&floor, f))
+            .flat_map(|f| feed_keys(&filter, f))
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
@@ -374,12 +374,12 @@ impl Reconciler {
     /// Fail-open / gating-disabled desired state: every enabled feed on, WS on if configured, shreds
     /// only via explicit sources (no CLI → no discovery).
     fn static_desired(&self) -> Desired {
-        let floor = self.floor();
+        let filter = self.filter();
         let feeds: HashSet<FeedKey> = self
             .cfg
             .enabled
             .iter()
-            .flat_map(|f| feed_keys(&floor, f))
+            .flat_map(|f| feed_keys(&filter, f))
             .collect();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
@@ -522,8 +522,9 @@ impl Reconciler {
     ///
     /// Diffs against the previous tick's full desired set, **not** `self.active` (which is what
     /// `apply_feeds`'s own `to_abort` computes): `reap_finished` runs first each tick and already
-    /// drops a self-exited receiver's key from `active`, so by the time a floor change removes that
-    /// same key from `desired` it was never in `active` to diff against, and an `active`-based check
+    /// drops a self-exited receiver's key from `active`, so by the time a channel filter change
+    /// removes that same key from `desired` it was never in `active` to diff against, and an
+    /// `active`-based check
     /// would silently miss the departure. Basing removal on *the channel leaving the desired set*
     /// rather than *an abort actually happening* is what closes that window.
     fn departed_channels(previous: &HashSet<FeedKey>, desired: &HashSet<FeedKey>) -> Vec<FeedKey> {
@@ -539,10 +540,11 @@ impl Reconciler {
     /// channel is dead goes empty).
     ///
     /// A flat publisher (`channel: None`) has no channel identity to forget — narrowing a flat row is
-    /// refused at floor-parse time, so this only ever fires for a row a channel actually identifies.
-    /// The venue/category are resolved from *this* departing key's own row, never assumed for the
-    /// whole group `code`: a code can span rows on different venues (`ingest::floor`'s docs), so
-    /// each departure carries its own row's identity rather than guessing one venue for the code.
+    /// refused at channel-filter-parse time, so this only ever fires for a row a channel actually
+    /// identifies. The venue/category are resolved from *this* departing key's own row, never
+    /// assumed for the whole group `code`: a code can span rows on different venues
+    /// (`ingest::channel_filter`'s docs), so each departure carries its own row's identity rather
+    /// than guessing one venue for the code.
     ///
     /// **Category-precise for the catalog, the history, and the book.** `history::Store::
     /// forget_channel` and `InstrumentSnapshot`'s key both now carry `category` (mirroring
@@ -688,7 +690,7 @@ impl Reconciler {
                         self.cfg.books.clone(),
                         self.cfg.history.clone(),
                         self.health.clone(),
-                        self.cfg.floor.clone(),
+                        self.cfg.filter.clone(),
                         self.cfg.enabled.clone(),
                     )));
                     self.history_feeder = Some(tokio::spawn(feed_history(
@@ -954,7 +956,7 @@ mod tests {
             },
         ];
         let feed = test_feed(PUBS);
-        let keys: Vec<FeedKey> = feed_keys(&ChannelFloor::default(), &feed).collect();
+        let keys: Vec<FeedKey> = feed_keys(&ChannelFilter::default(), &feed).collect();
         assert_eq!(
             keys,
             vec![
@@ -1228,23 +1230,23 @@ mod tests {
         assert_eq!(changes.get() - before, 1);
     }
 
-    /// The floor reaching the activation path: the desired receiver set for a narrowed row holds
-    /// exactly the admitted channels' publishers, so the excluded ones are never spawned and their
-    /// sockets are never bound.
+    /// The channel filter reaching the activation path: the desired receiver set for a narrowed
+    /// row holds exactly the admitted channels' publishers, so the excluded ones are never spawned
+    /// and their sockets are never bound.
     ///
     /// Asserted on the desired **keys** — which base ports this process will bind — rather than on
-    /// decoded output, which is empty for an excluded channel whether the floor works or not and so
-    /// could not fail. The unfiltered control run is what proves the narrowing is the floor's doing
-    /// and not a property of the fixture.
+    /// decoded output, which is empty for an excluded channel whether the channel filter works or
+    /// not and so could not fail. The unfiltered control run is what proves the narrowing is the
+    /// channel filter's doing and not a property of the fixture.
     #[test]
-    fn the_floor_narrows_the_desired_receiver_set() {
+    fn the_filter_narrows_the_desired_receiver_set() {
         let sports = *crate::ingest::feeds::feeds()
             .iter()
             .find(|f| f.category == "sports")
             .expect("the built-in registry has a sports row");
-        let floor = ChannelFloor::parse("lashay-4=10,11").unwrap();
+        let filter = ChannelFilter::parse("lashay-4=10,11").unwrap();
 
-        let narrowed = test_reconciler_with_floor(vec![sports], floor);
+        let narrowed = test_reconciler_with_filter(vec![sports], filter);
         let mut ports: Vec<u16> = narrowed
             .static_desired()
             .feeds
@@ -1262,9 +1264,9 @@ mod tests {
         );
     }
 
-    /// The real "sports" row (group code `lashay-4`), for tests that need genuine floor narrowing —
-    /// `ChannelFloor::parse` validates against the loaded registry, so a custom `Feed` with a made-up
-    /// code cannot be narrowed at all.
+    /// The real "sports" row (group code `lashay-4`), for tests that need genuine channel-filter
+    /// narrowing — `ChannelFilter::parse` validates against the loaded registry, so a custom `Feed`
+    /// with a made-up code cannot be narrowed at all.
     fn sports_row() -> Feed {
         *crate::ingest::feeds::feeds()
             .iter()
@@ -1358,15 +1360,16 @@ mod tests {
     /// `last_desired_feeds` against `desired`, independent of `active` entirely, is what still
     /// catches it.
     ///
-    /// Drives the real `tick()` across two ticks with a genuinely **narrowing floor** on the real
-    /// `lashay-4` sports row (`ChannelFloor::parse` validates against the loaded registry, so a
-    /// custom `Feed`'s made-up code cannot be narrowed — see `sports_row`). Channel 10 departs;
-    /// channel 11 stays admitted, so `cfg.enabled` is never emptied and the row stays resolvable.
+    /// Drives the real `tick()` across two ticks with a genuinely **narrowing channel filter** on
+    /// the real `lashay-4` sports row (`ChannelFilter::parse` validates against the loaded
+    /// registry, so a custom `Feed`'s made-up code cannot be narrowed — see `sports_row`). Channel
+    /// 10 departs; channel 11 stays admitted, so `cfg.enabled` is never emptied and the row stays
+    /// resolvable.
     #[tokio::test]
     async fn a_self_exited_receivers_channel_is_still_forgotten_when_it_leaves_the_desired_set() {
-        let mut r = test_reconciler_with_floor(
+        let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFloor::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("lashay-4=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
 
@@ -1398,9 +1401,10 @@ mod tests {
         r.tick().await;
         assert!(r.active.contains_key(&key10));
 
-        // Simulate the receiver having already self-exited and been reaped BEFORE the floor narrows
-        // the channel away — removed from `active` directly, bypassing `apply_feeds`'s own abort
-        // path, exactly as `reap_finished` would for a task that died on its own.
+        // Simulate the receiver having already self-exited and been reaped BEFORE the channel
+        // filter narrows the channel away — removed from `active` directly, bypassing
+        // `apply_feeds`'s own abort path, exactly as `reap_finished` would for a task that died on
+        // its own.
         let (h, tape) = r.active.remove(&key10).expect("the receiver was running");
         tape.store(false, std::sync::atomic::Ordering::Relaxed);
         h.abort();
@@ -1409,9 +1413,10 @@ mod tests {
             "fixture sanity: already reaped before the departure"
         );
 
-        // Tick 2: narrow the floor to channel 11 only. `active` no longer holds channel 10's key at
-        // all, so a diff against `active` (the pre-fix behaviour) would find nothing to forget.
-        *r.cfg.floor.lock().unwrap() = ChannelFloor::parse("lashay-4=11").unwrap();
+        // Tick 2: narrow the channel filter to channel 11 only. `active` no longer holds channel
+        // 10's key at all, so a diff against `active` (the pre-fix behaviour) would find nothing
+        // to forget.
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
         r.tick().await;
 
         assert!(
@@ -1434,7 +1439,7 @@ mod tests {
     ///
     /// Calls `forget_departing_channel` directly (not through `tick()`): this scenario — one group
     /// `code` spanning rows on two *different* venues — has no real registry row to validate a
-    /// floor narrowing against (`ChannelFloor::parse` only accepts codes the loaded registry
+    /// channel-filter narrowing against (`ChannelFilter::parse` only accepts codes the loaded registry
     /// carries), and shrinking `cfg.enabled` between ticks would remove the very row entry this
     /// method needs to resolve the departing key's venue/channel from, defeating the scenario
     /// entirely. `tick()`'s own ordering and the book-purge routing are what the dedicated
@@ -1616,14 +1621,14 @@ mod tests {
     /// it. A product still listed with a frozen `best_bid`/`best_ask` beside an empty trade list
     /// reads as "alive but quiet," which is worse than nothing being served at all. Seeds **all
     /// three** maps (catalog, book via the real arbiter, history) so this pins the whole purge, not
-    /// the catalog alone, and drives the real `tick()` across two ticks with a narrowing floor on
-    /// the real sports row (see `sports_row`/`a_self_exited_receivers_...` for why a custom-code row
-    /// can't be narrowed).
+    /// the catalog alone, and drives the real `tick()` across two ticks with a narrowing channel
+    /// filter on the real sports row (see `sports_row`/`a_self_exited_receivers_...` for why a
+    /// custom-code row can't be narrowed).
     #[tokio::test]
     async fn a_departed_channels_product_is_invisible_to_the_query_surface() {
-        let mut r = test_reconciler_with_floor(
+        let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFloor::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("lashay-4=10,11").unwrap(),
         );
 
         r.cfg.instruments.lock().unwrap().insert(
@@ -1665,7 +1670,7 @@ mod tests {
             r.cfg.books.clone(),
             r.cfg.history.clone(),
             Arc::new(FeedHealth::new()),
-            r.cfg.floor.clone(),
+            r.cfg.filter.clone(),
             r.cfg.enabled.clone(),
         ));
         let base = format!("http://{addr}");
@@ -1697,8 +1702,8 @@ mod tests {
 
         // Tick 1: channels 10 and 11 both admitted.
         r.tick().await;
-        // Tick 2: narrow the floor to channel 11 only — channel 10 departs.
-        *r.cfg.floor.lock().unwrap() = ChannelFloor::parse("lashay-4=11").unwrap();
+        // Tick 2: narrow the channel filter to channel 11 only — channel 10 departs.
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
         r.tick().await;
 
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:DEPARTED"))
@@ -1713,8 +1718,8 @@ mod tests {
     }
 
     /// N1 + N2 + N3, the deliverable: drives the real `tick()` (not a hand-called helper) across two
-    /// ticks with a genuinely **narrowing floor** (the real `lashay-4` sports row, via
-    /// `ChannelFloor::parse`), seeding all three maps a departure purges — the catalog, the book
+    /// ticks with a genuinely **narrowing channel filter** (the real `lashay-4` sports row, via
+    /// `ChannelFilter::parse`), seeding all three maps a departure purges — the catalog, the book
     /// (through the real arbiter, not a hand-built `BookReplay`), and history.
     ///
     /// Fails on an N1 regression (the purge moved back above `apply_feeds`) because
@@ -1725,8 +1730,10 @@ mod tests {
     #[tokio::test]
     async fn a_narrowed_channel_is_purged_from_all_three_maps_via_a_real_tick() {
         let feed = sports_row();
-        let mut r =
-            test_reconciler_with_floor(vec![feed], ChannelFloor::parse("lashay-4=10,11").unwrap());
+        let mut r = test_reconciler_with_filter(
+            vec![feed],
+            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+        );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
         let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
             ("KALSHI".into(), "sports".into(), 10u32, 1u32);
@@ -1782,8 +1789,8 @@ mod tests {
             .candles(&hist_key, 60, 10, 1_100)
             .is_empty());
 
-        // Narrow the floor: channel 10 departs, channel 11 stays admitted.
-        *r.cfg.floor.lock().unwrap() = ChannelFloor::parse("lashay-4=11").unwrap();
+        // Narrow the channel filter: channel 10 departs, channel 11 stays admitted.
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
 
         // Tick 2: the real `tick()` aborts the receiver and purges its state.
         r.tick().await;
@@ -1814,10 +1821,10 @@ mod tests {
     /// A `Reconciler` whose spawned receivers are never polled: `apply_feeds` is sync, so the tasks
     /// it creates bind no sockets before the test drops them.
     fn test_reconciler(enabled: Vec<Feed>) -> Reconciler {
-        test_reconciler_with_floor(enabled, ChannelFloor::default())
+        test_reconciler_with_filter(enabled, ChannelFilter::default())
     }
 
-    fn test_reconciler_with_floor(enabled: Vec<Feed>, floor: ChannelFloor) -> Reconciler {
+    fn test_reconciler_with_filter(enabled: Vec<Feed>, filter: ChannelFilter) -> Reconciler {
         let (tx, _rx) = broadcast::channel(16);
         // The arbiter's own `book_replay` must point at the *same* `BookSnapshot` handed to
         // `ReconcilerConfig::books` (the object `sinks::api`/`sinks::ws` read and this test module's
@@ -1834,7 +1841,7 @@ mod tests {
             depth: Default::default(),
             books,
             enabled,
-            floor: Arc::new(Mutex::new(floor)),
+            filter: Arc::new(Mutex::new(filter)),
             iface: "127.0.0.1".into(),
             recv_buf: 1 << 20,
             refresh: Duration::from_secs(30),
@@ -1983,7 +1990,7 @@ mod tests {
             Default::default(),
             history.clone(),
             health,
-            Arc::new(Mutex::new(ChannelFloor::default())),
+            Arc::new(Mutex::new(ChannelFilter::default())),
             Vec::new(),
         ));
         tokio::spawn(feed_history(
@@ -2120,7 +2127,7 @@ mod tests {
             Default::default(),
             history.clone(),
             health,
-            Arc::new(Mutex::new(ChannelFloor::default())),
+            Arc::new(Mutex::new(ChannelFilter::default())),
             Vec::new(),
         ));
         tokio::spawn(feed_history(

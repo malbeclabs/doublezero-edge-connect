@@ -198,27 +198,29 @@ Modules are grouped by role under `src/`:
   universes are separate because their `channel_id` ranges do not overlap — the allocation is
   mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
   only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from
-  (`None` on an explicit block) — the fact the ingest floor below is built on.
-- **`ingest/floor.rs`** — the **ingest floor**: which channels of an activated feed this process
-  decodes (`--channels`/`DZ_CHANNELS`, e.g. `lashay-4=10,11`). Sits between the two filters either
-  side of it — `reconcile` picks which *feeds* run, `sinks::ws`'s `SubFilter` picks what one *client*
-  receives — and is process-global and ops-owned, since it scopes books, history and CPU for
-  everyone. It acts **only** where the publisher derives a port per channel: an excluded channel is
-  never bound and the kernel discards its traffic before userspace, which is why it costs nothing and
-  is the reason that derivation exists upstream. Narrowing a row whose publishers bind one base port
-  **flat** is **refused at startup**, not implemented as a frame-header test: there `channel_id`
-  identifies mirrors, so every publisher carries the complete universe and narrowing would give up
-  redundancy without reducing a single decoded message. Keyed **by group code, never globally** (one
-  global flag would filter to a league and silently half-blind an unrelated mirrored feed), and takes
-  **numeric ids only** — channel *names* live in the publisher's inventory by design and a copy here
-  would drift exactly as four superseded port allocations did. Every id is validated against the
-  **loaded document's** roster and an unknown id or code is fatal at startup, because a floor that
+  (`None` on an explicit block) — the fact the channel filter below is built on.
+- **`ingest/channel_filter.rs`** — the **channel filter**: which channels of an activated feed this
+  process decodes (`--channels`/`DZ_CHANNELS`, e.g. `lashay-4=10,11`). It is an **allowlist**, not a
+  threshold — the old name, "floor", implied a minimum, which is backwards: it restricts a set, and
+  every unmentioned feed keeps admitting everything. Sits between the two filters either side of it
+  — `reconcile` picks which *feeds* run, `sinks::ws`'s `SubFilter` picks what one *client* receives —
+  and is process-global and ops-owned, since it scopes books, history and CPU for everyone. It acts
+  **only** where the publisher derives a port per channel: an excluded channel is never bound and the
+  kernel discards its traffic before userspace, which is why it costs nothing and is the reason that
+  derivation exists upstream. Narrowing a row whose publishers bind one base port **flat** is
+  **refused at startup**, not implemented as a frame-header test: there `channel_id` identifies
+  mirrors, so every publisher carries the complete universe and narrowing would give up redundancy
+  without reducing a single decoded message. Keyed **by group code, never globally** (one global flag
+  would filter to a league and silently half-blind an unrelated mirrored feed), and takes **numeric
+  ids only** — channel *names* live in the publisher's inventory by design and a copy here would
+  drift exactly as four superseded port allocations did. Every id is validated against the **loaded
+  document's** roster and an unknown id or code is fatal at startup, because a channel filter that
   silently filters nothing is worse than one that refuses to start. Parsed once in `main`; the
   reconciler consumes it as an *input* to the desired receiver set (`feed_keys`), so `reconcile`
   remains the single activation authority and its spawn/abort diff is unchanged. **Two mechanisms,
   one validator:** `--channels`/`DZ_CHANNELS` only sets the *initial* value of a shared
-  `Arc<Mutex<ChannelFloor>>`; `sinks::admin`'s `POST /admin/channels` can replace it at runtime
-  through the identical `ChannelFloor::parse`, so nothing reachable after startup can admit a row
+  `Arc<Mutex<ChannelFilter>>`; `sinks::admin`'s `POST /admin/channels` can replace it at runtime
+  through the identical `ChannelFilter::parse`, so nothing reachable after startup can admit a row
   startup itself would have refused.
 - **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
   (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
@@ -244,7 +246,7 @@ Modules are grouped by role under `src/`:
   every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
   (spawn/abort). The desired receiver set is the subscribed rows' publishers **narrowed by the
-  channel floor** (`ingest::floor`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
+  channel filter** (`ingest::channel_filter`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
   one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
   per `(venue, category)` — one owner per *universe*, since rows sharing a Source ID can carry
@@ -262,7 +264,7 @@ Modules are grouped by role under `src/`:
   row, so an incumbent keeps the tape until the newcomer really registers rather than bouncing on
   activation; above a dead one, so a cold start where nothing has bound falls back to rank instead of
   leaving the venue ownerless). Changes are counted by `dz_tape_owner_changes_total{venue}`.
-  `forget_departing_channel` is the other half of a floor narrowing (static at startup, or via
+  `forget_departing_channel` is the other half of a channel-filter narrowing (static at startup, or via
   `sinks::admin`'s `POST /admin/channels` at runtime): once a channel's receiver key actually leaves
   `plan()`'s desired set — never before, per the `N1` `debug_assert!` guarding reordering — it purges
   that departing row's own `(venue, category, channel)` slice from all three: the catalog
@@ -561,8 +563,8 @@ Modules are grouped by role under `src/`:
 - **`sinks/api.rs`**'s `GET /v1/status` carries three accounting blocks beyond per-venue
   `online`/`offline`: `history` (`history::Store::stats()` verbatim — products tracked/at cap,
   buckets, bucket budget, estimated bytes, window, evictions, late drops), `channels` (per enabled
-  row that carries a channel id — every row but a flat one, see `ingest/floor.rs` — its full roster
-  with `floor_admits` from the floor alone, `bound` from **real** receiver liveness
+  row that carries a channel id — every row but a flat one, see `ingest/channel_filter.rs` — its full
+  roster with `allowed` from the channel filter alone, `bound` from **real** receiver liveness
   (`SharedFeedHealth::liveness`, keyed exactly as the reconciler's own receiver map — an
   admitted-but-unsubscribed channel reads `Unregistered`/`Down` here rather than a false "bound",
   the exact field the admin surface's own `GET` had to caveat instead of fix, since it has no
@@ -580,12 +582,12 @@ Modules are grouped by role under `src/`:
   by default, unlike `--api-bind`: a mutation surface that defaulted on is one an operator gets by
   accident. **No authentication**, and under host networking a wildcard bind is genuinely
   network-reachable, so the documented recommendation is a loopback bind (`127.0.0.1:9098`), never a
-  bare wildcard. Two routes, both `/admin/channels`: `GET` reports the floor in force plus, per
-  enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver set
-  (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
+  bare wildcard. Two routes, both `/admin/channels`: `GET` reports the channel filter in force plus,
+  per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver
+  set (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
   field says so rather than the response naming the field "bound" and inviting the exact mistake
   `sinks/api.rs`'s own `channels` block above had to fix); `POST ?channels=<spec>` replaces the
-  shared `Arc<Mutex<ChannelFloor>>` through the identical `ChannelFloor::parse` the startup path
+  shared `Arc<Mutex<ChannelFilter>>` through the identical `ChannelFilter::parse` the startup path
   uses — so nothing here can admit a row startup would have refused — taking effect on the
   reconciler's *next* tick via the existing spawn/abort diff, which is also what purges a departing
   channel's catalog/book/history state (`reconcile::forget_departing_channel`, above), not the
@@ -593,12 +595,12 @@ Modules are grouped by role under `src/`:
   hand-rolled `sinks::http` scaffolding never reads one, so `POST` refuses two distinct caller
   mistakes rather than silently misfiring on the natural instinct to `POST` a body — a **missing**
   `channels` parameter (400, distinct from present-and-empty, which is how an operator explicitly
-  clears the floor) and a **non-empty request body** (400, detected via `Content-Length` — otherwise
-  silently ignored, which is how `curl -d` or a library's default `post(url, data=...)` would
-  quietly widen the floor to admit-everything while looking, to the caller, like it worked). Bind/
-  serve split exactly as `ws`/`api` (a taken port disables this surface without taking the tunnel
-  down) but deliberately **not** subscription-gated — an operator must be able to inspect or narrow
-  the floor before anything is subscribed at all.
+  clears the channel filter) and a **non-empty request body** (400, detected via `Content-Length` —
+  otherwise silently ignored, which is how `curl -d` or a library's default `post(url, data=...)`
+  would quietly widen the channel filter to admit-everything while looking, to the caller, like it
+  worked). Bind/serve split exactly as `ws`/`api` (a taken port disables this surface without taking
+  the tunnel down) but deliberately **not** subscription-gated — an operator must be able to inspect
+  or narrow the channel filter before anything is subscribed at all.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
   `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by

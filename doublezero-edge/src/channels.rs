@@ -3,12 +3,13 @@
 //! server, no mock listener).
 //!
 //! Two independent things live here:
-//! - A **client-side, best-effort** reading of the `<code>=<id>[,<id>...][;<code>=...]` floor-spec
-//!   syntax ([`FloorSpec`]), used only to preview which currently-populated channels a new floor
-//!   would stop admitting. This is deliberately **not** a validator: the server (via
-//!   `ChannelFloor::parse`, the exact function `--channels`/`DZ_CHANNELS` uses at startup) is the
-//!   only place a spec is authoritatively checked, and its error is what gets surfaced to the
-//!   caller on a `400` — this module never rejects a spec, it only estimates a preview from it.
+//! - A **client-side, best-effort** reading of the `<code>=<id>[,<id>...][;<code>=...]`
+//!   channel-filter-spec syntax ([`FilterSpec`]), used only to preview which currently-populated
+//!   channels a new channel filter would stop admitting. This is deliberately **not** a validator:
+//!   the server (via `ChannelFilter::parse`, the exact function `--channels`/`DZ_CHANNELS` uses at
+//!   startup) is the only place a spec is authoritatively checked, and its error is what gets
+//!   surfaced to the caller on a `400` — this module never rejects a spec, it only estimates a
+//!   preview from it.
 //! - [`render_channels_list`], the `--output table` renderer for `channels list`'s merged body
 //!   (`{"admin": ..., "status": ...}` — see `endpoint::Endpoint::ChannelsList`'s docs for why the
 //!   two are merged into one value before this runs).
@@ -17,23 +18,26 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
 
-use crate::render;
-use crate::types::{AdminChannelsResponse, ChannelsBlock};
+use crate::{
+    render,
+    types::{AdminChannelsResponse, ChannelsBlock},
+};
 
-/// A client-side reading of a floor spec: which channel ids each group code would admit under it.
-/// A code **absent** from the spec means "admit all" — the same semantic `ChannelFloor::parse`
-/// documents, and the reason an unmentioned row is never reported as a drop below.
+/// A client-side reading of a channel filter spec: which channel ids each group code would admit
+/// under it. A code **absent** from the spec means "admit all" — the same semantic
+/// `ChannelFilter::parse` documents, and the reason an unmentioned row is never reported as a drop
+/// below.
 #[derive(Debug, Clone, Default)]
-pub struct FloorSpec {
+pub struct FilterSpec {
     clauses: HashMap<String, BTreeSet<u64>>,
 }
 
-impl FloorSpec {
+impl FilterSpec {
     /// Parse `spec` leniently: a clause this can't make sense of (no `=`, a non-numeric id) is
     /// simply skipped rather than reported, because reporting it here would be a second, laxer
     /// validator exactly where the docs on this module say there must not be one. An invalid spec
     /// still reaches the server unchanged and is refused there with the real error.
-    pub fn parse(spec: &str) -> FloorSpec {
+    pub fn parse(spec: &str) -> FilterSpec {
         let mut clauses: HashMap<String, BTreeSet<u64>> = HashMap::new();
         for clause in spec.split(';') {
             let clause = clause.trim();
@@ -50,7 +54,7 @@ impl FloorSpec {
                 .collect();
             clauses.insert(code, ids);
         }
-        FloorSpec { clauses }
+        FilterSpec { clauses }
     }
 
     /// Would this spec admit `channel` on `code`? A code this spec never mentions admits
@@ -63,8 +67,8 @@ impl FloorSpec {
     }
 }
 
-/// One channel a proposed floor would stop admitting, carrying enough to both identify it to an
-/// operator and show what is at stake (its current product count).
+/// One channel a proposed channel filter would stop admitting, carrying enough to both identify it
+/// to an operator and show what is at stake (its current product count).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropRow {
     pub venue: String,
@@ -78,14 +82,14 @@ pub struct DropRow {
 /// Compute which currently-populated, currently-admitted channels `spec` would drop, reading the
 /// current state from a `/v1/status` body's `channels` block. Only a channel that (a) is admitted
 /// today and (b) holds at least one product is reported — an already-excluded channel has nothing
-/// left to lose, and this is a preview of loss, not of the floor's full shape.
+/// left to lose, and this is a preview of loss, not of the channel filter's full shape.
 pub fn compute_drops(status_body: &Value, spec: &str) -> Result<Vec<DropRow>, String> {
     let channels: ChannelsBlock = render::parse(&status_body["channels"])?;
-    let new_floor = FloorSpec::parse(spec);
+    let new_filter = FilterSpec::parse(spec);
     let mut drops = Vec::new();
     for row in &channels.rows {
         for c in &row.channels {
-            if c.floor_admits && c.products > 0 && !new_floor.admits(&row.code, c.channel as u64) {
+            if c.allowed && c.products > 0 && !new_filter.admits(&row.code, c.channel as u64) {
                 drops.push(DropRow {
                     venue: row.venue.clone(),
                     category: row.category.clone(),
@@ -103,7 +107,8 @@ pub fn compute_drops(status_body: &Value, spec: &str) -> Result<Vec<DropRow>, St
 /// Render the drop preview `channels set` shows before asking for confirmation.
 pub fn render_drop_preview(drops: &[DropRow]) -> String {
     if drops.is_empty() {
-        return "no currently-admitted channel with products would be dropped by this floor."
+        return "no currently-admitted channel with products would be dropped by this channel \
+            filter."
             .to_string();
     }
     let mut out = "the following channels would be DROPPED — their books, history and catalog \
@@ -128,19 +133,19 @@ pub fn render_drop_preview(drops: &[DropRow]) -> String {
 }
 
 /// `--output table` for `channels list`'s merged body (`{"admin": <GET /admin/channels>, "status":
-/// <GET /v1/status>}`). The floor summary comes from `admin` (the surface this command is gated
-/// on — see `main.rs`'s `--admin-url` handling); the per-channel bound state and product counts
-/// come from `status`, which is the only place real receiver liveness is computed
-/// (`sinks::admin::get_channels`'s own docs: its `floor_admits` is the floor's opinion, not the
+/// <GET /v1/status>}`). The channel filter summary comes from `admin` (the surface this command is
+/// gated on — see `main.rs`'s `--admin-url` handling); the per-channel bound state and product
+/// counts come from `status`, which is the only place real receiver liveness is computed
+/// (`sinks::admin::get_channels`'s own docs: its `allowed` is the channel filter's opinion, not the
 /// running receiver set).
 pub fn render_channels_list(body: &Value) -> Result<String, String> {
     let admin: AdminChannelsResponse = render::parse(&body["admin"])?;
     let channels: ChannelsBlock = render::parse(&body["status"]["channels"])?;
 
     let mut out = if admin.summary.is_empty() {
-        "floor: (unrestricted — every enabled row's channels are admitted)".to_string()
+        "channel filter: (unrestricted — every enabled row's channels are admitted)".to_string()
     } else {
-        format!("floor: {}", admin.summary.join(", "))
+        format!("channel filter: {}", admin.summary.join(", "))
     };
     out.push_str("\n\n");
     out.push_str(&render::render_channels_block(&channels));
@@ -152,28 +157,28 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------------------------
-    // FloorSpec
+    // FilterSpec
     // -----------------------------------------------------------------------------------------
 
     #[test]
     fn a_mentioned_code_admits_only_its_listed_ids() {
-        let f = FloorSpec::parse("lashay-4=10,11");
+        let f = FilterSpec::parse("lashay-4=10,11");
         assert!(f.admits("lashay-4", 10));
         assert!(f.admits("lashay-4", 11));
         assert!(!f.admits("lashay-4", 12));
     }
 
     /// The semantic this whole preview leans on: a code the spec never names admits everything,
-    /// exactly like `ChannelFloor::parse`'s own documented behaviour for an unmentioned row.
+    /// exactly like `ChannelFilter::parse`'s own documented behaviour for an unmentioned row.
     #[test]
     fn an_unmentioned_code_admits_everything() {
-        let f = FloorSpec::parse("lashay-4=10,11");
+        let f = FilterSpec::parse("lashay-4=10,11");
         assert!(f.admits("lashay-2", 999));
     }
 
     #[test]
     fn multiple_clauses_are_each_scoped_to_their_own_code() {
-        let f = FloorSpec::parse("lashay-4=10,11;lashay-2=5");
+        let f = FilterSpec::parse("lashay-4=10,11;lashay-2=5");
         assert!(f.admits("lashay-4", 10));
         assert!(!f.admits("lashay-4", 5));
         assert!(f.admits("lashay-2", 5));
@@ -193,12 +198,12 @@ mod tests {
                     "code": "lashay-4",
                     "excluded": 29,
                     "channels": [
-                        {"channel": 10, "floor_admits": true, "bound": true, "products": 412},
-                        {"channel": 11, "floor_admits": true, "bound": true, "products": 287},
-                        {"channel": 12, "floor_admits": false, "bound": false, "products": 0}
+                        {"channel": 10, "allowed": true, "bound": true, "products": 412},
+                        {"channel": 11, "allowed": true, "bound": true, "products": 287},
+                        {"channel": 12, "allowed": false, "bound": false, "products": 0}
                     ]
                 }],
-                "excluded_by_floor": 29
+                "excluded_by_filter": 29
             }
         })
     }
@@ -262,19 +267,19 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn channels_list_shows_the_floor_summary_and_the_channel_table() {
+    fn channels_list_shows_the_filter_summary_and_the_channel_table() {
         let body = serde_json::json!({
             "admin": {"summary": ["lashay-4=2 of 31"]},
             "status": status_fixture(),
         });
         let out = render_channels_list(&body).unwrap();
-        assert!(out.contains("floor: lashay-4=2 of 31"), "{out}");
+        assert!(out.contains("channel filter: lashay-4=2 of 31"), "{out}");
         assert!(out.contains("lashay-4"), "{out}");
         assert!(out.contains("412"), "{out}");
     }
 
     #[test]
-    fn channels_list_reports_an_unrestricted_floor_plainly() {
+    fn channels_list_reports_an_unrestricted_filter_plainly() {
         let body = serde_json::json!({
             "admin": {"summary": []},
             "status": status_fixture(),

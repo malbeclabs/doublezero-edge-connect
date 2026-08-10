@@ -102,7 +102,7 @@ const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
 
 #[derive(Subcommand)]
 enum ChannelsCommand {
-    /// List each enabled row's channels: floor admission, real bound state, product count.
+    /// List each enabled row's channels: channel-filter admission, real bound state, product count.
     List {
         /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
         /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
@@ -110,11 +110,11 @@ enum ChannelsCommand {
         #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
         admin_url: String,
     },
-    /// Replace the channel floor (same spec syntax as `--channels`/`DZ_CHANNELS`:
+    /// Replace the channel filter (same spec syntax as `--channels`/`DZ_CHANNELS`:
     /// `<code>=<id>[,<id>...][;<code>=...]`). Prints what would be dropped and requires
     /// confirmation unless `--force` — the drop is irreversible within the history window.
     Set {
-        /// The new floor spec. An empty string clears every restriction.
+        /// The new channel filter spec. An empty string clears every restriction.
         spec: String,
         /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
         /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
@@ -294,7 +294,7 @@ fn run_channels(cli: &Cli, action: &ChannelsCommand) -> i32 {
 }
 
 /// `channels list`: confirm the admin surface answers (naming `DZ_ADMIN_BIND` if it doesn't), then
-/// merge its floor summary with `/v1/status`'s real per-channel liveness into one JSON value so
+/// merge its channel-filter summary with `/v1/status`'s real per-channel liveness into one JSON value so
 /// `--jq`/`--output`/`--template` behave exactly as they do for every other command.
 fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &str) -> i32 {
     if cli.template {
@@ -329,7 +329,7 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
     emit(cli, Endpoint::ChannelsList, &combined)
 }
 
-/// `channels set`: preview what the new floor would drop (best-effort, from `/v1/status`), require
+/// `channels set`: preview what the new channel filter would drop (best-effort, from `/v1/status`), require
 /// confirmation unless `--force`, then `POST` the spec to the admin surface.
 fn run_channels_set(
     cli: &Cli,
@@ -380,7 +380,7 @@ fn run_channels_set(
             return 1;
         }
         print!(
-            "Apply this floor? Dropped channels' books/history/catalog entries are not \
+            "Apply this channel filter? Dropped channels' books/history/catalog entries are not \
                 recoverable within the window. Type 'yes' to continue: "
         );
         use std::io::Write;
@@ -389,7 +389,7 @@ fn run_channels_set(
         let confirmed = std::io::stdin().read_line(&mut input).is_ok()
             && input.trim().eq_ignore_ascii_case("yes");
         if !confirmed {
-            eprintln!("aborted; the channel floor was not changed.");
+            eprintln!("aborted; the channel filter was not changed.");
             return 1;
         }
     }

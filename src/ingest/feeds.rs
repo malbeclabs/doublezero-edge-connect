@@ -112,12 +112,13 @@ pub struct FeedPublisher {
     /// used the `derived` shape and this block came from that channel; `None` means the row used
     /// `explicit`. Nothing more.
     ///
-    /// **What it is used for** is the ingest floor ([`crate::ingest::floor`]): `Some` is exactly the
-    /// condition under which declining a channel is free, because that channel has a socket of its
-    /// own and never binding it makes the kernel discard its traffic before userspace. That much the
-    /// form does license.
+    /// **What it is used for** is the channel filter ([`crate::ingest::channel_filter`]): `Some` is
+    /// exactly the condition under which declining a channel is free, because that channel has a
+    /// socket of its own and never binding it makes the kernel discard its traffic before userspace.
+    /// That much the form does license.
     ///
-    /// ⚠️ **It is not the semantic discriminator, and the floor's refusal message assumes it is.**
+    /// ⚠️ **It is not the semantic discriminator, and the channel filter's refusal message assumes
+    /// it is.**
     /// The question the refusal actually answers — does `channel_id` partition markets, or identify
     /// mirrors of one complete universe? — is a property of the *feed*, and this field only proxies
     /// it. The schema permits an `explicit` row that writes per-channel blocks out at `base + id` by

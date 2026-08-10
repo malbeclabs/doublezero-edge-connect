@@ -274,14 +274,14 @@ fn render_history_line(h: &HistoryStatus) -> String {
 }
 
 /// The `channels` block, shared verbatim between `status`'s table view and `channels list`
-/// (`channels.rs`) — one row per enabled feed row, one line per channel with its floor admission,
-/// real bound state and product count kept as visibly distinct columns (never collapsed into one
-/// "admitted" notion — see the module-level rule this guards).
+/// (`channels.rs`) — one row per enabled feed row, one line per channel with its channel-filter
+/// admission, real bound state and product count kept as visibly distinct columns (never collapsed
+/// into one "admitted" notion — see the module-level rule this guards).
 pub(crate) fn render_channels_block(channels: &ChannelsBlock) -> String {
     let mut sections = Vec::new();
     for row in &channels.rows {
         let mut out = format!("channels: {} ({}/{})\n", row.code, row.venue, row.category);
-        let headers = ["CHANNEL", "NAME", "FLOOR_ADMITS", "BOUND", "PRODUCTS"];
+        let headers = ["CHANNEL", "NAME", "ALLOWED", "BOUND", "PRODUCTS"];
         let table_rows: Vec<Vec<String>> = row
             .channels
             .iter()
@@ -289,19 +289,22 @@ pub(crate) fn render_channels_block(channels: &ChannelsBlock) -> String {
                 vec![
                     c.channel.to_string(),
                     c.display_name(),
-                    c.floor_admits.to_string(),
+                    c.allowed.to_string(),
                     c.bound.to_string(),
                     c.products.to_string(),
                 ]
             })
             .collect();
         out.push_str(&table(&headers, &table_rows));
-        out.push_str(&format!("\n({} channels excluded by floor)", row.excluded));
+        out.push_str(&format!(
+            "\n({} channels excluded by channel filter)",
+            row.excluded
+        ));
         sections.push(out);
     }
     sections.push(format!(
-        "total channels excluded by floor: {}",
-        channels.excluded_by_floor
+        "total channels excluded by channel filter: {}",
+        channels.excluded_by_filter
     ));
     sections.join("\n\n")
 }
@@ -397,8 +400,8 @@ mod tests {
         })
     }
 
-    /// The at-cap marker is the operator's signal to narrow the floor, so it must be rendered
-    /// distinctly rather than left to be inferred from two numbers being equal.
+    /// The at-cap marker is the operator's signal to narrow the channel filter, so it must be
+    /// rendered distinctly rather than left to be inferred from two numbers being equal.
     #[test]
     fn the_table_marks_a_store_at_cap() {
         let out = render_status(&fixture_status_at_cap()).unwrap();
@@ -412,11 +415,11 @@ mod tests {
         assert!(!out.contains("AT CAP"), "{out}");
     }
 
-    /// `bound` and `floor_admits` must read as visibly distinct columns, not be collapsed into one
+    /// `bound` and `allowed` must read as visibly distinct columns, not be collapsed into one
     /// "admitted" notion — an admitted-but-not-bound channel (11 here) is the interesting case this
     /// project already shipped once as a single conflated field.
     #[test]
-    fn the_channels_block_distinguishes_bound_from_floor_admits() {
+    fn the_channels_block_distinguishes_bound_from_allowed() {
         let body = serde_json::json!({
             "venues": [],
             "history": {
@@ -427,17 +430,17 @@ mod tests {
                 "rows": [{
                     "venue": "KALSHI", "category": "sports", "code": "lashay-4", "excluded": 29,
                     "channels": [
-                        {"channel": 10, "floor_admits": true, "bound": true, "products": 2},
-                        {"channel": 11, "floor_admits": true, "bound": false, "products": 0},
-                        {"channel": 12, "floor_admits": false, "bound": false, "products": 0}
+                        {"channel": 10, "allowed": true, "bound": true, "products": 2},
+                        {"channel": 11, "allowed": true, "bound": false, "products": 0},
+                        {"channel": 12, "allowed": false, "bound": false, "products": 0}
                     ]
                 }],
-                "excluded_by_floor": 29
+                "excluded_by_filter": 29
             }
         });
         let out = render_status(&body).unwrap();
         // Locate each channel's row text and check its own two columns independently — this must
-        // fail if `bound` and `floor_admits` were rendered as the same value.
+        // fail if `bound` and `allowed` were rendered as the same value.
         let line_10 = out
             .lines()
             .find(|l| l.trim_start().starts_with("10 "))
@@ -452,7 +455,7 @@ mod tests {
             .unwrap();
         assert!(
             line_11.contains("true"),
-            "channel 11 must still read floor_admits=true: {line_11}"
+            "channel 11 must still read allowed=true: {line_11}"
         );
         assert!(
             line_11.contains("false"),
