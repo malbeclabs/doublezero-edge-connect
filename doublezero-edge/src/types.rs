@@ -207,21 +207,19 @@ pub struct ChannelEntry {
     /// matching or filtering — display only.
     #[serde(default)]
     pub label: Option<String>,
-    /// The distinct symbol prefixes (the portion of each instrument symbol before its first `-`)
-    /// seen on this channel, derived live from reference data — small and stable, unlike full
-    /// symbols, which are per-event and churn as contracts expire. Never used for lookup, matching
-    /// or filtering — display only.
+    /// The most common symbol prefixes (the portion of each instrument symbol before its first
+    /// `-`) seen on this channel, ranked by how many instruments carry each one and capped by the
+    /// server — small and stable, unlike full symbols, which are per-event and churn as contracts
+    /// expire. Never used for lookup, matching or filtering — display only.
     #[serde(default)]
     pub symbol_prefixes: Vec<String>,
-    /// True when the server capped `symbol_prefixes` and there were more it did not send. The
-    /// server omits the key entirely when it sent everything, so the default is the honest one.
-    ///
-    /// Without this, a capped list is indistinguishable from a complete one and the `+N more`
-    /// marker below states a total that is really a **lower bound** — a channel with twenty
-    /// prefixes would render as eight. The whole point of the server's cap is that a client can
-    /// tell; dropping the flag on the floor gives up exactly that.
+    /// The true number of **distinct** prefixes on this channel — sent whenever `symbol_prefixes`
+    /// is, regardless of whether the list was actually capped. `None` on an older server that
+    /// predates this field, or when `symbol_prefixes` itself is absent; the renderer then falls
+    /// back to the local list's own length (see [`render_symbol_prefixes`]), which cannot express
+    /// a remainder past what was sent.
     #[serde(default)]
-    pub symbol_prefixes_truncated: bool,
+    pub symbol_prefixes_total: Option<usize>,
 }
 
 /// How many symbol prefixes [`ChannelEntry::display_name`] shows before eliding the rest with a
@@ -242,32 +240,31 @@ impl ChannelEntry {
             }
         }
         if !self.symbol_prefixes.is_empty() {
-            return render_symbol_prefixes(&self.symbol_prefixes, self.symbol_prefixes_truncated);
+            return render_symbol_prefixes(&self.symbol_prefixes, self.symbol_prefixes_total);
         }
         self.channel.to_string()
     }
 }
 
-/// Render the prefix list for a human, eliding the tail with a count.
+/// Render the prefix list for a human, eliding the tail with an exact remainder.
 ///
-/// `server_capped` says the list itself is incomplete — the server had more prefixes than it was
-/// willing to send. When that holds, the elided count is a **lower bound**, so it is marked
-/// `+N more (capped)` rather than stated as a total. A reader must be able to tell "three of eight"
-/// from "three of at least eight"; those are different facts about how wide a channel is, and that
-/// is the question this column exists to answer.
-fn render_symbol_prefixes(prefixes: &[String], server_capped: bool) -> String {
+/// `total` is the server's true distinct-prefix count. When present, the remainder is `total -
+/// shown.len()` — an exact count, not a lower bound, so `KXNFLGAME, KXNFLSPREAD, KXNFLPLAYOFF +19
+/// more` states a fact rather than hedging with a "the list was capped" marker. When absent (an
+/// older server that predates the field), this falls back to the local list's own length — the
+/// best this client can do without a real count, and identical to this function's pre-total
+/// behaviour.
+fn render_symbol_prefixes(prefixes: &[String], total: Option<usize>) -> String {
     let shown: Vec<&str> = prefixes
         .iter()
         .take(MAX_PREFIXES_SHOWN)
         .map(String::as_str)
         .collect();
     let mut out = shown.join(", ");
-    let remaining = prefixes.len().saturating_sub(MAX_PREFIXES_SHOWN);
-    match (remaining, server_capped) {
-        (0, false) => {}
-        (0, true) => out.push_str(" (capped)"),
-        (n, false) => out.push_str(&format!(" +{n} more")),
-        (n, true) => out.push_str(&format!(" +{n} more (capped)")),
+    let total = total.unwrap_or(prefixes.len());
+    let remaining = total.saturating_sub(shown.len());
+    if remaining > 0 {
+        out.push_str(&format!(" +{remaining} more"));
     }
     out
 }
@@ -388,10 +385,11 @@ mod tests {
         assert_eq!(c.display_name(), "49");
     }
 
-    /// A long prefix list is truncated with an explicit `+N more` rather than silently dropping
-    /// entries or letting the column blow out.
+    /// No `symbol_prefixes_total` at all (an older server that predates the field): the renderer
+    /// falls back to the local list's own length, which is the pre-total behaviour and the best
+    /// this client can do without a real count.
     #[test]
-    fn a_long_symbol_prefix_list_is_truncated_with_a_visible_count() {
+    fn a_long_symbol_prefix_list_falls_back_to_the_local_length_without_a_total() {
         let c = channel_entry(
             r#"{"channel": 20, "allowed": true, "bound": true, "products": 5,
                 "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
@@ -399,52 +397,38 @@ mod tests {
         assert_eq!(c.display_name(), "A, B, C +2 more");
     }
 
-    /// The server caps the prefix list and says so. Without surfacing that, `+N more` states a
-    /// total when it is only a lower bound — a channel with twenty prefixes reads as five. The
-    /// pair below is the point: the SAME list renders differently depending on the flag, so a
-    /// renderer that ignores the flag cannot pass both.
+    /// The exact remainder, computed from the server's real total rather than the sent list's
+    /// length — mirrors the task's own example: three shown, nineteen more, because the server
+    /// held twenty-two distinct prefixes and sent only the top three.
     #[test]
-    fn a_server_capped_prefix_list_is_marked_as_a_lower_bound() {
-        let capped = channel_entry(
+    fn the_remainder_is_computed_exactly_from_the_servers_total() {
+        let c = channel_entry(
             r#"{"channel": 21, "allowed": true, "bound": true, "products": 5,
-                "symbol_prefixes": ["A", "B", "C", "D", "E"],
-                "symbol_prefixes_truncated": true}"#,
+                "symbol_prefixes": ["A", "B", "C"], "symbol_prefixes_total": 22}"#,
         );
-        assert_eq!(capped.display_name(), "A, B, C +2 more (capped)");
-
-        let complete = channel_entry(
-            r#"{"channel": 21, "allowed": true, "bound": true, "products": 5,
-                "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
-        );
-        assert_eq!(complete.display_name(), "A, B, C +2 more");
-        assert_ne!(
-            capped.display_name(),
-            complete.display_name(),
-            "a capped list must not render identically to a complete one"
-        );
+        assert_eq!(c.display_name(), "A, B, C +19 more");
     }
 
-    /// A capped list short enough to show whole still has a tail the server withheld, so the
-    /// marker must appear even with nothing elided locally. This is the case a `remaining > 0`
-    /// guard silently loses.
+    /// A list short enough to show whole can still have a real remainder the server counted but
+    /// did not send — this is the case a `remaining > 0` guard keyed on the *sent* length alone
+    /// would lose, since nothing was elided locally.
     #[test]
-    fn a_short_capped_prefix_list_is_still_marked() {
+    fn a_short_list_with_a_total_past_it_still_shows_the_remainder() {
         let c = channel_entry(
             r#"{"channel": 22, "allowed": true, "bound": true, "products": 5,
-                "symbol_prefixes": ["A", "B"], "symbol_prefixes_truncated": true}"#,
+                "symbol_prefixes": ["A", "B"], "symbol_prefixes_total": 5}"#,
         );
-        assert_eq!(c.display_name(), "A, B (capped)");
+        assert_eq!(c.display_name(), "A, B +3 more");
     }
 
-    /// The flag defaults to "not capped" when the server omits it — which is what an older or
-    /// complete-list server sends, and must not read as capped.
+    /// A total equal to the sent length means nothing was capped — no `+N more` marker at all,
+    /// which falls out of the arithmetic rather than needing a separate "was this capped" flag.
     #[test]
-    fn an_absent_truncation_flag_means_the_list_is_complete() {
+    fn a_total_matching_the_sent_length_shows_no_remainder() {
         let c = channel_entry(
             r#"{"channel": 23, "allowed": true, "bound": true, "products": 1,
-                "symbol_prefixes": ["A"]}"#,
+                "symbol_prefixes": ["A", "B"], "symbol_prefixes_total": 2}"#,
         );
-        assert!(!c.symbol_prefixes_truncated);
-        assert_eq!(c.display_name(), "A");
+        assert_eq!(c.display_name(), "A, B");
     }
 }

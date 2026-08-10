@@ -571,8 +571,10 @@ Modules are grouped by role under `src/`:
   liveness handle at all), `products` from `history::products_for` at the same `(venue, category,
   channel)` grain, plus `label` (registry-supplied, display-only) or, failing that, live-derived
   `symbol_prefixes` — one linear pass over the whole instrument catalog per request (not per
-  channel), capped at 8 distinct prefixes with a `_truncated` flag, both omitted rather than sent
-  empty/null so a bare channel id reads as "no signal yet," never an error), and `process`
+  channel), ranked by how many instruments carry each prefix (alphabetical tiebreak) and capped at
+  8 sent, with `symbol_prefixes_total` reporting the true distinct count regardless of the cap so a
+  client can render an exact remainder; both fields omitted rather than sent empty/null so a bare
+  channel id reads as "no signal yet," never an error), and `process`
   (resident memory + cumulative CPU time read straight off the Prometheus **process collector**,
   deliberately independent of `--metrics-bind` so it still answers over `--url` against a remote
   host with neither the metrics endpoint nor `/proc` access enabled; `None`, never a fabricated `0`,

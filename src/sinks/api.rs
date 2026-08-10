@@ -776,13 +776,13 @@ fn status(state: &ApiState) -> Response {
     }))
 }
 
-/// Max distinct symbol prefixes reported per channel in [`channel_symbol_prefixes`].
+/// Max distinct symbol prefixes **sent** per channel in [`channel_symbol_prefixes`] — the true
+/// count of distinct prefixes is reported regardless, as `symbol_prefixes_total`.
 ///
 /// Small and deliberately so: this list exists to let an operator recognise a channel by eye, not
 /// to dump its catalog — a handful of example tickers (`KXNFLGAME`, `KXNFLSPREAD`, ...) already
 /// answers "which channel is this", and a busy channel's full prefix set would otherwise balloon
-/// the response across up to 31 channels in one row. A channel with more distinct prefixes than
-/// this is marked `symbol_prefixes_truncated` rather than silently cut (see [`channel_symbol_prefixes`]).
+/// the response across up to 31 channels in one row.
 const MAX_SYMBOL_PREFIXES: usize = 8;
 
 /// The portion of `symbol` before its first `-`, or the whole symbol when there is none. An empty
@@ -796,41 +796,62 @@ fn symbol_prefix(symbol: &str) -> Option<&str> {
     }
 }
 
-/// Distinct symbol prefixes seen per `(venue, category, channel)`, derived from the live
-/// instrument catalog in **one linear pass** — the same grain `history::products_for` counts at, so
-/// two disjoint universes sharing a channel id (see `ingest/feeds.rs`'s sports/perps docs) never
-/// leak prefixes into each other's list. Costs one lock acquisition plus one pass over every
-/// `InstrumentSnapshot` entry — a symbol split and a small `BTreeSet` insert per instrument, so on a
-/// catalog of ~38,000 instruments this is ~38,000 cheap operations (microseconds), not per-channel
-/// work: the whole `channels` block does this scan once regardless of how many channels a row lists,
-/// rather than once per channel.
+/// Symbol prefixes seen per `(venue, category, channel)`, ranked by how many instruments carry
+/// each one — derived from the live instrument catalog in **one linear pass** — the same grain
+/// `history::products_for` counts at, so two disjoint universes sharing a channel id (see
+/// `ingest/feeds.rs`'s sports/perps docs) never leak prefixes into each other's list. Costs one
+/// lock acquisition plus one pass over every `InstrumentSnapshot` entry — a symbol split and a
+/// small per-channel `HashMap<String, usize>` counter bump per instrument, so on a catalog of
+/// ~38,000 instruments this is ~38,000 cheap operations (microseconds), not per-channel work: the
+/// whole `channels` block does this scan once regardless of how many channels a row lists, rather
+/// than once per channel.
 ///
-/// The `BTreeSet` gives the sorted, deduped order [`channels_block`] needs for determinism, and lets
-/// the cap plus the truncation flag fall out of one comparison per channel rather than a second sort.
+/// **Ranked by frequency, not alphabetically.** The column exists to answer "what is this
+/// channel?", and the most-instrument-carrying prefix is the answer — alphabetical order instead
+/// left a channel's dominant prefix unreported whenever it happened to sort past the cap while
+/// incidental ones didn't. Ties break alphabetically so the output is deterministic. Sorting is
+/// over each channel's own (typically small) distinct-prefix set, not a second pass over the
+/// catalog, so the "one linear pass" cost above is unaffected.
 ///
 /// Keyed exactly as `history::products_for` scopes its count (`(venue, category, channel)`) — named
-/// so clippy's `type_complexity` lint doesn't flag the bare tuple type at every use site.
-type ChannelPrefixes = HashMap<(Arc<str>, Arc<str>, u32), (Vec<String>, bool)>;
+/// so clippy's `type_complexity` lint doesn't flag the bare tuple type at every use site. The
+/// second element of the value is the true **distinct** prefix count, not the sent (possibly
+/// capped) list's length — see `symbol_prefixes_total` on [`channels_block`].
+type ChannelPrefixes = HashMap<(Arc<str>, Arc<str>, u32), (Vec<String>, usize)>;
+
+/// Per-channel prefix -> instrument-count accumulator, keyed the same way as [`ChannelPrefixes`]
+/// — named for the same `type_complexity` reason.
+type PrefixCounts = HashMap<(Arc<str>, Arc<str>, u32), HashMap<String, usize>>;
 
 fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
-    let mut acc: HashMap<(Arc<str>, Arc<str>, u32), std::collections::BTreeSet<String>> =
-        HashMap::new();
+    let mut acc: PrefixCounts = HashMap::new();
     {
         let map = crate::model::lock(&state.instruments);
         for inst in map.values() {
             let Some(prefix) = symbol_prefix(&inst.symbol) else {
                 continue;
             };
-            acc.entry((inst.venue.clone(), inst.category.clone(), inst.channel))
+            *acc.entry((inst.venue.clone(), inst.category.clone(), inst.channel))
                 .or_default()
-                .insert(prefix.to_string());
+                .entry(prefix.to_string())
+                .or_insert(0) += 1;
         }
     }
     acc.into_iter()
-        .map(|(key, set)| {
-            let truncated = set.len() > MAX_SYMBOL_PREFIXES;
-            let prefixes = set.into_iter().take(MAX_SYMBOL_PREFIXES).collect();
-            (key, (prefixes, truncated))
+        .map(|(key, counts)| {
+            let total = counts.len();
+            let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+            // Most instruments first; alphabetical tiebreak for determinism when two prefixes tie
+            // on count.
+            ranked.sort_by(|(name_a, count_a), (name_b, count_b)| {
+                count_b.cmp(count_a).then_with(|| name_a.cmp(name_b))
+            });
+            let prefixes = ranked
+                .into_iter()
+                .take(MAX_SYMBOL_PREFIXES)
+                .map(|(name, _count)| name)
+                .collect();
+            (key, (prefixes, total))
         })
         .collect()
 }
@@ -896,14 +917,12 @@ fn channels_block(state: &ApiState) -> Value {
             if let Some(label) = p.label {
                 entry["label"] = json!(label);
             }
-            if let Some((names, truncated)) =
+            if let Some((names, total)) =
                 prefixes.get(&(venue.clone(), category.clone(), channel as u32))
             {
                 if !names.is_empty() {
                     entry["symbol_prefixes"] = json!(names);
-                    if *truncated {
-                        entry["symbol_prefixes_truncated"] = json!(true);
-                    }
+                    entry["symbol_prefixes_total"] = json!(total);
                 }
             }
             channels.push(entry);
@@ -2895,36 +2914,60 @@ mod tests {
         );
     }
 
-    /// The server-side cap: a channel with more distinct prefixes than the cap must be truncated
-    /// **visibly** (`symbol_prefixes_truncated: true`), never silently cut; a channel at or under the
-    /// cap must carry no such field at all. Both directions in one fixture so neither can pass by
-    /// the marker always being present or always being absent.
+    /// **The bug this replaced.** Alphabetical order and frequency order genuinely disagree here:
+    /// `ZZZDOMINANT` carries by far the most instruments (50) but sorts alphabetically *last*,
+    /// past the 8-slot cap, while eight incidental one-instrument prefixes (`A0`..`A7`) sort
+    /// first. The old alphabetical-then-cap implementation would report `A0`..`A7` and never
+    /// mention `ZZZDOMINANT` at all — exactly the live-host failure this fix exists for (a
+    /// channel's dominant prefix silently unreported because it sorts past the cap). Ranked by
+    /// frequency, `ZZZDOMINANT` must lead, and the ties among the eight singletons resolve
+    /// alphabetically so the remaining slots are deterministic. Asserted on the exact resulting
+    /// order by value — a fixture where the most common prefix also sorted first could not fail
+    /// against the old implementation, which is the whole bug.
     #[tokio::test]
-    async fn channels_block_symbol_prefixes_truncation_is_visible_in_both_directions() {
+    async fn channels_block_symbol_prefixes_are_ranked_by_frequency_not_alphabetically() {
         let (instruments, depth, books, history, health, filter, _enabled) = empty_state();
         {
             let mut map = instruments.lock().unwrap();
-            // Channel 20: ten distinct prefixes, one past the cap of eight.
-            for i in 0..10u32 {
+            // The dominant prefix: 50 instruments, sorts alphabetically last.
+            for i in 0..50u32 {
                 map.insert(
                     ("KALSHI".into(), "perps".into(), 20u32, i),
-                    inst_in("perps", 3, "KALSHI", &format!("P{i}-X"), 20, i, -4, -2),
+                    inst_in(
+                        "perps",
+                        3,
+                        "KALSHI",
+                        &format!("ZZZDOMINANT-{i}"),
+                        20,
+                        i,
+                        -4,
+                        -2,
+                    ),
                 );
             }
-            // Channel 21: three distinct prefixes, under the cap.
-            for i in 0..3u32 {
+            // Eight incidental prefixes, one instrument each, all sorting alphabetically before
+            // the dominant one.
+            for i in 0..8u32 {
                 map.insert(
-                    ("KALSHI".into(), "perps".into(), 21u32, i),
-                    inst_in("perps", 3, "KALSHI", &format!("Q{i}-X"), 21, i, -4, -2),
+                    ("KALSHI".into(), "perps".into(), 20u32, 100 + i),
+                    inst_in(
+                        "perps",
+                        3,
+                        "KALSHI",
+                        &format!("A{i}-X"),
+                        20,
+                        100 + i,
+                        -4,
+                        -2,
+                    ),
                 );
             }
         }
-        let publishers: Vec<FeedPublisher> =
-            vec![channel_pub(39400, 20, None), channel_pub(39401, 21, None)];
+        let publishers: Vec<FeedPublisher> = vec![channel_pub(39400, 20, None)];
         let row = Feed {
             venue: "KALSHI",
             category: "perps",
-            code: "trunctest",
+            code: "freqtest",
             kind: FeedKind::MarketByPrice,
             group: std::net::Ipv4Addr::new(233, 84, 178, 213),
             publishers: Box::leak(publishers.into_boxed_slice()),
@@ -2937,34 +2980,73 @@ mod tests {
         let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
-        let channels = body["channels"]["rows"][0]["channels"].as_array().unwrap();
-        let find = |id: u64| -> &Value {
-            channels
-                .iter()
-                .find(|c| c["channel"] == id)
-                .unwrap_or_else(|| panic!("no channel {id} in {channels:?}"))
-        };
+        let channel = &body["channels"]["rows"][0]["channels"][0];
 
-        let capped = find(20);
+        let sent: Vec<String> = channel["symbol_prefixes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
-            capped["symbol_prefixes"].as_array().unwrap().len(),
-            8,
-            "the list itself must respect the cap: {capped}"
-        );
-        assert_eq!(
-            capped["symbol_prefixes_truncated"], true,
-            "ten distinct prefixes capped to eight must be marked truncated: {capped}"
+            sent,
+            vec!["ZZZDOMINANT", "A0", "A1", "A2", "A3", "A4", "A5", "A6"],
+            "the dominant prefix must lead, and the equal-count ties must break alphabetically: \
+             {channel}"
         );
 
-        let uncapped = find(21);
+        // The distinct count (9), never the instrument count (58 = 50 + 8) and never the sent
+        // list's length (8) — this must exceed the sent list precisely because one prefix (A7)
+        // was capped out.
         assert_eq!(
-            uncapped["symbol_prefixes"].as_array().unwrap().len(),
-            3,
-            "{uncapped}"
+            channel["symbol_prefixes_total"], 9,
+            "total must be the distinct prefix count, not instruments or the sent length: {channel}"
         );
         assert!(
-            uncapped.get("symbol_prefixes_truncated").is_none(),
-            "a channel under the cap must carry no truncation marker at all: {uncapped}"
+            channel["symbol_prefixes_total"].as_u64().unwrap() > sent.len() as u64,
+            "the total must exceed the sent list once it was capped: {channel}"
         );
+    }
+
+    /// A channel at or under the cap still reports `symbol_prefixes_total` (reported
+    /// unconditionally, per the field's docs) — and here it equals the sent list's own length,
+    /// since nothing was capped away.
+    #[tokio::test]
+    async fn channels_block_symbol_prefixes_total_matches_the_sent_list_when_not_capped() {
+        let (instruments, depth, books, history, health, filter, _enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            for i in 0..3u32 {
+                map.insert(
+                    ("KALSHI".into(), "perps".into(), 21u32, i),
+                    inst_in("perps", 3, "KALSHI", &format!("Q{i}-X"), 21, i, -4, -2),
+                );
+            }
+        }
+        let publishers: Vec<FeedPublisher> = vec![channel_pub(39401, 21, None)];
+        let row = Feed {
+            venue: "KALSHI",
+            category: "perps",
+            code: "notcappedtest",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 214),
+            publishers: Box::leak(publishers.into_boxed_slice()),
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let enabled = vec![row];
+
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let channel = &body["channels"]["rows"][0]["channels"][0];
+
+        assert_eq!(
+            channel["symbol_prefixes"].as_array().unwrap().len(),
+            3,
+            "{channel}"
+        );
+        assert_eq!(channel["symbol_prefixes_total"], 3, "{channel}");
     }
 }
