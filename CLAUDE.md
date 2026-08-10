@@ -178,8 +178,14 @@ Modules are grouped by role under `src/`:
   claiming the tape) are exactly that case. Both groups are **live and activated** (testnet and
   mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
   that does not match its live group fails **silently** — no warning, no failed bind, just a
-  permanently-zero `dz_receiver_up`; `feeds::tests::lashay_rows_match_the_deployment` pins both rows
-  against the deployment so a transcription slip fails the build instead. A third **Lashay** row
+  permanently-zero `dz_receiver_up`. ⚠️ **No test can catch that**, and one used to claim it did:
+  `feeds::tests::the_lashay_rows_expand_consistently_with_the_document` (formerly named
+  `..._match_the_deployment`) asserts the document against literals written beside it — the code
+  agreeing with itself. It catches a later edit that moves a value, never a value that was wrong when
+  written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
+  sibling row's block, with the build green throughout. **The external check is a packet capture**, and
+  the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
+  port moves. A third **Lashay** row
   (`lashay-4`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'

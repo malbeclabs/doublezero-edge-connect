@@ -213,6 +213,15 @@ pub struct ChannelEntry {
     /// or filtering — display only.
     #[serde(default)]
     pub symbol_prefixes: Vec<String>,
+    /// True when the server capped `symbol_prefixes` and there were more it did not send. The
+    /// server omits the key entirely when it sent everything, so the default is the honest one.
+    ///
+    /// Without this, a capped list is indistinguishable from a complete one and the `+N more`
+    /// marker below states a total that is really a **lower bound** — a channel with twenty
+    /// prefixes would render as eight. The whole point of the server's cap is that a client can
+    /// tell; dropping the flag on the floor gives up exactly that.
+    #[serde(default)]
+    pub symbol_prefixes_truncated: bool,
 }
 
 /// How many symbol prefixes [`ChannelEntry::display_name`] shows before eliding the rest with a
@@ -233,13 +242,20 @@ impl ChannelEntry {
             }
         }
         if !self.symbol_prefixes.is_empty() {
-            return render_symbol_prefixes(&self.symbol_prefixes);
+            return render_symbol_prefixes(&self.symbol_prefixes, self.symbol_prefixes_truncated);
         }
         self.channel.to_string()
     }
 }
 
-fn render_symbol_prefixes(prefixes: &[String]) -> String {
+/// Render the prefix list for a human, eliding the tail with a count.
+///
+/// `server_capped` says the list itself is incomplete — the server had more prefixes than it was
+/// willing to send. When that holds, the elided count is a **lower bound**, so it is marked
+/// `+N more (capped)` rather than stated as a total. A reader must be able to tell "three of eight"
+/// from "three of at least eight"; those are different facts about how wide a channel is, and that
+/// is the question this column exists to answer.
+fn render_symbol_prefixes(prefixes: &[String], server_capped: bool) -> String {
     let shown: Vec<&str> = prefixes
         .iter()
         .take(MAX_PREFIXES_SHOWN)
@@ -247,8 +263,11 @@ fn render_symbol_prefixes(prefixes: &[String]) -> String {
         .collect();
     let mut out = shown.join(", ");
     let remaining = prefixes.len().saturating_sub(MAX_PREFIXES_SHOWN);
-    if remaining > 0 {
-        out.push_str(&format!(" +{remaining} more"));
+    match (remaining, server_capped) {
+        (0, false) => {}
+        (0, true) => out.push_str(" (capped)"),
+        (n, false) => out.push_str(&format!(" +{n} more")),
+        (n, true) => out.push_str(&format!(" +{n} more (capped)")),
     }
     out
 }
@@ -380,5 +399,54 @@ mod tests {
                 "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
         );
         assert_eq!(c.display_name(), "A, B, C +2 more");
+    }
+
+    /// The server caps the prefix list and says so. Without surfacing that, `+N more` states a
+    /// total when it is only a lower bound — a channel with twenty prefixes reads as five. The
+    /// pair below is the point: the SAME list renders differently depending on the flag, so a
+    /// renderer that ignores the flag cannot pass both.
+    #[test]
+    fn a_server_capped_prefix_list_is_marked_as_a_lower_bound() {
+        let capped = channel_entry(
+            r#"{"channel": 21, "floor_admits": true, "bound": true, "products": 5,
+                "symbol_prefixes": ["A", "B", "C", "D", "E"],
+                "symbol_prefixes_truncated": true}"#,
+        );
+        assert_eq!(capped.display_name(), "A, B, C +2 more (capped)");
+
+        let complete = channel_entry(
+            r#"{"channel": 21, "floor_admits": true, "bound": true, "products": 5,
+                "symbol_prefixes": ["A", "B", "C", "D", "E"]}"#,
+        );
+        assert_eq!(complete.display_name(), "A, B, C +2 more");
+        assert_ne!(
+            capped.display_name(),
+            complete.display_name(),
+            "a capped list must not render identically to a complete one"
+        );
+    }
+
+    /// A capped list short enough to show whole still has a tail the server withheld, so the
+    /// marker must appear even with nothing elided locally. This is the case a `remaining > 0`
+    /// guard silently loses.
+    #[test]
+    fn a_short_capped_prefix_list_is_still_marked() {
+        let c = channel_entry(
+            r#"{"channel": 22, "floor_admits": true, "bound": true, "products": 5,
+                "symbol_prefixes": ["A", "B"], "symbol_prefixes_truncated": true}"#,
+        );
+        assert_eq!(c.display_name(), "A, B (capped)");
+    }
+
+    /// The flag defaults to "not capped" when the server omits it — which is what an older or
+    /// complete-list server sends, and must not read as capped.
+    #[test]
+    fn an_absent_truncation_flag_means_the_list_is_complete() {
+        let c = channel_entry(
+            r#"{"channel": 23, "floor_admits": true, "bound": true, "products": 1,
+                "symbol_prefixes": ["A"]}"#,
+        );
+        assert!(!c.symbol_prefixes_truncated);
+        assert_eq!(c.display_name(), "A");
     }
 }

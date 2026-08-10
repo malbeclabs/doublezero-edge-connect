@@ -821,10 +821,22 @@ fn roster_entries(
                 listed += 1;
                 merged
                     .entry(*id)
-                    .and_modify(|existing| {
-                        if existing.is_none() {
-                            existing.clone_from(label);
-                        }
+                    .and_modify(|existing| match (existing.as_deref(), label.as_deref()) {
+                        // Two labels for one id: the roster disagrees with itself about what this
+                        // channel is called. Keeping the first silently would show an operator a
+                        // name the document does not unambiguously assign — and the duplicate-id
+                        // case already warns, so saying nothing here is the inconsistent choice.
+                        // Not fatal: a label is display-only and never resolves anything, so a
+                        // conflict must not cost the fleet a feed.
+                        (Some(kept), Some(dropped)) if kept != dropped => warn!(
+                            venue = %row.venue,
+                            channel = id,
+                            kept,
+                            dropped,
+                            "registry: channel id listed twice with different labels; keeping the first"
+                        ),
+                        (None, Some(_)) => existing.clone_from(label),
+                        _ => {}
                     })
                     .or_insert_with(|| label.clone());
             }

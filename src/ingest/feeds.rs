@@ -602,7 +602,7 @@ mod tests {
     ///
     /// Scoped **per row**, not per venue: Lashay's two rows legitimately use different schemes, and
     /// framing it by scheme rather than by a venue carve-out is what keeps `lashay-3`/`lashay-4` from
-    /// re-tripping it. Lashay's exact blocks are pinned by `lashay_rows_match_the_deployment`, so
+    /// re-tripping it. Lashay's exact blocks are pinned by `the_lashay_rows_expand_consistently_with_the_document`, so
     /// widening this one loses nothing.
     #[test]
     fn publisher_blocks_use_a_known_layout() {
@@ -634,12 +634,26 @@ mod tests {
         }
     }
 
-    /// Both Lashay groups are live (testnet and mainnet, 2026-08-07), so a wrong value here activates
-    /// nothing and says nothing: `doublezero status` reports no matching code, the reconciler never
-    /// spawns the receiver, and the only symptom is a permanently-zero `dz_receiver_up`. Pin the
-    /// deployment exactly so a transcription slip fails the build instead.
+    /// ⚠️ **This test does NOT verify the deployment, and its previous name claimed it did.** It
+    /// asserts the built-in document against literals written beside it — the code agreeing with
+    /// itself. It catches a *later* edit that moves a value; it cannot catch a value that was wrong
+    /// when it was written, because both sides come from the same transcription.
+    ///
+    /// That distinction is not theoretical. On 2026-08-09 **all three** rows in this registry were
+    /// found provisioned on ports no publisher sends to — each authored one lane off, carrying a
+    /// sibling row's ports — and this test passed throughout, green, under its old name and its old
+    /// claim. Two of the three errors predated the branch entirely.
+    ///
+    /// A wrong value here activates nothing and says nothing: `doublezero status` reports no
+    /// matching code, or the socket binds and stays silent, and the only symptom is a permanently
+    /// zero `dz_receiver_up` — indistinguishable from a quiet publisher.
+    ///
+    /// **The external check is a packet capture**, and the procedure is recorded in the
+    /// `PORT PROVENANCE` block in `registry.json`. Run it when a row is added or a port moves. A
+    /// unit test cannot reach the wire, so this one is deliberately modest about what it pins:
+    /// document → expansion consistency, nothing more.
     #[test]
-    fn lashay_rows_match_the_deployment() {
+    fn the_lashay_rows_expand_consistently_with_the_document() {
         // Scoped by category as well as kind: the venue now carries two market-by-price rows on
         // disjoint universes, so `find` on the kind alone would silently pick whichever the
         // document happens to list first.
