@@ -637,8 +637,8 @@ mod tests {
         assert_eq!(tob.code, "lashay-1");
         assert_eq!(tob.group, Ipv4Addr::new(233, 84, 178, 3));
         assert_eq!(tob.publishers.len(), 1);
-        assert_eq!(tob.publishers[0].ports.mktdata(), 7576);
-        assert_eq!(tob.publishers[0].ports.refdata(), 7577);
+        assert_eq!(tob.publishers[0].ports.mktdata(), 31000);
+        assert_eq!(tob.publishers[0].ports.refdata(), 41000);
         assert_eq!(tob.publishers[0].ports.snapshot(), None);
 
         let mbp = row(FeedKind::MarketByPrice).expect("Lashay market-by-price row");
