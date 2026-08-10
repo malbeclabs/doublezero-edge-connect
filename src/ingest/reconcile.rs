@@ -943,6 +943,7 @@ mod tests {
                     refdata: 9102,
                 },
                 channel: None,
+                label: None,
             },
             FeedPublisher {
                 ports: FeedPorts::TwoPort {
@@ -950,6 +951,7 @@ mod tests {
                     refdata: 9202,
                 },
                 channel: None,
+                label: None,
             },
         ];
         let feed = test_feed(PUBS);
@@ -1173,6 +1175,7 @@ mod tests {
                 refdata: 7577,
             },
             channel: None,
+            label: None,
         }];
         static MBP_PUB: &[FeedPublisher] = &[FeedPublisher {
             ports: FeedPorts::ThreePort {
@@ -1181,6 +1184,7 @@ mod tests {
                 snapshot: 51000,
             },
             channel: None,
+            label: None,
         }];
         // A venue label used by no other test, so the counter delta below is this test's alone.
         let venue = "TapeFlipVenue";
@@ -1441,6 +1445,7 @@ mod tests {
                 snapshot: 53020,
             },
             channel: Some(20),
+            label: None,
         }];
         static PUB_B: &[FeedPublisher] = &[FeedPublisher {
             ports: FeedPorts::ThreePort {
@@ -1449,6 +1454,7 @@ mod tests {
                 snapshot: 53021,
             },
             channel: Some(20), // same channel id as PUB_A — only the venue/row differs
+            label: None,
         }];
         let feed_a = Feed {
             venue: "HYPERLIQUID", // source_id 1
@@ -1543,6 +1549,7 @@ mod tests {
                 snapshot: 53030,
             },
             channel: Some(10),
+            label: None,
         }];
         static PUB_SPORTS: &[FeedPublisher] = &[FeedPublisher {
             ports: FeedPorts::ThreePort {
@@ -1551,6 +1558,7 @@ mod tests {
                 snapshot: 53031,
             },
             channel: Some(10), // same channel id as PUB_PERPS — only the category differs
+            label: None,
         }];
         let feed_perps = Feed {
             venue: "KALSHI",

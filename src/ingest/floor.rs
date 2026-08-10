@@ -461,6 +461,7 @@ mod tests {
                     snapshot: 53000 + u16::from(id),
                 },
                 channel: Some(id),
+                label: None,
             })
             .collect();
         row(code, category, Box::leak(pubs.into_boxed_slice()))
@@ -474,6 +475,7 @@ mod tests {
                 refdata: 7577,
             },
             channel: None,
+            label: None,
         }];
         row(code, category, PUBS)
     }

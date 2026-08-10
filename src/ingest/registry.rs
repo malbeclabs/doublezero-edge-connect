@@ -346,13 +346,38 @@ struct Derived {
     unknown: Unknown,
 }
 
+/// One entry of a `derived.channels` roster: either an inclusive `[lo, hi]` span, or a single
+/// channel id optionally carrying a display `label`.
+///
+/// **Untagged, not the externally-tagged form the rest of this module uses**, and deliberately so:
+/// the labelled shape (`{"id": 10, "label": "sports.nfl"}`) needs `label` as a sibling of the tag
+/// key itself, which the single-field externally-tagged representation cannot express. Trying each
+/// variant in order is unambiguous here — `Range` requires a `range` field `Id` does not have, and
+/// vice versa.
+///
+/// A `label` is deliberately **not a field of `Range`**: a range names many channels, not one, so
+/// there is no single channel a range-level label could describe. That is enforced structurally
+/// rather than by a runtime check — `Range` has no `label` field to populate, so a document that
+/// writes one on a range falls into `unknown` and is warned about like any other unrecognised key
+/// (see [`report_unknown_keys`]), never applied and never fatal.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 enum ChannelSpec {
-    /// An inclusive `[lo, hi]` span.
-    Range([u8; 2]),
-    /// A single channel id.
-    Id(u8),
+    Range {
+        range: [u8; 2],
+        #[serde(flatten)]
+        unknown: Unknown,
+    },
+    Id {
+        id: u8,
+        /// A short human label for this one channel (e.g. `"sports.nfl"`), owned by the upstream
+        /// deployment inventory. Display-only downstream (see [`crate::ingest::feeds::FeedPublisher::label`])
+        /// — never read for lookup, matching or identity here either.
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(flatten)]
+        unknown: Unknown,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +541,15 @@ fn report_unknown_keys(doc: &Document) {
             Publishers::Derived(d) => {
                 warn_unknown(&format!("{at}.publishers.derived"), &d.unknown);
                 warn_unknown(&format!("{at}.publishers.derived.ports"), &d.ports.unknown);
+                for (k, spec) in d.channels.iter().enumerate() {
+                    let at = format!("{at}.publishers.derived.channels[{k}]");
+                    match spec {
+                        // Also where a `label` written on a `range` entry is caught: `Range` has no
+                        // `label` field, so it lands here and is reported, never applied.
+                        ChannelSpec::Range { unknown, .. } => warn_unknown(&at, unknown),
+                        ChannelSpec::Id { unknown, .. } => warn_unknown(&at, unknown),
+                    }
+                }
             }
         }
     }
@@ -683,6 +717,7 @@ fn block_to_publisher(b: &PortBlock) -> FeedPublisher {
     FeedPublisher {
         ports: ports(b.mktdata, b.refdata, b.snapshot),
         channel: None,
+        label: None,
     }
 }
 
@@ -705,10 +740,12 @@ fn ports(mktdata: u16, refdata: u16, snapshot: Option<u16>) -> FeedPorts {
 /// is the arithmetic the publisher itself asserts; a subscriber that computes it differently joins
 /// the right group and hears silence.
 fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryError> {
-    let ids = roster_ids(row, &d.channels)?;
+    let entries = roster_entries(row, &d.channels)?;
     let p = &d.ports;
-    ids.iter()
-        .map(|&id| {
+    entries
+        .iter()
+        .map(|e| {
+            let id = e.id;
             let off = u16::from(id);
             let plane = |base: u16| {
                 base.checked_add(off).ok_or(RegistryError::PortOverflow {
@@ -727,23 +764,46 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
                 // are both in hand, and it is what lets the ingest floor decline a channel by
                 // never binding its socket (see `ingest::floor`).
                 channel: Some(id),
+                // Leaked alongside every other `'static` field this row produces (see `leak`);
+                // display-only downstream, never a lookup key.
+                label: e.label.as_deref().map(leak),
             })
         })
         .collect()
 }
 
-/// Flatten ranges and singletons into a deduped, ascending id list.
+/// One resolved roster id, with its label if the document supplied one (always `None` for an id
+/// that came from a `range` — see [`ChannelSpec`]).
+struct RosterEntry {
+    id: u8,
+    label: Option<String>,
+}
+
+/// Flatten ranges and singletons into a deduped, ascending list of ids with their labels.
 ///
 /// Deduped rather than rejected on repeat: the same id reaching the expander twice would produce two
 /// publishers on one port block, and the roster is a human-edited list where a singleton overlapping
 /// a range is a plausible edit, not a corrupt document. The dedup is **reported** rather than
 /// swallowed — silently accepting it would hide the one case where it is not benign, an author who
 /// wrote the id twice meaning two different channels and got one.
-fn roster_ids(row: &FeedRow, channels: &[ChannelSpec]) -> Result<Vec<u8>, RegistryError> {
-    let mut ids = Vec::new();
+///
+/// A duplicate keeps whichever label was supplied first (a range's `None` never overrides a
+/// singleton's label seen earlier or later for the same id) — dedup is about the id, not about
+/// picking a winning label, and the ordering is document order via a stable merge rather than an
+/// artifact of sort order.
+fn roster_entries(
+    row: &FeedRow,
+    channels: &[ChannelSpec],
+) -> Result<Vec<RosterEntry>, RegistryError> {
+    let mut merged: std::collections::BTreeMap<u8, Option<String>> =
+        std::collections::BTreeMap::new();
+    let mut listed = 0usize;
     for spec in channels {
-        match *spec {
-            ChannelSpec::Range([lo, hi]) => {
+        match spec {
+            ChannelSpec::Range {
+                range: [lo, hi], ..
+            } => {
+                let (lo, hi) = (*lo, *hi);
                 if lo > hi {
                     return Err(RegistryError::BadRange {
                         venue: row.venue.clone(),
@@ -751,30 +811,44 @@ fn roster_ids(row: &FeedRow, channels: &[ChannelSpec]) -> Result<Vec<u8>, Regist
                         hi,
                     });
                 }
-                ids.extend(lo..=hi);
+                for id in lo..=hi {
+                    listed += 1;
+                    merged.entry(id).or_insert(None);
+                }
             }
-            ChannelSpec::Id(id) => ids.push(id),
+            ChannelSpec::Id { id, label, .. } => {
+                listed += 1;
+                merged
+                    .entry(*id)
+                    .and_modify(|existing| {
+                        if existing.is_none() {
+                            existing.clone_from(label);
+                        }
+                    })
+                    .or_insert_with(|| label.clone());
+            }
         }
     }
-    ids.sort_unstable();
-    let listed = ids.len();
-    ids.dedup();
-    if ids.len() != listed {
+    let distinct = merged.len();
+    if distinct != listed {
         warn!(
             venue = row.venue,
             category = row.category,
             listed,
-            distinct = ids.len(),
+            distinct,
             "feed registry: channel roster repeats ids; the duplicates were collapsed"
         );
     }
-    if ids.is_empty() {
+    if merged.is_empty() {
         return Err(RegistryError::EmptyRoster {
             venue: row.venue.clone(),
             category: row.category.clone(),
         });
     }
-    Ok(ids)
+    Ok(merged
+        .into_iter()
+        .map(|(id, label)| RosterEntry { id, label })
+        .collect())
 }
 
 /// Leak one document string into `'static`. Runs once per field at startup over a handful of rows.
@@ -795,7 +869,11 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
         .find(|f| f.category == "sports")
         .expect("built-in document has no sports row");
     match &row.publishers {
-        Publishers::Derived(d) => roster_ids(row, &d.channels).expect("sports roster"),
+        Publishers::Derived(d) => roster_entries(row, &d.channels)
+            .expect("sports roster")
+            .into_iter()
+            .map(|e| e.id)
+            .collect(),
         Publishers::Explicit(_) => panic!("the sports row must carry a derived roster"),
     }
 }
@@ -1108,6 +1186,57 @@ mod tests {
         let row = SPORTS_ROW.replace(r#"{"id":49}"#, r#"{"id":11}"#);
         let loaded = build(&doc_with(&row), "test").unwrap();
         assert_eq!(loaded.rows[0].publishers.len(), 3);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Channel labels
+    // ---------------------------------------------------------------------------------------
+
+    /// A single-channel roster entry may carry a `label`; a sibling entry with none must report the
+    /// field **absent**, not `null` — the field is display-only and its absence is the normal case
+    /// (the built-in document ships with none at all), so a spurious `null` would be a regression a
+    /// bare "no error" check could not catch.
+    #[test]
+    fn a_channel_label_is_carried_and_an_unlabelled_sibling_has_none() {
+        let row = SPORTS_ROW.replace(r#"{"id":49}"#, r#"{"id":49,"label":"sports.catchall"}"#);
+        let loaded = build(&doc_with(&row), "test").unwrap();
+        let by_channel = |id: u8| {
+            loaded.rows[0]
+                .publishers
+                .iter()
+                .find(|p| p.channel == Some(id))
+                .unwrap_or_else(|| panic!("no publisher for channel {id}"))
+        };
+        assert_eq!(by_channel(49).label, Some("sports.catchall"));
+        assert_eq!(
+            by_channel(10).label,
+            None,
+            "an unlabelled roster entry must carry no label, not an empty one"
+        );
+    }
+
+    /// A `range` entry names many channels, not one, so it may never carry a `label`. Enforced
+    /// structurally (only the single-id shape has the field), so a document that writes one on a
+    /// range degrades to an ignored, warned-about unknown key rather than mislabelling — or worse,
+    /// rejecting — the whole span.
+    #[test]
+    fn a_label_on_a_range_entry_is_ignored_not_applied() {
+        let row = SPORTS_ROW.replace(
+            r#"{"range":[10,12]}"#,
+            r#"{"range":[10,12],"label":"should-never-apply"}"#,
+        );
+        let loaded = build(&doc_with(&row), "test").expect("an extra key must not be fatal");
+        for id in [10u8, 11, 12] {
+            let p = loaded.rows[0]
+                .publishers
+                .iter()
+                .find(|p| p.channel == Some(id))
+                .unwrap_or_else(|| panic!("no publisher for channel {id}"));
+            assert_eq!(
+                p.label, None,
+                "a range's label must never be applied to its channels: channel {id}"
+            );
+        }
     }
 
     #[test]

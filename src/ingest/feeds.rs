@@ -132,6 +132,19 @@ pub struct FeedPublisher {
     /// and re-deriving it (by, say, taking the minimum base port) would mint a channel id for a flat
     /// row too — turning the coincidence above into a guarantee of being wrong.
     pub channel: Option<u8>,
+    /// A short human label for this channel (e.g. `"sports.nfl"`), carried verbatim from the
+    /// document's `derived.channels` roster when that entry supplied one. `None` for every publisher
+    /// today: the built-in document ships with no labels (the upstream inventory that owns them is
+    /// still being made reachable at runtime), and an `explicit` block has no channel concept to
+    /// label at all.
+    ///
+    /// **Display only.** It is never used for lookup, matching or identity — the channel **id** is
+    /// the only contract — and it is not accepted anywhere a channel id is expected. A `range` roster
+    /// entry may never carry one (a range names many channels, not one), which the schema enforces
+    /// structurally: only the single-id roster shape has a `label` field at all, so a `label`
+    /// written on a `range` entry lands in that entry's unknown-keys map and is warned about like any
+    /// other unrecognised key, never applied.
+    pub label: Option<&'static str>,
 }
 
 impl FeedPublisher {

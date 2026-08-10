@@ -776,6 +776,65 @@ fn status(state: &ApiState) -> Response {
     }))
 }
 
+/// Max distinct symbol prefixes reported per channel in [`channel_symbol_prefixes`].
+///
+/// Small and deliberately so: this list exists to let an operator recognise a channel by eye, not
+/// to dump its catalog — a handful of example tickers (`KXNFLGAME`, `KXNFLSPREAD`, ...) already
+/// answers "which channel is this", and a busy channel's full prefix set would otherwise balloon
+/// the response across up to 31 channels in one row. A channel with more distinct prefixes than
+/// this is marked `symbol_prefixes_truncated` rather than silently cut (see [`channel_symbol_prefixes`]).
+const MAX_SYMBOL_PREFIXES: usize = 8;
+
+/// The portion of `symbol` before its first `-`, or the whole symbol when there is none. An empty
+/// symbol contributes nothing — there is no prefix to report, and a bound channel with no
+/// reference data yet (a normal startup state) must not fabricate one.
+fn symbol_prefix(symbol: &str) -> Option<&str> {
+    if symbol.is_empty() {
+        None
+    } else {
+        Some(symbol.split('-').next().unwrap_or(symbol))
+    }
+}
+
+/// Distinct symbol prefixes seen per `(venue, category, channel)`, derived from the live
+/// instrument catalog in **one linear pass** — the same grain `history::products_for` counts at, so
+/// two disjoint universes sharing a channel id (see `ingest/feeds.rs`'s sports/perps docs) never
+/// leak prefixes into each other's list. Costs one lock acquisition plus one pass over every
+/// `InstrumentSnapshot` entry — a symbol split and a small `BTreeSet` insert per instrument, so on a
+/// catalog of ~38,000 instruments this is ~38,000 cheap operations (microseconds), not per-channel
+/// work: the whole `channels` block does this scan once regardless of how many channels a row lists,
+/// rather than once per channel.
+///
+/// The `BTreeSet` gives the sorted, deduped order [`channels_block`] needs for determinism, and lets
+/// the cap plus the truncation flag fall out of one comparison per channel rather than a second sort.
+///
+/// Keyed exactly as `history::products_for` scopes its count (`(venue, category, channel)`) — named
+/// so clippy's `type_complexity` lint doesn't flag the bare tuple type at every use site.
+type ChannelPrefixes = HashMap<(Arc<str>, Arc<str>, u32), (Vec<String>, bool)>;
+
+fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
+    let mut acc: HashMap<(Arc<str>, Arc<str>, u32), std::collections::BTreeSet<String>> =
+        HashMap::new();
+    {
+        let map = crate::model::lock(&state.instruments);
+        for inst in map.values() {
+            let Some(prefix) = symbol_prefix(&inst.symbol) else {
+                continue;
+            };
+            acc.entry((inst.venue.clone(), inst.category.clone(), inst.channel))
+                .or_default()
+                .insert(prefix.to_string());
+        }
+    }
+    acc.into_iter()
+        .map(|(key, set)| {
+            let truncated = set.len() > MAX_SYMBOL_PREFIXES;
+            let prefixes = set.into_iter().take(MAX_SYMBOL_PREFIXES).collect();
+            (key, (prefixes, truncated))
+        })
+        .collect()
+}
+
 /// The `channels` block: per enabled row that carries a channel id (i.e. every row except a flat
 /// one — see `ingest::floor`'s docs for why a flat row has no channel concept to narrow), the
 /// row's full channel roster with whether the floor admits it, whether a receiver is genuinely
@@ -789,9 +848,16 @@ fn status(state: &ApiState) -> Response {
 /// socket at all, so its liveness key is naturally never registered, and a channel the floor admits
 /// but whose group is not (yet) subscribed reads `Unregistered`/`Down` here rather than a
 /// false "bound". This is the genuine running state, not the floor's opinion of it.
+///
+/// Each channel also carries `label` (from the registry document, display-only — see
+/// `ingest::feeds::FeedPublisher::label`) when the document supplied one, and `symbol_prefixes`
+/// (derived live from reference data, see [`channel_symbol_prefixes`]) otherwise. Both are omitted
+/// rather than sent empty/null: an operator's tool renders the bare channel id when neither is
+/// present, which is a normal state (no label yet, no reference data yet), not an error.
 fn channels_block(state: &ApiState) -> Value {
     let floor = crate::model::lock(&state.floor).clone();
     let history = crate::model::lock(&state.history);
+    let prefixes = channel_symbol_prefixes(state);
     let mut rows = Vec::new();
     let mut excluded_by_floor = 0usize;
 
@@ -803,6 +869,7 @@ fn channels_block(state: &ApiState) -> Value {
             continue;
         };
         let category = category_arc(f.category);
+        let venue = venue_arc(f.venue);
 
         let mut channels = Vec::new();
         let mut row_excluded = 0usize;
@@ -820,12 +887,26 @@ fn channels_block(state: &ApiState) -> Value {
                 (f.venue, f.category, f.kind, p.base_port());
             let bound = matches!(state.health.liveness(&key), TapeLiveness::Up);
             let products = history.products_for(source_id, &category, channel as u32);
-            channels.push(json!({
+            let mut entry = json!({
                 "channel": channel,
                 "floor_admits": admitted,
                 "bound": bound,
                 "products": products,
-            }));
+            });
+            if let Some(label) = p.label {
+                entry["label"] = json!(label);
+            }
+            if let Some((names, truncated)) =
+                prefixes.get(&(venue.clone(), category.clone(), channel as u32))
+            {
+                if !names.is_empty() {
+                    entry["symbol_prefixes"] = json!(names);
+                    if *truncated {
+                        entry["symbol_prefixes_truncated"] = json!(true);
+                    }
+                }
+            }
+            channels.push(entry);
         }
         if channels.is_empty() {
             // A flat row: nothing per-channel to report.
@@ -985,7 +1066,7 @@ mod tests {
         ingest::{
             arbiter::{Arbiter, SharedArbiter},
             codec_mbp,
-            feeds::FeedKind,
+            feeds::{ArbitrationMode, FeedKind, FeedPorts, FeedPublisher},
             health::FeedHealth,
             processor::MbpProcessor,
             receiver::{FrameCtx, FrameProcessor, PortRole},
@@ -2644,9 +2725,243 @@ mod tests {
             p["resident_memory_bytes"].as_f64().unwrap_or(0.0) > 0.0,
             "a running process must report positive resident memory: {p}"
         );
+        // A bare `is_number()` type check passes even if `process_metric`'s `COUNTER` arm were
+        // hardcoded to `Some(0.0)` — only the `GAUGE` arm above was ever revert-tested. By the time
+        // this test runs the process has executed the harness plus every test ahead of it in this
+        // binary, so its cumulative CPU time is a real, positive sample, not a granularity artifact.
         assert!(
-            p["cpu_seconds_total"].is_number(),
-            "cpu time must be a real sample, not omitted: {p}"
+            p["cpu_seconds_total"].as_f64().unwrap_or(0.0) > 0.0,
+            "cpu time must be a real, nonzero sample, not omitted or hardcoded to zero: {p}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `channels` block: `label` and `symbol_prefixes`
+    // -----------------------------------------------------------------------------------------
+
+    /// One `derived`-shaped publisher for a test `Feed` row, carrying a channel id and (optionally)
+    /// a display label — the server-side counterpart of what `ingest::registry::expand` produces
+    /// from a document roster.
+    fn channel_pub(base: u16, channel: u8, label: Option<&'static str>) -> FeedPublisher {
+        FeedPublisher {
+            ports: FeedPorts::ThreePort {
+                mktdata: base,
+                refdata: base + 10_000,
+                snapshot: base + 20_000,
+            },
+            channel: Some(channel),
+            label,
+        }
+    }
+
+    /// A channel this row's publisher was given a `label` for must report it verbatim; a sibling
+    /// channel with none must have the field **absent** (`get` returns `None`), not present as
+    /// `null` — a client's `#[serde(default)]` only stays honest if the two states are visibly
+    /// different on the wire.
+    #[tokio::test]
+    async fn channels_block_reports_a_label_only_when_the_registry_supplied_one() {
+        let (instruments, depth, books, history, health, floor, _enabled) = empty_state();
+        let publishers: Vec<FeedPublisher> = vec![
+            channel_pub(39100, 10, Some("sports.nfl")),
+            channel_pub(39101, 11, None),
+        ];
+        let row = Feed {
+            venue: "KALSHI",
+            category: "sports",
+            code: "labeltest",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 210),
+            publishers: Box::leak(publishers.into_boxed_slice()),
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let enabled = vec![row];
+
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let channels = body["channels"]["rows"][0]["channels"].as_array().unwrap();
+        let find = |id: u64| -> &Value {
+            channels
+                .iter()
+                .find(|c| c["channel"] == id)
+                .unwrap_or_else(|| panic!("no channel {id} in {channels:?}"))
+        };
+        assert_eq!(find(10)["label"], "sports.nfl");
+        assert!(
+            find(11).get("label").is_none(),
+            "an unlabelled channel must omit the field, not send null: {}",
+            find(11)
+        );
+    }
+
+    /// The grain `symbol_prefixes` must respect: two disjoint universes ("perps", "sports") sharing
+    /// one channel id must each report only their **own** prefixes — never merged, and never the
+    /// other's. Asserted by value (the exact prefix strings), not by count, since a count could not
+    /// distinguish "scoped correctly" from "scoped to the wrong universe but the same size".
+    #[tokio::test]
+    async fn channels_block_symbol_prefixes_are_scoped_to_their_own_category() {
+        let (instruments, depth, books, history, health, floor, _enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 10u32, 1u32),
+                inst_in(
+                    "perps",
+                    3,
+                    "KALSHI",
+                    "KXNFLGAME-26AUG09DETSF",
+                    10,
+                    1,
+                    -4,
+                    -2,
+                ),
+            );
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 10u32, 2u32),
+                inst_in(
+                    "perps",
+                    3,
+                    "KALSHI",
+                    "KXNFLSPREAD-26AUG09DETSF",
+                    10,
+                    2,
+                    -4,
+                    -2,
+                ),
+            );
+            map.insert(
+                ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+                inst_in("sports", 3, "KALSHI", "KXUFC-300", 10, 1, -4, -2),
+            );
+        }
+        let perps_pub: Vec<FeedPublisher> = vec![channel_pub(39200, 10, None)];
+        let sports_pub: Vec<FeedPublisher> = vec![channel_pub(39300, 10, None)];
+        let perps_row = Feed {
+            venue: "KALSHI",
+            category: "perps",
+            code: "prefixtest-perps",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 211),
+            publishers: Box::leak(perps_pub.into_boxed_slice()),
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let sports_row = Feed {
+            venue: "KALSHI",
+            category: "sports",
+            code: "prefixtest-sports",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 212),
+            publishers: Box::leak(sports_pub.into_boxed_slice()),
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let enabled = vec![perps_row, sports_row];
+
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let rows = body["channels"]["rows"].as_array().unwrap();
+        let channel_of = |category: &str| -> &Value {
+            let row = rows
+                .iter()
+                .find(|r| r["category"] == category)
+                .unwrap_or_else(|| panic!("no {category} row in {rows:?}"));
+            row["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["channel"] == 10)
+                .unwrap_or_else(|| panic!("no channel 10 in {row}"))
+        };
+
+        let perps = channel_of("perps")["symbol_prefixes"].clone();
+        assert_eq!(
+            perps,
+            json!(["KXNFLGAME", "KXNFLSPREAD"]),
+            "perps channel 10 must list only perps prefixes: {perps}"
+        );
+        let sports = channel_of("sports")["symbol_prefixes"].clone();
+        assert_eq!(
+            sports,
+            json!(["KXUFC"]),
+            "sports channel 10 must list only its own prefix, never perps': {sports}"
+        );
+    }
+
+    /// The server-side cap: a channel with more distinct prefixes than the cap must be truncated
+    /// **visibly** (`symbol_prefixes_truncated: true`), never silently cut; a channel at or under the
+    /// cap must carry no such field at all. Both directions in one fixture so neither can pass by
+    /// the marker always being present or always being absent.
+    #[tokio::test]
+    async fn channels_block_symbol_prefixes_truncation_is_visible_in_both_directions() {
+        let (instruments, depth, books, history, health, floor, _enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            // Channel 20: ten distinct prefixes, one past the cap of eight.
+            for i in 0..10u32 {
+                map.insert(
+                    ("KALSHI".into(), "perps".into(), 20u32, i),
+                    inst_in("perps", 3, "KALSHI", &format!("P{i}-X"), 20, i, -4, -2),
+                );
+            }
+            // Channel 21: three distinct prefixes, under the cap.
+            for i in 0..3u32 {
+                map.insert(
+                    ("KALSHI".into(), "perps".into(), 21u32, i),
+                    inst_in("perps", 3, "KALSHI", &format!("Q{i}-X"), 21, i, -4, -2),
+                );
+            }
+        }
+        let publishers: Vec<FeedPublisher> =
+            vec![channel_pub(39400, 20, None), channel_pub(39401, 21, None)];
+        let row = Feed {
+            venue: "KALSHI",
+            category: "perps",
+            code: "trunctest",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 213),
+            publishers: Box::leak(publishers.into_boxed_slice()),
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+        };
+        let enabled = vec![row];
+
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let channels = body["channels"]["rows"][0]["channels"].as_array().unwrap();
+        let find = |id: u64| -> &Value {
+            channels
+                .iter()
+                .find(|c| c["channel"] == id)
+                .unwrap_or_else(|| panic!("no channel {id} in {channels:?}"))
+        };
+
+        let capped = find(20);
+        assert_eq!(
+            capped["symbol_prefixes"].as_array().unwrap().len(),
+            8,
+            "the list itself must respect the cap: {capped}"
+        );
+        assert_eq!(
+            capped["symbol_prefixes_truncated"], true,
+            "ten distinct prefixes capped to eight must be marked truncated: {capped}"
+        );
+
+        let uncapped = find(21);
+        assert_eq!(
+            uncapped["symbol_prefixes"].as_array().unwrap().len(),
+            3,
+            "{uncapped}"
+        );
+        assert!(
+            uncapped.get("symbol_prefixes_truncated").is_none(),
+            "a channel under the cap must carry no truncation marker at all: {uncapped}"
         );
     }
 }
