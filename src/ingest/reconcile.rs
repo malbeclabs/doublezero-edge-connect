@@ -689,6 +689,8 @@ impl Reconciler {
                         self.cfg.books.clone(),
                         self.cfg.history.clone(),
                         self.health.clone(),
+                        self.cfg.floor.clone(),
+                        self.cfg.enabled.clone(),
                     )));
                     self.history_feeder = Some(tokio::spawn(feed_history(
                         self.cfg.tx.subscribe(),
@@ -1651,6 +1653,8 @@ mod tests {
             r.cfg.books.clone(),
             r.cfg.history.clone(),
             Arc::new(FeedHealth::new()),
+            r.cfg.floor.clone(),
+            r.cfg.enabled.clone(),
         ));
         let base = format!("http://{addr}");
 
@@ -1967,6 +1971,8 @@ mod tests {
             Default::default(),
             history.clone(),
             health,
+            Arc::new(Mutex::new(ChannelFloor::default())),
+            Vec::new(),
         ));
         tokio::spawn(feed_history(
             tx.subscribe(),
@@ -2102,6 +2108,8 @@ mod tests {
             Default::default(),
             history.clone(),
             health,
+            Arc::new(Mutex::new(ChannelFloor::default())),
+            Vec::new(),
         ));
         tokio::spawn(feed_history(
             tx.subscribe(),

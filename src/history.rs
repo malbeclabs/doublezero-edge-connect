@@ -48,6 +48,11 @@ pub const MAX_PRODUCTS: usize = 1_024;
 /// memory is on the order of ~121 MiB.
 pub const MAX_BUCKETS_ACROSS_PRODUCTS: usize = 1 << 20;
 
+/// Measured per-bucket resident bytes (`BTreeMap` node overhead included — see
+/// `MAX_BUCKETS_ACROSS_PRODUCTS`'s doc), not the ~48-byte logical `(u64, Bucket)` payload. The
+/// constant an `est_bytes` estimate in [`Stats`] is built from.
+const BYTES_PER_BUCKET: usize = 93;
+
 /// One market's identity within the history store — the identity, not the display symbol (a
 /// price-aggregated `symbol` can collide across markets; see `products::ProductId`).
 ///
@@ -72,6 +77,35 @@ pub struct Print {
     pub ts_ns: u64,
     pub price: f64,
     pub size: f64,
+}
+
+/// The store's own cardinality accounting, as reported on `/v1/status`'s `history` block. See
+/// [`Store::stats`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stats {
+    /// Distinct products currently tracked.
+    pub products: usize,
+    /// Whether `products` is at [`MAX_PRODUCTS`] — the cardinality cap, not the aggregate bucket
+    /// budget below. Products at cap with a rising [`Stats::evicted`] is the signal an over-wide
+    /// floor produces: RSS stays flat (the budget below holds it there) while occupancy silently
+    /// churns, which is invisible in memory alone.
+    pub products_at_cap: bool,
+    /// The running total of 1-second buckets held across every product (`Store::buckets_total`),
+    /// not a recount.
+    pub buckets: usize,
+    /// [`MAX_BUCKETS_ACROSS_PRODUCTS`], carried here so a caller need not import the constant
+    /// separately to compute `buckets`'s headroom.
+    pub bucket_budget: usize,
+    /// A back-of-envelope resident-byte estimate (buckets at their measured per-bucket cost, plus
+    /// every product's fixed print-ring cost) — see [`Store::stats`]'s doc for what it is and is
+    /// not.
+    pub est_bytes: usize,
+    /// [`WINDOW_SECS`], carried here for the same reason as `bucket_budget`.
+    pub window_secs: u64,
+    /// Whole products evicted (cardinality cap or bucket budget overflow) since the store started.
+    pub evicted: u64,
+    /// Prints rejected for arriving older than their product's window, since the store started.
+    pub late_drops: u64,
 }
 
 /// One OHLCV candle at whatever granularity was requested.
@@ -201,6 +235,50 @@ impl Store {
     /// least recently traded first, so one counter covers both.
     pub fn evicted(&self) -> u64 {
         self.evicted
+    }
+
+    /// A snapshot of the store's own cardinality accounting, for the `/v1/status` `history` block.
+    ///
+    /// `buckets` reads `buckets_total` directly rather than recomputing `products.values().map(|p|
+    /// p.buckets.len()).sum()` — the whole reason that running total is maintained in step by every
+    /// mutation path (see its own doc) is so a caller asking "how full is the store right now" never
+    /// pays an O(products) scan to find out; `/v1/status` is exactly that caller, and it is what an
+    /// operator polls to answer "is my floor narrow enough."
+    ///
+    /// `est_bytes` is the same back-of-envelope arithmetic `MAX_BUCKETS_ACROSS_PRODUCTS`'s doc
+    /// derives by hand (measured ~93 B/bucket, plus each product's fixed `TRADE_RING` print ring) —
+    /// not a precise allocator accounting, but the two terms that actually dominate this store's
+    /// footprint.
+    pub fn stats(&self) -> Stats {
+        let ring_bytes = self
+            .products
+            .len()
+            .saturating_mul(TRADE_RING)
+            .saturating_mul(std::mem::size_of::<Print>());
+        Stats {
+            products: self.products.len(),
+            products_at_cap: self.products.len() >= MAX_PRODUCTS,
+            buckets: self.buckets_total,
+            bucket_budget: MAX_BUCKETS_ACROSS_PRODUCTS,
+            est_bytes: self.buckets_total.saturating_mul(BYTES_PER_BUCKET) + ring_bytes,
+            window_secs: WINDOW_SECS,
+            evicted: self.evicted,
+            late_drops: self.late_drops,
+        }
+    }
+
+    /// How many products are currently tracked under `(source_id, category, channel)` — the
+    /// non-mutating sibling of [`Store::forget_channel`], sharing its exact filter (same three
+    /// components, same reason `category` has to be in it: two disjoint universes under one Source
+    /// ID can share a channel id, and a count blind to `category` would attribute a peer universe's
+    /// occupancy to this one). Used by the `/v1/status` `channels` block to answer, per channel,
+    /// "how much of the store does an admitted channel actually hold" — the number that turns a
+    /// flat RSS reading into an answer to "is my floor narrow enough."
+    pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
+        self.products
+            .keys()
+            .filter(|k| k.source_id == source_id && k.category == *category && k.channel == channel)
+            .count()
     }
 
     /// Record one print for `key`.
@@ -1094,6 +1172,139 @@ mod tests {
             3,
             "the peer category sharing channel 10 must survive with its full candle count — \
              a category-blind filter would have wrongly dropped it too"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // stats / products_for — the `/v1/status` `history` and `channels` blocks' data source
+    // -------------------------------------------------------------------------------------------
+
+    /// The signal an over-wide floor produces is products at cap with a rising eviction count —
+    /// memory stays flat (the bucket budget holds it there), so it is invisible in RSS alone.
+    /// Reporting it is the whole point of `stats()`.
+    #[test]
+    fn stats_reports_products_at_cap_with_evictions() {
+        let mut s = Store::new();
+        for i in 0..(MAX_PRODUCTS + 50) {
+            let k = Key {
+                source_id: 1,
+                category: "default".into(),
+                channel: 0,
+                instrument_id: i as u32,
+            };
+            s.ingest(k, trade(1_000 + i as u64, 10.0, 1.0));
+        }
+        let stats = s.stats();
+        assert_eq!(stats.products, MAX_PRODUCTS);
+        assert!(stats.products_at_cap);
+        assert!(stats.evicted > 0, "evictions were not counted: {stats:?}");
+    }
+
+    /// The counters must track the store's real contents, not a constant. A store well below cap
+    /// reports below cap, with no evictions and a bucket count strictly between zero and the
+    /// aggregate budget.
+    #[test]
+    fn stats_reports_real_occupancy_below_cap() {
+        let mut s = Store::new();
+        s.ingest(key(), trade(1_000, 10.0, 1.0));
+        let stats = s.stats();
+        assert_eq!(stats.products, 1);
+        assert!(!stats.products_at_cap);
+        assert_eq!(stats.evicted, 0);
+        assert!(
+            stats.buckets > 0 && stats.buckets < MAX_BUCKETS_ACROSS_PRODUCTS,
+            "{stats:?}"
+        );
+        assert_eq!(stats.bucket_budget, MAX_BUCKETS_ACROSS_PRODUCTS);
+        assert_eq!(stats.window_secs, WINDOW_SECS);
+        assert_eq!(stats.late_drops, 0);
+    }
+
+    /// `est_bytes` must actually track ingest, not sit at a fixed value — an empty store estimates
+    /// zero, and a single print's bucket plus its product's print ring pushes it strictly positive.
+    #[test]
+    fn stats_est_bytes_grows_with_real_usage() {
+        let s = Store::new();
+        assert_eq!(
+            s.stats().est_bytes,
+            0,
+            "an empty store estimates zero bytes"
+        );
+        let mut s = Store::new();
+        s.ingest(key(), trade(1_000, 10.0, 1.0));
+        assert!(
+            s.stats().est_bytes > 0,
+            "one bucket plus one product's print ring must estimate positive bytes"
+        );
+    }
+
+    /// `products_for` shares `forget_channel`'s exact filter, so it must share its scoping
+    /// properties too: a peer differing on `channel`, on `source_id`, or on `category` alone must
+    /// not be counted, while the named product is. Named-count assertions throughout, not a bare
+    /// nonzero check, so a filter that over- or under-counts fails visibly.
+    #[test]
+    fn products_for_counts_only_the_named_scope() {
+        let mut s = Store::new();
+        let named = Key {
+            source_id: 3,
+            category: "perps".into(),
+            channel: 10,
+            instrument_id: 1,
+        };
+        let named_peer = Key {
+            source_id: 3,
+            category: "perps".into(),
+            channel: 10,
+            instrument_id: 2,
+        };
+        let peer_diff_channel = Key {
+            source_id: 3,
+            category: "perps".into(),
+            channel: 11,
+            instrument_id: 1,
+        };
+        let peer_diff_source = Key {
+            source_id: 7,
+            category: "perps".into(),
+            channel: 10,
+            instrument_id: 1,
+        };
+        let peer_diff_category = Key {
+            source_id: 3,
+            category: "sports".into(),
+            channel: 10,
+            instrument_id: 1,
+        };
+        s.ingest(named, trade(1_000, 10.0, 1.0));
+        s.ingest(named_peer, trade(1_000, 10.0, 1.0));
+        s.ingest(peer_diff_channel, trade(1_000, 10.0, 1.0));
+        s.ingest(peer_diff_source, trade(1_000, 10.0, 1.0));
+        s.ingest(peer_diff_category, trade(1_000, 10.0, 1.0));
+
+        assert_eq!(
+            s.products_for(3, &"perps".into(), 10),
+            2,
+            "exactly the two products in the named scope"
+        );
+        assert_eq!(
+            s.products_for(3, &"perps".into(), 11),
+            1,
+            "the peer channel's own single product"
+        );
+        assert_eq!(
+            s.products_for(7, &"perps".into(), 10),
+            1,
+            "the peer source_id's own single product"
+        );
+        assert_eq!(
+            s.products_for(3, &"sports".into(), 10),
+            1,
+            "the peer category's own single product"
+        );
+        assert_eq!(
+            s.products_for(3, &"perps".into(), 99),
+            0,
+            "an untracked channel counts zero, not an error"
         );
     }
 }

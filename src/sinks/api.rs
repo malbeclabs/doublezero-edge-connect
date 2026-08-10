@@ -49,13 +49,15 @@ use super::http::{self, Request, Response};
 use crate::{
     history,
     ingest::{
-        feeds::{feeds, FeedKind},
-        health::SharedFeedHealth,
+        feeds::{feeds, Feed, FeedKind},
+        floor::ChannelFloor,
+        health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
-        sources::source_label,
+        sources::{source_id_of, source_label},
     },
     model::{
-        venue_arc, BookSide, BookSnapshot, DepthSnapshot, InstrumentSnapshot, NormalizedInstrument,
+        category_arc, venue_arc, BookSide, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
+        NormalizedInstrument,
     },
     products::{self, Resolution},
 };
@@ -101,6 +103,15 @@ struct ApiState {
     books: BookSnapshot,
     history: Arc<Mutex<history::Store>>,
     health: SharedFeedHealth,
+    /// The runtime-mutable channel floor, the same shared handle the reconciler and the admin
+    /// surface read/replace (`main.rs`) — never a second instance. `/v1/status`'s `channels` block
+    /// reads it fresh on every request, so a floor change via `POST /admin/channels` is reflected
+    /// immediately, with no reconcile tick needed to observe it (the tick is what applies it to the
+    /// running receiver set, not what this surface reports).
+    floor: Arc<Mutex<ChannelFloor>>,
+    /// The `--feed`/`--publisher-port`-selected rows this process may run — fixed for the process's
+    /// lifetime, mirroring `sinks::admin::AdminState::enabled`. What the `channels` block iterates.
+    enabled: Vec<Feed>,
 }
 
 /// Bind the listener up front so the caller can decide what a bind failure means — mirrors
@@ -113,6 +124,7 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 
 /// The accept loop, split out so tests (and a future `main`) can drive a pre-bound listener —
 /// mirrors [`crate::sinks::ws::serve`].
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     instruments: InstrumentSnapshot,
@@ -120,6 +132,8 @@ pub async fn serve(
     books: BookSnapshot,
     history: Arc<Mutex<history::Store>>,
     health: SharedFeedHealth,
+    floor: Arc<Mutex<ChannelFloor>>,
+    enabled: Vec<Feed>,
 ) -> Result<()> {
     let state = Arc::new(ApiState {
         instruments,
@@ -127,6 +141,8 @@ pub async fn serve(
         books,
         history,
         health,
+        floor,
+        enabled,
     });
     http::serve_loop(
         listener,
@@ -737,16 +753,132 @@ fn status(state: &ApiState) -> Response {
         .collect();
 
     let history_json = {
-        let store = crate::model::lock(&state.history);
+        let stats = crate::model::lock(&state.history).stats();
         json!({
-            "products_tracked": store.len(),
-            "late_drops": store.late_drops(),
-            "evicted": store.evicted(),
-            "window_seconds": history::WINDOW_SECS,
+            // Kept for backward compatibility with a prior consumer of this field name.
+            "products_tracked": stats.products,
+            "products": stats.products,
+            "products_at_cap": stats.products_at_cap,
+            "buckets": stats.buckets,
+            "bucket_budget": stats.bucket_budget,
+            "est_bytes": stats.est_bytes,
+            "window_seconds": stats.window_secs,
+            "evicted": stats.evicted,
+            "late_drops": stats.late_drops,
         })
     };
 
-    ok_json(json!({ "venues": venues_json, "history": history_json }))
+    ok_json(json!({
+        "venues": venues_json,
+        "history": history_json,
+        "channels": channels_block(state),
+        "process": process_block(),
+    }))
+}
+
+/// The `channels` block: per enabled row that carries a channel id (i.e. every row except a flat
+/// one — see `ingest::floor`'s docs for why a flat row has no channel concept to narrow), the
+/// row's full channel roster with whether the floor admits it, whether a receiver is genuinely
+/// **bound** for it, and how many products it currently holds in `history::Store` — plus a total
+/// count of channels this floor excludes.
+///
+/// "Bound" is read off the real receiver liveness (`SharedFeedHealth::liveness`, keyed exactly as
+/// the reconciler keys its own receiver map), not off `ChannelFloor::admits` alone. Task 5's admin
+/// surface shipped a field that reported the floor's admission and called it `bound_publishers`,
+/// which read as "currently receiving packets" when it was not — an excluded channel never binds a
+/// socket at all, so its liveness key is naturally never registered, and a channel the floor admits
+/// but whose group is not (yet) subscribed reads `Unregistered`/`Down` here rather than a
+/// false "bound". This is the genuine running state, not the floor's opinion of it.
+fn channels_block(state: &ApiState) -> Value {
+    let floor = crate::model::lock(&state.floor).clone();
+    let history = crate::model::lock(&state.history);
+    let mut rows = Vec::new();
+    let mut excluded_by_floor = 0usize;
+
+    for f in &state.enabled {
+        // Every enabled row's venue resolves to a Source ID by construction (`feeds::init`
+        // validates it) — if it somehow didn't, there is no history key to look products up under,
+        // so the row is skipped rather than reported with a fabricated zero.
+        let Some(source_id) = source_id_of(f.venue) else {
+            continue;
+        };
+        let category = category_arc(f.category);
+
+        let mut channels = Vec::new();
+        let mut row_excluded = 0usize;
+        for p in f.publishers {
+            let Some(channel) = p.channel else {
+                // A flat row's publishers carry no channel id — nothing per-channel to report, and
+                // `ChannelFloor::parse` refuses to narrow such a row in the first place.
+                continue;
+            };
+            let admitted = floor.admits(f.code, channel);
+            if !admitted {
+                row_excluded += 1;
+            }
+            let key: crate::ingest::health::ReceiverKey =
+                (f.venue, f.category, f.kind, p.base_port());
+            let bound = matches!(state.health.liveness(&key), TapeLiveness::Up);
+            let products = history.products_for(source_id, &category, channel as u32);
+            channels.push(json!({
+                "channel": channel,
+                "floor_admits": admitted,
+                "bound": bound,
+                "products": products,
+            }));
+        }
+        if channels.is_empty() {
+            // A flat row: nothing per-channel to report.
+            continue;
+        }
+        excluded_by_floor += row_excluded;
+        rows.push(json!({
+            "venue": f.venue,
+            "category": f.category,
+            "code": f.code,
+            "channels": channels,
+            "excluded": row_excluded,
+        }));
+    }
+
+    json!({ "rows": rows, "excluded_by_floor": excluded_by_floor })
+}
+
+/// The `process` block: resident memory and cumulative CPU time, read straight off the Prometheus
+/// process collector's registry (`Cargo.toml`'s `prometheus` dependency already carries the
+/// `process` feature) — deliberately **not** gated on `--metrics-bind`, so these figures answer
+/// over `--url` against a remote host with no `--metrics-bind` enabled and no `docker stats` or
+/// `/proc` access on the querying side. `None` (omitted rather than a fabricated `0`) if the
+/// process collector isn't registered for this build/platform (it is Linux-only — see
+/// `metrics::Metrics::new`).
+fn process_block() -> Value {
+    json!({
+        "resident_memory_bytes": process_metric("process_resident_memory_bytes"),
+        "cpu_seconds_total": process_metric("process_cpu_seconds_total"),
+    })
+}
+
+/// The single sample value of the first metric family named `name` in the default registry, or
+/// `None` if it isn't present. Both process-collector families this module reads are gauges/
+/// counters with exactly one (unlabelled) sample. Dispatches on the family's own
+/// [`prometheus::proto::MetricType`] rather than probing each variant, since — with this crate's
+/// `default-features = false` build (no `protobuf` feature) — every [`prometheus::proto::Metric`]
+/// carries all five typed sub-messages unconditionally (each defaulted to zero when unused, not an
+/// `Option`), so there is nothing to probe.
+fn process_metric(name: &str) -> Option<f64> {
+    use prometheus::proto::MetricType;
+    for family in crate::metrics::metrics().registry().gather() {
+        if family.name() != name {
+            continue;
+        }
+        let metric = family.get_metric().first()?;
+        return match family.get_field_type() {
+            MetricType::GAUGE => Some(metric.get_gauge().get_value()),
+            MetricType::COUNTER => Some(metric.get_counter().get_value()),
+            _ => None,
+        };
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -908,36 +1040,57 @@ mod tests {
         }
     }
 
-    fn empty_state() -> (
+    /// The tuple `empty_state`/`spawn` pass around — named so clippy's `type_complexity` lint
+    /// doesn't flag the bare tuple type at every use site.
+    type EmptyState = (
         InstrumentSnapshot,
         DepthSnapshot,
         BookSnapshot,
         Arc<Mutex<Store>>,
         SharedFeedHealth,
-    ) {
+        Arc<Mutex<ChannelFloor>>,
+        Vec<Feed>,
+    );
+
+    fn empty_state() -> EmptyState {
         (
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(crate::model::BookReplay::default())),
             Arc::new(Mutex::new(Store::new())),
             Arc::new(FeedHealth::new()),
+            Arc::new(Mutex::new(ChannelFloor::default())),
+            Vec::new(),
         )
     }
 
     /// Spawn `serve` over an ephemeral listener and return its base URL. The join handle is
     /// dropped intentionally (matches `sinks::metrics`'s test pattern) — the spawned task is
     /// aborted implicitly when the test process exits.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn(
         instruments: InstrumentSnapshot,
         depth: DepthSnapshot,
         books: BookSnapshot,
         history: Arc<Mutex<Store>>,
         health: SharedFeedHealth,
+        floor: Arc<Mutex<ChannelFloor>>,
+        enabled: Vec<Feed>,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = serve(listener, instruments, depth, books, history, health).await;
+            let _ = serve(
+                listener,
+                instruments,
+                depth,
+                books,
+                history,
+                health,
+                floor,
+                enabled,
+            )
+            .await;
         });
         format!("http://{addr}")
     }
@@ -948,14 +1101,14 @@ mod tests {
 
     #[tokio::test]
     async fn products_list_carries_discrete_identity_fields() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
@@ -979,13 +1132,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_product_404s_with_a_remedy() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:BTCC"))
             .await
             .unwrap();
@@ -1120,10 +1273,10 @@ mod tests {
     /// rather than a synthetic one (see `ingest_real_mbp_collision`).
     #[tokio::test]
     async fn an_ambiguous_product_id_lists_its_candidates() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         ingest_real_mbp_collision(&instruments);
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
 
         // Both markets survive real ingest and are listed.
         let list = reqwest::get(format!("{base}/v1/products")).await.unwrap();
@@ -1174,7 +1327,7 @@ mod tests {
     /// one that doesn't false) against the SAME pre-limit span, per `history.rs`'s own contract.
     #[tokio::test]
     async fn candles_carry_a_retention_block() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
@@ -1206,7 +1359,7 @@ mod tests {
             }
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
 
         // A `limit` small enough to bind: `truncated` must be true, and `oldest`/`newest` must
         // still report the pre-limit span (all 5 candles), not the 2 actually returned.
@@ -1271,7 +1424,7 @@ mod tests {
     /// candle at ONE_DAY — a count only the real bucket widths produce.
     #[tokio::test]
     async fn granularity_names_map_to_the_documented_bucket_width() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
@@ -1303,7 +1456,7 @@ mod tests {
             );
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
 
         let resp = reqwest::get(format!(
             "{base}/v1/products/HYPERLIQUID:BTC/candles?granularity=ONE_MINUTE&limit=10"
@@ -1332,7 +1485,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_granularity_coarser_than_the_window_returns_a_partial_candle() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
@@ -1356,7 +1509,7 @@ mod tests {
             );
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         // ONE_DAY (86,400s) is coarser than the store's whole 3,600s window — not an error.
         let resp = reqwest::get(format!(
             "{base}/v1/products/HYPERLIQUID:BTC/candles?granularity=ONE_DAY"
@@ -1376,13 +1529,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unrecognised_granularity_is_rejected_with_the_accepted_values() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!(
             "{base}/v1/products/HYPERLIQUID:BTC/candles?granularity=FORTNIGHT"
         ))
@@ -1420,13 +1573,13 @@ mod tests {
     /// no candles" instead of "you asked for zero of them").
     #[tokio::test]
     async fn malformed_limit_is_rejected_with_a_remedy() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         for bad in ["abc", "-5", "0"] {
             let resp = reqwest::get(format!(
                 "{base}/v1/products/HYPERLIQUID:BTC/candles?limit={bad}"
@@ -1482,7 +1635,7 @@ mod tests {
 
     #[tokio::test]
     async fn book_reports_coverage_and_respects_baselined() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
@@ -1535,7 +1688,7 @@ mod tests {
             map.insert(("KALSHI".into(), "perps".into(), 3, 7), mid_stream);
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
 
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:BASELINED%232.41/book"))
             .await
@@ -1568,7 +1721,7 @@ mod tests {
     /// alone did not (its books are too small to ever hit the cap).
     #[tokio::test]
     async fn book_caps_levels_per_side_and_reports_the_cap_as_incomplete() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("KALSHI".into(), "perps".into(), 5u32, 1u32),
             inst_in("perps", 3, "KALSHI", "BIGBOOK", 5, 1, -4, -2),
@@ -1594,7 +1747,7 @@ mod tests {
             map.insert(("KALSHI".into(), "perps".into(), 5, 1), acc);
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:BIGBOOK/book"))
             .await
             .unwrap();
@@ -1626,7 +1779,7 @@ mod tests {
     /// first-match bug still returns 200 with plausible-looking numbers, just the wrong universe's.
     #[tokio::test]
     async fn book_and_ticker_do_not_cross_universes_sharing_a_channel_and_instrument_id() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
@@ -1682,7 +1835,7 @@ mod tests {
             map.insert(("KALSHI".into(), "sports".into(), 9, 1), sports_acc);
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
 
         let perps_book = reqwest::get(format!("{base}/v1/products/KALSHI:PERPMKT/book"))
             .await
@@ -1731,7 +1884,7 @@ mod tests {
     /// `BookSnapshot` entry, a `DepthSnapshot` one instead) with the same coverage contract.
     #[tokio::test]
     async fn book_falls_back_to_market_by_order_depth_when_no_accumulator_exists() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
@@ -1752,7 +1905,7 @@ mod tests {
             },
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:BTC/book"))
             .await
             .unwrap();
@@ -1774,7 +1927,7 @@ mod tests {
     /// cannot tell whether the true book holds more beyond what the producer chose to send.
     #[tokio::test]
     async fn book_market_by_order_depth_at_the_wire_cap_is_not_reported_complete() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
@@ -1797,7 +1950,7 @@ mod tests {
             },
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:BTC/book"))
             .await
             .unwrap();
@@ -1820,14 +1973,14 @@ mod tests {
 
     #[tokio::test]
     async fn product_detail_returns_the_full_entry() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("PHOENIX".into(), "default".into(), 0u32, 7u32),
             inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
         health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/PHOENIX:SOL"))
             .await
             .unwrap();
@@ -1848,7 +2001,7 @@ mod tests {
 
     #[tokio::test]
     async fn ticker_returns_recent_trades_and_best_levels() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
@@ -1895,7 +2048,7 @@ mod tests {
             },
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:BTC/ticker"))
             .await
             .unwrap();
@@ -1911,7 +2064,7 @@ mod tests {
 
     #[tokio::test]
     async fn best_bid_ask_reports_only_derivable_products() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
@@ -1977,7 +2130,7 @@ mod tests {
                 acc
             });
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/best_bid_ask"))
             .await
             .unwrap();
@@ -2011,7 +2164,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_venue_health_and_history_counters() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
         {
             let mut store = history.lock().unwrap();
@@ -2031,7 +2184,7 @@ mod tests {
             );
         }
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
@@ -2057,7 +2210,7 @@ mod tests {
     /// Market-by-Price) and no evidence yet for this exact identity.
     #[tokio::test]
     async fn feed_kind_ladder_prefers_book_then_depth_then_registry_then_unknown() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
@@ -2097,7 +2250,7 @@ mod tests {
             },
         );
 
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products")).await.unwrap();
         let body: Value = resp.json().await.unwrap();
         let products = body["products"].as_array().unwrap().clone();
@@ -2134,8 +2287,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_endpoint_404s_with_a_remedy() {
-        let (instruments, depth, books, history, health) = empty_state();
-        let base = spawn(instruments, depth, books, history, health).await;
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/nope")).await.unwrap();
         assert_eq!(resp.status(), 404);
         let body: Value = resp.json().await.unwrap();
@@ -2151,12 +2304,12 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_subresource_404s_with_a_remedy() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         instruments.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
-        let base = spawn(instruments, depth, books, history, health).await;
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:BTC/tikcer"))
             .await
             .unwrap();
@@ -2245,13 +2398,15 @@ mod tests {
     /// from the guard's presence in `handle`'s source.
     #[test]
     fn the_query_surface_refuses_every_mutating_method() {
-        let (instruments, depth, books, history, health) = empty_state();
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
         let state = ApiState {
             instruments,
             depth,
             books,
             history,
             health,
+            floor,
+            enabled,
         };
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
             let req = Request {
@@ -2263,5 +2418,235 @@ mod tests {
             let (status, _, _) = handle(&state, &req);
             assert_eq!(status, "405 Method Not Allowed", "{method} was not refused by /v1");
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // /v1/status: history, channels and process blocks (Task 6)
+    // -----------------------------------------------------------------------------------------
+
+    /// The real built-in "sports" row (group code `lashay-4`) — a genuinely derived, multi-channel
+    /// row, matching `sinks::admin`'s and `ingest::floor`'s own tests. Using the real row (rather
+    /// than a hand-built one) is what lets a real `ChannelFloor::parse` spec actually narrow it.
+    fn sports_row() -> Feed {
+        *feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row")
+    }
+
+    /// A store below cap must report real occupancy, not a hardcoded shape: exactly one product,
+    /// not at cap, no evictions, and a bucket count strictly between zero and the aggregate
+    /// budget — the same assertions `history::Store::stats`'s own unit test makes, now checked
+    /// through the wire envelope `status()` actually serves.
+    #[tokio::test]
+    async fn status_history_block_reports_real_occupancy_below_cap() {
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
+        {
+            let mut store = history.lock().unwrap();
+            store.ingest(
+                history::Key {
+                    source_id: 1,
+                    category: "default".into(),
+                    channel: 0,
+                    instrument_id: 41,
+                },
+                Print {
+                    ts_ns: 1_000 * 1_000_000_000,
+                    price: 10.0,
+                    size: 1.0,
+                },
+            );
+        }
+
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let h = &body["history"];
+        assert_eq!(h["products"], 1, "{h}");
+        assert_eq!(h["products_at_cap"], false, "{h}");
+        assert_eq!(h["evicted"], 0, "{h}");
+        assert_eq!(h["late_drops"], 0, "{h}");
+        assert_eq!(h["window_seconds"], 3600, "{h}");
+        let buckets = h["buckets"].as_u64().expect("buckets must be a number");
+        let budget = h["bucket_budget"]
+            .as_u64()
+            .expect("bucket_budget must be a number");
+        assert!(buckets > 0 && buckets < budget, "{h}");
+        assert!(
+            h["est_bytes"].as_u64().expect("est_bytes must be a number") > 0,
+            "{h}"
+        );
+    }
+
+    /// The signal an over-wide floor produces: products pinned at the cardinality cap with a
+    /// rising eviction count — memory stays flat (the bucket budget holds it there), so this is
+    /// invisible in RSS alone. `/v1/status` must surface it, not report a store that always reads
+    /// comfortably below cap.
+    #[tokio::test]
+    async fn status_history_block_reports_products_at_cap_with_evictions() {
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
+        {
+            let mut store = history.lock().unwrap();
+            for i in 0..(history::MAX_PRODUCTS + 50) {
+                store.ingest(
+                    history::Key {
+                        source_id: 1,
+                        category: "default".into(),
+                        channel: 0,
+                        instrument_id: i as u32,
+                    },
+                    Print {
+                        ts_ns: (1_000 + i as u64) * 1_000_000_000,
+                        price: 10.0,
+                        size: 1.0,
+                    },
+                );
+            }
+        }
+
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let h = &body["history"];
+        assert_eq!(h["products"], history::MAX_PRODUCTS as u64, "{h}");
+        assert_eq!(h["products_at_cap"], true, "{h}");
+        assert!(
+            h["evicted"].as_u64().expect("evicted must be a number") > 0,
+            "evictions were not counted: {h}"
+        );
+    }
+
+    /// The `channels` block's whole point: an admitted-and-genuinely-bound channel, an
+    /// admitted-but-never-registered one, and one the floor excludes outright, must read as three
+    /// distinct states — not collapsed into "the floor admits it" the way Task 5's admin surface
+    /// did before its `bound_publishers` field was renamed to `floor_admits`. "Bound" here is real
+    /// receiver liveness (`SharedFeedHealth`), so an admitted channel with no registered receiver
+    /// must read `bound: false`, exactly like an excluded one.
+    #[tokio::test]
+    async fn status_channels_block_distinguishes_admission_from_real_liveness() {
+        let (instruments, depth, books, history, health, _floor, _enabled) = empty_state();
+        let row = sports_row();
+        // Admits channels 10 and 11 of the sports row's 31-channel roster; every other channel
+        // (12 included) is excluded by the floor.
+        let floor = Arc::new(Mutex::new(ChannelFloor::parse("lashay-4=10,11").unwrap()));
+        let enabled = vec![row];
+
+        // Channel 10: admitted AND a receiver has genuinely registered up.
+        let base_port_10 = row
+            .publishers
+            .iter()
+            .find(|p| p.channel == Some(10))
+            .expect("fixture sanity: the sports row carries channel 10")
+            .base_port();
+        health.register((row.venue, row.category, row.kind, base_port_10), |_| {});
+        // Channel 11 is admitted but nothing ever registers for it — the "subscribed group, dead
+        // or not-yet-bound receiver" case `ingest::health::TapeLiveness::Unregistered` exists for.
+        // Channel 12 is excluded by the floor outright; nothing registers for it either.
+
+        let source_id = source_id_of(row.venue).expect("fixture sanity: KALSHI resolves");
+        let category = category_arc(row.category);
+        {
+            let mut store = history.lock().unwrap();
+            store.ingest(
+                history::Key {
+                    source_id,
+                    category: category.clone(),
+                    channel: 10,
+                    instrument_id: 1,
+                },
+                Print {
+                    ts_ns: 1_000 * 1_000_000_000,
+                    price: 1.0,
+                    size: 1.0,
+                },
+            );
+            store.ingest(
+                history::Key {
+                    source_id,
+                    category,
+                    channel: 10,
+                    instrument_id: 2,
+                },
+                Print {
+                    ts_ns: 1_000 * 1_000_000_000,
+                    price: 2.0,
+                    size: 1.0,
+                },
+            );
+        }
+
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+
+        let rows = body["channels"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one enabled row: {rows:?}");
+        let row_json = &rows[0];
+        assert_eq!(row_json["venue"], "KALSHI");
+        assert_eq!(row_json["category"], "sports");
+        assert_eq!(row_json["code"], "lashay-4");
+
+        let channels = row_json["channels"].as_array().unwrap();
+        let find = |id: u64| -> &Value {
+            channels
+                .iter()
+                .find(|c| c["channel"] == id)
+                .unwrap_or_else(|| panic!("channel {id} missing from {channels:?}"))
+        };
+
+        let c10 = find(10);
+        assert_eq!(c10["floor_admits"], true, "{c10}");
+        assert_eq!(
+            c10["bound"], true,
+            "a genuinely registered-up receiver must read bound: {c10}"
+        );
+        assert_eq!(c10["products"], 2, "{c10}");
+
+        let c11 = find(11);
+        assert_eq!(c11["floor_admits"], true, "{c11}");
+        assert_eq!(
+            c11["bound"], false,
+            "admitted but never registered must not read bound: {c11}"
+        );
+        assert_eq!(c11["products"], 0, "{c11}");
+
+        let c12 = find(12);
+        assert_eq!(c12["floor_admits"], false, "{c12}");
+        assert_eq!(c12["bound"], false, "{c12}");
+        assert_eq!(c12["products"], 0, "{c12}");
+
+        assert_eq!(
+            row_json["excluded"], 29,
+            "31-channel roster minus the 2 admitted: {row_json}"
+        );
+        assert_eq!(
+            body["channels"]["excluded_by_floor"], 29,
+            "the only enabled row, so the total equals the row's own count: {body}"
+        );
+    }
+
+    /// The `process` block must read real numbers off the process collector, not omit them or
+    /// fabricate a placeholder — and it must do so with no `--metrics-bind` involved at all (this
+    /// test never touches `sinks::metrics`), which is the entire reason it reads the registry
+    /// directly rather than scraping `/metrics`.
+    #[tokio::test]
+    async fn status_process_block_reports_resident_memory_and_cpu() {
+        let (instruments, depth, books, history, health, floor, enabled) = empty_state();
+        let base = spawn(instruments, depth, books, history, health, floor, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let p = &body["process"];
+        assert!(
+            p["resident_memory_bytes"].as_f64().unwrap_or(0.0) > 0.0,
+            "a running process must report positive resident memory: {p}"
+        );
+        assert!(
+            p["cpu_seconds_total"].is_number(),
+            "cpu time must be a real sample, not omitted: {p}"
+        );
     }
 }
