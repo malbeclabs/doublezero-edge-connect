@@ -405,6 +405,10 @@ pub struct BookAccumulator {
     symbol: Arc<str>,
     bids: std::collections::BTreeMap<i128, (f64, f64)>,
     asks: std::collections::BTreeMap<i128, (f64, f64)>,
+    /// Resting orders for an order-level (L3) market as `(is_bid, price_key, price, size)`, keyed by
+    /// the venue's order id. Empty for a price-aggregated market, whose changes carry `order_id == 0`
+    /// and live in `bids`/`asks`; the two populations never coexist for one market.
+    orders: HashMap<u64, (bool, i128, f64, f64)>,
     /// Changes of a logical event still awaiting its `last` batch — see [`BookAccumulator::apply`].
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
@@ -419,6 +423,22 @@ pub struct BookAccumulator {
     source_id: u16,
 }
 
+/// One folded price level as `(price, total size, resting order count)`.
+pub type CountedLevel = (f64, f64, u32);
+
+/// How much detail a replayed `book` re-baseline carries. Levels is the default because an L2
+/// consumer must not be handed a venue's whole order population — tens of thousands of changes on a
+/// busy market — to learn a book it will immediately aggregate away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayScope {
+    /// Price levels, each carrying `order_id == 0`.
+    #[default]
+    Levels,
+    /// Every resting order, each carrying the venue's `order_id`.
+    Orders,
+}
+
 /// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
 /// datagram source, so a stream that never sets `last` must not grow this without limit; the cap sits
 /// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
@@ -431,6 +451,7 @@ impl BookAccumulator {
             symbol,
             bids: std::collections::BTreeMap::new(),
             asks: std::collections::BTreeMap::new(),
+            orders: HashMap::new(),
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
@@ -470,19 +491,53 @@ impl BookAccumulator {
                 .iter()
                 .filter(|c| c.price.is_finite() && c.size.is_finite()),
         );
-        // An event that outgrows the buffer is abandoned rather than truncated: keeping the levels it
-        // did fold in while dropping the rest would leave a book still claiming to be complete.
-        if self.pending.len() > MAX_PENDING_CHANGES {
-            self.pending.clear();
-            self.baselined = false;
-            return;
-        }
         if !b.last {
+            // The cap guards only an event still waiting for its `last`: an event that outgrows it is
+            // abandoned rather than truncated, since keeping the levels it did fold in while dropping
+            // the rest would leave a book still claiming to be complete. A *terminated* batch folds
+            // below whatever its size, or an order-level snapshot — tens of thousands of orders in one
+            // batch — could never baseline.
+            if self.pending.len() > MAX_PENDING_CHANGES {
+                self.pending.clear();
+                self.baselined = false;
+            }
             return;
         }
         let mut cleared = (false, false);
         for c in std::mem::take(&mut self.pending) {
             let key = (c.price * 10f64.powi(8)).round() as i128;
+            // An order-level change is keyed by its order id, not its price: two orders rest at one
+            // price, and only the id says which of them moved.
+            if c.order_id != 0 {
+                match (c.action, c.side) {
+                    (BookAction::Clear, BookSide::Bid) => {
+                        self.orders.retain(|_, (is_bid, ..)| !*is_bid);
+                        cleared.0 = true;
+                    }
+                    (BookAction::Clear, BookSide::Ask) => {
+                        self.orders.retain(|_, (is_bid, ..)| *is_bid);
+                        cleared.1 = true;
+                    }
+                    (BookAction::Clear, BookSide::Both) => {
+                        self.orders.clear();
+                        cleared = (true, true);
+                    }
+                    (BookAction::Delete, _) => {
+                        self.orders.remove(&c.order_id);
+                    }
+                    // A zero size is how an order-level producer says the order is gone; resting it
+                    // would leave a phantom the consumer keeps forever.
+                    (BookAction::Update, _) if c.size == 0.0 => {
+                        self.orders.remove(&c.order_id);
+                    }
+                    (BookAction::Update, side) => {
+                        let is_bid = matches!(side, BookSide::Bid);
+                        self.orders
+                            .insert(c.order_id, (is_bid, key, c.price, c.size));
+                    }
+                }
+                continue;
+            }
             match (c.action, c.side) {
                 (BookAction::Clear, BookSide::Bid) => {
                     self.bids.clear();
@@ -524,10 +579,52 @@ impl BookAccumulator {
         &self.symbol
     }
 
-    /// Materialize the current state as a re-baseline: `clear` first, then every level best-first.
-    /// Stamps `snapshot`/`last`, so only call it when [`Self::baselined`] holds — otherwise it claims
-    /// completeness for a book that is missing every level which has not moved.
-    pub fn to_book(&self, venue: &Arc<str>, channel: u32, instrument_id: u32) -> NormalizedBook {
+    /// Fold the accumulated orders into price levels with the order count at each, bids best-first
+    /// then asks best-first. The count is not derivable from a price-aggregated book, which is why
+    /// this accumulator is order-keyed at all.
+    pub fn price_fold(&self) -> (Vec<CountedLevel>, Vec<CountedLevel>) {
+        let mut bids: std::collections::BTreeMap<i128, CountedLevel> = Default::default();
+        let mut asks: std::collections::BTreeMap<i128, CountedLevel> = Default::default();
+        for &(is_bid, key, price, size) in self.orders.values() {
+            let side = if is_bid { &mut bids } else { &mut asks };
+            let e = side.entry(key).or_insert((price, 0.0, 0));
+            e.1 += size;
+            e.2 += 1;
+        }
+        (
+            bids.into_values().rev().collect(),
+            asks.into_values().collect(),
+        )
+    }
+
+    /// Every resting order as `(order_id, is_bid, price, size)`, bids best-first then asks best-first,
+    /// ties broken by order id so a replay is byte-identical across runs.
+    fn order_set(&self) -> Vec<(u64, bool, f64, f64)> {
+        let (mut bids, mut asks): (Vec<_>, Vec<_>) = self
+            .orders
+            .iter()
+            .map(|(&id, &(is_bid, key, price, size))| (id, is_bid, key, price, size))
+            .partition(|&(_, is_bid, ..)| is_bid);
+        bids.sort_by_key(|&(id, _, key, ..)| (std::cmp::Reverse(key), id));
+        asks.sort_by_key(|&(id, _, key, ..)| (key, id));
+        bids.into_iter()
+            .chain(asks)
+            .map(|(id, is_bid, _, price, size)| (id, is_bid, price, size))
+            .collect()
+    }
+
+    /// Materialize the current state as a re-baseline: `clear` first, then the whole book best-first —
+    /// as price levels under [`ReplayScope::Levels`], or as individual orders (each carrying its
+    /// `order_id`) under [`ReplayScope::Orders`]. Stamps `snapshot`/`last`, so only call it when
+    /// [`Self::baselined`] holds — otherwise it claims completeness for a book that is missing every
+    /// level which has not moved.
+    pub fn to_book(
+        &self,
+        venue: &Arc<str>,
+        channel: u32,
+        instrument_id: u32,
+        scope: ReplayScope,
+    ) -> NormalizedBook {
         let mut changes = Vec::with_capacity(self.bids.len() + self.asks.len() + 1);
         changes.push(BookChange {
             action: BookAction::Clear,
@@ -536,24 +633,37 @@ impl BookAccumulator {
             size: 0.0,
             order_id: 0,
         });
-        // Bids descend, asks ascend, so the first of each is the inside market.
+        let level = |side: BookSide, price: f64, size: f64, order_id: u64| BookChange {
+            action: BookAction::Update,
+            side,
+            price,
+            size,
+            order_id,
+        };
+        // The price-keyed population, which only a price-aggregated market has. Bids descend, asks
+        // ascend, so the first of each is the inside market.
         for &(price, size) in self.bids.values().rev() {
-            changes.push(BookChange {
-                action: BookAction::Update,
-                side: BookSide::Bid,
-                price,
-                size,
-                order_id: 0,
-            });
+            changes.push(level(BookSide::Bid, price, size, 0));
         }
         for &(price, size) in self.asks.values() {
-            changes.push(BookChange {
-                action: BookAction::Update,
-                side: BookSide::Ask,
-                price,
-                size,
-                order_id: 0,
-            });
+            changes.push(level(BookSide::Ask, price, size, 0));
+        }
+        match scope {
+            ReplayScope::Orders => {
+                for (id, is_bid, price, size) in self.order_set() {
+                    let side = if is_bid { BookSide::Bid } else { BookSide::Ask };
+                    changes.push(level(side, price, size, id));
+                }
+            }
+            ReplayScope::Levels => {
+                let (bids, asks) = self.price_fold();
+                for (price, size, _) in bids {
+                    changes.push(level(BookSide::Bid, price, size, 0));
+                }
+                for (price, size, _) in asks {
+                    changes.push(level(BookSide::Ask, price, size, 0));
+                }
+            }
         }
         NormalizedBook {
             venue: venue.clone(),
@@ -862,7 +972,7 @@ mod tests {
             true,
         ));
 
-        let out = acc.to_book(&venue, 2, 41);
+        let out = acc.to_book(&venue, 2, 41, ReplayScope::Levels);
         assert!(out.snapshot && out.last);
         assert_eq!(out.symbol.as_ref(), "KXBTCPERP");
         assert_eq!(
@@ -910,7 +1020,12 @@ mod tests {
         };
 
         acc.apply(&book(vec![bid(0.61, 10.0)], false, true));
-        assert_eq!(acc.to_book(&venue, 2, 41).changes.len(), 2); // clear + one bid
+        assert_eq!(
+            acc.to_book(&venue, 2, 41, ReplayScope::Levels)
+                .changes
+                .len(),
+            2
+        ); // clear + one bid
 
         // First half of a rebuild: buffered, not applied.
         acc.apply(&book(
@@ -927,7 +1042,7 @@ mod tests {
             true,
             false,
         ));
-        let mid = acc.to_book(&venue, 2, 41);
+        let mid = acc.to_book(&venue, 2, 41, ReplayScope::Levels);
         assert_eq!(
             mid.changes,
             vec![
@@ -946,7 +1061,7 @@ mod tests {
         // The closing batch commits the whole event at once.
         acc.apply(&book(vec![bid(0.71, 2.0)], true, true));
         assert_eq!(
-            acc.to_book(&venue, 2, 41).changes,
+            acc.to_book(&venue, 2, 41, ReplayScope::Levels).changes,
             vec![
                 BookChange {
                     action: BookAction::Clear,
@@ -1001,7 +1116,7 @@ mod tests {
             false,
             true,
         ));
-        let out = acc.to_book(&venue, 2, 41);
+        let out = acc.to_book(&venue, 2, 41, ReplayScope::Levels);
         assert_eq!(
             out.changes,
             vec![
@@ -1031,7 +1146,7 @@ mod tests {
         let mut acc = BookAccumulator::new("KXBTCPERP".into());
         acc.apply(&book(vec![], false, true));
         assert_eq!(
-            acc.to_book(&venue, 2, 41).source_ts_ns,
+            acc.to_book(&venue, 2, 41, ReplayScope::Levels).source_ts_ns,
             1_781_019_263_715_344_015
         );
 
@@ -1039,7 +1154,7 @@ mod tests {
         unknown.source_ts_ns = 0;
         acc.apply(&unknown);
         assert_eq!(
-            acc.to_book(&venue, 2, 41).source_ts_ns,
+            acc.to_book(&venue, 2, 41, ReplayScope::Levels).source_ts_ns,
             1_781_019_263_715_344_015
         );
     }
@@ -1118,11 +1233,173 @@ mod tests {
             ws_send_ts_ns: 0,
         });
 
-        let out = acc.to_book(&venue, 0, 41);
+        let out = acc.to_book(&venue, 0, 41, ReplayScope::Levels);
         assert_eq!(
             out.source_id, 1,
             "the id the producer resolved, not a placeholder"
         );
         assert_eq!(out.source, venue);
+    }
+
+    // ---- order-level (L3) accumulation ----
+
+    fn order(
+        action: BookAction,
+        side: BookSide,
+        price: f64,
+        size: f64,
+        order_id: u64,
+    ) -> BookChange {
+        BookChange {
+            action,
+            side,
+            price,
+            size,
+            order_id,
+        }
+    }
+
+    /// The accumulator holds orders, and price levels are a fold over them — including the count per
+    /// level, which a price-keyed accumulator structurally cannot produce.
+    #[test]
+    fn the_accumulator_folds_orders_into_levels_with_counts() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book(
+            vec![
+                order(BookAction::Update, BookSide::Bid, 100.0, 5.0, 1),
+                order(BookAction::Update, BookSide::Bid, 100.0, 3.0, 2),
+                order(BookAction::Update, BookSide::Bid, 99.0, 1.0, 3),
+                order(BookAction::Update, BookSide::Ask, 101.0, 2.0, 4),
+            ],
+            false,
+            true,
+        ));
+        let (bids, asks) = acc.price_fold();
+        assert_eq!(
+            bids,
+            vec![(100.0, 8.0, 2), (99.0, 1.0, 1)],
+            "two orders rest at 100, and the level is their sum"
+        );
+        assert_eq!(asks, vec![(101.0, 2.0, 1)]);
+    }
+
+    /// Removing the last order at a price leaves no phantom level behind — by `Delete`, and by the
+    /// zero-size `Update` an order-level producer may send instead.
+    #[test]
+    fn removing_the_last_order_at_a_price_removes_the_level() {
+        for gone in [
+            order(BookAction::Delete, BookSide::Bid, 100.0, 0.0, 1),
+            order(BookAction::Update, BookSide::Bid, 100.0, 0.0, 1),
+        ] {
+            let mut acc = BookAccumulator::new("BTC".into());
+            acc.apply(&book(
+                vec![order(BookAction::Update, BookSide::Bid, 100.0, 5.0, 1)],
+                false,
+                true,
+            ));
+            acc.apply(&book(vec![gone], false, true));
+            assert!(acc.price_fold().0.is_empty());
+        }
+    }
+
+    /// A one-sided clear drops only that side's orders: clearing bids must not silently delete the
+    /// asks a consumer is still holding.
+    #[test]
+    fn a_one_sided_clear_spares_the_other_sides_orders() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book(
+            vec![
+                order(BookAction::Update, BookSide::Bid, 100.0, 5.0, 1),
+                order(BookAction::Update, BookSide::Ask, 101.0, 2.0, 2),
+            ],
+            false,
+            true,
+        ));
+        acc.apply(&book(
+            vec![order(BookAction::Clear, BookSide::Bid, 0.0, 0.0, 1)],
+            false,
+            true,
+        ));
+        let (bids, asks) = acc.price_fold();
+        assert!(bids.is_empty());
+        assert_eq!(asks, vec![(101.0, 2.0, 1)]);
+    }
+
+    /// A terminated batch folds however large it is: an order-level snapshot is tens of thousands of
+    /// changes in one batch, and the unterminated-event cap must not reject it.
+    #[test]
+    fn a_terminated_batch_larger_than_the_pending_cap_still_baselines() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        let mut changes = vec![order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0)];
+        changes.extend(
+            (1..=MAX_PENDING_CHANGES as u64 + 100)
+                .map(|id| order(BookAction::Update, BookSide::Bid, id as f64, 1.0, id)),
+        );
+        let n = changes.len() - 1;
+        acc.apply(&book(changes, true, true));
+        assert!(
+            acc.baselined(),
+            "a complete snapshot must count as a baseline"
+        );
+        assert_eq!(acc.price_fold().0.len(), n);
+    }
+
+    /// An event still waiting for its `last` is what the cap bounds: an unterminated stream past it is
+    /// abandoned rather than folded as a book claiming to be complete.
+    #[test]
+    fn an_unterminated_event_past_the_cap_is_abandoned() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book(
+            vec![order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0)],
+            true,
+            true,
+        ));
+        assert!(acc.baselined());
+        let flood: Vec<_> = (1..=MAX_PENDING_CHANGES as u64 + 1)
+            .map(|id| order(BookAction::Update, BookSide::Bid, id as f64, 1.0, id))
+            .collect();
+        acc.apply(&book(flood, false, false));
+        assert!(!acc.baselined());
+        assert!(acc.price_fold().0.is_empty());
+    }
+
+    /// A connecting client is bootstrapped with price levels by default, so an L2 consumer never pays
+    /// for a full order population; asking for order scope gets the orders, each with its id.
+    #[test]
+    fn replay_scope_folds_to_levels_or_materializes_orders() {
+        let venue: Arc<str> = "HYPERLIQUID".into();
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book(
+            vec![
+                order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0),
+                order(BookAction::Update, BookSide::Bid, 100.0, 5.0, 1),
+                order(BookAction::Update, BookSide::Bid, 100.0, 3.0, 2),
+            ],
+            true,
+            true,
+        ));
+
+        let levels = acc.to_book(&venue, 0, 1, ReplayScope::Levels);
+        let updates = |b: &NormalizedBook| -> Vec<BookChange> {
+            b.changes
+                .iter()
+                .filter(|c| c.action != BookAction::Clear)
+                .copied()
+                .collect()
+        };
+        let folded = updates(&levels);
+        assert_eq!(folded.len(), 1, "two orders at one price fold to one level");
+        assert_eq!(folded[0].size, 8.0);
+        assert!(
+            folded.iter().all(|c| c.order_id == 0),
+            "a price level carries no order identity"
+        );
+
+        let orders = updates(&acc.to_book(&venue, 0, 1, ReplayScope::Orders));
+        assert_eq!(
+            orders.iter().map(|c| c.order_id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "every resting order, deterministically ordered"
+        );
     }
 }

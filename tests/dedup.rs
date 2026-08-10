@@ -20,7 +20,9 @@ use doublezero_edge_connect::{
         processor::{MboProcessor, TobProcessor},
         receiver::{FrameCtx, FrameProcessor, PortRole},
     },
-    model::{BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook},
+    model::{
+        BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook, ReplayScope,
+    },
 };
 use serde_json::Value;
 use std::{
@@ -761,7 +763,12 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
     for b in &published {
         acc.apply(b);
     }
-    let full = acc.to_book(&BOOK_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+    let full = acc.to_book(
+        &BOOK_VENUE.into(),
+        BOOK_CHANNEL,
+        BOOK_INSTRUMENT,
+        ReplayScope::Orders,
+    );
     assert_eq!(
         full.changes[1..].to_vec(), // [0] is the re-baseline `clear`
         vec![

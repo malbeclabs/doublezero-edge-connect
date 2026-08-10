@@ -192,6 +192,9 @@ pub struct Metrics {
     /// key is wire-supplied, so this is the forged-market backstop: an evicted market loses its replay
     /// bootstrap, and its next batch re-baselines the consumer from whatever it accumulates again.
     pub book_markets_evicted: IntCounterVec,
+    /// Removed order ids an MBO book forgot at its resurrection-guard cap. Non-zero reopens the
+    /// resurrection path for a copy arriving later than that many removals.
+    pub mbo_removed_evicted: IntCounter,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -646,6 +649,13 @@ impl Metrics {
                  reached; an evicted market loses its replay bootstrap.",
                 &["venue"],
             ),
+            mbo_removed_evicted: counter(
+                &registry,
+                "dz_mbo_removed_evicted_total",
+                "Removed order ids forgotten because a book's resurrection guard hit its cap. \
+                 Non-zero means a very late duplicate could resurrect a dead order; sustained \
+                 non-zero means the cap is too small for this venue's churn.",
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -922,6 +932,7 @@ mod tests {
             .inc();
         m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
         m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
+        m.mbo_removed_evicted.inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -965,6 +976,7 @@ mod tests {
             "dz_arm_unmatched_trades_total",
             "dz_book_dropped_total",
             "dz_book_markets_evicted_total",
+            "dz_mbo_removed_evicted_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {

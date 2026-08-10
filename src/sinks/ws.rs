@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::{
     metrics::metrics,
-    model::{now_ns, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
+    model::{now_ns, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot, ReplayScope},
 };
 
 /// A message serialized **once** for all clients: the JSON text plus the fields the per-client
@@ -132,6 +132,11 @@ struct SubFilter {
     /// keyword; the wire name is `type`.
     #[serde(rename = "type", default)]
     msg_type: Option<String>,
+    /// How much detail this subscription's `book` bootstrap carries. Not a filter dimension — it
+    /// selects no messages, so `matches` ignores it — but it does count for subscription equality, so
+    /// re-subscribing to the same scope replays nothing while asking for the other scope bootstraps.
+    #[serde(default)]
+    book_scope: ReplayScope,
 }
 
 impl SubFilter {
@@ -302,6 +307,21 @@ fn text(value: serde_json::Value) -> WsMessage {
 /// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
 /// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
 /// state, so the overlap a connect-then-subscribe client sees is harmless.
+/// The `book_scope` to bootstrap one market at: order-level if any subscription selecting this market
+/// asked for it, price levels otherwise (and on the unfiltered connect-time replay, where there are no
+/// subscriptions yet to ask).
+fn book_scope(subs: &[SubFilter], venue: &str, symbol: &str, channel: u32) -> ReplayScope {
+    let asked = subs
+        .iter()
+        .filter(|f| f.matches(venue, Some(symbol), Some(channel), "book"))
+        .any(|f| f.book_scope == ReplayScope::Orders);
+    if asked {
+        ReplayScope::Orders
+    } else {
+        ReplayScope::Levels
+    }
+}
+
 async fn replay_scoped<W>(
     write: &mut W,
     instruments: &InstrumentSnapshot,
@@ -349,7 +369,10 @@ where
             // replaying it as full state would tell the client to discard the ones it never saw.
             .filter(|(_, acc)| acc.baselined())
             .filter(|((venue, channel, _), acc)| pass(venue, acc.symbol(), Some(*channel), "book"))
-            .map(|((venue, channel, id), acc)| FeedMessage::Book(acc.to_book(venue, *channel, *id)))
+            .map(|((venue, channel, id), acc)| {
+                let scope = book_scope(subs, venue, acc.symbol(), *channel);
+                FeedMessage::Book(acc.to_book(venue, *channel, *id, scope))
+            })
             .collect()
     };
     for m in snapshot.into_iter().chain(depths).chain(rebaselines) {
@@ -1213,6 +1236,91 @@ mod tests {
                 level_update(BookSide::Bid, 0.61, 10.0),
                 level_update(BookSide::Ask, 0.63, 20.0),
             ]
+        );
+
+        srv.abort();
+    }
+
+    /// An order-level market bootstraps as price levels by default, so an L2 client is not handed a
+    /// venue's whole order population; `book_scope: "orders"` asks for the orders, ids included.
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_selects_the_book_replay_scope() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book_batch(
+            "BTC",
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 5.0,
+                    order_id: 7,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 3.0,
+                    order_id: 8,
+                },
+            ],
+            true,
+        ));
+        let mut books = HashMap::new();
+        books.insert((Arc::<str>::from("HYPERLIQUID"), 0u32, 1u32), acc);
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed book"),
+        );
+        let updates: Vec<_> = b
+            .changes
+            .iter()
+            .filter(|c| c.action != BookAction::Clear)
+            .collect();
+        assert_eq!(
+            updates.len(),
+            1,
+            "two orders at one price fold to one level"
+        );
+        assert_eq!(updates[0].order_id, 0);
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"BTC","book_scope":"orders"}}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("order-scoped book replay"),
+        );
+        assert_eq!(
+            b.changes
+                .iter()
+                .filter(|c| c.action != BookAction::Clear)
+                .map(|c| c.order_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
         );
 
         srv.abort();
