@@ -292,9 +292,10 @@ mod tests {
     /// publisher's own `validate_port_scheme` asserts, and the one a subscriber must match exactly
     /// or it joins the right group and hears silence.
     ///
-    /// The bases are the **wire** allocation. The target allocation (34000/44000/54000) has not
-    /// migrated, and a row built from it joins the right group and receives nothing — which reads
-    /// as a dead publisher, not as a misconfiguration.
+    /// The bases are what the publishers are configured with, confirmed against the deployment
+    /// inventory on 2026-08-09. `33000/43000` is the **top-of-book sibling's** base; a
+    /// market-by-price row built on it joins the right group and receives nothing — which reads as
+    /// a dead publisher, not as a misconfiguration.
     #[test]
     fn sports_ports_are_the_base_plus_the_channel_id() {
         let row = feeds()
@@ -315,9 +316,9 @@ mod tests {
             else {
                 panic!("sports publishers bind three ports");
             };
-            assert_eq!(mktdata, 33000 + u16::from(id), "mktdata for channel {id}");
-            assert_eq!(refdata, 43000 + u16::from(id), "refdata for channel {id}");
-            assert_eq!(snapshot, 53000 + u16::from(id), "snapshot for channel {id}");
+            assert_eq!(mktdata, 34000 + u16::from(id), "mktdata for channel {id}");
+            assert_eq!(refdata, 44000 + u16::from(id), "refdata for channel {id}");
+            assert_eq!(snapshot, 54000 + u16::from(id), "snapshot for channel {id}");
         }
     }
 

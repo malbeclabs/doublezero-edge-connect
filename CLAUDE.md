@@ -178,9 +178,13 @@ Modules are grouped by role under `src/`:
   against the deployment so a transcription slip fails the build instead. A third **Lashay** row
   (`lashay-4`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
-  (ids 10-29, 39-48, 49) expanded to `33000`/`43000`/`53000 + id`. Those bases are the **wire**
-  allocation; the target (`34000`/`44000`/`54000 + id`) has **not** migrated, and a row built from it
-  joins the right group and receives nothing, which reads as a dead publisher. Never argue that the
+  (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
+  own deployment inventory on 2026-08-09. `33000`/`43000` is the **top-of-book sibling's** base, and a
+  market-by-price row built on it joins the right group and receives nothing, which reads as a dead
+  publisher rather than as a misconfiguration — this row carried those bases until that check. A
+  second publisher takes the same roster with every id offset by **+100** and the ports untouched: the
+  port names the league, so a subscriber binds one socket per league and hears both publishers on it,
+  while `channel_id` names the league *and* the publisher so the two are sequenced separately. Never argue that the
   universes are separate because their `channel_id` ranges do not overlap — the allocation is
   mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
   only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from

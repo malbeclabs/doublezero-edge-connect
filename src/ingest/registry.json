@@ -223,21 +223,25 @@
         "validate_port_scheme asserts. A subscriber that computes it differently joins the right",
         "group and hears silence.",
         "",
-        "These bases are the WIRE allocation as it stands today. The target allocation is",
-        "34000/44000/54000 + id and has NOT migrated; a row provisioned from the target joins the",
-        "right group and receives nothing, which is indistinguishable from a dead publisher. Move",
-        "these three numbers when the publisher moves, not before. The same allocation has been",
-        "decided four times upstream in dated specs, each reversing the last, which is why it lives",
-        "here and not in compiled code.",
+        "These bases are what the publishers are configured with, confirmed against the deployment",
+        "inventory on 2026-08-09: 34000/44000/54000 + id. They were 33000/43000/53000 here until",
+        "that check - 33000/43000 is the top-of-book sibling's base, and a market-by-price row built",
+        "on it joins the right group and receives nothing, which reads as a dead publisher rather",
+        "than as a misconfiguration. The same allocation has been decided several times upstream in",
+        "dated specs, each reversing the last, which is why it lives here and not in compiled code:",
+        "correcting it is an edit to this document, not a rebuild.",
         "",
-        "DEPLOYMENT. The sports lanes run on a perps host today; dedicated sports hosts do not exist",
-        "yet, so this feed has one publisher per channel and no failover. The top-of-book sibling on",
-        "group 233.84.178.17 is not yet published, which is why this document carries no row for it."
+        "DEPLOYMENT. One publisher per channel and no failover today. A second publisher takes this",
+        "same roster with every id offset by +100, leaving the ports untouched - the port names the",
+        "league so a subscriber binds one socket per league and hears both publishers on it, while",
+        "channel_id names the league AND the publisher so the two are sequenced separately. The",
+        "top-of-book sibling on group 233.84.178.17 is not yet published, which is why this document",
+        "carries no row for it."
       ],
       "publishers": {
         "derived": {
           "channels": [{ "range": [10, 29] }, { "range": [39, 48] }, { "id": 49 }],
-          "ports": { "mktdata": 33000, "refdata": 43000, "snapshot": 53000 }
+          "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 }
         }
       }
     }

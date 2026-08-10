@@ -385,7 +385,7 @@ mod tests {
             .iter()
             .map(|p| p.base_port())
             .collect();
-        assert_eq!(ports, vec![33010, 33011]);
+        assert_eq!(ports, vec![34010, 34011]);
     }
 
     /// The other half of the same property, and the one that fails if `publishers_for` ever starts

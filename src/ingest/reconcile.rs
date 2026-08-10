@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn disjoint_categories_each_hold_their_own_tape() {
         let perps_tob = ("KALSHI", "perps", TOB, 7576);
-        let sports_mbp = ("KALSHI", "sports", MBP, 33010);
+        let sports_mbp = ("KALSHI", "sports", MBP, 34010);
         let owners = tape_owners([perps_tob, sports_mbp], all_live);
         assert!(owns(&owners, &perps_tob));
         assert!(
@@ -1244,7 +1244,7 @@ mod tests {
         let narrowed = test_reconciler_with_floor(vec![sports], floor);
         let mut ports: Vec<u16> = narrowed.static_desired().feeds.iter().map(|k| k.3).collect();
         ports.sort_unstable();
-        assert_eq!(ports, vec![33010, 33011]);
+        assert_eq!(ports, vec![34010, 34011]);
 
         let wide = test_reconciler(vec![sports]);
         assert_eq!(
@@ -1360,7 +1360,7 @@ mod tests {
             vec![sports_row()],
             ChannelFloor::parse("lashay-4=10,11").unwrap(),
         );
-        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 33010u16);
+        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
 
         let hist_key = history::Key {
             source_id: 3,
@@ -1715,7 +1715,7 @@ mod tests {
         let feed = sports_row();
         let mut r =
             test_reconciler_with_floor(vec![feed], ChannelFloor::parse("lashay-4=10,11").unwrap());
-        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 33010u16);
+        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
         let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
             ("KALSHI".into(), "sports".into(), 10u32, 1u32);
         let book_key: crate::ingest::authority::MarketKey =
