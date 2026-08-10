@@ -302,13 +302,20 @@ impl Reconciler {
             return;
         };
         self.reap_finished();
-        // Driven by *a channel leaving the desired set*, not by *an abort happening* — see
-        // `forget_departed_channels` and `last_desired_feeds`'s doc. Must run before
-        // `last_desired_feeds` is updated below, and is independent of `apply_feeds`/`reap_finished`
-        // ordering since it never reads `active`.
-        self.forget_departed_channels(&desired.feeds);
+        // Which channels just left the desired set, computed against the *previous* tick's
+        // desired set (`last_desired_feeds`) before it's overwritten below — see
+        // `departed_channels`'s doc for why this, and not `active`, is the right diff.
+        let departed = Self::departed_channels(&self.last_desired_feeds, &desired.feeds);
         self.last_desired_feeds = desired.feeds.clone();
+        // Abort the departing receivers *before* purging their catalog/book/history state (N1): if
+        // the purge ran first, the still-live receiver could process one more refdata burst in the
+        // window between the purge and its own abort taking effect, silently re-inserting the very
+        // catalog entry just removed — permanently, since that map has no other removal path and
+        // this channel will not be diffed as "departing" again on any later tick.
         self.apply_feeds(&desired.feeds);
+        for key in &departed {
+            self.forget_departing_channel(key);
+        }
         self.apply_ws(desired.ws_on).await;
         self.apply_api(desired.api_on).await;
         self.apply_shred(desired.shred_sources);
@@ -509,24 +516,23 @@ impl Reconciler {
         }
     }
 
-    /// Every channel that just left the desired set (present at the end of the last tick, absent
-    /// now) has its catalog/book/history state forgotten — see `forget_departing_channel`.
+    /// Every channel that just left the desired set (present in `previous`, absent from `desired`)
+    /// — a pure diff, called from `tick` *before* `last_desired_feeds` is overwritten and *before*
+    /// `apply_feeds` runs (see `tick`'s own comment for why the actual forgetting happens after
+    /// `apply_feeds`, not here).
     ///
-    /// Diffs `last_desired_feeds` against `desired`, **not** `self.active` against `desired`
-    /// (which is what `apply_feeds`'s own `to_abort` computes): `reap_finished` runs first each
-    /// tick and already drops a self-exited receiver's key from `active`, so by the time a floor
-    /// change removes that same key from `desired` it was never in `active` to diff against, and an
-    /// `active`-based check would silently miss the departure. Basing removal on *the channel
-    /// leaving the desired set* rather than *an abort actually happening* is what closes that
-    /// window.
-    fn forget_departed_channels(&self, desired: &HashSet<FeedKey>) {
-        for key in self.last_desired_feeds.difference(desired) {
-            self.forget_departing_channel(key);
-        }
+    /// Diffs against the previous tick's full desired set, **not** `self.active` (which is what
+    /// `apply_feeds`'s own `to_abort` computes): `reap_finished` runs first each tick and already
+    /// drops a self-exited receiver's key from `active`, so by the time a floor change removes that
+    /// same key from `desired` it was never in `active` to diff against, and an `active`-based check
+    /// would silently miss the departure. Basing removal on *the channel leaving the desired set*
+    /// rather than *an abort actually happening* is what closes that window.
+    fn departed_channels(previous: &HashSet<FeedKey>, desired: &HashSet<FeedKey>) -> Vec<FeedKey> {
+        previous.difference(desired).copied().collect()
     }
 
-    /// `key` just left the desired set: if its publisher was derived from a channel
-    /// (`FeedPublisher::channel`), drop everything the query surface and a reconnecting WS client
+    /// `key` just left the desired set and its receiver (if any) has already been aborted by
+    /// `apply_feeds` (see `tick`): drop everything the query surface and a reconnecting WS client
     /// would otherwise keep serving from it — the catalog entry, the accumulated book, and the
     /// rolling trade history — so a departed channel goes fully dark rather than reading as "alive
     /// but quiet" (a frozen `best_bid`/`best_ask` beside an empty trade list is worse than no data
@@ -546,8 +552,8 @@ impl Reconciler {
     /// so this purge can over-drop a live peer universe's product sharing the departed channel id.
     /// That is a pre-existing limitation of those two maps' key shapes (not introduced here — see
     /// `history::Store::forget_channel`'s own doc), and the fix — a category-carrying identity — is
-    /// folded into the next task. `BookSnapshot`'s key (`model::BookKey`) already carries the
-    /// category, so `model::BookReplay::forget_channel` does not share this risk.
+    /// folded into the next task. `BookSnapshot`'s key (`authority::MarketKey`) already carries the
+    /// category, so `Arbiter::forget_channel_books` does not share this risk.
     ///
     /// `DepthSnapshot` (Market-by-Order's replay map) is deliberately left untouched: its key is
     /// `(venue, symbol)` with no channel dimension at all, so a channel-scoped purge cannot be
@@ -570,15 +576,33 @@ impl Reconciler {
         };
         let channel = u32::from(channel);
 
+        // N1's invariant, made loud rather than merely documented: by the time this runs, `tick`
+        // must have already aborted this key's receiver (if it was running at all) — otherwise a
+        // still-live task's next refdata burst can re-populate the catalog entry the purge below is
+        // about to remove, and nothing will purge it again (this channel is not diffed as
+        // "departing" a second time). Compiles out in release builds; active in every test and
+        // debug run, which is where a reordering regression would otherwise pass silently.
+        debug_assert!(
+            !self.active.contains_key(key),
+            "forget_departing_channel ran before its receiver was aborted (N1 regression): \
+             venue={} category={} channel={channel}",
+            feed.venue,
+            feed.category,
+        );
+
         // The catalog: a bare HashMap<(venue, channel, instrument_id), _>, so a `retain` needs no
         // seam of its own (see the category-blindness caveat above).
         crate::model::lock(&self.cfg.instruments)
             .retain(|k, _| !(k.0.as_ref() == feed.venue && k.1 == channel));
 
-        // The book: `BookKey` carries the category, so this purge cannot reach a peer universe's
-        // market the way the catalog/history purges below can.
-        let books_dropped =
-            crate::model::lock(&self.cfg.books).forget_channel(feed.venue, feed.category, channel);
+        // The book: routed through the arbiter, never hand-deleted from the replay map directly, so
+        // the accumulator, the replay entry and `StickyAuthority::last_admitted` drop together —
+        // see `Arbiter::forget_channel_books`'s doc for why a direct replay-map delete is unsafe.
+        let books_dropped = crate::ingest::arbiter::lock(&self.cfg.arbiter).forget_channel_books(
+            feed.venue,
+            feed.category,
+            channel,
+        );
 
         let history_dropped = match sources::source_id_of(feed.venue) {
             Some(source_id) => crate::model::lock(&self.cfg.history).forget_channel(source_id, channel),
@@ -1222,59 +1246,127 @@ mod tests {
         );
     }
 
+    /// The real "sports" row (group code `lashay-4`), for tests that need genuine floor narrowing —
+    /// `ChannelFloor::parse` validates against the loaded registry, so a custom `Feed` with a made-up
+    /// code cannot be narrowed at all.
+    fn sports_row() -> Feed {
+        *crate::ingest::feeds::feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row")
+    }
+
+    /// One `book` batch for a given identity, reused by the tests below that seed a real arbiter.
+    #[allow(clippy::too_many_arguments)]
+    fn book_message(
+        venue: &str,
+        source_id: u16,
+        symbol: &str,
+        channel: u32,
+        instrument_id: u32,
+        changes: Vec<crate::model::BookChange>,
+    ) -> FeedMessage {
+        FeedMessage::Book(crate::model::NormalizedBook {
+            venue: venue.into(),
+            source: venue.into(),
+            source_id,
+            symbol: symbol.into(),
+            channel,
+            instrument_id,
+            changes,
+            snapshot: false,
+            last: true,
+            source_ts_ns: 1,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        })
+    }
+
+    /// Emit an opening re-baseline (`Clear` + one level) for `key` through the reconciler's real
+    /// arbiter, so the accumulator, replay entry and authority record all populate the way real
+    /// ingest would — never a hand-built `BookReplay` insert.
+    fn seed_book(
+        r: &Reconciler,
+        venue: &str,
+        source_id: u16,
+        symbol: &str,
+        category: &'static str,
+        channel: u32,
+        instrument_id: u32,
+    ) {
+        let mut a = crate::ingest::arbiter::lock(&r.cfg.arbiter);
+        let publisher = crate::ingest::arbiter::Publisher::Edge(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+        ));
+        a.emit(
+            book_message(
+                venue,
+                source_id,
+                symbol,
+                channel,
+                instrument_id,
+                vec![crate::model::BookChange {
+                    action: crate::model::BookAction::Clear,
+                    side: crate::model::BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                }],
+            ),
+            publisher,
+            category,
+        );
+        a.emit(
+            book_message(
+                venue,
+                source_id,
+                symbol,
+                channel,
+                instrument_id,
+                vec![crate::model::BookChange {
+                    action: crate::model::BookAction::Update,
+                    side: crate::model::BookSide::Bid,
+                    price: 0.5,
+                    size: 10.0,
+                }],
+            ),
+            publisher,
+            category,
+        );
+    }
+
     /// I1's exact regression: `reap_finished` runs (and, in a real tick, would have already dropped
-    /// a self-exited receiver from `active`) *before* the floor narrows the channel away, so a
+    /// a self-exited receiver from `active`) *before* the channel leaves the desired set, so a
     /// departure check keyed on `active` (as `apply_feeds`'s own `to_abort` is) never sees it —
     /// `active` no longer holds the key by the time `desired` stops naming it either. Diffing
-    /// `last_desired_feeds` against `desired` (`forget_departed_channels`), independent of `active`
-    /// entirely, is what still catches it. This test removes the entry from `active` directly
-    /// (bypassing `apply_feeds`'s own abort path) to simulate exactly that ordering.
+    /// `last_desired_feeds` against `desired`, independent of `active` entirely, is what still
+    /// catches it.
+    ///
+    /// Drives the real `tick()` across two ticks with a genuinely **narrowing floor** on the real
+    /// `lashay-4` sports row (`ChannelFloor::parse` validates against the loaded registry, so a
+    /// custom `Feed`'s made-up code cannot be narrowed — see `sports_row`). Channel 10 departs;
+    /// channel 11 stays admitted, so `cfg.enabled` is never emptied and the row stays resolvable.
     #[tokio::test]
     async fn a_self_exited_receivers_channel_is_still_forgotten_when_it_leaves_the_desired_set() {
-        static PUB: &[FeedPublisher] = &[FeedPublisher {
-            ports: FeedPorts::ThreePort {
-                mktdata: 33007,
-                refdata: 43007,
-                snapshot: 53007,
-            },
-            channel: Some(7),
-        }];
-        let feed = Feed {
-            venue: "HYPERLIQUID",
-            category: "testcategory",
-            code: "testcode-forget",
-            kind: FeedKind::MarketByPrice,
-            group: std::net::Ipv4Addr::new(233, 84, 178, 99),
-            publishers: PUB,
-            emit_trades: true,
-            arbitration: ArbitrationMode::Sticky,
-        };
-        let mut r = test_reconciler(vec![feed]);
-        let key = (
-            "HYPERLIQUID",
-            "testcategory",
-            FeedKind::MarketByPrice,
-            33007u16,
+        let mut r = test_reconciler_with_floor(
+            vec![sports_row()],
+            ChannelFloor::parse("lashay-4=10,11").unwrap(),
         );
+        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 33010u16);
 
-        // Seed the shared store directly for channel 7 under Hyperliquid's Source ID (1) — this
-        // test is about the departure -> forget plumbing, not real ingest.
         let hist_key = history::Key {
-            source_id: 1,
-            channel: 7,
+            source_id: 3,
+            channel: 10,
             instrument_id: 1,
         };
-        {
-            let mut h = r.cfg.history.lock().unwrap();
-            h.ingest(
-                hist_key,
-                history::Print {
-                    ts_ns: 1_000 * 1_000_000_000,
-                    price: 1.0,
-                    size: 1.0,
-                },
-            );
-        }
+        r.cfg.history.lock().unwrap().ingest(
+            hist_key,
+            history::Print {
+                ts_ns: 1_000 * 1_000_000_000,
+                price: 1.0,
+                size: 1.0,
+            },
+        );
         assert!(
             !r.cfg
                 .history
@@ -1285,29 +1377,25 @@ mod tests {
             "fixture sanity: the seeded print must be queryable before the departure"
         );
 
-        // Tick 1: the channel is desired.
-        let desired1: HashSet<FeedKey> = [key].into_iter().collect();
-        r.forget_departed_channels(&desired1);
-        r.last_desired_feeds = desired1.clone();
-        r.apply_feeds(&desired1);
-        assert!(r.active.contains_key(&key));
+        // Tick 1: channels 10 and 11 both admitted.
+        r.tick().await;
+        assert!(r.active.contains_key(&key10));
 
-        // Simulate the receiver having already self-exited and been reaped BEFORE the floor
-        // narrows the channel away — removed from `active` directly, bypassing `apply_feeds`'s own
-        // abort path, exactly as `reap_finished` would for a task that died on its own.
-        let (h, tape) = r.active.remove(&key).expect("the receiver was running");
+        // Simulate the receiver having already self-exited and been reaped BEFORE the floor narrows
+        // the channel away — removed from `active` directly, bypassing `apply_feeds`'s own abort
+        // path, exactly as `reap_finished` would for a task that died on its own.
+        let (h, tape) = r.active.remove(&key10).expect("the receiver was running");
         tape.store(false, std::sync::atomic::Ordering::Relaxed);
         h.abort();
         assert!(
-            !r.active.contains_key(&key),
+            !r.active.contains_key(&key10),
             "fixture sanity: already reaped before the departure"
         );
 
-        // Tick 2: the channel leaves the desired set. `active` no longer holds the key at all, so a
-        // diff against `active` (the pre-fix behaviour) would find nothing to forget.
-        let desired2: HashSet<FeedKey> = HashSet::new();
-        r.forget_departed_channels(&desired2);
-        r.last_desired_feeds = desired2;
+        // Tick 2: narrow the floor to channel 11 only. `active` no longer holds channel 10's key at
+        // all, so a diff against `active` (the pre-fix behaviour) would find nothing to forget.
+        *r.cfg.floor.lock().unwrap() = ChannelFloor::parse("lashay-4=11").unwrap();
+        r.tick().await;
 
         assert!(
             r.cfg
@@ -1326,8 +1414,17 @@ mod tests {
     /// venue's departure would misattribute to (or be silently skipped in favour of) the other. Both
     /// rows share the exact same channel id, so a code-once resolution bug can't hide behind the
     /// channel ids happening to differ.
-    #[tokio::test]
-    async fn departing_channels_on_a_shared_code_resolve_their_own_rows_source_id() {
+    ///
+    /// Calls `forget_departing_channel` directly (not through `tick()`): this scenario — one group
+    /// `code` spanning rows on two *different* venues — has no real registry row to validate a
+    /// floor narrowing against (`ChannelFloor::parse` only accepts codes the loaded registry
+    /// carries), and shrinking `cfg.enabled` between ticks would remove the very row entry this
+    /// method needs to resolve the departing key's venue/channel from, defeating the scenario
+    /// entirely. `tick()`'s own ordering and the book-purge routing are what the dedicated
+    /// `a_narrowed_channel_is_purged_from_all_three_maps_via_a_real_tick` test below covers; this one
+    /// is scoped to the per-row resolution step alone.
+    #[test]
+    fn departing_channels_on_a_shared_code_resolve_their_own_rows_source_id() {
         static PUB_A: &[FeedPublisher] = &[FeedPublisher {
             ports: FeedPorts::ThreePort {
                 mktdata: 33020,
@@ -1364,7 +1461,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
         };
-        let mut r = test_reconciler(vec![feed_a, feed_b]);
+        let r = test_reconciler(vec![feed_a, feed_b]);
         let key_a = (
             "HYPERLIQUID",
             "testcategory",
@@ -1403,16 +1500,8 @@ mod tests {
             );
         }
 
-        let desired1: HashSet<FeedKey> = [key_a, key_b].into_iter().collect();
-        r.forget_departed_channels(&desired1);
-        r.last_desired_feeds = desired1.clone();
-        r.apply_feeds(&desired1);
-
-        // Both rows depart in the same tick.
-        let desired2: HashSet<FeedKey> = HashSet::new();
-        r.forget_departed_channels(&desired2);
-        r.last_desired_feeds = desired2.clone();
-        r.apply_feeds(&desired2);
+        r.forget_departing_channel(&key_a);
+        r.forget_departing_channel(&key_b);
 
         let store = r.cfg.history.lock().unwrap();
         assert!(
@@ -1428,48 +1517,43 @@ mod tests {
 
     /// C1: after a channel departs, the **query surface** — not just an internal map — must reflect
     /// it. A product still listed with a frozen `best_bid`/`best_ask` beside an empty trade list
-    /// reads as "alive but quiet," which is worse than nothing being served at all. Drives the real
-    /// `/v1` handler over the same shared `InstrumentSnapshot` the reconciler purges, so this fails
-    /// if the catalog purge (not just the history purge) is ever dropped.
+    /// reads as "alive but quiet," which is worse than nothing being served at all. Seeds **all
+    /// three** maps (catalog, book via the real arbiter, history) so this pins the whole purge, not
+    /// the catalog alone, and drives the real `tick()` across two ticks with a narrowing floor on
+    /// the real sports row (see `sports_row`/`a_self_exited_receivers_...` for why a custom-code row
+    /// can't be narrowed).
     #[tokio::test]
     async fn a_departed_channels_product_is_invisible_to_the_query_surface() {
-        static PUB: &[FeedPublisher] = &[FeedPublisher {
-            ports: FeedPorts::ThreePort {
-                mktdata: 33030,
-                refdata: 43030,
-                snapshot: 53030,
-            },
-            channel: Some(30),
-        }];
-        let feed = Feed {
-            venue: "HYPERLIQUID",
-            category: "testcategory",
-            code: "testcode-forget-query",
-            kind: FeedKind::MarketByPrice,
-            group: std::net::Ipv4Addr::new(233, 84, 178, 95),
-            publishers: PUB,
-            emit_trades: true,
-            arbitration: ArbitrationMode::Sticky,
-        };
-        let mut r = test_reconciler(vec![feed]);
-        let key = (
-            "HYPERLIQUID",
-            "testcategory",
-            FeedKind::MarketByPrice,
-            33030u16,
+        let mut r = test_reconciler_with_floor(
+            vec![sports_row()],
+            ChannelFloor::parse("lashay-4=10,11").unwrap(),
         );
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), 30u32, 1u32),
+            ("KALSHI".into(), 10u32, 1u32),
             crate::model::NormalizedInstrument {
-                venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
-                source_id: 1,
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
                 symbol: "DEPARTED".into(),
-                channel: 30,
+                channel: 10,
                 instrument_id: 1,
-                price_exponent: -2,
-                qty_exponent: -5,
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+        seed_book(&r, "KALSHI", 3, "DEPARTED", "sports", 10, 1);
+        let hist_key = history::Key {
+            source_id: 3,
+            channel: 10,
+            instrument_id: 1,
+        };
+        r.cfg.history.lock().unwrap().ingest(
+            hist_key,
+            history::Print {
+                ts_ns: 1_000 * 1_000_000_000,
+                price: 1.0,
+                size: 1.0,
             },
         );
 
@@ -1485,8 +1569,9 @@ mod tests {
         ));
         let base = format!("http://{addr}");
 
-        // Fixture sanity: the product resolves before the departure.
-        let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:DEPARTED"))
+        // Fixture sanity: the product resolves, with a real book and trade history, before the
+        // departure.
+        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:DEPARTED"))
             .await
             .unwrap();
         assert_eq!(
@@ -1494,16 +1579,28 @@ mod tests {
             200,
             "fixture sanity: the product must resolve before departure"
         );
+        let ticker = reqwest::get(format!("{base}/v1/products/KALSHI:DEPARTED/ticker"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert!(
+            !ticker["trades"].as_array().unwrap().is_empty(),
+            "fixture sanity: history must be seeded before departure: {ticker}"
+        );
+        assert!(
+            ticker["best_bid"].is_string(),
+            "fixture sanity: the book must be seeded before departure: {ticker}"
+        );
 
-        let desired1: HashSet<FeedKey> = [key].into_iter().collect();
-        r.forget_departed_channels(&desired1);
-        r.last_desired_feeds = desired1;
+        // Tick 1: channels 10 and 11 both admitted.
+        r.tick().await;
+        // Tick 2: narrow the floor to channel 11 only — channel 10 departs.
+        *r.cfg.floor.lock().unwrap() = ChannelFloor::parse("lashay-4=11").unwrap();
+        r.tick().await;
 
-        let desired2: HashSet<FeedKey> = HashSet::new();
-        r.forget_departed_channels(&desired2);
-        r.last_desired_feeds = desired2;
-
-        let resp = reqwest::get(format!("{base}/v1/products/HYPERLIQUID:DEPARTED"))
+        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:DEPARTED"))
             .await
             .unwrap();
         assert_eq!(
@@ -1511,6 +1608,102 @@ mod tests {
             404,
             "a departed channel's product must vanish from the query surface, not read as \
              alive-but-quiet"
+        );
+    }
+
+    /// N1 + N2 + N3, the deliverable: drives the real `tick()` (not a hand-called helper) across two
+    /// ticks with a genuinely **narrowing floor** (the real `lashay-4` sports row, via
+    /// `ChannelFloor::parse`), seeding all three maps a departure purges — the catalog, the book
+    /// (through the real arbiter, not a hand-built `BookReplay`), and history.
+    ///
+    /// Fails on an N1 regression (the purge moved back above `apply_feeds`) because
+    /// `forget_departing_channel`'s own `debug_assert!` trips the moment the departing key is still
+    /// in `active` — a plain panic, not a silent pass. Fails on an N2 regression (the book purge
+    /// deleted) because the book assertions below check `cfg.books` directly: nothing else in this
+    /// crate would otherwise clear it for a departed channel.
+    #[tokio::test]
+    async fn a_narrowed_channel_is_purged_from_all_three_maps_via_a_real_tick() {
+        let feed = sports_row();
+        let mut r =
+            test_reconciler_with_floor(vec![feed], ChannelFloor::parse("lashay-4=10,11").unwrap());
+        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 33010u16);
+        let catalog_key: (Arc<str>, u32, u32) = ("KALSHI".into(), 10u32, 1u32);
+        let book_key: crate::ingest::authority::MarketKey =
+            (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
+        let hist_key = history::Key {
+            source_id: 3,
+            channel: 10,
+            instrument_id: 1,
+        };
+
+        // Tick 1: both channel 10 and 11 admitted.
+        r.tick().await;
+        assert!(
+            r.active.contains_key(&key10),
+            "fixture sanity: channel 10 is running after tick 1"
+        );
+
+        // Seed all three maps for channel 10's identity (KALSHI, source_id 3, channel 10).
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            crate::model::NormalizedInstrument {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "NARROWED".into(),
+                channel: 10,
+                instrument_id: 1,
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+        seed_book(&r, "KALSHI", 3, "NARROWED", "sports", 10, 1);
+        r.cfg.history.lock().unwrap().ingest(
+            hist_key,
+            history::Print {
+                ts_ns: 1_000 * 1_000_000_000,
+                price: 1.0,
+                size: 1.0,
+            },
+        );
+
+        // Fixture sanity: all three populated before the narrowing.
+        assert!(r.cfg.instruments.lock().unwrap().contains_key(&catalog_key));
+        assert!(crate::model::lock(&r.cfg.books).contains_key(&book_key));
+        assert!(!r
+            .cfg
+            .history
+            .lock()
+            .unwrap()
+            .candles(&hist_key, 60, 10, 1_100)
+            .is_empty());
+
+        // Narrow the floor: channel 10 departs, channel 11 stays admitted.
+        *r.cfg.floor.lock().unwrap() = ChannelFloor::parse("lashay-4=11").unwrap();
+
+        // Tick 2: the real `tick()` aborts the receiver and purges its state.
+        r.tick().await;
+
+        assert!(
+            !r.active.contains_key(&key10),
+            "channel 10's receiver must be aborted"
+        );
+        assert!(
+            !r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "the catalog entry must be purged"
+        );
+        assert!(
+            !crate::model::lock(&r.cfg.books).contains_key(&book_key),
+            "the book replay entry must be purged through the arbiter"
+        );
+        assert!(
+            r.cfg
+                .history
+                .lock()
+                .unwrap()
+                .candles(&hist_key, 60, 10, 1_100)
+                .is_empty(),
+            "history must be purged"
         );
     }
 
@@ -1522,15 +1715,20 @@ mod tests {
 
     fn test_reconciler_with_floor(enabled: Vec<Feed>, floor: ChannelFloor) -> Reconciler {
         let (tx, _rx) = broadcast::channel(16);
+        // The arbiter's own `book_replay` must point at the *same* `BookSnapshot` handed to
+        // `ReconcilerConfig::books` (the object `sinks::api`/`sinks::ws` read and this test module's
+        // assertions check) — otherwise `Arbiter::forget_channel_books` purges a replay map nothing
+        // else ever sees, and a test seeding books only through `cfg.books` directly would never
+        // exercise the real path at all.
+        let books: crate::model::BookSnapshot = Default::default();
+        let mut arbiter = crate::ingest::arbiter::Arbiter::new(tx.clone(), 16);
+        arbiter.set_book_replay(books.clone());
         Reconciler::new(ReconcilerConfig {
-            arbiter: Arc::new(std::sync::Mutex::new(crate::ingest::arbiter::Arbiter::new(
-                tx.clone(),
-                16,
-            ))),
+            arbiter: Arc::new(std::sync::Mutex::new(arbiter)),
             tx,
             instruments: Default::default(),
             depth: Default::default(),
-            books: Default::default(),
+            books,
             enabled,
             floor: Arc::new(Mutex::new(floor)),
             iface: "127.0.0.1".into(),

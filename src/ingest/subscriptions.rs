@@ -59,14 +59,25 @@ struct StatusEntry {
 
 /// Parse the subscribed group **codes** from `doublezero status --json`. Each `multicast_groups`
 /// token is `ROLE:code`; we keep subscriber (`S:`) entries (the bridge only ever receives), strip
-/// the role prefix, and tolerate a bare `code` with no prefix. A parse error yields an empty list
-/// (soft-fail).
-pub fn parse_status_codes(stdout: &[u8]) -> Vec<String> {
+/// the role prefix, and tolerate a bare `code` with no prefix.
+///
+/// Returns `None` when the top-level JSON does not even parse as the expected array-of-entries
+/// shape — an upstream CLI output-format change, not a legitimate host state. That distinction
+/// matters to the caller (`detect`): a format change must read as `Detected::Unavailable` (fail
+/// open, keep the current activations — the same promise fail-open already makes everywhere else),
+/// never as "this host is subscribed to nothing," which would tear down every market-data receiver
+/// plus (since the channel-departure purge landed) the catalog, book and trade history for every
+/// channel this process runs.
+///
+/// `Some(codes)` — `codes` possibly empty — is the honest, structurally-parsed answer: an IBRL
+/// session, or any host truly holding no multicast subscriptions, is a *real* zero-subscription
+/// state and must proceed as such, not be conflated with a parse failure.
+pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
     let entries: Vec<StatusEntry> = match serde_json::from_slice(stdout) {
         Ok(e) => e,
         Err(e) => {
-            warn!(%e, "could not parse `doublezero status --json`; treating as no subscriptions");
-            return Vec::new();
+            warn!(%e, "could not parse `doublezero status --json`; reporting Unavailable (not zero subscriptions)");
+            return None;
         }
     };
     let mut out = Vec::new();
@@ -92,7 +103,7 @@ pub fn parse_status_codes(stdout: &[u8]) -> Vec<String> {
             }
         }
     }
-    out
+    Some(out)
 }
 
 /// Run `doublezero status --json` (always) and `doublezero multicast group list --json-compact`
@@ -104,7 +115,13 @@ pub fn detect(need_group_ips: bool) -> Detected {
         CliOut::Missing => return Detected::CliMissing,
         CliOut::Err => return Detected::Unavailable,
     };
-    let subscribed_codes: HashSet<String> = parse_status_codes(&status).into_iter().collect();
+    // `None` here means the JSON didn't even parse as the expected shape (a format change), which
+    // is transient/`Unavailable` by the same fail-open rule as every other soft-fail in this
+    // module — never read as "this host subscribes to nothing" (see `parse_status_codes`'s doc).
+    let Some(codes) = parse_status_codes(&status) else {
+        return Detected::Unavailable;
+    };
+    let subscribed_codes: HashSet<String> = codes.into_iter().collect();
 
     // The group list is only needed to resolve shred-group IPs (market-data IPs come from FEEDS).
     // A failure here doesn't invalidate the status-based market-data/WS gating, so it degrades to an
@@ -204,7 +221,10 @@ mod tests {
     ]"#;
 
     fn codes(json: &str) -> HashSet<String> {
-        parse_status_codes(json.as_bytes()).into_iter().collect()
+        parse_status_codes(json.as_bytes())
+            .expect("must parse for this fixture")
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -244,20 +264,44 @@ mod tests {
         );
     }
 
+    /// A well-formed response reporting no multicast groups at all (an IBRL session, or an empty
+    /// `multicast_groups` field) is a **real** zero-subscription state: `Some(vec![])`, never
+    /// `None`. Distinct from `unparseable_json_reports_none_not_an_empty_list` below on purpose — a
+    /// test covering only one of the two branches cannot tell a `None`-vs-`Some(empty)` regression
+    /// apart, which is exactly the bug this pair of tests exists to catch.
     #[test]
-    fn entries_without_groups_yield_nothing() {
-        // An IBRL session with no multicast_groups field, and an empty string, both -> nothing.
-        assert!(parse_status_codes(br#"[{"response":{"user_type":"IBRL"}}]"#).is_empty());
-        assert!(parse_status_codes(br#"[{"multicast_groups":""}]"#).is_empty());
-        assert!(parse_status_codes(br#"[{"multicast_groups":null}]"#).is_empty());
+    fn a_well_formed_response_with_no_groups_reports_some_empty_not_none() {
+        assert_eq!(
+            parse_status_codes(br#"[{"response":{"user_type":"IBRL"}}]"#),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_status_codes(br#"[{"multicast_groups":""}]"#),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_status_codes(br#"[{"multicast_groups":null}]"#),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_status_codes(b"[]"),
+            Some(Vec::new()),
+            "an empty array of entries is also a legitimate zero-subscription response"
+        );
     }
 
+    /// The other branch: the JSON does not even parse as the expected array-of-entries shape — an
+    /// upstream CLI output-format change, not a legitimate host state. Must report `None` so
+    /// `detect` returns `Detected::Unavailable` (fail open, keep current activations) rather than
+    /// reading the format change as "this host subscribes to nothing" and, since the
+    /// channel-departure purge landed, tearing down the catalog/book/history for every channel this
+    /// process runs.
     #[test]
-    fn invalid_json_yields_nothing() {
-        assert!(parse_status_codes(b"").is_empty());
-        assert!(parse_status_codes(b"not json").is_empty());
-        assert!(parse_status_codes(b"{\"multicast_groups\":\"S:x\"}").is_empty());
-        // object, not array
+    fn unparseable_json_reports_none_not_an_empty_list() {
+        assert_eq!(parse_status_codes(b""), None);
+        assert_eq!(parse_status_codes(b"not json"), None);
+        // A JSON object, not an array — the same "wrong shape" case, just a different flavor of it.
+        assert_eq!(parse_status_codes(b"{\"multicast_groups\":\"S:x\"}"), None);
     }
 
     fn subs(codes: &[&str], code_ip: &[(&str, Ipv4Addr)]) -> HostSubs {
