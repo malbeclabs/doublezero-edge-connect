@@ -55,19 +55,30 @@ no `l4Book` subscription, so nothing in Nautilus will ever ask for one, and its 
 order id `0`. Order-level is available to a client that asks for `l4Book` — our own adapter, or
 Nautilus once someone extends it. "Hyperliquid-compatible" does not mean "Nautilus gets L3".
 
-**Three fields the wire cannot supply.** Hyperliquid's schema describes a venue that also owns the
-account model; our input is an order book. A trade's `users` and `hash`, an order's `user` and its
-`triggerCondition`/`orderType`/`tif`/`cloid` block, and `l4Book`'s `height` are emitted as null or
+**What the wire cannot supply.** Hyperliquid's schema describes a venue that also owns the account
+model; our input is an order book. A trade's `users` and `hash`, an order's `user`, `timestamp` and
+its `triggerCondition`/`orderType`/`tif`/`cloid` block, and `l4Book`'s `height` are emitted as null or
 zero so a client written against the publisher still parses the frames — a consumer must not read
-meaning into them. `l4Book`'s `order_statuses` is always empty for the same reason, and its order
-diffs use `new`/`remove` only: our changes carry an order's absolute resulting quantity and no prior
-one, so the publisher's `update{origSz,newSz}` could only be fabricated.
+meaning into them. In particular `timestamp` is **0, not the book's event time**: stamping the event
+time would give every order in a snapshot the same plausible placement time, which a consumer ranking
+queue priority or ageing orders would read as real. `l4Book`'s `order_statuses` is always empty for
+the same reason, and its order diffs use `new`/`remove` only: our changes carry an order's absolute
+resulting quantity and no prior one, so the publisher's `update{origSz,newSz}` could only be
+fabricated. On `trades`, a print whose aggressor side the venue did not report is **dropped** rather
+than guessed: `side` is the one field on that channel a consumer acts on directionally and
+Hyperliquid's schema has no "unknown", so the compat tape can be shorter than the normalized one.
 
 Both book channels publish a market only once the bridge holds its **complete** book. `l2Book`
 replaces a consumer's book wholesale on every frame and an `l4Book` snapshot claims completeness, so
 a market accumulated mid-stream — before a producer re-baseline — is withheld rather than published
-as if it were whole. Observability is `dz_hl_sink_clients` and `dz_hl_sink_messages_total{channel}`.
-There is **no TLS**, as with the rest of the service surface.
+as if it were whole.
+
+Client limits are fixed rather than configurable (64 clients, 256 subscriptions each, 600 inbound
+control frames per minute, a 20s heartbeat with a 60s idle reap). The rate limit is the one that
+matters: a subscribe frame is tens of bytes and can cost a whole book to answer. Rendering never runs
+while the shared book map is locked — that mutex is the one the ingest emit path takes, so holding it
+across a book render would stall receivers on *every* feed. Observability is `dz_hl_sink_clients` and
+`dz_hl_sink_messages_total{channel}`. There is **no TLS**, as with the rest of the service surface.
 
 ## Metrics (Prometheus)
 

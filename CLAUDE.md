@@ -497,15 +497,27 @@ Modules are grouped by role under `src/`:
   (`l2Book`/`trades` field names and types, the `B`/`A` side spelling, `{"channel":"pong"}` for its
   30s `{"method":"ping"}`), and the **DZ Hyperliquid publisher** (`malbeclabs/hyperliquid`,
   `app/publisher/server/src`) is the only authority for `l4Book`, the significant-figure arithmetic and
-  the `nLevels` extension. ⚠️ Both book channels are gated on `BookAccumulator::baselined()`: an
+  the `nLevels` extension. ⚠️ **No rendering happens under the shared `BookSnapshot` lock** — that is
+  the mutex the arbiter's `apply_book_replay` takes on every published batch, so a book render held
+  across it stalls every receiver on every feed; `take_market`/`take_markets` clone the accumulator out
+  and everything O(book) runs after the guard drops, and the `price_fold` behind a client's `l2Book`
+  subscriptions is computed **once per market per message** (it is view-independent, so folding per
+  subscription would let one client multiply a 44k-order book by `MAX_SUBS`). Both book channels are
+  gated on `baselined() && is_order_level()`: an
   `l2Book` frame *replaces* a Nautilus consumer's book wholesale and an `l4Book` snapshot claims
-  completeness, so a market accumulated mid-stream must be withheld, not published as if whole. An
+  completeness, so a market accumulated mid-stream must be withheld, not published as if whole — and a
+  price-aggregated market, whose orders this sink cannot read, would render as an empty book. An
   out-of-range `nSigFigs`/`mantissa` is **rejected** rather than coerced (a substituted bucket yields
   prices that look like the venue's and are not); `nLevels` only truncates, so it clamps. The schema's
-  account-model fields (`users`/`hash`, an order's `user`/`orderType`/`tif`/`cloid`, `height`,
-  `order_statuses`) have no counterpart on the MBO wire and are null/zero/empty — parseable, never
-  meaningful; order diffs are `new`/`remove` only, since `update{origSz,newSz}` would need a prior
-  quantity we do not carry.
+  account-model fields (`users`/`hash`, an order's `user`/`timestamp`/`orderType`/`tif`/`cloid`,
+  `height`, `order_statuses`) have no counterpart on the MBO wire and are null/zero/empty — parseable,
+  never meaningful. `timestamp` is deliberately `0` rather than the book's event time: that stamp is one
+  instant shared by every order in a snapshot, which a consumer ageing orders reads as real. Order diffs
+  are `new`/`remove` only, since `update{origSz,newSz}` would need a prior quantity we do not carry.
+  The accept loop never propagates an error (this task's `Err` reaches `main`'s `select!` and would exit
+  the process; unlike `ws`'s, no reconciler respawns it), and the client limits are constants, of which
+  the inbound rate cap is the load-bearing one — a subscribe frame is tens of bytes and costs a whole
+  book to answer, and the `subs.contains` guard cannot see an unsubscribe-then-resubscribe loop.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
   `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
