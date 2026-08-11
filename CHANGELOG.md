@@ -55,6 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when) two candidates would otherwise render identically. The product id format is unchanged.
 
 ### Added
+- `doublezero-edge` is now packaged as a signed deb and rpm, built as a static musl binary and
+  published to the same repositories as the DoubleZero client — so installing it needs no new key
+  and no new trust decision. The package carries the binary and shell completions and nothing else:
+  no dependencies, no maintainer scripts, no unit files, which is what makes it safe for
+  `scripts/connect.sh` to offer from a prompt. A `completion` subcommand generates the bundled
+  scripts at build time.
+- `scripts/connect.sh` offers to install that package once the bridge is up. The prompt states what
+  it will do — run the vendor's repository setup script as root, then install one package — before
+  doing any of it. `DZ_INSTALL_CLI=1|0` answers non-interactively. Declining, a package-manager
+  failure, or a run with no terminal all leave the bridge running and the installer exiting success:
+  the bridge is the product and the CLI is a convenience.
+- The image now defaults `DZ_FEED_REGISTRY_URL` to the hosted feed registry, overridable with `-e`
+  or by bind-mounting a document. A host that cannot reach it falls back to the built-in copy
+  silently by design, so `connect.sh` prints which source actually resolved.
 - A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus
   a bounded ring of recent prints, per product, fed from the post-arbiter broadcast — so every print
   arriving here is already deduplicated on `trade_id` and gated by the tape leader, one copy per
