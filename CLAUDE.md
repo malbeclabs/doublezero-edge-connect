@@ -10,7 +10,8 @@ data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks four ed
 sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
-re-serves it as full-state `depth`), and **Market-by-Price** (magic `0x4442`; the bridge
+re-serves it both as full-state `depth` and as the order-level incremental `book`, carrying the venue's
+own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
 reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
 row selects it, on a group that is live). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
@@ -326,8 +327,11 @@ Modules are grouped by role under `src/`:
   `side` maps `bid->buy`/`ask->sell`. No `FEEDS` row depends on it (off until enabled).
 - **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
-  `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
-  + trades), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
+  `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`,
+  the order-level `book` and trades — `emit_book` mirrors `emit_depth`'s gates exactly, and each book's
+  sync state is reported to the arbiter *before* the frame's emissions so the re-baseline suppression has
+  a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy arm and
+  suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
   incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
@@ -398,7 +402,16 @@ Modules are grouped by role under `src/`:
   bodies legally grew, and the whole feed would decode to `Other`.
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
-  Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
+  Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth` **and**
+  the order-level changes the `book` product is built from — `on_delta_reporting` appends one
+  `OrderChange` (raw ints, absolute resulting quantity) per applied event and nothing for one it
+  rejects, and `order_set` materializes the whole book, deterministically ordered so two publishers'
+  copies compare byte-for-byte. **The removed-order guard is what carries correctness under racing**
+  (`MAX_REMOVED_ORDERS`, `dz_mbo_removed_evicted_total`): a venue never reuses an `order_id`, so an
+  `Add` for an id this book has removed is a late copy and is refused outright — which is why the
+  arbiter's dedup window is a cost knob and not a correctness parameter. The refused event still
+  consumes its sequence number, or the next contiguous delta would read as a gap. Session and
+  instrument resets, and a snapshot install, all clear the set: each is a fresh id space.
 - **`ingest/pricebook.rs`** — `PriceBook`: per-instrument **price-keyed** book + the market-by-price
   snapshot+delta recovery machine (`AwaitingSnapshot`/`BuildingSnapshot`/`Ready`/`Gap`). A **sibling**
   of `book.rs`, not a reuse: the wire is already price-aggregated and each level carries its absolute
@@ -447,7 +460,13 @@ Modules are grouped by role under `src/`:
   `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
   absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
   reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`
-  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookSnapshot`
+  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookChange` carries
+  `order_id` (`0` = price-aggregated), and `BookAccumulator` keys order-level changes by it while keeping
+  the price maps for the aggregated kind; `price_fold` folds the orders into levels **with a count per
+  level**, which a price-keyed accumulator structurally cannot produce, and `to_book(ReplayScope)`
+  materializes either rendering. Its pending-change cap now bounds only an event still awaiting its
+  `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
+  baseline. `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
@@ -480,10 +499,12 @@ Modules are grouped by role under `src/`:
   `InstrumentReset`/`Heartbeat`/`EndOfSession` have **no fixture** (offset-test-only — confirm
   against a live frame before a live MBO feed). No `FEEDS` row uses these kinds until their
   endpoints are confirmed.
-- **MBO is re-served as derived full-state `depth`, never raw deltas.** The bridge reconstructs the
-  L3 book and runs snapshot+delta recovery internally (`book.rs`), so the WS contract's "every
-  message is full state and self-heals" guarantee holds. Do not expose order add/cancel/execute
-  events on the wire.
+- **MBO is re-served as two derived products, never raw deltas.** The bridge reconstructs the L3 book
+  and runs snapshot+delta recovery internally (`book.rs`), then derives full-state `depth` (top-N) and
+  the order-level incremental `book` from it. A `book` change is one order's **absolute resulting
+  state**, not the wire's add/cancel/execute event, and a recovery still surfaces only as a
+  `Clear`-led re-baseline — do not expose the raw order events. `depth` is additive and unchanged:
+  there are testers on it, and deleting it is its own change (PROTOCOL.md v2).
 - **Four latency timestamps** ride every quote: `source_ts_ns` (venue), `kernel_rx_ts_ns`
   (`SO_TIMESTAMPNS`, captured in the driver softirq — best-effort, falls back to 0), `recv_ts_ns`
   (user-space post-decode), `ws_send_ts_ns` (stamped in `sinks/ws.rs` just before send). `0` is
