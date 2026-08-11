@@ -433,6 +433,38 @@ fn join_ports(ports: &[u16]) -> String {
         .join(", ")
 }
 
+/// Fail startup if the channel filter, applied to the already `--feed`/`--publisher-port`-narrowed
+/// `enabled` set, admits zero publishers of some enabled feed.
+///
+/// `ChannelFilter::parse` validates a clause against the **whole** registry, so a spec valid there
+/// can still cross with `--feed`/`--publisher-port`'s narrowing to leave a feed with nothing
+/// admitted: e.g. `--publisher-port` keeps only one derived channel's publisher, and `--channels`
+/// then names a different (individually valid) channel on that same code. The existing loop above
+/// this call only warns when a clause's *code* is absent from `enabled` entirely — it says nothing
+/// when the code is present but every one of its admitted ids was narrowed away by
+/// `--publisher-port`. The result is a feed silently left with no publisher, which takes the WS
+/// sink, query API and history feeder down with it if it was the only market-data feed running —
+/// with no warning at all. A channel filter that silently admits nothing is worse than one that
+/// refuses to start.
+fn check_channel_filter_covers_enabled(
+    enabled: &[feeds::Feed],
+    filter: &ingest::channel_filter::ChannelFilter,
+) -> Result<()> {
+    for f in enabled {
+        if filter.publishers_for(f).is_empty() {
+            bail!(
+                "channel filter admits no publisher of enabled feed {} ({}, code {}); \
+                 --publisher-port and --channels together leave it with zero publishers - \
+                 narrow one of them less aggressively",
+                f.venue,
+                f.category,
+                f.code
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // RUST_LOG, when set, is honored verbatim. Unset, we default to a quiet base of `warn`
@@ -491,6 +523,10 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // A code present in `enabled` can still end up with zero admitted publishers once
+    // `--publisher-port` and `--channels` are combined - the warn loop above only catches a code
+    // absent entirely. Fatal, not a warning: see the function's docs.
+    check_channel_filter_covers_enabled(&enabled, &filter)?;
 
     info!(
         feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), filter.publishers_for(f).len())).collect::<Vec<_>>(),
@@ -900,5 +936,70 @@ mod tests {
     fn unknown_publisher_base_port_is_an_error() {
         registry();
         assert!(filter_publishers(select_feeds(&[]).unwrap(), &[1234]).is_err());
+    }
+
+    /// The regression this pins: a `--publisher-port` + `--channels` combination that empties an
+    /// enabled feed while both, taken alone, are valid against the whole registry. `--publisher-port`
+    /// keeps only the sports (`lashay-4`) feed's channel-10 publisher; `--channels lashay-4=11` is a
+    /// perfectly valid clause against the full 31-channel roster, but channel 11's publisher was
+    /// never in the narrowed `enabled` set to begin with, so it admits nothing.
+    #[test]
+    fn a_publisher_port_and_channel_filter_combo_that_empties_a_feed_is_refused() {
+        registry();
+        let sports = feeds::feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row");
+        let chan10_port = sports
+            .publishers
+            .iter()
+            .find(|p| p.channel == Some(10))
+            .expect("channel 10 is in the sports roster")
+            .base_port();
+
+        let enabled = filter_publishers(
+            select_feeds(&[sports.venue.to_string()]).unwrap(),
+            &[chan10_port],
+        )
+        .unwrap();
+        assert_eq!(
+            enabled.len(),
+            1,
+            "only the sports feed's channel-10 publisher should remain"
+        );
+
+        // Individually valid against the whole registry (11 is in the sports roster), but it names
+        // a channel that --publisher-port already excluded.
+        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=11").unwrap();
+
+        let err = check_channel_filter_covers_enabled(&enabled, &filter)
+            .expect_err("a feed left with zero admitted publishers must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("lashay-4"), "{msg}");
+    }
+
+    /// The same combination when the filter still admits the surviving publisher must pass.
+    #[test]
+    fn a_channel_filter_that_still_admits_the_narrowed_publisher_is_fine() {
+        registry();
+        let sports = feeds::feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row");
+        let chan10_port = sports
+            .publishers
+            .iter()
+            .find(|p| p.channel == Some(10))
+            .expect("channel 10 is in the sports roster")
+            .base_port();
+
+        let enabled = filter_publishers(
+            select_feeds(&[sports.venue.to_string()]).unwrap(),
+            &[chan10_port],
+        )
+        .unwrap();
+
+        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=10").unwrap();
+        assert!(check_channel_filter_covers_enabled(&enabled, &filter).is_ok());
     }
 }

@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing that key (a server predating it) failed to deserialize instead of defaulting — losing
   the drop preview and, without `--force`, refusing `channels set` outright, on exactly the server
   skew `#[serde(default)]` exists to tolerate. Both now default a missing key to an empty object.
+- `--publisher-port` combined with `--channels` could narrow an enabled feed to zero publishers
+  with no warning (a channel-filter clause can be individually valid against the whole registry
+  while naming a channel `--publisher-port` already excluded), silently taking the WS sink, query
+  API and history feeder down. Startup now refuses that combination.
+- The same combination via `POST /admin/channels` returned `200` and emptied the feed on the
+  reconciler's next tick. It now returns `400` and leaves the prior channel filter in force.
 
 ### Added
 - A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus

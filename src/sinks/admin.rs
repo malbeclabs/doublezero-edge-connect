@@ -151,6 +151,15 @@ fn get_channels(state: &AdminState) -> Response {
 /// other startup refusal are refused here identically, for the same reasons (see
 /// `ingest::channel_filter`'s docs).
 ///
+/// A spec that parses fine on its own can still, combined with `state.enabled` (this process's own
+/// `--feed`/`--publisher-port` narrowing), admit **zero** publishers of an enabled feed —
+/// `ChannelFilter::parse` only validates a clause against the whole registry, not against what this
+/// process actually runs. At startup that combination is fatal; here it is refused with `400` and
+/// the running channel filter is left exactly as it was, because a runtime misconfiguration must
+/// never tear down every receiver (plus the WS sink and query API, if that was the only market-data
+/// feed) on the next reconcile tick with no warning — the asymmetry startup/runtime already draws
+/// everywhere else in this crate.
+///
 /// Two request shapes are refused before `channels` is even looked at, both because the natural
 /// client shape for a `POST` is a body and this endpoint does not read one:
 /// - **No `channels` parameter at all** — `400 missing_channels_parameter`. Silently falling back
@@ -188,6 +197,26 @@ fn post_channels(state: &AdminState, req: &Request) -> Response {
     };
     match ChannelFilter::parse(spec) {
         Ok(new_filter) => {
+            if let Some(f) = state
+                .enabled
+                .iter()
+                .find(|f| new_filter.publishers_for(f).is_empty())
+            {
+                return json_status(
+                    "400 Bad Request",
+                    json!({
+                        "error": "channel_filter_empties_a_feed",
+                        "message": format!(
+                            "this channel filter admits no publisher of enabled feed {} \
+                             ({}, code {})",
+                            f.venue, f.category, f.code
+                        ),
+                        "remediation": "Narrow --channels less aggressively, or leave that \
+                            feed's code unmentioned so it keeps admitting every publisher this \
+                            process runs. The prior channel filter is unchanged.",
+                    }),
+                );
+            }
             let summary = new_filter.summary();
             *crate::model::lock(&state.filter) = new_filter;
             info!(
@@ -259,6 +288,28 @@ mod tests {
             .iter()
             .find(|f| f.category == "sports")
             .expect("the built-in registry has a sports row")
+    }
+
+    /// The sports row narrowed to a single publisher (`channel`'s), mirroring what
+    /// `main.rs::filter_publishers` does to `state.enabled` when the process was started with
+    /// `--publisher-port` pinned to that channel's derived port.
+    fn sports_row_narrowed_to_channel(channel: u8) -> Feed {
+        let feed = sports_row();
+        let kept: Vec<crate::ingest::feeds::FeedPublisher> = feed
+            .publishers
+            .iter()
+            .filter(|p| p.channel == Some(channel))
+            .copied()
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "channel {channel} must be in the sports roster exactly once"
+        );
+        Feed {
+            publishers: Box::leak(kept.into_boxed_slice()),
+            ..feed
+        }
     }
 
     async fn spawn(filter: Arc<Mutex<ChannelFilter>>, enabled: Vec<Feed>) -> String {
@@ -384,6 +435,54 @@ mod tests {
         );
         assert!(after.admits("lashay-4", 10) && after.admits("lashay-4", 11));
         assert!(!after.admits("lashay-4", 12));
+    }
+
+    /// Findings 3/4: a channel filter that is individually valid against the whole registry (11 is
+    /// a real sports channel) but, crossed with an `enabled` set already narrowed to a single
+    /// publisher (channel 10 only — the `--publisher-port` case), admits **zero** publishers of that
+    /// feed. Must be a `400`, and must leave the prior (non-empty, so a reset-to-default can't pass
+    /// by coincidence) channel filter exactly as it was — not merely refused, but the filter this
+    /// process runs with must still be the one from before the POST.
+    #[tokio::test]
+    async fn a_post_that_would_empty_an_enabled_feed_is_refused_and_changes_nothing() {
+        let filter = Arc::new(Mutex::new(ChannelFilter::default()));
+        let narrowed = sports_row_narrowed_to_channel(10);
+        let base = spawn(filter.clone(), vec![narrowed]).await;
+
+        // Establish a non-empty starting channel filter that DOES admit the surviving publisher.
+        let setup = reqwest::Client::new()
+            .post(format!("{base}/admin/channels"))
+            .query(&[("channels", "lashay-4=10")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.status(),
+            200,
+            "fixture sanity: the setup POST must apply"
+        );
+        let before = crate::model::lock(&filter).clone();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/channels"))
+            .query(&[("channels", "lashay-4=11")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "channel_filter_empties_a_feed");
+
+        let after = crate::model::lock(&filter).clone();
+        assert_eq!(
+            after.summary(),
+            before.summary(),
+            "a filter that would empty an enabled feed must leave the prior filter in force"
+        );
+        assert!(
+            after.admits("lashay-4", 10),
+            "the prior filter's admission must be unchanged"
+        );
     }
 
     /// I2: an absent `channels` parameter is a `400`, distinct from one present-and-empty (which is
