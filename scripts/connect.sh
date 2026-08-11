@@ -25,7 +25,10 @@
 #   DZ_IMAGE=ghcr.io/malbeclabs/doublezero-edge-connect:mainnet-beta
 #   DZ_NAME=doublezero-edge-connect      container name
 #   DZ_FEEDS=<venue,venue>               optional: narrow ingested venues (default: all)
-#   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install)
+#   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install) -- also
+#                                        implies "yes" to the doublezero-edge CLI offer below
+#   DZ_INSTALL_CLI=1|0                   answer the doublezero-edge CLI install prompt
+#                                        non-interactively (1=install, 0=skip)
 #   DZ_CLIENT_IP=<ipv4>                  override the public IP used by the access-pass pre-check
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
@@ -66,6 +69,7 @@ DZ_ENV="${DZ_ENV:-mainnet-beta}"
 DZ_SECRET="${DZ_SECRET:-}"
 DZ_FEEDS="${DZ_FEEDS:-}"
 DZ_ASSUME_YES="${DZ_ASSUME_YES:-0}"
+DZ_INSTALL_CLI="${DZ_INSTALL_CLI:-}"
 KEYPAIR_DEST="/root/.config/doublezero/id.json"   # client's default keypair path (container runs as root)
 LIVENESS_UDP_PORT=44880
 WS_PORT=8081                                       # bridge WebSocket (PROTOCOL.md)
@@ -728,3 +732,100 @@ echo "  sudo docker logs -f $DZ_NAME                            # bridge + daemo
 echo "  sudo docker exec -it $DZ_NAME doublezero status         # tunnel status"
 echo "  sudo docker exec -it $DZ_NAME doublezero latency        # device latencies"
 echo "  sudo docker stop $DZ_NAME && sudo docker rm $DZ_NAME    # disconnect, stop & remove"
+
+# ----------------------------------------------------------------------------
+# 9. offer the doublezero-edge CLI (host-side; a convenience, never load-bearing)
+# ----------------------------------------------------------------------------
+# doublezero-edge is a small agent-facing CLI over this container's /v1 (and, if enabled,
+# /admin) HTTP API, packaged as a signed, dependency-free deb/rpm with no maintainer scripts (see
+# release/.goreleaser.*.edge-cli.yaml). The bridge above is already up; nothing here can affect
+# it -- declining, or any package-manager failure, only warns and moves on. Never `die`.
+echo
+offer_cli_package() {
+  if command -v doublezero-edge >/dev/null 2>&1; then
+    info "doublezero-edge CLI already installed ($(doublezero-edge --version 2>/dev/null || echo 'version unknown'))."
+    return 0
+  fi
+
+  local pm=""
+  if command -v apt-get >/dev/null 2>&1; then pm=apt
+  elif command -v dnf >/dev/null 2>&1; then pm=dnf
+  elif command -v yum >/dev/null 2>&1; then pm=yum
+  fi
+
+  # Which Cloudsmith repo carries the package for this environment (release/.goreleaser.{testnet,
+  # mainnet-beta}.edge-cli.yaml): the CLI has no ledger coupling, so testnet publishes to
+  # doublezero-testnet and every other env (mainnet-beta, devnet) shares doublezero-mainnet-beta.
+  local cs_repo="doublezero-mainnet-beta"
+  [ "$DZ_ENV" = testnet ] && cs_repo="doublezero-testnet"
+
+  if [ -z "$pm" ]; then
+    warn "No supported package manager (apt/dnf/yum) found; skipping the doublezero-edge CLI. Install it later: https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.<deb|rpm>.sh"
+    return 0
+  fi
+
+  local manual="curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.deb.sh | sudo -E bash && sudo apt install doublezero-edge"
+  [ "$pm" = apt ] || manual="curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.rpm.sh | sudo -E bash && sudo $pm install doublezero-edge"
+
+  case "$DZ_INSTALL_CLI" in
+    0) info "Skipping the doublezero-edge CLI (DZ_INSTALL_CLI=0). Install it later: $manual"; return 0 ;;
+    1) : ;;
+    *)
+      # confirm()'s own '[ -r "$TTY" ]' check isn't enough: a readable /dev/tty inode can still
+      # fail to OPEN with no controlling terminal (the same headless curl|bash / container case
+      # section 3b already works around), and confirm() would then read into an unset 'ans' and
+      # abort the whole script under 'set -u'. Probe an actual open first; no controlling
+      # terminal means no answer, so this is attendantless: skip rather than crash.
+      local want_cli=1
+      if [ "$DZ_ASSUME_YES" != 1 ]; then
+        if { : <"$TTY"; } 2>/dev/null; then
+          confirm "Install the doublezero-edge CLI too? This adds the malbeclabs/$cs_repo Cloudsmith repository (unless already configured) and installs the 'doublezero-edge' package." || want_cli=0
+        else
+          want_cli=0
+        fi
+      fi
+      if [ "$want_cli" != 1 ]; then
+        info "Skipping the doublezero-edge CLI. Install it later: $manual"
+        return 0
+      fi
+      ;;
+  esac
+
+  local repo_configured=0
+  case "$pm" in
+    apt) apt-cache policy doublezero-edge 2>/dev/null | grep -q "Candidate:" \
+           && ! apt-cache policy doublezero-edge 2>/dev/null | grep -q "Candidate: (none)" \
+           && repo_configured=1 ;;
+    dnf) dnf list --available doublezero-edge >/dev/null 2>&1 && repo_configured=1 ;;
+    yum) yum list available doublezero-edge >/dev/null 2>&1 && repo_configured=1 ;;
+  esac
+
+  if [ "$repo_configured" = 1 ]; then
+    info "The malbeclabs/$cs_repo repository is already configured; installing doublezero-edge directly."
+  else
+    info "Configuring the malbeclabs/$cs_repo Cloudsmith repository..."
+    case "$pm" in
+      apt)     local setup_url="https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.deb.sh" ;;
+      dnf|yum) local setup_url="https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.rpm.sh" ;;
+    esac
+    # "$SUDO -E bash" only makes sense when $SUDO is non-empty; when we're already root (the
+    # common container case) $SUDO is "" and a bare "-E" would be run as a command.
+    local setup_runner=(bash)
+    [ -n "$SUDO" ] && setup_runner=("$SUDO" -E bash)
+    if ! curl -1sLf "$setup_url" | "${setup_runner[@]}"; then
+      warn "Could not configure the malbeclabs/$cs_repo repository; skipping the doublezero-edge CLI. Install it later: $manual"
+      return 0
+    fi
+  fi
+
+  info "Installing doublezero-edge..."
+  case "$pm" in
+    apt)     $SUDO apt-get install -y doublezero-edge ;;
+    dnf|yum) $SUDO "$pm" install -y doublezero-edge ;;
+  esac || {
+    warn "Installing doublezero-edge failed; continuing without it. Retry later: sudo $([ "$pm" = apt ] && echo "apt install" || echo "$pm install") doublezero-edge"
+    return 0
+  }
+  info "Installed doublezero-edge CLI ($(doublezero-edge --version 2>/dev/null || echo 'version unknown'))."
+}
+offer_cli_package
