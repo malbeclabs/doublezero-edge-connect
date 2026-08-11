@@ -37,8 +37,8 @@ use crate::{
     },
     metrics::metrics,
     model::{
-        venue_arc, BookAction, BookChange, BookSide, DepthSnapshot, FeedMessage, NormalizedBook,
-        NormalizedDepth, NormalizedInstrument, NormalizedMidpoint, NormalizedQuote,
+        now_mono_ns, venue_arc, BookAction, BookChange, BookSide, DepthSnapshot, FeedMessage,
+        NormalizedBook, NormalizedDepth, NormalizedInstrument, NormalizedMidpoint, NormalizedQuote,
         NormalizedTrade, Side,
     },
 };
@@ -833,6 +833,11 @@ impl FrameProcessor for MidpointProcessor {
     }
 }
 
+/// Minimum gap between two reveal-forced full-book republishes for one `(publisher, instrument)` — see
+/// [`MboProcessor::reveal_rebaseline_due`]. Matches the arbiter's own definition re-announce interval,
+/// since the republish exists to give the consumer a book under the identity that reveal announced.
+const REVEAL_REBASELINE_INTERVAL_NS: u64 = 15_000_000_000; // 15s
+
 /// Cap on the number of distinct instrument books [`MboProcessor`] tracks. The MBO `instrument_id`
 /// is an unauthenticated, spoofable wire field, so without a bound a forged stream could mint a
 /// `BookState` per distinct id and grow the map without limit (memory-exhaustion DoS) — the same
@@ -915,6 +920,9 @@ pub struct MboProcessor {
     /// The sync state last reported to the arbiter per `(publisher, instrument)`, so only transitions
     /// are reported. Evicted in lockstep with `books`, whose keys it mirrors.
     synced_reported: HashMap<(IpAddr, u32), bool>,
+    /// When a reveal last forced a full-book republish per `(publisher, instrument)` — see
+    /// [`MboProcessor::reveal_rebaseline_due`]. Same lifecycle as `synced_reported`.
+    reveal_rebaselined_ns: HashMap<(IpAddr, u32), u64>,
     /// One-shot guard for the manifest `Valid=0` override warning (see the handler).
     warned_invalid_manifest: bool,
     /// Rate limit for the per-datagram decode-error warning.
@@ -938,6 +946,7 @@ impl MboProcessor {
             frame_changes: Vec::new(),
             order_scratch: Vec::new(),
             synced_reported: HashMap::new(),
+            reveal_rebaselined_ns: HashMap::new(),
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
             tape,
@@ -1046,6 +1055,21 @@ impl MboProcessor {
         }
     }
 
+    /// Clear the raced order-event state for every market this processor has emitted a book under — the
+    /// `EndOfSession` counterpart of [`Self::reset_all_known_depth_floors`]. A session boundary restarts
+    /// the venue's order-id space, so the ended session's tombstones would refuse the new session's
+    /// legitimately-reused ids. Scoped to the racing state only: a peer arm that missed the session end
+    /// is still serving these markets, and dropping its published book is the failure the arbiter's
+    /// narrower seam exists to avoid.
+    fn reset_all_known_book_events(&self, ctx: &FrameCtx) {
+        let mut arb = lock(ctx.arbiter);
+        for key in self.books.keys().filter(|(p, _)| *p == ctx.publisher) {
+            if let Some(market) = self.market_key(key) {
+                arb.reset_book_events_for_market(&market);
+            }
+        }
+    }
+
     /// Get-or-create the [`BookState`] for `instrument_id`, **gated and bounded** — the two checks
     /// that keep the unauthenticated, spoofable wire `instrument_id` from growing memory without
     /// limit:
@@ -1079,6 +1103,7 @@ impl MboProcessor {
                         self.last_top.remove(&old);
                         self.emitted_symbol.remove(&old);
                         self.synced_reported.remove(&old);
+                        self.reveal_rebaselined_ns.remove(&old);
                         // Resolve the wire venue this evicted key's depth was actually filed under
                         // BEFORE dropping the cache entry that supplies it — the replay-map purge
                         // below must key by the same venue `emit_depth` used, not `ctx.venue`. `None`
@@ -1186,6 +1211,26 @@ impl MboProcessor {
         // pre-floor would record a book that may never reach the wire. The processor still purges
         // this map on book eviction (see `book_for`).
         ctx.emit(FeedMessage::Depth(depth));
+    }
+
+    /// Whether a reveal-forced full-book republish is due for `(publisher, instrument)`.
+    ///
+    /// A reveal fires whenever the wire Source ID for a key *changes*, and the wire is unauthenticated:
+    /// one spoofed datagram flipping the id would otherwise make this materialize the whole book — up to
+    /// `MAX_ORDERS_PER_BOOK` changes — once per datagram, at ~10^5 amplification. Rate-limited to the
+    /// same interval the arbiter applies to the definition the reveal announces, so a genuine Source ID
+    /// change still republishes promptly while a flip-flop costs one republish per interval. A snapshot
+    /// install is deliberately not limited: it needs no rate limit because forging one costs the
+    /// attacker the whole book.
+    fn reveal_rebaseline_due(&mut self, key: (IpAddr, u32)) -> bool {
+        let now = now_mono_ns();
+        match self.reveal_rebaselined_ns.get(&key) {
+            Some(&last) if now.saturating_sub(last) < REVEAL_REBASELINE_INTERVAL_NS => false,
+            _ => {
+                self.reveal_rebaselined_ns.insert(key, now);
+                true
+            }
+        }
     }
 
     /// Apply one order delta, recording the instrument as touched, as changed if the book took it, and
@@ -1472,6 +1517,7 @@ impl FrameProcessor for MboProcessor {
                     // `ctx.venue` (see `reset_all_known_depth_floors`) — BEFORE clearing the memo
                     // that supplies it.
                     self.reset_all_known_depth_floors(ctx, "end_of_session");
+                    self.reset_all_known_book_events(ctx);
                     self.last_top.clear();
                     self.emitted_symbol.clear();
                 }
@@ -1494,7 +1540,9 @@ impl FrameProcessor for MboProcessor {
                     // instrument's definition but never follow it with any book content.
                     if self.reveal_if_needed(ctx, o.instrument_id, o.source_id) {
                         changed.insert(o.instrument_id);
-                        rebaselined.insert(o.instrument_id);
+                        if self.reveal_rebaseline_due((ctx.publisher, o.instrument_id)) {
+                            rebaselined.insert(o.instrument_id);
+                        }
                     }
                 }
                 codec_mbo::Message::OrderCancel(o) => {
@@ -1509,7 +1557,9 @@ impl FrameProcessor for MboProcessor {
                     self.apply_delta(o.instrument_id, op, ctx, &mut changed, &mut touched);
                     if self.reveal_if_needed(ctx, o.instrument_id, o.source_id) {
                         changed.insert(o.instrument_id);
-                        rebaselined.insert(o.instrument_id);
+                        if self.reveal_rebaseline_due((ctx.publisher, o.instrument_id)) {
+                            rebaselined.insert(o.instrument_id);
+                        }
                     }
                 }
                 codec_mbo::Message::OrderExecute(o) => {
@@ -1526,7 +1576,9 @@ impl FrameProcessor for MboProcessor {
                     self.apply_delta(o.instrument_id, op, ctx, &mut changed, &mut touched);
                     if self.reveal_if_needed(ctx, o.instrument_id, o.source_id) {
                         changed.insert(o.instrument_id);
-                        rebaselined.insert(o.instrument_id);
+                        if self.reveal_rebaseline_due((ctx.publisher, o.instrument_id)) {
+                            rebaselined.insert(o.instrument_id);
+                        }
                     }
                     // An execution is also a public trade print; emit it like a Top-of-Book trade.
                     // `reveal_if_needed` above guarantees this instrument is revealed whenever a
@@ -1566,7 +1618,9 @@ impl FrameProcessor for MboProcessor {
                     // `depth` re-baseline so that content isn't left permanently unshown.
                     if self.reveal_if_needed(ctx, t.instrument_id, t.source_id) {
                         changed.insert(t.instrument_id);
-                        rebaselined.insert(t.instrument_id);
+                        if self.reveal_rebaseline_due((ctx.publisher, t.instrument_id)) {
+                            rebaselined.insert(t.instrument_id);
+                        }
                     }
                     let venue: &'static str = source_label(t.source_id);
                     let source = venue_arc(venue);
@@ -1643,6 +1697,11 @@ impl FrameProcessor for MboProcessor {
                             );
                         }
                         _ => self.reset_all_known_depth_floors(ctx, "instrument_reset"),
+                    }
+                    // The new session may reuse this instrument's order ids, so the raced state's
+                    // tombstones must go with the book or they would refuse the reused ids.
+                    if let Some(market) = self.market_key(&key) {
+                        lock(ctx.arbiter).reset_book_events_for_market(&market);
                     }
                     // Reset the existing book directly — NOT via `book_for`, whose definition gate
                     // would skip the reset in the same transient-no-definition window as above

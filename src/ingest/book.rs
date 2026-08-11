@@ -28,10 +28,15 @@ const MAX_ORDERS_PER_BOOK: usize = 1 << 18;
 /// regardless of which buffered deltas survived.
 const MAX_PENDING_DELTAS: usize = 1 << 18;
 
-/// Cap on remembered removed order ids. The wire is unauthenticated, so this cannot be unbounded;
-/// past the cap the oldest id is forgotten, which reopens the resurrection path only for a copy
-/// arriving later than this many removals. Counted by `dz_mbo_removed_evicted_total`.
-const MAX_REMOVED_ORDERS: usize = 1 << 20;
+/// Cap on remembered removed order ids. This set is **defence in depth, not the cross-publisher
+/// guard**: one book sees one publisher's stream, where the sequence check already rejects a repeat, so
+/// what it actually catches is a forged `Add` re-using a dead id at a contiguous sequence. The
+/// cross-publisher case — a lagging peer's only copy of an `Add` for an order another publisher already
+/// killed — is invisible here and is refused at the merge point (`ingest::arbiter`). Sized well below
+/// `MAX_ORDERS_PER_BOOK` accordingly: at 4096 books per receiver task the cap is resident memory, and
+/// nothing is protected by remembering removals no attacker could exploit. Evictions are counted by
+/// `dz_mbo_removed_evicted_total`.
+const MAX_REMOVED_ORDERS: usize = 1 << 16;
 
 /// One aggregated price level as `(price_raw, qty_raw)` - raw integers in the instrument's
 /// price/qty exponents (the caller scales them).
@@ -125,8 +130,8 @@ pub struct BookState {
     building: Option<Building>,
     /// Deltas buffered while `Recovering`, replayed after the next snapshot.
     pending: Vec<DeltaOp>,
-    /// Order ids this book has removed. A venue never reuses one, so an `Add` naming an id in here is
-    /// a stale racing copy and must not resurrect the order.
+    /// Order ids this book has removed — see [`MAX_REMOVED_ORDERS`] for what this does and does not
+    /// catch. A venue never reuses one, so an `Add` naming an id in here did not come from the venue.
     removed: HashSet<u64>,
     /// `removed` in removal order, oldest first, so the set can be bounded.
     removed_order: VecDeque<u64>,

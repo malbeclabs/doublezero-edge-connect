@@ -287,11 +287,11 @@ A change is either **price-aggregated** (`order_id: 0`, from the Market-by-Price
 **One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed, and a consumer sees one coherent book from them, never two to merge. How that happens depends on whether the changes carry an `order_id`, but the consumer contract is the same either way and it is never told which publisher it is reading.
 
 - **Price-aggregated.** The producer elects one authoritative publisher per market and republishes only its stream. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow.
-- **Order-level.** Every publisher stamps the venue's own `order_id`, so the producer instead publishes each venue event's first arrival and collapses the rest: a consumer gets each event once, from whichever publisher was fastest for *that* event. A publisher recovering by snapshot republishes its whole book only when no healthy peer is serving the market, so a recovery cannot wipe a book that another publisher is keeping current.
+- **Order-level.** Every publisher stamps the venue's own `order_id`, so the producer instead publishes each venue event's first arrival and collapses the rest: a consumer gets each event once, from whichever publisher was fastest for *that* event. A change for an order the producer has already published as gone is refused, so a lagging publisher cannot resurrect it. A publisher recovering by snapshot republishes its whole book only when no peer is both healthy and currently serving the market, so a recovery cannot wipe a book another publisher is keeping current — while a publisher that stops reaching the producer cannot block the recovery either.
 
 Either way a consumer that honors `clear` needs nothing else.
 
-**An order-level consumer must ask for an order-level bootstrap.** See `book_scope` under *Subscriptions & filtering*: the default replay is price-aggregated, and a consumer that keys its book by `order_id` will otherwise be bootstrapped with levels carrying no ids and then receive changes for ids it never saw.
+**The bootstrap matches the market.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a stream of different granularity. `book_scope` under *Subscriptions & filtering* overrides that for a consumer that folds the stream itself.
 
 ### `status`
 
@@ -435,7 +435,7 @@ are otherwise ignored.
 
 Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
 
-**`book_scope` selects the granularity of that `book` replay, not which messages arrive.** It defaults to `"levels"`: an order-level market is bootstrapped as price levels carrying `order_id: 0`, so an L2 consumer is never handed a venue's whole order population. `"orders"` bootstraps every resting order with its `order_id` instead, and is **required** for a consumer that keys its book by order id — with the default, such a consumer receives levels with no ids and then order-level changes referencing ids it never saw, and its book diverges silently. It is not a filter dimension, so it never excludes a message; it is part of the subscription's identity, so re-subscribing with the other scope is a distinct subscription and does bootstrap again.
+**`book_scope` selects the granularity of that `book` replay, not which messages arrive.** Omitted — the default, and the only possibility on the connect-time replay — it **follows the market**: an order-level market is bootstrapped as every resting order with its `order_id`, a price-aggregated one as price levels carrying `order_id: 0`. That is what a consumer needs, because a bootstrap and a stream of different granularity cannot be reconciled: an order-level change carries one *order's* absolute size, and applying it as a level's size corrupts the book. `"levels"` asks for the price fold of an order-level market anyway, which is useful only to a consumer that folds the live stream itself; `"orders"` asks for orders explicitly. It is a rendering choice rather than a filter dimension, so it neither excludes messages nor forms part of a subscription's identity — changing scope is an `unsubscribe` followed by a `subscribe`.
 
 ## Heartbeat & liveness
 
@@ -482,8 +482,8 @@ on connect:
       "book":                                        # incremental; apply in order
         book = book_for(msg.venue, msg.channel, msg.instrument_id)
         for c in msg.changes:                        # "clear" re-baselines, not msg.snapshot
-          # c.order_id == 0 keys the change by price; non-zero keys it by the venue's order id
-          # (and needs a `book_scope: "orders"` subscription so the bootstrap carries ids too).
+          # c.order_id == 0 keys the change by price; non-zero keys it by the venue's order id.
+          # The bootstrap arrives at the same granularity, so one dispatcher covers both.
           apply(book, c.action, c.side, c.price, c.size, c.order_id)
         if msg.last: publish(book)                   # honor `last` or you wedge
       _: ignore        # unknown type
