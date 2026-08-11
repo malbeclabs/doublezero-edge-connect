@@ -195,6 +195,14 @@ pub struct Metrics {
     /// Removed order ids an MBO book forgot at its resurrection-guard cap. Non-zero reopens the
     /// resurrection path for a copy arriving later than that many removals.
     pub mbo_removed_evicted: IntCounter,
+    /// Order-level `book` events collapsed because another publisher delivered the same venue event
+    /// first. In steady state this is the whole stream of every publisher but the fastest, so it is a
+    /// throughput figure rather than a fault.
+    pub book_events_deduped: IntCounterVec,
+    /// Two publishers reported the same venue event with different resulting state: the identity
+    /// matched and the content did not, which is the signature of a book that has silently drifted.
+    /// Any sustained non-zero rate is a correctness alarm.
+    pub mbo_arm_disagreement: IntCounterVec,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -656,6 +664,22 @@ impl Metrics {
                  Non-zero means a very late duplicate could resurrect a dead order; sustained \
                  non-zero means the cap is too small for this venue's churn.",
             ),
+            book_events_deduped: counter_vec(
+                &registry,
+                "dz_book_events_deduped_total",
+                "Order-level book events collapsed because another publisher delivered the same \
+                 venue event first. In steady state this is the whole stream of every publisher but \
+                 the fastest, so it is a throughput figure, not a fault.",
+                &["venue"],
+            ),
+            mbo_arm_disagreement: counter_vec(
+                &registry,
+                "dz_mbo_arm_disagreement_total",
+                "Two publishers reported the same venue event with different resulting state. The \
+                 identity matched and the content did not, which is the signature of a book that has \
+                 silently drifted. Any sustained non-zero rate is a correctness alarm.",
+                &["venue"],
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -933,6 +957,12 @@ mod tests {
         m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
         m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
         m.mbo_removed_evicted.inc();
+        m.book_events_deduped
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_arm_disagreement
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -977,6 +1007,8 @@ mod tests {
             "dz_book_dropped_total",
             "dz_book_markets_evicted_total",
             "dz_mbo_removed_evicted_total",
+            "dz_book_events_deduped_total",
+            "dz_mbo_arm_disagreement_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {

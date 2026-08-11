@@ -53,8 +53,9 @@ use crate::{
     },
     metrics::metrics,
     model::{
-        self, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot, FeedMessage,
-        NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade, ReplayScope,
+        self, now_mono_ns, now_ns, BookAccumulator, BookAction, BookChange, BookSnapshot,
+        DepthSnapshot, FeedMessage, NormalizedBook, NormalizedDepth, NormalizedQuote,
+        NormalizedTrade, ReplayScope,
     },
 };
 
@@ -98,6 +99,15 @@ const MAX_BOOK_MARKETS: usize = 16_384;
 /// `model`'s pending-change cap, which desynchronizes the accumulator at the same scale, so the
 /// abandoned re-baseline degrades to a bare `clear` rather than to a book claiming completeness.
 const MAX_WITHHELD_BATCHES: u32 = 8192;
+
+/// Cap on order events remembered per order-level market — the count half of the dedup window, so a
+/// publisher that stalls the wall clock cannot grow the map past it. Sized like [`TRADE_DEDUP_WINDOW`],
+/// which bounds the same shape of state per `(venue, symbol)`.
+const MAX_SEEN_ORDER_EVENTS: usize = 8192;
+
+/// Default order-event dedup window, matching `main.rs`'s `--arb-book-dedup-window-ms` so an arbiter
+/// built without the flag races on the same window the shipped binary does.
+const DEFAULT_BOOK_DEDUP_WINDOW_NS: u64 = 250_000_000; // 250ms
 
 /// Which ingest source produced an update — the floor's per-tick leader identity. The edge
 /// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
@@ -409,6 +419,130 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
     }
 }
 
+/// One order-level `book` event's venue identity: which order, what happened to it, and the state it
+/// ended in. Every publisher of a distributed venue reports these identically for one venue event, so
+/// the first arrival is published and the rest collapse. Never the producer's `per_instrument_seq` —
+/// that is per publisher and unrelated across arms (measured: three unrelated bases for one execution).
+///
+/// `size_bits` is part of the *identity*, not merely content compared after the fact: successive
+/// partial fills of one order share the id, the action and the resting price and differ only here, so
+/// omitting it would collapse the second fill as a duplicate of the first and leave every consumer's
+/// book holding a quantity the venue has already reduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OrderEvent {
+    order_id: u64,
+    action: BookAction,
+    price_bits: u64,
+    size_bits: u64,
+}
+
+/// One order-level market's cross-publisher race state: the events recently delivered to the wire, and
+/// the smallest resting quantity any publisher has claimed for each live order.
+///
+/// Bounded twice — by [`MAX_SEEN_ORDER_EVENTS`] and by the caller's time window — because the wire is
+/// unauthenticated. Neither bound carries correctness: a removed order id is never re-added
+/// (`ingest::book`), so an undersized window costs a redundant emission, not a corrupt book.
+#[derive(Default)]
+struct MarketEvents {
+    /// Delivered events mapped to the publisher that delivered each first and when it arrived.
+    seen: HashMap<OrderEvent, (Publisher, u64)>,
+    /// `seen` in delivery order, oldest first, for both bounds.
+    order: VecDeque<OrderEvent>,
+    /// Per live order, the smallest resting quantity any publisher has reported and who reported it. A
+    /// resting order only ever shrinks, so a publisher claiming MORE is resting than a peer already
+    /// saw has missed a fill — the drift signature `dz_mbo_arm_disagreement_total` counts.
+    smallest: HashMap<u64, (f64, Publisher)>,
+    /// `smallest`'s keys in insertion order, oldest first, for its own bound.
+    smallest_order: VecDeque<u64>,
+}
+
+/// Whether one order event reached the wire, and what its arrival said about the arms.
+enum EventVerdict {
+    /// First delivery of this venue event: publish it.
+    Deliver,
+    /// A peer delivered it already: collapse this copy.
+    Duplicate,
+    /// First delivery, but this publisher claims more is resting for the order than a peer already
+    /// reported — publish it and count the disagreement.
+    DeliverDisagreeing,
+}
+
+impl MarketEvents {
+    /// The race decision for one order-level change from `publisher`, arriving at `arrival_ns`, with
+    /// events older than `window_ns` forgotten first.
+    fn admit(
+        &mut self,
+        ev: OrderEvent,
+        publisher: Publisher,
+        arrival_ns: u64,
+        window_ns: u64,
+    ) -> EventVerdict {
+        self.expire(arrival_ns, window_ns);
+        if self.seen.contains_key(&ev) {
+            return EventVerdict::Duplicate;
+        }
+        self.seen.insert(ev, (publisher, arrival_ns));
+        self.order.push_back(ev);
+        while self.order.len() > MAX_SEEN_ORDER_EVENTS {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        let size = f64::from_bits(ev.size_bits);
+        // The order is gone: nothing rests, so there is nothing left to disagree about.
+        if size == 0.0 {
+            self.forget_order(ev.order_id);
+            return EventVerdict::Deliver;
+        }
+        match self.smallest.get_mut(&ev.order_id) {
+            Some((seen_size, seen_by)) if size > *seen_size && *seen_by != publisher => {
+                EventVerdict::DeliverDisagreeing
+            }
+            Some((seen_size, seen_by)) => {
+                if size < *seen_size {
+                    *seen_size = size;
+                    *seen_by = publisher;
+                }
+                EventVerdict::Deliver
+            }
+            None => {
+                self.smallest.insert(ev.order_id, (size, publisher));
+                self.smallest_order.push_back(ev.order_id);
+                while self.smallest_order.len() > MAX_SEEN_ORDER_EVENTS {
+                    if let Some(old) = self.smallest_order.pop_front() {
+                        self.smallest.remove(&old);
+                    }
+                }
+                EventVerdict::Deliver
+            }
+        }
+    }
+
+    /// Forget events delivered more than `window_ns` before `now`. `order` is in delivery order, so the
+    /// scan stops at the first entry still inside the window.
+    fn expire(&mut self, now: u64, window_ns: u64) {
+        while let Some(oldest) = self.order.front() {
+            let Some(&(_, arrival)) = self.seen.get(oldest) else {
+                self.order.pop_front();
+                continue;
+            };
+            if now.saturating_sub(arrival) <= window_ns {
+                return;
+            }
+            let old = self.order.pop_front();
+            if let Some(old) = old {
+                self.seen.remove(&old);
+            }
+        }
+    }
+
+    /// Drop a gone order's claim. The FIFO keeps the id — dropping it there would be a linear scan on
+    /// every cancel, and a venue never reuses an id, so the stale entry only ever evicts a no-op.
+    fn forget_order(&mut self, order_id: u64) {
+        self.smallest.remove(&order_id);
+    }
+}
+
 /// Per-key bounded dedup of recently-seen identities. Keeps the most recent `capacity` values per
 /// key, so a duplicate from a second publisher (or a reorder within the window) is dropped while
 /// memory stays bounded.
@@ -563,6 +697,15 @@ pub struct Arbiter {
     /// instrument_id)`. Mirrors the serving arm's state: seeded from its accumulator on every
     /// re-baseline, then advanced by each admitted batch. `None` when no replay map is wired.
     book_replay: Option<BookSnapshot>,
+    /// Per order-level market, every reporting publisher's book sync state. Presence **also marks the
+    /// market as order-level**: [`Arbiter::set_book_synced`] has exactly one caller, the Market-by-Order
+    /// processor, so an entry here is what routes the market to the racing gate instead of the
+    /// single-arm authority. Bounded and evicted alongside `book_markets`.
+    order_level_books: HashMap<MarketKey, HashMap<Publisher, bool>>,
+    /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
+    book_events: HashMap<MarketKey, MarketEvents>,
+    /// How long a delivered order event is remembered (`--arb-book-dedup-window-ms`).
+    book_dedup_window_ns: u64,
 }
 
 /// Who serves one `Sticky` venue's trade tape, per [`Arbiter::tape_arm_admits`].
@@ -762,7 +905,33 @@ impl Arbiter {
             book_markets: HashMap::new(),
             book_order: VecDeque::new(),
             book_replay: None,
+            order_level_books: HashMap::new(),
+            book_events: HashMap::new(),
+            book_dedup_window_ns: DEFAULT_BOOK_DEDUP_WINDOW_NS,
         }
+    }
+
+    /// How long a delivered order event stays in the racing window (`--arb-book-dedup-window-ms`).
+    pub fn set_book_dedup_window(&mut self, window_ns: u64) {
+        self.book_dedup_window_ns = window_ns;
+    }
+
+    /// Report one publisher's order-level book sync state for a market — the seam the Market-by-Order
+    /// processor calls on every [`crate::ingest::book::BookState`] status transition, and the only
+    /// thing that marks a market order-level (see [`Arbiter::order_level_books`]).
+    ///
+    /// **Contract: report `true` before emitting the re-baseline that follows a snapshot install.** The
+    /// suppression below reads these states to decide whether a recovering arm is alone, and an arm that
+    /// publishes its full book before saying so would let a simultaneously-recovering peer conclude the
+    /// same and wipe the consumer twice.
+    pub fn set_book_synced(&mut self, key: &MarketKey, publisher: Publisher, synced: bool) {
+        if !self.book_markets.contains_key(key) {
+            self.track_book_market(key);
+        }
+        self.order_level_books
+            .entry(key.clone())
+            .or_default()
+            .insert(publisher, synced);
     }
 
     /// Install the `--arb-*` arbitration tunables: the single-arm authority config, and the cross-arm
@@ -916,6 +1085,8 @@ impl Arbiter {
                 break;
             };
             self.book_markets.remove(&old);
+            self.order_level_books.remove(&old);
+            self.book_events.remove(&old);
             if let Some(replay) = &self.book_replay {
                 model::lock(replay).remove(&old);
             }
@@ -958,11 +1129,109 @@ impl Arbiter {
     /// rather than tearing down a live arm's published book.
     pub fn reset_book_for_market(&mut self, key: &MarketKey) {
         self.book_markets.remove(key);
+        self.order_level_books.remove(key);
+        self.book_events.remove(key);
         self.book_order.retain(|k| k != key);
         if let Some(replay) = &self.book_replay {
             model::lock(replay).remove(key);
         }
         self.books.forget_market(key);
+    }
+
+    /// Race one order-level `book` batch across a distributed venue's publishers: publish each venue
+    /// event's first arrival and collapse every later copy, so a consumer sees each event once and
+    /// always from whichever publisher was fastest for *that event*.
+    ///
+    /// Two decisions, in order. A `Clear`-led batch is a **re-baseline** and must not race: a publisher
+    /// recovering via snapshot would wipe a consumer a healthy peer is serving correctly, so it is
+    /// published only when no peer of that market is synced — decided here, in one place, because two
+    /// publishers recovering together must not both conclude they are alone. Every other batch is
+    /// filtered change by change: the surviving events are republished and the collapsed ones are not.
+    /// Filtering rather than passing the batch whole is load-bearing — an already-delivered change
+    /// carries the order's *absolute* quantity, so re-delivering it after the wire has moved on would
+    /// walk a consumer's order back to a size the venue has already reduced.
+    ///
+    /// A change with no order identity (`order_id == 0`) is un-collapsable and always published.
+    fn emit_order_level_book(&mut self, key: MarketKey, b: &NormalizedBook, publisher: Publisher) {
+        if b.changes
+            .first()
+            .is_some_and(|c| c.action == BookAction::Clear)
+        {
+            let peer_synced = self
+                .order_level_books
+                .get(&key)
+                .is_some_and(|arms| arms.iter().any(|(&p, &synced)| p != publisher && synced));
+            if peer_synced {
+                self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                return;
+            }
+            // The consumer's book is replaced wholesale, so nothing delivered before it can be a
+            // duplicate of anything that follows.
+            self.book_events.remove(&key);
+            self.publish_book(&key, b.clone());
+            return;
+        }
+        let window = self.book_dedup_window_ns;
+        let events = self.book_events.entry(key.clone()).or_default();
+        let mut kept: Vec<BookChange> = Vec::new();
+        let (mut deduped, mut disagreed) = (0u64, 0u64);
+        for c in &b.changes {
+            if c.order_id == 0 {
+                kept.push(*c);
+                continue;
+            }
+            let ev = OrderEvent {
+                order_id: c.order_id,
+                action: c.action,
+                price_bits: c.price.to_bits(),
+                size_bits: c.size.to_bits(),
+            };
+            match events.admit(ev, publisher, b.recv_ts_ns, window) {
+                EventVerdict::Deliver => kept.push(*c),
+                EventVerdict::DeliverDisagreeing => {
+                    disagreed += 1;
+                    kept.push(*c);
+                }
+                EventVerdict::Duplicate => deduped += 1,
+            }
+        }
+        let venue = b.venue.as_ref();
+        if deduped > 0 {
+            metrics()
+                .book_events_deduped
+                .with_label_values(&[venue])
+                .inc_by(deduped);
+        }
+        if disagreed > 0 {
+            metrics()
+                .mbo_arm_disagreement
+                .with_label_values(&[venue])
+                .inc_by(disagreed);
+        }
+        if kept.is_empty() {
+            return;
+        }
+        let out = if kept.len() == b.changes.len() {
+            b.clone()
+        } else {
+            NormalizedBook {
+                changes: kept,
+                ..b.clone()
+            }
+        };
+        self.publish_book(&key, out);
+    }
+
+    /// Broadcast one order-level batch and advance the shared replay accumulator with it, so a client
+    /// connecting mid-stream is bootstrapped from what actually reached the wire rather than from any
+    /// single publisher's copy.
+    fn publish_book(&mut self, key: &MarketKey, b: NormalizedBook) {
+        if !self.book_markets.contains_key(key) {
+            self.track_book_market(key);
+        }
+        self.apply_book_replay(key, &b);
+        self.vm(&b.venue).emit[EMIT_BOOK].inc();
+        let _ = self.tx.send(Arc::new(FeedMessage::Book(b)));
     }
 
     /// Advance the shared replay accumulator with an admitted batch, keeping it in step with the
@@ -1401,6 +1670,15 @@ impl Arbiter {
                 // nor evict a real market's state.
                 if self.books.arm_ordinal(&b.venue, publisher) == OTHER_ARM {
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                    return;
+                }
+                // An order-level market on a distributed venue races per venue event instead: every
+                // publisher stamps the same `order_id`, so best-of-N is on offer here where a
+                // price-aggregated book (whose arms share no identity at all) can only elect one arm.
+                if self.order_level_books.contains_key(&key)
+                    && self.mode_for(&b.venue) == ArbitrationMode::Coordinated
+                {
+                    self.emit_order_level_book(key, b, publisher);
                     return;
                 }
                 // Then track the market before admitting it, so the authority's own wire-keyed
@@ -2860,8 +3138,10 @@ mod tests {
         );
     }
 
-    /// There is no mode branch: a `source_ts` tick can hold several deltas, so `Coordinated`'s
-    /// per-tick latch would interleave two arms inside one logical event.
+    /// A price-aggregated book keeps the single-arm gate in `Coordinated` mode too: its arms share no
+    /// per-event identity to race on, and a `source_ts` tick can hold several deltas, so the quote
+    /// floor's per-tick latch would interleave two arms inside one logical event. Only an order-level
+    /// market, where every publisher stamps the venue's own `order_id`, races.
     #[test]
     fn book_publishes_one_arm_in_coordinated_mode_too() {
         let (mut a, mut rx) = gated("HYPERLIQUID", AuthorityConfig::default());
@@ -3528,5 +3808,297 @@ mod tests {
             Some(arm(2)),
             "the zero-id tape must still be matched"
         );
+    }
+
+    // ---- order-level (L3) book racing ----
+
+    /// The venue most racing tests use. The two that read `dz_mbo_arm_disagreement_total` name their
+    /// own instead: that counter is process-global, so sharing a label would make their before/after
+    /// deltas depend on test execution order.
+    const L3_VENUE: &str = "HYPERLIQUID";
+
+    /// One order-level change: the resting state of `order_id` after some venue event.
+    fn order(action: BookAction, order_id: u64, price: f64, size: f64) -> BookChange {
+        BookChange {
+            action,
+            side: BookSide::Bid,
+            price,
+            size,
+            order_id,
+        }
+    }
+
+    /// An arbiter whose one market is order-level and racing: `Coordinated` mode, and both arms
+    /// registered as synced exactly as the Market-by-Order processor reports them.
+    fn racing(
+        venue: &'static str,
+        arms: &[Publisher],
+    ) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>) {
+        let (tx, rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_mode(venue, ArbitrationMode::Coordinated);
+        let key: MarketKey = (venue.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        for &p in arms {
+            a.set_book_synced(&key, p, true);
+        }
+        (a, rx)
+    }
+
+    /// One order-level batch for the market under test.
+    fn l3_batch(venue: &str, changes: Vec<BookChange>, recv_ns: u64) -> FeedMessage {
+        let FeedMessage::Book(mut b) = book(venue, BOOK_INSTRUMENT, changes, true, recv_ns) else {
+            unreachable!()
+        };
+        b.symbol = "BTC".into();
+        FeedMessage::Book(b)
+    }
+
+    fn disagreements(venue: &str) -> u64 {
+        metrics()
+            .mbo_arm_disagreement
+            .with_label_values(&[venue])
+            .get()
+    }
+
+    /// Two publishers of a distributed venue deliver the same venue events. The first copy of each is
+    /// published and the rest collapse, so a consumer sees each event once and always from whichever
+    /// publisher was fastest for that event.
+    #[test]
+    fn order_events_collapse_across_publishers_keeping_first_arrival() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1), arm(2)]);
+        let ev = |oid, size| vec![order(BookAction::Update, oid, 100.0, size)];
+
+        a.emit(l3_batch(L3_VENUE, ev(7, 10.0), 1_000), arm(1));
+        a.emit(l3_batch(L3_VENUE, ev(7, 10.0), 1_100), arm(2)); // the slower publisher's copy
+        a.emit(l3_batch(L3_VENUE, ev(8, 4.0), 1_200), arm(2)); // this one arm 2 won
+        a.emit(l3_batch(L3_VENUE, ev(8, 4.0), 1_300), arm(1));
+
+        let books = drain_books(&mut rx);
+        assert_eq!(
+            books.len(),
+            2,
+            "each venue event reaches the wire exactly once"
+        );
+        assert_eq!(books[0].changes[0].order_id, 7);
+        assert_eq!(books[1].changes[0].order_id, 8);
+    }
+
+    /// Successive partial fills of one order share the id, action and resting price and differ only in
+    /// the quantity left. Each is its own venue event: collapsing the second as a duplicate of the
+    /// first would leave every consumer holding a quantity the venue has already reduced.
+    #[test]
+    fn successive_partial_fills_of_one_order_all_reach_the_wire() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1), arm(2)]);
+        for (i, remaining) in [10.0, 6.0, 3.0].iter().enumerate() {
+            let recv = 1_000 + i as u64;
+            let batch = vec![order(BookAction::Update, 7, 100.0, *remaining)];
+            a.emit(l3_batch(L3_VENUE, batch.clone(), recv), arm(1));
+            a.emit(l3_batch(L3_VENUE, batch, recv + 1), arm(2));
+        }
+        let sizes: Vec<f64> = drain_books(&mut rx)
+            .iter()
+            .map(|b| b.changes[0].size)
+            .collect();
+        assert_eq!(sizes, vec![10.0, 6.0, 3.0]);
+    }
+
+    /// A batch whose events are part new and part already delivered is republished with only the new
+    /// ones. Passing it whole would re-deliver an order's absolute quantity after the wire moved on,
+    /// walking the consumer's order back to a size the venue already reduced.
+    #[test]
+    fn a_partly_duplicate_batch_publishes_only_its_new_events() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1), arm(2)]);
+        a.emit(
+            l3_batch(
+                L3_VENUE,
+                vec![order(BookAction::Update, 7, 100.0, 6.0)],
+                1_000,
+            ),
+            arm(1),
+        );
+        a.emit(
+            l3_batch(
+                L3_VENUE,
+                vec![order(BookAction::Update, 7, 100.0, 3.0)],
+                1_001,
+            ),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+
+        // The slower arm's batch carries the already-published 6.0 alongside a genuinely new order.
+        a.emit(
+            l3_batch(
+                L3_VENUE,
+                vec![
+                    order(BookAction::Update, 7, 100.0, 6.0),
+                    order(BookAction::Update, 9, 99.0, 1.0),
+                ],
+                1_002,
+            ),
+            arm(2),
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]
+                .changes
+                .iter()
+                .map(|c| (c.order_id, c.size))
+                .collect::<Vec<_>>(),
+            vec![(9, 1.0)],
+            "the stale copy of order 7 must not walk the consumer back to 6.0"
+        );
+    }
+
+    /// A resting order only ever shrinks, so a publisher claiming more is resting than a peer already
+    /// reported has missed a fill. Its copy still reaches the wire — dropping an arm's stream on one
+    /// suspicion is worse — but the disagreement is counted rather than silently absorbed.
+    #[test]
+    fn a_content_disagreement_is_counted() {
+        const VENUE: &str = "BookDriftCounted";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        let before = disagreements(VENUE);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 6.0)], 1_000),
+            arm(1),
+        );
+        // arm 2 missed the fill that took this order to 6, so it thinks 8 is resting.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 8.0)], 1_001),
+            arm(2),
+        );
+        assert_eq!(drain_books(&mut rx).len(), 2);
+        assert_eq!(disagreements(VENUE), before + 1);
+    }
+
+    /// A shrinking sequence across two arms is an ordinary race, not drift: whichever arm delivers the
+    /// smaller remainder first simply won that event.
+    #[test]
+    fn an_interleaved_race_is_not_a_disagreement() {
+        const VENUE: &str = "BookRaceNotDrift";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        let before = disagreements(VENUE);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 6.0)], 1_000),
+            arm(1),
+        );
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 3.0)], 1_001),
+            arm(2),
+        );
+        assert_eq!(drain_books(&mut rx).len(), 2);
+        assert_eq!(disagreements(VENUE), before);
+    }
+
+    /// With one live publisher the racing path is a pass-through: no stall, no waiting for a peer.
+    #[test]
+    fn a_single_publisher_streams_unimpeded() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1)]);
+        for oid in 1..=5u64 {
+            a.emit(
+                l3_batch(
+                    L3_VENUE,
+                    vec![order(BookAction::Update, oid, 100.0, 1.0)],
+                    1_000 + oid,
+                ),
+                arm(1),
+            );
+        }
+        assert_eq!(drain_books(&mut rx).len(), 5);
+    }
+
+    /// A copy arriving past the window is a redundant emission at worst, never a book change the guard
+    /// in `ingest::book` would have refused — which is why the window is a cost knob, not a correctness
+    /// parameter.
+    #[test]
+    fn a_copy_past_the_window_re_emits_rather_than_corrupting() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let ev = vec![order(BookAction::Update, 7, 100.0, 6.0)];
+        a.emit(l3_batch(L3_VENUE, ev.clone(), 1_000), arm(1));
+        a.emit(l3_batch(L3_VENUE, ev.clone(), 1_500), arm(2)); // inside the window -> collapsed
+        assert_eq!(drain_books(&mut rx).len(), 1);
+        a.emit(l3_batch(L3_VENUE, ev, 9_000), arm(2)); // past it -> re-emitted
+        assert_eq!(drain_books(&mut rx).len(), 1);
+    }
+
+    /// A recovering publisher must not wipe a consumer that a healthy peer is serving, so its
+    /// `Clear`-led re-baseline is dropped while any peer of the market is synced.
+    #[test]
+    fn a_rebaseline_is_suppressed_while_a_peer_is_synced() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1)]);
+        let key: MarketKey = (L3_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        a.set_book_synced(&key, arm(2), false);
+        let _ = drain_books(&mut rx);
+
+        a.emit(
+            l3_batch(
+                L3_VENUE,
+                vec![clear_both(), order(BookAction::Update, 7, 100.0, 6.0)],
+                1_000,
+            ),
+            arm(2),
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "arm 1 is serving this market"
+        );
+    }
+
+    /// With every publisher recovering there is nothing to protect, so the re-baseline goes out — and
+    /// exactly once, however many publishers recover together, because the arm that publishes reports
+    /// itself synced before doing so.
+    #[test]
+    fn simultaneous_recoveries_produce_exactly_one_rebaseline() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[]);
+        let key: MarketKey = (L3_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        a.set_book_synced(&key, arm(1), false);
+        a.set_book_synced(&key, arm(2), false);
+        let _ = drain_books(&mut rx);
+
+        let rebaseline = vec![clear_both(), order(BookAction::Update, 7, 100.0, 6.0)];
+        // Each arm reports itself synced as it installs its snapshot, then publishes.
+        a.set_book_synced(&key, arm(1), true);
+        a.emit(l3_batch(L3_VENUE, rebaseline.clone(), 1_000), arm(1));
+        a.set_book_synced(&key, arm(2), true);
+        a.emit(l3_batch(L3_VENUE, rebaseline, 1_001), arm(2));
+        assert_eq!(drain_books(&mut rx).len(), 1);
+    }
+
+    /// The racing window is bounded by event count as well as by time, so a publisher that stalls the
+    /// clock cannot grow one market's state without limit.
+    #[test]
+    fn the_racing_window_is_bounded_by_event_count() {
+        let (mut a, mut rx) = racing(L3_VENUE, &[arm(1)]);
+        for oid in 0..(MAX_SEEN_ORDER_EVENTS as u64 + 512) {
+            a.emit(
+                l3_batch(
+                    L3_VENUE,
+                    vec![order(BookAction::Update, oid + 1, 100.0, 1.0)],
+                    1_000,
+                ),
+                arm(1),
+            );
+        }
+        let _ = drain_books(&mut rx);
+        let key: MarketKey = (L3_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let events = &a.book_events[&key];
+        assert!(events.seen.len() <= MAX_SEEN_ORDER_EVENTS);
+        assert!(events.smallest.len() <= MAX_SEEN_ORDER_EVENTS);
+    }
+
+    /// A market evicted from the tracked set takes its racing state with it, or the two maps keyed by
+    /// wire-supplied ids would grow past the cap `book_markets` enforces.
+    #[test]
+    fn eviction_drops_the_racing_state_too() {
+        let (mut a, _rx) = racing(L3_VENUE, &[arm(1)]);
+        for id in 0..(MAX_BOOK_MARKETS as u32 + 8) {
+            let key: MarketKey = (L3_VENUE.into(), BOOK_CHANNEL, id);
+            a.set_book_synced(&key, arm(1), true);
+        }
+        assert_eq!(a.book_markets.len(), MAX_BOOK_MARKETS);
+        assert!(a.order_level_books.len() <= MAX_BOOK_MARKETS);
+        assert!(a.book_events.len() <= MAX_BOOK_MARKETS);
     }
 }
