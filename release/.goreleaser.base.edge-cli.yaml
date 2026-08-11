@@ -98,8 +98,11 @@ release:
   replace_existing_artifacts: true
 
 git:
+  # The nightly tag below must be ignored, or a later release can select it as the previous tag and
+  # compute its changelog from the wrong range. Foreign prefixes need no entry: monorepo.tag_prefix
+  # already excludes them.
   ignore_tags:
-    - shred-proxy-v*
+    - doublezero-edge/daily
 
 nightly:
   publish_release: true
