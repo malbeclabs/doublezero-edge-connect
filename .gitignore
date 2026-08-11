@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
 
+# goreleaser local build/package output (release/.goreleaser.*.yaml)
+/build/
+/dist/
+
 # Roadbike / Claude Code session artifacts
 .claude/
 

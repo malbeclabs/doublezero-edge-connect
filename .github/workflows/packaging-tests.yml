@@ -1,0 +1,66 @@
+name: packaging-tests
+
+# Runs tests/packaging.bats, which pins the CLI package's inertness (Task 4 of
+# docs/design/cli-packaging-and-installer-plan.md): it builds a real snapshot .deb/.rpm with
+# goreleaser and asserts on the built artifacts (dpkg/rpm/ldd output), not on
+# release/.goreleaser.base.edge-cli.yaml, so a dependency or maintainer script arriving through
+# any mechanism still fails the build.
+#
+# goreleaser OSS can't parse the shipped config's two goreleaser-pro-only top-level keys
+# (`monorepo:`, `nightly:`); the test builds from a copy with just those deleted (via `yq`), so
+# this job needs no GORELEASER_KEY and runs on PRs from forks. Separate from shell-tests.yml
+# because it needs a musl + rpm + goreleaser toolchain the connect.sh suite does not.
+#
+# Runs unconditionally rather than filtering on `paths:` -- see actionlint.yml for why a
+# paths-filtered required check gets stuck as "Expected -- Waiting for status to be reported" on
+# PRs that don't touch the filtered paths.
+on:
+  push:
+    branches: [main, 'hotfix/**']
+  pull_request:
+
+# Least-privilege default: this workflow only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-targets: |
+            target
+            target/x86_64-unknown-linux-musl/release
+
+      # bats runs the test; rpm/musl-tools are the same packaging toolchain
+      # release.edge-cli.yml installs (musl-tools provides musl-gcc, the static build's
+      # linker; rpm is nfpm's rpm-building dependency).
+      - name: Install bats, rpm and musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats rpm musl-tools
+
+      # goreleaser OSS (not -pro): the test needs no license, so it runs on every PR including
+      # forks. Pinned to the version this test was validated against.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          install-only: true
+
+      - name: Install yq
+        run: |
+          sudo curl -sL -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Run packaging tests
+        run: bats tests/packaging.bats

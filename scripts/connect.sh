@@ -25,7 +25,10 @@
 #   DZ_IMAGE=ghcr.io/malbeclabs/doublezero-edge-connect:mainnet-beta
 #   DZ_NAME=doublezero-edge-connect      container name
 #   DZ_FEEDS=<venue,venue>               optional: narrow ingested venues (default: all)
-#   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install)
+#   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install) -- also
+#                                        implies "yes" to the doublezero-edge CLI offer below
+#   DZ_INSTALL_CLI=1|0                   answer the doublezero-edge CLI install prompt
+#                                        non-interactively (1=install, 0=skip)
 #   DZ_CLIENT_IP=<ipv4>                  override the public IP used by the access-pass pre-check
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
@@ -66,6 +69,7 @@ DZ_ENV="${DZ_ENV:-mainnet-beta}"
 DZ_SECRET="${DZ_SECRET:-}"
 DZ_FEEDS="${DZ_FEEDS:-}"
 DZ_ASSUME_YES="${DZ_ASSUME_YES:-0}"
+DZ_INSTALL_CLI="${DZ_INSTALL_CLI:-}"
 KEYPAIR_DEST="/root/.config/doublezero/id.json"   # client's default keypair path (container runs as root)
 LIVENESS_UDP_PORT=44880
 WS_PORT=8081                                       # bridge WebSocket (PROTOCOL.md)
@@ -549,6 +553,19 @@ if [ -n "${DZ_FEED_REGISTRY:-}" ]; then
   info "Bind-mounting feed registry: $DZ_FEED_REGISTRY (read-only)"
 fi
 
+# The image bakes in a default DZ_FEED_REGISTRY_URL (the hosted document — see the Dockerfile),
+# and the bridge tries that URL before ever looking at DZ_FEED_REGISTRY (ingest/registry.rs:
+# Source::from_flags takes the URL whenever it is non-empty). An operator who set DZ_FEED_REGISTRY
+# almost certainly wants the file to win — that's the whole point of the air-gapped/locked-down
+# path — so if they didn't also set DZ_FEED_REGISTRY_URL themselves, clear it explicitly on the
+# container; otherwise the bind-mounted file would be silently ignored in favor of the image's
+# baked-in URL.
+CLEAR_REGISTRY_URL=0
+if [ -n "${DZ_FEED_REGISTRY:-}" ] && [ -z "${DZ_FEED_REGISTRY_URL:-}" ]; then
+  CLEAR_REGISTRY_URL=1
+  info "DZ_FEED_REGISTRY is set; clearing the image's default DZ_FEED_REGISTRY_URL so the bind-mounted file is what actually loads."
+fi
+
 # ----------------------------------------------------------------------------
 # 4d. admin surface warning (host-side)
 # ----------------------------------------------------------------------------
@@ -625,6 +642,9 @@ env_args=()
 for v in "${PASSTHROUGH[@]}"; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
+# See 4c above: force DZ_FEED_REGISTRY_URL empty on the container so the bind-mounted file wins
+# over the image's baked-in default, rather than being silently shadowed by it.
+[ "$CLEAR_REGISTRY_URL" = 1 ] && env_args+=(-e "DZ_FEED_REGISTRY_URL=")
 # WS_BIND is the one var forwarded whenever it is *set* — including set-but-empty (WS_BIND="") —
 # so the WS sink can be disabled straight from the one-liner (an empty --ws-bind turns the sink
 # off in the bridge). The preflight above may also have set/cleared it in response to a conflict.
@@ -687,6 +707,24 @@ echo
 spin_sleep 5 "Waiting for the tunnel to settle"
 $SUDO docker exec "$DZ_NAME" doublezero status || true
 echo
+
+# The image bakes in DZ_FEED_REGISTRY_URL (the hosted feeds document); a host that can't reach
+# it falls back to the built-in copy SILENTLY BY DESIGN (see ingest/registry.rs), so the bridge's
+# own "feed registry resolved" startup log line is the only signal of which one actually loaded.
+# Surface it here rather than leaving the operator to go find it. The resolve happens at process
+# start (well before this point in the script), so one look back over the log is enough; retry
+# briefly only to cover a slow container start.
+registry_line=""
+for _ in $(seq 1 10); do
+  registry_line="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "feed registry resolved" | tail -1 || true)"
+  [ -n "$registry_line" ] && break
+  sleep 1
+done
+if [ -n "$registry_line" ]; then
+  info "Feed registry: ${registry_line#*feed registry resolved }"
+else
+  warn "Could not find the 'feed registry resolved' startup log line yet. Check: sudo docker logs $DZ_NAME | grep 'feed registry'"
+fi
 if ws_disabled; then
   info "Done. The WebSocket sink is disabled (WS_BIND=\"\"); the bridge ingests DZ Edge and (if configured) forwards shreds, but serves no WebSocket."
 else
@@ -728,3 +766,100 @@ echo "  sudo docker logs -f $DZ_NAME                            # bridge + daemo
 echo "  sudo docker exec -it $DZ_NAME doublezero status         # tunnel status"
 echo "  sudo docker exec -it $DZ_NAME doublezero latency        # device latencies"
 echo "  sudo docker stop $DZ_NAME && sudo docker rm $DZ_NAME    # disconnect, stop & remove"
+
+# ----------------------------------------------------------------------------
+# 9. offer the doublezero-edge CLI (host-side; a convenience, never load-bearing)
+# ----------------------------------------------------------------------------
+# doublezero-edge is a small agent-facing CLI over this container's /v1 (and, if enabled,
+# /admin) HTTP API, packaged as a signed, dependency-free deb/rpm with no maintainer scripts (see
+# release/.goreleaser.*.edge-cli.yaml). The bridge above is already up; nothing here can affect
+# it -- declining, or any package-manager failure, only warns and moves on. Never `die`.
+echo
+offer_cli_package() {
+  if command -v doublezero-edge >/dev/null 2>&1; then
+    info "doublezero-edge CLI already installed ($(doublezero-edge --version 2>/dev/null || echo 'version unknown'))."
+    return 0
+  fi
+
+  local pm=""
+  if command -v apt-get >/dev/null 2>&1; then pm=apt
+  elif command -v dnf >/dev/null 2>&1; then pm=dnf
+  elif command -v yum >/dev/null 2>&1; then pm=yum
+  fi
+
+  # Which Cloudsmith repo carries the package for this environment (release/.goreleaser.{testnet,
+  # mainnet-beta}.edge-cli.yaml): the CLI has no ledger coupling, so testnet publishes to
+  # doublezero-testnet and every other env (mainnet-beta, devnet) shares doublezero-mainnet-beta.
+  local cs_repo="doublezero-mainnet-beta"
+  [ "$DZ_ENV" = testnet ] && cs_repo="doublezero-testnet"
+
+  if [ -z "$pm" ]; then
+    warn "No supported package manager (apt/dnf/yum) found; skipping the doublezero-edge CLI. Install it later: https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.<deb|rpm>.sh"
+    return 0
+  fi
+
+  local manual="curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.deb.sh | sudo -E bash && sudo apt install doublezero-edge"
+  [ "$pm" = apt ] || manual="curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.rpm.sh | sudo -E bash && sudo $pm install doublezero-edge"
+
+  case "$DZ_INSTALL_CLI" in
+    0) info "Skipping the doublezero-edge CLI (DZ_INSTALL_CLI=0). Install it later: $manual"; return 0 ;;
+    1) : ;;
+    *)
+      # confirm()'s own '[ -r "$TTY" ]' check isn't enough: a readable /dev/tty inode can still
+      # fail to OPEN with no controlling terminal (the same headless curl|bash / container case
+      # section 3b already works around), and confirm() would then read into an unset 'ans' and
+      # abort the whole script under 'set -u'. Probe an actual open first; no controlling
+      # terminal means no answer, so this is attendantless: skip rather than crash.
+      local want_cli=1
+      if [ "$DZ_ASSUME_YES" != 1 ]; then
+        if { : <"$TTY"; } 2>/dev/null; then
+          confirm "Install the doublezero-edge CLI too? This runs Cloudsmith's unpinned setup script for malbeclabs/$cs_repo as root (unless already configured), then installs the 'doublezero-edge' package." || want_cli=0
+        else
+          want_cli=0
+        fi
+      fi
+      if [ "$want_cli" != 1 ]; then
+        info "Skipping the doublezero-edge CLI. Install it later: $manual"
+        return 0
+      fi
+      ;;
+  esac
+
+  local repo_configured=0
+  case "$pm" in
+    apt) apt-cache policy doublezero-edge 2>/dev/null | grep -q "Candidate:" \
+           && ! apt-cache policy doublezero-edge 2>/dev/null | grep -q "Candidate: (none)" \
+           && repo_configured=1 ;;
+    dnf) dnf list --available doublezero-edge >/dev/null 2>&1 && repo_configured=1 ;;
+    yum) yum list available doublezero-edge >/dev/null 2>&1 && repo_configured=1 ;;
+  esac
+
+  if [ "$repo_configured" = 1 ]; then
+    info "The malbeclabs/$cs_repo repository is already configured; installing doublezero-edge directly."
+  else
+    info "Configuring the malbeclabs/$cs_repo Cloudsmith repository..."
+    case "$pm" in
+      apt)     local setup_url="https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.deb.sh" ;;
+      dnf|yum) local setup_url="https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.rpm.sh" ;;
+    esac
+    # "$SUDO -E bash" only makes sense when $SUDO is non-empty; when we're already root (the
+    # common container case) $SUDO is "" and a bare "-E" would be run as a command.
+    local setup_runner=(bash)
+    [ -n "$SUDO" ] && setup_runner=("$SUDO" -E bash)
+    if ! curl -1sLf "$setup_url" | "${setup_runner[@]}"; then
+      warn "Could not configure the malbeclabs/$cs_repo repository; skipping the doublezero-edge CLI. Install it later: $manual"
+      return 0
+    fi
+  fi
+
+  info "Installing doublezero-edge..."
+  case "$pm" in
+    apt)     $SUDO apt-get install -y doublezero-edge ;;
+    dnf|yum) $SUDO "$pm" install -y doublezero-edge ;;
+  esac || {
+    warn "Installing doublezero-edge failed; continuing without it. Retry later: sudo $([ "$pm" = apt ] && echo "apt install" || echo "$pm install") doublezero-edge"
+    return 0
+  }
+  info "Installed doublezero-edge CLI ($(doublezero-edge --version 2>/dev/null || echo 'version unknown'))."
+}
+offer_cli_package

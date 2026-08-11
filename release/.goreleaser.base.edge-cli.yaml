@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+#
+# Modeled on the DoubleZero client's own CLI packaging
+# (release/.goreleaser.base.client.yaml in the doublezero repo): same musl build, same nfpm
+# completion paths, same signing/publish story. Unlike the client, this package has no
+# environment-specific build variant — the CLI is a plain HTTP client with no ledger coupling, so
+# one build and one nfpm id are published to both the testnet and mainnet-beta repositories.
+
+version: 2
+
+project_name: doublezero-edge
+
+monorepo:
+  tag_prefix: doublezero-edge/
+
+# Generate shell-completion scripts once, natively, before the cross-compiled release build runs.
+# The output of `doublezero-edge completion <shell>` depends only on the clap Command tree, not the
+# target arch, so a native build is sufficient and the same files are bundled into the nfpm
+# artifact.
+before:
+  hooks:
+    - sh -c 'mkdir -p build/completions'
+    - cargo build --release --package=doublezero-edge --bin=doublezero-edge
+    - sh -c 'target/release/doublezero-edge completion bash > build/completions/doublezero-edge.bash'
+    - sh -c 'target/release/doublezero-edge completion zsh  > build/completions/_doublezero-edge'
+    - sh -c 'target/release/doublezero-edge completion fish > build/completions/doublezero-edge.fish'
+
+builds:
+  - id: doublezero-edge
+    builder: rust
+    tool: cargo
+    binary: doublezero-edge
+    targets:
+      - x86_64-unknown-linux-musl
+    command: build
+    flags:
+      - --package=doublezero-edge
+      - --release
+    # Static musl build: a glibc-linked binary built on the CI image fails on older hosts, and we
+    # do not control the host distro.
+    env:
+      - CC_x86_64_unknown_linux_musl=musl-gcc
+      - CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+
+archives:
+  - id: doublezero_edge_archive
+    formats: ['tar.gz']
+    ids: [doublezero-edge]
+    # this name template makes the OS and Arch compatible with the results of `uname`.
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+
+nfpms:
+  - id: doublezero-edge
+    package_name: doublezero-edge
+    ids: [doublezero-edge]
+    vendor: doublezero
+    homepage: doublezero.xyz
+    maintainer: Malbec Labs <dev@malbeclabs.com>
+    description: |-
+      DoubleZero Edge CLI: a read-only client for a running doublezero-edge-connect bridge's
+      /v1 market-data and /admin APIs.
+    license: Apache 2.0
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    release: 1
+    section: default
+    # Deliberately inert: no dependencies, no maintainer scripts, no unit files, nothing beyond the
+    # binary and its completions. That is what makes the package safe to install from a prompt.
+    contents:
+      - src: build/completions/doublezero-edge.bash
+        dst: /usr/share/bash-completion/completions/doublezero-edge
+      - src: build/completions/_doublezero-edge
+        dst: /usr/share/zsh/site-functions/_doublezero-edge
+      - src: build/completions/doublezero-edge.fish
+        dst: /usr/share/fish/vendor_completions.d/doublezero-edge.fish
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  github:
+    owner: malbeclabs
+    name: doublezero-edge-connect
+  draft: false
+  replace_existing_artifacts: true
+
+git:
+  # The nightly tag below must be ignored, or a later release can select it as the previous tag and
+  # compute its changelog from the wrong range. Foreign prefixes need no entry: monorepo.tag_prefix
+  # already excludes them.
+  ignore_tags:
+    - doublezero-edge/daily
+
+nightly:
+  publish_release: true
+  keep_single_release: true
+  version_template: '{{ incpatch .Version }}~git{{ .Env.BUILD_DATE }}.{{ .ShortCommit }}'
+  tag_name: 'doublezero-edge/daily'

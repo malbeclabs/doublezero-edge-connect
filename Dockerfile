@@ -98,6 +98,14 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/bridge-entrypoint.sh
 # default in src/main.rs); override with `-e RUST_LOG=debug` to get verbose output.
 ENV RUST_LOG=warn,doublezero_edge_connect=info
 
+# The hosted feed registry, as an image ENV rather than a compiled-in clap default: the binary
+# stays neutral (running from source reaches no network) while the container is opinionated,
+# inspectable via `docker inspect`, and overridable with `-e DZ_FEED_REGISTRY_URL=...` or a
+# bind-mounted file (`-e DZ_FEED_REGISTRY=<path>`). A host that can't reach the URL falls back to
+# the built-in document silently by design — see the "feed registry resolved" log line at startup
+# (src/ingest/registry.rs) for which source actually loaded.
+ENV DZ_FEED_REGISTRY_URL=https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json
+
 # Documentational: host networking ignores published ports (EXPOSE opens nothing by itself), but
 # this records the surfaces a default config can listen on. Always-on: 8081 (WS, --ws-bind) and
 # 9099 (query API, --api-bind). Off unless configured: 9090 (metrics, --metrics-bind, empty

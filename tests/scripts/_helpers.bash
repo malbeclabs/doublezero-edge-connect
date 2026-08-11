@@ -35,12 +35,15 @@ EOF
   # docker: record every invocation to $DOCKER_LOG; answer the few subcommands
   # the script reads back. `logs` emits the readiness line so the 30x wait loop
   # breaks on the first iteration.
+  # `logs` always emits the readiness line the daemon-wait loop looks for; it also appends the
+  # contents of $DZ_TEST_DOCKER_LOG_EXTRA (a file path), when set, so a test can make e.g. the
+  # bridge's "feed registry resolved" startup line appear without a real container.
   cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"$DOCKER_LOG"
 case "$1" in
   info) exit 0 ;;
-  logs) echo "doublezerod ready"; exit 0 ;;
+  logs) echo "doublezerod ready"; [ -n "${DZ_TEST_DOCKER_LOG_EXTRA:-}" ] && cat "$DZ_TEST_DOCKER_LOG_EXTRA" 2>/dev/null; exit 0 ;;
   ps)   echo "stubcontainerid"; exit 0 ;;
   *)    exit 0 ;;
 esac
