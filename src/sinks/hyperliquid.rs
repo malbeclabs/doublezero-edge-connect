@@ -37,8 +37,8 @@ use tracing::{info, warn};
 use crate::{
     metrics::metrics,
     model::{
-        now_ns, BookAccumulator, BookAction, BookSide, BookSnapshot, FeedMessage, NormalizedBook,
-        NormalizedTrade, ReplayScope, Side,
+        now_ns, BookAccumulator, BookAction, BookSide, BookSnapshot, CountedLevel, FeedMessage,
+        NormalizedBook, NormalizedTrade, ReplayScope, Side,
     },
 };
 
@@ -60,8 +60,22 @@ const MAX_COIN_LEN: usize = 32;
 /// shipped default.
 const MAX_CLIENTS: usize = 64;
 const MAX_SUBS: usize = 256;
+const MAX_INBOUND_PER_MIN: u32 = 600;
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on an inbound frame. Control frames here are tens of bytes; tungstenite's 64 MiB default would
+/// let `MAX_CLIENTS` peers buffer gigabytes before a single byte is parsed. Read-path only, so the
+/// sink's own large `l4Book` snapshots are unaffected.
+fn inbound_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(64 * 1024))
+        .max_frame_size(Some(64 * 1024))
+}
+
+/// A market in the shared replay map: `(venue, channel, instrument_id)`.
+type MarketKey = (Arc<str>, u32, u32);
 
 /// Longest client text echoed back in an error frame, so a hostile client cannot amplify its own
 /// input into our output.
@@ -79,7 +93,7 @@ const ZERO_HASH: &str = "0x00000000000000000000000000000000000000000000000000000
 /// default applied, the ceiling clamped), so the value carried is the one actually served.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub(crate) enum Sub {
+enum Sub {
     #[serde(rename_all = "camelCase")]
     L2Book {
         coin: String,
@@ -93,18 +107,10 @@ pub(crate) enum Sub {
     Trades { coin: String },
 }
 
-impl Sub {
-    fn coin(&self) -> &str {
-        match self {
-            Sub::L2Book { coin, .. } | Sub::L4Book { coin } | Sub::Trades { coin } => coin,
-        }
-    }
-}
-
 /// The `l2Book` view a subscription asked for: the significant-figure bucket, its mantissa
 /// refinement, and how deep to publish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct L2View {
+struct L2View {
     n_sig_figs: Option<u32>,
     mantissa: Option<u32>,
     n_levels: usize,
@@ -112,7 +118,7 @@ pub(crate) struct L2View {
 
 /// One recognized inbound control frame.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Control {
+enum Control {
     Subscribe(Sub),
     Unsubscribe(Sub),
     /// `{"method":"ping"}` — NautilusTrader sends this every 30s and parses only `{"channel":"pong"}`
@@ -152,7 +158,7 @@ enum Inbound {
 /// An out-of-range `nSigFigs`/`mantissa` is **rejected, not coerced**: a silently-substituted bucket
 /// produces a book whose prices are plausible and not the venue's, which is worse for a consumer
 /// than being told no. `nLevels` is our own extension and only truncates, so it clamps.
-pub(crate) fn parse_control(text: &str) -> Result<Control, String> {
+fn parse_control(text: &str) -> Result<Control, String> {
     let inbound = serde_json::from_str::<Inbound>(text).map_err(|_| {
         let mut shown: String = text.chars().take(MAX_ECHOED_ERROR).collect();
         if shown.len() < text.len() {
@@ -199,6 +205,12 @@ fn normalize(s: SubIn) -> Result<Sub, String> {
                         "Invalid subscription: mantissa {m} requires nSigFigs 5 and must be 2 or 5"
                     ))
                 }
+            }
+            // Zero is refused rather than clamped up: it renders as an empty book on every frame,
+            // which an `l2Book` consumer applies as "the book is now empty" and then holds forever
+            // with nothing to explain it.
+            if n_levels == Some(0) {
+                return Err("Invalid subscription: nLevels must be > 0".to_string());
             }
             Ok(Sub::L2Book {
                 coin,
@@ -334,7 +346,12 @@ fn aggregate_price(px: f64, is_bid: bool, n_sig_figs: Option<u32>, mantissa: Opt
     }
     let v = scaled as u64;
     let digits = if v == 0 { 1 } else { v.ilog10() + 1 };
-    let inc = u64::from(mantissa.unwrap_or(1)).saturating_mul(10u64.pow(digits.saturating_sub(n)));
+    // `normalize` bounds `n` to 2..=5, which bounds the exponent to 18 — but the fallback keeps a
+    // caller that skipped validation from panicking in debug and wrapping in release.
+    let Some(pow) = 10u64.checked_pow(digits.saturating_sub(n)) else {
+        return px;
+    };
+    let inc = u64::from(mantissa.unwrap_or(1)).saturating_mul(pow);
     let bucketed = if is_bid {
         (v / inc).checked_mul(inc)
     } else {
@@ -348,11 +365,7 @@ fn aggregate_price(px: f64, is_bid: bool, n_sig_figs: Option<u32>, mantissa: Opt
 
 /// Bucket one already-best-first side and merge the levels that collide, summing size and order
 /// count. Input order is preserved, so a merged level keeps the position of the best price in it.
-fn bucket_side(
-    levels: &[crate::model::CountedLevel],
-    is_bid: bool,
-    view: L2View,
-) -> Vec<(f64, f64, u32)> {
+fn bucket_side(levels: &[CountedLevel], is_bid: bool, view: L2View) -> Vec<CountedLevel> {
     let mut out: Vec<(f64, f64, u32)> = Vec::with_capacity(levels.len().min(view.n_levels));
     for &(px, sz, n) in levels {
         let px = aggregate_price(px, is_bid, view.n_sig_figs, view.mantissa);
@@ -373,15 +386,18 @@ fn bucket_side(
 }
 
 /// Render one market's whole book as an `l2Book` frame. `l2Book` is snapshot-per-update, not deltas:
-/// Nautilus clears and rebuilds from every frame, so the caller must only ever hand this an
-/// accumulator that is [`BookAccumulator::baselined`].
-pub(crate) fn render_l2book(
-    acc: &BookAccumulator,
+/// Nautilus clears and rebuilds from every frame, so the caller must only ever hand this the folded
+/// levels of a market that is [`BookAccumulator::baselined`].
+///
+/// Takes the fold rather than the accumulator because the fold is O(resting orders) and independent
+/// of the view: one is computed per market per message and shared by every subscription of it.
+fn render_l2book(
+    bids: &[CountedLevel],
+    asks: &[CountedLevel],
     coin: &str,
     view: L2View,
     time_ms: u64,
 ) -> String {
-    let (bids, asks) = acc.price_fold();
     let level = |(px, sz, n): (f64, f64, u32)| Level {
         px: num(px),
         sz: num(sz),
@@ -391,11 +407,11 @@ pub(crate) fn render_l2book(
         coin,
         time: time_ms,
         levels: [
-            bucket_side(&bids, true, view)
+            bucket_side(bids, true, view)
                 .into_iter()
                 .map(level)
                 .collect(),
-            bucket_side(&asks, false, view)
+            bucket_side(asks, false, view)
                 .into_iter()
                 .map(level)
                 .collect(),
@@ -414,7 +430,7 @@ fn side_code(side: BookSide) -> &'static str {
     }
 }
 
-fn l4_order<'a>(coin: &'a str, side: BookSide, px: f64, sz: f64, oid: u64, ts: u64) -> L4Order<'a> {
+fn l4_order<'a>(coin: &'a str, side: BookSide, px: f64, sz: f64, oid: u64) -> L4Order<'a> {
     L4Order {
         user: None,
         coin,
@@ -422,7 +438,10 @@ fn l4_order<'a>(coin: &'a str, side: BookSide, px: f64, sz: f64, oid: u64, ts: u
         limit_px: num(px),
         sz: num(sz),
         oid,
-        timestamp: ts,
+        // Not the book's event time: that is one instant shared by every order in a snapshot, which a
+        // consumer ranking queue priority or ageing orders would read as a real placement time. The
+        // wire carries no per-order timestamp, so 0 says so.
+        timestamp: 0,
         trigger_condition: "N/A",
         is_trigger: false,
         trigger_px: "0",
@@ -437,11 +456,7 @@ fn l4_order<'a>(coin: &'a str, side: BookSide, px: f64, sz: f64, oid: u64, ts: u
 /// Render the whole resting book, order by order with the venue's own ids — what an `l4Book`
 /// subscriber receives before any diff, and what re-baselines it afterwards (the channel has no
 /// clear, so a producer re-baseline becomes another snapshot).
-pub(crate) fn render_l4book_snapshot(
-    acc: &BookAccumulator,
-    key: &(Arc<str>, u32, u32),
-    coin: &str,
-) -> String {
+fn render_l4book_snapshot(acc: &BookAccumulator, key: &MarketKey, coin: &str) -> String {
     let b = acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders);
     let time = ms_or_now(b.source_ts_ns);
     let (mut bids, mut asks) = (Vec::new(), Vec::new());
@@ -451,7 +466,7 @@ pub(crate) fn render_l4book_snapshot(
         if c.order_id == 0 {
             continue;
         }
-        let order = l4_order(coin, c.side, c.price, c.size, c.order_id, time);
+        let order = l4_order(coin, c.side, c.price, c.size, c.order_id);
         if matches!(c.side, BookSide::Bid) {
             bids.push(order);
         } else {
@@ -471,7 +486,7 @@ pub(crate) fn render_l4book_snapshot(
 
 /// Render one incremental batch as `l4Book` order diffs. `None` when the batch is for another venue
 /// or coin, or when it carries no order-level change at all.
-pub(crate) fn render_l4book_diff(b: &NormalizedBook, coin: &str) -> Option<String> {
+fn render_l4book_diff(b: &NormalizedBook, coin: &str) -> Option<String> {
     if b.venue.as_ref() != VENUE || b.symbol.as_ref() != coin {
         return None;
     }
@@ -523,7 +538,7 @@ struct TradeData<'a> {
 ///
 /// A trade whose aggressor we do not know is dropped rather than guessed: the side is the only field
 /// on this channel a consumer acts on directionally, and Hyperliquid's schema has no "unknown".
-pub(crate) fn render_trade(t: &NormalizedTrade, coin: &str) -> Option<String> {
+fn render_trade(t: &NormalizedTrade, coin: &str) -> Option<String> {
     if t.venue.as_ref() != VENUE || t.symbol.as_ref() != coin {
         return None;
     }
@@ -596,7 +611,17 @@ pub async fn serve(
 ) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
     loop {
-        let (stream, peer) = listener.accept().await?;
+        // Never propagate an accept error: this task's `Err` reaches `main`'s `select!` and would
+        // exit the process — tunnel, receivers and every other sink with it — over a transient
+        // `ECONNABORTED`/`EMFILE` on an opt-in compatibility port. That is the same outcome the
+        // non-fatal bind above exists to avoid.
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("hl sink accept failed: {e}");
+                continue;
+            }
+        };
         if clients.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
             clients.fetch_sub(1, Ordering::SeqCst);
             warn!(%peer, max = MAX_CLIENTS, "hl sink at max clients; rejecting connection");
@@ -625,82 +650,150 @@ fn sent(channel: &'static str) {
         .inc();
 }
 
-/// The current full state of one market on the channel `sub` asked for, or `None` when the market is
-/// not this venue's, not the subscribed coin, or not [`BookAccumulator::baselined`].
+/// Whether this market's accumulated book may be published as full state on either book channel.
 ///
-/// That last gate is load-bearing on **both** book channels: an `l2Book` frame replaces a consumer's
-/// book wholesale and an `l4Book` snapshot claims completeness, so an accumulator seeded mid-stream —
-/// holding only the levels that have moved since — must be withheld rather than published as whole.
-fn full_state(
-    key: &(Arc<str>, u32, u32),
-    acc: &BookAccumulator,
-    sub: &Sub,
-) -> Option<(&'static str, String)> {
-    if key.0.as_ref() != VENUE || acc.symbol().as_ref() != sub.coin() || !acc.baselined() {
-        return None;
+/// `baselined` is load-bearing on **both**: an `l2Book` frame replaces a consumer's book wholesale
+/// and an `l4Book` snapshot claims completeness, so an accumulator seeded mid-stream — holding only
+/// the levels that have moved since — must be withheld rather than published as whole. `is_order_level`
+/// is what keeps that honest for a market whose changes are price-aggregated: this sink reads only the
+/// order population, so such a market would render as an *empty* book, telling the consumer to discard
+/// levels the bridge holds.
+fn publishable(key: &MarketKey, acc: &BookAccumulator, coin: &str) -> bool {
+    key.0.as_ref() == VENUE
+        && acc.symbol().as_ref() == coin
+        && acc.baselined()
+        && acc.is_order_level()
+}
+
+/// Clone one market's accumulator **out from under** the shared lock, which the arbiter's emit path
+/// takes on every published batch. Everything downstream — the fold, the decimal formatting, the JSON
+/// — is O(book) and would stall every ingest receiver, on every feed, if it ran while holding this.
+fn take_market(books: &BookSnapshot, key: &MarketKey, coin: &str) -> Option<BookAccumulator> {
+    let guard = crate::model::lock(books);
+    guard
+        .get(key)
+        .filter(|acc| publishable(key, acc, coin))
+        .cloned()
+}
+
+/// Every market of this venue matching `coin`, cloned out from under the lock as above. Scans the
+/// map, so it is for a subscribe or a recovery — never the steady stream, which resolves one market by
+/// its own key.
+fn take_markets(books: &BookSnapshot, coin: &str) -> Vec<(MarketKey, BookAccumulator)> {
+    let guard = crate::model::lock(books);
+    guard
+        .iter()
+        .filter(|(key, acc)| publishable(key, acc, coin))
+        .map(|(key, acc)| (key.clone(), acc.clone()))
+        .collect()
+}
+
+fn l2_view(n_sig_figs: Option<u32>, mantissa: Option<u32>, n_levels: usize) -> L2View {
+    L2View {
+        n_sig_figs,
+        mantissa,
+        n_levels,
     }
+}
+
+/// Bootstrap `sub` from current state.
+fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
     match sub {
+        // Prints are point-in-time: there is nothing to bootstrap, and no reason to take the lock.
+        Sub::Trades { .. } => Vec::new(),
         Sub::L2Book {
             coin,
             n_sig_figs,
             mantissa,
             n_levels,
-        } => {
-            let view = L2View {
-                n_sig_figs: *n_sig_figs,
-                mantissa: *mantissa,
-                n_levels: *n_levels,
-            };
-            let time = ms_or_now(acc.source_ts_ns());
-            Some(("l2Book", render_l2book(acc, coin, view, time)))
-        }
-        Sub::L4Book { coin } => Some(("l4Book", render_l4book_snapshot(acc, key, coin))),
-        Sub::Trades { .. } => None,
+        } => take_markets(books, coin)
+            .into_iter()
+            .map(|(_, acc)| {
+                let (bids, asks) = acc.price_fold();
+                let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
+                let time = ms_or_now(acc.source_ts_ns());
+                ("l2Book", render_l2book(&bids, &asks, coin, view, time))
+            })
+            .collect(),
+        Sub::L4Book { coin } => take_markets(books, coin)
+            .into_iter()
+            .map(|(key, acc)| ("l4Book", render_l4book_snapshot(&acc, &key, coin)))
+            .collect(),
     }
 }
 
-/// Bootstrap `sub` from current state — every market of this venue whose symbol is the subscribed
-/// coin. Scans the market map, so it is for a subscribe or a recovery, never the steady stream.
-fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
-    let guard = crate::model::lock(books);
-    guard
-        .iter()
-        .filter_map(|(key, acc)| full_state(key, acc, sub))
-        .collect()
-}
-
-/// Every frame one broadcast message produces for `sub`. Filtering on venue and coin happens before
-/// any rendering, which is the expensive part, and the book channels resolve the market by its own
-/// `(venue, channel, instrument_id)` key rather than rescanning the map per message.
-fn render(m: &FeedMessage, sub: &Sub, books: &BookSnapshot) -> Vec<(&'static str, String)> {
-    match (m, sub) {
-        (FeedMessage::Trade(t), Sub::Trades { coin }) => render_trade(t, coin)
-            .map(|f| vec![("trades", f)])
-            .unwrap_or_default(),
-        (FeedMessage::Book(b), Sub::L2Book { coin, .. } | Sub::L4Book { coin })
-            if b.venue.as_ref() == VENUE && b.symbol.as_ref() == coin.as_str() =>
-        {
+/// Every frame one broadcast message produces across a client's subscriptions.
+///
+/// Filtering on venue and coin happens before any rendering, and the book state is resolved **once**
+/// per message: one lock acquisition, one clone, one `price_fold` shared by every `l2Book`
+/// subscription of that market (the fold is O(resting orders) and independent of the view, so folding
+/// per subscription would let one client multiply a 44k-order book by `MAX_SUBS`).
+fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    match m {
+        FeedMessage::Trade(t) => {
+            for sub in subs {
+                if let Sub::Trades { coin } = sub {
+                    out.extend(render_trade(t, coin).map(|f| ("trades", f)));
+                }
+            }
+        }
+        FeedMessage::Book(b) if b.venue.as_ref() == VENUE => {
+            let coin = b.symbol.as_ref();
+            let l2 = subs
+                .iter()
+                .any(|s| matches!(s, Sub::L2Book { coin: c, .. } if c == coin));
+            let l4 = subs
+                .iter()
+                .any(|s| matches!(s, Sub::L4Book { coin: c } if c == coin));
             // A `Clear`-led batch is a producer re-baseline. `l4Book` has no clear, so it becomes
             // another snapshot; `l2Book` is snapshot-per-update and needs no special case.
             let rebaseline = b
                 .changes
                 .first()
                 .is_some_and(|c| c.action == BookAction::Clear);
-            if matches!(sub, Sub::L4Book { .. }) && !rebaseline {
-                return render_l4book_diff(b, coin)
-                    .map(|f| vec![("l4Book", f)])
-                    .unwrap_or_default();
-            }
             let key = (b.venue.clone(), b.channel, b.instrument_id);
-            let guard = crate::model::lock(books);
-            guard
-                .get(&key)
-                .and_then(|acc| full_state(&key, acc, sub))
-                .map(|f| vec![f])
-                .unwrap_or_default()
+            // Only these two cases need book state; an ordinary `l4Book` diff is rendered from the
+            // batch alone and takes no lock.
+            let market = (l2 || (l4 && rebaseline))
+                .then(|| take_market(books, &key, coin))
+                .flatten();
+            let fold = market
+                .as_ref()
+                .filter(|_| l2)
+                .map(BookAccumulator::price_fold);
+            for sub in subs {
+                match sub {
+                    Sub::L2Book {
+                        coin: c,
+                        n_sig_figs,
+                        mantissa,
+                        n_levels,
+                    } if c == coin => {
+                        if let (Some(acc), Some((bids, asks))) = (&market, &fold) {
+                            let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
+                            let time = ms_or_now(acc.source_ts_ns());
+                            out.push(("l2Book", render_l2book(bids, asks, c, view, time)));
+                        }
+                    }
+                    Sub::L4Book { coin: c } if c == coin => {
+                        if rebaseline {
+                            out.extend(
+                                market
+                                    .as_ref()
+                                    .map(|acc| ("l4Book", render_l4book_snapshot(acc, &key, c))),
+                            );
+                        } else {
+                            out.extend(render_l4book_diff(b, c).map(|f| ("l4Book", f)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        _ => Vec::new(),
+        _ => {}
     }
+    out
 }
 
 async fn serve_client(
@@ -708,17 +801,39 @@ async fn serve_client(
     mut rx: broadcast::Receiver<Arc<FeedMessage>>,
     books: BookSnapshot,
 ) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+    // The client slot is taken before this point, and the idle reaper only starts after it, so a peer
+    // that connects and never handshakes would hold one of `MAX_CLIENTS` indefinitely.
+    let ws = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::accept_async_with_config(stream, Some(inbound_limits())),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     let (mut write, mut read) = ws.split();
     let mut subs: Vec<Sub> = Vec::new();
     let mut last_seen = Instant::now();
     let mut hb = tokio::time::interval(HEARTBEAT);
+    let mut win_start = Instant::now();
+    let mut win_count: u32 = 0;
 
     loop {
         tokio::select! {
             incoming = read.next() => match incoming {
                 Some(Ok(WsMessage::Text(txt))) => {
                     last_seen = Instant::now();
+                    // Inbound rate limit (per rolling minute). This is what bounds the cost of a
+                    // control frame: a subscribe renders a market's whole book, so without a cap an
+                    // `unsubscribe`/`subscribe` loop is an output amplifier — the `added` guard below
+                    // only suppresses an identical *repeat*.
+                    if win_start.elapsed() >= Duration::from_secs(60) {
+                        win_start = Instant::now();
+                        win_count = 0;
+                    }
+                    win_count += 1;
+                    if win_count > MAX_INBOUND_PER_MIN {
+                        write.send(error_frame("inbound rate limit exceeded")).await?;
+                        break;
+                    }
                     match parse_control(&txt) {
                         Ok(Control::Ping) => write.send(WsMessage::Text(
                             json(Envelope { channel: "pong", data: serde_json::Value::Null }).into(),
@@ -728,9 +843,10 @@ async fn serve_client(
                                 write.send(error_frame("Invalid subscription: max subscriptions reached")).await?;
                                 continue;
                             }
-                            // Only a *new* subscription bootstraps. A repeat adds no scope, and
-                            // rendering anyway would let a client loop O(book) work — taken under the
-                            // mutex the ingest emit path shares — without ever reaching `MAX_SUBS`.
+                            // Only a *new* subscription bootstraps: a repeat adds no scope, and
+                            // rendering a whole book again for it is free work a client could loop
+                            // without ever reaching `MAX_SUBS`. The rate limit above is what bounds
+                            // the unsubscribe-then-resubscribe variant this cannot see.
                             let added = !subs.contains(&sub);
                             write.send(subscription_response("subscribe", &sub)).await?;
                             if added {
@@ -765,19 +881,18 @@ async fn serve_client(
 
             msg = rx.recv() => match msg {
                 Ok(m) => {
-                    for sub in &subs {
-                        for (channel, frame) in render(&m, sub, &books) {
-                            sent(channel);
-                            write.send(WsMessage::Text(frame.into())).await?;
-                        }
+                    for (channel, frame) in frames(&m, &subs, &books) {
+                        sent(channel);
+                        write.send(WsMessage::Text(frame.into())).await?;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("hl sink client lagged, dropped {n}");
-                    // `l4Book` is incremental, so a dropped batch leaves this client's book
-                    // permanently wrong. (`l2Book` self-heals on the next frame; re-bootstrapping it
-                    // here just makes that immediate.)
-                    for sub in &subs {
+                    // `l4Book` only: it is incremental, so a dropped batch leaves this client's book
+                    // permanently wrong. `l2Book` self-heals on its next frame, and re-rendering it
+                    // here would spend the most work on the one path where the client is already
+                    // behind — which is what makes it lag again.
+                    for sub in subs.iter().filter(|s| matches!(s, Sub::L4Book { .. })) {
                         for (channel, frame) in bootstrap(&books, sub) {
                             sent(channel);
                             write.send(WsMessage::Text(frame.into())).await?;
@@ -824,14 +939,6 @@ mod tests {
 
     use super::*;
     use crate::model::{BookChange, NormalizedBook};
-
-    fn l2_view(n_sig_figs: Option<u32>, mantissa: Option<u32>, n_levels: usize) -> L2View {
-        L2View {
-            n_sig_figs,
-            mantissa,
-            n_levels,
-        }
-    }
 
     /// A `NormalizedBook` of order-level changes, `Clear`-led so the accumulator baselines it.
     fn order_book(orders: Vec<(BookSide, f64, f64, u64)>) -> NormalizedBook {
@@ -995,6 +1102,7 @@ mod tests {
             r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","mantissa":5}}"#,
             r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":4,"mantissa":5}}"#,
             r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":5,"mantissa":3}}"#,
+            r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nLevels":0}}"#,
             r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":""}}"#,
         ] {
             assert!(parse_control(f).is_err(), "must reject {f}");
@@ -1034,7 +1142,14 @@ mod tests {
             (BookSide::Ask, 101.0, 2.0, 4),
         ]);
 
-        let json = render_l2book(&acc, "BTC", l2_view(None, None, 20), 1_700_000_000_000);
+        let (bids, asks) = acc.price_fold();
+        let json = render_l2book(
+            &bids,
+            &asks,
+            "BTC",
+            l2_view(None, None, 20),
+            1_700_000_000_000,
+        );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(v["channel"], "l2Book");
@@ -1057,7 +1172,8 @@ mod tests {
                 .map(|i| (BookSide::Bid, 100.0 - f64::from(i), 1.0, u64::from(i) + 1))
                 .collect(),
         );
-        let json = render_l2book(&acc, "BTC", l2_view(None, None, 5), 0);
+        let (bids, asks) = acc.price_fold();
+        let json = render_l2book(&bids, &asks, "BTC", l2_view(None, None, 5), 0);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["data"]["levels"][0].as_array().unwrap().len(), 5);
         assert_eq!(v["data"]["levels"][0][0]["px"], "100", "best bid first");
@@ -1085,7 +1201,8 @@ mod tests {
             (BookSide::Bid, 12346.0, 2.0, 2),
             (BookSide::Bid, 12300.0, 4.0, 3),
         ]);
-        let json = render_l2book(&acc, "BTC", l2_view(Some(3), None, 20), 0);
+        let (bids, asks) = acc.price_fold();
+        let json = render_l2book(&bids, &asks, "BTC", l2_view(Some(3), None, 20), 0);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let bids = v["data"]["levels"][0].as_array().unwrap();
         assert_eq!(
@@ -1104,7 +1221,8 @@ mod tests {
             (BookSide::Bid, 12345.0, 1.0, 1),
             (BookSide::Bid, 12346.0, 2.0, 2),
         ]);
-        let json = render_l2book(&acc, "BTC", l2_view(None, None, 20), 0);
+        let (bids, asks) = acc.price_fold();
+        let json = render_l2book(&bids, &asks, "BTC", l2_view(None, None, 20), 0);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["data"]["levels"][0].as_array().unwrap().len(), 2);
     }
@@ -1162,6 +1280,21 @@ mod tests {
         assert_eq!(bids[0]["side"], "B");
         assert_eq!(snap["levels"][1][0]["oid"], 22);
         assert_eq!(snap["levels"][1][0]["side"], "A");
+    }
+
+    /// An order carries no timestamp on the market-by-order wire. Stamping the book's event time
+    /// would give every order in a snapshot the same plausible, wrong placement time — which a
+    /// consumer ranking queue priority reads as real.
+    #[test]
+    fn l4book_orders_carry_no_fabricated_timestamp() {
+        let acc = accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_l4book_snapshot(&acc, &key(), "BTC")).unwrap();
+        assert_eq!(v["data"]["Snapshot"]["levels"][0][0]["timestamp"], 0);
+        assert_eq!(
+            v["data"]["Snapshot"]["levels"][0][0]["user"],
+            serde_json::Value::Null
+        );
     }
 
     /// After the snapshot, each incremental book message becomes an order diff.
@@ -1311,6 +1444,82 @@ mod tests {
         )
         .is_empty());
         assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).is_empty());
+    }
+
+    /// This sink reads only the accumulator's *order* population, so a price-aggregated market would
+    /// render as an empty book — telling an `l2Book` consumer to discard levels the bridge holds.
+    /// Withhold it instead.
+    #[test]
+    fn a_price_aggregated_market_is_not_published() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book_with(vec![
+            BookChange {
+                action: BookAction::Clear,
+                side: BookSide::Both,
+                price: 0.0,
+                size: 0.0,
+                order_id: 0,
+            },
+            BookChange {
+                action: BookAction::Update,
+                side: BookSide::Bid,
+                price: 100.0,
+                size: 1.0,
+                order_id: 0,
+            },
+        ]));
+        assert!(acc.baselined() && !acc.is_order_level());
+        let books = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+        assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).is_empty());
+        assert!(bootstrap(
+            &books,
+            &Sub::L2Book {
+                coin: "BTC".into(),
+                n_sig_figs: None,
+                mantissa: None,
+                n_levels: 20
+            }
+        )
+        .is_empty());
+    }
+
+    /// One book message serves every subscription of that market — and the `l2Book` fold behind them
+    /// is computed once, not once per subscription, so a client cannot multiply a whole book by
+    /// `MAX_SUBS`.
+    #[test]
+    fn one_book_message_serves_every_subscription_of_the_market() {
+        let books = Arc::new(Mutex::new(HashMap::from([(
+            key(),
+            accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]),
+        )])));
+        let subs = vec![
+            Sub::L2Book {
+                coin: "BTC".into(),
+                n_sig_figs: None,
+                mantissa: None,
+                n_levels: 20,
+            },
+            Sub::L4Book { coin: "BTC".into() },
+            Sub::Trades { coin: "BTC".into() },
+            Sub::L2Book {
+                coin: "ETH".into(),
+                n_sig_figs: None,
+                mantissa: None,
+                n_levels: 20,
+            },
+        ];
+        let m = FeedMessage::Book(book_with(vec![BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price: 100.0,
+            size: 3.0,
+            order_id: 11,
+        }]));
+        let out = frames(&m, &subs, &books);
+        assert_eq!(
+            out.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec!["l2Book", "l4Book"]
+        );
     }
 
     async fn spawn(
@@ -1493,6 +1702,45 @@ mod tests {
         srv.abort();
     }
 
+    /// A control frame is cheap to send and can cost a whole book to answer, so the per-minute cap is
+    /// what bounds the amplification. Crossing it ends the connection rather than throttling, which is
+    /// what the normalized sink does.
+    #[tokio::test]
+    async fn crossing_the_inbound_rate_limit_ends_the_connection() {
+        let (_tx, addr, srv) = spawn(HashMap::new()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        for _ in 0..=MAX_INBOUND_PER_MIN {
+            if ws
+                .send(WsMessage::Text(r#"{"method":"ping"}"#.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // Drain until the rate-limit error arrives (every frame before it is a pong).
+        let limited = timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => {
+                        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                        if v["channel"] == "error" {
+                            return true;
+                        }
+                    }
+                    Some(Ok(_)) => continue,
+                    _ => return false,
+                }
+            }
+        })
+        .await
+        .expect("must answer within the timeout");
+        assert!(limited, "the connection must end with the rate-limit error");
+        srv.abort();
+    }
+
     /// The golden fixture `tests/hyperliquid_sink_shapes.rs` pins is generated from this renderer,
     /// so the pin tracks what the sink actually emits rather than what we wrote down.
     #[test]
@@ -1503,7 +1751,14 @@ mod tests {
             (BookSide::Bid, 99.0, 1.0, 3),
             (BookSide::Ask, 101.0, 2.0, 4),
         ]);
-        let frame = render_l2book(&acc, "BTC", l2_view(None, None, 20), 1_700_000_000_000);
+        let (bids, asks) = acc.price_fold();
+        let frame = render_l2book(
+            &bids,
+            &asks,
+            "BTC",
+            l2_view(None, None, 20),
+            1_700_000_000_000,
+        );
         assert_eq!(
             frame,
             include_str!("../../tests/fixtures/hl_l2book_golden.json").trim_end(),
