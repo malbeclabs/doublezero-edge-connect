@@ -135,6 +135,15 @@ Modules are grouped by role under `src/`:
   fleet when the document changed but each process at its next reschedule, far from the cause; a host
   that is *up* serving one new field must never be worse than one that is down. A `File` (an
   operator's explicit instruction about this one container) or the built-in copy is **fatal**.
+  The binary's own `clap` default for `--feed-registry-url` is empty (running from source reaches
+  no network); the **image** bakes in the hosted URL as a `Dockerfile` `ENV` instead, so it stays
+  inspectable via `docker inspect` and overridable with `-e` without a rebuild either way — a `File`
+  source wins only when the URL is empty, so an operator combining a bind-mounted file with the
+  image must clear `DZ_FEED_REGISTRY_URL` too (`scripts/connect.sh` does this automatically when
+  `DZ_FEED_REGISTRY` is set and the operator hasn't set a URL of their own). `Loaded::log_resolved`
+  is the one place that announces which source actually won (`"feed registry resolved"`,
+  `source`/`version`/`rows`/`receivers`); `connect.sh` greps it after startup and echoes it, since
+  the URL-failure fallback above is silent by design and that log line is the only signal.
   There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
@@ -674,3 +683,41 @@ Modules are grouped by role under `src/`:
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
   `wss://` client in `ingest/ws_feeder.rs` (public HL feed), which uses rustls + bundled webpki roots.
+
+## Packaging and release (the `doublezero-edge` CLI)
+
+The bridge stays a container; only `doublezero-edge` (the read-only `/v1`/`/admin` CLI, a separate
+workspace member — see `doublezero-edge/`) ships as a **signed deb/rpm**, modeled end-to-end on the
+DoubleZero client's own CLI packaging (`release/.goreleaser.base.client.yaml` in the `doublezero`
+repo) so it reuses that signing and distribution rather than inventing a second path:
+
+- **`release/.goreleaser.base.edge-cli.yaml`** (+ `testnet`/`mainnet-beta` overlays that each add
+  only a `cloudsmiths:` block) — `builder: rust`, `--package=doublezero-edge`, target
+  `x86_64-unknown-linux-musl` with `CC_x86_64_unknown_linux_musl=musl-gcc`. **Static by design**: a
+  glibc build on the CI image would fail on an older host we don't control. `before.hooks` generate
+  the three shell-completion files from `doublezero-edge completion <bash|zsh|fish>` (a plain
+  `clap_complete` subcommand in `doublezero-edge/src/main.rs` that runs with no config file, no
+  server, no network — packaging depends on that). `nfpms:` bundles the binary at `/usr/bin` plus
+  those three completions and **nothing else**: no `dependencies:`, no `scripts:`, no unit files.
+  That inertness — pinned from the built artifact, not the config, by `tests/packaging.bats`
+  (`dpkg -c`/`rpm -qlp` list exactly those four paths; `ldd` reports the binary as not dynamically
+  linked) — is what makes the package safe to install unattended from a shell prompt; a future
+  maintainer script is a design decision to revisit, not a detail to slip in.
+- **`.github/workflows/release.edge-cli.yml`** — tag-triggered on `doublezero-edge/v*` (the
+  `monorepo.tag_prefix`, namespaced so it never collides with this repo's `shred-proxy-v*` tags),
+  mirrors `release.client.yml`: installs `rpm` + `musl-tools`, runs goreleaser-pro twice (once per
+  overlay) with `GORELEASER_KEY` + `CLOUDSMITH_TOKEN`.
+- **Cloudsmith, existing repos.** Publishes into `doublezero-testnet` / `doublezero-mainnet-beta`
+  (org `malbeclabs`) — the same repos the DoubleZero client already publishes into — not a new one,
+  so a host that already trusts that source installs `doublezero-edge` with no second key or source
+  file. **One artifact serves both environments**: the CLI is a plain HTTP client with no ledger
+  coupling, so unlike the client it needs no env-specific build variant.
+- **`scripts/connect.sh`** offers the package only *after* the bridge container is confirmed
+  healthy, and only ever warns on decline or failure — the container is the product, the CLI a
+  convenience (see `tests/scripts/install_cli.bats`). It names the repo and package before touching
+  anything; `DZ_INSTALL_CLI=1|0` and `DZ_ASSUME_YES=1` answer non-interactively. It also clears the
+  image's default `DZ_FEED_REGISTRY_URL` when an operator sets `DZ_FEED_REGISTRY` without a URL of
+  their own — see the `ingest/registry.rs` entry above (`tests/scripts/feed_registry.bats`).
+
+Adding a fourth environment or changing the completion paths means editing the base file once; the
+overlays exist only to hold each environment's `cloudsmiths:` block.

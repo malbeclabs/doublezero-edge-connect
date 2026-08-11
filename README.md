@@ -56,6 +56,11 @@ What the script does:
    cloud-provider rules.
 4. Runs the bridge container (`--network host`, `NET_ADMIN`/`NET_RAW`, `/dev/net/tun`) and runs
    `doublezero connect multicast`.
+5. Once the container is up, offers to install the **[`doublezero-edge` CLI](#query-market-data-the-doublezero-edge-cli)**
+   (a signed, dependency-free package) — naming the Cloudsmith repository and package before
+   touching anything. Decline at the prompt, or set `DZ_INSTALL_CLI=0`; `DZ_INSTALL_CLI=1` /
+   `DZ_ASSUME_YES=1` accepts non-interactively. Declining, or any package-manager failure, only
+   warns — the container is already up either way.
 
 > **Attendantless.** The only input is the access secret. Provide it via `DZ_SECRET` to run with
 > no prompts; otherwise you're prompted once. Everything else has a default.
@@ -86,11 +91,12 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion. Does **not** affect Solana shred forwarding. |
 | `DZ_PUBLISHER_PORTS` | *(all)* | Comma-separated publisher **base ports** (the market-data port of each block, e.g. `9201`) to narrow which mirrors of each selected feed are ingested. One receiver runs per publisher, so this caps ingest cost on a multi-publisher venue. Base ports are unique within a feed but not across feeds — pair with `DZ_FEEDS` to scope to one venue. |
 | `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned feed ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a feed whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
-| `DZ_FEED_REGISTRY_URL` | *(none)* | URL to fetch the feed registry document from at startup. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used and a warning is logged — never fatal. |
-| `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, ignored when `DZ_FEED_REGISTRY_URL` is set. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
+| `DZ_FEED_REGISTRY_URL` | hosted URL (**image default**) | URL to fetch the feed registry document from at startup — the image sets this to `https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used instead and a warning is logged — never fatal. See [Feed registry](#feed-registry) below for how to tell which source actually loaded. |
+| `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, for an air-gapped/locked-down host. The bridge tries `DZ_FEED_REGISTRY_URL` first when it's non-empty, so the installer clears the image's default URL for you whenever you set this without also setting a URL of your own — otherwise the file would be silently shadowed. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
 | `DZ_ADMIN_BIND` | *(off)* | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). Off by default; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you enable it, bind to loopback (e.g. `127.0.0.1:9098`) — never a bare wildcard. Loopback alone does not stop a browser page on the same host from POSTing here, so `POST` also requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it automatically. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
-| `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
+| `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt) and imply "yes" to the `doublezero-edge` CLI install offer too. |
+| `DZ_INSTALL_CLI` | *(prompted)* | Answer the `doublezero-edge` CLI install offer non-interactively: `1` installs, `0` skips. Overridden by `DZ_ASSUME_YES=1`. |
 | `DZ_CLIENT_IP` | *(auto-detected)* | Override the host public IP used by the access-pass pre-check (set if auto-detection is wrong). |
 | `DZ_LEDGER_RPC_URL` | per env | Override the DoubleZero ledger RPC the access-pass pre-check queries. |
 | `DZ_GHCR_TOKEN` | — | **devnet only**, required: a GHCR token with `read:packages` (the devnet image is private). |
@@ -164,6 +170,43 @@ sudo docker stop doublezero-edge-connect && sudo docker rm doublezero-edge-conne
 > **No TLS.** The bridge targets a trusted/local network; terminate TLS at a reverse proxy if you
 > expose it.
 
+## Upgrade & remove
+
+The CLI versions independently of the bridge image, so upgrade and remove them separately:
+
+| | Bridge (container) | `doublezero-edge` CLI (package) |
+|---|---|---|
+| Upgrade | `docker pull` the new image, then re-run the one-liner (or your own `docker run`) | `sudo apt upgrade doublezero-edge` / `sudo dnf upgrade doublezero-edge` |
+| Remove | `docker stop`/`rm` the container (see [Manage](#manage)) — leaves the CLI and its Cloudsmith repo config untouched | `sudo apt remove doublezero-edge` / `sudo dnf remove doublezero-edge` — leaves the container and the repo config untouched |
+
+Removing the Cloudsmith repository itself (not just the package) is a normal `apt`/`dnf` source
+removal — see your package manager's docs; nothing here manages that file.
+
+> **Version skew is fine.** `/v1` and `/admin` are additive-only and both sides ignore unknown
+> fields, so an older CLI against a newer bridge just doesn't see the new field, and a newer CLI
+> against an older bridge falls back when a field is absent. Upgrade either half whenever.
+
+## Feed registry
+
+The document that maps venues to multicast groups/ports (`src/ingest/registry.rs`). The image's
+`DZ_FEED_REGISTRY_URL` default points at the hosted copy:
+
+```
+https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json
+```
+
+served fresh at every container start — no rebuild needed to pick up a new venue or port. Override
+with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY` (the
+installer clears the default URL for you in that case — see the table above). A host that can't
+reach the URL falls back to the built-in copy **silently by design**; the bridge's own startup log
+says which source actually won, and the one-liner echoes it for you:
+
+```
+==> Feed registry: source="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
+```
+
+Check it yourself any time with `sudo docker logs <name> | grep 'feed registry resolved'`.
+
 ## Consume Edge Feeds
 _For Edge Feeds (not solana-shreds)_
 
@@ -223,6 +266,23 @@ in memory** — the window does not survive a bridge restart and nothing here is
 
 **`channels` is the one exception**, and talks to a different, off-by-default surface entirely — see
 [Admin surface](#admin-surface-runtime-channel-changes) below.
+
+### Install the CLI alone
+
+Only querying a remote bridge over `--url` and never running the container on this host? Skip the
+one-liner and install just the package — a signed, dependency-free deb/rpm — from the same
+repository the bridge's own one-liner offers:
+
+```bash
+# deb hosts (Ubuntu/Debian):
+curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/doublezero-mainnet-beta/setup.deb.sh | sudo -E bash
+sudo apt install doublezero-edge
+
+# rpm hosts (Fedora/RHEL): swap setup.deb.sh -> setup.rpm.sh and apt install -> dnf/yum install
+```
+
+Testnet package: swap `doublezero-mainnet-beta` for `doublezero-testnet` (mainnet-beta serves
+devnet too — the CLI has no ledger coupling).
 
 ### Admin surface (runtime channel changes)
 

@@ -553,6 +553,19 @@ if [ -n "${DZ_FEED_REGISTRY:-}" ]; then
   info "Bind-mounting feed registry: $DZ_FEED_REGISTRY (read-only)"
 fi
 
+# The image bakes in a default DZ_FEED_REGISTRY_URL (the hosted document — see the Dockerfile),
+# and the bridge tries that URL before ever looking at DZ_FEED_REGISTRY (ingest/registry.rs:
+# Source::from_flags takes the URL whenever it is non-empty). An operator who set DZ_FEED_REGISTRY
+# almost certainly wants the file to win — that's the whole point of the air-gapped/locked-down
+# path — so if they didn't also set DZ_FEED_REGISTRY_URL themselves, clear it explicitly on the
+# container; otherwise the bind-mounted file would be silently ignored in favor of the image's
+# baked-in URL.
+CLEAR_REGISTRY_URL=0
+if [ -n "${DZ_FEED_REGISTRY:-}" ] && [ -z "${DZ_FEED_REGISTRY_URL:-}" ]; then
+  CLEAR_REGISTRY_URL=1
+  info "DZ_FEED_REGISTRY is set; clearing the image's default DZ_FEED_REGISTRY_URL so the bind-mounted file is what actually loads."
+fi
+
 # ----------------------------------------------------------------------------
 # 4d. admin surface warning (host-side)
 # ----------------------------------------------------------------------------
@@ -629,6 +642,9 @@ env_args=()
 for v in "${PASSTHROUGH[@]}"; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
+# See 4c above: force DZ_FEED_REGISTRY_URL empty on the container so the bind-mounted file wins
+# over the image's baked-in default, rather than being silently shadowed by it.
+[ "$CLEAR_REGISTRY_URL" = 1 ] && env_args+=(-e "DZ_FEED_REGISTRY_URL=")
 # WS_BIND is the one var forwarded whenever it is *set* — including set-but-empty (WS_BIND="") —
 # so the WS sink can be disabled straight from the one-liner (an empty --ws-bind turns the sink
 # off in the bridge). The preflight above may also have set/cleared it in response to a conflict.
@@ -691,6 +707,24 @@ echo
 spin_sleep 5 "Waiting for the tunnel to settle"
 $SUDO docker exec "$DZ_NAME" doublezero status || true
 echo
+
+# The image bakes in DZ_FEED_REGISTRY_URL (the hosted feeds document); a host that can't reach
+# it falls back to the built-in copy SILENTLY BY DESIGN (see ingest/registry.rs), so the bridge's
+# own "feed registry resolved" startup log line is the only signal of which one actually loaded.
+# Surface it here rather than leaving the operator to go find it. The resolve happens at process
+# start (well before this point in the script), so one look back over the log is enough; retry
+# briefly only to cover a slow container start.
+registry_line=""
+for _ in $(seq 1 10); do
+  registry_line="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "feed registry resolved" | tail -1 || true)"
+  [ -n "$registry_line" ] && break
+  sleep 1
+done
+if [ -n "$registry_line" ]; then
+  info "Feed registry: ${registry_line#*feed registry resolved }"
+else
+  warn "Could not find the 'feed registry resolved' startup log line yet. Check: sudo docker logs $DZ_NAME | grep 'feed registry'"
+fi
 if ws_disabled; then
   info "Done. The WebSocket sink is disabled (WS_BIND=\"\"); the bridge ingests DZ Edge and (if configured) forwards shreds, but serves no WebSocket."
 else
