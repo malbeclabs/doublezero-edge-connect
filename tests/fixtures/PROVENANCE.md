@@ -400,3 +400,37 @@ cargo run --example pcap2frames -- mbp.pcap --protocol mbp --group <group> \
 
 Keep at least one multi-channel set and one dense-delta set; the fixture tests assert both shapes.
 Record the source IP, capture date, frame counts and observed `depth_bound` above.
+
+## Schema v3 reference data — `tob_v3`, `mbp_perps_v3`, `sports_v3`
+
+Cut 2026-08-11 from the mainnet capture warehouse
+(`s3://malbeclabs-multicast-pcap-warehouse/mainnet-beta/aws-cmh-mn-recorder1-16.59.144.33/2026/08/11/18/`),
+refdata plane only, ~12 KB each:
+
+| fixture | group | port | frames | sources |
+|---|---|---|---|---|
+| `tob_v3.refdata.bin` | `233.84.178.3` | 41000 | 114 | `148.51.121.69`, `148.51.120.6` |
+| `mbp_perps_v3.refdata.bin` | `233.84.178.4` | 42000 | 113 | `148.51.120.6`, `148.51.121.69` |
+| `sports_v3.refdata.bin` | `233.84.178.20` | 44041 | 13 | `148.51.121.250`, `148.51.121.209` |
+
+**What they establish, and why they were cut.** Every frame carries `schema_version = 3`, and the
+symbol field is the widened one: `sports_v3` holds 99 distinct symbols up to **33 characters**, far
+past the 16-byte field that made the older fixtures truncate. So the symbol collision recorded above —
+one cut-off symbol standing for two instrument ids — **cannot occur on this schema**, which is what
+retires the argument that trade dedup keyed on `(venue, symbol)` can silently drop a second market's
+fills. These fixtures are the evidence for that claim; without them it rests on an upstream assertion.
+
+**Both arms are present in every set** — unlike the older captures, these are simultaneous, so an
+interleaved two-arm fixture can be cut from this warehouse when one is needed.
+
+### Regenerating
+
+```
+aws s3api get-object --bucket malbeclabs-multicast-pcap-warehouse \
+  --key <prefix>/capture_<group>_000001.pcap --range bytes=0-12000000 slice.pcap
+tshark -r slice.pcap -Y 'udp.dstport==<refdata port>' -T fields -e data.data
+```
+
+Concatenate the payloads; the fixture is raw frames back to back, split by magic like every other set
+here. A ranged fetch is deliberate — the warehouse objects are 50 MB each and a refdata cycle is
+seconds.
