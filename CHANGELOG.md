@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `doublezero-edge`'s `client::get`/`classify` treated a `2xx` response with an undecodable body
+  as success, printing the synthesized `invalid_response` envelope to stdout with exit code 0 —
+  pointing `--url` at the wrong port (e.g. the WebSocket) made `products list` "succeed" with
+  garbage. A decode failure is now a distinct `Outcome::Invalid`, refused regardless of status,
+  same as an unreachable server.
+- `channels list`/`channels set` indexed the `/v1/status` `channels` block directly, so a body
+  missing that key (a server predating it) failed to deserialize instead of defaulting — losing
+  the drop preview and, without `--force`, refusing `channels set` outright, on exactly the server
+  skew `#[serde(default)]` exists to tolerate. Both now default a missing key to an empty object.
+
 ### Added
 - A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus
   a bounded ring of recent prints, per product, fed from the post-arbiter broadcast — so every print

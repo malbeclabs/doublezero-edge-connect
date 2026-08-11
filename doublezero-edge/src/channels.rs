@@ -23,6 +23,21 @@ use crate::{
     types::{AdminChannelsResponse, ChannelsBlock},
 };
 
+/// Parse `value` as `T`, treating a **missing** key (indexing yields `Value::Null`) as an empty
+/// object so `#[serde(default)]` fields take effect, rather than failing to deserialize `Null`
+/// against a struct that expects a map. `status_body["channels"]` on a server predating this block
+/// is exactly that: plain indexing gives `Null`, not an absent key `render::parse` could special-case,
+/// so without this a server one version behind loses the drop preview and, without `--force`,
+/// refuses `channels set` outright — the one case `#[serde(default)]` exists to degrade gracefully
+/// on. A present-but-empty object is unaffected: it already deserializes via the same defaults.
+fn parse_defaulting_null<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, String> {
+    if value.is_null() {
+        render::parse(&serde_json::json!({}))
+    } else {
+        render::parse(value)
+    }
+}
+
 /// A client-side reading of a channel filter spec: which channel ids each group code would admit
 /// under it. A code **absent** from the spec means "admit all" — the same semantic
 /// `ChannelFilter::parse` documents, and the reason an unmentioned row is never reported as a drop
@@ -84,7 +99,7 @@ pub struct DropRow {
 /// today and (b) holds at least one product is reported — an already-excluded channel has nothing
 /// left to lose, and this is a preview of loss, not of the channel filter's full shape.
 pub fn compute_drops(status_body: &Value, spec: &str) -> Result<Vec<DropRow>, String> {
-    let channels: ChannelsBlock = render::parse(&status_body["channels"])?;
+    let channels: ChannelsBlock = parse_defaulting_null(&status_body["channels"])?;
     let new_filter = FilterSpec::parse(spec);
     let mut drops = Vec::new();
     for row in &channels.rows {
@@ -140,7 +155,7 @@ pub fn render_drop_preview(drops: &[DropRow]) -> String {
 /// running receiver set).
 pub fn render_channels_list(body: &Value) -> Result<String, String> {
     let admin: AdminChannelsResponse = render::parse(&body["admin"])?;
-    let channels: ChannelsBlock = render::parse(&body["status"]["channels"])?;
+    let channels: ChannelsBlock = parse_defaulting_null(&body["status"]["channels"])?;
 
     let mut out = if admin.summary.is_empty() {
         "channel filter: (unrestricted — every enabled row's channels are admitted)".to_string()
@@ -236,6 +251,17 @@ mod tests {
         assert!(drops.is_empty(), "{drops:?}");
     }
 
+    /// The regression this pins: a `/v1/status` body with the `channels` key **absent** (a server
+    /// predating the block), not present-and-empty. Plain indexing yields `Value::Null`, and
+    /// `serde_json::from_value::<ChannelsBlock>(Null)` errors rather than defaulting, so without
+    /// `parse_defaulting_null` this returns `Err` and the drop preview is lost.
+    #[test]
+    fn a_status_body_with_no_channels_key_defaults_to_no_drops() {
+        let status_body = serde_json::json!({});
+        let drops = compute_drops(&status_body, "lashay-4=10").unwrap();
+        assert!(drops.is_empty(), "{drops:?}");
+    }
+
     // -----------------------------------------------------------------------------------------
     // render_drop_preview
     // -----------------------------------------------------------------------------------------
@@ -283,6 +309,19 @@ mod tests {
         let body = serde_json::json!({
             "admin": {"summary": []},
             "status": status_fixture(),
+        });
+        let out = render_channels_list(&body).unwrap();
+        assert!(out.contains("unrestricted"), "{out}");
+    }
+
+    /// The `--output table` regression this pins: a `status` body with no `channels` key at all (a
+    /// server predating the block). Without defaulting-on-null this is an `Err` and `channels list`
+    /// hard-refuses against exactly the server skew `#[serde(default)]` exists to tolerate.
+    #[test]
+    fn channels_list_tolerates_a_status_body_with_no_channels_key() {
+        let body = serde_json::json!({
+            "admin": {"summary": []},
+            "status": {},
         });
         let out = render_channels_list(&body).unwrap();
         assert!(out.contains("unrestricted"), "{out}");

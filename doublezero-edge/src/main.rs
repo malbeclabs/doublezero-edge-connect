@@ -254,7 +254,7 @@ fn run() -> i32 {
             print_error(&body);
             exit_code_for_status(status)
         }
-        client::Outcome::Unreachable { body } => {
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
             print_error(&body);
             3
         }
@@ -307,7 +307,7 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
             print_error(&body);
             return exit_code_for_status(status);
         }
-        client::Outcome::Unreachable { body } => {
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
             print_error(&body);
             return 3;
         }
@@ -319,7 +319,7 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
             print_error(&body);
             return exit_code_for_status(status);
         }
-        client::Outcome::Unreachable { body } => {
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
             print_error(&body);
             return 3;
         }
@@ -350,14 +350,9 @@ fn run_channels_set(
                 None
             }
         },
-        client::Outcome::Failed { body, .. } => {
-            eprintln!(
-                "warning: could not fetch current status for the drop preview: {}",
-                serde_json::to_string(&body).unwrap_or_default()
-            );
-            None
-        }
-        client::Outcome::Unreachable { body } => {
+        client::Outcome::Failed { body, .. }
+        | client::Outcome::Invalid { body, .. }
+        | client::Outcome::Unreachable { body } => {
             eprintln!(
                 "warning: could not fetch current status for the drop preview: {}",
                 serde_json::to_string(&body).unwrap_or_default()
@@ -400,7 +395,7 @@ fn run_channels_set(
             print_error(&body);
             exit_code_for_status(status)
         }
-        client::Outcome::Unreachable { body } => {
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
             print_error(&body);
             3
         }

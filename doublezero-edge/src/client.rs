@@ -6,8 +6,8 @@
 
 use serde_json::{json, Value};
 
-/// What a request against the API produced, already classified into the three shapes the rest of
-/// this crate cares about. `status` on the two response-bearing variants is the raw HTTP status
+/// What a request against the API produced, already classified into the four shapes the rest of
+/// this crate cares about. `status` on the response-bearing variants is the raw HTTP status
 /// code — the exit-code mapping in `main.rs` is the only other place that needs it.
 #[derive(Debug)]
 pub enum Outcome {
@@ -16,6 +16,12 @@ pub enum Outcome {
     /// A non-`2xx` response the server still answered — its body is already the
     /// `{"error","message","remediation"}` envelope `sinks/api.rs` promises.
     Failed { status: u16, body: Value },
+    /// A response body that did not decode as JSON, whatever the status. This can never be the
+    /// server's own error envelope (that's `Failed`), so a `2xx` here is not success either — it
+    /// means something other than edge-connect answered (a proxy, an ingress banner, the wrong
+    /// port). Every caller treats this the same as `Unreachable`: print the synthesized envelope
+    /// and exit non-zero, never `emit` the body as if it were real data.
+    Invalid { status: u16, body: Value },
     /// No response at all (connection refused, DNS failure, timeout, ...). Synthesized into the
     /// same envelope shape as a server-side error so a caller never has to special-case "the
     /// transport failed" versus "the server said no" — see [`unreachable_envelope`].
@@ -42,18 +48,17 @@ pub fn get(
         }
     };
     let status = resp.status().as_u16();
-    let body: Value = match resp.json() {
-        Ok(v) => v,
-        Err(_e) => json!({
-            "error": "invalid_response",
-            "message": format!("Response from {full} was not valid JSON."),
-            "remediation": "Check --url points at an edge-connect instance's /v1 API, not something else on that port.",
-        }),
-    };
-    if (200..300).contains(&status) {
-        Outcome::Ok { body }
-    } else {
-        Outcome::Failed { status, body }
+    match resp.json::<Value>() {
+        Ok(body) if (200..300).contains(&status) => Outcome::Ok { body },
+        Ok(body) => Outcome::Failed { status, body },
+        Err(_e) => Outcome::Invalid {
+            status,
+            body: json!({
+                "error": "invalid_response",
+                "message": format!("Response from {full} was not valid JSON."),
+                "remediation": "Check --url points at an edge-connect instance's /v1 API, not something else on that port.",
+            }),
+        },
     }
 }
 
@@ -137,18 +142,17 @@ pub fn admin_post_channels(
 fn classify(resp: reqwest::blocking::Response) -> Outcome {
     let status = resp.status().as_u16();
     let full = resp.url().to_string();
-    let body: Value = match resp.json() {
-        Ok(v) => v,
-        Err(_e) => json!({
-            "error": "invalid_response",
-            "message": format!("Response from {full} was not valid JSON."),
-            "remediation": "Check --admin-url points at an edge-connect instance's admin surface.",
-        }),
-    };
-    if (200..300).contains(&status) {
-        Outcome::Ok { body }
-    } else {
-        Outcome::Failed { status, body }
+    match resp.json::<Value>() {
+        Ok(body) if (200..300).contains(&status) => Outcome::Ok { body },
+        Ok(body) => Outcome::Failed { status, body },
+        Err(_e) => Outcome::Invalid {
+            status,
+            body: json!({
+                "error": "invalid_response",
+                "message": format!("Response from {full} was not valid JSON."),
+                "remediation": "Check --admin-url points at an edge-connect instance's admin surface.",
+            }),
+        },
     }
 }
 
@@ -332,5 +336,66 @@ mod tests {
             .expect("captured request");
         let request_line = raw.lines().next().unwrap_or_default();
         assert_eq!(request_line, "GET /admin/channels HTTP/1.1");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A 2xx with an undecodable body must never classify as `Ok`. A 500 with HTML would already
+    // fall into `Failed` under the old code and prove nothing about this bug — the fixture here is
+    // genuinely a 2xx, which is the one case the old `if (200..300).contains(&status)` let through
+    // as success regardless of whether `resp.json()` actually decoded.
+    // -----------------------------------------------------------------------------------------
+
+    /// Bind an ephemeral listener and answer exactly one request with a canned, fixed response —
+    /// the mirror image of `capture_one_request`, which captures the request instead of scripting
+    /// the response. Used to serve a genuinely non-JSON 2xx.
+    fn serve_one_response(
+        status_line: &'static str,
+        content_type: &'static str,
+        body: &'static [u8],
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The finding this pins: `--url` pointed at something that answers `200` with an HTML body
+    /// (a WebSocket port's upgrade-refusal page, an ingress's default page, ...) must not be read
+    /// as a successful JSON response.
+    #[test]
+    fn get_treats_a_2xx_non_json_body_as_invalid_not_ok() {
+        let base = serve_one_response("200 OK", "text/html", b"<html>not json</html>");
+        let client = reqwest::blocking::Client::new();
+        let outcome = get(&client, &base, "/v1/products", &[]);
+        assert!(
+            matches!(outcome, Outcome::Invalid { status: 200, .. }),
+            "a 2xx with a non-JSON body must classify as Invalid, not Ok: {outcome:?}"
+        );
+    }
+
+    /// `classify` (the admin-surface path `admin_get`/`admin_post_channels` share) has the exact
+    /// same shape and must be pinned separately — a fix to `get` alone would leave this one broken.
+    #[test]
+    fn classify_treats_a_2xx_non_json_body_as_invalid_not_ok() {
+        let base = serve_one_response("200 OK", "text/html", b"<html>not json</html>");
+        let client = reqwest::blocking::Client::new();
+        let outcome = admin_get(&client, &base, "/admin/channels");
+        assert!(
+            matches!(outcome, Outcome::Invalid { status: 200, .. }),
+            "a 2xx with a non-JSON body must classify as Invalid, not Ok: {outcome:?}"
+        );
     }
 }
