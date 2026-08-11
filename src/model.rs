@@ -426,14 +426,17 @@ pub struct BookAccumulator {
 /// One folded price level as `(price, total size, resting order count)`.
 pub type CountedLevel = (f64, f64, u32);
 
-/// How much detail a replayed `book` re-baseline carries. Levels is the default because an L2
-/// consumer must not be handed a venue's whole order population — tens of thousands of changes on a
-/// busy market — to learn a book it will immediately aggregate away.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+/// How much detail a replayed `book` re-baseline carries.
+///
+/// **Unset follows the market**, which is what a consumer needs by default: a bootstrap of price levels
+/// followed by a live stream of order-level changes cannot be reconciled at all — each change carries one
+/// *order's* absolute size, and applying it as a level's size corrupts the book — so the granularity has
+/// to match what the market streams. Asking for `Levels` on an order-level market is therefore only
+/// useful to a consumer that folds the stream itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplayScope {
     /// Price levels, each carrying `order_id == 0`.
-    #[default]
     Levels,
     /// Every resting order, each carrying the venue's `order_id`.
     Orders,
@@ -444,6 +447,10 @@ pub enum ReplayScope {
 /// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
 /// rather than silently dropping changes from a book still claimed to be complete.
 const MAX_PENDING_CHANGES: usize = 8192;
+
+/// Cap on resting orders one market's replay state holds — the same ceiling `ingest::book`'s own
+/// `MAX_ORDERS_PER_BOOK` puts on the producer, so a well-behaved market never reaches it.
+const MAX_ACCUMULATED_ORDERS: usize = 1 << 18;
 
 impl BookAccumulator {
     pub fn new(symbol: Arc<str>) -> Self {
@@ -507,51 +514,33 @@ impl BookAccumulator {
         for c in std::mem::take(&mut self.pending) {
             let key = (c.price * 10f64.powi(8)).round() as i128;
             // An order-level change is keyed by its order id, not its price: two orders rest at one
-            // price, and only the id says which of them moved.
+            // price, and only the id says which of them moved. A `Clear` is the exception: it names a
+            // *side*, not an order, so it always carries `order_id == 0` and must discard that side of
+            // **both** populations — routing it by id would leave every order of a re-baselined-away
+            // book resting in the replay map forever.
             if c.order_id != 0 {
-                match (c.action, c.side) {
-                    (BookAction::Clear, BookSide::Bid) => {
-                        self.orders.retain(|_, (is_bid, ..)| !*is_bid);
-                        cleared.0 = true;
-                    }
-                    (BookAction::Clear, BookSide::Ask) => {
-                        self.orders.retain(|_, (is_bid, ..)| *is_bid);
-                        cleared.1 = true;
-                    }
-                    (BookAction::Clear, BookSide::Both) => {
-                        self.orders.clear();
-                        cleared = (true, true);
-                    }
-                    (BookAction::Delete, _) => {
+                match c.action {
+                    BookAction::Delete => {
                         self.orders.remove(&c.order_id);
                     }
                     // A zero size is how an order-level producer says the order is gone; resting it
                     // would leave a phantom the consumer keeps forever.
-                    (BookAction::Update, _) if c.size == 0.0 => {
+                    BookAction::Update if c.size == 0.0 => {
                         self.orders.remove(&c.order_id);
                     }
-                    (BookAction::Update, side) => {
-                        let is_bid = matches!(side, BookSide::Bid);
+                    BookAction::Update => {
+                        let is_bid = matches!(c.side, BookSide::Bid);
                         self.orders
                             .insert(c.order_id, (is_bid, key, c.price, c.size));
                     }
+                    // A `Clear` carrying an order id is a producer bug: it names a side, and acting on
+                    // one order would clear neither side. Fall through to the side-scoped arms below.
+                    BookAction::Clear => self.clear_side(c.side, &mut cleared),
                 }
                 continue;
             }
             match (c.action, c.side) {
-                (BookAction::Clear, BookSide::Bid) => {
-                    self.bids.clear();
-                    cleared.0 = true;
-                }
-                (BookAction::Clear, BookSide::Ask) => {
-                    self.asks.clear();
-                    cleared.1 = true;
-                }
-                (BookAction::Clear, BookSide::Both) => {
-                    self.bids.clear();
-                    self.asks.clear();
-                    cleared = (true, true);
-                }
+                (BookAction::Clear, _) => self.clear_side(c.side, &mut cleared),
                 (BookAction::Delete, BookSide::Bid) => {
                     self.bids.remove(&key);
                 }
@@ -571,7 +560,36 @@ impl BookAccumulator {
         }
         // A both-sided clear is the producer re-baselining: from here the levels are the whole book.
         self.baselined |= cleared == (true, true);
+        // A producer whose own book overflows its order cap clears it silently, with no `Clear` on the
+        // wire, so this population must bound itself rather than trusting a re-baseline to arrive.
+        // Overflow abandons it: a book still claiming completeness is worse than none.
+        if self.orders.len() > MAX_ACCUMULATED_ORDERS {
+            self.orders.clear();
+            self.baselined = false;
+        }
         self.source_ts_ns = self.pending_ts_ns;
+    }
+
+    /// Discard one or both sides of the book, across **both** populations — a `Clear` names a side, and
+    /// which population holds that side is a property of the market, not of the change.
+    fn clear_side(&mut self, side: BookSide, cleared: &mut (bool, bool)) {
+        if matches!(side, BookSide::Bid | BookSide::Both) {
+            self.bids.clear();
+            self.orders.retain(|_, (is_bid, ..)| !*is_bid);
+            cleared.0 = true;
+        }
+        if matches!(side, BookSide::Ask | BookSide::Both) {
+            self.asks.clear();
+            self.orders.retain(|_, (is_bid, ..)| *is_bid);
+            cleared.1 = true;
+        }
+    }
+
+    /// Whether this market's book is order-level, i.e. whether it holds orders rather than price
+    /// levels. This is what an unset `book_scope` follows, so a client is bootstrapped at the same
+    /// granularity the market streams.
+    pub fn is_order_level(&self) -> bool {
+        !self.orders.is_empty()
     }
 
     /// The market's display label, as last seen on the wire.
@@ -1303,7 +1321,8 @@ mod tests {
     }
 
     /// A one-sided clear drops only that side's orders: clearing bids must not silently delete the
-    /// asks a consumer is still holding.
+    /// asks a consumer is still holding. The `Clear` carries `order_id: 0` because that is the shape a
+    /// producer emits — it names a side, not an order.
     #[test]
     fn a_one_sided_clear_spares_the_other_sides_orders() {
         let mut acc = BookAccumulator::new("BTC".into());
@@ -1316,13 +1335,63 @@ mod tests {
             true,
         ));
         acc.apply(&book(
-            vec![order(BookAction::Clear, BookSide::Bid, 0.0, 0.0, 1)],
+            vec![order(BookAction::Clear, BookSide::Bid, 0.0, 0.0, 0)],
             false,
             true,
         ));
         let (bids, asks) = acc.price_fold();
         assert!(bids.is_empty());
         assert_eq!(asks, vec![(101.0, 2.0, 1)]);
+    }
+
+    /// A re-baseline replaces the book, so the orders the previous one held must be gone. They are
+    /// exactly the orders that died while the publisher was gapped — keeping them would replay a
+    /// phantom set to every client that connects afterwards, forever.
+    #[test]
+    fn a_rebaseline_discards_the_previous_order_population() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book(
+            vec![
+                order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0),
+                order(BookAction::Update, BookSide::Bid, 100.0, 5.0, 1),
+                order(BookAction::Update, BookSide::Bid, 99.0, 4.0, 2),
+            ],
+            true,
+            true,
+        ));
+        acc.apply(&book(
+            vec![
+                order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0),
+                order(BookAction::Update, BookSide::Ask, 101.0, 7.0, 3),
+            ],
+            true,
+            true,
+        ));
+        let (bids, asks) = acc.price_fold();
+        assert!(bids.is_empty(), "the first baseline's orders must be gone");
+        assert_eq!(asks, vec![(101.0, 7.0, 1)]);
+    }
+
+    /// The replay population bounds itself: a producer whose own book overflows its order cap clears it
+    /// with no `Clear` on the wire, so nothing else would ever trim this.
+    #[test]
+    fn the_accumulated_order_population_is_bounded() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book(
+            vec![order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0)],
+            true,
+            true,
+        ));
+        for chunk in 0..=(MAX_ACCUMULATED_ORDERS as u64 / 4096) {
+            let changes: Vec<_> = (0..4096)
+                .map(|i| {
+                    let id = chunk * 4096 + i + 1;
+                    order(BookAction::Update, BookSide::Bid, id as f64, 1.0, id)
+                })
+                .collect();
+            acc.apply(&book(changes, false, true));
+        }
+        assert!(acc.orders.len() <= MAX_ACCUMULATED_ORDERS);
     }
 
     /// A terminated batch folds however large it is: an order-level snapshot is tens of thousands of

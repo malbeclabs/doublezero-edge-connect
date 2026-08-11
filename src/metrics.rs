@@ -203,6 +203,10 @@ pub struct Metrics {
     /// matched and the content did not, which is the signature of a book that has silently drifted.
     /// Any sustained non-zero rate is a correctness alarm.
     pub mbo_arm_disagreement: IntCounterVec,
+    /// Order-level changes dropped because the market had already published that order as gone — a
+    /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
+    /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
+    pub book_resurrections_dropped: IntCounterVec,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -672,6 +676,15 @@ impl Metrics {
                  the fastest, so it is a throughput figure, not a fault.",
                 &["venue"],
             ),
+            book_resurrections_dropped: counter_vec(
+                &registry,
+                "dz_book_resurrections_dropped_total",
+                "Order-level changes dropped because the market had already published that order as \
+                 gone. A venue never reuses an order id, so each one is a lagging publisher's stale \
+                 copy refused before it could resurrect a dead order in every consumer's book — the \
+                 guard order-level racing rests on, working.",
+                &["venue"],
+            ),
             mbo_arm_disagreement: counter_vec(
                 &registry,
                 "dz_mbo_arm_disagreement_total",
@@ -963,6 +976,9 @@ mod tests {
         m.mbo_arm_disagreement
             .with_label_values(&["HYPERLIQUID"])
             .inc();
+        m.book_resurrections_dropped
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -1009,6 +1025,7 @@ mod tests {
             "dz_mbo_removed_evicted_total",
             "dz_book_events_deduped_total",
             "dz_mbo_arm_disagreement_total",
+            "dz_book_resurrections_dropped_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {

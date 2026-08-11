@@ -266,8 +266,38 @@ Modules are grouped by role under `src/`:
   book replayed to a new client). The *quote* floor is
   deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
-- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**,
-  in *both* arbitration modes with no `mode_for` branch (#105): one `source_ts` tick can hold several
+  The `Book` arm has **two** gates, chosen by what the wire supplies rather than by venue name. A batch
+  carrying a non-zero `order_id` (or for a market whose `BookMarket::order_level` memo says an earlier one
+  did — that covers a bare `clear`) on a `Coordinated` venue is **raced per venue event**; everything else
+  takes the single-arm authority below. Routing on *content* rather than on a report is deliberate: an
+  evicted market re-routes on its next order-level batch instead of reverting to the authority for good,
+  and a forged sync report cannot divert a price-aggregated market off that gate. Racing keys on
+  `OrderEvent` = `(order_id, action, price bits, size bits)` per market — never `per_instrument_seq`,
+  which is per publisher (measured: three unrelated bases for one execution). **`size_bits` is part of
+  the identity, not content compared afterwards**: successive partial fills of one order share id, action
+  and resting price and differ only there, so omitting it would collapse the second fill as a duplicate
+  and leave every consumer holding a quantity the venue already reduced. A partly-duplicate batch is
+  republished **filtered** to its surviving changes, because a change carries an order's absolute quantity
+  and re-delivering a stale one walks the consumer back.
+  **`MarketEvents::resting` is the resurrection guard, and this is the only scope that can hold it**
+  (`dz_book_resurrections_dropped_total`): a `size == 0` event tombstones the order and any later change
+  for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order another
+  publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
+  order. Tombstones are bounded by `MAX_SEEN_ORDER_EVENTS` and deliberately **not** by the time window,
+  which is what keeps `--arb-book-dedup-window-ms` a cost knob. `dz_mbo_arm_disagreement_total` is the
+  drift observable and is a *monotonic* check — a resting order only shrinks, so a publisher claiming
+  **more** than a peer already reported has missed a fill; an interleaved race, where an arm delivers the
+  smaller remainder first, is not counted. Both copies are still published rather than preferring the
+  smaller: the peer could be the drifted one, and dropping the larger would let a forged small size mute a
+  real publisher's order. A `Clear`-led batch never races — it is published only when no peer is **both**
+  synced and recently on the wire (`PEER_SERVING_NS`). The flag alone would let a departed publisher
+  suppress this product's only self-heal forever; requiring a delivery also settles the both-recovering
+  race, since whichever arm publishes first records one. A session boundary restarts the venue's id space,
+  so `reset_book_events_for_market` clears the tombstones — narrower than `reset_book_for_market` on
+  purpose, since a peer that missed the session end is still serving that market.
+- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**
+  for a price-aggregated market, in *both* arbitration modes with no `mode_for` branch (#105): one
+  `source_ts` tick can hold several
   deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
   arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
   every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
@@ -406,11 +436,12 @@ Modules are grouped by role under `src/`:
   the order-level changes the `book` product is built from — `on_delta_reporting` appends one
   `OrderChange` (raw ints, absolute resulting quantity) per applied event and nothing for one it
   rejects, and `order_set` materializes the whole book, deterministically ordered so two publishers'
-  copies compare byte-for-byte. **The removed-order guard is what carries correctness under racing**
-  (`MAX_REMOVED_ORDERS`, `dz_mbo_removed_evicted_total`): a venue never reuses an `order_id`, so an
-  `Add` for an id this book has removed is a late copy and is refused outright — which is why the
-  arbiter's dedup window is a cost knob and not a correctness parameter. The refused event still
-  consumes its sequence number, or the next contiguous delta would read as a gap. Session and
+  copies compare byte-for-byte. The removed-order set (`MAX_REMOVED_ORDERS`,
+  `dz_mbo_removed_evicted_total`) is **defence in depth, not the cross-publisher guard**: one book sees
+  one publisher's stream, where the sequence check already rejects a repeat, so what it catches is a
+  forged `Add` re-using a dead id at a contiguous sequence. The racing guard is at the merge point
+  (`arbiter.rs`), the only scope with the shared identity to see a *peer's* delete. A refused `Add`
+  still consumes its sequence number, or the next contiguous delta would read as a gap. Session and
   instrument resets, and a snapshot install, all clear the set: each is a fresh id space.
 - **`ingest/pricebook.rs`** — `PriceBook`: per-instrument **price-keyed** book + the market-by-price
   snapshot+delta recovery machine (`AwaitingSnapshot`/`BuildingSnapshot`/`Ready`/`Gap`). A **sibling**
@@ -464,7 +495,10 @@ Modules are grouped by role under `src/`:
   `order_id` (`0` = price-aggregated), and `BookAccumulator` keys order-level changes by it while keeping
   the price maps for the aggregated kind; `price_fold` folds the orders into levels **with a count per
   level**, which a price-keyed accumulator structurally cannot produce, and `to_book(ReplayScope)`
-  materializes either rendering. Its pending-change cap now bounds only an event still awaiting its
+  materializes either rendering, and `is_order_level` is what an unset `book_scope` follows so a client's
+  bootstrap matches the granularity the market streams. A `Clear` names a *side*, so it always carries
+  `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
+  of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
   `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
   baseline. `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's

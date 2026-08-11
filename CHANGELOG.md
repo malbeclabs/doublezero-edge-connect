@@ -68,19 +68,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the consumers on it. PROTOCOL.md stays **v1** — both additions are fields a consumer may ignore.
 - `order_id` on a `book` change: the venue's order id for an order-level change, `0` when the change
   is price-aggregated (Market-by-Price) and carries no order identity.
-- `book_scope` on a subscription (`"levels"` | `"orders"`, default `"levels"`): the granularity of the
-  `book` bootstrap. A consumer that keys its book by `order_id` **must** request `"orders"` — with the
-  default it is bootstrapped with levels carrying no ids, then receives changes for ids it never saw.
+- `book_scope` on a subscription (`"levels"` | `"orders"`): the granularity of the `book` bootstrap.
+  Omitted — the default, and the only possibility on the connect-time replay — it **follows the
+  market**, so an order-level market is bootstrapped as orders and a price-aggregated one as levels. A
+  bootstrap and a stream of different granularity cannot be reconciled: an order-level change carries
+  one *order's* absolute size, and applying it as a level's size corrupts the book.
 - Order-level `book` events are **raced across publishers on venue event identity** rather than served
   by one elected arm: each event is published once, from whichever publisher delivered it first. What
-  carries correctness is a per-order guard, not the dedup window — a book never re-adds an order id it
-  has removed, so an arbitrarily late copy costs a redundant emission and cannot resurrect a dead
-  order. A publisher recovering by snapshot republishes its whole book only when no peer of that market
-  is synced. `--arb-book-dedup-window-ms` (default 250) tunes how long a delivered event is remembered.
-- `dz_book_events_deduped_total{venue}`, `dz_mbo_arm_disagreement_total{venue}` and
-  `dz_mbo_removed_evicted_total`. The disagreement counter is the one to alert on: it fires when a
-  publisher claims more resting quantity for an order than a peer already reported, which is a book
-  that has silently drifted. See `docs/metrics.md`.
+  carries correctness is a per-order guard at the merge point, not the dedup window — a change for an
+  order the producer has already published as gone is refused, so an arbitrarily late copy costs a
+  redundant emission and cannot resurrect a dead order. A publisher recovering by snapshot republishes
+  its whole book only when no peer is both synced and actually serving the market, so a recovery cannot
+  wipe a live book and a departed publisher cannot block one either.
+  `--arb-book-dedup-window-ms` (default 250) tunes how long a delivered event is remembered.
+- `dz_book_events_deduped_total{venue}`, `dz_book_resurrections_dropped_total{venue}`,
+  `dz_mbo_arm_disagreement_total{venue}` and `dz_mbo_removed_evicted_total`. The disagreement counter
+  is the one to alert on: it fires when a publisher claims more resting quantity for an order than a
+  peer already reported, which is a book that has silently drifted. See `docs/metrics.md`.
 - Every message now carries `source` and `source_id` alongside `venue`. The subscription filter
   accepts `source` as an alias for `venue`; supplying both ANDs them.
 - `dz_source_id_changed_total{venue}` counts a publisher changing an instrument's Source ID
