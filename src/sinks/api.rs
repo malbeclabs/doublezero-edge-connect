@@ -1881,7 +1881,7 @@ mod tests {
     /// while the fixed `top_levels` path costs the same regardless of book size.
     #[test]
     fn book_reads_a_huge_pricebook_in_bounded_time() {
-        const TOTAL_LEVELS: usize = 200_000;
+        const TOTAL_LEVELS: usize = 5_000_000;
         const BATCH: usize = 4_000;
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
