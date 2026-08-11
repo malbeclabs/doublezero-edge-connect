@@ -967,8 +967,8 @@ impl Arbiter {
     }
 
     /// The single expression of the **three-way drop**: the per-arm accumulators (`book_markets`),
-    /// the shared replay entry (and with it the `by_identity` index prune) and `StickyAuthority`'s
-    /// `last_admitted`, for a batch of keys — [`Self::reset_book_for_market`] is one key through
+    /// the shared replay entry and `StickyAuthority`'s `last_admitted`, for a batch of keys —
+    /// [`Self::reset_book_for_market`] is one key through
     /// here and [`Self::forget_channel_books`] is a channel's worth.
     ///
     /// The three legs **must** drop together: losing `last_admitted` is what forces the consumer
@@ -3859,22 +3859,12 @@ mod tests {
             guard.get(&kept).is_some_and(|acc| acc.baselined()),
             "the peer universe's live, complete replay entry must survive that eviction"
         );
-        // ...and the wire-identity index went with the evicted market rather than outliving it. The
-        // REST surface resolves markets through this lookup and has no key to fall back on, so an
-        // index entry pointing at an evicted market makes the surviving one invisible — the same
-        // together-or-not-at-all rule the accumulator and the authority entry follow.
-        assert!(
-            guard
-                .by_identity(&Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT)
-                .is_some_and(|acc| acc.baselined()),
-            "the identity index must resolve the surviving market, not the evicted one"
-        );
     }
 
-    /// The index is also dropped when the market it names is, with nothing left behind: a stale entry
-    /// would have `/v1/products` report a `market_by_price` book for a market that no longer exists.
+    /// An evicted market's replay entry is gone with nothing left behind: a stale entry would have
+    /// `/v1/products` report a `market_by_price` book for a market that no longer exists.
     #[test]
-    fn an_evicted_market_leaves_no_identity_index_entry() {
+    fn an_evicted_market_is_unreachable_by_full_key() {
         let venue = "BookEvictionIndex";
         let (tx, _rx) = broadcast::channel(1);
         let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
@@ -3889,22 +3879,12 @@ mod tests {
         }
         let guard = model::lock(&replay);
         assert_eq!(guard.len(), MAX_BOOK_MARKETS, "one market was evicted");
-        assert_eq!(
-            guard.identity_index_len(),
-            guard.len(),
-            "the index must hold exactly the live markets — an entry outliving its market both \
-             grows without bound and, where two universes share an identity, hides the survivor"
+        assert!(
+            guard.get(&mkey(venue, 0)).is_none(),
+            "the evicted market must not still be reachable"
         );
         assert!(
-            guard
-                .by_identity(&Arc::from(venue), BOOK_CHANNEL, 0)
-                .is_none(),
-            "the evicted market must not still be reachable by wire identity"
-        );
-        assert!(
-            guard
-                .by_identity(&Arc::from(venue), BOOK_CHANNEL, MAX_BOOK_MARKETS as u32)
-                .is_some(),
+            guard.get(&mkey(venue, MAX_BOOK_MARKETS as u32)).is_some(),
             "...while a live one still is"
         );
     }
@@ -4057,9 +4037,9 @@ mod tests {
             "fixture sanity"
         );
         assert_eq!(
-            model::lock(&replay).identity_index_len(),
+            model::lock(&replay).len(),
             4,
-            "fixture sanity: four distinct markets indexed"
+            "fixture sanity: four distinct markets in the replay map"
         );
 
         let dropped = a.forget_channel_books(venue, "sports", BOOK_CHANNEL);
@@ -4110,15 +4090,13 @@ mod tests {
             );
         }
 
-        // F4: the identity index must drop exactly the two doomed markets' entries and nothing
-        // else (the coverage `model::BookReplay::forget_channel`'s own test carried before this
-        // seam moved to the arbiter). An entry outliving its market both leaks and, where two
-        // universes collide on one identity (`peer_category` here), makes the survivor unreachable
-        // by wire identity until a stale entry happens to be overwritten.
+        // F4: the replay map must drop exactly the two doomed markets' entries and nothing else
+        // (the coverage `model::BookReplay::forget_channel`'s own test carried before this seam
+        // moved to the arbiter).
         assert_eq!(
-            model::lock(&replay).identity_index_len(),
+            model::lock(&replay).len(),
             2,
-            "the index must hold exactly the two surviving markets"
+            "the replay map must hold exactly the two surviving markets"
         );
     }
 
@@ -4158,8 +4136,9 @@ mod tests {
         admitted: Vec<(MarketKey, Option<Publisher>)>,
         /// The replay entry per seeded key: present-and-`baselined`, present-and-not, or absent.
         replay: Vec<(MarketKey, Option<bool>)>,
-        /// Keys held by the replay map's `by_identity` index (a stale one hides a live market).
-        identity_index: usize,
+        /// Total entries in the replay map (a leaked entry from a market that should have been
+        /// dropped would show up here even if it isn't one of the tracked `keys`).
+        replay_len: usize,
     }
 
     fn book_legs(a: &Arbiter, replay: &crate::model::BookSnapshot, keys: &[MarketKey]) -> BookLegs {
@@ -4177,7 +4156,7 @@ mod tests {
                 .iter()
                 .map(|k| (k.clone(), guard.get(k).map(|acc| acc.baselined())))
                 .collect(),
-            identity_index: guard.identity_index_len(),
+            replay_len: guard.len(),
         }
     }
 
@@ -4298,8 +4277,8 @@ mod tests {
             "only the doomed market's replay entry may drop, and the peers stay baselined"
         );
         assert_eq!(
-            after_single.identity_index, 3,
-            "the identity index must drop exactly the doomed market's key"
+            after_single.replay_len, 3,
+            "the replay map must drop exactly the doomed market's key"
         );
     }
 

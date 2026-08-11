@@ -499,6 +499,10 @@ pub struct BookAccumulator {
 /// rather than silently dropping changes from a book still claimed to be complete.
 const MAX_PENDING_CHANGES: usize = 8192;
 
+/// Return type of [`BookAccumulator::top_levels`]: `(bids, asks, true bid count, true ask count)`
+/// — named so clippy's `type_complexity` lint doesn't flag the bare tuple at the signature.
+pub type TopLevels = (Vec<(f64, f64)>, Vec<(f64, f64)>, usize, usize);
+
 impl BookAccumulator {
     pub fn new(symbol: Arc<str>) -> Self {
         Self {
@@ -613,6 +617,27 @@ impl BookAccumulator {
         self.asks.values().next().copied()
     }
 
+    /// The accumulator's last-applied event time. A caller that only needs a level slice (see
+    /// [`Self::top_levels`]) rather than a full materialization shouldn't have to call
+    /// [`Self::to_book`] — which stamps this same value — just to read it.
+    pub fn source_ts_ns(&self) -> u64 {
+        self.source_ts_ns
+    }
+
+    /// The best `n` levels per side, best-first (bids high-to-low, asks low-to-high), plus each
+    /// side's **true** level count. Cheap regardless of book size — reads straight off the
+    /// accumulator's own `BTreeMap`s and takes at most `n` per side, the same discipline
+    /// [`Self::best_bid`]/[`Self::best_ask`] use for the inside market — so a capped caller (e.g.
+    /// `sinks/api.rs::book`, which serves at most a fixed per-side cap) never pays for
+    /// [`Self::to_book`]'s full materialization of the book's real size just to keep a handful of
+    /// rows. The counts are the true, uncapped per-side sizes rather than `min(len, n)`, because a
+    /// capped caller needs the real count to tell an honest truncation from a complete book.
+    pub fn top_levels(&self, n: usize) -> TopLevels {
+        let bids: Vec<(f64, f64)> = self.bids.values().rev().take(n).copied().collect();
+        let asks: Vec<(f64, f64)> = self.asks.values().take(n).copied().collect();
+        (bids, asks, self.bids.len(), self.asks.len())
+    }
+
     /// Materialize the current state as a re-baseline: `clear` first, then every level best-first.
     /// Stamps `snapshot`/`last`, so only call it when [`Self::baselined`] holds — otherwise it claims
     /// completeness for a book that is missing every level which has not moved.
@@ -687,45 +712,24 @@ pub type BookKey = (Arc<str>, Arc<str>, u32, u32);
 /// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
 pub type BookMap = HashMap<BookKey, BookAccumulator>;
 
-/// The wire identity alone — all a consumer-facing reader can name, since neither PROTOCOL.md nor
-/// the REST surface exposes the arbitration scope.
-type BookIdentity = (Arc<str>, u32, u32);
-
-fn book_identity(key: &BookKey) -> BookIdentity {
-    (key.0.clone(), key.2, key.3)
-}
-
-/// The replay state behind [`BookSnapshot`]: every market's accumulated book, plus a secondary index
-/// from **wire identity** to full key.
+/// The replay state behind [`BookSnapshot`]: every market's accumulated book, keyed on the full
+/// [`BookKey`] (arbitration scope plus wire identity).
 ///
-/// `sinks/ws.rs` iterates, so it needs nothing from the index. `sinks/api.rs` now resolves a market
-/// from a `NormalizedInstrument`, which carries `category` (see its doc) alongside the wire
-/// identity, so its `feed_kind_for`/`best_levels`/`book` handlers build the full `BookKey` directly
-/// and look it up with [`get`](Self::get) in one hash hit — no ambiguity, no scan, and no use for
-/// [`by_identity`](Self::by_identity) at all. That method is kept for a caller that genuinely has
-/// only the wire identity and no category to disambiguate with (as `sinks/api.rs` once did): it
-/// resolves the *first* key indexed for that identity, which is correct only when a single
-/// universe actually holds it — two universes under one Source ID can carry the same `(channel,
-/// instrument_id)`, so a caller reaching for it instead of the category-precise `get` can silently
-/// name the wrong universe's market. Do not reason from today's `channel_id` ranges happening not
-/// to overlap: that separation is a numbering convention owned upstream, it is mid-migration, and
-/// nothing here enforces it.
-///
-/// The two maps are mutated **only** through this type's methods, so the index cannot drift from the
-/// books it indexes: an eviction drops the accumulator and the index entry in one step, exactly as
-/// the arbiter drops the replay entry and the authority's per-market state together. That
-/// together-or-not-at-all property is the whole reason this is a struct and not a second map kept
-/// beside the first.
+/// `sinks/ws.rs` iterates. `sinks/api.rs` resolves a market from a `NormalizedInstrument`, which
+/// carries `category` (see its doc) alongside the wire identity, so its
+/// `feed_kind_for`/`best_levels`/`book` handlers build the full `BookKey` directly and look it up
+/// with [`get`](Self::get) in one hash hit — no ambiguity, no scan. A prior version kept a second
+/// index from wire identity alone to full key, for a caller with no category to disambiguate with;
+/// nothing calls that path anymore (every production lookup already has the category), so it was
+/// removed rather than kept live on the hot path for no reader.
 #[derive(Default)]
 pub struct BookReplay {
     books: BookMap,
-    by_identity: HashMap<BookIdentity, Vec<BookKey>>,
 }
 
 impl BookReplay {
     /// Replace one market's accumulator (the re-baseline path).
     pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) {
-        self.index(&key);
         self.books.insert(key, acc);
     }
 
@@ -735,19 +739,11 @@ impl BookReplay {
         key: &BookKey,
         f: impl FnOnce() -> BookAccumulator,
     ) -> &mut BookAccumulator {
-        self.index(key);
         self.books.entry(key.clone()).or_insert_with(f)
     }
 
-    /// Drop one market: accumulator and index entry together. The eviction and session-reset path.
+    /// Drop one market. The eviction and session-reset path.
     pub fn remove(&mut self, key: &BookKey) -> Option<BookAccumulator> {
-        let id = book_identity(key);
-        if let Some(keys) = self.by_identity.get_mut(&id) {
-            keys.retain(|k| k != key);
-            if keys.is_empty() {
-                self.by_identity.remove(&id);
-            }
-        }
         self.books.remove(key)
     }
 
@@ -757,21 +753,6 @@ impl BookReplay {
 
     pub fn contains_key(&self, key: &BookKey) -> bool {
         self.books.contains_key(key)
-    }
-
-    /// One market by wire identity, in O(1) — the REST surface's lookup. Reads the *first* key
-    /// indexed for that identity and does not fall back to a later one, so a stale index entry shows
-    /// up as a missing book rather than being silently papered over.
-    pub fn by_identity(
-        &self,
-        venue: &Arc<str>,
-        channel: u32,
-        instrument_id: u32,
-    ) -> Option<&BookAccumulator> {
-        let keys = self
-            .by_identity
-            .get(&(venue.clone(), channel, instrument_id))?;
-        self.books.get(keys.first()?)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&BookKey, &BookAccumulator)> {
@@ -784,21 +765,6 @@ impl BookReplay {
 
     pub fn is_empty(&self) -> bool {
         self.books.is_empty()
-    }
-
-    fn index(&mut self, key: &BookKey) {
-        let keys = self.by_identity.entry(book_identity(key)).or_default();
-        if !keys.contains(key) {
-            keys.push(key.clone());
-        }
-    }
-
-    /// Distinct wire identities currently indexed, so a test can assert the index holds exactly the
-    /// live markets. An entry that outlives its market is both an unbounded leak and — where two
-    /// universes collide on one identity — what makes the survivor unreachable.
-    #[cfg(test)]
-    pub fn identity_index_len(&self) -> usize {
-        self.by_identity.values().map(Vec::len).sum()
     }
 
     // Deliberately no `forget_channel` (or any other multi-market removal) here. This map is one

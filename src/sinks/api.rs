@@ -56,7 +56,7 @@ use crate::{
         sources::{source_id_of, source_label},
     },
     model::{
-        category_arc, venue_arc, BookSide, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
+        category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
         NormalizedInstrument,
     },
     products::{self, Resolution},
@@ -545,9 +545,14 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     .render(ambiguous);
 
     // Prefer the incremental market-by-price accumulator when this identity has one. Looked up by
-    // the full category-carrying key (not `BookReplay::by_identity`, which is category-blind and
-    // would return whichever universe's market happened to be indexed first — see its doc) since
-    // `inst.category` names exactly the universe this instrument belongs to.
+    // the full category-carrying key (a category-blind lookup would return whichever universe's
+    // market happened to collide first) since `inst.category` names exactly the universe this
+    // instrument belongs to.
+    //
+    // Reads `top_levels` rather than `to_book` — same reasoning as `best_levels` above: `to_book`
+    // materializes the market's entire level set (up to 2^18 of them) to then serve 50 per side,
+    // and it would do so while still holding `state.books`. `Arbiter::apply_book_replay` takes that
+    // same guard from inside `emit`, so a slow request here would stall ingest for every venue.
     let mbp = {
         let books = crate::model::lock(&state.books);
         books
@@ -558,24 +563,18 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
                 inst.instrument_id,
             ))
             .map(|acc| {
+                let (bids, asks, bids_total, asks_total) = acc.top_levels(MAX_LEVELS_PER_SIDE);
                 (
                     acc.baselined(),
-                    acc.to_book(&inst.venue, inst.channel, inst.instrument_id),
+                    acc.source_ts_ns(),
+                    bids,
+                    asks,
+                    bids_total,
+                    asks_total,
                 )
             })
     };
-    if let Some((baselined, materialized)) = mbp {
-        let mut bids = Vec::new();
-        let mut asks = Vec::new();
-        for c in &materialized.changes {
-            match c.side {
-                BookSide::Bid => bids.push((c.price, c.size)),
-                BookSide::Ask => asks.push((c.price, c.size)),
-                // The leading `Clear` that opens `to_book`'s output; not a level.
-                BookSide::Both => {}
-            }
-        }
-        let (bids_total, asks_total) = (bids.len(), asks.len());
+    if let Some((baselined, source_ts_ns, bids, asks, bids_total, asks_total)) = mbp {
         // Our own serving cap, independent of `baselined()`: even a fully re-baselined book is
         // truncated here, and — unlike the market-by-order path below — we know the true pre-cap
         // count, so cutting real levels off is itself what makes the response incomplete.
@@ -590,7 +589,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            materialized.source_ts_ns,
+            source_ts_ns,
             (inst.price_exponent, inst.qty_exponent),
             MAX_LEVELS_PER_SIDE,
             complete,
@@ -877,8 +876,12 @@ fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
 /// present, which is a normal state (no label yet, no reference data yet), not an error.
 fn channels_block(state: &ApiState) -> Value {
     let filter = crate::model::lock(&state.filter).clone();
-    let history = crate::model::lock(&state.history);
+    // Computed before taking `history`'s lock, not after: `channel_symbol_prefixes` locks
+    // `instruments` and walks the whole catalog, and holding `history` across that walk would block
+    // the history feeder (which appends under the same lock) for as long as the walk takes,
+    // punching a hole in the rolling window `/v1` serves.
     let prefixes = channel_symbol_prefixes(state);
+    let history = crate::model::lock(&state.history);
     let mut rows = Vec::new();
     let mut excluded_by_filter = 0usize;
 
