@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes this — see above.)
 
 ### Added
+- **A Hyperliquid-compatible output sink** (`--hl-ws-bind` / `HL_WS_BIND`, off by default): the same
+  market data in Hyperliquid's own WebSocket schema — `l2Book` (full depth with the per-level order
+  count), `l4Book` (order-level snapshot then diffs, carrying the venue's order ids) and `trades` —
+  so an existing Hyperliquid client consumes edge-connect by changing one URL. A rendering, not a
+  second protocol: PROTOCOL.md is unaffected. See
+  [Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink), including what a stock
+  NautilusTrader client can and cannot receive.
 - **Market-by-Order now serves the order-level `book` alongside its existing `depth`.** The bridge no
   longer throws the order identity away: every change carries the venue's own `order_id`, a snapshot
   install re-baselines as a `clear` plus the full order set, and `depth` keeps working unchanged for

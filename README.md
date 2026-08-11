@@ -171,6 +171,12 @@ Any engine that speaks WebSocket + JSON consumes it with a thin (~50-100 line) a
 wire contract is in **[PROTOCOL.md](PROTOCOL.md)** (see
 [Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine)).
 
+Already have a **Hyperliquid** client? `HL_WS_BIND=0.0.0.0:8082` turns on a second sink that serves
+the same data in Hyperliquid's own schema (`l2Book`, `l4Book`, `trades`), so pointing that client's
+WebSocket endpoint at it needs no adapter work. Off by default; see
+[Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink) for what it does and does not
+deliver.
+
 ## Standalone shred-proxy
 
 Shreds-only host and don't need the market-data bridge? The **[`shred-proxy/`](shred-proxy/)**

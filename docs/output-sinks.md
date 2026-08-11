@@ -8,6 +8,7 @@ sink can't stall ingest. Every flag also reads from the env var shown.
 | Sink | Default | Enable / disable | Config flags (env) |
 |------|---------|------------------|--------------------|
 | **WebSocket** (`sinks::ws`) | **on when subscribed** | configured unless `--ws-bind` is empty (`--ws-bind ""` disables it); *activated* only when ≥1 market-data feed is subscribed | `--ws-bind` (`WS_BIND`, default `0.0.0.0:8081`) + the `--ws-*` limits |
+| **Hyperliquid-compatible** (`sinks::hyperliquid`) | **off** | on when `--hl-ws-bind` is non-empty; **not** subscription-gated | `--hl-ws-bind` (`HL_WS_BIND`, default empty) |
 | **Metrics** (`sinks::metrics`) | **off** | on when `--metrics-bind` is non-empty | `--metrics-bind` (`METRICS_BIND`, default empty) |
 
 The metrics endpoint is active when its key config value is non-empty. The WebSocket sink ships a
@@ -19,6 +20,54 @@ no manual config. Its listener is bound non-fatally: a taken port disables the s
 from source without the `doublezero` CLI, gating falls open and the sink is active whenever
 configured. See the main README for the reconciler flags (`--subscription-refresh-secs`,
 `--subscription-gating-disable`).
+
+## Hyperliquid-compatible sink
+
+Serves the same market data in **Hyperliquid's own WebSocket schema** instead of
+[PROTOCOL.md](../PROTOCOL.md)'s, so an existing Hyperliquid client consumes edge-connect by changing
+one URL. It is **off by default**; give it a bind address to turn it on:
+
+```bash
+./target/release/doublezero-edge-connect --iface doublezero1 --hl-ws-bind 0.0.0.0:8082
+```
+
+It is a **rendering, not a second protocol**: it holds no book of its own, adds no deduplication and
+influences no arbitration, reading the same internal broadcast the normalized sink reads. Nothing
+about it belongs in PROTOCOL.md, which is the contract for our own protocol. Scoped to the
+Hyperliquid venue — `coin` is our `symbol`, and no other venue is rendered. Not subscription-gated
+(it has no multicast group of its own to be subscribed to); like the normalized sink, a bind failure
+disables it with a warning rather than taking the process down.
+
+Three channels, subscribed with Hyperliquid's own control frame
+(`{"method":"subscribe","subscription":{"type":…,"coin":…}}`), acknowledged with a
+`subscriptionResponse` echo, and `{"method":"ping"}` answered with `{"channel":"pong"}`:
+
+| Channel | Contract |
+|---|---|
+| `l2Book` | Snapshot-per-update: every frame carries the whole top-N of both sides, `px`/`sz` as strings and `n` as the resting-order count at that price. Honours `nSigFigs` (2–5), `mantissa` (2 or 5, only at `nSigFigs` 5) and `nLevels` (default 20, clamped to 100). Bids bucket down and asks bucket up, so aggregation never invents a price better than the book holds. |
+| `l4Book` | The whole resting book order by order, then order diffs — each carrying the **venue's own order id**. Externally tagged `{"Snapshot":{…}}` / `{"Updates":{…}}`, matching the contract DoubleZero's own Hyperliquid publisher defines. A producer re-baseline arrives as another `Snapshot`, since the channel has no clear. |
+| `trades` | Our `trade`, in Hyperliquid's envelope: string price and size, the aggressor side spelled `B`/`A`, and the venue's own `tid`. |
+
+**What a stock NautilusTrader client actually gets, and what it does not.** Set
+`HyperliquidDataClientConfig.base_url_ws` to this sink and a v1.227.0 Hyperliquid trader receives
+genuine full-depth L2 with no adapter change. It **cannot** receive L3: its Rust WebSocket client has
+no `l4Book` subscription, so nothing in Nautilus will ever ask for one, and its book path hardcodes
+order id `0`. Order-level is available to a client that asks for `l4Book` — our own adapter, or
+Nautilus once someone extends it. "Hyperliquid-compatible" does not mean "Nautilus gets L3".
+
+**Three fields the wire cannot supply.** Hyperliquid's schema describes a venue that also owns the
+account model; our input is an order book. A trade's `users` and `hash`, an order's `user` and its
+`triggerCondition`/`orderType`/`tif`/`cloid` block, and `l4Book`'s `height` are emitted as null or
+zero so a client written against the publisher still parses the frames — a consumer must not read
+meaning into them. `l4Book`'s `order_statuses` is always empty for the same reason, and its order
+diffs use `new`/`remove` only: our changes carry an order's absolute resulting quantity and no prior
+one, so the publisher's `update{origSz,newSz}` could only be fabricated.
+
+Both book channels publish a market only once the bridge holds its **complete** book. `l2Book`
+replaces a consumer's book wholesale on every frame and an `l4Book` snapshot claims completeness, so
+a market accumulated mid-stream — before a producer re-baseline — is withheld rather than published
+as if it were whole. Observability is `dz_hl_sink_clients` and `dz_hl_sink_messages_total{channel}`.
+There is **no TLS**, as with the rest of the service surface.
 
 ## Metrics (Prometheus)
 

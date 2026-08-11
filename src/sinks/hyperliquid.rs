@@ -625,43 +625,53 @@ fn sent(channel: &'static str) {
         .inc();
 }
 
-/// Every frame that bootstraps `sub` from current state: an `l2Book` full book, or an `l4Book`
-/// snapshot, for each market of this venue whose symbol is the subscribed coin.
+/// The current full state of one market on the channel `sub` asked for, or `None` when the market is
+/// not this venue's, not the subscribed coin, or not [`BookAccumulator::baselined`].
 ///
-/// Markets that are not [`BookAccumulator::baselined`] are skipped. Both channels are full-state on
-/// this path, so publishing an accumulator seeded mid-stream would tell the client that the levels it
-/// happens to hold are the whole book.
+/// That last gate is load-bearing on **both** book channels: an `l2Book` frame replaces a consumer's
+/// book wholesale and an `l4Book` snapshot claims completeness, so an accumulator seeded mid-stream —
+/// holding only the levels that have moved since — must be withheld rather than published as whole.
+fn full_state(
+    key: &(Arc<str>, u32, u32),
+    acc: &BookAccumulator,
+    sub: &Sub,
+) -> Option<(&'static str, String)> {
+    if key.0.as_ref() != VENUE || acc.symbol().as_ref() != sub.coin() || !acc.baselined() {
+        return None;
+    }
+    match sub {
+        Sub::L2Book {
+            coin,
+            n_sig_figs,
+            mantissa,
+            n_levels,
+        } => {
+            let view = L2View {
+                n_sig_figs: *n_sig_figs,
+                mantissa: *mantissa,
+                n_levels: *n_levels,
+            };
+            let time = ms_or_now(acc.source_ts_ns());
+            Some(("l2Book", render_l2book(acc, coin, view, time)))
+        }
+        Sub::L4Book { coin } => Some(("l4Book", render_l4book_snapshot(acc, key, coin))),
+        Sub::Trades { .. } => None,
+    }
+}
+
+/// Bootstrap `sub` from current state — every market of this venue whose symbol is the subscribed
+/// coin. Scans the market map, so it is for a subscribe or a recovery, never the steady stream.
 fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
     let guard = crate::model::lock(books);
     guard
         .iter()
-        .filter(|((venue, _, _), acc)| venue.as_ref() == VENUE && acc.baselined())
-        .filter(|(_, acc)| acc.symbol().as_ref() == sub.coin())
-        .filter_map(|(key, acc)| match sub {
-            Sub::L2Book {
-                coin,
-                n_sig_figs,
-                mantissa,
-                n_levels,
-            } => {
-                let view = L2View {
-                    n_sig_figs: *n_sig_figs,
-                    mantissa: *mantissa,
-                    n_levels: *n_levels,
-                };
-                let ts = acc
-                    .to_book(&key.0, key.1, key.2, ReplayScope::Orders)
-                    .source_ts_ns;
-                Some(("l2Book", render_l2book(acc, coin, view, ms_or_now(ts))))
-            }
-            Sub::L4Book { coin } => Some(("l4Book", render_l4book_snapshot(acc, key, coin))),
-            Sub::Trades { .. } => None,
-        })
+        .filter_map(|(key, acc)| full_state(key, acc, sub))
         .collect()
 }
 
 /// Every frame one broadcast message produces for `sub`. Filtering on venue and coin happens before
-/// any rendering, which is the expensive part.
+/// any rendering, which is the expensive part, and the book channels resolve the market by its own
+/// `(venue, channel, instrument_id)` key rather than rescanning the map per message.
 fn render(m: &FeedMessage, sub: &Sub, books: &BookSnapshot) -> Vec<(&'static str, String)> {
     match (m, sub) {
         (FeedMessage::Trade(t), Sub::Trades { coin }) => render_trade(t, coin)
@@ -681,7 +691,13 @@ fn render(m: &FeedMessage, sub: &Sub, books: &BookSnapshot) -> Vec<(&'static str
                     .map(|f| vec![("l4Book", f)])
                     .unwrap_or_default();
             }
-            bootstrap(books, sub)
+            let key = (b.venue.clone(), b.channel, b.instrument_id);
+            let guard = crate::model::lock(books);
+            guard
+                .get(&key)
+                .and_then(|acc| full_state(&key, acc, sub))
+                .map(|f| vec![f])
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     }
