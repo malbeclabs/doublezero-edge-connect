@@ -787,11 +787,10 @@ offer_cli_package() {
   elif command -v yum >/dev/null 2>&1; then pm=yum
   fi
 
-  # Which Cloudsmith repo carries the package for this environment (release/.goreleaser.{testnet,
-  # mainnet-beta}.edge-cli.yaml): the CLI has no ledger coupling, so testnet publishes to
-  # doublezero-testnet and every other env (mainnet-beta, devnet) shares doublezero-mainnet-beta.
-  local cs_repo="doublezero-mainnet-beta"
-  [ "$DZ_ENV" = testnet ] && cs_repo="doublezero-testnet"
+  # One repo for every environment: the CLI has no ledger coupling, so both overlays publish here,
+  # and it is the repo a host running the DoubleZero client already trusts — no second key, no
+  # second source file. Per-environment names were tried first and nothing subscribes to them.
+  local cs_repo="doublezero"
 
   if [ -z "$pm" ]; then
     warn "No supported package manager (apt/dnf/yum) found; skipping the doublezero-edge CLI. Install it later: https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.<deb|rpm>.sh"
