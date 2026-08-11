@@ -204,7 +204,7 @@ pub struct NormalizedDepth {
 /// one rather than a separate message type: the reference consumer's book dispatcher branches on
 /// this action alone and never reads a snapshot flag, so a boolean "this is a snapshot" field would
 /// be silently ineffective there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BookAction {
     /// Discard the named side(s) before applying the rest of the batch.

@@ -272,6 +272,18 @@ struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     arb_match_window_secs: u64,
+
+    /// Milliseconds a delivered order-level book event is remembered so a slower publisher's copy is
+    /// recognized as a duplicate. Correctness does not depend on it — a removed order id is never
+    /// re-added regardless (`ingest::book`) — so this trades memory against redundant work, not
+    /// against a corrupt book.
+    #[arg(
+        long = "arb-book-dedup-window-ms",
+        env = "DZ_ARB_BOOK_DEDUP_WINDOW_MS",
+        default_value_t = 250,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_book_dedup_window_ms: u64,
 }
 
 /// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
@@ -442,6 +454,7 @@ async fn main() -> Result<()> {
             authority_cfg,
             args.arb_match_window_secs.saturating_mul(1_000_000_000),
         );
+        a.set_book_dedup_window(args.arb_book_dedup_window_ms.saturating_mul(1_000_000));
         Arc::new(Mutex::new(a))
     };
 
