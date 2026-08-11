@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The channel-departure purge fired on any shrink of the desired feed set, including a plain
+  subscription loss (a group unsubscribed, or a `doublezero status` blip that parses fine and
+  momentarily stops listing a code) — destroying a channel's catalog/book/history on a one-tick
+  blip that used to be harmless (an unsubscribe only ever stopped receiver tasks before this
+  reconciler purged anything). The purge is now driven solely by an explicit channel-filter
+  narrowing (`--channels` at startup, or `POST /admin/channels`); a subscription loss still stops
+  the receivers, but leaves their data alone to resync onto once the subscription returns.
 - A mirror publisher that raises every channel id by a fixed offset on the same ports (registry
   `derived.publisher_offset`) minted a second catalog/history/book entry under the raised id, half
   of which a departure purge could never reach (it purges by the registry's roster id alone),

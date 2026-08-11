@@ -254,12 +254,25 @@ pub struct Reconciler {
     /// task's own liveness write, so the reconciler must not deregister on its behalf.
     health: SharedFeedHealth,
     cli_missing_logged: bool,
-    /// The full **desired** feed-key set as of the last completed tick — deliberately not derived
-    /// from `active`. A receiver that already self-exited (`reap_finished` runs *before*
-    /// `apply_feeds` computes `current` from `active`) is gone from `active` by the time a channel
-    /// filter change would otherwise abort it, so diffing consecutive `desired` sets — not `active`
-    /// vs. `desired` — is what still detects the departure. See `forget_departed_channels`.
-    last_desired_feeds: HashSet<FeedKey>,
+    /// The channel filter's own admitted feed-key set for `cfg.enabled`, as of the last completed
+    /// tick — **independent of subscription state**, and deliberately not derived from `active`.
+    ///
+    /// This, not `desired.feeds`, is what a purge diffs against. `desired.feeds` shrinks for two
+    /// unrelated reasons — an operator narrowing the channel filter (a decision to drop data) and
+    /// a plain subscription loss (a group unsubscribed, or a `doublezero status` blip that parses
+    /// fine but momentarily stops listing a code) — and only the first may ever purge a channel's
+    /// catalog/book/history: losing a subscription must only stop the receivers, exactly as it did
+    /// before this reconciler purged anything at all, or a one-tick re-provision blip destroys an
+    /// hour of trade history nothing can refill. `filter_admitted` is computed from `cfg.enabled`
+    /// alone (see its doc), so it never moves on a subscription change and only moves on a real
+    /// filter change — which is the whole distinction.
+    ///
+    /// Diffed against consecutive ticks' own value rather than `active`, for the same reason the
+    /// pre-purge-split code diffed `desired` sets that way: a receiver that already self-exited
+    /// (`reap_finished` runs *before* `apply_feeds` computes `current` from `active`) is gone from
+    /// `active` by the time a channel filter change would otherwise abort it, so an `active`-based
+    /// check would silently miss the departure.
+    last_filter_admitted: HashSet<FeedKey>,
     /// Departed channels whose receiver has been `abort()`-ed but isn't yet confirmed stopped —
     /// see `drain_departed` for why the purge waits here instead of running right away.
     draining: Vec<Draining>,
@@ -281,6 +294,12 @@ struct Draining {
     key: FeedKey,
     handle: JoinHandle<Result<()>>,
     ticks_waited: u32,
+    /// Whether this departure is a channel-filter narrowing — the only thing `drain_departed` may
+    /// purge for. Decided by `apply_feeds` at abort time (`filter_departed.contains(&key)`), never
+    /// re-derived later: by the time this entry is drained, `last_filter_admitted` has already
+    /// moved on to a later tick's value and could no longer answer "was THIS departure a filter
+    /// change" correctly.
+    purge: bool,
 }
 
 impl Reconciler {
@@ -294,7 +313,7 @@ impl Reconciler {
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
-            last_desired_feeds: HashSet::new(),
+            last_filter_admitted: HashSet::new(),
             draining: Vec::new(),
         }
     }
@@ -322,12 +341,29 @@ impl Reconciler {
         let Some(desired) = self.compute_desired().await else {
             return;
         };
+        self.apply_desired(desired).await;
+    }
+
+    /// Apply one computed [`Desired`] state. Split out of `tick` so a test can drive this
+    /// directly with a hand-built `Desired` — bypassing `compute_desired`'s real
+    /// `doublezero status` shell-out — which is what makes the purge-vs-abort-only distinction
+    /// below testable without a `doublezero` CLI on the test host.
+    async fn apply_desired(&mut self, desired: Desired) {
         self.reap_finished();
-        // Which channels just left the desired set, computed against the *previous* tick's
-        // desired set (`last_desired_feeds`) before it's overwritten below — see
-        // `departed_channels`'s doc for why this, and not `active`, is the right diff.
-        let departed = Self::departed_channels(&self.last_desired_feeds, &desired.feeds);
-        self.last_desired_feeds = desired.feeds.clone();
+
+        // The channel filter's own admitted set, independent of subscription state — see
+        // `last_filter_admitted`'s doc for why this, and not `desired.feeds`, is the purge diff.
+        // Computed and diffed BEFORE `apply_feeds` runs, same as the pre-split code diffed
+        // `desired` sets: `reap_finished` above already dropped a self-exited receiver's key from
+        // `active`, so an `active`-based check would silently miss a departure that lands the same
+        // tick — see `departed_channels`'s doc.
+        let filter_admitted = self.filter_admitted();
+        let filter_departed: HashSet<FeedKey> =
+            Self::departed_channels(&self.last_filter_admitted, &filter_admitted)
+                .into_iter()
+                .collect();
+        self.last_filter_admitted = filter_admitted;
+
         // Abort the departing receivers *before* purging their catalog/book/history state (N1): if
         // the purge ran first, the still-live receiver could process one more refdata burst in the
         // window between the purge and its own abort taking effect, silently re-inserting the very
@@ -341,14 +377,15 @@ impl Reconciler {
         // overwritten by that in-flight write. A key with no entry in `active` already stopped on
         // its own before this tick (an earlier `reap_finished`, or it never ran at all), so nothing
         // can race an immediate purge; a key still in `active` gets aborted by `apply_feeds` below
-        // and moves to `self.draining`, whose purge waits for confirmed completion — see
-        // `drain_departed`.
-        for key in &departed {
+        // (which still aborts on ANY shrink of `desired.feeds` — a subscription loss included, just
+        // never a purge) and moves to `self.draining`, whose purge waits for confirmed completion
+        // and only fires for a filter-departed key — see `drain_departed`.
+        for key in &filter_departed {
             if !self.active.contains_key(key) {
                 self.forget_departing_channel(key);
             }
         }
-        self.apply_feeds(&desired.feeds);
+        self.apply_feeds(&desired.feeds, &filter_departed);
         self.drain_departed();
         self.apply_ws(desired.ws_on).await;
         self.apply_api(desired.api_on).await;
@@ -407,21 +444,33 @@ impl Reconciler {
     }
 
     /// Fail-open / gating-disabled desired state: every enabled feed on, WS on if configured, shreds
-    /// only via explicit sources (no CLI → no discovery).
+    /// only via explicit sources (no CLI → no discovery). Exactly [`Self::filter_admitted`] — there
+    /// is no subscription dimension in this mode, so every enabled+admitted key is desired.
     fn static_desired(&self) -> Desired {
-        let filter = self.filter();
-        let feeds: HashSet<FeedKey> = self
-            .cfg
-            .enabled
-            .iter()
-            .flat_map(|f| feed_keys(&filter, f))
-            .collect();
+        let feeds = self.filter_admitted();
         Desired {
             ws_on: !self.cfg.ws_bind.is_empty() && !feeds.is_empty(),
             api_on: !self.cfg.api_bind.is_empty() && !feeds.is_empty(),
             shred_sources: self.desired_shred_sources(None),
             feeds,
         }
+    }
+
+    /// The feed keys the channel filter currently admits across `cfg.enabled` — **independent of
+    /// subscription state**: every enabled row contributes, whether or not its group is actually
+    /// subscribed to right now. This is what an operator's channel filter (`--channels` at
+    /// startup, or `POST /admin/channels` at runtime) controls directly, and *only* it: narrowing
+    /// it is a decision to drop data, which is the one thing allowed to purge a channel's
+    /// catalog/book/history (`Self::last_filter_admitted`/`apply_desired`). A subscription change
+    /// never moves this set, which is exactly the property that keeps a subscription blip from
+    /// ever being mistaken for a filter narrowing.
+    fn filter_admitted(&self) -> HashSet<FeedKey> {
+        let filter = self.filter();
+        self.cfg
+            .enabled
+            .iter()
+            .flat_map(|f| feed_keys(&filter, f))
+            .collect()
     }
 
     fn desired_shred_sources(&self, subs: Option<&HostSubs>) -> Vec<SocketAddrV4> {
@@ -486,7 +535,12 @@ impl Reconciler {
         }
     }
 
-    fn apply_feeds(&mut self, desired: &HashSet<FeedKey>) {
+    /// Spawn/abort receivers to match `desired`. **Aborts on any shrink** of `desired` — a
+    /// subscription loss included — since a stopped receiver is always correct; whether that
+    /// departure also *purges* the channel's catalog/book/history is `filter_departed`'s call
+    /// alone, threaded into each `Draining` entry so `drain_departed` can honour it later without
+    /// having to re-derive it from a `last_filter_admitted` that has since moved on.
+    fn apply_feeds(&mut self, desired: &HashSet<FeedKey>, filter_departed: &HashSet<FeedKey>) {
         let current: HashSet<FeedKey> = self.active.keys().copied().collect();
         let (to_spawn, to_abort) = plan(&current, desired);
         for key in to_abort {
@@ -503,12 +557,16 @@ impl Reconciler {
                     publisher = key.3,
                     "deactivating market-data receiver (no longer subscribed)"
                 );
-                // Its catalog/book/history purge waits for confirmed completion, not just this
-                // `abort()` call — see `drain_departed`.
+                // Its catalog/book/history purge — if this departure is a filter narrowing at all
+                // — waits for confirmed completion, not just this `abort()` call. A departure that
+                // is merely a subscription loss is never purged: `purge` stays false and
+                // `drain_departed` only ever reaps this entry's handle.
+                let purge = filter_departed.contains(&key);
                 self.draining.push(Draining {
                     key,
                     handle: h,
                     ticks_waited: 0,
+                    purge,
                 });
             }
         }
@@ -557,18 +615,23 @@ impl Reconciler {
         }
     }
 
-    /// Purge a draining receiver's catalog/book/history state once its task is actually finished —
-    /// never merely aborted. See `tick`'s comment for why `abort()` alone isn't a safe purge
-    /// trigger: a receiver already past `recv_any().await` runs the rest of its synchronous body
-    /// before the cancellation lands, and purging any earlier can be overwritten by that write,
-    /// permanently. Waiting for `is_finished()` guarantees the purge runs strictly after the last
-    /// write that receiver could ever make.
+    /// Reap every draining receiver whose task is actually finished — never merely aborted — and,
+    /// for the ones that departed via a **channel-filter narrowing** (`entry.purge`), purge its
+    /// catalog/book/history state. A departure that is only a subscription loss reaps its handle
+    /// here and nothing else: its data is left exactly as it was, so the receiver resyncs onto it
+    /// the moment the subscription (or a wider channel filter) returns.
+    ///
+    /// See `apply_desired`'s comment for why `abort()` alone isn't a safe purge trigger: a receiver
+    /// already past `recv_any().await` runs the rest of its synchronous body before the
+    /// cancellation lands, and purging any earlier can be overwritten by that write, permanently.
+    /// Waiting for `is_finished()` guarantees the purge runs strictly after the last write that
+    /// receiver could ever make.
     ///
     /// Bounded by `MAX_DRAIN_TICKS`: a receiver `abort()` can't actually interrupt would otherwise
-    /// sit here forever, permanently leaking this entry and the stale state its purge would have
-    /// cleared. Past the bound we purge anyway and log loudly — the same residual risk the old
-    /// immediate-purge path always carried on every departure, now confined to a rare, bounded, and
-    /// observable case.
+    /// sit here forever, permanently leaking this entry and (for a purge-worthy one) the stale
+    /// state its purge would have cleared. Past the bound the entry is reaped anyway and logged
+    /// loudly — the same residual risk the old immediate-purge path always carried on every
+    /// departure, now confined to a rare, bounded, and observable case.
     fn drain_departed(&mut self) {
         let mut i = 0;
         while i < self.draining.len() {
@@ -583,35 +646,35 @@ impl Reconciler {
                         kind = entry.key.2.label(),
                         publisher = entry.key.3,
                         ticks_waited = entry.ticks_waited,
-                        "departed receiver still hasn't stopped after the drain bound; purging \
-                         its state anyway"
+                        purge = entry.purge,
+                        "departed receiver still hasn't stopped after the drain bound; reaping it \
+                         anyway"
                     );
                 }
-                self.forget_departing_channel(&entry.key);
+                if entry.purge {
+                    self.forget_departing_channel(&entry.key);
+                }
             } else {
                 i += 1;
             }
         }
     }
 
-    /// Every channel that just left the desired set (present in `previous`, absent from `desired`)
-    /// — a pure diff, called from `tick` *before* `last_desired_feeds` is overwritten and *before*
-    /// `apply_feeds` runs (see `tick`'s own comment for why the actual forgetting happens after
-    /// `apply_feeds`, not here).
-    ///
-    /// Diffs against the previous tick's full desired set, **not** `self.active` (which is what
-    /// `apply_feeds`'s own `to_abort` computes): `reap_finished` runs first each tick and already
-    /// drops a self-exited receiver's key from `active`, so by the time a channel filter change
-    /// removes that same key from `desired` it was never in `active` to diff against, and an
-    /// `active`-based check
-    /// would silently miss the departure. Basing removal on *the channel leaving the desired set*
-    /// rather than *an abort actually happening* is what closes that window.
-    fn departed_channels(previous: &HashSet<FeedKey>, desired: &HashSet<FeedKey>) -> Vec<FeedKey> {
-        previous.difference(desired).copied().collect()
+    /// Every key present in `previous` and absent from `current` — a pure set diff. Used by
+    /// `apply_desired` to compute `filter_departed` (`last_filter_admitted` vs. this tick's
+    /// `filter_admitted()`), **not** on `desired.feeds`/`self.active`: `reap_finished` runs first
+    /// each tick and already drops a self-exited receiver's key from `active`, so by the time a
+    /// channel filter change removes that same key from `filter_admitted()` it was never in
+    /// `active` to diff against, and an `active`-based check would silently miss the departure.
+    /// Basing removal on *the key leaving the filter's admitted set* rather than *an abort actually
+    /// happening* is what closes that window.
+    fn departed_channels(previous: &HashSet<FeedKey>, current: &HashSet<FeedKey>) -> Vec<FeedKey> {
+        previous.difference(current).copied().collect()
     }
 
-    /// `key` just left the desired set and its receiver (if any) has already been aborted by
-    /// `apply_feeds` (see `tick`): drop everything the query surface and a reconnecting WS client
+    /// `key` just left the channel filter's admitted set and its receiver (if any) has already
+    /// been aborted by `apply_feeds` (see `apply_desired`): drop everything the query surface and
+    /// a reconnecting WS client
     /// would otherwise keep serving from it — the catalog entry, the accumulated book, and the
     /// rolling trade history — so a departed channel goes fully dark rather than reading as "alive
     /// but quiet" (a frozen `best_bid`/`best_ask` beside an empty trade list is worse than no data
@@ -697,7 +760,8 @@ impl Reconciler {
                 channel,
                 history_dropped,
                 books_dropped,
-                "channel left the desired set; dropped its catalog/book/history state"
+                "channel left the channel filter's admitted set; dropped its catalog/book/history \
+                 state"
             );
         }
     }
@@ -1291,6 +1355,7 @@ mod tests {
             &[(venue, "testcategory", FeedKind::TopOfBook, 7576), mbp_key]
                 .into_iter()
                 .collect(),
+            &HashSet::new(),
         );
         let mbp_tape = r.active[&mbp_key].1.clone();
         assert!(
@@ -1298,7 +1363,7 @@ mod tests {
             "top of book owns the tape"
         );
 
-        r.apply_feeds(&[mbp_key].into_iter().collect());
+        r.apply_feeds(&[mbp_key].into_iter().collect(), &HashSet::new());
         assert!(
             mbp_tape.load(Ordering::Relaxed),
             "the tape moved to market-by-price"
@@ -1434,11 +1499,11 @@ mod tests {
     }
 
     /// I1's exact regression: `reap_finished` runs (and, in a real tick, would have already dropped
-    /// a self-exited receiver from `active`) *before* the channel leaves the desired set, so a
-    /// departure check keyed on `active` (as `apply_feeds`'s own `to_abort` is) never sees it —
-    /// `active` no longer holds the key by the time `desired` stops naming it either. Diffing
-    /// `last_desired_feeds` against `desired`, independent of `active` entirely, is what still
-    /// catches it.
+    /// a self-exited receiver from `active`) *before* the channel leaves the channel filter's
+    /// admitted set, so a departure check keyed on `active` (as `apply_feeds`'s own `to_abort` is)
+    /// never sees it — `active` no longer holds the key by the time `filter_admitted()` stops
+    /// naming it either. Diffing `last_filter_admitted` against `filter_admitted()`, independent of
+    /// `active` entirely, is what still catches it.
     ///
     /// Drives the real `tick()` across two ticks with a genuinely **narrowing channel filter** on
     /// the real `lashay-4` sports row (`ChannelFilter::parse` validates against the loaded
@@ -1918,6 +1983,116 @@ mod tests {
                 .candles(&hist_key, 60, 10, 1_100)
                 .is_empty(),
             "history must be purged"
+        );
+    }
+
+    /// **The purge split.** A subscription loss — the group unsubscribed, or a `doublezero status`
+    /// blip that shrinks `desired.feeds` for a tick without the channel filter moving at all — must
+    /// only stop the receiver; the catalog/book/history stay exactly as they were, since before
+    /// this reconciler purged anything an unsubscribe only ever stopped receiver tasks. Drives
+    /// `apply_desired` directly with hand-built `Desired`s (the seam it exists to expose): `tick()`
+    /// itself can't be driven this way without a `doublezero` CLI on the test host, and this is
+    /// precisely the distinction a test that only asserts "the receiver stopped" cannot tell apart
+    /// from the narrowing case above.
+    ///
+    /// Revert-verify: reverting `apply_desired` to diff `desired.feeds` instead of
+    /// `filter_admitted()` (the pre-fix behaviour, where ANY shrink purges) makes the history/book/
+    /// catalog assertions below fail — confirmed by hand before landing this test (see the PR
+    /// report for the exact failure output).
+    #[tokio::test]
+    async fn a_subscription_loss_stops_the_receiver_without_purging_its_state() {
+        let mut r = test_reconciler_with_filter(
+            vec![sports_row()],
+            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+        );
+        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
+        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
+            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let book_key: crate::ingest::authority::MarketKey =
+            (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
+        let hist_key = history::Key {
+            source_id: 3,
+            category: "sports".into(),
+            channel: 10,
+            instrument_id: 1,
+        };
+        let subscribed = |feeds: HashSet<FeedKey>| Desired {
+            feeds,
+            ws_on: false,
+            api_on: false,
+            shred_sources: Vec::new(),
+        };
+
+        // Both admitted channels subscribed and running.
+        let both = r.filter_admitted();
+        r.apply_desired(subscribed(both.clone())).await;
+        assert!(
+            r.active.contains_key(&key10),
+            "fixture sanity: channel 10 is running before the blip"
+        );
+
+        // Seed all three maps for channel 10's identity.
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            crate::model::NormalizedInstrument {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "STILLHERE".into(),
+                channel: 10,
+                instrument_id: 1,
+                category: "sports".into(),
+                price_exponent: -4,
+                qty_exponent: -2,
+            },
+        );
+        seed_book(&r, "KALSHI", 3, "STILLHERE", "sports", 10, 1);
+        r.cfg.history.lock().unwrap().ingest(
+            hist_key.clone(),
+            history::Print {
+                ts_ns: 1_000 * 1_000_000_000,
+                price: 1.0,
+                size: 1.0,
+            },
+        );
+
+        // The subscription blip: channel 10 drops out of `desired.feeds` — the channel filter
+        // itself (`cfg.filter`) is never touched. Driven past `MAX_DRAIN_TICKS` so the drain
+        // bound's reap-anyway path is exercised too, and it must still not purge.
+        let mut lost_sub = both.clone();
+        lost_sub.remove(&key10);
+        for _ in 0..=MAX_DRAIN_TICKS {
+            r.apply_desired(subscribed(lost_sub.clone())).await;
+        }
+
+        assert!(
+            !r.active.contains_key(&key10),
+            "the receiver must stop once its subscription is gone"
+        );
+        assert!(
+            r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "a subscription loss must never purge the catalog"
+        );
+        assert!(
+            crate::model::lock(&r.cfg.books).contains_key(&book_key),
+            "a subscription loss must never purge the book"
+        );
+        assert!(
+            !r.cfg
+                .history
+                .lock()
+                .unwrap()
+                .candles(&hist_key, 60, 10, 1_100)
+                .is_empty(),
+            "a subscription loss must never purge history"
+        );
+
+        // The subscription returning respawns the receiver onto the very same state — nothing was
+        // ever discarded for it to resync from scratch.
+        r.apply_desired(subscribed(both)).await;
+        assert!(
+            r.active.contains_key(&key10),
+            "the receiver must resume once the subscription returns"
         );
     }
 
