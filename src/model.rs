@@ -597,6 +597,12 @@ impl BookAccumulator {
         &self.symbol
     }
 
+    /// Timestamp of the latest book event folded in (ns since epoch), 0 if unknown — the same stamp
+    /// [`Self::to_book`] carries, readable without materializing the book.
+    pub fn source_ts_ns(&self) -> u64 {
+        self.source_ts_ns
+    }
+
     /// Fold the accumulated orders into price levels with the order count at each, bids best-first
     /// then asks best-first. The count is not derivable from a price-aggregated book, which is why
     /// this accumulator is order-keyed at all.

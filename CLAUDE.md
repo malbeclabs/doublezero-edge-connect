@@ -86,7 +86,8 @@ Modules are grouped by role under `src/`:
   `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
-  (WebSocket, on by default). A new feature is a sibling module here + a spawn in `main.rs`.
+  (WebSocket, on by default) and `hyperliquid` (the same data in Hyperliquid's own schema, off by
+  default). A new feature is a sibling module here + a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
   market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
@@ -482,6 +483,29 @@ Modules are grouped by role under `src/`:
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
+- **`sinks/hyperliquid.rs`** — the **Hyperliquid-compatible** sink (`--hl-ws-bind`, off by default,
+  **not** subscription-gated): the same broadcast re-served in *Hyperliquid's* schema so an existing
+  Hyperliquid client needs only a URL change. A **rendering, not a second pipeline** — no ingest state,
+  no dedup identity, no arbitration input — so it is documented in `docs/output-sinks.md` and **never**
+  in PROTOCOL.md, which is the contract for our own protocol only. Scoped to `VENUE = "HYPERLIQUID"`
+  (`coin` is our `symbol`), with `bind()` split from `serve()` like `ws`'s. Three channels off the
+  order-keyed `BookAccumulator` in the shared `BookSnapshot`: `l2Book` (snapshot-per-update from
+  `price_fold()` — whose per-level order count is the whole reason the accumulator is order-keyed;
+  honours `nSigFigs`/`mantissa`/`nLevels`), `l4Book` (`to_book(ReplayScope::Orders)` as the publisher's
+  externally-tagged `{"Snapshot":…}`, then `{"Updates":…}` order diffs) and `trades`. Two references
+  define the wire and one rule settles them: **NautilusTrader v1.227.0 wins for anything it parses**
+  (`l2Book`/`trades` field names and types, the `B`/`A` side spelling, `{"channel":"pong"}` for its
+  30s `{"method":"ping"}`), and the **DZ Hyperliquid publisher** (`malbeclabs/hyperliquid`,
+  `app/publisher/server/src`) is the only authority for `l4Book`, the significant-figure arithmetic and
+  the `nLevels` extension. ⚠️ Both book channels are gated on `BookAccumulator::baselined()`: an
+  `l2Book` frame *replaces* a Nautilus consumer's book wholesale and an `l4Book` snapshot claims
+  completeness, so a market accumulated mid-stream must be withheld, not published as if whole. An
+  out-of-range `nSigFigs`/`mantissa` is **rejected** rather than coerced (a substituted bucket yields
+  prices that look like the venue's and are not); `nLevels` only truncates, so it clamps. The schema's
+  account-model fields (`users`/`hash`, an order's `user`/`orderType`/`tif`/`cloid`, `height`,
+  `order_statuses`) have no counterpart on the MBO wire and are null/zero/empty — parseable, never
+  meaningful; order diffs are `new`/`remove` only, since `update{origSz,newSz}` would need a prior
+  quantity we do not carry.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
   `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
@@ -554,7 +578,9 @@ Modules are grouped by role under `src/`:
   the shred forwarder) when the reconciler sees the host subscribed to the relevant group. ws
   (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only
   *activated* when a market-data feed is subscribed; the public WS input feeder is **off** by
-  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated. README has the
+  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated, and neither is
+  the Hyperliquid-compatible sink (**off**, on when `--hl-ws-bind` is non-empty) — it renders whatever
+  the broadcast carries, so it has no group of its own to be subscribed to. README has the
   full activation tables.
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
