@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   API and history feeder down. Startup now refuses that combination.
 - The same combination via `POST /admin/channels` returned `200` and emptied the feed on the
   reconciler's next tick. It now returns `400` and leaves the prior channel filter in force.
+- `POST /admin/channels` accepted a bodyless request with a query string, which a plain HTML
+  `<form>` post can produce with no attacker involvement beyond an open web page on the admin-bound
+  host — loopback does not stop a request that originates on the host itself. `POST` now also
+  requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it
+  automatically.
 
 ### Added
 - A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus

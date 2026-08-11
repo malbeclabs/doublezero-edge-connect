@@ -2594,6 +2594,7 @@ mod tests {
                 path: "/v1/products".to_string(),
                 params: Vec::new(),
                 content_length: 0,
+                headers: Vec::new(),
             };
             let (status, _, _) = handle(&state, &req);
             assert_eq!(

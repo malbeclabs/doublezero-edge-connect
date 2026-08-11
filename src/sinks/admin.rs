@@ -40,6 +40,18 @@
 //! subscription-gated — an operator must be able to inspect or change the channel filter even when
 //! nothing is currently subscribed, e.g. to prepare a narrowing before subscribing at all — so it is
 //! spawned once at startup, gated only on `--admin-bind` being non-empty.
+//!
+//! **CSRF on the mutating endpoint.** Loopback does not protect `POST /admin/channels` from a web
+//! page open in a browser on the same host: the page can point a plain HTML `<form>` at
+//! `http://127.0.0.1:<port>/admin/channels?channels=<spec>`, and the browser sends that request with
+//! no involvement from this crate at all. A `<form>` (or any request built from the small set of
+//! CORS-"simple" content types) can only carry a handful of fixed headers — it cannot add an
+//! arbitrary one — so `POST` also requires [`REQUIRED_HEADER`] to be present (see `post_channels`).
+//! The header only needs to be **present**, not carry a shared-secret value: this surface documents
+//! itself as having no authentication (see above), and a value would imply exactly that, plus the
+//! provisioning/rotation problem that comes with it. What the header actually rules out is not "an
+//! unauthorized caller" but "a request a browser page could have caused by accident" — a
+//! `curl -H 'x-dz-admin-request: 1'` from anyone reaching loopback still succeeds, same as today.
 
 use std::sync::{Arc, Mutex};
 
@@ -53,6 +65,11 @@ use crate::ingest::{channel_filter::ChannelFilter, feeds::Feed};
 
 /// Small, operator-only surface: no need for the concurrency `sinks::api`/`sinks::metrics` allow.
 const MAX_CONNS: usize = 8;
+
+/// Header a mutating request must carry (any value — see [`post_channels`]'s docs for why presence
+/// alone is the right bar). Named on the `doublezero-edge` CLI side too (`client::admin_post_channels`);
+/// there is no shared crate between them, so the literal is duplicated with a comment pointing here.
+const REQUIRED_HEADER: &str = "x-dz-admin-request";
 
 /// Shared state the admin handler reads and mutates.
 struct AdminState {
@@ -160,8 +177,10 @@ fn get_channels(state: &AdminState) -> Response {
 /// feed) on the next reconcile tick with no warning — the asymmetry startup/runtime already draws
 /// everywhere else in this crate.
 ///
-/// Two request shapes are refused before `channels` is even looked at, both because the natural
-/// client shape for a `POST` is a body and this endpoint does not read one:
+/// Three request shapes are refused before `channels` is even looked at:
+/// - **No [`REQUIRED_HEADER`]** — `403 missing_admin_header`. This is the CSRF defense (see the
+///   module docs): a browser `<form>` post cannot set this header, so its absence marks the request
+///   as one this surface must not have honored, regardless of body or query string.
 /// - **No `channels` parameter at all** — `400 missing_channels_parameter`. Silently falling back
 ///   to `""` (as an absent parameter and an explicitly empty one would otherwise be indistinguishable)
 ///   would parse as "admit everything," replacing an operator's narrowing with the widest possible
@@ -172,6 +191,22 @@ fn get_channels(state: &AdminState) -> Response {
 ///   quietly widen the channel filter to admit-everything while looking, to the caller, like it
 ///   worked.
 fn post_channels(state: &AdminState, req: &Request) -> Response {
+    if req.header(REQUIRED_HEADER).is_none() {
+        return json_status(
+            "403 Forbidden",
+            json!({
+                "error": "missing_admin_header",
+                "message": format!(
+                    "Request did not carry the required `{REQUIRED_HEADER}` header."
+                ),
+                "remediation": format!(
+                    "Add a `{REQUIRED_HEADER}` header (any value) — this is what stops a web \
+                     page's form post from silently changing the channel filter; see the \
+                     admin-surface section of the README."
+                ),
+            }),
+        );
+    }
     if req.content_length > 0 {
         return json_status(
             "400 Bad Request",
@@ -363,6 +398,7 @@ mod tests {
 
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=10")])
             .send()
             .await
@@ -389,6 +425,75 @@ mod tests {
         assert_eq!(admitted[0]["channel"], 10);
     }
 
+    /// The CSRF fix this module exists for: a `POST` with no [`REQUIRED_HEADER`] — exactly what a
+    /// browser `<form>` submit can produce — is refused, and critically the **prior filter stays in
+    /// force**. Asserting only the status code would pass even if the rejected request had already
+    /// mutated the filter before answering `403`, so this checks the filter directly.
+    #[tokio::test]
+    async fn a_post_without_the_required_header_is_refused_and_the_prior_filter_stays_in_force() {
+        let filter = Arc::new(Mutex::new(ChannelFilter::default()));
+        let feed = sports_row();
+        let base = spawn(filter.clone(), vec![feed]).await;
+
+        // Establish a non-empty starting channel filter, with the header present.
+        let setup = reqwest::Client::new()
+            .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
+            .query(&[("channels", "lashay-4=10")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.status(),
+            200,
+            "fixture sanity: the setup POST must apply"
+        );
+        let before = crate::model::lock(&filter).clone();
+        assert!(before.admits("lashay-4", 10) && !before.admits("lashay-4", 11));
+
+        // The attack this module defends against: a POST with a `channels` query parameter but no
+        // header at all — precisely what a browser `<form action=... method=POST>` produces.
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/channels"))
+            .query(&[("channels", "lashay-4=11")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "missing_admin_header");
+
+        let after = crate::model::lock(&filter).clone();
+        assert_eq!(
+            after.summary(),
+            before.summary(),
+            "a POST missing the required header must leave the prior channel filter untouched"
+        );
+        assert!(
+            after.admits("lashay-4", 10) && !after.admits("lashay-4", 11),
+            "the filter must still be the one the setup POST applied, not the attempted `lashay-4=11`"
+        );
+    }
+
+    /// The header alone (no secret value needed, see the module docs) is sufficient for a `POST` to
+    /// succeed — the mirror image of the refusal test above.
+    #[tokio::test]
+    async fn a_post_with_the_required_header_present_succeeds() {
+        let filter = Arc::new(Mutex::new(ChannelFilter::default()));
+        let feed = sports_row();
+        let base = spawn(filter.clone(), vec![feed]).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "anything-at-all")
+            .query(&[("channels", "lashay-4=10")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(crate::model::lock(&filter).admits("lashay-4", 10));
+    }
+
     /// An invalid spec is a `400` and the channel filter is left exactly as it was — never a
     /// partial apply, and never a silent reset to default. Starts from a **non-empty** channel
     /// filter (a prior valid `POST`) so an implementation that resets to empty on error cannot pass
@@ -404,6 +509,7 @@ mod tests {
         // Establish a non-empty starting channel filter.
         let setup = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=10,11")])
             .send()
             .await
@@ -419,6 +525,7 @@ mod tests {
 
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=250")]) // 250 is well outside the 31-channel roster
             .send()
             .await
@@ -452,6 +559,7 @@ mod tests {
         // Establish a non-empty starting channel filter that DOES admit the surviving publisher.
         let setup = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=10")])
             .send()
             .await
@@ -465,6 +573,7 @@ mod tests {
 
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=11")])
             .send()
             .await
@@ -497,6 +606,7 @@ mod tests {
         // Establish a non-empty starting channel filter, so a silent "clear" would be observable.
         reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=10")])
             .send()
             .await
@@ -506,6 +616,7 @@ mod tests {
 
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .send()
             .await
             .unwrap();
@@ -531,6 +642,7 @@ mod tests {
 
         reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .query(&[("channels", "lashay-4=10")])
             .send()
             .await
@@ -540,6 +652,7 @@ mod tests {
 
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
             .body("lashay-4=11")
             .send()
             .await

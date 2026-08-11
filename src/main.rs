@@ -238,8 +238,10 @@ struct Args {
     /// mutation path someone gets by accident. This surface carries **no authentication** and — like
     /// `--api-bind` — under host networking a wildcard bind is genuinely network-reachable, so the
     /// recommendation if you enable it at all is a loopback bind (e.g. `127.0.0.1:9098`), never a
-    /// bare wildcard. Deliberately separate from `--api-bind`'s `/v1`, which must stay provably
-    /// read-only.
+    /// bare wildcard. Loopback alone does not stop a web page open in a browser on this host from
+    /// POSTing a form here, so `POST` also requires an `X-DZ-Admin-Request` header (any value — a
+    /// form post cannot set it). Deliberately separate from `--api-bind`'s `/v1`, which must stay
+    /// provably read-only.
     #[arg(long = "admin-bind", env = "DZ_ADMIN_BIND", default_value = "")]
     admin_bind: String,
 

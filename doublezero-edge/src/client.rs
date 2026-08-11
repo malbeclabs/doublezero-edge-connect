@@ -120,13 +120,23 @@ pub fn admin_get(client: &reqwest::blocking::Client, admin_url: &str, path: &str
 ///   omitting the parameter altogether (which the server 400s) — `reqwest` always includes a
 ///   `key=value` pair for `.query(&[(k, v)])` even when `v` is `""`, so that distinction is
 ///   preserved without this function doing anything special.
+///
+/// Also sets `X-DZ-Admin-Request` (any value — the server checks presence, not content): the
+/// server refuses a `POST` without it as a CSRF defense, since a browser `<form>` post cannot add
+/// an arbitrary header but this CLI, run deliberately by an operator, can (see
+/// `doublezero-edge-connect::sinks::admin`'s module docs for why presence alone is the bar).
 pub fn admin_post_channels(
     client: &reqwest::blocking::Client,
     admin_url: &str,
     spec: &str,
 ) -> Outcome {
     let full = format!("{}/admin/channels", admin_url.trim_end_matches('/'));
-    let resp = match client.post(&full).query(&[("channels", spec)]).send() {
+    let resp = match client
+        .post(&full)
+        .header("X-DZ-Admin-Request", "1")
+        .query(&[("channels", spec)])
+        .send()
+    {
         Ok(r) => r,
         Err(_e) => {
             return Outcome::Unreachable {
@@ -321,6 +331,10 @@ mod tests {
         assert!(
             !head.to_lowercase().contains("content-length"),
             "a bodyless POST must not send a Content-Length header at all: {head}"
+        );
+        assert!(
+            head.to_lowercase().contains("x-dz-admin-request"),
+            "the CSRF-defeating header must be sent on every admin POST: {head}"
         );
     }
 

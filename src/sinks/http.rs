@@ -32,7 +32,8 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// `text/plain` content type shared by the plain-text (non-encoded-body) responses.
 pub const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
 
-/// A parsed request line: method, path (query stripped) and the decoded query parameters.
+/// A parsed request line: method, path (query stripped), the decoded query parameters and the
+/// header block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub method: String,
@@ -44,6 +45,11 @@ pub struct Request {
     /// exists only so a handler can **detect and refuse** one — see `sinks::admin`'s `POST`, which
     /// must not silently ignore a caller's body while treating an empty one as "clear everything".
     pub content_length: usize,
+    /// `(name, value)` pairs for every other header line, in wire order, names as received
+    /// (compare via [`Request::header`], which is case-insensitive per RFC 7230). Kept general
+    /// rather than picking out one more named field, so the next sink that needs a header (e.g.
+    /// `sinks::admin`'s CSRF-defeating header) reads it without a second parser.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Request {
@@ -52,6 +58,15 @@ impl Request {
         self.params
             .iter()
             .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The first value bound to `name` among the request headers, case-insensitively (header names
+    /// are case-insensitive on the wire — RFC 7230 §3.2).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 }
@@ -72,31 +87,37 @@ pub fn parse_request(buf: &[u8]) -> Option<Request> {
         .next()
         .map(parse_query_params)
         .unwrap_or_default();
-    let content_length = content_length(lines);
+    let headers = parse_headers(lines);
+    let content_length = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(0);
     Some(Request {
         method,
         path,
         params,
         content_length,
+        headers,
     })
 }
 
-/// `Content-Length`, scanned case-insensitively from the header lines (everything after the
-/// request line, up to the blank-line terminator or the end of what's buffered so far). `0` if
-/// absent or not a valid number — never treated as an error, since nothing here needs the exact
-/// value beyond "is there a body at all" (see `Request::content_length`'s doc).
-fn content_length<'a>(header_lines: impl Iterator<Item = &'a str>) -> usize {
+/// Parse every header line (everything after the request line, up to the blank-line terminator or
+/// the end of what's buffered so far) into `(name, value)` pairs, names and values as received
+/// (untrimmed of nothing but the standard `": "` split — comparisons go through
+/// [`Request::header`], which is case-insensitive). A line with no `:` is skipped rather than
+/// rejected, so one malformed header doesn't take an otherwise-parseable request down.
+fn parse_headers<'a>(header_lines: impl Iterator<Item = &'a str>) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
     for line in header_lines {
         if line.is_empty() {
             break; // the blank line ends the headers
         }
         if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                return value.trim().parse().unwrap_or(0);
-            }
+            headers.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
-    0
+    headers
 }
 
 /// Split a query string on `&` into percent-decoded `(key, value)` pairs. A pair with no `=` gets
@@ -301,5 +322,27 @@ mod tests {
     fn a_missing_content_length_header_reads_as_zero() {
         let r = parse_request(b"GET /v1/products HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
         assert_eq!(r.content_length, 0);
+    }
+
+    /// `Request::header` is a general, case-insensitive lookup over every header line — not just
+    /// `Content-Length` — since `sinks::admin`'s CSRF-defeating header needs the same mechanism.
+    #[test]
+    fn header_looks_up_any_header_case_insensitively() {
+        let r = parse_request(
+            b"POST /admin/channels HTTP/1.1\r\nX-DZ-Admin-Request: 1\r\nHost: x\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(r.header("x-dz-admin-request"), Some("1"));
+        assert_eq!(r.header("X-DZ-ADMIN-REQUEST"), Some("1"));
+        assert_eq!(r.header("nonexistent"), None);
+    }
+
+    /// A request with no headers at all still parses, with an empty header list rather than a
+    /// panic or a `None` request.
+    #[test]
+    fn a_request_with_no_headers_has_an_empty_header_list() {
+        let r = parse_request(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        assert!(r.headers.is_empty());
+        assert_eq!(r.header("anything"), None);
     }
 }

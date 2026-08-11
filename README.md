@@ -88,7 +88,7 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned feed ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a feed whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
 | `DZ_FEED_REGISTRY_URL` | *(none)* | URL to fetch the feed registry document from at startup. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used and a warning is logged — never fatal. |
 | `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, ignored when `DZ_FEED_REGISTRY_URL` is set. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
-| `DZ_ADMIN_BIND` | *(off)* | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). Off by default; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you enable it, bind to loopback (e.g. `127.0.0.1:9098`) — never a bare wildcard. |
+| `DZ_ADMIN_BIND` | *(off)* | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). Off by default; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you enable it, bind to loopback (e.g. `127.0.0.1:9098`) — never a bare wildcard. Loopback alone does not stop a browser page on the same host from POSTing here, so `POST` also requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it automatically. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt). |
 | `DZ_CLIENT_IP` | *(auto-detected)* | Override the host public IP used by the access-pass pre-check (set if auto-detection is wrong). |
@@ -248,7 +248,11 @@ irreversible within the history window.
 > **No authentication.** This surface has none, and under the container's `--network host`, a
 > wildcard bind is genuinely reachable from the network, same as `/v1`. **Bind it to loopback**
 > (`127.0.0.1:9098`, `doublezero-edge`'s own default), never a bare wildcard, unless you have your
-> own network-level access control in front of it.
+> own network-level access control in front of it. Loopback alone does not stop a web page open in
+> a browser on this host from POSTing a form to `/admin/channels` — the request would originate
+> from the host itself. `POST` therefore also requires an `X-DZ-Admin-Request` header (any value is
+> fine — a form post cannot set an arbitrary header, so requiring one is enough). `doublezero-edge
+> channels set` sends it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`.
 
 The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
 `doublezero-edge` builds and runs on macOS as well as Linux; the bridge itself does not (it uses
