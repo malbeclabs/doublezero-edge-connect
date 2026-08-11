@@ -48,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `held` field distinguishing "the store no longer tracks this product" from "no trades in this
   window," and `MAX_PRODUCTS` is raised 1,024 -> 8,192 (see `history.rs`'s docs for the memory
   arithmetic).
+- `products::resolve`'s ambiguity error rendered two candidates identically when two universes
+  under one Source ID happened to share both symbol and `(channel, instrument_id)` — the one case
+  the disambiguating suffix cannot break — naming no market a caller could actually ask for.
+  `resolve` is now category-aware internally and the error appends the category when (and only
+  when) two candidates would otherwise render identically. The product id format is unchanged.
 
 ### Added
 - A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus

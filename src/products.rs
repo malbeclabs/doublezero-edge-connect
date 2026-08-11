@@ -7,6 +7,16 @@
 //!
 //! Rendering the suffix only when needed keeps the common case readable; parsing accepts either form
 //! always, so a consumer that pinned a suffixed id keeps working if the collision later clears.
+//!
+//! **The id deliberately carries no universe/category segment.** Symbols are now 64 bytes and
+//! unique within a source, so the plain `SOURCE:SYMBOL` form resolves on its own in the overwhelming
+//! common case, and the `#<channel>.<instrument_id>` suffix above already exists as a rarely-needed
+//! tiebreak for the residual truncated-symbol collision. Two disjoint universes under one Source ID
+//! can, by coincidence, share a symbol *and* that same `(channel, instrument_id)` pair (see
+//! `resolve`'s docs) — the one case the suffix cannot break — but burdening every client's id syntax
+//! with a permanent universe segment to cover a coincidence that resolve() can instead detect and
+//! name in the ambiguity error (see `render_ambiguous`) is not worth it. Do not revisit this without
+//! a real client actually hitting the collision.
 
 use std::sync::Arc;
 
@@ -99,6 +109,13 @@ pub enum Resolution {
 /// `Ambiguous` exactly as a same-category symbol collision already does, and the `#<channel>.
 /// <instrument_id>` suffix disambiguates them the same way — without a category ever entering the
 /// wire syntax.
+///
+/// **The one case that suffix cannot break**: two universes whose symbol collides *and* whose
+/// `(channel, instrument_id)` pair also happens to collide. `category` is what makes this store
+/// safe (`InstrumentSnapshot`'s key includes it), but the id syntax has no room for a fourth
+/// component — see this module's docs for why that is deliberate — so both hits survive the identity
+/// filter below and `render_ambiguous` names their categories in the error instead of silently
+/// picking one or printing the same suffixed string twice.
 pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
     let map = crate::model::lock(instruments);
     let mut hits: Vec<ProductId> = map
@@ -123,8 +140,31 @@ pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
     match hits.len() {
         0 => Resolution::None,
         1 => Resolution::One(hits.remove(0)),
-        _ => Resolution::Ambiguous(hits.iter().map(|p| p.render(true)).collect()),
+        _ => Resolution::Ambiguous(render_ambiguous(&hits)),
     }
+}
+
+/// Render each ambiguous candidate for the error list, one string per hit. The plain suffixed
+/// rendering (`ProductId::render(true)`) is enough to tell two candidates apart *unless* they share
+/// both symbol and `(channel, instrument_id)` — which can only happen across two different
+/// categories (within one category that pair is already unique, since it prefixes
+/// `InstrumentSnapshot`'s own key). In exactly that case the plain rendering is byte-identical for
+/// both and names neither market, so this appends the category — never inside the id syntax itself
+/// (see this module's docs for why), only in the error text, which is free to say more than the id
+/// can.
+fn render_ambiguous(hits: &[ProductId]) -> Vec<String> {
+    let rendered: Vec<String> = hits.iter().map(|p| p.render(true)).collect();
+    hits.iter()
+        .zip(rendered.iter())
+        .map(|(p, r)| {
+            let collides = rendered.iter().filter(|other| *other == r).count() > 1;
+            if collides {
+                format!("{r} (category: {})", p.category)
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -278,6 +318,71 @@ mod tests {
         match resolve(&snap, &sports) {
             Resolution::One(p) => assert_eq!(p.category.as_ref(), "sports"),
             other => panic!("expected exactly the sports market: {other:?}"),
+        }
+    }
+
+    /// The finding this pins: two universes whose symbol collides *and* whose `(channel,
+    /// instrument_id)` pair also collides — the one case the disambiguating suffix cannot break,
+    /// since it names neither category. Before the fix both hits rendered as the identical
+    /// `HYPERLIQUID:BTC#5.41`, so the ambiguity error named no market a caller could actually ask
+    /// for. Asserted on the rendered text, since being able to tell the two apart *is* the fix.
+    #[test]
+    fn a_genuine_cross_universe_identity_collision_names_both_categories() {
+        let snap = snapshot(vec![
+            instrument("perps", "BTC", 5, 41),
+            instrument("sports", "BTC", 5, 41),
+        ]);
+
+        // The suffixed form is the caller's best attempt at disambiguating — and still can't.
+        let id = parse("HYPERLIQUID:BTC#5.41").unwrap();
+        match resolve(&snap, &id) {
+            Resolution::Ambiguous(rendered) => {
+                assert_eq!(rendered.len(), 2, "{rendered:?}");
+                assert_ne!(
+                    rendered[0], rendered[1],
+                    "the two candidates must not render identically: {rendered:?}"
+                );
+                assert!(
+                    rendered.iter().any(|s| s.contains("perps")),
+                    "the perps universe must be named: {rendered:?}"
+                );
+                assert!(
+                    rendered.iter().any(|s| s.contains("sports")),
+                    "the sports universe must be named: {rendered:?}"
+                );
+            }
+            other => panic!("expected a genuinely ambiguous resolution: {other:?}"),
+        }
+    }
+
+    /// The ordinary ambiguous case (no identity collision) must keep rendering the way it always
+    /// has — no spurious category annotation on candidates that already render distinctly.
+    #[test]
+    fn an_ordinary_ambiguity_without_an_identity_collision_is_not_annotated() {
+        let snap = snapshot(vec![
+            instrument("perps", "BTC", 1, 10),
+            instrument("perps", "BTC", 2, 20),
+        ]);
+        let id = parse("HYPERLIQUID:BTC").unwrap();
+        match resolve(&snap, &id) {
+            Resolution::Ambiguous(rendered) => {
+                assert_eq!(rendered.len(), 2, "{rendered:?}");
+                assert!(
+                    rendered.contains(&"HYPERLIQUID:BTC#1.10".to_string()),
+                    "{rendered:?}"
+                );
+                assert!(
+                    rendered.contains(&"HYPERLIQUID:BTC#2.20".to_string()),
+                    "{rendered:?}"
+                );
+                for r in &rendered {
+                    assert!(
+                        !r.contains("category"),
+                        "no annotation needed when the suffix already disambiguates: {rendered:?}"
+                    );
+                }
+            }
+            other => panic!("expected an ordinary ambiguous resolution: {other:?}"),
         }
     }
 }
