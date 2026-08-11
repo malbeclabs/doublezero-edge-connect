@@ -248,7 +248,12 @@
         "publisher_offset records that +100 for ingest: it canonicalises the mirror's channel id back",
         "to the league's for catalog/history/book identity ONLY, never for the per-publisher book and",
         "sequence state that has to stay separate. The top-of-book sibling on group 233.84.178.17 is",
-        "not yet published, which is why this document carries no row for it."
+        "not yet published, which is why this document carries no row for it.",
+        "",
+        "SOURCE ADDRESSES. A live capture on this group (2026-08-09) saw every frame from a single",
+        "source address - one publisher today, consistent with the mirror above not existing yet.",
+        "The book gate elects one arm per (venue, category); a second live source address here would",
+        "need that election revisited, not assumed safe by analogy to the perps rows."
       ],
       "publishers": {
         "derived": {
