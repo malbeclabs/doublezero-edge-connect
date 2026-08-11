@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A mirror publisher that raises every channel id by a fixed offset on the same ports (registry
+  `derived.publisher_offset`) minted a second catalog/history/book entry under the raised id, half
+  of which a departure purge could never reach (it purges by the registry's roster id alone),
+  leaving them served forever. Ingest now canonicalises the wire channel to the base id for every
+  consumer-facing identity — catalog, history, book, product id — while producer-side state (books,
+  sequence tracking, reset counts) stays keyed on the raw wire channel, since the two arms are
+  independently sequenced.
 - `doublezero-edge`'s `client::get`/`classify` treated a `2xx` response with an undecodable body
   as success, printing the synthesized `invalid_response` envelope to stdout with exit code 0 —
   pointing `--url` at the wrong port (e.g. the WebSocket) made `products list` "succeed" with

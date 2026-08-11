@@ -506,6 +506,7 @@ mod tests {
             publishers,
             emit_trades: true,
             arbitration: crate::ingest::feeds::ArbitrationMode::Sticky,
+            mirror_offset: None,
         }
     }
 

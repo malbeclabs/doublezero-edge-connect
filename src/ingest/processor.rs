@@ -1715,7 +1715,7 @@ impl MbpProcessor {
                 ctx.instruments,
                 &venue_arc(source_label(old_id)),
                 &category_arc(ctx.category),
-                key.1 as u32,
+                ctx.canonical_channel(key.1),
                 key.2,
             );
         }
@@ -1726,7 +1726,7 @@ impl MbpProcessor {
             source: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
-            channel: key.1 as u32,
+            channel: ctx.canonical_channel(key.1),
             instrument_id: key.2,
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
@@ -1925,10 +1925,12 @@ impl MbpProcessor {
         };
         // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
         // instrument universe, so a report filed without it targets nothing the gate ever admitted.
+        // `ctx.canonical_channel`, not the raw `key.1`, so a mirror arm's health report lands on
+        // the SAME `MarketKey` `send_book` admits its `book` under — see `FrameCtx::canonical_channel`.
         let market: MarketKey = (
             venue_arc(venue),
             category_arc(ctx.category),
-            key.1 as u32,
+            ctx.canonical_channel(key.1),
             key.2,
         );
         lock(ctx.arbiter).set_book_health(&market, Publisher::Edge(key.0), healthy);
@@ -2042,7 +2044,7 @@ impl MbpProcessor {
             source: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
-            channel: channel as u32,
+            channel: ctx.canonical_channel(channel),
             instrument_id,
             changes,
             snapshot,
@@ -2199,7 +2201,7 @@ impl FrameProcessor for MbpProcessor {
                                 source: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
-                                channel: channel as u32,
+                                channel: ctx.canonical_channel(channel),
                                 instrument_id: d.instrument_id,
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
@@ -2561,13 +2563,17 @@ impl FrameProcessor for MbpProcessor {
                         source: source.clone(),
                         source_id: t.source_id,
                         symbol,
-                        // `channel` is this frame's header channel id (u8 on the wire; widened to
-                        // match the `instrument`/`book` identity's u32) — the same value `ensure_book`
-                        // just keyed this instrument's book under. This is the field a price-aggregated
-                        // venue's mirrored arms disagree on (identical instrument set, distinct
-                        // `channel` per arm), so it must ride the message rather than be re-derived
-                        // downstream by a `symbol` match that can't tell the two arms apart.
-                        channel: channel as u32,
+                        // `channel` is this frame's header channel id, canonicalized for
+                        // consumer-facing identity (see `FrameCtx::canonical_channel`) — a mirror
+                        // publisher's `N + offset` becomes the same `N` its peer arm carries, so
+                        // the history/catalog see one market rather than two. This is still the
+                        // field that disambiguates a price-aggregated venue's mirrored arms
+                        // (identical instrument set, distinct wire `channel` per arm) from each
+                        // other's identical-looking content, so it must ride the message rather
+                        // than be re-derived downstream by a `symbol` match that can't tell them
+                        // apart — the raw wire book/sequence state that actually keeps the two
+                        // arms independent is untouched by this canonicalization.
+                        channel: ctx.canonical_channel(channel),
                         instrument_id: t.instrument_id,
                         category: category_arc(ctx.category),
                         price: apply_exponent(t.trade_price_raw, price_exponent),
@@ -2940,6 +2946,7 @@ mod tests {
             recv_ts_ns: 0,
             role,
             publisher: TEST_PUB,
+            mirror_offset: None,
         }
     }
 
@@ -4875,6 +4882,183 @@ mod tests {
         let mut c = make_ctx(arbiter, instruments, role);
         c.venue = venue;
         c
+    }
+
+    /// [`mbp_ctx`], with a mirror offset — for the tests exercising a second publisher that mirrors
+    /// the same channels raised by `offset` (`Feed::mirror_offset`/`registry.json`'s
+    /// `publisher_offset`).
+    fn mbp_ctx_mirrored<'a>(
+        venue: &'static str,
+        arbiter: &'a SharedArbiter,
+        instruments: &'a crate::model::InstrumentSnapshot,
+        role: PortRole,
+        offset: u8,
+    ) -> FrameCtx<'a> {
+        let mut c = mbp_ctx(venue, arbiter, instruments, role);
+        c.mirror_offset = Some(offset);
+        c
+    }
+
+    /// **The mirror finding.** A second publisher mirrors this channel's whole roster on the SAME
+    /// socket, stamping every wire `channel_id` raised by `publisher_offset` — so one receiver
+    /// decodes frames stamped both channel 10 and channel 110 for the identical market. The
+    /// datagram source IP is deliberately the SAME for both frames here (the registry's own
+    /// `DEPLOYMENT` note keys the two arms apart by `channel_id`, never by host), which is what
+    /// makes this a real regression guard: if `ensure_book`/`note_reset_count`/`revealed` ever
+    /// canonicalized their channel instead of using the raw wire one, the two arms below would
+    /// collapse into ONE producer-side key (same IP, same canonical channel) and corrupt book
+    /// recovery — the exact failure `Feed::mirror_offset`'s docs warn against.
+    ///
+    /// Catalog identity must go the other way: `reveal_if_needed` canonicalizes, so both arms'
+    /// eager v3 reveals resolve to ONE catalog entry, not two.
+    #[test]
+    fn mbp_mirror_offset_collapses_catalog_identity_but_keeps_arms_separate() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let base = mbp_ctx_mirrored("TV", &arbiter, &instruments, PortRole::Combined, 100);
+        let mirror = mbp_ctx_mirrored("TV", &arbiter, &instruments, PortRole::Combined, 100);
+
+        let def_frame = |channel_id: u8| {
+            mbp_frame_v3(
+                channel_id,
+                0,
+                0,
+                &[
+                    mbp_wire::enc_manifest_summary(&codec_mbp::ManifestSummary {
+                        channel_id,
+                        valid: true,
+                        manifest_seq: 1,
+                        instrument_count: 1,
+                        ts: 0,
+                    }),
+                    enc_instrument_def_v3(41, 3, "MARKET-X", 1),
+                ],
+            )
+        };
+        // The base arm, wire channel 10.
+        proc.on_datagram(&def_frame(10), &base);
+        // The mirror arm, wire channel 110 (10 + the 100 offset) — same source IP, same
+        // instrument, same Source ID: the same market as far as a consumer is concerned.
+        proc.on_datagram(&def_frame(110), &mirror);
+
+        // Catalog: ONE market at the canonical channel, not two.
+        {
+            let cat = instruments.lock().unwrap();
+            let keys: Vec<_> = cat.keys().cloned().collect();
+            assert_eq!(
+                cat.len(),
+                1,
+                "the mirror must not mint a second catalog entry: {keys:?}"
+            );
+            assert!(
+                cat.contains_key(&("KALSHI".into(), "testcategory".into(), 10u32, 41u32)),
+                "the single entry must live under the canonical channel: {keys:?}"
+            );
+        }
+
+        // Only ONE `Instrument` reaches the wire: canonicalizing both arms onto channel 10 means
+        // the mirror's reveal is, correctly, an identical-precision reannounce of the SAME
+        // `(venue, channel, instrument_id)` the arbiter already rate-limits — the same collapse
+        // ordinary mirrored refdata bursts get, now reached via the channel offset instead of a
+        // repeated burst on one channel.
+        let seen = drain_all(&mut rx);
+        let inst_channels: Vec<u32> = seen
+            .iter()
+            .filter_map(|m| match m {
+                FeedMessage::Instrument(i) => Some(i.channel),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inst_channels,
+            vec![10],
+            "the mirror's reveal must ride the canonical channel and collapse into the base arm's"
+        );
+
+        // Producer-side state stays keyed on the RAW wire channel: two distinct reveal entries,
+        // one per arm, even though they collapsed to one catalog entry above.
+        assert_eq!(
+            proc.revealed.len(),
+            2,
+            "each arm's own reveal memo must survive independently"
+        );
+
+        // Sync each arm's own book to `Ready` from an empty anchor (an empty snapshot cycle, same
+        // shape `synced_mbp_proc` below drives) so a following delta actually applies rather than
+        // merely buffering — the only way to observe divergent book *content*, not just presence.
+        proc.on_datagram(
+            &mbp_wire::frame(10, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &base,
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(110, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &mirror,
+        );
+        assert_eq!(mbp_status(&proc, TEST_PUB, 10, 41), Some(BookStatus::Ready));
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 110, 41),
+            Some(BookStatus::Ready)
+        );
+
+        // Now apply a DIFFERENT price on each arm's book — a stand-in for the two arms' genuinely
+        // independent delta sequences.
+        let level = |price: i64| {
+            mbp_wire::enc_level_update(&codec_mbp::LevelUpdate {
+                instrument_id: 41,
+                source_id: 3,
+                side: codec_mbp::SIDE_BID,
+                action: 1,
+                per_instrument_seq: 1,
+                price_raw: price,
+                qty_raw: 5,
+                ts: 1,
+                order_count: Some(1),
+                level_index: None,
+                update_reason: 0,
+                level_flags: 0,
+            })
+        };
+        proc.on_datagram(&mbp_wire::frame(10, 0, 2, &[level(100)]), &base);
+        proc.on_datagram(&mbp_wire::frame(110, 0, 2, &[level(200)]), &mirror);
+
+        assert_eq!(
+            proc.books.len(),
+            2,
+            "one book per (publisher, wire channel, instrument) — the mirror must not share the \
+             base arm's book"
+        );
+        let base_book = proc
+            .books
+            .get(&(TEST_PUB, 10, 41))
+            .expect("the base arm's own book, keyed on its raw wire channel");
+        let mirror_book = proc
+            .books
+            .get(&(TEST_PUB, 110, 41))
+            .expect("the mirror arm's own book, keyed on ITS raw wire channel");
+        assert_eq!(
+            base_book.bids().map(|(p, _)| p).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(
+            mirror_book.bids().map(|(p, _)| p).collect::<Vec<_>>(),
+            vec![200],
+            "the two arms' books must evolve independently"
+        );
+
+        // Every `book` this frame pair emitted still carries the canonical channel, proving the
+        // collapse is consumer-facing only and not a side effect of the books above having stayed
+        // apart.
+        let book_channels: Vec<u32> = drain_all(&mut rx)
+            .iter()
+            .filter_map(|m| match m {
+                FeedMessage::Book(b) => Some(b.channel),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !book_channels.is_empty() && book_channels.iter().all(|&c| c == 10),
+            "every emitted book must ride the canonical channel: {book_channels:?}"
+        );
     }
 
     /// An `MbpProcessor` with `ids` defined and each synced from an empty-book anchor, in the drive

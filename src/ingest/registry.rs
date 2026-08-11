@@ -377,6 +377,15 @@ struct PortBlock {
 struct Derived {
     channels: Vec<ChannelSpec>,
     ports: PortBases,
+    /// A second publisher mirrors this whole roster on the **same ports**, stamping every wire
+    /// `channel_id` raised by this amount — so the channel-N socket also receives frames stamped
+    /// `N + publisher_offset`. Data, like the roster and the port bases beside it: which mirror
+    /// scheme (if any) a deployment runs is the publisher's to decide, not a rule this loader
+    /// derives from the numbers (a `% offset` or range test would mint a false mirror out of any
+    /// row whose roster happens to be wide enough). `None` (the default) means no such mirror.
+    /// See [`crate::ingest::feeds::Feed::mirror_offset`] for what this becomes downstream.
+    #[serde(default)]
+    publisher_offset: Option<u8>,
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
@@ -784,6 +793,11 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
         None => return Err(RegistryError::UnknownVenue(row.venue.clone())),
     }
 
+    let mirror_offset = match &row.publishers {
+        Publishers::Explicit(_) => None,
+        Publishers::Derived(d) => d.publisher_offset,
+    };
+
     let publishers: Vec<FeedPublisher> = match &row.publishers {
         Publishers::Explicit(blocks) => blocks.iter().map(block_to_publisher).collect(),
         Publishers::Derived(d) => expand(row, d)?,
@@ -822,6 +836,7 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
         publishers: Box::leak(publishers.into_boxed_slice()),
         emit_trades: row.emit_trades,
         arbitration: row.arbitration.into(),
+        mirror_offset,
     })
 }
 
@@ -1092,6 +1107,49 @@ mod tests {
                 (33012, 43012, Some(53012)),
                 (33049, 43049, Some(53049)),
             ]
+        );
+    }
+
+    /// A row with no `publisher_offset` carries no mirror — the state every row but the mirrored
+    /// one is in today.
+    #[test]
+    fn a_row_with_no_publisher_offset_has_no_mirror_offset() {
+        let loaded = build(&doc_with(SPORTS_ROW), "test").unwrap();
+        assert_eq!(loaded.rows[0].mirror_offset, None);
+    }
+
+    /// `derived.publisher_offset` is recorded on the `Feed` as data, and it changes nothing about
+    /// port derivation — the mirror sends to the identical ports, only its wire `channel_id` is
+    /// raised. An `explicit` row has no `publisher_offset` to carry and its `mirror_offset` is
+    /// always `None`, regardless of what a sibling `derived` row declares.
+    #[test]
+    fn a_publisher_offset_is_recorded_without_touching_port_derivation() {
+        let row = SPORTS_ROW.replace(
+            r#""ports":{"mktdata":33000,"refdata":43000,"snapshot":53000}"#,
+            r#""ports":{"mktdata":33000,"refdata":43000,"snapshot":53000},"publisher_offset":100"#,
+        );
+        let loaded = build(&doc_with(&format!("{row},{PERPS_ROW}")), "test").unwrap();
+        let sports = loaded.rows.iter().find(|f| f.category == "sports").unwrap();
+        assert_eq!(sports.mirror_offset, Some(100));
+        let ports: Vec<(u16, u16, Option<u16>)> = sports
+            .publishers
+            .iter()
+            .map(|p| (p.ports.mktdata(), p.ports.refdata(), p.ports.snapshot()))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                (33010, 43010, Some(53010)),
+                (33011, 43011, Some(53011)),
+                (33012, 43012, Some(53012)),
+                (33049, 43049, Some(53049)),
+            ],
+            "publisher_offset must not shift ports; the mirror binds nothing new"
+        );
+        let perps = loaded.rows.iter().find(|f| f.category == "perps").unwrap();
+        assert_eq!(
+            perps.mirror_offset, None,
+            "an explicit row never carries a mirror offset"
         );
     }
 

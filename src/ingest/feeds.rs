@@ -213,6 +213,22 @@ pub struct Feed {
     /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
     pub arbitration: ArbitrationMode,
+    /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
+    /// wire `channel_id` raised by this amount (`derived.publisher_offset` in the document) —
+    /// so the socket bound for channel `N` also receives frames stamped `N + offset`. `None` for
+    /// every row with no such mirror.
+    ///
+    /// **Consumer-facing identity only.** Ingest subtracts this from a wire channel id at the
+    /// point a message becomes catalog/history/book identity (`FrameCtx::canonical_channel`), so
+    /// the mirror's `N + offset` and the base publisher's `N` are one market — one catalog entry,
+    /// one book, one history series — to everything downstream of that point. It must **never**
+    /// be applied to producer-side state (books, sequence tracking, reset counts, snapshot
+    /// cycles): those stay keyed on the raw wire channel id precisely because the two arms are
+    /// separately sequenced, and collapsing that would corrupt book recovery.
+    ///
+    /// Ports are unaffected: the mirror sends to the identical port block, so this never factors
+    /// into `FeedPublisher::base_port()` or the derived-port arithmetic.
+    pub mirror_offset: Option<u8>,
 }
 
 /// Every feed row known to the bridge, resolved once at startup from the registry document.

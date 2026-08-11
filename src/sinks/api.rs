@@ -1328,6 +1328,7 @@ mod tests {
             recv_ts_ns: 0,
             role,
             publisher,
+            mirror_offset: None,
         };
         let mut proc = MbpProcessor::new(Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
@@ -2875,6 +2876,7 @@ mod tests {
             publishers: Box::leak(publishers.into_boxed_slice()),
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
+            mirror_offset: None,
         };
         let enabled = vec![row];
 
@@ -2948,6 +2950,7 @@ mod tests {
             publishers: Box::leak(perps_pub.into_boxed_slice()),
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
+            mirror_offset: None,
         };
         let sports_row = Feed {
             venue: "KALSHI",
@@ -2958,6 +2961,7 @@ mod tests {
             publishers: Box::leak(sports_pub.into_boxed_slice()),
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
+            mirror_offset: None,
         };
         let enabled = vec![perps_row, sports_row];
 
@@ -3052,6 +3056,7 @@ mod tests {
             publishers: Box::leak(publishers.into_boxed_slice()),
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
+            mirror_offset: None,
         };
         let enabled = vec![row];
 
@@ -3112,6 +3117,7 @@ mod tests {
             publishers: Box::leak(publishers.into_boxed_slice()),
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
+            mirror_offset: None,
         };
         let enabled = vec![row];
 

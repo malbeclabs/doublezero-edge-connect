@@ -244,14 +244,17 @@
         "DEPLOYMENT. One publisher per channel and no failover today. A second publisher takes this",
         "same roster with every id offset by +100, leaving the ports untouched - the port names the",
         "league so a subscriber binds one socket per league and hears both publishers on it, while",
-        "channel_id names the league AND the publisher so the two are sequenced separately. The",
-        "top-of-book sibling on group 233.84.178.17 is not yet published, which is why this document",
-        "carries no row for it."
+        "channel_id names the league AND the publisher so the two are sequenced separately.",
+        "publisher_offset records that +100 for ingest: it canonicalises the mirror's channel id back",
+        "to the league's for catalog/history/book identity ONLY, never for the per-publisher book and",
+        "sequence state that has to stay separate. The top-of-book sibling on group 233.84.178.17 is",
+        "not yet published, which is why this document carries no row for it."
       ],
       "publishers": {
         "derived": {
           "channels": [{ "range": [10, 29] }, { "range": [39, 48] }, { "id": 49 }],
-          "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 }
+          "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 },
+          "publisher_offset": 100
         }
       }
     }

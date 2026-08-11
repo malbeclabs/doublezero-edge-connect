@@ -132,9 +132,28 @@ pub struct FrameCtx<'a> {
     /// onto the same group (sharing `channel_id`), so per-publisher state (sequence tracking, MBO
     /// books) keys on this rather than the port.
     pub publisher: IpAddr,
+    /// This row's [`Feed::mirror_offset`], carried per datagram so a processor can canonicalize a
+    /// wire channel id for consumer-facing identity without reaching back into the registry.
+    /// `None` for every row with no declared mirror.
+    pub mirror_offset: Option<u8>,
 }
 
 impl FrameCtx<'_> {
+    /// Canonicalize a wire channel id for **consumer-facing identity** — the catalog, history, the
+    /// book authority's `MarketKey`, and the emitted `channel` field itself. A mirror publisher
+    /// (`mirror_offset` set) stamps the same market's frames at `N + offset`; subtracting it here
+    /// is what makes that one market rather than two.
+    ///
+    /// **Never call this for producer-side state** (book keys, sequence trackers, reset counts,
+    /// snapshot cycles) — those must stay keyed on the raw wire channel id, because the two arms
+    /// are independently sequenced and collapsing that corrupts book recovery.
+    pub fn canonical_channel(&self, wire_channel: u8) -> u32 {
+        match self.mirror_offset {
+            Some(offset) if wire_channel >= offset => u32::from(wire_channel - offset),
+            _ => u32::from(wire_channel),
+        }
+    }
+
     /// Emit a normalized message through the shared arbiter, tagged with this datagram's edge
     /// publisher so the quote floor can race it against the other sources for the tick's leadership.
     /// The brief critical section is the arbiter's admit-decision-plus-send.
@@ -641,6 +660,7 @@ async fn drive<P: FrameProcessor>(
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     health: SharedFeedHealth,
+    mirror_offset: Option<u8>,
     mut processor: P,
 ) -> Result<()> {
     // This receiver's own liveness: true while its market-data multicast is considered down (silent
@@ -776,6 +796,7 @@ async fn drive<P: FrameProcessor>(
                 recv_ts_ns: recv_ns,
                 role,
                 publisher,
+                mirror_offset,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -825,6 +846,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 TobProcessor::new(tape),
             )
             .await
@@ -843,6 +865,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MidpointProcessor::new(),
             )
             .await
@@ -877,6 +900,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MboProcessor::new(depth, tape),
             )
             .await
@@ -911,6 +935,7 @@ pub async fn run_feed(
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MbpProcessor::new(tape),
             )
             .await
@@ -1072,6 +1097,7 @@ mod tests {
             recv_ts_ns: 0,
             role: PortRole::Mktdata,
             publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            mirror_offset: None,
         };
         let quote = NormalizedQuote {
             venue: wire_venue.into(),
