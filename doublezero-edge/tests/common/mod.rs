@@ -1,6 +1,11 @@
 //! Test-only scaffolding shared by the CLI-level integration tests: a minimal one-shot-per-request
 //! HTTP server (so a test can hand the built binary a canned status + JSON body without needing a
 //! real edge-connect container) and a helper to grab a port nothing is listening on.
+//!
+//! Each integration-test file is its own compiled binary and pulls in this module separately, so a
+//! binary that only needs a subset (e.g. `completion_cli.rs`, which needs just `bin`) would
+//! otherwise see the rest as dead code under `-D warnings`.
+#![allow(dead_code)]
 
 use std::{
     io::{Read, Write},

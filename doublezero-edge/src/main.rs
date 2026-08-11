@@ -12,7 +12,8 @@
 
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
 use serde_json::Value;
 
@@ -91,6 +92,12 @@ enum Command {
     Channels {
         #[command(subcommand)]
         action: ChannelsCommand,
+    },
+    /// Print a shell-completion script for `<shell>` to stdout. Local-only — no config file, no
+    /// server, no network — so packaging can run it at build time.
+    Completion {
+        #[arg(value_enum)]
+        shell: Shell,
     },
 }
 
@@ -180,6 +187,11 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
                 "Command::Channels is dispatched directly by run(), never through resolve()"
             )
         }
+        Command::Completion { .. } => {
+            unreachable!(
+                "Command::Completion is dispatched directly by run(), never through resolve()"
+            )
+        }
     }
 }
 
@@ -218,6 +230,12 @@ fn run() -> i32 {
         Ok(cli) => cli,
         Err(e) => return handle_clap_error(&e),
     };
+
+    if let Command::Completion { shell } = &cli.command {
+        // Local-only: no config file, no server, no network — must return before any HTTP client
+        // is built so packaging can run this at build time.
+        return run_completion(*shell);
+    }
 
     if let Command::Channels { action } = &cli.command {
         // A distinct command group over a distinct surface (`--admin-url`, never `cli.url`) with
@@ -268,6 +286,16 @@ fn build_http_client() -> Result<reqwest::blocking::Client, String> {
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))
+}
+
+/// `completion <shell>`: write a shell-completion script for `shell` to stdout. Local-only (no
+/// config file, no server, no network), matching the sibling `doublezero` CLI's own `completion`
+/// command so the two tools feel identical.
+fn run_completion(shell: Shell) -> i32 {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    generate(shell, &mut cmd, name, &mut std::io::stdout());
+    0
 }
 
 /// `channels list` / `channels set`. Both talk to the admin surface (`--admin-url`), never
