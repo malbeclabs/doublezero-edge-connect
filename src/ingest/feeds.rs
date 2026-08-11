@@ -508,7 +508,9 @@ mod tests {
     }
 
     /// Every feed must list at least one publisher, else it would bind nothing and silently
-    /// contribute no data.
+    /// contribute no data. Enforced for real in `registry::feed_from` (`RegistryError::
+    /// EmptyPublishers`) now that a document can be supplied at runtime; this stays as coverage of
+    /// the built-in document over the same path.
     #[test]
     fn every_feed_has_at_least_one_publisher() {
         for f in feeds() {

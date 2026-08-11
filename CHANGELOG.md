@@ -64,6 +64,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that product before it ever reached the print ring — so both `/candles` and `/ticker` emptied
   out for it with no recovery. An implausible timestamp now falls back to the trade's own receive
   time, the same fallback already used for the `source_ts_ns == 0` sentinel.
+- The feed registry validated a document's `venue` for resolvability only, which admits a legacy
+  alias for one Source ID even though only its canonical name ever reaches the wire. A document
+  naming the alias validated cleanly and then silently split every downstream lookup keyed on the
+  venue string (the arbitration mode, the channel-filter purge, `--feed <venue>` selection). The
+  venue must now round-trip through its canonical name.
+- A `--feed-registry` file that could not be read degraded to the built-in document with only a
+  warning, so an unmounted volume or a typo'd path started the container healthy on a stale
+  topology instead of refusing. That read failure is now fatal, matching the parse errors beside it
+  and the file source's documented contract.
+- An `explicit` publisher list left empty in the document installed a row with zero publishers —
+  no error, no receivers, and a healthy-looking `rows=1 receivers=0` log line. It is now rejected
+  the same way an empty `derived` roster already was.
+- The feed registry fetch had no bound on response size, so a hostile or compromised endpoint could
+  OOM the process instead of ever reaching the built-in fallback, and then crash-loop re-fetching on
+  restart. The fetch is now capped, checking both a declared `Content-Length` and the accumulated
+  body as it streams in, so a chunked response with no declared length is covered too.
 
 ### Added
 - `trade` carries `channel`/`instrument_id`, the same identity pair `instrument`/`book` already carry.

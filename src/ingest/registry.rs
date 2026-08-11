@@ -82,9 +82,28 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
+    /// `venue` resolves to a Source ID, but not under this exact name — a legacy alias that only
+    /// ever reaches this loader, never the wire, so a document naming it would split every
+    /// downstream lookup that keys on the venue string.
+    NonCanonicalVenue {
+        venue: String,
+        canonical: &'static str,
+    },
     EmptyRoster {
         venue: String,
         category: String,
+    },
+    /// A row's publisher list is empty, whichever shape (`explicit` or `derived`) produced it — it
+    /// would bind nothing and serve nothing while the process reports healthy.
+    EmptyPublishers {
+        venue: String,
+        category: String,
+    },
+    /// A `--feed-registry` file could not be read. Unlike a `Url` source, this is an operator's
+    /// explicit instruction about this one container, so it must not silently degrade.
+    ReadFailed {
+        path: PathBuf,
+        error: std::io::Error,
     },
     BadRange {
         venue: String,
@@ -151,9 +170,28 @@ impl std::fmt::Display for RegistryError {
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
                  status stream would go unrecorded"
             ),
+            RegistryError::NonCanonicalVenue { venue, canonical } => write!(
+                f,
+                "venue `{venue}` resolves to Source ID for `{canonical}`, but is not that exact \
+                 name; only `{canonical}` ever reaches the wire, and every downstream lookup keyed \
+                 on the venue string (arbitration mode, channel-filter purge, `--feed` selection) \
+                 would silently miss"
+            ),
             RegistryError::EmptyRoster { venue, category } => {
                 write!(f, "{venue}/{category}: derived roster is empty")
             }
+            RegistryError::EmptyPublishers { venue, category } => write!(
+                f,
+                "{venue}/{category}: publisher list is empty; the row would bind nothing and \
+                 serve nothing while reporting healthy"
+            ),
+            RegistryError::ReadFailed { path, error } => write!(
+                f,
+                "feed registry file {} could not be read: {error}; a bind-mounted file is an \
+                 operator's explicit instruction about this container, so it must not silently \
+                 start on the built-in document",
+                path.display()
+            ),
             RegistryError::BadRange { venue, lo, hi } => {
                 write!(f, "{venue}: channel range [{lo}, {hi}] is descending")
             }
@@ -470,15 +508,14 @@ pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
             }
         }
         Source::File(path) => match std::fs::read_to_string(path) {
-            // A file that cannot be *read* is still the missing-registry case, not the wrong one.
-            Err(e) => {
-                warn!(path = %path.display(), error = %e,
-                      "feed registry read failed; falling back to the built-in document");
-                build(
-                    BUILT_IN,
-                    &format!("built-in (read of {} failed)", path.display()),
-                )
-            }
+            // Fatal, like the parse errors beside it: a bind-mounted file is an operator's
+            // explicit instruction about this one container, and a wrong or missing one (an
+            // unmounted volume, a typo'd path) must not silently start on the built-in copy — that
+            // is the stale-copy failure mode this registry exists to surface, not hide.
+            Err(e) => Err(RegistryError::ReadFailed {
+                path: path.clone(),
+                error: e,
+            }),
             Ok(text) => build(&text, &format!("file {}", path.display())),
         },
         Source::BuiltIn => load_built_in(),
@@ -490,16 +527,67 @@ pub fn load_built_in() -> Result<Loaded, RegistryError> {
     build(BUILT_IN, "built-in")
 }
 
-async fn fetch(url: &str) -> Result<String, reqwest::Error> {
-    reqwest::Client::builder()
+/// Hard cap on a fetched registry response body.
+///
+/// A hostile or compromised registry endpoint could otherwise stream an unbounded body through
+/// `.text()`, OOM-killing the process instead of ever reaching the fallback — and then
+/// crash-looping re-fetching under `--restart unless-stopped`. Far beyond any real registry
+/// document (the built-in one, our largest, is a few KB), so this never binds in practice.
+const MAX_FETCH_BYTES: u64 = 8 * 1024 * 1024;
+
+/// [`fetch`]'s error: an HTTP/transport failure, or a body that crossed [`MAX_FETCH_BYTES`].
+/// Exceeding the cap is treated exactly like any other fetch failure — [`load`] degrades to the
+/// built-in document for either.
+#[derive(Debug)]
+enum FetchError {
+    Http(reqwest::Error),
+    TooLarge,
+    NotUtf8,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Http(e) => write!(f, "{e}"),
+            FetchError::TooLarge => {
+                write!(f, "response body exceeds the {MAX_FETCH_BYTES}-byte cap")
+            }
+            FetchError::NotUtf8 => write!(f, "response body is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+impl From<reqwest::Error> for FetchError {
+    fn from(e: reqwest::Error) -> Self {
+        FetchError::Http(e)
+    }
+}
+
+async fn fetch(url: &str) -> Result<String, FetchError> {
+    let mut resp = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .build()?
         .get(url)
         .send()
         .await?
-        .error_for_status()?
-        .text()
-        .await
+        .error_for_status()?;
+
+    // Refuse a declared oversize body before reading any of it, then enforce the same cap while
+    // accumulating: a chunked reply declares no length, so the header check alone would miss it.
+    if resp.content_length().is_some_and(|n| n > MAX_FETCH_BYTES) {
+        return Err(FetchError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() as u64 + chunk.len() as u64 > MAX_FETCH_BYTES {
+            return Err(FetchError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| FetchError::NotUtf8)
 }
 
 /// Parse, validate, expand and leak. The single place a document becomes feed rows.
@@ -677,15 +765,40 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
         }
     }
     // A venue `source_id_of` does not resolve is dropped by `receiver::record_revealed`, so its
-    // `status` stream goes unrecorded — a row that ingests but never reports.
-    if sources::source_id_of(&row.venue).is_none() {
-        return Err(RegistryError::UnknownVenue(row.venue.clone()));
+    // `status` stream goes unrecorded — a row that ingests but never reports. But resolvability
+    // alone is not enough: `source_id_of` deliberately also accepts a legacy alias for one Source
+    // ID (see the codename constant in `sources.rs`), and only the canonical name ever reaches the
+    // wire. A document naming the alias would validate here and then split every place downstream
+    // that keys on the venue string — `main.rs` sets the arbitration mode under the alias while
+    // `arbiter.rs` reads it under the canonical name and falls back to `Coordinated`, dropping the
+    // tape gate; `forget_departing_channel`'s purge never matches; and `--feed <canonical>` selects
+    // nothing. So the venue must round-trip through the canonical name, not merely resolve.
+    match sources::source_id_of(&row.venue).and_then(sources::source_name) {
+        Some(canonical) if canonical == row.venue => {}
+        Some(canonical) => {
+            return Err(RegistryError::NonCanonicalVenue {
+                venue: row.venue.clone(),
+                canonical,
+            })
+        }
+        None => return Err(RegistryError::UnknownVenue(row.venue.clone())),
     }
 
-    let publishers = match &row.publishers {
+    let publishers: Vec<FeedPublisher> = match &row.publishers {
         Publishers::Explicit(blocks) => blocks.iter().map(block_to_publisher).collect(),
         Publishers::Derived(d) => expand(row, d)?,
     };
+
+    // A row with no publishers binds nothing and serves nothing, but validates cleanly and reads
+    // healthy — the desired feed set is simply empty. `Derived` already refuses an empty roster
+    // (`EmptyRoster`, above), but `explicit` had no equivalent check; this catches both shapes,
+    // whichever produced the empty list.
+    if publishers.is_empty() {
+        return Err(RegistryError::EmptyPublishers {
+            venue: row.venue.clone(),
+            category: row.category.clone(),
+        });
+    }
 
     // Base ports are the `publisher` metric label and the reconciler's task-key component, so a
     // duplicate would silently merge two publishers' state machines into one receiver task.
@@ -1122,10 +1235,24 @@ mod tests {
         assert!(matches!(err, Err(RegistryError::Parse(_))));
     }
 
-    /// A file that cannot be *read* is the missing case, not the wrong one: warn and fall back.
+    /// A file that cannot be *read* is fatal, like the parse errors beside it — it is an operator's
+    /// explicit instruction about this one container (an unmounted volume, a typo'd path), and must
+    /// not silently start on the built-in copy the way the `Url` source does.
     #[tokio::test]
-    async fn an_unreadable_file_falls_back_to_the_built_in_document() {
-        let loaded = load(Source::File(PathBuf::from("/nonexistent/registry.json")))
+    async fn an_unreadable_file_is_fatal() {
+        let err = load(Source::File(PathBuf::from("/nonexistent/registry.json")))
+            .await
+            .map(|_| ())
+            .expect_err("an unreadable file must not fall back");
+        assert!(matches!(err, RegistryError::ReadFailed { .. }), "{err:?}");
+    }
+
+    /// The `Url` source's degrade-on-failure behavior is unchanged: a fetch failure (as opposed to
+    /// the file case above, now fatal) still falls back to the built-in document.
+    #[tokio::test]
+    async fn an_unreachable_url_still_falls_back() {
+        // Nothing listens on this loopback port: the connection is refused.
+        let loaded = load(Source::Url("http://127.0.0.1:1".to_string()))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1391,5 +1518,118 @@ mod tests {
             Source::from_flags("http://x", "/p"),
             Source::Url(_)
         ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Venue canonicality
+    // ---------------------------------------------------------------------------------------
+
+    /// `source_id_of` deliberately still resolves the legacy pre-launch codename for one Source ID
+    /// (only its registry name is ever emitted), so a document naming the alias specifically —
+    /// not merely an unresolvable venue — must be what this test exercises; a wrong-but-unresolvable
+    /// venue would already be caught by `UnknownVenue` and would pass against the old code too.
+    #[test]
+    fn a_legacy_venue_alias_is_fatal() {
+        let row = PERPS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"LASHAY""#);
+        assert!(matches!(
+            build(&doc_with(&row), "test"),
+            Err(RegistryError::NonCanonicalVenue {
+                canonical: "KALSHI",
+                ..
+            })
+        ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Empty publisher lists
+    // ---------------------------------------------------------------------------------------
+
+    /// An empty `explicit` list has no roster to reject the way `derived` does (see
+    /// `an_empty_roster_is_fatal` above, which covers the derived shape) — it must be checked on
+    /// the resulting publisher list itself, whichever shape produced it.
+    #[test]
+    fn an_empty_explicit_publisher_list_is_fatal() {
+        let row = PERPS_ROW.replace(
+            r#""publishers":{"explicit":[{"mktdata":7576,"refdata":7577}]}"#,
+            r#""publishers":{"explicit":[]}"#,
+        );
+        assert!(matches!(
+            build(&doc_with(&row), "test"),
+            Err(RegistryError::EmptyPublishers { .. })
+        ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Bounded fetch
+    // ---------------------------------------------------------------------------------------
+
+    /// A declared `Content-Length` over the cap is rejected before a single body byte is read —
+    /// the server here writes only the headers and never sends the (huge) declared body, so a bug
+    /// that read before checking the header would hang the test rather than pass it.
+    async fn serve_oversized_declared_length() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let declared = MAX_FETCH_BYTES + 1;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {declared}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                // Deliberately never writes the declared body: the length check alone must reject.
+            }
+        });
+        format!("http://{addr}/registry.json")
+    }
+
+    /// Exercises `fetch` directly rather than through `load`: any fetch failure falls back to the
+    /// built-in document (see `an_unreachable_url_still_falls_back`), so asserting only that would
+    /// pass even without a cap — a broken connection produces a different, also-Err outcome. This
+    /// pins the *specific* rejection reason.
+    #[tokio::test]
+    async fn a_declared_oversized_content_length_is_rejected() {
+        let url = serve_oversized_declared_length().await;
+        assert!(matches!(fetch(&url).await, Err(FetchError::TooLarge)));
+    }
+
+    /// A chunked response over the cap with **no** declared length at all — the shape a
+    /// `content_length()`-only check misses entirely, since there is no header to inspect. Only the
+    /// accumulation loop over `.chunk()` catches this one.
+    async fn serve_oversized_chunked() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let chunk = vec![b'a'; 1024 * 1024];
+                let mut sent = 0u64;
+                while sent < MAX_FETCH_BYTES + 1 {
+                    let _ = sock
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await;
+                    let _ = sock.write_all(&chunk).await;
+                    let _ = sock.write_all(b"\r\n").await;
+                    sent += chunk.len() as u64;
+                }
+                let _ = sock.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}/registry.json")
+    }
+
+    #[tokio::test]
+    async fn a_chunked_response_over_the_cap_is_rejected() {
+        let url = serve_oversized_chunked().await;
+        assert!(matches!(fetch(&url).await, Err(FetchError::TooLarge)));
     }
 }
