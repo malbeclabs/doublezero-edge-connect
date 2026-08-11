@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+#
+# Same artifact as the testnet overlay, published to the mainnet-beta repository too: the CLI has
+# no ledger coupling, so one build serves both environments.
+
+includes:
+  - from_file:
+      path: release/.goreleaser.base.edge-cli.yaml
+
+cloudsmiths:
+  - organization: malbeclabs
+    repository: doublezero-mainnet-beta
+    ids:
+      - doublezero-edge
+    distributions:
+      deb: "any-distro/any-version"
+      rpm: "any-distro/any-version"
