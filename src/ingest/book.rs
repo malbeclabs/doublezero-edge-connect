@@ -333,17 +333,18 @@ impl BookState {
         true
     }
 
-    /// Apply a delta. While `Recovering`, deltas are buffered (returns `false`). While `Synced`,
-    /// the per-instrument sequence is enforced: a duplicate/old delta is ignored, the next
-    /// contiguous one is applied, and a forward gap drops to `Recovering`. Returns whether the
-    /// top-of-book-bearing levels may have changed (i.e. a delta was actually applied).
-    pub fn on_delta(&mut self, op: DeltaOp) -> bool {
+    /// [`Self::on_delta_reporting`] for a caller that only needs to know whether the delta applied.
+    #[cfg(test)]
+    pub(crate) fn on_delta(&mut self, op: DeltaOp) -> bool {
         self.on_delta_reporting(op, &mut Vec::new())
     }
 
-    /// [`Self::on_delta`], additionally appending the order-level change each applied event
-    /// produced. Reports nothing for an event the book rejects, so a caller cannot publish a change
-    /// the book did not make.
+    /// Apply a delta, appending the order-level change it produced. While `Recovering`, deltas are
+    /// buffered (returns `false`). While `Synced`, the per-instrument sequence is enforced: a
+    /// duplicate/old delta is ignored, the next contiguous one is applied, and a forward gap drops to
+    /// `Recovering`. Returns whether the top-of-book-bearing levels may have changed (i.e. a delta was
+    /// actually applied), and reports nothing for an event the book rejects — so a caller cannot
+    /// publish a change the book did not make.
     pub fn on_delta_reporting(&mut self, op: DeltaOp, out: &mut Vec<OrderChange>) -> bool {
         match self.state {
             SyncState::Recovering => {
