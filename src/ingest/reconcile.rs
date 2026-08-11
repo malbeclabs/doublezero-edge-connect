@@ -260,6 +260,27 @@ pub struct Reconciler {
     /// filter change would otherwise abort it, so diffing consecutive `desired` sets — not `active`
     /// vs. `desired` — is what still detects the departure. See `forget_departed_channels`.
     last_desired_feeds: HashSet<FeedKey>,
+    /// Departed channels whose receiver has been `abort()`-ed but isn't yet confirmed stopped —
+    /// see `drain_departed` for why the purge waits here instead of running right away.
+    draining: Vec<Draining>,
+}
+
+/// How many ticks a departed receiver may sit in `draining` unfinished before `drain_departed`
+/// purges its state anyway. `abort()` cancels a task only at its next `.await`; a receiver wedged
+/// in a blocking call (or otherwise starved of a poll) might never actually finish, and waiting on
+/// it forever would leak both this entry and the stale catalog/book/history state a client keeps
+/// reading. Ten ticks (five minutes at the default `--subscription-refresh-secs=30`) is generous —
+/// a normally-behaving receiver's only synchronous stretch is one datagram's `on_datagram`, so it
+/// finishes on the very next scheduling opportunity — while still bounding the pathological case.
+const MAX_DRAIN_TICKS: u32 = 10;
+
+/// One departed receiver waiting in `Reconciler::draining` for `is_finished()` to confirm it has
+/// actually stopped, so its catalog/book/history purge can't be overwritten by a write still
+/// in flight when it was aborted.
+struct Draining {
+    key: FeedKey,
+    handle: JoinHandle<Result<()>>,
+    ticks_waited: u32,
 }
 
 impl Reconciler {
@@ -274,6 +295,7 @@ impl Reconciler {
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
             last_desired_feeds: HashSet::new(),
+            draining: Vec::new(),
         }
     }
 
@@ -311,10 +333,23 @@ impl Reconciler {
         // window between the purge and its own abort taking effect, silently re-inserting the very
         // catalog entry just removed — permanently, since that map has no other removal path and
         // this channel will not be diffed as "departing" again on any later tick.
-        self.apply_feeds(&desired.feeds);
+        //
+        // N1 alone isn't enough: `abort()` only cancels a task at its next `.await`, and a receiver
+        // already past `recv_any().await` runs the rest of its synchronous body — `on_datagram` ->
+        // catalog upsert -> book replay, no `.await` in between (see `receiver::drive`) — before
+        // the cancellation lands. Purging in this same uninterrupted stretch can still be
+        // overwritten by that in-flight write. A key with no entry in `active` already stopped on
+        // its own before this tick (an earlier `reap_finished`, or it never ran at all), so nothing
+        // can race an immediate purge; a key still in `active` gets aborted by `apply_feeds` below
+        // and moves to `self.draining`, whose purge waits for confirmed completion — see
+        // `drain_departed`.
         for key in &departed {
-            self.forget_departing_channel(key);
+            if !self.active.contains_key(key) {
+                self.forget_departing_channel(key);
+            }
         }
+        self.apply_feeds(&desired.feeds);
+        self.drain_departed();
         self.apply_ws(desired.ws_on).await;
         self.apply_api(desired.api_on).await;
         self.apply_shred(desired.shred_sources);
@@ -468,6 +503,13 @@ impl Reconciler {
                     publisher = key.3,
                     "deactivating market-data receiver (no longer subscribed)"
                 );
+                // Its catalog/book/history purge waits for confirmed completion, not just this
+                // `abort()` call — see `drain_departed`.
+                self.draining.push(Draining {
+                    key,
+                    handle: h,
+                    ticks_waited: 0,
+                });
             }
         }
         // Ownership over the post-apply running set, which `desired` already is: the aborts above
@@ -512,6 +554,43 @@ impl Reconciler {
                 tape.clone(),
             ));
             self.active.insert(key, (h, tape));
+        }
+    }
+
+    /// Purge a draining receiver's catalog/book/history state once its task is actually finished —
+    /// never merely aborted. See `tick`'s comment for why `abort()` alone isn't a safe purge
+    /// trigger: a receiver already past `recv_any().await` runs the rest of its synchronous body
+    /// before the cancellation lands, and purging any earlier can be overwritten by that write,
+    /// permanently. Waiting for `is_finished()` guarantees the purge runs strictly after the last
+    /// write that receiver could ever make.
+    ///
+    /// Bounded by `MAX_DRAIN_TICKS`: a receiver `abort()` can't actually interrupt would otherwise
+    /// sit here forever, permanently leaking this entry and the stale state its purge would have
+    /// cleared. Past the bound we purge anyway and log loudly — the same residual risk the old
+    /// immediate-purge path always carried on every departure, now confined to a rare, bounded, and
+    /// observable case.
+    fn drain_departed(&mut self) {
+        let mut i = 0;
+        while i < self.draining.len() {
+            let finished = self.draining[i].handle.is_finished();
+            self.draining[i].ticks_waited += 1;
+            if finished || self.draining[i].ticks_waited > MAX_DRAIN_TICKS {
+                let entry = self.draining.remove(i);
+                if !finished {
+                    warn!(
+                        venue = entry.key.0,
+                        category = entry.key.1,
+                        kind = entry.key.2.label(),
+                        publisher = entry.key.3,
+                        ticks_waited = entry.ticks_waited,
+                        "departed receiver still hasn't stopped after the drain bound; purging \
+                         its state anyway"
+                    );
+                }
+                self.forget_departing_channel(&entry.key);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -1702,9 +1781,15 @@ mod tests {
 
         // Tick 1: channels 10 and 11 both admitted.
         r.tick().await;
-        // Tick 2: narrow the channel filter to channel 11 only — channel 10 departs.
+        // Tick 2: narrow the channel filter to channel 11 only — channel 10 departs. The purge
+        // itself is now deferred until the aborted receiver is confirmed stopped (`drain_departed`);
+        // drive `MAX_DRAIN_TICKS` further ticks so the bound forces it regardless of whether this
+        // test's spawned receiver ever gets polled to completion on its own.
         *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
         r.tick().await;
+        for _ in 0..MAX_DRAIN_TICKS {
+            r.tick().await;
+        }
 
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:DEPARTED"))
             .await
@@ -1727,6 +1812,14 @@ mod tests {
     /// in `active` — a plain panic, not a silent pass. Fails on an N2 regression (the book purge
     /// deleted) because the book assertions below check `cfg.books` directly: nothing else in this
     /// crate would otherwise clear it for a departed channel.
+    ///
+    /// The purge itself no longer lands on the departure tick: it waits in `draining` for the
+    /// receiver's `JoinHandle` to report `is_finished()` (see `drain_departed`), and this test's
+    /// spawned receiver is never actually polled (`test_reconciler`'s doc), so it never satisfies
+    /// that on its own. The extra ticks below drive past `MAX_DRAIN_TICKS` so the bound forces the
+    /// purge instead — the deterministic seam for *this* test. The race the bound guards against
+    /// (a write landing between `abort()` and confirmed completion) is covered on its own by
+    /// `a_write_that_lands_after_abort_is_still_purged_once_the_receiver_finishes` below.
     #[tokio::test]
     async fn a_narrowed_channel_is_purged_from_all_three_maps_via_a_real_tick() {
         let feed = sports_row();
@@ -1792,8 +1885,13 @@ mod tests {
         // Narrow the channel filter: channel 10 departs, channel 11 stays admitted.
         *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
 
-        // Tick 2: the real `tick()` aborts the receiver and purges its state.
+        // Tick 2: the real `tick()` aborts the receiver and queues it in `draining`. Its spawned
+        // task is never polled in this harness, so it never reports finished on its own; drive
+        // `MAX_DRAIN_TICKS` further ticks so the drain bound forces the purge.
         r.tick().await;
+        for _ in 0..MAX_DRAIN_TICKS {
+            r.tick().await;
+        }
 
         assert!(
             !r.active.contains_key(&key10),
@@ -1815,6 +1913,87 @@ mod tests {
                 .candles(&hist_key, 60, 10, 1_100)
                 .is_empty(),
             "history must be purged"
+        );
+    }
+
+    /// The race the finding described: `abort()` only cancels a task at its next `.await`, so a
+    /// receiver caught mid-synchronous-body (past `recv_any().await`, before its next loop
+    /// iteration — see `receiver::drive`) can still write state *after* `tick()`'s abort call.
+    /// Genuine OS-thread concurrency can't be driven deterministically in a unit test (this crate's
+    /// tests run on the current-thread runtime — see `test_reconciler`'s doc — where two tasks
+    /// never truly run "at the same time"), so this test makes the ordering explicit instead: a
+    /// stand-in occupies `active` in place of a real receiver, and the "late write" a still-running
+    /// receiver would perform is done directly by the test, sequenced strictly after the abort call
+    /// and before the stand-in is confirmed finished. What's under test is exactly what
+    /// `drain_departed` is supposed to guarantee: a write landing in that window must not survive
+    /// as a permanent catalog entry once the purge actually runs.
+    ///
+    /// Revert-verify: reverting `tick`/`drain_departed` to purge immediately when a key departs
+    /// (the pre-fix behaviour) makes the final assertion fail — the late write survives forever,
+    /// since this channel is never diffed as departing a second time. Confirmed by hand before
+    /// landing this test (see the PR report for the exact failure output).
+    #[tokio::test]
+    async fn a_write_that_lands_after_abort_is_still_purged_once_the_receiver_finishes() {
+        let mut r = test_reconciler_with_filter(
+            vec![sports_row()],
+            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+        );
+        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
+        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
+            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+
+        // Tick 1: both channels admitted (spawns real, never-polled receivers).
+        r.tick().await;
+        assert!(r.active.contains_key(&key10));
+
+        // Replace channel 10's real receiver with a stand-in we fully control: it never completes
+        // on its own, so `is_finished()` stays false until `abort()`'s cancellation actually lands.
+        let (_, tape) = r
+            .active
+            .remove(&key10)
+            .expect("channel 10 is running after tick 1");
+        let standin: JoinHandle<Result<()>> = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        r.active.insert(key10, (standin, tape));
+
+        // Seed the catalog entry the departure is supposed to purge.
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            test_instrument_in("sports", "KALSHI", 3, "NARROWED", 10, 1),
+        );
+
+        // Narrow the filter: channel 10 departs. Tick 2 aborts the stand-in and queues it in
+        // `draining` rather than purging right away.
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        r.tick().await;
+        assert!(
+            !r.active.contains_key(&key10),
+            "fixture sanity: the stand-in is aborted"
+        );
+
+        // The in-flight "datagram" lands now — strictly after the abort call above, exactly the
+        // ordering the finding describes.
+        r.cfg.instruments.lock().unwrap().insert(
+            catalog_key.clone(),
+            test_instrument_in("sports", "KALSHI", 3, "LATE-WRITE", 10, 1),
+        );
+
+        // Give the runtime a chance to actually process the stand-in's cancellation: it's parked
+        // on a pending future with no synchronous work of its own, so once `abort()`'s
+        // cancellation is scheduled, a handful of scheduling passes is generous.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Tick 3: `drain_departed` now sees the stand-in finished and purges — strictly after the
+        // late write, not before it.
+        r.tick().await;
+
+        assert!(
+            !r.cfg.instruments.lock().unwrap().contains_key(&catalog_key),
+            "a write that lands after the abort call must not leave a permanent catalog entry"
         );
     }
 

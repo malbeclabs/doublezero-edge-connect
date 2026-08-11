@@ -80,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OOM the process instead of ever reaching the built-in fallback, and then crash-loop re-fetching on
   restart. The fetch is now capped, checking both a declared `Content-Length` and the accumulated
   body as it streams in, so a chunked response with no declared length is covered too.
+- A departed channel's catalog/book/history purge ran right after its receiver's `abort()` call,
+  but `abort()` only cancels a task at its next `.await`; a receiver already past
+  `recv_any().await` can still run the rest of its synchronous body and re-insert the very state
+  the purge just removed — permanently, since a channel is never diffed as departing twice. The
+  purge now waits for the receiver's `JoinHandle` to report finished before running, with a bounded
+  fallback so one that never does (e.g. wedged in a blocking call) can't leak its state forever.
 
 ### Added
 - `trade` carries `channel`/`instrument_id`, the same identity pair `instrument`/`book` already carry.
