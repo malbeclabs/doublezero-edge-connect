@@ -254,6 +254,12 @@ pub struct Metrics {
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
 
+    // --- Hyperliquid-compatible sink (off by default) ---
+    /// Currently-connected clients of the Hyperliquid-compatible sink.
+    pub hl_sink_clients: IntGauge,
+    /// Frames sent by the Hyperliquid-compatible sink, by `channel` (l2Book/l4Book/trades).
+    pub hl_sink_messages: IntCounterVec,
+
     // --- Public WS input feeders (per-venue backstops; off by default) ---
     /// Feeder health per `venue`: 1 while the public WebSocket session is connected, 0 while
     /// down/reconnecting.
@@ -755,6 +761,17 @@ impl Metrics {
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
             ),
+            hl_sink_clients: gauge(
+                &registry,
+                "dz_hl_sink_clients",
+                "Clients connected to the Hyperliquid-compatible sink",
+            ),
+            hl_sink_messages: counter_vec(
+                &registry,
+                "dz_hl_sink_messages_total",
+                "Frames sent by the Hyperliquid-compatible sink, by channel",
+                &["channel"],
+            ),
             ws_feeder_up: gauge_vec(
                 &registry,
                 "dz_ws_feeder_up",
@@ -979,6 +996,7 @@ mod tests {
         m.book_resurrections_dropped
             .with_label_values(&["HYPERLIQUID"])
             .inc();
+        m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -1026,6 +1044,8 @@ mod tests {
             "dz_book_events_deduped_total",
             "dz_mbo_arm_disagreement_total",
             "dz_book_resurrections_dropped_total",
+            "dz_hl_sink_clients",
+            "dz_hl_sink_messages_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
         ] {

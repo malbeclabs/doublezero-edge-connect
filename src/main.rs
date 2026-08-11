@@ -188,6 +188,13 @@ struct Args {
     )]
     phoenix_ws_input_url: String,
 
+    /// Bind address for the Hyperliquid-compatible WebSocket sink, e.g. `0.0.0.0:8082`. Off by
+    /// default (empty disables it). This serves Hyperliquid's own schema, not the protocol in
+    /// PROTOCOL.md — point an existing Hyperliquid client's WebSocket endpoint at it. Not
+    /// subscription-gated. No TLS; terminate at a proxy if exposed.
+    #[arg(long = "hl-ws-bind", env = "HL_WS_BIND", default_value = "")]
+    hl_ws_bind: String,
+
     /// Prometheus metrics HTTP endpoint bind address (e.g. `127.0.0.1:9090`). Off by default
     /// (opt-in): empty means no endpoint is exposed. Metrics are recorded regardless; this only
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
@@ -492,6 +499,26 @@ async fn main() -> Result<()> {
         broadcast_capacity: args.ws_broadcast_capacity,
     };
 
+    // Hyperliquid-compatible sink: off by default (opt-in via `--hl-ws-bind`), and not
+    // subscription-gated — it is a rendering of whatever the shared broadcast carries, so it has no
+    // group of its own to be subscribed to. A bind failure disables it with a warning rather than
+    // taking the tunnel down, exactly as the normalized sink's does.
+    let hl_sink = if args.hl_ws_bind.is_empty() {
+        info!("Hyperliquid-compatible sink disabled (empty --hl-ws-bind)");
+        None
+    } else {
+        match sinks::hyperliquid::bind(&args.hl_ws_bind).await {
+            Ok(listener) => {
+                let (tx, books) = (tx.clone(), books.clone());
+                Some(tokio::spawn(sinks::hyperliquid::serve(listener, tx, books)))
+            }
+            Err(e) => {
+                warn!(bind = %args.hl_ws_bind, "Hyperliquid-compatible sink disabled: {e}");
+                None
+            }
+        }
+    };
+
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always
     // on; this only exposes the registry over HTTP for scraping.
     let metrics_srv = if args.metrics_bind.is_empty() {
@@ -610,6 +637,10 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r?,
+        r = async { match hl_sink {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
         // The metrics endpoint (when enabled) loops forever; its arm resolves only on a bind/accept
         // failure or a task panic.
         r = async { match metrics_srv {
