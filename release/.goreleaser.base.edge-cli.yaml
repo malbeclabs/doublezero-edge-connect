@@ -42,6 +42,11 @@ builds:
     env:
       - CC_x86_64_unknown_linux_musl=musl-gcc
       - CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+      # Without crt-static the musl target links DYNAMICALLY against musl: the binary keeps an
+      # INTERP of /lib/ld-musl-x86_64.so.1, which does not exist on a glibc host, so the package
+      # installs and the binary cannot execute. `ldd` still prints "statically linked", so only
+      # running it on a real host catches this.
+      - RUSTFLAGS=-C target-feature=+crt-static -C relocation-model=static
 
 archives:
   - id: doublezero_edge_archive

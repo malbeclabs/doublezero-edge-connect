@@ -46,7 +46,7 @@ jobs:
       - name: Install bats, rpm and musl-tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y bats rpm musl-tools
+          sudo apt-get install -y bats rpm musl-tools binutils
 
       # goreleaser OSS (not -pro): the test needs no license, so it runs on every PR including
       # forks. Pinned to the version this test was validated against.
