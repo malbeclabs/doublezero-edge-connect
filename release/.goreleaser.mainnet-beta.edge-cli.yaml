@@ -10,7 +10,7 @@ includes:
 
 cloudsmiths:
   - organization: malbeclabs
-    repository: doublezero-mainnet-beta
+    repository: doublezero
     ids:
       - doublezero-edge
     distributions:

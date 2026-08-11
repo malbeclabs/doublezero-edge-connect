@@ -39,7 +39,7 @@ EXPECTED_PATHS="/usr/bin/doublezero-edge
 /usr/share/zsh/site-functions/_doublezero-edge"
 
 setup_file() {
-  for tool in goreleaser yq dpkg-deb dpkg rpm ldd cargo rustup; do
+  for tool in goreleaser yq dpkg-deb dpkg rpm ldd readelf cargo rustup; do
     command -v "$tool" >/dev/null 2>&1 || skip "requires $tool on PATH -- see packaging-tests.yml"
   done
   rustup target list --installed 2>/dev/null | grep -qx 'x86_64-unknown-linux-musl' \
@@ -152,9 +152,19 @@ setup() {
   run dpkg-deb -x "$DEB_PATH" "$extract"
   [ "$status" -eq 0 ]
   run ldd "$extract/usr/bin/doublezero-edge"
-  # A dynamically-linked binary makes ldd print resolved libraries and exit 0; a static one
-  # (including musl static-PIE, which still carries a PT_INTERP string) makes it print exactly
-  # this and exit nonzero -- never partial output, so grepping for a marker string is unambiguous.
   echo "$output" # surfaced on failure
   printf '%s\n' "$output" | grep -qiE 'not a dynamic executable|statically linked'
+
+  # `ldd` alone is not enough, and this test used to stop above. A musl binary linked WITHOUT
+  # crt-static prints "statically linked" here while still carrying a PT_INTERP of
+  # /lib/ld-musl-x86_64.so.1 -- an interpreter no glibc host has, so the package installs and the
+  # binary dies with "cannot execute: required file not found". Found by installing on a real
+  # host, not by any assertion in this file. So: require no interpreter at all.
+  run readelf -l "$extract/usr/bin/doublezero-edge"
+  [ "$status" -eq 0 ]
+  if printf '%s\n' "$output" | grep -q 'INTERP'; then
+    printf '%s\n' "$output" | grep -A1 'INTERP'
+    echo "binary requires an interpreter; it will not run on a host without it"
+    return 1
+  fi
 }
