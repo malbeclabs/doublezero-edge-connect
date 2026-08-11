@@ -176,12 +176,19 @@ fn render_candles(body: &Value) -> Result<String, String> {
     let mut out = table(&headers, &rows);
     out.push_str("\n\n");
     out.push_str(&format!(
-        "retention: window_seconds={} oldest={} newest={} truncated={}",
+        "retention: window_seconds={} oldest={} newest={} truncated={} held={}",
         parsed.retention.window_seconds,
         parsed.retention.oldest,
         parsed.retention.newest,
-        parsed.retention.truncated
+        parsed.retention.truncated,
+        parsed.retention.held,
     ));
+    if !parsed.retention.held && parsed.candles.is_empty() {
+        out.push_str(
+            "\nnote: this product is not currently held in the history store (evicted for \
+             capacity, or never seen) — this is not the same as a market with no trades.",
+        );
+    }
     Ok(out)
 }
 
@@ -340,13 +347,44 @@ mod tests {
             "candles": [
                 {"start": "1000", "low": "1", "high": "2", "open": "1", "close": "2", "volume": "5"}
             ],
-            "retention": {"window_seconds": 3600, "oldest": "900", "newest": "1000", "truncated": true}
+            "retention": {"window_seconds": 3600, "oldest": "900", "newest": "1000", "truncated": true, "held": true}
         });
         let out = render_candles(&body).unwrap();
         assert!(
-            out.contains("retention: window_seconds=3600 oldest=900 newest=1000 truncated=true"),
+            out.contains(
+                "retention: window_seconds=3600 oldest=900 newest=1000 truncated=true held=true"
+            ),
             "{out}"
         );
+    }
+
+    /// The distinction the fix is for: an evicted product (`held: false`) with no candles must read
+    /// differently from a genuinely quiet one — a fixture that only ever set `held: true` (or omitted
+    /// it) could never express this, since both render an empty candle table otherwise.
+    #[test]
+    fn an_unheld_product_with_no_candles_gets_an_explanatory_note() {
+        let body = serde_json::json!({
+            "candles": [],
+            "retention": {"window_seconds": 3600, "oldest": "1000", "newest": "1000", "truncated": false, "held": false}
+        });
+        let out = render_candles(&body).unwrap();
+        assert!(out.contains("held=false"), "{out}");
+        assert!(
+            out.contains("not currently held"),
+            "an unheld product with no candles must say so, not read like a quiet market: {out}"
+        );
+    }
+
+    /// The mirror image: a genuinely quiet but still-tracked product gets no such note.
+    #[test]
+    fn a_held_product_with_no_candles_gets_no_note() {
+        let body = serde_json::json!({
+            "candles": [],
+            "retention": {"window_seconds": 3600, "oldest": "1000", "newest": "1000", "truncated": false, "held": true}
+        });
+        let out = render_candles(&body).unwrap();
+        assert!(out.contains("held=true"), "{out}");
+        assert!(!out.contains("not currently held"), "{out}");
     }
 
     #[test]

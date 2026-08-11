@@ -34,8 +34,16 @@ pub const TRADE_RING: usize = 1_000;
 /// is exactly the over-provisioned-for-the-quiet-case multiply `MAX_BUCKETS_ACROSS_PRODUCTS` below
 /// exists to avoid — see its doc for the bound that actually holds. The print ring *is* a fixed
 /// per-product cost regardless of trade rate, so this cap does bound it directly:
-/// `MAX_PRODUCTS * TRADE_RING * size_of::<Print>()` is ~1,024 * 1,000 * 24 B =~ 24 MiB.
-pub const MAX_PRODUCTS: usize = 1_024;
+/// `MAX_PRODUCTS * TRADE_RING * size_of::<Print>()` is 8,192 * 1,000 * 24 B = 187.5 MiB.
+///
+/// 1,024 was sized against nothing in particular and sat below even one real venue: a single
+/// perps venue alone carries on the order of 1,300 live markets (`ingest::public_feeder`'s own
+/// `instrument_known` doc), so that venue *alone* was already thrashing this cap before a second
+/// feed's channels were counted. Raised 8x to 8,192 — proportionate to a handful of concurrently
+/// admitted venues/channels rather than to the sports feed's own tens-of-thousands universe, which
+/// `ingest::channel_filter`'s docs already say the window can't hold and narrowing exists to manage
+/// (raising this cap is not a substitute for narrowing that feed's channel filter).
+pub const MAX_PRODUCTS: usize = 8_192;
 /// Total 1-second buckets held across every product before the overflow policy evicts whole
 /// products — least recently traded first — until back under budget. This, not `MAX_PRODUCTS`, is
 /// the bound that actually holds, for the same reason `MAX_BUFFERED_DELTAS_ACROSS_BOOKS` exists in
@@ -44,8 +52,10 @@ pub const MAX_PRODUCTS: usize = 1_024;
 /// keys are wire-supplied, and a burst of synthetic ascending print timestamps fills a product's
 /// whole hour-window on arrival rather than over a real hour. At ~93 bytes resident per retained
 /// bucket (measured, not the ~48-byte logical `(u64, Bucket)` payload — `BTreeMap`'s node overhead
-/// is real), 2^20 buckets is ~97 MiB; together with the print-ring bound above, worst-case history
-/// memory is on the order of ~121 MiB.
+/// is real), 2^20 buckets is exactly 93 MiB; together with the print-ring bound above (187.5 MiB at
+/// the raised `MAX_PRODUCTS`), worst-case history memory is on the order of ~281 MiB. This bound is
+/// unchanged by the `MAX_PRODUCTS` raise above — it was already independent of it, which is the
+/// point of having it.
 pub const MAX_BUCKETS_ACROSS_PRODUCTS: usize = 1 << 20;
 
 /// Measured per-bucket resident bytes (`BTreeMap` node overhead included — see
@@ -134,6 +144,15 @@ pub struct Retention {
     /// tell a full window from a truncated one without this: at second granularity 3,600 candles
     /// exist against any reasonably small page size, so this fires routinely.
     pub truncated: bool,
+    /// Whether the store currently tracks this product at all (`Store::held`) — **not** whether the
+    /// requested window happened to contain a print. Past `MAX_PRODUCTS`/`MAX_BUCKETS_ACROSS_PRODUCTS`
+    /// the least-recently-traded product is evicted whole, and an evicted product's `candles()` comes
+    /// back empty exactly like a real market that simply printed nothing this hour — `oldest`/`newest`
+    /// both read as `now_secs` and `truncated` is `false` in both cases, which is indistinguishable
+    /// from "we hold the full window and it is genuinely quiet" unless this is checked. `false` here
+    /// is the honest answer "this store holds nothing for this product" (evicted, or never seen);
+    /// `true` with an empty `candles()` result is the honest "no trades in this window."
+    pub held: bool,
 }
 
 /// One second's aggregated trade activity. `close` is the last print seen for this bucket by
@@ -222,6 +241,15 @@ impl Store {
 
     pub fn is_empty(&self) -> bool {
         self.products.is_empty()
+    }
+
+    /// Whether the store currently tracks `key` at all — the single source of truth
+    /// [`Retention::held`] reports. `true` even for a product whose current window is empty (it
+    /// stopped trading within the hour, or simply hasn't yet); `false` for one this store has never
+    /// seen, or has evicted for capacity. See [`Retention::held`]'s doc for why this distinction
+    /// exists.
+    pub fn held(&self, key: &Key) -> bool {
+        self.products.contains_key(key)
     }
 
     /// Prints rejected for arriving older than their product's window. Global across products: the
@@ -491,6 +519,7 @@ impl Store {
             oldest,
             newest,
             truncated: groups.len() > limit,
+            held: self.held(key),
         }
     }
 
@@ -777,6 +806,7 @@ mod tests {
             "identical span, regardless of a limit that doesn't bind"
         );
         assert_eq!(r500.newest, 1_099);
+        assert!(r10.held, "a product just fed prints must read as held");
     }
 
     #[test]
@@ -786,6 +816,80 @@ mod tests {
         assert_eq!(r.oldest, 12_345);
         assert_eq!(r.newest, 12_345);
         assert!(!r.truncated);
+        assert!(
+            !r.held,
+            "a key the store has never seen must not read as held"
+        );
+    }
+
+    /// The property the fix is for: an evicted market and a genuinely quiet one must not answer
+    /// identically. Both produce an empty `candles()` and the same `oldest == newest == now_secs,
+    /// truncated == false` shape from `rollup`/`retention` alone — a fixture exercising only one of
+    /// the two cases could never catch a regression that collapsed them back together. Here: fill
+    /// the store to `MAX_PRODUCTS` with `key()` least-recently-traded, force its eviction with one
+    /// more distinct key, then query `key()` (evicted: `held` must be `false`) against a second,
+    /// still-tracked product whose own last print is outside the requested window (quiet: `held`
+    /// must be `true`, since the store still holds its entry even with nothing in-window).
+    #[test]
+    fn an_evicted_product_reports_unheld_while_a_quiet_tracked_one_reports_held() {
+        let mut s = Store::new();
+
+        // `key()` touched first, so it is the single oldest entry once the cap is reached below.
+        s.ingest(key(), trade(1, 10.0, 1.0));
+
+        // A second product, touched right after `key()` — old enough that its own print will sit
+        // outside the window we query below, but touched *later* than `key()`, so it survives the
+        // eviction that follows and stays tracked.
+        let quiet = Key {
+            source_id: 9,
+            category: "default".into(),
+            channel: 0,
+            instrument_id: 999,
+        };
+        s.ingest(quiet.clone(), trade(0, 10.0, 1.0));
+
+        // Exactly enough distinct new keys to fill the store to `MAX_PRODUCTS` (no eviction yet,
+        // since `touch` only evicts when the cap is already met going in) and then one more to
+        // trigger exactly one eviction — the single oldest entry, `key()`.
+        for i in 0..(MAX_PRODUCTS - 1) {
+            let k = Key {
+                source_id: 2,
+                category: "default".into(),
+                channel: 0,
+                instrument_id: i as u32,
+            };
+            s.ingest(k, trade(2 + i as u64, 10.0, 1.0));
+        }
+        assert!(
+            !s.held(&key()),
+            "fixture sanity: key() must have been evicted by the fill above"
+        );
+        assert!(
+            s.held(&quiet),
+            "fixture sanity: quiet must have survived the same fill"
+        );
+
+        let now = WINDOW_SECS * 10; // long past `quiet`'s one print, well outside its window
+        let evicted_r = s.retention(&key(), 1, 10, now);
+        let quiet_r = s.retention(&quiet, 1, 10, now);
+
+        assert!(s.candles(&key(), 1, 10, now).is_empty(), "evicted: empty");
+        assert!(
+            s.candles(&quiet, 1, 10, now).is_empty(),
+            "quiet: also empty"
+        );
+        assert_eq!(
+            evicted_r.oldest, evicted_r.newest,
+            "both report the same zero-width shape without `held`"
+        );
+        assert_eq!(evicted_r.oldest, quiet_r.oldest);
+        assert_eq!(evicted_r.truncated, quiet_r.truncated);
+
+        assert!(!evicted_r.held, "an evicted product must report held=false");
+        assert!(
+            quiet_r.held,
+            "a product the store still tracks must report held=true even with nothing in window"
+        );
     }
 
     /// A product must not stay LRU-hot merely by being ingested if every such call is a rejected

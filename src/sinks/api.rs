@@ -435,6 +435,7 @@ fn candles(state: &ApiState, inst: &NormalizedInstrument, req: &Request) -> Resp
             "oldest": retention.oldest.to_string(),
             "newest": retention.newest.to_string(),
             "truncated": retention.truncated,
+            "held": retention.held,
         },
     }))
 }

@@ -83,6 +83,17 @@ pub struct Retention {
     pub oldest: String,
     pub newest: String,
     pub truncated: bool,
+    /// Whether the server's history store still tracks this product at all — distinct from an
+    /// empty `candles` array, which a genuinely quiet (but still tracked) market and an evicted one
+    /// both produce. Defaults to `true` (the old, non-distinguishing behavior) against a server
+    /// predating this field, rather than `bool::default()`'s `false`, which would misreport a
+    /// tracked market as evicted purely because an old server never sent the field at all.
+    #[serde(default = "held_default")]
+    pub held: bool,
+}
+
+fn held_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

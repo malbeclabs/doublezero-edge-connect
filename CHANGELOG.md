@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host — loopback does not stop a request that originates on the host itself. `POST` now also
   requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it
   automatically.
+- `candles`/`retention` answered an evicted product exactly like one genuinely holding no trades
+  (both an empty candle list and `oldest == newest == now, truncated == false`), so a busy market
+  bumped from the history store by the `MAX_PRODUCTS` cap read as quiet. `retention` now carries a
+  `held` field distinguishing "the store no longer tracks this product" from "no trades in this
+  window," and `MAX_PRODUCTS` is raised 1,024 -> 8,192 (see `history.rs`'s docs for the memory
+  arithmetic).
 
 ### Added
 - A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus

@@ -85,10 +85,12 @@ over this surface.
 prints, fed from the post-arbiter broadcast — so every print arriving here is already deduplicated on
 `trade_id` and gated by the tape leader, one copy per print — with **no persistence of any kind**: the
 window is gone the moment the process restarts. Every `candles` response carries its own `retention`
-block (`window_seconds`, `oldest`/`newest`, `truncated`), so a caller can tell a full window from a
-`limit`-truncated one without guessing, and every `book`/depth response carries a `coverage` block
-with the same honesty (`complete: false` rather than a guess whenever the served levels might not be
-all of them).
+block (`window_seconds`, `oldest`/`newest`, `truncated`, `held`), so a caller can tell a full window
+from a `limit`-truncated one without guessing — and, via `held`, a product the store still tracks
+(genuinely no trades in the window) from one it no longer tracks at all (evicted for capacity, or
+never seen), which otherwise look like the same empty response. Every `book`/depth response carries
+a `coverage` block with the same honesty (`complete: false` rather than a guess whenever the served
+levels might not be all of them).
 
 **The catalog is not necessarily every instrument the feed defines.** A product is listed in
 `/v1/products` once its source is known: immediately, for a publisher whose reference data carries
