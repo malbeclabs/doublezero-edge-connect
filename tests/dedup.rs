@@ -16,7 +16,7 @@ use doublezero_edge_connect::{
     ingest::{
         arbiter::{Arbiter, Publisher, SharedArbiter, TRADE_DEDUP_WINDOW},
         codec, codec_mbo,
-        feeds::{FeedKind, FEEDS},
+        feeds::{feeds, init_built_in, FeedKind},
         processor::{MboProcessor, TobProcessor},
         receiver::{FrameCtx, FrameProcessor, PortRole},
     },
@@ -57,12 +57,14 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "HYPERLIQUID",
+            category: "perps",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,
             role: port_role(*role),
             publisher: *ip,
+            mirror_offset: None,
         };
         p.on_datagram(frame, &ctx);
     }
@@ -121,6 +123,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     for (ip, role, frame) in recs {
         let ctx = FrameCtx {
             venue: "HYPERLIQUID",
+            category: "perps",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
@@ -131,6 +134,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
                 PortRole::Mktdata
             },
             publisher: *ip,
+            mirror_offset: None,
         };
         p.on_datagram(frame, &ctx);
     }
@@ -607,7 +611,8 @@ fn mbo_prints_carry_no_venue_trade_id() {
 
     // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
     // real trade ids, and that is its own row's call.
-    for f in FEEDS
+    init_built_in();
+    for f in feeds()
         .iter()
         .filter(|f| f.venue == "HYPERLIQUID" && f.kind == FeedKind::MarketByOrder)
     {
@@ -737,8 +742,8 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
     // legitimately transfer on silence.
     for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
         let t = 1_000 + i as u64 * 2_000;
-        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1));
-        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2));
+        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1), "perps");
+        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2), "perps");
     }
 
     // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer

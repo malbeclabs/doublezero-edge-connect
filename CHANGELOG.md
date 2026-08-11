@@ -7,6 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The channel-departure purge fired on any shrink of the desired feed set, including a plain
+  subscription loss (a group unsubscribed, or a `doublezero status` blip that parses fine and
+  momentarily stops listing a code) — destroying a channel's catalog/book/history on a one-tick
+  blip that used to be harmless (an unsubscribe only ever stopped receiver tasks before this
+  reconciler purged anything). The purge is now driven solely by an explicit channel-filter
+  narrowing (`--channels` at startup, or `POST /admin/channels`); a subscription loss still stops
+  the receivers, but leaves their data alone to resync onto once the subscription returns.
+- A mirror publisher that raises every channel id by a fixed offset on the same ports (registry
+  `derived.publisher_offset`) minted a second catalog/history/book entry under the raised id, half
+  of which a departure purge could never reach (it purges by the registry's roster id alone),
+  leaving them served forever. Ingest now canonicalises the wire channel to the base id for every
+  consumer-facing identity — catalog, history, book, product id — while producer-side state (books,
+  sequence tracking, reset counts) stays keyed on the raw wire channel, since the two arms are
+  independently sequenced.
+- `doublezero-edge`'s `client::get`/`classify` treated a `2xx` response with an undecodable body
+  as success, printing the synthesized `invalid_response` envelope to stdout with exit code 0 —
+  pointing `--url` at the wrong port (e.g. the WebSocket) made `products list` "succeed" with
+  garbage. A decode failure is now a distinct `Outcome::Invalid`, refused regardless of status,
+  same as an unreachable server.
+- `channels list`/`channels set` indexed the `/v1/status` `channels` block directly, so a body
+  missing that key (a server predating it) failed to deserialize instead of defaulting — losing
+  the drop preview and, without `--force`, refusing `channels set` outright, on exactly the server
+  skew `#[serde(default)]` exists to tolerate. Both now default a missing key to an empty object.
+- `--publisher-port` combined with `--channels` could narrow an enabled feed to zero publishers
+  with no warning (a channel-filter clause can be individually valid against the whole registry
+  while naming a channel `--publisher-port` already excluded), silently taking the WS sink, query
+  API and history feeder down. Startup now refuses that combination.
+- The same combination via `POST /admin/channels` returned `200` and emptied the feed on the
+  reconciler's next tick. It now returns `400` and leaves the prior channel filter in force.
+- `POST /admin/channels` accepted a bodyless request with a query string, which a plain HTML
+  `<form>` post can produce with no attacker involvement beyond an open web page on the admin-bound
+  host — loopback does not stop a request that originates on the host itself. `POST` now also
+  requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it
+  automatically.
+- `candles`/`retention` answered an evicted product exactly like one genuinely holding no trades
+  (both an empty candle list and `oldest == newest == now, truncated == false`), so a busy market
+  bumped from the history store by the `MAX_PRODUCTS` cap read as quiet. `retention` now carries a
+  `held` field distinguishing "the store no longer tracks this product" from "no trades in this
+  window," and `MAX_PRODUCTS` is raised 1,024 -> 8,192 (see `history.rs`'s docs for the memory
+  arithmetic).
+- `products::resolve`'s ambiguity error rendered two candidates identically when two universes
+  under one Source ID happened to share both symbol and `(channel, instrument_id)` — the one case
+  the disambiguating suffix cannot break — naming no market a caller could actually ask for.
+  `resolve` is now category-aware internally and the error appends the category when (and only
+  when) two candidates would otherwise render identically. The product id format is unchanged.
+
+### Added
+- A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus
+  a bounded ring of recent prints, per product, fed from the post-arbiter broadcast — so every print
+  arriving here is already deduplicated on `trade_id` and gated by the tape leader, one copy per
+  print. Pre-aggregating into fixed one-second buckets keeps the footprint independent of trade rate
+  (a product costs the same whether it prints once a second or five hundred times). **The window
+  lives in memory only and is gone the moment the process restarts** — there is no persistence of
+  any kind, and no retention beyond the hour. Bounded two ways, since a per-product cap alone
+  doesn't bound total memory: `MAX_PRODUCTS` (1,024, a pure cardinality guard on the tracked-product
+  map) and an aggregate `MAX_BUCKETS_ACROSS_PRODUCTS` (2^20) bucket budget across every product —
+  the bound that actually holds, at ~121 MiB worst case together with the print-ring bound — both
+  evicting the least-recently-traded product first.
+- A read-only `/v1` HTTP query API (`src/sinks/api.rs`), a sibling output sink to the WebSocket and
+  Prometheus endpoints: the instrument catalog (`GET /v1/products`, `/v1/products/{id}`), OHLCV
+  candles (`/v1/products/{id}/candles`), recent trades + best bid/ask (`/v1/products/{id}/ticker`),
+  an order book (`/v1/products/{id}/book`), best bid/ask across products (`/v1/best_bid_ask`), and
+  feed/history status (`/v1/status`). Binds `127.0.0.1:9099` by default (`--api-bind` /
+  `DZ_API_BIND`; empty disables it outright); the subscription reconciler activates it under the
+  **same condition as the WebSocket sink** (≥1 market-data feed subscribed) and binds it
+  non-fatally, so a taken port disables the API without crash-looping the tunnel. **No
+  authentication and no TLS**, matching every other service surface here — the loopback default is
+  load-bearing, since the container runs host networking and a wildcard bind would be genuinely
+  network-reachable; terminate at a reverse proxy if this must be exposed. The catalog is not
+  necessarily every instrument the feed defines: a product appears once its source is known, which
+  for a publisher whose reference data carries its own Source ID is at definition time, but for one
+  whose reference data carries no Source ID of its own is only after its first price — so a
+  defined-but-never-traded instrument on the latter kind of publisher is absent from `/v1/products`
+  until it prints, and both publisher generations can be live at once. Every response that could be
+  mistaken for complete carries an honest coverage/retention block rather than a guess (an
+  unbaselined `book`, a depth slice truncated at the wire's own cap, a `candles` page cut short by
+  `limit`).
+- **`doublezero-edge`**, a new read-only host-side CLI (its own workspace member) that queries that
+  API: `products list`, `products get`, `products ticker`, `products candles`, `products book`,
+  `products best_bid_ask`, and `status` — seven commands, modelled on the Coinbase Advanced Trade
+  CLI's `key==value`/`--jq`/`--template`/`--output table` surface. `--url` (`DOUBLEZERO_EDGE_URL`,
+  default `http://127.0.0.1:9099`) points it at a remote container. There is no order-placement or
+  mutation path anywhere in edge-connect for it to reach, so unlike the tool it emulates, no command
+  here ever needs a confirmation prompt. It builds on macOS as well as Linux; the bridge itself does
+  not, since it uses `SO_TIMESTAMPNS` via `nix` with no `cfg` gate — the reason this is a separate
+  workspace member rather than a bin in the bridge crate.
+
+### Fixed
+- The query API's history feeder resolved a `trade`'s product by matching `(venue, symbol)` against
+  the instrument catalog, dropping any trade whose symbol matched more than one market. On a
+  price-aggregated venue whose redundant publisher arms carry an identical instrument set under
+  distinct channel ids, *every* symbol matches twice, so every trade was silently dropped: zero
+  candles and zero ticker history for that venue's whole product set, indistinguishable from a
+  market that simply had not traded. `trade` now carries its own `channel`/`instrument_id` (see
+  Added, below), so the feeder keys straight off the message instead of guessing from a
+  possibly-ambiguous symbol; the lookup this replaces is removed entirely.
+- A trade's venue-supplied `source_ts_ns` more than a few seconds ahead of its own receive time, or
+  older than the history window, is no longer trusted into the query API's rolling store. The store's
+  late-print rejection compares only against a product's own high-water mark, which it never resets:
+  one implausible print latched it permanently, late-dropping every subsequent, correctly-timed print
+  for that product before it ever reached the print ring — so both `/candles` and `/ticker` emptied
+  out for it with no recovery. An implausible timestamp now falls back to the trade's own receive
+  time, the same fallback already used for the `source_ts_ns == 0` sentinel.
+- The feed registry validated a document's `venue` for resolvability only, which admits a legacy
+  alias for one Source ID even though only its canonical name ever reaches the wire. A document
+  naming the alias validated cleanly and then silently split every downstream lookup keyed on the
+  venue string (the arbitration mode, the channel-filter purge, `--feed <venue>` selection). The
+  venue must now round-trip through its canonical name.
+- A `--feed-registry` file that could not be read degraded to the built-in document with only a
+  warning, so an unmounted volume or a typo'd path started the container healthy on a stale
+  topology instead of refusing. That read failure is now fatal, matching the parse errors beside it
+  and the file source's documented contract.
+- An `explicit` publisher list left empty in the document installed a row with zero publishers —
+  no error, no receivers, and a healthy-looking `rows=1 receivers=0` log line. It is now rejected
+  the same way an empty `derived` roster already was.
+- The feed registry fetch had no bound on response size, so a hostile or compromised endpoint could
+  OOM the process instead of ever reaching the built-in fallback, and then crash-loop re-fetching on
+  restart. The fetch is now capped, checking both a declared `Content-Length` and the accumulated
+  body as it streams in, so a chunked response with no declared length is covered too.
+- A departed channel's catalog/book/history purge ran right after its receiver's `abort()` call,
+  but `abort()` only cancels a task at its next `.await`; a receiver already past
+  `recv_any().await` can still run the rest of its synchronous body and re-insert the very state
+  the purge just removed — permanently, since a channel is never diffed as departing twice. The
+  purge now waits for the receiver's `JoinHandle` to report finished before running, with a bounded
+  fallback so one that never does (e.g. wedged in a blocking call) can't leak its state forever.
+
+### Added
+- `trade` carries `channel`/`instrument_id`, the same identity pair `instrument`/`book` already carry.
+  Purely additive — existing fields are unchanged, and the fields are ignored harmlessly by any
+  consumer that doesn't read them yet. `0` on a source with no channel concept of its own (the public
+  WS backstops resolve the real value from the edge catalog where one exists).
+- `dz_history_unattributable_trades_total{venue}` counts a trade the query API's history store
+  dropped because its declared `(venue, channel, instrument_id)` names no known instrument — a
+  definition race, belt-and-braces alongside the fix above. Should stay flat at zero.
+- `dz_history_feed_lagged_total` counts the query API's history feeder falling behind the broadcast
+  and dropping messages (`Lagged`) — a hole in the rolling window, not a crash.
+
 ### Changed
 - An instrument whose reference data carries its own Source ID (the newer feed-spec generation) is
   now named the moment its definition is decoded, instead of waiting on a price. `instrument`

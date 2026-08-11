@@ -348,8 +348,15 @@ where
             // A market accumulated mid-stream holds only the levels that have moved since, so
             // replaying it as full state would tell the client to discard the ones it never saw.
             .filter(|(_, acc)| acc.baselined())
-            .filter(|((venue, channel, _), acc)| pass(venue, acc.symbol(), Some(*channel), "book"))
-            .map(|((venue, channel, id), acc)| FeedMessage::Book(acc.to_book(venue, *channel, *id)))
+            // The key's second element is the producer-side arbitration scope (`Feed::category`,
+            // which keeps two universes' colliding instrument ids apart in the map); it is not a
+            // filter dimension and never reaches the wire.
+            .filter(|((venue, _, channel, _), acc)| {
+                pass(venue, acc.symbol(), Some(*channel), "book")
+            })
+            .map(|((venue, _, channel, id), acc)| {
+                FeedMessage::Book(acc.to_book(venue, *channel, *id))
+            })
             .collect()
     };
     for m in snapshot.into_iter().chain(depths).chain(rebaselines) {
@@ -512,8 +519,8 @@ mod tests {
     use crate::{
         metrics::metrics,
         model::{
-            BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook,
-            NormalizedInstrument, NormalizedQuote,
+            BookAccumulator, BookAction, BookChange, BookReplay, BookSide, FeedMessage,
+            NormalizedBook, NormalizedInstrument, NormalizedQuote,
         },
     };
 
@@ -655,12 +662,17 @@ mod tests {
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
+            category: "default".into(),
             price_exponent: -2,
             qty_exponent: -2,
         }))
         .expect("serializes");
         assert_eq!(i.kind, "instrument");
         assert_eq!(i.channel, Some(2));
+        assert!(
+            !i.payload.contains("category"),
+            "category is producer-side only and must never reach the wire"
+        );
 
         assert_eq!(
             prepare(&FeedMessage::Quote(sample_quote()))
@@ -731,7 +743,7 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let books = Arc::new(Mutex::new(HashMap::new()));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
@@ -795,7 +807,7 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let books = Arc::new(Mutex::new(HashMap::new()));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws1, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
@@ -857,17 +869,23 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
 
         let mut defs = HashMap::new();
-        for sym in ["SOL", "BTC"] {
+        for (n, sym) in ["SOL", "BTC"].into_iter().enumerate() {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("HYPERLIQUID"), arc.clone()),
+                (
+                    Arc::<str>::from("HYPERLIQUID"),
+                    Arc::<str>::from("default"),
+                    0u32,
+                    n as u32,
+                ),
                 NormalizedInstrument {
                     venue: "HYPERLIQUID".into(),
                     source: "HYPERLIQUID".into(),
                     source_id: 0,
                     symbol: arc,
                     channel: 0,
-                    instrument_id: 1,
+                    instrument_id: n as u32,
+                    category: "default".into(),
                     price_exponent: -2,
                     qty_exponent: -2,
                 },
@@ -883,7 +901,7 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let books = Arc::new(Mutex::new(HashMap::new()));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
@@ -965,8 +983,9 @@ mod tests {
     }
 
     /// A `{"channel":N}` subscriber's replay is scoped by the instrument's own channel, so it is
-    /// bootstrapped with the definitions it can use and not another channel's. The two markets use
-    /// different symbols because the snapshot is keyed `(venue, symbol)`. `#[serial]` for the shared
+    /// bootstrapped with the definitions it can use and not another channel's. The two markets
+    /// differ by channel (the snapshot's actual identity component); distinct symbols are used too,
+    /// purely so the assertions below can tell them apart by content. `#[serial]` for the shared
     /// `dz_ws_clients` gauge.
     #[tokio::test]
     #[serial]
@@ -979,7 +998,12 @@ mod tests {
         for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
             let arc: Arc<str> = sym.into();
             defs.insert(
-                (Arc::<str>::from("KALSHI"), arc.clone()),
+                (
+                    Arc::<str>::from("KALSHI"),
+                    Arc::<str>::from("default"),
+                    channel,
+                    41u32,
+                ),
                 NormalizedInstrument {
                     venue: "KALSHI".into(),
                     source: "KALSHI".into(),
@@ -987,6 +1011,7 @@ mod tests {
                     symbol: arc,
                     channel,
                     instrument_id: 41,
+                    category: "default".into(),
                     price_exponent: -2,
                     qty_exponent: -2,
                 },
@@ -1007,7 +1032,7 @@ mod tests {
             tx.clone(),
             instruments,
             depth,
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(BookReplay::default())),
             cfg,
         ));
 
@@ -1123,8 +1148,8 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, Arc<str>), NormalizedInstrument>,
-        books: HashMap<(Arc<str>, u32, u32), BookAccumulator>,
+        instruments: HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>,
+        books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         broadcast::Sender<std::sync::Arc<FeedMessage>>,
@@ -1183,9 +1208,14 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn connect_replays_the_accumulated_book_rebaseline() {
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1220,13 +1250,23 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn subscribe_scopes_the_book_replay_by_channel() {
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         books.insert(
-            (Arc::<str>::from("KALSHI"), 3u32, 7u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                3u32,
+                7u32,
+            ),
             accumulator("KXETHPERP", 0.41, 0.43),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1273,7 +1313,12 @@ mod tests {
     async fn instrument_is_replayed_before_the_book() {
         let mut defs = HashMap::new();
         defs.insert(
-            (Arc::<str>::from("KALSHI"), Arc::<str>::from("KXBTCPERP")),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             NormalizedInstrument {
                 venue: "KALSHI".into(),
                 source: "KALSHI".into(),
@@ -1281,13 +1326,19 @@ mod tests {
                 symbol: "KXBTCPERP".into(),
                 channel: 2,
                 instrument_id: 41,
+                category: "perps".into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
         );
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(defs, books).await;
@@ -1325,10 +1376,23 @@ mod tests {
         ));
         assert!(!mid_stream.baselined(), "no Clear was folded in");
 
-        let mut books = HashMap::new();
-        books.insert((Arc::<str>::from("KALSHI"), 3u32, 7u32), mid_stream);
+        let mut books = BookReplay::default();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                3u32,
+                7u32,
+            ),
+            mid_stream,
+        );
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
@@ -1366,9 +1430,14 @@ mod tests {
             assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
         }
 
-        let mut books = HashMap::new();
+        let mut books = BookReplay::default();
         books.insert(
-            (Arc::<str>::from("KALSHI"), 2u32, 41u32),
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
             accumulator("KXBTCPERP", 0.61, 0.63),
         );
         let cfg = WsConfig {

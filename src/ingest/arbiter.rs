@@ -48,13 +48,13 @@ use tracing::warn;
 use crate::{
     ingest::{
         arm_race::ArmRace,
-        authority::{AuthorityConfig, MarketKey, StickyAuthority, OTHER_ARM},
+        authority::{AuthorityConfig, MarketKey, ScopeKey, StickyAuthority, OTHER_ARM},
         feeds::ArbitrationMode,
     },
     metrics::metrics,
     model::{
-        self, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot, FeedMessage,
-        NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade,
+        self, category_arc, now_mono_ns, now_ns, BookAccumulator, BookSnapshot, DepthSnapshot,
+        FeedMessage, NormalizedBook, NormalizedDepth, NormalizedQuote, NormalizedTrade,
     },
 };
 
@@ -515,7 +515,7 @@ pub struct Arbiter {
     /// symbol-keyed rate limit would starve a `{"channel":N}` subscriber of a definition another
     /// channel announced first. Bounded by the distinct instrument count, like the
     /// `InstrumentSnapshot` `processor::upsert_instrument` maintains.
-    instrument_defs: HashMap<MarketKey, (InstrumentId, u64)>,
+    instrument_defs: HashMap<(Arc<str>, u32, u32), (InstrumentId, u64)>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -541,9 +541,15 @@ pub struct Arbiter {
     /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
     no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
-    /// Which **arm** serves each `Sticky` venue's tape. See [`Arbiter::tape_arm_admits`]. One entry
-    /// per `Sticky` venue that has ever printed.
-    tape_leader: HashMap<Arc<str>, TapeLead>,
+    /// Which **arm** serves each `Sticky` universe's tape, keyed on `(venue, category)`. See
+    /// [`Arbiter::tape_arm_admits`]. One entry per `Sticky` universe that has ever printed.
+    ///
+    /// Venue alone would let a publisher on one universe mute a publisher on a disjoint one: a
+    /// single Source ID can carry universes that mirror nothing, and the gate below drops every
+    /// print from an arm that is not the leader. That drop has no bound in practice — the silence
+    /// handover only fires once the incumbent stops, and an incumbent streaming its own universe
+    /// never does — so the loser's tape goes dark for the life of the process.
+    tape_leader: HashMap<(Arc<str>, Arc<str>), TapeLead>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
     /// Whether the "batches carry no `last`" warning has fired.
@@ -788,7 +794,7 @@ impl Arbiter {
     /// Report one arm's book health for a market — the seam the MBP processor calls on every
     /// `PriceBook` status transition, since `books` is private here.
     ///
-    /// Health is a **per-market override** on venue-wide authority: an arm gapped on one market yields
+    /// Health is a **per-market override** on the universe's authority: an arm gapped on one market yields
     /// that market only, and takes it back on its own once the book recovers. Under incremental output
     /// a lost level does not self-heal until the next snapshot, so an unhealthy arm must not serve.
     pub fn set_book_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
@@ -914,11 +920,12 @@ impl Arbiter {
             let Some(old) = self.book_order.pop_front() else {
                 break;
             };
-            self.book_markets.remove(&old);
-            if let Some(replay) = &self.book_replay {
-                model::lock(replay).remove(&old);
-            }
-            self.books.forget_market(&old);
+            // The same pairing every other drop path uses — `pop_front` above has already taken
+            // this key out of `book_order`, which is why eviction calls the leg-dropper directly
+            // rather than going through [`Self::reset_books_for_markets`]: that would add a full
+            // `book_order` scan per evicted market, on the ingest hot path, to remove a key that
+            // is already gone.
+            self.drop_market_state(&old);
             self.vm(&old.0).book_markets_evicted.inc();
         }
         self.book_order.push_back(key.clone());
@@ -941,7 +948,7 @@ impl Arbiter {
         if let Some(replay) = &self.book_replay {
             model::lock(replay).insert(key.clone(), acc.clone());
         }
-        acc.baselined().then(|| acc.to_book(&key.0, key.1, key.2))
+        acc.baselined().then(|| acc.to_book(&key.0, key.2, key.3))
     }
 
     /// Drop one market's tracked `book` state — the session-reset seam, mirroring
@@ -952,12 +959,88 @@ impl Arbiter {
     /// emitting arm and channel and reports those markets unhealthy, which hands them to the peer arm
     /// rather than tearing down a live arm's published book.
     pub fn reset_book_for_market(&mut self, key: &MarketKey) {
+        // Delegated, not re-implemented: [`Self::reset_books_for_markets`] is the single expression
+        // of the drop, so the pairing cannot drift between a single-key and a batch path. The cost
+        // is unchanged — this path always scanned `book_order` once (`retain`) — plus one
+        // one-element `HashSet`, which is not on any hot path (this is the session-reset seam).
+        self.reset_books_for_markets(std::slice::from_ref(key));
+    }
+
+    /// The single expression of the **three-way drop**: the per-arm accumulators (`book_markets`),
+    /// the shared replay entry and `StickyAuthority`'s `last_admitted`, for a batch of keys —
+    /// [`Self::reset_book_for_market`] is one key through
+    /// here and [`Self::forget_channel_books`] is a channel's worth.
+    ///
+    /// The three legs **must** drop together: losing `last_admitted` is what forces the consumer
+    /// re-baseline, so a replay entry deleted without it leaves a market that never re-baselines and
+    /// stays invisible to every new client. Adding a fourth leg is an edit here (and in
+    /// [`Self::drop_market_state`], which eviction shares) rather than a thing to remember in three
+    /// places.
+    ///
+    /// `book_order`'s cleanup is one linear scan over the whole queue, not one scan per key: a
+    /// per-key `retain` is O(`book_order.len()`), so a loop over N keys is O(`N *
+    /// book_order.len()`), which is real money at [`MAX_BOOK_MARKETS`] scale — shedding most of a
+    /// channel's markets (the common floor-narrowing case: a handful of channels admitted out of
+    /// dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for tens
+    /// of milliseconds to seconds.
+    fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let doomed: HashSet<&MarketKey> = keys.iter().collect();
+        for key in keys {
+            self.drop_market_state(key);
+        }
+        self.book_order.retain(|k| !doomed.contains(k));
+    }
+
+    /// Drop one market's three paired legs — accumulators, replay entry, `last_admitted` — and
+    /// nothing else. Every path that discards a market's `book` state goes through here (batch
+    /// reset, single reset via the batch, and eviction), which is what keeps the pairing written
+    /// once.
+    ///
+    /// `book_order` is deliberately **not** touched: it is the eviction queue, not one of the paired
+    /// legs, and its callers remove from it differently (eviction has already `pop_front`ed the key;
+    /// the reset paths filter the queue once for the whole batch). A residual entry there costs one
+    /// wasted `pop_front` at eviction time — [`Self::track_book_market`] tolerates a key that is
+    /// already gone — never corruption.
+    fn drop_market_state(&mut self, key: &MarketKey) {
         self.book_markets.remove(key);
-        self.book_order.retain(|k| k != key);
         if let Some(replay) = &self.book_replay {
             model::lock(replay).remove(key);
         }
         self.books.forget_market(key);
+    }
+
+    /// Drop **every** tracked `book` market on `(venue, category, channel)` — every
+    /// `instrument_id` under it — through [`Self::reset_books_for_markets`], so each one's
+    /// accumulator, replay entry and `StickyAuthority::last_admitted` drop together exactly as a
+    /// single-market reset does — one batch, so `book_order` is filtered once rather than once per
+    /// key (see that method's doc).
+    ///
+    /// The channel-departure seam (`ingest::reconcile`'s ingest-floor narrowing/removal) — a
+    /// different reason from `reset_book_for_market`'s "no venue-wide variant" note above, which is
+    /// about *EndOfSession*, a producer-side signal scoped to one arm/channel that must not tear
+    /// down a live peer arm's book. This is the opposite case: an operator-driven removal of a
+    /// channel this process has stopped ingesting altogether, so every market on it — across every
+    /// arm — is meant to go.
+    ///
+    /// **Never hand-delete from `self.book_replay` (or any caller reaching into a `BookSnapshot`
+    /// directly) instead of calling this.** `last_admitted` would be left behind: if the channel is
+    /// later restored and the same arm resumes, nothing forces a re-baseline, so
+    /// `apply_book_replay` recreates the replay entry with `baselined() == false`, and
+    /// `sinks/ws.rs`'s replay path then hides the market from every new client until the arm
+    /// happens to emit a `Clear` of its own accord.
+    pub fn forget_channel_books(&mut self, venue: &str, category: &str, channel: u32) -> usize {
+        let doomed: Vec<MarketKey> = self
+            .book_markets
+            .keys()
+            .filter(|k| k.0.as_ref() == venue && k.1.as_ref() == category && k.2 == channel)
+            .cloned()
+            .collect();
+        let dropped = doomed.len();
+        self.reset_books_for_markets(&doomed);
+        dropped
     }
 
     /// Advance the shared replay accumulator with an admitted batch, keeping it in step with the
@@ -970,8 +1053,7 @@ impl Arbiter {
             return;
         }
         model::lock(replay)
-            .entry(key.clone())
-            .or_insert_with(|| BookAccumulator::new(b.symbol.clone()))
+            .entry_or_insert_with(key, || BookAccumulator::new(b.symbol.clone()))
             .apply(b);
     }
 
@@ -982,13 +1064,24 @@ impl Arbiter {
     /// serves no `book` at all — matching it would poison `dz_arm_lead_ns` with edge-vs-public leads
     /// and could hand a venue's books to a source that publishes none. **Already tracked by the
     /// authority**: `observe_matched_lead` creates an arm entry for whatever it is handed, so an
-    /// untracked publisher (a peer feed row of the same venue, a forged source IP) would otherwise
-    /// spend one of the venue's eight admission slots and could displace a real mirror arm.
-    fn race_eligible(&self, venue: &str, publisher: Publisher) -> bool {
-        matches!(publisher, Publisher::Edge(_)) && self.books.tracks_arm(venue, publisher)
+    /// untracked publisher (a peer feed row of the same universe, a forged source IP) would otherwise
+    /// spend one of the universe's eight admission slots and could displace a real mirror arm.
+    fn race_eligible(&self, scope: &ScopeKey, publisher: Publisher) -> bool {
+        matches!(publisher, Publisher::Edge(_)) && self.books.tracks_arm(scope, publisher)
     }
 
-    /// Whether this arm currently serves a `Sticky` venue's tape.
+    /// Whether this arm currently serves a `Sticky` **universe**'s tape — one gate per
+    /// `(venue, category)`, never one per venue.
+    ///
+    /// Scope first, because it is what makes every rule below safe to state: a single Source ID can
+    /// carry instrument universes that mirror nothing of one another, and this gate exists to pick
+    /// one arm out of a set of *mirrors*. Keyed on the venue alone it would instead pick one arm
+    /// across disjoint universes and drop the other's whole stream — permanently, since the silence
+    /// handover needs the incumbent to stop and an incumbent streaming its own universe never does.
+    /// The symptom is empty candles for that universe, indistinguishable from a market that did not
+    /// trade. `Feed::category` is the registry's declaration of which rows mirror each other, and it
+    /// reaches here as an [`Arbiter::emit`] parameter rather than a wire field (PROTOCOL.md is a
+    /// consumer contract; this is producer-side keying).
     ///
     /// The reconciler's row ownership picks which *feed* prints; this picks which *arm* within it, and
     /// the `trade_id == 0` bypass below needs both. A sticky venue's arms share no trade-id space: one
@@ -999,7 +1092,7 @@ impl Arbiter {
     /// Four rules, each load-bearing:
     ///
     /// - **No dark start.** With no entry the first arm to print leads. A top-of-book-only deployment
-    ///   carries no `book` traffic, so `venue_leader` is `None` forever and electing first would drop
+    ///   carries no `book` traffic, so `scope_leader` is `None` forever and electing first would drop
     ///   the venue's whole tape.
     /// - **Corroborated beats uncorroborated.** A challenger the authority tracks displaces an
     ///   incumbent it does not, immediately. The incumbent slot is filled by whoever prints first, and
@@ -1020,20 +1113,34 @@ impl Arbiter {
     /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged source that
     /// prints first holds the tape until it goes quiet for a window — the same primitive
     /// [`StickyAuthority::admit`]'s no-dark-start already exposes for the `book` product, and not
-    /// closable without an identity the wire does not carry. And the gate is **venue-wide**: it assumes
-    /// the owning row's arms mirror one tape, so if they instead sharded prints between them the
-    /// non-serving arm's exclusive fills would be dropped. `dz_tape_arm_dropped_total` is what makes
-    /// either visible — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose
-    /// steady state here is the challenger's whole stream.
+    /// closable without an identity the wire does not carry. And the gate spans a whole **category**:
+    /// it assumes the rows sharing one carry mirrored tapes, so if two of them instead sharded prints
+    /// between them the non-serving arm's exclusive fills would be dropped — the registry's job is to
+    /// give sharded rows distinct categories. `dz_tape_arm_dropped_total` is what makes either visible
+    /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
+    /// here is the challenger's whole stream.
+    ///
+    /// The two `books` lookups below read the authority at the **same** `(venue, category)` grain
+    /// this gate runs at, so the deferral can only ever name an arm elected on *this* universe. While
+    /// [`StickyAuthority`] was venue-wide they could name an arm elected on a disjoint universe — a
+    /// stranger to this tape — and hand it prints it never makes.
     ///
     /// Applies to every publisher class uniformly, [`Publisher::PublicWs`] included; no `Sticky` venue
     /// has a public backstop today, and adding one needs this revisited.
-    fn tape_arm_admits(&mut self, t: &NormalizedTrade, publisher: Publisher) -> bool {
-        let elected = self.books.venue_leader(&t.venue);
-        let tracked = self.books.tracks_arm(&t.venue, publisher);
-        let Some(lead) = self.tape_leader.get_mut(&t.venue) else {
+    fn tape_arm_admits(
+        &mut self,
+        t: &NormalizedTrade,
+        publisher: Publisher,
+        category: &'static str,
+    ) -> bool {
+        // Interned, so the per-print key is two refcount bumps rather than an allocation. One key for
+        // the tape gate and the authority alike: they must not disagree about what a universe is.
+        let key: ScopeKey = (t.venue.clone(), category_arc(category));
+        let elected = self.books.scope_leader(&key);
+        let tracked = self.books.tracks_arm(&key, publisher);
+        let Some(lead) = self.tape_leader.get_mut(&key) else {
             self.tape_leader.insert(
-                t.venue.clone(),
+                key,
                 TapeLead {
                     arm: publisher,
                     last_ns: t.recv_ts_ns,
@@ -1044,7 +1151,7 @@ impl Arbiter {
         };
         let transfer = lead.arm != publisher;
         if transfer {
-            let displaces_uncorroborated = tracked && !self.books.tracks_arm(&t.venue, lead.arm);
+            let displaces_uncorroborated = tracked && !self.books.tracks_arm(&key, lead.arm);
             let new_election = elected == Some(publisher) && lead.honored_election != elected;
             let silent = t.recv_ts_ns.saturating_sub(lead.last_ns) > NO_ID_TAPE_HANDOVER_NS;
             if !(displaces_uncorroborated || new_election || silent) {
@@ -1089,9 +1196,12 @@ impl Arbiter {
 
     /// Pair this trade with the peer arm's copy and hand the signed lead to the authority — the only
     /// producer of the evidence [`StickyAuthority::close_window`] elects on.
-    fn observe_trade_race(&mut self, t: &NormalizedTrade, publisher: Publisher) {
+    ///
+    /// `scope` is the emitting row's `(venue, category)`: the election it feeds is per universe, so a
+    /// lead measured between two of one universe's mirrors must not be filed against another's arms.
+    fn observe_trade_race(&mut self, scope: &ScopeKey, t: &NormalizedTrade, publisher: Publisher) {
         let Some(m) = self.race.on_trade(
-            &t.venue,
+            scope,
             &t.symbol,
             t.price,
             t.size,
@@ -1101,14 +1211,13 @@ impl Arbiter {
         ) else {
             return;
         };
-        let Some(leader) = self.books.venue_leader(&t.venue) else {
+        let Some(leader) = self.books.scope_leader(scope) else {
             return;
         };
         let Some((challenger, lead_ns)) = m.lead_for(leader) else {
             return;
         };
-        self.books
-            .observe_matched_lead(&t.venue, challenger, lead_ns);
+        self.books.observe_matched_lead(scope, challenger, lead_ns);
         // A matched pair has a real winner either way, which is what makes `{winner="challenger"}`
         // reachable — unlike `Admit::Contest`'s structurally non-negative phase.
         self.vm(&t.venue).arm_lead[usize::from(lead_ns < 0)].observe(lead_ns.unsigned_abs() as f64);
@@ -1122,27 +1231,31 @@ impl Arbiter {
     /// admitted batch rather than in a burst of `O(markets)` clears for markets the new arm may not
     /// even speak for (93 of 1,239 instruments saw any update at all in 39 s on the live sports feed).
     pub fn close_authority_windows(&mut self) {
-        for (venue, _) in self.books.close_window(now_ns()) {
+        for ((venue, _category), _) in self.books.close_window(now_ns()) {
             metrics()
                 .arm_transfers
                 .with_label_values(&[venue.as_ref(), "margin"])
                 .inc();
         }
-        // `arm_label`, never `arm_ordinal`: labelling must not admit. `drain_unmatched`'s keys are
-        // every publisher that sent a trade for the venue, so minting here would spend the venue's
-        // admission slots on sources that never serve a book.
+        // Never `arm_ordinal` on either loop: labelling must not admit. `drain_unmatched`'s keys are
+        // every publisher that sent a trade for the scope, so minting here would spend that scope's
+        // eight admission slots on sources that never serve a book.
+        //
+        // The two lookups differ because their key sets do. `markets_held_all` is summed per venue
+        // (the gauge is labelled `{venue, arm}`), so its label is resolved across the venue's
+        // universes; the matcher is scope-keyed, so its label is the exact per-scope ordinal.
         for (venue, arm, held) in self.books.markets_held_all() {
-            let label = self.books.arm_label(&venue, arm);
+            let label = self.books.arm_label_in_venue(&venue, arm);
             metrics()
                 .arm_markets_held
                 .with_label_values(&[venue.as_ref(), label])
                 .set(held as i64);
         }
-        for ((venue, arm), n) in self.race.drain_unmatched() {
-            let label = self.books.arm_label(&venue, arm);
+        for ((scope, arm), n) in self.race.drain_unmatched() {
+            let label = self.books.arm_label(&scope, arm);
             metrics()
                 .arm_unmatched_trades
-                .with_label_values(&[venue.as_ref(), label])
+                .with_label_values(&[scope.0.as_ref(), label])
                 .inc_by(n);
         }
     }
@@ -1152,9 +1265,15 @@ impl Arbiter {
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
     ///
+    /// `category` is the emitting source's instrument **universe** (`ingest::feeds::Feed::category`,
+    /// supplied by the caller because it is a property of the *row*, not of the message). Only the
+    /// `Sticky` trade gate reads it, and it is deliberately a parameter rather than a field on the
+    /// wire types: those serialize into the WebSocket JSON, which PROTOCOL.md fixes as a consumer
+    /// contract, and a consumer has no use for a producer-side arbitration key.
+    ///
     /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
     /// increments a cached handle rather than doing a label-map lookup for each counter.
-    pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher) {
+    pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher, category: &'static str) {
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
@@ -1224,13 +1343,15 @@ impl Arbiter {
                 // Feed the cross-arm matcher BEFORE the `trade_id == 0` bypass returns: that sentinel
                 // is exactly what a FIX-sourced arm prints, so a call below it would never see the arm
                 // the election exists to judge.
-                if self.race_eligible(&t.venue, publisher) {
-                    self.observe_trade_race(t, publisher);
+                let scope: ScopeKey = (t.venue.clone(), category_arc(category));
+                if self.race_eligible(&scope, publisher) {
+                    self.observe_trade_race(&scope, t, publisher);
                 }
-                // Then the per-venue arm gate, for the same reason the `book` arm has one: a `Sticky`
-                // venue's two arms mirror one tape with no shared identity to collapse them on.
+                // Then the per-universe arm gate, for the same reason the `book` arm has one: a
+                // `Sticky` universe's two arms mirror one tape with no shared identity to collapse
+                // them on. Scoped by `(venue, category)`, not by venue — see `tape_arm_admits`.
                 let sticky = self.mode_for(&t.venue) == ArbitrationMode::Sticky;
-                if sticky && !self.tape_arm_admits(t, publisher) {
+                if sticky && !self.tape_arm_admits(t, publisher, category) {
                     metrics()
                         .tape_arm_dropped
                         .with_label_values(&[t.venue.as_ref()])
@@ -1390,11 +1511,15 @@ impl Arbiter {
             // are unrelated by construction — a consumer's book corrupts while every per-arm sequence
             // check the producer ran still passes.
             FeedMessage::Book(b) => {
-                let key: MarketKey = (b.venue.clone(), b.channel, b.instrument_id);
+                // The arbitration scope rides in on the key: one election per instrument universe,
+                // never one per venue (see `authority`'s module doc — a venue-wide election drops a
+                // disjoint universe's whole book stream).
+                let scope: ScopeKey = (b.venue.clone(), category_arc(category));
+                let key: MarketKey = (scope.0.clone(), scope.1.clone(), b.channel, b.instrument_id);
                 // Eligibility first, exactly as `admit` applies it: an arm past the authority's
-                // per-venue cap enters no map here either, so a forged source can neither be served
-                // nor evict a real market's state.
-                if self.books.arm_ordinal(&b.venue, publisher) == OTHER_ARM {
+                // per-universe cap enters no map here either, so a forged source can neither be
+                // served nor evict a real market's state.
+                if self.books.arm_ordinal(&scope, publisher) == OTHER_ARM {
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                     return;
                 }
@@ -1405,7 +1530,7 @@ impl Arbiter {
                     self.track_book_market(&key);
                 }
                 let prev = self.books.last_admitted(&key);
-                let leader_before = self.books.venue_leader(&b.venue);
+                let leader_before = self.books.scope_leader(&scope);
                 let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
                 // Accumulate the arm's stream whether or not it was admitted: a transfer republishes
                 // the new arm's current levels, which exist only if its copies were folded in all along.
@@ -1414,7 +1539,7 @@ impl Arbiter {
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                     return;
                 }
-                let leader_after = self.books.venue_leader(&b.venue);
+                let leader_after = self.books.scope_leader(&scope);
                 if let Some(reason) = transfer_reason(prev, leader_before, leader_after, publisher)
                 {
                     metrics()
@@ -1503,6 +1628,11 @@ pub fn lock(arbiter: &SharedArbiter) -> std::sync::MutexGuard<'_, Arbiter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The category every test that is not *about* categories emits under. Sharing one is the point:
+    /// the whole suite must behave exactly as it did before the tape gate was scoped, which is what
+    /// makes the two category tests below evidence of the scope change and not of a rewrite.
+    const TEST_CATEGORY: &str = "testcategory";
 
     #[test]
     fn quote_first_sample_admits() {
@@ -1616,7 +1746,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::model::{NormalizedQuote, NormalizedTrade, Side};
+    use crate::model::{BookReplay, NormalizedQuote, NormalizedTrade, Side};
 
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
@@ -1655,9 +1785,21 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // exact repeat -> dropped
-        a.emit(FeedMessage::Quote(quote(1000, 100.5, 101.0)), edge); // new content same tick -> kept
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // exact repeat -> dropped
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.5, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // new content same tick -> kept
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1000, 100.5)]);
     }
 
@@ -1671,15 +1813,21 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         // Steady state: edge opens tick 1000, public's copy at the same tick is dropped.
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
         a.emit(
             FeedMessage::Quote(quote(1000, 100.0, 101.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         );
         // Edge gaps: the public feed opens the next tick and fills in.
         a.emit(
             FeedMessage::Quote(quote(1001, 100.2, 101.2)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         );
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1001, 100.2)]);
     }
@@ -1696,6 +1844,9 @@ mod tests {
                 source: "HYPERLIQUID".into(),
                 source_id: 0,
                 symbol: "BTC".into(),
+                channel: 0,
+                instrument_id: 0,
+                category: "default".into(),
                 price: 100.0,
                 size: 1.0,
                 aggressor_side: Side::Buy,
@@ -1709,9 +1860,9 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(trade(7), edge);
-        a.emit(trade(7), Publisher::PublicWs); // same id from public -> dropped
-        a.emit(trade(8), Publisher::PublicWs);
+        a.emit(trade(7), edge, TEST_CATEGORY);
+        a.emit(trade(7), Publisher::PublicWs, TEST_CATEGORY); // same id from public -> dropped
+        a.emit(trade(8), Publisher::PublicWs, TEST_CATEGORY);
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
             if let FeedMessage::Trade(t) = &*m {
@@ -1727,6 +1878,9 @@ mod tests {
             source: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
+            channel: 0,
+            instrument_id: 0,
+            category: "default".into(),
             price: 0.62,
             size: 100.0,
             aggressor_side: Side::Buy,
@@ -1748,7 +1902,7 @@ mod tests {
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         for _ in 0..5 {
-            a.emit(FeedMessage::Trade(trade(0)), p);
+            a.emit(FeedMessage::Trade(trade(0)), p, TEST_CATEGORY);
         }
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -1776,13 +1930,13 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let (m, p) = t(a1);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         let (m, p) = t(a1);
-        a.emit(m, p); // the owner's own repeat is not a conflict
+        a.emit(m, p, TEST_CATEGORY); // the owner's own repeat is not a conflict
         assert_eq!(conflicts.get(), 0);
 
         let (m, p) = t(a2);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(
             conflicts.get(),
             1,
@@ -1820,22 +1974,22 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let (m, p) = t(a1, 1_000);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
 
         // Exactly at the window: a2 is still a concurrent second emitter, and a rejected challenger
         // must not refresh the incumbent's clock (or a burst of them would hold the tape open).
         let (m, p) = t(a2, 1_000 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(conflicts.get(), 1, "not yet past the window");
 
         // Past it: a2 inherits the tape...
         let (m, p) = t(a2, 1_001 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(conflicts.get(), 1, "a quiet tape hands over");
 
         // ...and keeps it, so its own later prints are its own.
         let (m, p) = t(a2, 1_002 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(
             conflicts.get(),
             1,
@@ -1844,7 +1998,7 @@ mod tests {
 
         // The previous owner returning while a2 is live is a conflict again.
         let (m, p) = t(a1, 1_003 + NO_ID_TAPE_HANDOVER_NS);
-        a.emit(m, p);
+        a.emit(m, p, TEST_CATEGORY);
         assert_eq!(conflicts.get(), 2, "two live emitters still conflict");
     }
 
@@ -1855,7 +2009,7 @@ mod tests {
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         for _ in 0..5 {
-            a.emit(FeedMessage::Trade(trade(77)), p);
+            a.emit(FeedMessage::Trade(trade(77)), p, TEST_CATEGORY);
         }
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -1872,8 +2026,16 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // identical duplicate -> dropped
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // identical duplicate -> dropped
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
     }
 
@@ -1886,8 +2048,16 @@ mod tests {
         let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), pub_a); // A opens the tick -> emit
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), pub_b); // B's mirror -> non-leader, dropped
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            pub_a,
+            TEST_CATEGORY,
+        ); // A opens the tick -> emit
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            pub_b,
+            TEST_CATEGORY,
+        ); // B's mirror -> non-leader, dropped
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
     }
 
@@ -1903,6 +2073,9 @@ mod tests {
                 source: "HYPERLIQUID".into(),
                 source_id: 0,
                 symbol: "BTC".into(),
+                channel: 0,
+                instrument_id: 0,
+                category: "default".into(),
                 price: 100.0,
                 size: 1.0,
                 aggressor_side: Side::Buy,
@@ -1916,8 +2089,8 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(trade(), edge);
-        a.emit(trade(), edge); // identical duplicate -> dropped
+        a.emit(trade(), edge, TEST_CATEGORY);
+        a.emit(trade(), edge, TEST_CATEGORY); // identical duplicate -> dropped
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
             if let FeedMessage::Trade(t) = &*m {
@@ -1941,9 +2114,14 @@ mod tests {
         a.emit(
             FeedMessage::Quote(quote(bogus_future, 1.0, 2.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         );
         // The real edge quote (at ~now) is not stale relative to the floor and still emits.
-        a.emit(FeedMessage::Quote(quote(now, 100.0, 101.0)), edge);
+        a.emit(
+            FeedMessage::Quote(quote(now, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        );
         assert_eq!(drain_quotes(&mut rx), vec![(now, 100.0)]);
     }
 
@@ -1954,12 +2132,21 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote(0, 100.0, 101.0)), edge); // bypass -> emitted, floor untouched
+        a.emit(
+            FeedMessage::Quote(quote(0, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // bypass -> emitted, floor untouched
         a.emit(
             FeedMessage::Quote(quote(0, 100.5, 101.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // also bypass -> emitted
-        a.emit(FeedMessage::Quote(quote(1000, 100.0, 101.0)), edge); // real tick still emits
+        a.emit(
+            FeedMessage::Quote(quote(1000, 100.0, 101.0)),
+            edge,
+            TEST_CATEGORY,
+        ); // real tick still emits
         assert_eq!(
             drain_quotes(&mut rx),
             vec![(0, 100.0), (0, 100.5), (1000, 100.0)]
@@ -2001,8 +2188,8 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         // Edge opens tick 1000 arriving at t=100; the public copy at the same tick arrives at t=150
         // -> contest, edge led the public copy by 50ns.
-        a.emit(mk(1000, 100, 100.0), edge);
-        a.emit(mk(1000, 150, 100.5), Publisher::PublicWs);
+        a.emit(mk(1000, 100, 100.0), edge, TEST_CATEGORY);
+        a.emit(mk(1000, 150, 100.5), Publisher::PublicWs, TEST_CATEGORY);
 
         let m = metrics();
         let edge_beats_public = m
@@ -2047,8 +2234,8 @@ mod tests {
         };
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk(100, 100.0), mirror_a); // A opens the tick
-        a.emit(mk(120, 100.0), mirror_b); // B's mirror copy loses by 20ns
+        a.emit(mk(100, 100.0), mirror_a, TEST_CATEGORY); // A opens the tick
+        a.emit(mk(120, 100.0), mirror_b, TEST_CATEGORY); // B's mirror copy loses by 20ns
 
         let m = metrics();
         let mirror_race = m.quote_lead_ns.with_label_values(&[venue, "edge", "edge"]);
@@ -2076,6 +2263,9 @@ mod tests {
                 source: venue.into(),
                 source_id: 0,
                 symbol: "BTC".into(),
+                channel: 0,
+                instrument_id: 0,
+                category: "default".into(),
                 price: 100.0,
                 size: 1.0,
                 aggressor_side: Side::Buy,
@@ -2089,8 +2279,8 @@ mod tests {
         };
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(trade(100), edge); // edge delivers id 7 first at t=100
-        a.emit(trade(175), Publisher::PublicWs); // public's copy loses by 75ns
+        a.emit(trade(100), edge, TEST_CATEGORY); // edge delivers id 7 first at t=100
+        a.emit(trade(175), Publisher::PublicWs, TEST_CATEGORY); // public's copy loses by 75ns
 
         let m = metrics();
         let edge_beats_public = m
@@ -2139,12 +2329,21 @@ mod tests {
         let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Depth(depth(0, vec![], vec![])), pub_a); // A opens tick 0 -> emit
-        a.emit(FeedMessage::Depth(depth(0, vec![], vec![])), pub_b); // B's identical anchor -> dropped
-                                                                     // A real later event re-advances the floor (no wedge from the latched 0 tick).
+        a.emit(
+            FeedMessage::Depth(depth(0, vec![], vec![])),
+            pub_a,
+            TEST_CATEGORY,
+        ); // A opens tick 0 -> emit
+        a.emit(
+            FeedMessage::Depth(depth(0, vec![], vec![])),
+            pub_b,
+            TEST_CATEGORY,
+        ); // B's identical anchor -> dropped
+           // A real later event re-advances the floor (no wedge from the latched 0 tick).
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         );
         assert_eq!(drain_depths(&mut rx), vec![(0, 0.0), (1000, 100.0)]);
     }
@@ -2162,22 +2361,27 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         ); // A leads tick 1000
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B mirror -> dropped
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[99.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B divergent same tick -> still dropped (non-leader)
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[101.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         ); // A's own new content same tick -> kept
         a.emit(
             FeedMessage::Depth(depth(1001, vec![[102.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B opens the next tick -> leads, kept
         assert_eq!(
             drain_depths(&mut rx),
@@ -2196,10 +2400,12 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(2000, vec![[100.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         );
         a.emit(
             FeedMessage::Depth(depth(1999, vec![[99.0, 1.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // older tick -> stale, dropped
         assert_eq!(drain_depths(&mut rx), vec![(2000, 100.0)]);
     }
@@ -2215,10 +2421,12 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(now + 3_600_000_000_000, vec![[1.0, 1.0]], vec![])),
             edge,
+            TEST_CATEGORY,
         ); // 1h ahead -> rejected
         a.emit(
             FeedMessage::Depth(depth(now, vec![[100.0, 1.0]], vec![])),
             edge,
+            TEST_CATEGORY,
         );
         assert_eq!(drain_depths(&mut rx), vec![(now, 100.0)]);
     }
@@ -2240,8 +2448,8 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         // A opens tick 1000 at t=200; B's copy of the same tick arrives at t=290 -> contest, A led 90.
-        a.emit(mk(200, 100.0), pub_a);
-        a.emit(mk(290, 100.5), pub_b);
+        a.emit(mk(200, 100.0), pub_a, TEST_CATEGORY);
+        a.emit(mk(290, 100.5), pub_b, TEST_CATEGORY);
 
         let m = metrics();
         let a_beats_b = m.depth_lead_ns.with_label_values(&[venue, "edge", "edge"]);
@@ -2266,10 +2474,12 @@ mod tests {
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[100.0, 1.0]], vec![])),
             pub_a,
+            TEST_CATEGORY,
         ); // A leads tick 1000 -> admitted, recorded
         a.emit(
             FeedMessage::Depth(depth(1000, vec![[99.0, 2.0]], vec![])),
             pub_b,
+            TEST_CATEGORY,
         ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
         let map = model::lock(&replay);
         let entry = map
@@ -2301,9 +2511,9 @@ mod tests {
         let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);
         a.set_depth_replay(replay.clone());
-        a.emit(mk("VenueA", "BTC"), edge);
-        a.emit(mk("VenueA", "ETH"), edge);
-        a.emit(mk("VenueB", "BTC"), edge);
+        a.emit(mk("VenueA", "BTC"), edge, TEST_CATEGORY);
+        a.emit(mk("VenueA", "ETH"), edge, TEST_CATEGORY);
+        a.emit(mk("VenueB", "BTC"), edge, TEST_CATEGORY);
         assert_eq!(model::lock(&replay).len(), 3);
 
         a.reset_depth_floor_for_symbol("VenueA", "BTC", "instrument_reset");
@@ -2344,10 +2554,10 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk(5000, 100.0), edge); // latches high_water at 5000
-        a.emit(mk(100, 99.0), edge); // post-restart lower tick -> stale, dropped (the wedge)
+        a.emit(mk(5000, 100.0), edge, TEST_CATEGORY); // latches high_water at 5000
+        a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // post-restart lower tick -> stale, dropped (the wedge)
         a.reset_depth_floor_for_venue(venue, "end_of_session");
-        a.emit(mk(100, 99.0), edge); // floor cleared -> re-opens the tick, admitted
+        a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // floor cleared -> re-opens the tick, admitted
         let ts: Vec<u64> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
@@ -2380,11 +2590,11 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk("VenueA", 5000), edge);
-        a.emit(mk("VenueB", 5000), edge);
+        a.emit(mk("VenueA", 5000), edge, TEST_CATEGORY);
+        a.emit(mk("VenueB", 5000), edge, TEST_CATEGORY);
         a.reset_depth_floor_for_venue("VenueA", "end_of_session");
-        a.emit(mk("VenueA", 100), edge); // cleared -> admitted
-        a.emit(mk("VenueB", 100), edge); // untouched -> still stale, dropped
+        a.emit(mk("VenueA", 100), edge, TEST_CATEGORY); // cleared -> admitted
+        a.emit(mk("VenueB", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
@@ -2417,11 +2627,11 @@ mod tests {
         };
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(mk("BTC", 5000), edge);
-        a.emit(mk("ETH", 5000), edge);
+        a.emit(mk("BTC", 5000), edge, TEST_CATEGORY);
+        a.emit(mk("ETH", 5000), edge, TEST_CATEGORY);
         a.reset_depth_floor_for_symbol("HYPERLIQUID", "BTC", "instrument_reset");
-        a.emit(mk("BTC", 100), edge); // cleared -> admitted
-        a.emit(mk("ETH", 100), edge); // untouched -> still stale, dropped
+        a.emit(mk("BTC", 100), edge, TEST_CATEGORY); // cleared -> admitted
+        a.emit(mk("ETH", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
             let mut out = Vec::new();
             while let Ok(m) = rx.try_recv() {
@@ -2527,19 +2737,41 @@ mod tests {
         let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.0)), edge_a); // edge opens tick 1000
-        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.5)), edge_a); // in-tick content: no re-count
-        a.emit(FeedMessage::Quote(quote_at(venue, 1000, 100.0)), edge_b); // mirror copy: no count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // edge opens tick 1000
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.5)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // in-tick content: no re-count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
+            edge_b,
+            TEST_CATEGORY,
+        ); // mirror copy: no count
         a.emit(
             FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // late public copy: no count
         a.emit(
             FeedMessage::Quote(quote_at(venue, 2000, 101.0)),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // public opens tick 2000
-        a.emit(FeedMessage::Quote(quote_at(venue, 3000, 102.0)), edge_a); // walkover tick 3000
-        a.emit(FeedMessage::Quote(quote_at(venue, 0, 99.0)), edge_a); // sentinel: bypass, no count
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 3000, 102.0)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // walkover tick 3000
+        a.emit(
+            FeedMessage::Quote(quote_at(venue, 0, 99.0)),
+            edge_a,
+            TEST_CATEGORY,
+        ); // sentinel: bypass, no count
         let m = crate::metrics::metrics();
         assert_eq!(
             m.quote_ticks_won.with_label_values(&[venue, "edge"]).get(),
@@ -2567,15 +2799,25 @@ mod tests {
         let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(FeedMessage::Depth(depth_at(0, vec![])), edge_a); // A's empty anchor opens tick 0
-        a.emit(FeedMessage::Depth(depth_at(0, vec![])), edge_b); // B's identical anchor: no re-count
+        a.emit(
+            FeedMessage::Depth(depth_at(0, vec![])),
+            edge_a,
+            TEST_CATEGORY,
+        ); // A's empty anchor opens tick 0
+        a.emit(
+            FeedMessage::Depth(depth_at(0, vec![])),
+            edge_b,
+            TEST_CATEGORY,
+        ); // B's identical anchor: no re-count
         a.emit(
             FeedMessage::Depth(depth_at(1000, vec![[100.0, 1.0]])),
             edge_b,
+            TEST_CATEGORY,
         ); // B opens tick 1000
         a.emit(
             FeedMessage::Depth(depth_at(2000, vec![[100.0, 2.0]])),
             Publisher::PublicWs,
+            TEST_CATEGORY,
         ); // public opens tick 2000
         let m = crate::metrics::metrics();
         assert_eq!(
@@ -2638,6 +2880,7 @@ mod tests {
             symbol: symbol.into(),
             channel: 0,
             instrument_id,
+            category: "default".into(),
             price_exponent,
             qty_exponent,
         })
@@ -2664,12 +2907,12 @@ mod tests {
         let peer = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(instrument(1, "BTC", -2, -4), edge);
-        a.emit(instrument(1, "BTC", -2, -4), edge); // same publisher's next burst -> dropped
-        a.emit(instrument(1, "BTC", -2, -4), peer); // mirror's copy -> dropped
-        a.emit(instrument(2, "ETH", -2, -4), edge); // different symbol -> kept
-        a.emit(instrument(1, "BTC", -3, -4), peer); // real precision change -> kept
-        a.emit(instrument(1, "BTC", -3, -4), edge); // ...then deduped at the new content
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY); // same publisher's next burst -> dropped
+        a.emit(instrument(1, "BTC", -2, -4), peer, TEST_CATEGORY); // mirror's copy -> dropped
+        a.emit(instrument(2, "ETH", -2, -4), edge, TEST_CATEGORY); // different symbol -> kept
+        a.emit(instrument(1, "BTC", -3, -4), peer, TEST_CATEGORY); // real precision change -> kept
+        a.emit(instrument(1, "BTC", -3, -4), edge, TEST_CATEGORY); // ...then deduped at the new content
         assert_eq!(
             drain_instruments(&mut rx),
             vec![
@@ -2689,22 +2932,22 @@ mod tests {
         let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
-        a.emit(instrument(1, "BTC", -2, -4), edge);
-        a.emit(instrument(1, "BTC", -2, -4), edge); // inside the interval -> collapsed
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY); // inside the interval -> collapsed
         assert_eq!(drain_instruments(&mut rx).len(), 1);
 
         // Backdate the last-broadcast stamp past the interval rather than sleeping 30s.
         for (_, last) in a.instrument_defs.values_mut() {
             *last = last.saturating_sub(INSTRUMENT_REANNOUNCE_NS);
         }
-        a.emit(instrument(1, "BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
         assert_eq!(
             drain_instruments(&mut rx),
             vec![("BTC".to_string(), -2, -4)],
             "unchanged content must be re-announced once the interval elapses"
         );
         // ...and the clock restarts, so the next mirror copy collapses again.
-        a.emit(instrument(1, "BTC", -2, -4), edge);
+        a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
         assert!(drain_instruments(&mut rx).is_empty());
     }
 
@@ -2714,6 +2957,22 @@ mod tests {
 
     const BOOK_CHANNEL: u32 = 2;
     const BOOK_INSTRUMENT: u32 = 41;
+
+    /// The arbitration scope every book test runs in: one venue, one instrument universe.
+    fn bscope(venue: &str) -> ScopeKey {
+        (Arc::from(venue), TEST_CATEGORY.into())
+    }
+
+    /// The authority's key for `(venue, TEST_CATEGORY, BOOK_CHANNEL, instrument)` — what the gate
+    /// itself builds for a batch `book()` produces.
+    fn mkey(venue: &str, instrument_id: u32) -> MarketKey {
+        (
+            Arc::from(venue),
+            TEST_CATEGORY.into(),
+            BOOK_CHANNEL,
+            instrument_id,
+        )
+    }
 
     fn arm(n: u8) -> Publisher {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
@@ -2775,6 +3034,7 @@ mod tests {
         a.emit(
             book(venue, instrument_id, vec![clear_both()], true, recv_ns),
             publisher,
+            TEST_CATEGORY,
         );
     }
 
@@ -2810,8 +3070,8 @@ mod tests {
             t.recv_ts_ns = 10_000 + i * 1_000_000;
             let mut peer = t.clone();
             peer.recv_ts_ns = t.recv_ts_ns + 50_000;
-            a.emit(FeedMessage::Trade(t), fast);
-            a.emit(FeedMessage::Trade(peer), slow);
+            a.emit(FeedMessage::Trade(t), fast, TEST_CATEGORY);
+            a.emit(FeedMessage::Trade(peer), slow, TEST_CATEGORY);
         }
     }
 
@@ -2839,10 +3099,12 @@ mod tests {
             a.emit(
                 book("KALSHI", BOOK_INSTRUMENT, vec![bid(px, 10.0)], true, 1_100),
                 arm(1),
+                TEST_CATEGORY,
             );
             a.emit(
                 book("KALSHI", BOOK_INSTRUMENT, vec![bid(px, 99.0)], true, 1_101),
                 arm(2),
+                TEST_CATEGORY,
             );
         }
         let out = drain_books(&mut rx);
@@ -2870,6 +3132,7 @@ mod tests {
                         1_100,
                     ),
                     p,
+                    TEST_CATEGORY,
                 );
             }
         }
@@ -2878,20 +3141,28 @@ mod tests {
         assert!(out.iter().all(|b| b.changes[0].size == 10.0));
     }
 
-    /// Authority is venue-wide (per the amended `StickyAuthority`), so the arm that won the venue
-    /// serves every market — including one a challenger got to first.
+    /// Authority spans a universe (per `StickyAuthority`), so the arm that won it serves every market
+    /// in that universe — including one a challenger got to first.
     #[test]
-    fn book_authority_is_venue_wide_across_markets() {
+    fn book_authority_spans_the_universe_across_markets() {
         let venue = "BookVenueWide";
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         for id in [42, 43] {
             // The challenger speaks first for a market the leader has never sent for.
-            a.emit(book(venue, id, vec![bid(0.40, 99.0)], true, 1_100), arm(2));
+            a.emit(
+                book(venue, id, vec![bid(0.40, 99.0)], true, 1_100),
+                arm(2),
+                TEST_CATEGORY,
+            );
             assert!(
                 drain_books(&mut rx).is_empty(),
                 "market {id}: a challenger must not take a market by getting there first"
             );
-            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_101), arm(1));
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_101),
+                arm(1),
+                TEST_CATEGORY,
+            );
             // A market's first admitted batch re-baselines too, and this arm has sent no producer
             // re-baseline for it, so the honest re-baseline is a bare clear ahead of the batch.
             let out = drain_books(&mut rx);
@@ -2906,7 +3177,7 @@ mod tests {
     #[test]
     fn book_replay_accumulates_the_authoritative_arm() {
         let venue = "BookReplayLeader";
-        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
@@ -2914,14 +3185,16 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 99.0)], true, 1_101),
             arm(2),
+            TEST_CATEGORY,
         );
         let guard = model::lock(&replay);
         let acc = guard
-            .get(&(Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT))
+            .get(&mkey(venue, BOOK_INSTRUMENT))
             .expect("the admitted market is in the replay map");
         let full = acc.to_book(&Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
         assert_eq!(
@@ -2941,6 +3214,7 @@ mod tests {
             a.emit(
                 book(venue, BOOK_INSTRUMENT, vec![bid(0.40, size)], true, 1_100),
                 arm(1),
+                TEST_CATEGORY,
             );
         }
         assert_eq!(
@@ -2972,10 +3246,12 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
             arm(2),
+            TEST_CATEGORY,
         );
         assert_eq!(drain_books(&mut rx).len(), 1);
 
@@ -2986,6 +3262,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 11.0)], true, 2_000),
             arm(1),
+            TEST_CATEGORY,
         );
         assert!(
             drain_books(&mut rx).is_empty(),
@@ -2995,6 +3272,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 66.0)], true, 2_100),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(out.len(), 1, "one re-baseline, not a batch plus a clear");
@@ -3021,15 +3299,17 @@ mod tests {
             .arm_transfers
             .with_label_values(&[venue, "health"]);
         let before = health.get();
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
             arm(2),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
 
@@ -3037,6 +3317,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 66.0)], true, 1_200),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(out.len(), 1);
@@ -3045,7 +3326,7 @@ mod tests {
             vec![clear_both(), bid(0.42, 66.0), bid(0.40, 55.0)]
         );
         assert_eq!(
-            a.books.venue_leader(venue),
+            a.books.scope_leader(&bscope(venue)),
             Some(arm(1)),
             "the venue is untouched"
         );
@@ -3058,11 +3339,12 @@ mod tests {
     #[test]
     fn a_rebaseline_waits_for_the_event_boundary() {
         let venue = "BookRebaselineBoundary";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
         a.set_book_health(&key, arm(1), false);
@@ -3070,6 +3352,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 20.0)], false, 1_200),
             arm(2),
+            TEST_CATEGORY,
         );
         assert!(
             drain_books(&mut rx).is_empty(),
@@ -3078,6 +3361,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 30.0)], true, 1_201),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(out.len(), 1);
@@ -3094,11 +3378,12 @@ mod tests {
     #[test]
     fn an_unterminated_event_does_not_withhold_forever() {
         let venue = "BookUnterminated";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
         a.set_book_health(&key, arm(1), false);
@@ -3113,6 +3398,7 @@ mod tests {
                     1_200,
                 ),
                 arm(2),
+                TEST_CATEGORY,
             );
         }
         let out = drain_books(&mut rx);
@@ -3130,7 +3416,7 @@ mod tests {
     #[test]
     fn a_mid_stream_arm_rebaselines_with_a_bare_clear() {
         let venue = "BookMidStreamArm";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         synced(&mut a, venue, BOOK_INSTRUMENT, arm(1), 1_000);
@@ -3138,6 +3424,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_100),
             arm(2),
+            TEST_CATEGORY,
         );
         let _ = drain_books(&mut rx);
 
@@ -3145,6 +3432,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 66.0)], true, 1_200),
             arm(2),
+            TEST_CATEGORY,
         );
         let out = drain_books(&mut rx);
         assert_eq!(
@@ -3168,12 +3456,12 @@ mod tests {
         let (mut a, _rx) = gated(venue, sticky_cfg());
         race_trades(&mut a, venue, Publisher::PublicWs, arm(1), 20);
         a.close_authority_windows();
-        assert!(!a.books.tracks_arm(venue, Publisher::PublicWs));
-        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        assert!(!a.books.tracks_arm(&bscope(venue), Publisher::PublicWs));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(1)));
     }
 
     /// A trade publisher the authority does not track — a peer feed row of the same venue, or a forged
-    /// source IP — must not spend one of the venue's eight admission slots through the metrics path.
+    /// source IP — must not spend one of the universe's eight admission slots through the metrics path.
     /// Once they are gone a real mirror arm is ineligible and the venue can never fail over.
     #[test]
     fn an_untracked_trade_publisher_never_becomes_an_arm() {
@@ -3182,36 +3470,40 @@ mod tests {
         for n in 20..40u8 {
             let mut t = trade(u64::from(n));
             t.venue = venue.into();
-            a.emit(FeedMessage::Trade(t), arm(n));
+            a.emit(FeedMessage::Trade(t), arm(n), TEST_CATEGORY);
         }
         a.close_authority_windows();
         for n in 20..40u8 {
-            assert!(!a.books.tracks_arm(venue, arm(n)), "arm {n} was admitted");
+            assert!(
+                !a.books.tracks_arm(&bscope(venue), arm(n)),
+                "arm {n} was admitted"
+            );
             assert_eq!(
-                a.books.arm_label(venue, arm(n)),
+                a.books.arm_label(&bscope(venue), arm(n)),
                 crate::ingest::authority::OTHER_ARM
             );
         }
         // ...and a third real arm still gets a slot.
         assert_ne!(
-            a.books.arm_ordinal(venue, arm(3)),
+            a.books.arm_ordinal(&bscope(venue), arm(3)),
             crate::ingest::authority::OTHER_ARM
         );
     }
 
-    /// An arm past the authority's per-venue cap enters no per-market map, so a forged source can
+    /// An arm past the authority's per-universe cap enters no per-market map, so a forged source can
     /// neither be served nor evict a real market's book state through the gate.
     #[test]
     fn an_ineligible_arm_creates_no_book_state() {
         let venue = "BookIneligibleArm";
         let (mut a, _rx) = gated(venue, AuthorityConfig::default());
         for n in 3..=8 {
-            a.books.arm_ordinal(venue, arm(n)); // fill the eight labelled slots
+            a.books.arm_ordinal(&bscope(venue), arm(n)); // fill the eight labelled slots
         }
         let before = a.book_markets.len();
         a.emit(
             book(venue, 777, vec![bid(0.40, 10.0)], true, 1_100),
             arm(200),
+            TEST_CATEGORY,
         );
         assert_eq!(a.book_markets.len(), before, "no market was tracked for it");
     }
@@ -3230,7 +3522,7 @@ mod tests {
         let mut t = trade(id);
         t.venue = venue.into();
         t.recv_ts_ns = recv_ts_ns;
-        a.emit(FeedMessage::Trade(t), p);
+        a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
     }
 
     fn drain_trades(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> usize {
@@ -3302,8 +3594,9 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
-        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(1)));
         let _ = drain_books(&mut rx);
         let _ = drain_trades(&mut rx);
 
@@ -3322,8 +3615,8 @@ mod tests {
         let (mut a, mut rx) = gated(venue, sticky_cfg());
         a.set_mode(venue, ArbitrationMode::Sticky);
         let squatter = arm(200);
-        assert!(!a.books.tracks_arm(venue, squatter));
-        assert!(a.books.tracks_arm(venue, arm(1)));
+        assert!(!a.books.tracks_arm(&bscope(venue), squatter));
+        assert!(a.books.tracks_arm(&bscope(venue), arm(1)));
 
         tape_print(&mut a, venue, squatter, 1, 2_000);
         let _ = drain_trades(&mut rx);
@@ -3345,8 +3638,9 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
-        assert_eq!(a.books.venue_leader(venue), Some(arm(1)));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(1)));
         let _ = drain_books(&mut rx);
         let _ = drain_trades(&mut rx);
 
@@ -3376,6 +3670,7 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         tape_print(&mut a, venue, arm(2), 0, 2_000); // opens the tape
         tape_print(&mut a, venue, arm(1), 0, 2_001); // the elected arm takes it over
@@ -3383,6 +3678,59 @@ mod tests {
             tape_print(&mut a, venue, arm(1), 0, 2_002 + i);
         }
         assert_eq!(conflicts.get(), before);
+    }
+
+    /// An `Arbiter` whose one `Sticky` venue is the venue both category tests print under. No book
+    /// traffic, so the authority elects nobody and the tape gate is on its own — the shape of a
+    /// deployment where one Source ID carries two universes.
+    fn arbiter() -> Arbiter {
+        let (tx, _rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_mode("KALSHI", ArbitrationMode::Sticky);
+        a
+    }
+
+    /// One print from `p` for `(venue, category)`, returning whether it reached the wire. The
+    /// receiver is subscribed immediately before the emit, so it observes this print alone.
+    fn tape_print_in(
+        a: &mut Arbiter,
+        venue: &str,
+        category: &'static str,
+        p: Publisher,
+        id: u64,
+        recv_ts_ns: u64,
+    ) -> bool {
+        let mut rx = a.sender().subscribe();
+        let mut t = trade(id);
+        t.venue = venue.into();
+        t.recv_ts_ns = recv_ts_ns;
+        a.emit(FeedMessage::Trade(t), p, category);
+        matches!(rx.try_recv(), Ok(m) if matches!(&*m, FeedMessage::Trade(_)))
+    }
+
+    /// The arm gate is per `(venue, category)`. Two publishers on disjoint universes are not
+    /// competing for one tape, so neither may mute the other — a venue-wide gate drops the
+    /// loser's prints forever, since a continuously-printing incumbent never goes silent.
+    #[test]
+    fn an_arm_on_another_category_does_not_take_the_tape() {
+        let mut a = arbiter();
+        tape_print_in(&mut a, "KALSHI", "perps", arm(1), 1, 1_000);
+        let admitted = tape_print_in(&mut a, "KALSHI", "sports", arm(2), 2, 1_001);
+        assert!(
+            admitted,
+            "a sports print was dropped by the perps tape leader"
+        );
+        // ...and the perps arm keeps its own tape rather than being displaced by the sports arm.
+        assert!(tape_print_in(&mut a, "KALSHI", "perps", arm(1), 3, 1_002));
+    }
+
+    /// Within one category the sticky single-arm gate is unchanged: the second arm is dropped
+    /// while the incumbent keeps printing.
+    #[test]
+    fn a_peer_arm_in_the_same_category_is_still_dropped() {
+        let mut a = arbiter();
+        assert!(tape_print_in(&mut a, "KALSHI", "perps", arm(1), 1, 1_000));
+        assert!(!tape_print_in(&mut a, "KALSHI", "perps", arm(2), 2, 1_001));
     }
 
     /// The gate is `Sticky`-only, so every `Coordinated` venue keeps the id-keyed behaviour: two arms'
@@ -3409,6 +3757,7 @@ mod tests {
             a.emit(
                 book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 99.0)], true, 1_100),
                 arm(2),
+                TEST_CATEGORY,
             );
         }
         assert_eq!(dropped.get(), before + 3);
@@ -3421,11 +3770,15 @@ mod tests {
     fn book_markets_are_bounded() {
         let venue = "BookMarketCap";
         let (tx, _rx) = broadcast::channel(1);
-        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_book_replay(replay.clone());
         for id in 0..(MAX_BOOK_MARKETS as u32 + 64) {
-            a.emit(book(venue, id, vec![bid(0.40, 10.0)], true, 1_000), arm(1));
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_000),
+                arm(1),
+                TEST_CATEGORY,
+            );
         }
         assert_eq!(a.book_markets.len(), MAX_BOOK_MARKETS);
         assert_eq!(a.book_order.len(), MAX_BOOK_MARKETS);
@@ -3441,13 +3794,108 @@ mod tests {
         );
     }
 
+    /// The WS-replay map is keyed at the **same grain** as the market key, and eviction is what makes
+    /// that load-bearing rather than cosmetic. Two universes under one Source ID have independent id
+    /// spaces, so they can carry the same `(channel, instrument_id)`. Under a venue-grained replay key
+    /// they share one entry, and evicting one universe's market deletes the **other's live** entry
+    /// while its `book_markets` and `last_admitted` survive — so it never re-baselines, its rebuilt
+    /// entry stays `!baselined()`, and it is invisible to every client that connects from then on.
+    #[test]
+    fn evicting_one_universes_market_spares_the_others_replay_entry() {
+        let venue = "BookEvictionAcrossUniverses";
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+
+        // The same wire identity in two universes, each with a producer re-baseline of its own so
+        // both replay entries are complete.
+        let doomed: MarketKey = (
+            Arc::from(venue),
+            "perps".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        let kept: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        for category in ["perps", "sports"] {
+            // The producer's opening re-baseline, in this universe (`synced` is TEST_CATEGORY-bound).
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000),
+                arm(1),
+                category,
+            );
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_001),
+                arm(1),
+                category,
+            );
+        }
+        assert!(
+            model::lock(&replay)
+                .get(&kept)
+                .is_some_and(|acc| acc.baselined()),
+            "both universes start with a complete replay entry"
+        );
+
+        // Fill to the cap and one past it. `doomed` was tracked first, so it is the single eviction.
+        for id in 0..(MAX_BOOK_MARKETS as u32 - 1) {
+            a.emit(
+                book(venue, 1_000 + id, vec![bid(0.40, 10.0)], true, 1_100),
+                arm(1),
+                "perps",
+            );
+        }
+        let guard = model::lock(&replay);
+        assert!(
+            !guard.contains_key(&doomed),
+            "the oldest market was evicted, replay entry included"
+        );
+        assert!(
+            guard.get(&kept).is_some_and(|acc| acc.baselined()),
+            "the peer universe's live, complete replay entry must survive that eviction"
+        );
+    }
+
+    /// An evicted market's replay entry is gone with nothing left behind: a stale entry would have
+    /// `/v1/products` report a `market_by_price` book for a market that no longer exists.
+    #[test]
+    fn an_evicted_market_is_unreachable_by_full_key() {
+        let venue = "BookEvictionIndex";
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+        for id in 0..(MAX_BOOK_MARKETS as u32 + 1) {
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_000),
+                arm(1),
+                TEST_CATEGORY,
+            );
+        }
+        let guard = model::lock(&replay);
+        assert_eq!(guard.len(), MAX_BOOK_MARKETS, "one market was evicted");
+        assert!(
+            guard.get(&mkey(venue, 0)).is_none(),
+            "the evicted market must not still be reachable"
+        );
+        assert!(
+            guard.get(&mkey(venue, MAX_BOOK_MARKETS as u32)).is_some(),
+            "...while a live one still is"
+        );
+    }
+
     /// Eviction drops the authority's record of who served a market, and that is what keeps it safe:
     /// the market's next batch reads as a change of serving arm and re-baselines the consumer instead
     /// of resuming an unrelated delta series on top of its state.
     #[test]
     fn an_evicted_market_rebaselines_rather_than_resuming() {
         let venue = "BookEvictionRebaseline";
-        let key: MarketKey = (Arc::from(venue), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, _rx) = gated(venue, AuthorityConfig::default());
         assert_eq!(a.books.last_admitted(&key), Some(arm(1)));
 
@@ -3458,11 +3906,379 @@ mod tests {
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
             arm(1),
+            TEST_CATEGORY,
         );
         assert_eq!(
             drain_books(&mut rx)[0].changes[0].action,
             BookAction::Clear,
             "a market with no served-arm record must be re-baselined"
+        );
+    }
+
+    /// N2: `forget_channel_books` must drop all **three** legs of the pairing — the accumulator
+    /// (`book_markets`), the replay entry, and `StickyAuthority::last_admitted` — for every
+    /// instrument on the departed `(venue, category, channel)`, and leave a peer instrument on a
+    /// different category untouched in all three. Hand-deleting only the replay entry (the bug this
+    /// method exists to rule out) would leave `last_admitted` behind, which is exactly what a bare
+    /// `contains_key` check on the replay map alone cannot catch — so this asserts `last_admitted`
+    /// directly, not just replay-map absence.
+    #[test]
+    fn forget_channel_books_drops_the_full_pairing_and_spares_untouched_peers() {
+        let venue = "BookForgetChannel";
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+
+        // A second channel, same venue/category as the doomed markets — a still-running sibling
+        // channel. `book()` always stamps `BOOK_CHANNEL`, so this batch is built by hand.
+        const OTHER_CHANNEL: u32 = BOOK_CHANNEL + 1;
+        let book_on_channel = |channel: u32, instrument_id: u32, changes: Vec<BookChange>| {
+            FeedMessage::Book(NormalizedBook {
+                venue: venue.into(),
+                source: venue.into(),
+                source_id: 0,
+                symbol: "KXBTCPERP".into(),
+                channel,
+                instrument_id,
+                changes,
+                snapshot: false,
+                last: true,
+                source_ts_ns: 1_000,
+                recv_ts_ns: 1_000,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            })
+        };
+
+        // Two instruments on the doomed (venue, "sports", BOOK_CHANNEL), each fully re-baselined.
+        for id in [BOOK_INSTRUMENT, BOOK_INSTRUMENT + 1] {
+            a.emit(
+                book(venue, id, vec![clear_both()], true, 1_000),
+                arm(1),
+                "sports",
+            );
+            a.emit(
+                book(venue, id, vec![bid(0.40, 10.0)], true, 1_001),
+                arm(1),
+                "sports",
+            );
+        }
+        // Peer 1: a different **category**, same venue/channel/instrument_id as the first doomed
+        // market — the exact collision this crate's docs warn about. Deleting the category term
+        // from `forget_channel_books`'s filter would wrongly sweep this one up too.
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000),
+            arm(1),
+            "perps",
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.50, 5.0)], true, 1_001),
+            arm(1),
+            "perps",
+        );
+        // Peer 2: a different **channel**, same venue/category as the doomed markets. Deleting the
+        // channel term from the filter would wrongly sweep this still-running sibling channel up
+        // too — the failure mode a single-channel fixture cannot express.
+        a.emit(
+            book_on_channel(OTHER_CHANNEL, BOOK_INSTRUMENT, vec![clear_both()]),
+            arm(1),
+            "sports",
+        );
+        a.emit(
+            book_on_channel(OTHER_CHANNEL, BOOK_INSTRUMENT, vec![bid(0.60, 7.0)]),
+            arm(1),
+            "sports",
+        );
+
+        let doomed_a: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        let doomed_b: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT + 1,
+        );
+        let peer_category: MarketKey = (
+            Arc::from(venue),
+            "perps".into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+        let peer_channel: MarketKey = (
+            Arc::from(venue),
+            "sports".into(),
+            OTHER_CHANNEL,
+            BOOK_INSTRUMENT,
+        );
+
+        assert_eq!(
+            a.books.last_admitted(&doomed_a),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            a.books.last_admitted(&doomed_b),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            a.books.last_admitted(&peer_category),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            a.books.last_admitted(&peer_channel),
+            Some(arm(1)),
+            "fixture sanity"
+        );
+        assert_eq!(
+            model::lock(&replay).len(),
+            4,
+            "fixture sanity: four distinct markets in the replay map"
+        );
+
+        let dropped = a.forget_channel_books(venue, "sports", BOOK_CHANNEL);
+        assert_eq!(
+            dropped, 2,
+            "exactly the two sports instruments on that channel"
+        );
+
+        // All three legs, for both doomed markets.
+        assert!(!a.book_markets.contains_key(&doomed_a));
+        assert!(!a.book_markets.contains_key(&doomed_b));
+        assert_eq!(
+            a.books.last_admitted(&doomed_a),
+            None,
+            "last_admitted must drop too"
+        );
+        assert_eq!(
+            a.books.last_admitted(&doomed_b),
+            None,
+            "last_admitted must drop too"
+        );
+        {
+            let guard = model::lock(&replay);
+            assert!(!guard.contains_key(&doomed_a));
+            assert!(!guard.contains_key(&doomed_b));
+        }
+
+        // Both peers survive in all three, checked by name so a category-blind purge and a
+        // channel-blind purge each fail on their own peer rather than one masking the other.
+        for (name, peer) in [
+            ("peer_category", &peer_category),
+            ("peer_channel", &peer_channel),
+        ] {
+            assert!(
+                a.book_markets.contains_key(peer),
+                "{name} must survive in book_markets"
+            );
+            assert_eq!(
+                a.books.last_admitted(peer),
+                Some(arm(1)),
+                "{name}'s authority record must survive"
+            );
+            assert!(
+                model::lock(&replay)
+                    .get(peer)
+                    .is_some_and(|acc| acc.baselined()),
+                "{name}'s replay entry must survive, complete"
+            );
+        }
+
+        // F4: the replay map must drop exactly the two doomed markets' entries and nothing else
+        // (the coverage `model::BookReplay::forget_channel`'s own test carried before this seam
+        // moved to the arbiter).
+        assert_eq!(
+            model::lock(&replay).len(),
+            2,
+            "the replay map must hold exactly the two surviving markets"
+        );
+    }
+
+    /// A `book` batch on an explicit `channel` (the `book()` helper always stamps `BOOK_CHANNEL`).
+    fn book_ch(
+        venue: &str,
+        channel: u32,
+        instrument_id: u32,
+        changes: Vec<BookChange>,
+    ) -> FeedMessage {
+        FeedMessage::Book(NormalizedBook {
+            venue: venue.into(),
+            source: venue.into(),
+            source_id: 0,
+            symbol: "KXBTCPERP".into(),
+            channel,
+            instrument_id,
+            changes,
+            snapshot: false,
+            last: true,
+            source_ts_ns: 1_000,
+            recv_ts_ns: 1_000,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        })
+    }
+
+    /// Every leg of the book-market pairing, plus the eviction queue, in one comparable value.
+    #[derive(Debug, PartialEq)]
+    struct BookLegs {
+        /// `book_markets` keys, sorted (the per-arm accumulators).
+        markets: Vec<MarketKey>,
+        /// `book_order` in queue order — not one of the paired legs, but a divergence here would
+        /// change which market a later eviction drops.
+        order: Vec<MarketKey>,
+        /// `StickyAuthority::last_admitted` per seeded key.
+        admitted: Vec<(MarketKey, Option<Publisher>)>,
+        /// The replay entry per seeded key: present-and-`baselined`, present-and-not, or absent.
+        replay: Vec<(MarketKey, Option<bool>)>,
+        /// Total entries in the replay map (a leaked entry from a market that should have been
+        /// dropped would show up here even if it isn't one of the tracked `keys`).
+        replay_len: usize,
+    }
+
+    fn book_legs(a: &Arbiter, replay: &crate::model::BookSnapshot, keys: &[MarketKey]) -> BookLegs {
+        let mut markets: Vec<MarketKey> = a.book_markets.keys().cloned().collect();
+        markets.sort();
+        let guard = model::lock(replay);
+        BookLegs {
+            markets,
+            order: a.book_order.iter().cloned().collect(),
+            admitted: keys
+                .iter()
+                .map(|k| (k.clone(), a.books.last_admitted(k)))
+                .collect(),
+            replay: keys
+                .iter()
+                .map(|k| (k.clone(), guard.get(k).map(|acc| acc.baselined())))
+                .collect(),
+            replay_len: guard.len(),
+        }
+    }
+
+    /// Four markets under one venue, each fully re-baselined by `arm(1)`: two on
+    /// `(venue, "sports", BOOK_CHANNEL)`, one on a peer **category** colliding with the first on
+    /// `(channel, instrument_id)`, one on a peer **channel**. Returns the arbiter, its replay map
+    /// and the four keys in that order.
+    fn seeded_books(venue: &str) -> (Arbiter, crate::model::BookSnapshot, Vec<MarketKey>) {
+        const OTHER_CHANNEL: u32 = BOOK_CHANNEL + 1;
+        let (tx, _rx) = broadcast::channel(1);
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+
+        for (category, channel, id) in [
+            ("sports", BOOK_CHANNEL, BOOK_INSTRUMENT),
+            ("sports", BOOK_CHANNEL, BOOK_INSTRUMENT + 1),
+            ("perps", BOOK_CHANNEL, BOOK_INSTRUMENT),
+            ("sports", OTHER_CHANNEL, BOOK_INSTRUMENT),
+        ] {
+            a.emit(
+                book_ch(venue, channel, id, vec![clear_both()]),
+                arm(1),
+                category,
+            );
+            a.emit(
+                book_ch(venue, channel, id, vec![bid(0.40, 10.0)]),
+                arm(1),
+                category,
+            );
+        }
+
+        let keys: Vec<MarketKey> = vec![
+            (
+                Arc::from(venue),
+                "sports".into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT,
+            ),
+            (
+                Arc::from(venue),
+                "sports".into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT + 1,
+            ),
+            (
+                Arc::from(venue),
+                "perps".into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT,
+            ),
+            (
+                Arc::from(venue),
+                "sports".into(),
+                OTHER_CHANNEL,
+                BOOK_INSTRUMENT,
+            ),
+        ];
+        (a, replay, keys)
+    }
+
+    /// The three legs of the book-market drop are expressed **once**: `reset_book_for_market`
+    /// delegates to `reset_books_for_markets`. This is the test that keeps them from drifting apart
+    /// again — the single-key path and the batch path are run against identical seeded state and
+    /// their results must match on every leg (accumulators, `last_admitted`, replay entry + its
+    /// identity index) plus the eviction queue. Re-implementing either path so it drops a strict
+    /// subset (the historical failure: a replay entry deleted while `last_admitted` survives, so the
+    /// market never re-baselines and is invisible to new clients) fails here.
+    #[test]
+    fn the_single_key_and_the_batch_reset_leave_identical_state() {
+        let venue = "BookResetPathAgreement";
+        let (mut single, single_replay, keys) = seeded_books(venue);
+        let (mut batch, batch_replay, _) = seeded_books(venue);
+        let doomed = keys[0].clone();
+
+        // Fixture sanity: the two seeds start identical, and the market about to be dropped really
+        // holds all three legs (otherwise the agreement below could be two no-ops agreeing).
+        assert_eq!(
+            book_legs(&single, &single_replay, &keys),
+            book_legs(&batch, &batch_replay, &keys),
+            "the two seeds must start identical"
+        );
+        assert!(single.book_markets.contains_key(&doomed));
+        assert_eq!(single.books.last_admitted(&doomed), Some(arm(1)));
+        assert!(model::lock(&single_replay).contains_key(&doomed));
+
+        single.reset_book_for_market(&doomed);
+        batch.reset_books_for_markets(std::slice::from_ref(&doomed));
+
+        let after_single = book_legs(&single, &single_replay, &keys);
+        let after_batch = book_legs(&batch, &batch_replay, &keys);
+        assert_eq!(
+            after_single, after_batch,
+            "the single-key reset and the batch reset must leave identical state on all three legs"
+        );
+
+        // ...and the drop actually happened: the doomed market is gone from all three legs and from
+        // the eviction queue, while the three untouched peers survive complete.
+        assert_eq!(
+            after_single.markets.len(),
+            3,
+            "exactly one market dropped, three survive"
+        );
+        assert!(!after_single.markets.contains(&doomed));
+        assert!(!after_single.order.contains(&doomed));
+        assert_eq!(
+            after_single.admitted,
+            keys.iter()
+                .map(|k| (k.clone(), (k != &doomed).then(|| arm(1))))
+                .collect::<Vec<_>>(),
+            "only the doomed market's last_admitted may drop"
+        );
+        assert_eq!(
+            after_single.replay,
+            keys.iter()
+                .map(|k| (k.clone(), (k != &doomed).then_some(true)))
+                .collect::<Vec<_>>(),
+            "only the doomed market's replay entry may drop, and the peers stay baselined"
+        );
+        assert_eq!(
+            after_single.replay_len, 3,
+            "the replay map must drop exactly the doomed market's key"
         );
     }
 
@@ -3474,9 +4290,13 @@ mod tests {
     fn book_health_reaches_the_authority_before_the_first_batch() {
         let venue = "BookHealthEarly";
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
-        let fresh: MarketKey = (Arc::from(venue), BOOK_CHANNEL, 999);
+        let fresh: MarketKey = mkey(venue, 999);
         a.set_book_health(&fresh, arm(1), false);
-        a.emit(book(venue, 999, vec![bid(0.40, 10.0)], true, 1_100), arm(1));
+        a.emit(
+            book(venue, 999, vec![bid(0.40, 10.0)], true, 1_100),
+            arm(1),
+            TEST_CATEGORY,
+        );
         assert!(
             drain_books(&mut rx).is_empty(),
             "an arm known gapped here must not serve this market"
@@ -3491,7 +4311,7 @@ mod tests {
         let (mut a, _rx) = gated(venue, sticky_cfg());
         race_trades(&mut a, venue, arm(2), arm(1), 6);
         a.close_authority_windows();
-        assert_eq!(a.books.venue_leader(venue), Some(arm(2)));
+        assert_eq!(a.books.scope_leader(&bscope(venue)), Some(arm(2)));
     }
 
     /// The one placement error that would make the whole election inert for the venue it was built
@@ -3507,12 +4327,12 @@ mod tests {
             t.recv_ts_ns = 10_000 + i * 1_000_000;
             let mut peer = t.clone();
             peer.recv_ts_ns = t.recv_ts_ns + 50_000;
-            a.emit(FeedMessage::Trade(t), arm(2));
-            a.emit(FeedMessage::Trade(peer), arm(1));
+            a.emit(FeedMessage::Trade(t), arm(2), TEST_CATEGORY);
+            a.emit(FeedMessage::Trade(peer), arm(1), TEST_CATEGORY);
         }
         a.close_authority_windows();
         assert_eq!(
-            a.books.venue_leader(venue),
+            a.books.scope_leader(&bscope(venue)),
             Some(arm(2)),
             "the zero-id tape must still be matched"
         );

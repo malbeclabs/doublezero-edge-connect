@@ -28,10 +28,12 @@ use serde::Deserialize;
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, finite_non_negative, instrument_known, PublicVenue},
+        public_feeder::{self, finite_non_negative, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
-    model::{now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedTrade, Side},
+    model::{
+        category_arc, now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedTrade, Side,
+    },
 };
 
 /// Phoenix's public WebSocket endpoint.
@@ -50,6 +52,20 @@ const PHOENIX_SOURCE_ID: u16 = 2;
 fn phoenix_venue() -> &'static str {
     crate::ingest::sources::source_label(PHOENIX_SOURCE_ID)
 }
+
+/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`,
+/// handed to the arbiter on every emit.
+///
+/// **Inert on this venue today**, and the comment should not pretend otherwise: `category` is read
+/// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
+/// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
+/// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
+/// backstop its own universe rather than another arm of the same one, and the gate would stop
+/// collapsing the two copies of one fill. Here the `trade_id` window is the only thing left holding
+/// that line, and it holds only because the public `tradeSequenceNumber` matches the edge id on this
+/// venue (validated 2026-06-30); a venue where it did not would double-print.
+/// `category_names_the_row_this_backstop_mirrors` pins the value.
+const PHOENIX_CATEGORY: &str = "spot";
 
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
 /// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
@@ -149,9 +165,13 @@ impl PhoenixVenue {
         // symbol the edge doesn't define is DROPPED here (the backstop silently stops for it) rather
         // than emitted under a mismatched key that would double-print alongside the edge copy. The
         // resolved market set is logged at startup (see `run`) so a divergence is at least visible.
-        if !instrument_known(instruments, phoenix_venue(), symbol) {
+        // Resolves precision AND the (channel, instrument_id) identity in one scan — see
+        // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
+        let Some((channel, instrument_id)) =
+            resolve_instrument(instruments, phoenix_venue(), symbol)
+        else {
             return; // precision unknown / symbol not defined by the edge; drop
-        }
+        };
         let Ok(trade_id) = fill.trade_sequence_number.parse::<u64>() else {
             self.decode_error();
             return;
@@ -182,6 +202,9 @@ impl PhoenixVenue {
             source: venue_arc(phoenix_venue()),
             source_id: PHOENIX_SOURCE_ID,
             symbol: symbol.into(),
+            channel,
+            instrument_id,
+            category: category_arc(PHOENIX_CATEGORY),
             price,
             // `baseAmount` is the fill's base-asset quantity in the *same real units* the edge emits
             // (edge `trade_qty_raw * 10^qty_exponent`) — verified equal on all 257 shared fills in the
@@ -204,7 +227,11 @@ impl PhoenixVenue {
             .ws_feeder_messages
             .with_label_values(&[phoenix_venue(), "trade"])
             .inc();
-        lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
+        lock(arbiter).emit(
+            FeedMessage::Trade(trade),
+            Publisher::PublicWs,
+            PHOENIX_CATEGORY,
+        );
     }
 
     fn decode_error(&self) {
@@ -285,12 +312,34 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// [`PHOENIX_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
+    /// venue's top-of-book row, whose `Trade`s are the ones these fills race against.
+    ///
+    /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
+    /// universes is the case `Feed::category` exists to express, so that assertion would fail a
+    /// legitimate registry change and leave deleting the test as the only fix. This one still fails
+    /// if the constant drifts, because then no row matches it.
+    #[test]
+    fn category_names_the_row_this_backstop_mirrors() {
+        let mirrored = crate::ingest::feeds::feeds().iter().find(|f| {
+            f.venue == phoenix_venue()
+                && f.category == PHOENIX_CATEGORY
+                && f.kind == crate::ingest::feeds::FeedKind::TopOfBook
+        });
+        assert!(
+            mirrored.is_some(),
+            "no {} top-of-book row carries category {PHOENIX_CATEGORY:?}: this backstop claims to \
+             mirror a universe the registry does not publish",
+            phoenix_venue()
+        );
+    }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (phoenix_venue().into(), symbol.into()),
+            (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u32, 1u32),
             NormalizedInstrument {
                 venue: phoenix_venue().into(),
                 source: phoenix_venue().into(),
@@ -298,6 +347,7 @@ mod tests {
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
+                category: PHOENIX_CATEGORY.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
@@ -357,6 +407,11 @@ mod tests {
                 // The registry Source ID, not the `0` "unknown" sentinel: a consumer joining this
                 // backstop to the edge copy on `source_id` must see the same id both sides.
                 assert_eq!(t.source_id, PHOENIX_SOURCE_ID);
+                // Resolved from the edge catalog (`instruments_with`'s (channel=0, instrument_id=1)
+                // entry), not left at the zero default — this is the identity `history::Key` groups
+                // trades on downstream.
+                assert_eq!(t.channel, 0);
+                assert_eq!(t.instrument_id, 1);
             }
             other => panic!("expected a trade, got {other:?}"),
         }

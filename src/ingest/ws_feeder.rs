@@ -22,11 +22,12 @@ use tracing::warn;
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, instrument_known, parse_decimal, PublicVenue},
+        public_feeder::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
-        now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade, Side,
+        category_arc, now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote,
+        NormalizedTrade, Side,
     },
 };
 
@@ -45,6 +46,19 @@ const HL_SOURCE_ID: u16 = 1;
 fn hl_venue() -> &'static str {
     crate::ingest::sources::source_label(HL_SOURCE_ID)
 }
+
+/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`,
+/// handed to the arbiter on every emit.
+///
+/// **Inert on this venue today**, and the comment should not pretend otherwise: `category` is read
+/// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
+/// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
+/// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
+/// backstop its own universe rather than another arm of the same one, and the gate would stop
+/// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
+/// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
+/// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.
+const HL_CATEGORY: &str = "perps";
 
 /// Hyperliquid documents a cap of 1000 subscriptions per WebSocket connection. We fan out two
 /// subscriptions (`bbo` + `trades`) per coin over a single connection and log if the configured coin
@@ -237,14 +251,17 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         .ws_feeder_messages
         .with_label_values(&[hl_venue(), "quote"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs, HL_CATEGORY);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
 fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
-    if !instrument_known(instruments, hl_venue(), &t.coin) {
+    // Resolves precision AND the (channel, instrument_id) identity in one scan — see
+    // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
+    let Some((channel, instrument_id)) = resolve_instrument(instruments, hl_venue(), &t.coin)
+    else {
         return;
-    }
+    };
     let (Some(price), Some(size)) = (parse_decimal(&t.px), parse_decimal(&t.sz)) else {
         return;
     };
@@ -256,6 +273,9 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         source: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: t.coin.into(),
+        channel,
+        instrument_id,
+        category: category_arc(HL_CATEGORY),
         price,
         size,
         // HL trade side: "B" = aggressing buy, "A" = aggressing sell.
@@ -275,7 +295,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         .ws_feeder_messages
         .with_label_values(&[hl_venue(), "trade"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs, HL_CATEGORY);
 }
 
 #[cfg(test)]
@@ -288,12 +308,34 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// [`HL_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
+    /// venue's top-of-book row, the source of both the quotes and the prints it emits.
+    ///
+    /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
+    /// universes is the case `Feed::category` exists to express, so that assertion would fail a
+    /// legitimate registry change and leave deleting the test as the only fix. This one still fails
+    /// if the constant drifts, because then no row matches it.
+    #[test]
+    fn category_names_the_row_this_backstop_mirrors() {
+        let mirrored = crate::ingest::feeds::feeds().iter().find(|f| {
+            f.venue == hl_venue()
+                && f.category == HL_CATEGORY
+                && f.kind == crate::ingest::feeds::FeedKind::TopOfBook
+        });
+        assert!(
+            mirrored.is_some(),
+            "no {} top-of-book row carries category {HL_CATEGORY:?}: this backstop claims to \
+             mirror a universe the registry does not publish",
+            hl_venue()
+        );
+    }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (hl_venue().into(), symbol.into()),
+            (hl_venue().into(), HL_CATEGORY.into(), 0u32, 1u32),
             NormalizedInstrument {
                 venue: hl_venue().into(),
                 source: hl_venue().into(),
@@ -301,6 +343,7 @@ mod tests {
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,
+                category: HL_CATEGORY.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
@@ -425,6 +468,11 @@ mod tests {
                 assert_eq!(t.aggressor_side, crate::model::Side::Buy);
                 assert_eq!(t.trade_id, 42);
                 assert_eq!(t.source_id, HL_SOURCE_ID);
+                // Resolved from the edge catalog (`instruments_with`'s (channel=0, instrument_id=1)
+                // entry), not left at the zero default — this is the identity `history::Key` groups
+                // trades on downstream.
+                assert_eq!(t.channel, 0);
+                assert_eq!(t.instrument_id, 1);
             }
             other => panic!("expected a trade, got {other:?}"),
         }

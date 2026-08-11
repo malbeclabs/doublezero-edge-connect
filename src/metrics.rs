@@ -294,6 +294,20 @@ pub struct Metrics {
     pub unregistered_sources: IntCounter,
     /// Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached.
     pub unregistered_source_labels_capped: IntCounter,
+
+    // --- Query API history feeder (`ingest::reconcile::feed_history`) ---
+    /// Trades dropped rather than stored because the catalog carries no `instrument` for the exact
+    /// `(venue, channel, instrument_id)` the message names - a definition race (or, on an
+    /// unauthenticated wire, a forged identity). Belt-and-braces: keying `history::Key` straight off
+    /// the message should make this rare to never for an edge trade, whose own processor already
+    /// gates emission on holding that definition. Should stay flat at zero; a nonzero rate is a
+    /// venue quietly losing history the way the defect this metric was added for did, invisible
+    /// anywhere else.
+    pub history_unattributable_trades: IntCounterVec,
+    /// Times the history feeder fell behind the post-arbiter broadcast and dropped messages
+    /// (`Lagged`) - the history-store counterpart of `dz_ws_serializer_lagged_total`. A gap here is a
+    /// hole in the rolling window, not a crash.
+    pub history_feed_lagged: IntCounter,
 }
 
 /// Build an [`IntCounterVec`] and register it, panicking on a registration error (a duplicate name
@@ -826,6 +840,20 @@ impl Metrics {
                 "dz_unregistered_source_labels_capped_total",
                 "Messages labelled UNREGISTERED because the distinct-unregistered-ID cap was reached",
             ),
+            history_unattributable_trades: counter_vec(
+                &registry,
+                "dz_history_unattributable_trades_total",
+                "Trades dropped rather than stored in the query API's history because the catalog \
+                 carries no instrument definition for the exact (venue, channel, instrument_id) the \
+                 message names (a definition race, or a forged identity). Should stay flat at zero.",
+                &["venue"],
+            ),
+            history_feed_lagged: counter(
+                &registry,
+                "dz_history_feed_lagged_total",
+                "Times the query API's history feeder fell behind the post-arbiter broadcast and \
+                 dropped messages (a hole in the rolling window, not a crash)",
+            ),
             registry,
         }
     }
@@ -926,6 +954,10 @@ mod tests {
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
             .observe(123_456.0);
+        m.history_unattributable_trades
+            .with_label_values(&["Hyperliquid"])
+            .inc();
+        m.history_feed_lagged.inc();
 
         let mut buf = Vec::new();
         let encoder = TextEncoder::new();
@@ -967,6 +999,8 @@ mod tests {
             "dz_book_markets_evicted_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
+            "dz_history_unattributable_trades_total",
+            "dz_history_feed_lagged_total",
         ] {
             assert!(out.contains(name), "expected `{name}` in metrics output");
         }

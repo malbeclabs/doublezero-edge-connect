@@ -57,7 +57,7 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 use crate::{
     ingest::{
         arbiter::{lock, Publisher, SharedArbiter},
-        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher, FEEDS},
+        feeds::{feeds, Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
         processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor},
         reconcile::TapeOwner,
@@ -113,6 +113,12 @@ pub struct FrameCtx<'a> {
     /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
     /// venue ultimately comes from the `&'static` `FEEDS` registry.
     pub venue: &'static str,
+    /// The instrument **universe** this receiver's row carries (`Feed::category`), passed straight
+    /// through to the arbiter on every emit. Carried here rather than derived from the message
+    /// because it is a property of the row, and rows sharing a venue can carry universes that
+    /// mirror nothing: without it the arbiter's tape gate elects one arm across both and drops the
+    /// other universe's prints for good.
+    pub category: &'static str,
     /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
     pub arbiter: &'a SharedArbiter,
     pub instruments: &'a InstrumentSnapshot,
@@ -126,9 +132,28 @@ pub struct FrameCtx<'a> {
     /// onto the same group (sharing `channel_id`), so per-publisher state (sequence tracking, MBO
     /// books) keys on this rather than the port.
     pub publisher: IpAddr,
+    /// This row's [`Feed::mirror_offset`], carried per datagram so a processor can canonicalize a
+    /// wire channel id for consumer-facing identity without reaching back into the registry.
+    /// `None` for every row with no declared mirror.
+    pub mirror_offset: Option<u8>,
 }
 
 impl FrameCtx<'_> {
+    /// Canonicalize a wire channel id for **consumer-facing identity** — the catalog, history, the
+    /// book authority's `MarketKey`, and the emitted `channel` field itself. A mirror publisher
+    /// (`mirror_offset` set) stamps the same market's frames at `N + offset`; subtracting it here
+    /// is what makes that one market rather than two.
+    ///
+    /// **Never call this for producer-side state** (book keys, sequence trackers, reset counts,
+    /// snapshot cycles) — those must stay keyed on the raw wire channel id, because the two arms
+    /// are independently sequenced and collapsing that corrupts book recovery.
+    pub fn canonical_channel(&self, wire_channel: u8) -> u32 {
+        match self.mirror_offset {
+            Some(offset) if wire_channel >= offset => u32::from(wire_channel - offset),
+            _ => u32::from(wire_channel),
+        }
+    }
+
     /// Emit a normalized message through the shared arbiter, tagged with this datagram's edge
     /// publisher so the quote floor can race it against the other sources for the tick's leadership.
     /// The brief critical section is the arbiter's admit-decision-plus-send.
@@ -143,7 +168,7 @@ impl FrameCtx<'_> {
     pub fn emit(&self, msg: FeedMessage) {
         let (wire_venue, _) = msg.venue_symbol();
         record_revealed(self.venue, wire_venue);
-        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher));
+        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher), self.category);
     }
 }
 
@@ -353,7 +378,7 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
         .with_label_values(&[venue])
         .set(stale_ms as i64);
     for wire_venue in revealed_venues_for(venue) {
-        if wire_venue.as_ref() != venue && FEEDS.iter().any(|f| f.venue == wire_venue.as_ref()) {
+        if wire_venue.as_ref() != venue && feeds().iter().any(|f| f.venue == wire_venue.as_ref()) {
             continue; // that venue has its own row(s) and its own aggregate; it speaks for itself
         }
         let source_id = sources::source_id_of(wire_venue.as_ref()).unwrap_or(0);
@@ -629,11 +654,13 @@ async fn drive<P: FrameProcessor>(
     iface: String,
     recv_buf: usize,
     venue: &'static str,
+    category: &'static str,
     kind: FeedKind,
     publisher_port: u16,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     health: SharedFeedHealth,
+    mirror_offset: Option<u8>,
     mut processor: P,
 ) -> Result<()> {
     // This receiver's own liveness: true while its market-data multicast is considered down (silent
@@ -695,7 +722,7 @@ async fn drive<P: FrameProcessor>(
             ReceiverRegistration::new(
                 health.clone(),
                 arbiter.clone(),
-                (venue, kind, publisher_port),
+                (venue, category, kind, publisher_port),
                 m.receiver_up
                     .with_label_values(&[venue, kind_label, publisher_name]),
             )
@@ -762,12 +789,14 @@ async fn drive<P: FrameProcessor>(
 
             let ctx = FrameCtx {
                 venue,
+                category,
                 arbiter: &arbiter,
                 instruments: &instruments,
                 kernel_rx_ts_ns: kernel_ns,
                 recv_ts_ns: recv_ns,
                 role,
                 publisher,
+                mirror_offset,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -811,11 +840,13 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 TobProcessor::new(tape),
             )
             .await
@@ -828,11 +859,13 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MidpointProcessor::new(),
             )
             .await
@@ -861,11 +894,13 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MboProcessor::new(depth, tape),
             )
             .await
@@ -894,11 +929,13 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MbpProcessor::new(tape),
             )
             .await
@@ -924,7 +961,7 @@ mod tests {
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
         let health = FeedHealth::new();
-        health.register((venue, FeedKind::TopOfBook, 9101), |_| {});
+        health.register((venue, "testcategory", FeedKind::TopOfBook, 9101), |_| {});
         init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
@@ -1053,12 +1090,14 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let ctx = FrameCtx {
             venue: row_venue,
+            category: "testcategory",
             arbiter: &arbiter,
             instruments: &instruments,
             kernel_rx_ts_ns: 0,
             recv_ts_ns: 0,
             role: PortRole::Mktdata,
             publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            mirror_offset: None,
         };
         let quote = NormalizedQuote {
             venue: wire_venue.into(),
@@ -1109,7 +1148,7 @@ mod tests {
 
         let (arbiter, mut rx) = test_arbiter();
         let health = FeedHealth::new();
-        let key = (row_venue, FeedKind::TopOfBook, 9101);
+        let key = (row_venue, "testcategory", FeedKind::TopOfBook, 9101);
         let up_gauge = metrics()
             .receiver_up
             .with_label_values(&[row_venue, "tob", "9101"]);

@@ -1,0 +1,14 @@
+{
+  "pricebooks": [
+    {
+      "product_id": "HYPERLIQUID:BTC",
+      "bids": [["67000.00", "1.20000"]],
+      "asks": [["67001.50", "0.80000"]]
+    },
+    {
+      "product_id": "HYPERLIQUID:ETH",
+      "bids": [],
+      "asks": [["3500.25", "4.00000"]]
+    }
+  ]
+}
