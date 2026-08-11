@@ -1870,6 +1870,82 @@ mod tests {
         );
     }
 
+    /// `book()` must cost O(cap), not O(book size): `Arbiter::apply_book_replay` takes the very
+    /// same `books` guard from inside `emit`, so a request that materializes the market's whole
+    /// level set (`to_book`, up to 2^18 of them) while holding it would stall ingest for every
+    /// venue for as long as the request takes. There is no second contended lock inside `book()` to
+    /// force a deterministic block on (unlike `channels_block`'s `history`/`instruments` ordering,
+    /// see the test below), so this is expressed as a generous wall-clock bound rather than a pure
+    /// blocking assertion — `to_book`'s two full-size passes (build the `NormalizedBook`, then copy
+    /// it into `bids`/`asks`) make the un-fixed cost scale with `TOTAL_LEVELS` well past this bound,
+    /// while the fixed `top_levels` path costs the same regardless of book size.
+    #[test]
+    fn book_reads_a_huge_pricebook_in_bounded_time() {
+        const TOTAL_LEVELS: usize = 200_000;
+        const BATCH: usize = 4_000;
+
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        instruments.lock().unwrap().insert(
+            ("HUGE".into(), "perps".into(), 9u32, 1u32),
+            inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2),
+        );
+        {
+            let mut map = books.lock().unwrap();
+            let mut acc = BookAccumulator::new("HUGEBOOK".into());
+            acc.apply(&book_batch(
+                "HUGE",
+                "HUGEBOOK",
+                9,
+                1,
+                vec![BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                }],
+                true,
+            ));
+            // Batched under `apply`'s own pending-changes cap — this is only fixture setup, not
+            // the property under test.
+            let mut level = 0usize;
+            while level < TOTAL_LEVELS {
+                let end = (level + BATCH).min(TOTAL_LEVELS);
+                let changes: Vec<BookChange> = (level..end)
+                    .map(|l| level_update(BookSide::Bid, 1.0 - (l as f64) * 1e-6, 1.0))
+                    .collect();
+                acc.apply(&book_batch("HUGE", "HUGEBOOK", 9, 1, changes, true));
+                level = end;
+            }
+            assert!(acc.baselined(), "fixture sanity");
+            map.insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+        }
+
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+        };
+        let inst = inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2);
+
+        let started = std::time::Instant::now();
+        let (status, _, body) = book(&state, &inst);
+        let elapsed = started.elapsed();
+
+        assert_eq!(status, "200 OK");
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["coverage"]["levels_returned"], MAX_LEVELS_PER_SIDE as u64);
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "book() took {elapsed:?} for a {TOTAL_LEVELS}-level book: it must read the top \
+             {MAX_LEVELS_PER_SIDE} levels directly rather than materializing the whole book while \
+             holding `state.books`"
+        );
+    }
+
     /// The headline regression: two disjoint universes ("perps" and "sports") under one Source ID
     /// (KALSHI) both use `channel=9, instrument_id=1` — never assume `channel_id` ranges stay
     /// disjoint across universes, see this module's docs. Each market has its own catalog entry and
@@ -3051,5 +3127,54 @@ mod tests {
             "{channel}"
         );
         assert_eq!(channel["symbol_prefixes_total"], 3, "{channel}");
+    }
+
+    /// `channels_block` must compute `channel_symbol_prefixes` (which locks `instruments`) *before*
+    /// taking `history`'s lock. Locking `history` first and walking the catalog while still holding
+    /// it (the bug) blocks the history feeder — which appends under that same lock — for as long as
+    /// the walk takes, punching a hole in the rolling window `/v1` serves.
+    ///
+    /// Proven with a forced, deterministic block rather than timing: this thread holds
+    /// `instruments` for the whole test, so a worker thread running `channels_block` gets stuck
+    /// trying to acquire it from inside `channel_symbol_prefixes`. If `channels_block` locked
+    /// `history` *before* that call (the bug), the worker would still be holding `history` while
+    /// stuck — so `history.try_lock()` from here would fail at some point in the window below.
+    /// With the fix, the worker never reaches `history` at all until it has gotten past
+    /// `instruments`, which never happens until this thread releases it — so `history` must stay
+    /// obtainable for the entire window, not just eventually.
+    #[test]
+    fn channels_block_computes_prefixes_before_locking_history() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let state = Arc::new(ApiState {
+            instruments: instruments.clone(),
+            depth,
+            books,
+            history: history.clone(),
+            health,
+            filter,
+            enabled,
+        });
+
+        let instruments_guard = instruments.lock().unwrap();
+
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            channels_block(&worker_state);
+        });
+
+        // A generous window: long enough that the worker is certain to have been scheduled and to
+        // have made (and be stuck on) its lock calls regardless of system load, however many times
+        // it takes to observe. Every single iteration must find `history` free.
+        for _ in 0..2_000 {
+            assert!(
+                history.try_lock().is_ok(),
+                "history was held while channels_block was blocked acquiring instruments — it \
+                 must compute channel_symbol_prefixes first"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+
+        drop(instruments_guard);
+        worker.join().unwrap();
     }
 }
