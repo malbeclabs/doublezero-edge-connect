@@ -250,10 +250,15 @@
         "sequence state that has to stay separate. The top-of-book sibling on group 233.84.178.17 is",
         "not yet published, which is why this document carries no row for it.",
         "",
-        "SOURCE ADDRESSES. A live capture on this group (2026-08-09) saw every frame from a single",
-        "source address - one publisher today, consistent with the mirror above not existing yet.",
-        "The book gate elects one arm per (venue, category); a second live source address here would",
-        "need that election revisited, not assumed safe by analogy to the perps rows."
+        "SOURCE ADDRESSES. Two, confirmed by a warehouse capture on 2026-08-11: both publishers",
+        "carry the WHOLE roster, mirroring each other, and are separated by the channel offset above.",
+        "An earlier capture (2026-08-09) saw one address and the note here said so; the second host",
+        "came up between them, so treat any count recorded here as of its date and re-measure.",
+        "",
+        "That two-publisher shape is the one the book gate is built for - it elects one per",
+        "(venue, category) and drops the peer's copy. What would break it is a publisher PER CHANNEL,",
+        "since 31 addresses on one (venue, category) would leave one channel served and thirty",
+        "dropped. That is not the deployment: the roster is mirrored, not sharded."
       ],
       "publishers": {
         "derived": {
