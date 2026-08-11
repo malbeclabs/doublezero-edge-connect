@@ -813,7 +813,7 @@ offer_cli_package() {
       local want_cli=1
       if [ "$DZ_ASSUME_YES" != 1 ]; then
         if { : <"$TTY"; } 2>/dev/null; then
-          confirm "Install the doublezero-edge CLI too? This adds the malbeclabs/$cs_repo Cloudsmith repository (unless already configured) and installs the 'doublezero-edge' package." || want_cli=0
+          confirm "Install the doublezero-edge CLI too? This runs Cloudsmith's unpinned setup script for malbeclabs/$cs_repo as root (unless already configured), then installs the 'doublezero-edge' package." || want_cli=0
         else
           want_cli=0
         fi
