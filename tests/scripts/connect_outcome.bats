@@ -149,6 +149,14 @@ dump() { echo "# --- stdout"; sed 's/^/#   /' "$OUT"; echo "# --- stderr"; sed '
       if ! grep -q 'Done\.' "$OUT"; then echo "# $s.sh never noticed the session that came up"; dump; exit 1; fi
       if grep -qi 'Not connected yet' "$ERR"; then echo "# $s.sh printed a stale not-connected verdict"; dump; exit 1; fi
       if grep -qi 'Reminder: this host is NOT connected' "$ERR"; then echo "# $s.sh closed with a stale reminder"; dump; exit 1; fi
+      # The pin. The three assertions above are all satisfied by a script that claims a
+      # connection unconditionally, so they cannot fail on the behaviour this case names.
+      # Only the pre-banner re-probe puts a `status --json` AFTER the status table.
+      last_table="$(grep -n 'doublezero status$' "$DOCKER_LOG" | tail -1 | cut -d: -f1)"
+      last_probe="$(grep -n 'doublezero status --json' "$DOCKER_LOG" | tail -1 | cut -d: -f1)"
+      if [ -z "$last_table" ] || [ -z "$last_probe" ] || [ "$last_probe" -le "$last_table" ]; then
+        echo "# $s.sh never re-probed the session after the status table (table@${last_table:-none} probe@${last_probe:-none})"; dump; exit 1
+      fi
       exit 0
     ) || fails=1
   done

@@ -618,13 +618,16 @@ fi
 # "Network Unreachable", the CLI's synthesized "disconnected") does not -- so match
 # the suffix, never one literal. Grepping the JSON key rather than the human table
 # avoids depending on column layout, and on jq, which the image doesn't ship.
-DZ_PROBE=""   # `timeout`, when present, bounds each probe against a wedged daemon
-if command -v timeout >/dev/null 2>&1; then DZ_PROBE="timeout 3"; fi
+# `timeout`, when present, bounds each probe against a wedged daemon -- the same 5s the
+# container's own probe uses (docker-entrypoint.sh), since this path adds `docker exec`
+# overhead on top and a probe that gives up early would report a live tunnel as absent.
+DZ_PROBE=()
+if command -v timeout >/dev/null 2>&1; then DZ_PROBE=(timeout 5); fi
 dz_connected() {
   # Capture, then match in-shell: piping into `grep -q` under `set -o pipefail` can
   # report the probe as failed when grep's early exit SIGPIPEs the writer (cf. #70).
   local json
-  json="$($SUDO $DZ_PROBE docker exec "$DZ_NAME" doublezero status --json 2>/dev/null || true)"
+  json="$($SUDO "${DZ_PROBE[@]}" docker exec "$DZ_NAME" doublezero status --json 2>/dev/null || true)"
   [[ "$json" =~ \"session_status\"[[:space:]]*:[[:space:]]*\"[^\"]*[Uu]p\" ]]
 }
 
