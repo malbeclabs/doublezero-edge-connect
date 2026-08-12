@@ -18,6 +18,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddrV4},
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -375,7 +376,7 @@ pub fn detect(need_group_ips: bool, probe_latency: bool) -> Detected {
     // cannot be allowed to move activation, and it runs only after the codes are already decided.
     let latency = match probe_latency {
         false => None,
-        true => match run_cli(&["latency", "--json"]) {
+        true => match run_cli_bounded(&["latency", "--json"], LATENCY_PROBE_TIMEOUT) {
             CliOut::Ok(bytes) => Some(parse_latency(&bytes)),
             _ => None,
         },
@@ -463,6 +464,95 @@ fn output_tail(bytes: &[u8]) -> Option<String> {
         .find(|i| text.is_char_boundary(*i))
         .unwrap_or(text.len());
     Some(text[start..].to_string())
+}
+
+/// A `doublezero latency` probe is killed after this long.
+///
+/// `status` and `multicast group list` are cheap local reads of the daemon; this one is **active
+/// measurement against every device**, and every one of them runs inline in the reconciler's tick
+/// (`tick().await` then `sleep(refresh)`). An unbounded stall there is not just a missing
+/// diagnostic: no died receiver is respawned, tape ownership never moves, the WS sink and shred
+/// forwarder never reconcile, and `checked_at_unix` freezes — degrading the process on exactly the
+/// broken host this read exists for. Generous next to a probe that normally answers in about a
+/// second; it exists so a stall has an end, not to pace anything.
+const LATENCY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often [`wait_bounded`] re-checks a running child. Short enough not to add meaningfully to a
+/// fast probe, long enough not to spin.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// [`run_cli`] with a deadline — see [`LATENCY_PROBE_TIMEOUT`] for why only this caller needs one.
+///
+/// stdin is `/dev/null` so a verb that ever prompted could not block on a descriptor inherited from
+/// the bridge. A child that fills its pipe buffer blocks instead of exiting and is therefore killed
+/// at the deadline rather than read; `latency` emits a few hundred bytes per device, far inside the
+/// buffer, and the degradation is a bounded kill either way.
+fn run_cli_bounded(args: &[&str], timeout: Duration) -> CliOut {
+    use std::process::Stdio;
+
+    let mut child = match std::process::Command::new("doublezero")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CliOut::Missing,
+        Err(e) => {
+            warn!(?args, %e, "could not run `doublezero`");
+            return CliOut::Err {
+                detail: Some(e.to_string()),
+            };
+        }
+    };
+    if let Err(detail) = wait_bounded(&mut child, timeout) {
+        warn!(?args, %detail, "`doublezero` did not finish before its deadline");
+        return CliOut::Err {
+            detail: Some(detail),
+        };
+    }
+    // The child has already exited, so reading its pipes cannot block on a live writer.
+    match child.wait_with_output() {
+        Ok(o) if o.status.success() => CliOut::Ok(o.stdout),
+        Ok(o) => {
+            warn!(?args, status = %o.status, "`doublezero` exited non-zero");
+            CliOut::Err {
+                detail: output_tail(&o.stderr).or_else(|| output_tail(&o.stdout)),
+            }
+        }
+        Err(e) => CliOut::Err {
+            detail: Some(e.to_string()),
+        },
+    }
+}
+
+/// Wait for `child` up to `timeout`, killing it and reporting why if it overruns. Split out of
+/// [`run_cli_bounded`] so a test can drive it with a short deadline against a real never-exiting
+/// process — the behaviour that matters is the kill, not the policy number.
+fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            // The child's status is unknowable; reap what we can rather than spin on the same
+            // error until the deadline.
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait on the child process: {e}"));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "killed after {}s without exiting",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(WAIT_POLL_INTERVAL),
+        }
+    }
 }
 
 fn run_cli(args: &[&str]) -> CliOut {
@@ -921,6 +1011,48 @@ We recommend updating to the latest version for the best experience.
         assert!(parse_latency(b"Please start the doublezerod service.").is_empty());
         assert!(parse_latency(b"").is_empty());
         assert!(parse_latency(b"[{\"device_code\": ").is_empty());
+    }
+
+    /// The bound that stops a stalled probe wedging the reconciler's tick. Driven against a real
+    /// `sleep` with the deadline swapped for a short one — the 20s constant is a policy number, and
+    /// the behaviour under test is the kill.
+    ///
+    /// Skipped where `/bin/sh` isn't spawnable; the fixture needs a real process that ignores EOF
+    /// on stdin, which no stub can stand in for.
+    #[test]
+    fn a_child_that_never_exits_is_killed_and_the_wait_returns() {
+        let mut child = match std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let start = Instant::now();
+        let outcome = wait_bounded(&mut child, Duration::from_millis(300));
+        let detail = outcome.expect_err("an overrunning child must not report success");
+        assert!(detail.contains("killed after"), "{detail}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the wait must be bounded, not the child's own 60s"
+        );
+    }
+
+    /// The ordinary path still returns promptly and reports success.
+    #[test]
+    fn a_child_that_exits_is_waited_for_normally() {
+        let mut child = match std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        assert!(wait_bounded(&mut child, Duration::from_secs(10)).is_ok());
     }
 
     /// The tail helper keeps the end of a long message (that is where a bail line lands), bounds

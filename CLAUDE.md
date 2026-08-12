@@ -263,7 +263,12 @@ Modules are grouped by role under `src/`:
   shows a *nearer* device has appeared since this host chose the one it is on. It is paced instead,
   by `reconcile::LATENCY_PROBE_INTERVAL` (5 min, a constant rather than a flag), because it is
   active measurement against every device while what it reports moves with network topology, not
-  with a 30s tick; `publish_tick` carries the last probe across the ticks that skip it and dates it
+  with a 30s tick. It is the one CLI call here with a **deadline** (`LATENCY_PROBE_TIMEOUT`, 20s,
+  via `run_cli_bounded`/`wait_bounded`): every shell-out runs inline in the reconciler's tick, and
+  `status`/`group list` are cheap local reads while this one measures the network, so an unbounded
+  stall would stop receivers respawning and freeze `checked_at_unix` on exactly the broken host the
+  read exists for. A timeout degrades to "not probed", never to an `Unavailable` tick.
+  `publish_tick` `publish_tick` carries the last probe across the ticks that skip it and dates it
   `latency_at_unix`, so the figures never read as just-measured. `parse_latency` **locates** the
   JSON rather than assuming byte 0 — the client's "a new version is available" notice goes to
   stderr today (`client/doublezero/src/main.rs` hands `check_version` a locked stderr) but
@@ -655,16 +660,14 @@ Modules are grouped by role under `src/`:
   container's onchain identity. ⚠️ That route is **unauthenticated like the rest of this surface and
   the most informative one on it**: device/metro names, the tunnel name, every subscribed group code,
   the subscription rows' multicast IPs, the probed devices' codes and IPs, all four binds and the
-  feed-registry URL. On the loopback
-  default that is the same audience that could already run `doublezero status`; a non-loopback bind
+  feed-registry URL. On the loopback default that is the same audience that could already run
+  `doublezero status`; a non-loopback bind
   hands it to anyone who can reach the port, and **DNS rebinding** reaches it too (a page served from
   a name re-pointed at `127.0.0.1` is same-origin, so the CSRF header below does not stop it
   *reading*). Refusing a `Host` that names a DNS name would close that at the cost of
   `--admin-url http://myhost.local:9098`; the read is left open deliberately and the trade is stated
   here, in the flag's doc and in the module docs rather than left to be inferred. The other two
-  routes are `/admin/channels`: `GET`
-  provisioning. The other two routes are `/admin/channels`: `GET`
-  reports the channel filter in force plus,
+  routes are `/admin/channels`: `GET` reports the channel filter in force plus,
   per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver
   set (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
   field says so rather than the response naming the field "bound" and inviting the exact mistake

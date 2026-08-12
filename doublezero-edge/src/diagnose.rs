@@ -295,6 +295,28 @@ mod tests {
         assert!(out.contains("(no sessions reported)"), "{out}");
     }
 
+    /// The staleness marker only renders when it disagrees with `checked_at_unix` — that gap *is*
+    /// the staleness. Both branches, since a fixture that never sets the field would leave the
+    /// printing one unexecuted.
+    #[test]
+    fn the_last_ok_time_prints_only_when_the_last_tick_failed() {
+        let mut d = diagnostics_fixture();
+        d["tunnel"]["detection"] = json!("unavailable");
+        d["tunnel"]["last_ok_at_unix"] = json!(1782920000);
+        let out = render_diagnose(&json!({"diagnostics": d, "status": null})).unwrap();
+        assert!(out.contains("last_ok_at_unix=1782920000"), "{out}");
+        assert!(out.contains("is from that poll"), "{out}");
+
+        // Agreeing with checked_at_unix is the healthy case: nothing stale to mark.
+        let mut d = diagnostics_fixture();
+        d["tunnel"]["last_ok_at_unix"] = d["tunnel"]["checked_at_unix"].clone();
+        let out = render_diagnose(&json!({"diagnostics": d, "status": null})).unwrap();
+        assert!(
+            !out.contains("last_ok_at_unix"),
+            "a fresh poll must not print a second copy of the same timestamp: {out}"
+        );
+    }
+
     /// The `latency` read #133 asks for, off a real capture. Rendered nearest-first and in ms,
     /// because the question on a down host is "is anything reachable, and which is closest".
     #[test]
@@ -329,9 +351,18 @@ mod tests {
         let dead = rows.iter().position(|l| l.contains("dz-unreachable"));
         assert!(nearest < further, "nearest reachable device first: {out}");
         assert!(further < dead, "unreachable devices sort last: {out}");
-        assert!(
-            out.contains('-'),
-            "a device with no samples renders a dash: {out}"
+
+        // Its three sample columns specifically — `out.contains('-')` would pass on any device
+        // name or the table rule, so it asserted nothing.
+        let dead_row = rows
+            .iter()
+            .find(|l| l.contains("dz-unreachable"))
+            .expect("the unreachable device still gets a row");
+        let cells: Vec<&str> = dead_row.split_whitespace().collect();
+        assert_eq!(
+            &cells[cells.len() - 3..],
+            &["-", "-", "-"],
+            "a device with no samples renders dashes, never a fabricated 0.000: {out}"
         );
     }
 

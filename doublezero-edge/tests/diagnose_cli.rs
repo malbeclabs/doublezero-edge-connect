@@ -218,7 +218,3 @@ fn diagnose_jq_extracts_the_verdict_code() {
     assert_eq!(r.status, 0, "stdout: {} stderr: {}", r.stdout, r.stderr);
     assert_eq!(r.stdout.trim(), "\"tunnel_down\"");
 }
-
-// -------------------------------------------------------------------------------------------
-// connect / disconnect
-// -------------------------------------------------------------------------------------------

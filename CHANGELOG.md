@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could already run `doublezero status`. The container also reads `doublezero latency` and reports
   each device's reachability and min/avg/max round trip, nearest first — on a down host, whether
   anything is reachable; on a connected one, whether a nearer device has appeared since it chose
-  the one it is on. Probed every 5 minutes rather than every poll, so the block carries its own
-  `latency_at_unix`; `null` (never probed) stays distinct from `[]` (probed, nothing answered).
+  the one it is on. Probed every 5 minutes rather than every poll and bounded at 20s, so a stalled
+  probe cannot wedge the reconciler's tick; the block carries its own `latency_at_unix`, and `null`
+  (never probed) stays distinct from `[]` (probed, nothing answered).
   `--admin-url` is now a global flag rather than one on the two `channels` subcommands.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is

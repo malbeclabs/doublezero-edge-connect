@@ -167,7 +167,9 @@ and `gating_disabled` run no status call, so they leave it unset rather than dat
 document to now).
 
 A `doublezero latency --json` read is reported under `latency` (device code/IP, reachability,
-min/avg/max ns) with its own `latency_at_unix`. Probed every 5 minutes rather than every tick — it
+min/avg/max ns) with its own `latency_at_unix`. Bounded at 20s and killed on overrun — it runs
+inline in the reconciler's tick, so a stall would otherwise stop receivers being respawned as well
+as freezing the diagnostic. Probed every 5 minutes rather than every tick — it
 is active measurement against every device, while what it reports (a device nearer than the one
 this host is on) moves with topology — and the last result is carried across the ticks that skip
 it. `null` means never probed; `[]` means probed and nothing answered.
