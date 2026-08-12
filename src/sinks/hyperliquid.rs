@@ -1632,11 +1632,14 @@ mod tests {
         );
     }
 
-    /// `Arbiter::apply_book_replay` takes this same mutex on every published batch, so only the
-    /// copy-out may run under it — the formatting and the JSON, both O(book), must not. Pinned by
-    /// holding the map for the whole render: a render that reached for it would time out here.
+    /// A book far larger than any view of it: `nLevels` truncates the `l2Book` view while the
+    /// `l4Book` snapshot carries every order.
+    ///
+    /// Deliberately says nothing about the shared book lock. That only the copy-out runs under it is
+    /// real and load-bearing (see [`take_market`]), and nothing here can observe it: the renderers
+    /// take no `BookSnapshot`, so a clone moved back under the guard would still pass.
     #[test]
-    fn rendering_does_not_hold_the_shared_book_lock() {
+    fn a_large_book_truncates_for_l2_and_renders_whole_for_l4() {
         let acc = accumulated(
             (0u32..5_000)
                 .map(|i| {
@@ -1650,8 +1653,6 @@ mod tests {
                 .collect(),
         );
         let books: BookSnapshot = replay(vec![(key(), acc)]);
-
-        // Everything the two book channels need, copied out under the lock — never the accumulator.
         let (fold, time) = take_market(&books, &key(), "BTC", |a| {
             (a.price_fold(), ms_or_now(a.source_ts_ns()))
         })
@@ -1661,24 +1662,8 @@ mod tests {
         })
         .unwrap();
 
-        // An ingest apply in flight, holding the map for as long as the renders below take.
-        let mut held = crate::model::lock(&books);
-        held.insert(
-            (Arc::from(VENUE), Arc::from(TEST_CATEGORY), 0, 8),
-            BookAccumulator::new("ETH".into()),
-        );
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let rendering = std::thread::spawn(move || {
-            let l2 = render_l2book(&fold.0, &fold.1, "BTC", l2_view(None, None, 100), time);
-            tx.send((l2, render_l4book_snapshot(&snapshot, "BTC")))
-        });
-        let (l2, l4) = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a render must not wait on the shared book lock");
-        drop(held);
-        rendering.join().unwrap().unwrap();
-
+        let l2 = render_l2book(&fold.0, &fold.1, "BTC", l2_view(None, None, 100), time);
+        let l4 = render_l4book_snapshot(&snapshot, "BTC");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&l2).unwrap()["data"]["levels"][0]
                 .as_array()

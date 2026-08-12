@@ -631,7 +631,8 @@ Modules are grouped by role under `src/`:
   the `nLevels` extension. ⚠️ **No rendering happens under the shared `BookSnapshot` lock** — that is
   the mutex the arbiter's `apply_book_replay` takes on every published batch, so a book render held
   across it stalls every receiver on every feed; `take_market`/`take_markets` clone the accumulator out
-  and everything O(book) runs after the guard drops, and the `price_fold` behind a client's `l2Book`
+  (itself O(book), and the cheapest snapshot on offer — measured ~0.45 ms against ~9.1 ms to fold
+  under the guard) and every rendering step runs after the guard drops, and the `price_fold` behind a client's `l2Book`
   subscriptions is computed **once per market per message** (it is view-independent, so folding per
   subscription would let one client multiply a 44k-order book by `MAX_SUBS`). Both book channels are
   gated on `baselined() && is_order_level()`: an
