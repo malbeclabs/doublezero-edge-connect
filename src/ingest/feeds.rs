@@ -214,9 +214,10 @@ pub struct Feed {
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
     pub arbitration: ArbitrationMode,
     /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
-    /// wire `channel_id` raised by this amount (`derived.publisher_offset` in the document) —
-    /// so the socket bound for channel `N` also receives frames stamped `N + offset`. `None` for
-    /// every row with no such mirror.
+    /// wire `channel_id` raised by this amount (`publisher_offset` in the document, a row-level
+    /// field — an `explicit` row can declare it exactly like a `derived` one) — so the socket
+    /// bound for channel `N` also receives frames stamped `N + offset`. `None` for every row with
+    /// no such mirror.
     ///
     /// **Consumer-facing identity only.** Ingest subtracts this from a wire channel id at the
     /// point a message becomes catalog/history/book identity (`FrameCtx::canonical_channel`), so

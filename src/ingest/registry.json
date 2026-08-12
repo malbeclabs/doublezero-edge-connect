@@ -154,6 +154,7 @@
       "group": "233.84.178.3",
       "emit_trades": true,
       "arbitration": "Sticky",
+      "publisher_offset": 100,
       "notes": [
         "Perps, two separately-gated groups: lashay-1 carries top of book and lashay-2 the",
         "market-by-price book. Both claim the tape - a host holding only lashay-2 must still serve",
@@ -182,8 +183,15 @@
         "deployment inventory - or it is marked unverified. Never by reading prose that describes an",
         "allocation; read the values the publisher actually renders.",
         "",
-        "One publisher per row: the two arms share a port block and are distinguished only by",
-        "datagram source IP."
+        "One publisher per row: the two arms share a port block and are distinguished, for",
+        "producer-side state (RefDataState, sequence tracking), only by datagram source IP.",
+        "",
+        "MIRROR. A second publisher mirrors the whole roster on that SAME port block, stamping",
+        "every wire channel_id raised by 100 - confirmed live on 2026-08-11 from a product catalog",
+        "listing every market twice, at channel N and channel N+100. publisher_offset records that",
+        "for ingest: it canonicalises the mirror's channel id back to the base publisher's for",
+        "catalog/history identity ONLY, never for the per-publisher book and sequence state above,",
+        "which stays keyed on the raw wire channel id and the source-IP split."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 31000, "refdata": 41000 }]
@@ -197,9 +205,13 @@
       "group": "233.84.178.4",
       "emit_trades": true,
       "arbitration": "Sticky",
+      "publisher_offset": 100,
       "notes": [
         "The market-by-price block is spaced +10000 / +20000, not the +1 / +2 the Hyperliquid",
-        "publisher role uses."
+        "publisher role uses.",
+        "",
+        "Mirrored exactly like the lashay-1 top-of-book sibling: a second publisher on the same",
+        "port block, channel_id raised by 100. See lashay-1's MIRROR note."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 32000, "refdata": 42000, "snapshot": 52000 }]
@@ -213,6 +225,7 @@
       "group": "233.84.178.20",
       "emit_trades": true,
       "arbitration": "Sticky",
+      "publisher_offset": 100,
       "notes": [
         "A disjoint universe under the same Source ID as the perps rows, which is exactly what",
         "`category` exists to express: these markets mirror nothing of the perps ones, so the two",
@@ -263,8 +276,7 @@
       "publishers": {
         "derived": {
           "channels": [{ "range": [10, 29] }, { "range": [39, 48] }, { "id": 49 }],
-          "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 },
-          "publisher_offset": 100
+          "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 }
         }
       }
     }
