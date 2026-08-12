@@ -5061,6 +5061,59 @@ mod tests {
         );
     }
 
+    /// **The live regression, end to end.** The mirror offset here does not come from a
+    /// hand-built `FrameCtx` — it comes from parsing an `explicit` registry row (the shape the
+    /// live mirrored feeds actually use: one shared port block, two arms separated only by
+    /// `channel_id`), exactly the document shape that used to be hard-wired to `mirror_offset:
+    /// None`. Two arms stamp the same market at channel 1 and channel 101 (the offsets seen on
+    /// the live host); if the registry still dropped an `explicit` row's `publisher_offset`, this
+    /// collapses to zero (`None`) and the catalog would carry two entries instead of one.
+    #[test]
+    fn explicit_row_publisher_offset_from_registry_collapses_catalog_identity() {
+        let feed = crate::ingest::registry::parse_one_row(
+            r#"{
+                "venue":"KALSHI","category":"perps","code":"d","kind":"MarketByPrice",
+                "group":"233.84.178.3","emit_trades":true,"arbitration":"Sticky",
+                "publisher_offset":100,
+                "publishers":{"explicit":[{"mktdata":32000,"refdata":42000,"snapshot":52000}]}}"#,
+        );
+        let offset = feed
+            .mirror_offset
+            .expect("an explicit row must be able to declare a mirror offset");
+
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let base = mbp_ctx_mirrored("KALSHI", &arbiter, &instruments, PortRole::Combined, offset);
+        let mirror = mbp_ctx_mirrored("KALSHI", &arbiter, &instruments, PortRole::Combined, offset);
+
+        let def_frame = |channel_id: u8| {
+            mbp_frame_v3(
+                channel_id,
+                0,
+                0,
+                &[
+                    mbp_wire::enc_manifest_summary(&codec_mbp::ManifestSummary {
+                        channel_id,
+                        valid: true,
+                        manifest_seq: 1,
+                        instrument_count: 1,
+                        ts: 0,
+                    }),
+                    enc_instrument_def_v3(41, 3, "MARKET-X", 1),
+                ],
+            )
+        };
+        proc.on_datagram(&def_frame(1), &base);
+        proc.on_datagram(&def_frame(101), &mirror);
+
+        let cat = instruments.lock().unwrap();
+        assert_eq!(
+            cat.len(),
+            1,
+            "an explicit row's declared mirror must collapse the two arms into one catalog entry"
+        );
+    }
+
     /// An `MbpProcessor` with `ids` defined and each synced from an empty-book anchor, in the drive
     /// order the wire uses: reference data, then the snapshot stream, then deltas.
     fn synced_mbp_proc(

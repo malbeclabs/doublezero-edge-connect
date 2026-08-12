@@ -307,6 +307,17 @@ struct FeedRow {
     emit_trades: bool,
     arbitration: WireArbitration,
     publishers: Publishers,
+    /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
+    /// wire `channel_id` raised by this amount — so a socket bound for channel `N` also receives
+    /// frames stamped `N + publisher_offset`. Row-level, not shape-specific: which mirror scheme
+    /// (if any) a deployment runs is a property of the *feed*, not of whether the document happens
+    /// to write its ports out explicitly or derive them from a roster — an `explicit` row is
+    /// exactly as capable of being mirrored as a `derived` one (confirmed live: two publishers
+    /// sharing one explicit port block, separated only by `channel_id`). `None` (the default)
+    /// means no such mirror. See [`crate::ingest::feeds::Feed::mirror_offset`] for what this
+    /// becomes downstream.
+    #[serde(default)]
+    publisher_offset: Option<u8>,
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
@@ -377,15 +388,10 @@ struct PortBlock {
 struct Derived {
     channels: Vec<ChannelSpec>,
     ports: PortBases,
-    /// A second publisher mirrors this whole roster on the **same ports**, stamping every wire
-    /// `channel_id` raised by this amount — so the channel-N socket also receives frames stamped
-    /// `N + publisher_offset`. Data, like the roster and the port bases beside it: which mirror
-    /// scheme (if any) a deployment runs is the publisher's to decide, not a rule this loader
-    /// derives from the numbers (a `% offset` or range test would mint a false mirror out of any
-    /// row whose roster happens to be wide enough). `None` (the default) means no such mirror.
-    /// See [`crate::ingest::feeds::Feed::mirror_offset`] for what this becomes downstream.
-    #[serde(default)]
-    publisher_offset: Option<u8>,
+    // `publisher_offset` moved to `FeedRow` (row-level, not shape-specific — a mirror is a
+    // property of the feed, not of whether its ports are written out explicitly or derived). A
+    // document still nesting it here falls into `unknown` below and is warned about like any
+    // other unrecognised key, never silently applied.
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
@@ -793,10 +799,10 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
         None => return Err(RegistryError::UnknownVenue(row.venue.clone())),
     }
 
-    let mirror_offset = match &row.publishers {
-        Publishers::Explicit(_) => None,
-        Publishers::Derived(d) => d.publisher_offset,
-    };
+    // Row-level: which mirror scheme (if any) a deployment runs is a property of the feed, not of
+    // whether its publishers are written out explicitly or derived — both shapes carry it the same
+    // way (see `FeedRow::publisher_offset`).
+    let mirror_offset = row.publisher_offset;
 
     let publishers: Vec<FeedPublisher> = match &row.publishers {
         Publishers::Explicit(blocks) => blocks.iter().map(block_to_publisher).collect(),
@@ -1019,6 +1025,17 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
     }
 }
 
+/// Parse a single feed row (wrapped in a one-row document) and return the resulting [`Feed`].
+///
+/// A cross-module test helper: `processor.rs`'s mirror tests want a `Feed::mirror_offset` that
+/// actually came from parsing a document — not one poked directly onto a hand-built `FrameCtx` —
+/// so the registry's own parsing is what is under test, exactly like the live defect was.
+#[cfg(test)]
+pub(crate) fn parse_one_row(feed_json: &str) -> Feed {
+    let doc = format!(r#"{{"version":1,"feeds":[{feed_json}]}}"#);
+    build(&doc, "test").expect("document parses").rows[0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,25 +1128,29 @@ mod tests {
     }
 
     /// A row with no `publisher_offset` carries no mirror — the state every row but the mirrored
-    /// one is in today.
+    /// ones is in today. True of either shape: `PERPS_ROW` here is `explicit` and declares
+    /// nothing, `SPORTS_ROW` is `derived` and declares nothing.
     #[test]
     fn a_row_with_no_publisher_offset_has_no_mirror_offset() {
-        let loaded = build(&doc_with(SPORTS_ROW), "test").unwrap();
-        assert_eq!(loaded.rows[0].mirror_offset, None);
+        let loaded = build(&doc_with(&format!("{SPORTS_ROW},{PERPS_ROW}")), "test").unwrap();
+        let sports = loaded.rows.iter().find(|f| f.category == "sports").unwrap();
+        assert_eq!(sports.mirror_offset, None);
+        let perps = loaded.rows.iter().find(|f| f.category == "perps").unwrap();
+        assert_eq!(perps.mirror_offset, None);
     }
 
-    /// `derived.publisher_offset` is recorded on the `Feed` as data, and it changes nothing about
-    /// port derivation — the mirror sends to the identical ports, only its wire `channel_id` is
-    /// raised. An `explicit` row has no `publisher_offset` to carry and its `mirror_offset` is
-    /// always `None`, regardless of what a sibling `derived` row declares.
+    /// `publisher_offset` is row-level, so a `derived` row still records it as data exactly as
+    /// before, and it changes nothing about port derivation — the mirror sends to the identical
+    /// ports, only its wire `channel_id` is raised.
     #[test]
-    fn a_publisher_offset_is_recorded_without_touching_port_derivation() {
-        let row = SPORTS_ROW.replace(
-            r#""ports":{"mktdata":33000,"refdata":43000,"snapshot":53000}"#,
-            r#""ports":{"mktdata":33000,"refdata":43000,"snapshot":53000},"publisher_offset":100"#,
+    fn a_derived_row_records_publisher_offset_without_touching_port_derivation() {
+        let row = SPORTS_ROW.replacen(
+            r#""publishers":{"derived""#,
+            r#""publisher_offset":100,"publishers":{"derived""#,
+            1,
         );
-        let loaded = build(&doc_with(&format!("{row},{PERPS_ROW}")), "test").unwrap();
-        let sports = loaded.rows.iter().find(|f| f.category == "sports").unwrap();
+        let loaded = build(&doc_with(&row), "test").unwrap();
+        let sports = &loaded.rows[0];
         assert_eq!(sports.mirror_offset, Some(100));
         let ports: Vec<(u16, u16, Option<u16>)> = sports
             .publishers
@@ -1146,10 +1167,36 @@ mod tests {
             ],
             "publisher_offset must not shift ports; the mirror binds nothing new"
         );
-        let perps = loaded.rows.iter().find(|f| f.category == "perps").unwrap();
+    }
+
+    /// **The regression this change fixes.** An `explicit` row is exactly as capable of declaring
+    /// a mirror as a `derived` one — the mirror on the live host is two publishers sharing one
+    /// explicit port block, separated only by `channel_id` (N vs N+100). Under the bug,
+    /// `publisher_offset` lived only inside `derived` and every `explicit` row's `mirror_offset`
+    /// was hard-wired to `None`, so this row's mirror never canonicalised and every market it
+    /// carried entered the catalog twice.
+    #[test]
+    fn an_explicit_row_can_declare_a_publisher_offset() {
+        let row = PERPS_ROW.replacen(
+            r#""publishers":{"explicit""#,
+            r#""publisher_offset":100,"publishers":{"explicit""#,
+            1,
+        );
+        let loaded = build(&doc_with(&row), "test").unwrap();
+        let perps = &loaded.rows[0];
         assert_eq!(
-            perps.mirror_offset, None,
-            "an explicit row never carries a mirror offset"
+            perps.mirror_offset,
+            Some(100),
+            "an explicit row must be able to declare the same mirror a derived row can"
+        );
+        // Ports are the one explicit block, untouched: the mirror shares the socket, it does not
+        // bind a new one.
+        assert_eq!(
+            (
+                perps.publishers[0].ports.mktdata(),
+                perps.publishers[0].ports.refdata(),
+            ),
+            (7576, 7577),
         );
     }
 
