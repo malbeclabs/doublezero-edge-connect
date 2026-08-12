@@ -449,12 +449,16 @@ struct OrderEvent {
     size_bits: u64,
 }
 
+/// Why a market must be re-baselined before it can be served again.
+const FORCED_DISAGREEMENT: &str = "disagreement";
+const FORCED_GUARD_EVICTED: &str = "guard_evicted";
+
 /// One order-level market's cross-publisher race state: the events recently delivered to the wire, and
 /// the smallest resting quantity any publisher has claimed for each live order.
 ///
 /// Bounded twice — by [`MAX_SEEN_ORDER_EVENTS`] and by the caller's time window — because the wire is
-/// unauthenticated. Neither bound carries correctness: a removed order id is never re-added
-/// (`ingest::book`), so an undersized window costs a redundant emission, not a corrupt book.
+/// unauthenticated. The time bound is a cost knob; the count bound is not, since it also bounds the
+/// resurrection guard, so [`Self::forced`] carries what it costs when it binds.
 #[derive(Default)]
 struct MarketEvents {
     /// Delivered events mapped to the publisher that delivered each first and when it arrived.
@@ -473,6 +477,11 @@ struct MarketEvents {
     resting: HashMap<u64, Option<(f64, Publisher)>>,
     /// `resting`'s keys in insertion order, oldest first, for its own bound.
     resting_order: VecDeque<u64>,
+    /// One-shot: why this market can no longer be served from either arm's deltas, drained by the
+    /// caller. Set when the guard cannot answer — the arms disagreed, or a tracked order aged out of
+    /// `resting` — because from then on neither publisher's stream is known to describe the book a
+    /// consumer holds.
+    forced: Option<&'static str>,
 }
 
 /// Whether one order event reached the wire, and what its arrival said about the arms.
@@ -484,9 +493,10 @@ enum EventVerdict {
     /// An order this market has already published as gone. A venue never reuses an id, so this is a
     /// lagging publisher's stale copy — drop it, or every consumer resurrects a dead order.
     Resurrection,
-    /// First delivery, but this publisher claims more is resting for the order than a peer already
-    /// reported — publish it and count the disagreement.
-    DeliverDisagreeing,
+    /// This publisher claims more is resting for the order than a peer already reported, so one of the
+    /// two books has drifted. Neither copy is published: the larger rewinds the consumer past a fill
+    /// the venue already applied, the smaller lets a forged size mute a real order.
+    Disagreement,
 }
 
 impl MarketEvents {
@@ -527,10 +537,10 @@ impl MarketEvents {
             }
             Some(Some((seen_size, seen_by))) => {
                 if size > *seen_size && *seen_by != publisher {
-                    // A resting order only shrinks, so this publisher has missed a fill its peer saw.
-                    // Still published: the peer could be the drifted one, and preferring the smaller
-                    // quantity would let a forged small size mute a real publisher's order.
-                    return EventVerdict::DeliverDisagreeing;
+                    // A resting order only shrinks, so one of the two books has missed a fill. Which
+                    // one is unknowable here, so the market re-baselines instead of picking.
+                    self.force(FORCED_DISAGREEMENT);
+                    return EventVerdict::Disagreement;
                 }
                 if size < *seen_size {
                     *seen_size = size;
@@ -539,16 +549,56 @@ impl MarketEvents {
                 EventVerdict::Deliver
             }
             None => {
-                let slot = (size != 0.0).then_some((size, publisher));
-                self.resting.insert(ev.order_id, slot);
-                self.resting_order.push_back(ev.order_id);
-                while self.resting_order.len() > MAX_SEEN_ORDER_EVENTS {
-                    if let Some(old) = self.resting_order.pop_front() {
-                        self.resting.remove(&old);
-                    }
-                }
+                self.track(
+                    ev.order_id,
+                    (size != 0.0).then_some((size, publisher)),
+                    true,
+                );
                 EventVerdict::Deliver
             }
+        }
+    }
+
+    /// Track one order's resting state, evicting the oldest to stay within [`MAX_SEEN_ORDER_EVENTS`].
+    ///
+    /// An eviction is where the resurrection guard stops being able to answer, so it forces a
+    /// re-baseline — except while `seed`ing from a re-baseline's own orders, which is the one case the
+    /// consumer's book was *just* replaced and the entries being dropped describe the book it no longer
+    /// holds. Without that exemption a book larger than the cap would re-force on its own snapshot.
+    fn track(&mut self, order_id: u64, slot: Option<(f64, Publisher)>, forcing: bool) {
+        if self.resting.insert(order_id, slot).is_none() {
+            self.resting_order.push_back(order_id);
+        }
+        while self.resting_order.len() > MAX_SEEN_ORDER_EVENTS {
+            let Some(old) = self.resting_order.pop_front() else {
+                break;
+            };
+            self.resting.remove(&old);
+            if forcing {
+                self.force(FORCED_GUARD_EVICTED);
+            }
+        }
+    }
+
+    /// Record why this market must re-baseline. First cause wins: the flag is one-shot and a second
+    /// cause before it is drained describes the same unserveable market.
+    fn force(&mut self, reason: &'static str) {
+        self.forced.get_or_insert(reason);
+    }
+
+    /// Re-point the race state at a re-baseline's book.
+    ///
+    /// The consumer's book is replaced wholesale, so nothing delivered before it can be a duplicate of
+    /// anything that follows and the dedup window goes. The **resurrection guard does not**: a venue
+    /// still never reuses an order id, so a peer's stale `Add` for an order this snapshot does not
+    /// contain must still be refused. `changes` seeds the floor with the snapshot's own orders, so a
+    /// later peer claiming more is resting for one of them is still caught as drift.
+    fn rebaselined(&mut self, changes: &[BookChange], publisher: Publisher) {
+        self.seen.clear();
+        self.order.clear();
+        self.forced = None;
+        for c in changes.iter().filter(|c| c.order_id != 0 && c.size != 0.0) {
+            self.track(c.order_id, Some((c.size, publisher)), false);
         }
     }
 
@@ -985,6 +1035,22 @@ impl Arbiter {
         peer.synced = synced;
     }
 
+    /// Drop a departed publisher's book standing across every market — the seam a Market-by-Order
+    /// receiver's registration calls as it exits.
+    ///
+    /// Departure is the authoritative signal and [`PEER_SERVING_NS`] is only its backstop, for a
+    /// publisher that goes quiet without deregistering: a gap-and-recover cycle is sub-second, so the
+    /// timer never binds on it, and a suppressed re-baseline is never retried — the surviving arm's
+    /// market wedges for the life of the process.
+    pub fn forget_publisher_books(&mut self, publisher: Publisher) {
+        for arms in self.book_sync.values_mut() {
+            arms.remove(&publisher);
+        }
+        for market in self.book_markets.values_mut() {
+            market.arms.remove(&publisher);
+        }
+    }
+
     /// Install the `--arb-*` arbitration tunables: the single-arm authority config, and the cross-arm
     /// matcher's pairing window. Called once at startup; without it both take
     /// [`AuthorityConfig::DEFAULT`] — the same values `main.rs`'s clap defaults are derived from — so
@@ -1004,6 +1070,16 @@ impl Arbiter {
     #[cfg(test)]
     pub(crate) fn authority(&self) -> &StickyAuthority {
         &self.books
+    }
+
+    /// Whether one arm still claims a synced book for a market, so a test can assert a departure
+    /// released it.
+    #[cfg(test)]
+    pub(crate) fn book_arm_synced(&self, key: &MarketKey, publisher: Publisher) -> bool {
+        self.book_sync
+            .get(key)
+            .and_then(|arms| arms.get(&publisher))
+            .is_some_and(|st| st.synced)
     }
 
     /// Report one arm's book health for a market — the seam the MBP processor calls on every
@@ -1216,6 +1292,9 @@ impl Arbiter {
     /// A change with no order identity (`order_id == 0`) is un-collapsable and always published.
     fn emit_order_level_book(&mut self, key: MarketKey, b: &NormalizedBook, publisher: Publisher) {
         let now = now_mono_ns();
+        // Fold every arm's own stream, not just the winning copies: a forced re-baseline republishes
+        // one arm's whole book, which exists only if that arm's copies were accumulated all along.
+        self.accumulate_book(&key, publisher, b);
         if b.changes
             .first()
             .is_some_and(|c| c.action == BookAction::Clear)
@@ -1238,11 +1317,12 @@ impl Arbiter {
                 self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                 return;
             }
-            // The consumer's book is replaced wholesale, so nothing delivered before it can be a
-            // duplicate of anything that follows.
-            self.book_events.remove(&key);
-            self.note_book_delivery(&key, b, publisher, now);
-            self.publish_book(&key, b.clone());
+            self.clear_led_rebaseline(&key, b, publisher, now);
+            return;
+        }
+        if self.book_markets.get(&key).is_some_and(|m| m.rebaseline)
+            && !self.serve_forced_rebaseline(&key, b, publisher, now)
+        {
             return;
         }
         let window = self.book_dedup_window_ns;
@@ -1262,13 +1342,14 @@ impl Arbiter {
             };
             match events.admit(ev, publisher, b.recv_ts_ns, window) {
                 EventVerdict::Deliver => kept.push(*c),
-                EventVerdict::DeliverDisagreeing => {
-                    disagreed += 1;
-                    kept.push(*c);
-                }
+                EventVerdict::Disagreement => disagreed += 1,
                 EventVerdict::Duplicate => deduped += 1,
                 EventVerdict::Resurrection => resurrected += 1,
             }
+        }
+        let forced = events.forced.take();
+        if let Some(reason) = forced {
+            self.force_rebaseline(&key, &b.venue, reason);
         }
         let venue = b.venue.as_ref();
         if deduped > 0 {
@@ -1302,6 +1383,82 @@ impl Arbiter {
         };
         self.note_book_delivery(&key, b, publisher, now);
         self.publish_book(&key, out);
+    }
+
+    /// Publish a producer's own `Clear`-led re-baseline and re-point the market's race state at it.
+    fn clear_led_rebaseline(
+        &mut self,
+        key: &MarketKey,
+        b: &NormalizedBook,
+        publisher: Publisher,
+        now: u64,
+    ) {
+        self.book_events
+            .entry(key.clone())
+            .or_default()
+            .rebaselined(&b.changes, publisher);
+        if let Some(m) = self.book_markets.get_mut(key) {
+            m.rebaseline = false;
+            m.withheld = 0;
+        }
+        self.note_book_delivery(key, b, publisher, now);
+        self.publish_book(key, b.clone());
+    }
+
+    /// Mark a market unserveable until it is re-baselined, counting why.
+    fn force_rebaseline(&mut self, key: &MarketKey, venue: &str, reason: &'static str) {
+        if let Some(m) = self.book_markets.get_mut(key) {
+            m.rebaseline = true;
+        }
+        metrics()
+            .mbo_forced_rebaselines
+            .with_label_values(&[venue, reason])
+            .inc();
+    }
+
+    /// Discharge a forced re-baseline on `publisher`'s batch, returning whether the caller should go on
+    /// to publish that batch as usual.
+    ///
+    /// Ordinary events are withheld meanwhile: while the flag is set neither arm's deltas are known to
+    /// describe the book a consumer holds, so publishing them is the guess the flag exists to refuse.
+    /// The wait for a completed logical event, and its bound, are the authority path's — a `to_book` of
+    /// a half-applied event goes out stamped `last` as a torn book, and `last` is a promise made by an
+    /// unauthenticated producer.
+    fn serve_forced_rebaseline(
+        &mut self,
+        key: &MarketKey,
+        b: &NormalizedBook,
+        publisher: Publisher,
+        now: u64,
+    ) -> bool {
+        if let Some(m) = self.book_markets.get_mut(key) {
+            if !b.last && m.withheld < MAX_WITHHELD_BATCHES {
+                m.withheld += 1;
+                self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                return false;
+            }
+            m.rebaseline = false;
+            m.withheld = 0;
+        }
+        let Some(full) = self.rebaseline_book(key, publisher) else {
+            // Nothing complete to republish: empty the consumer's book and let this batch rebuild onto
+            // it, exactly as the single-arm gate degrades.
+            self.book_events
+                .entry(key.clone())
+                .or_default()
+                .rebaselined(&[], publisher);
+            self.vm(&b.venue).emit[EMIT_BOOK].inc();
+            let _ = self.tx.send(Arc::new(FeedMessage::Book(clear_only(b))));
+            return true;
+        };
+        self.book_events
+            .entry(key.clone())
+            .or_default()
+            .rebaselined(&full.changes, publisher);
+        self.note_book_delivery(key, b, publisher, now);
+        self.vm(&b.venue).emit[EMIT_BOOK].inc();
+        let _ = self.tx.send(Arc::new(FeedMessage::Book(full)));
+        false
     }
 
     /// Record that `publisher` reached the wire for this market, and mark the market order-level. Both
@@ -4063,8 +4220,9 @@ mod tests {
     }
 
     /// A resting order only ever shrinks, so a publisher claiming more is resting than a peer already
-    /// reported has missed a fill. Its copy still reaches the wire — dropping an arm's stream on one
-    /// suspicion is worse — but the disagreement is counted rather than silently absorbed.
+    /// reported has missed a fill. The disagreement is counted rather than silently absorbed; what
+    /// happens to the market afterwards is
+    /// [`a_size_disagreement_forces_a_rebaseline_rather_than_a_guess`].
     #[test]
     fn a_content_disagreement_is_counted() {
         const VENUE: &str = "BookDriftCounted";
@@ -4079,8 +4237,180 @@ mod tests {
             l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 8.0)], 1_001),
             arm(2),
         );
-        assert_eq!(drain_books(&mut rx).len(), 2);
+        assert_eq!(drain_books(&mut rx).len(), 1);
         assert_eq!(disagreements(VENUE), before + 1);
+    }
+
+    fn forced_rebaselines(venue: &str, reason: &str) -> u64 {
+        metrics()
+            .mbo_forced_rebaselines
+            .with_label_values(&[venue, reason])
+            .get()
+    }
+
+    /// Two publishers disagreeing about a resting order's size proves one of them has drifted, and
+    /// which is unknowable here. Publishing either is a guess — the larger rewinds the consumer past a
+    /// fill the venue already applied, the smaller lets a forged size mute a real order — so the market
+    /// stops being served from deltas and re-baselines instead.
+    #[test]
+    fn a_size_disagreement_forces_a_rebaseline_rather_than_a_guess() {
+        const VENUE: &str = "BookDriftRebaseline";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        let (before_dis, before_forced) = (
+            disagreements(VENUE),
+            forced_rebaselines(VENUE, FORCED_DISAGREEMENT),
+        );
+        // Arm 1 installs its book, so the gate has a complete one to republish.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 7, 100.0, 6.0)],
+                1_000,
+            ),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+
+        // Arm 2 missed the fill that took order 7 to 6, so it claims 8 is resting.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 8.0)], 1_100),
+            arm(2),
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "neither publisher's claim may reach the wire"
+        );
+        assert_eq!(disagreements(VENUE), before_dis + 1);
+        assert_eq!(
+            forced_rebaselines(VENUE, FORCED_DISAGREEMENT),
+            before_forced + 1
+        );
+
+        // The next completed logical event re-baselines rather than resuming the delta stream.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 9, 99.0, 1.0)], 1_200),
+            arm(1),
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].changes[0].action, BookAction::Clear);
+        assert!(out[0].last, "a re-baseline must terminate its own event");
+    }
+
+    /// The cross-publisher guard is bounded, so a tracked order can age out. An eviction must not
+    /// silently reopen the resurrection path: the market degrades to a re-baseline instead.
+    #[test]
+    fn evicting_a_tracked_order_marks_the_market_for_rebaseline() {
+        const VENUE: &str = "BookGuardEvicted";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
+        for oid in 1..=(MAX_SEEN_ORDER_EVENTS as u64 + 1) {
+            a.emit(
+                l3_batch(
+                    VENUE,
+                    vec![order(BookAction::Update, oid, 100.0, 1.0)],
+                    1_000,
+                ),
+                arm(1),
+            );
+        }
+        let _ = drain_books(&mut rx);
+        let key: MarketKey = (VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        assert!(
+            a.book_markets[&key].rebaseline,
+            "a lost guard entry must stop the market being served from deltas"
+        );
+        assert_eq!(
+            forced_rebaselines(VENUE, FORCED_GUARD_EVICTED),
+            before + 1,
+            "and it must be separable from a disagreement in production"
+        );
+    }
+
+    /// A re-baseline replaces the consumer's book, so prior *events* are no longer duplicates — but the
+    /// record of which orders are dead must survive it, or a peer's stale `Add` resurrects one.
+    #[test]
+    fn a_rebaseline_keeps_the_resurrection_guard() {
+        const VENUE: &str = "BookRebaselineGuard";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let add = vec![order(BookAction::Update, 7, 100.0, 6.0)];
+        a.emit(l3_batch(VENUE, add.clone(), 1_000), arm(1));
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Delete, 7, 100.0, 0.0)], 1_100),
+            arm(1),
+        );
+        // Arm 1 gaps and recovers; its snapshot does not contain the dead order 7.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 9, 99.0, 1.0)],
+                1_200,
+            ),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+
+        // The slow arm's only copy of the add, long after both.
+        a.emit(l3_batch(VENUE, add, 9_000_000), arm(2));
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "a re-baseline must not reopen the resurrection path"
+        );
+    }
+
+    /// A re-baseline's own orders seed the resting floor, so a peer claiming more than the snapshot
+    /// holds is still caught as drift rather than read as an unseen order.
+    #[test]
+    fn a_rebaseline_seeds_the_guard_with_its_own_orders() {
+        const VENUE: &str = "BookRebaselineSeed";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        let before = disagreements(VENUE);
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 9, 99.0, 5.0)],
+                1_000,
+            ),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 9, 99.0, 8.0)], 1_100),
+            arm(2),
+        );
+        assert!(drain_books(&mut rx).is_empty());
+        assert_eq!(disagreements(VENUE), before + 1);
+    }
+
+    /// A publisher that has gone away must not hold a market's re-baseline hostage. Its departure is
+    /// known the moment its receiver deregisters; waiting out [`PEER_SERVING_NS`] wedges the surviving
+    /// arm, because a suppressed re-baseline is never retried.
+    #[test]
+    fn a_departed_publisher_does_not_suppress_a_peers_rebaseline() {
+        const VENUE: &str = "BookDepartedPeer";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 1, 100.0, 1.0)], 1_000),
+            arm(1),
+        );
+        let _ = drain_books(&mut rx);
+
+        a.forget_publisher_books(arm(1));
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 7, 100.0, 6.0)],
+                1_100,
+            ),
+            arm(2),
+        );
+        assert_eq!(
+            drain_books(&mut rx).len(),
+            1,
+            "the departed arm's serving claim went with its receiver"
+        );
     }
 
     /// A shrinking sequence across two arms is an ordinary race, not drift: whichever arm delivers the

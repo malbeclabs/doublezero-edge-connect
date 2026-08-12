@@ -207,6 +207,10 @@ pub struct Metrics {
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
     pub book_resurrections_dropped: IntCounterVec,
+    /// Order-level markets forced to re-baseline because the cross-publisher guard could not answer:
+    /// `disagreement` (two arms claimed different resting state) or `guard_evicted` (a tracked order
+    /// aged out at the per-market cap).
+    pub mbo_forced_rebaselines: IntCounterVec,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -699,6 +703,16 @@ impl Metrics {
                  silently drifted. Any sustained non-zero rate is a correctness alarm.",
                 &["venue"],
             ),
+            mbo_forced_rebaselines: counter_vec(
+                &registry,
+                "dz_mbo_forced_rebaselines_total",
+                "Order-level markets withheld and re-baselined because the cross-publisher guard \
+                 could not answer. reason=disagreement: two arms claimed different resting state for \
+                 one order, so neither is known to be right. reason=guard_evicted: a tracked order \
+                 aged out at the per-market cap, reopening the resurrection path. A sustained rate on \
+                 either is the signal to reconsider the per-publisher book model.",
+                &["venue", "reason"],
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -996,6 +1010,9 @@ mod tests {
         m.book_resurrections_dropped
             .with_label_values(&["HYPERLIQUID"])
             .inc();
+        m.mbo_forced_rebaselines
+            .with_label_values(&["HYPERLIQUID", "disagreement"])
+            .inc();
         m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
@@ -1044,6 +1061,7 @@ mod tests {
             "dz_book_events_deduped_total",
             "dz_mbo_arm_disagreement_total",
             "dz_book_resurrections_dropped_total",
+            "dz_mbo_forced_rebaselines_total",
             "dz_hl_sink_clients",
             "dz_hl_sink_messages_total",
             "dz_shred_wins_total",
