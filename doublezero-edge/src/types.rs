@@ -342,10 +342,14 @@ pub struct DiagnosticsResponse {
     pub subscriptions: SubscriptionsBlock,
     #[serde(default)]
     pub activation: ActivationBlock,
-    /// `doublezero latency`, probed by the container only when no session is up. Absent (rather
-    /// than empty) means it was not probed, which is the healthy steady state.
+    /// `doublezero latency`, probed by the container on its own coarse cadence. Absent (rather
+    /// than empty) means it has never probed; empty means it probed and nothing answered.
     #[serde(default)]
     pub latency: Option<Vec<DeviceLatency>>,
+    /// When that probe ran. Routinely older than `tunnel.checked_at_unix`, since the probe is
+    /// paced far coarser than the subscription poll.
+    #[serde(default)]
+    pub latency_at_unix: Option<u64>,
     #[serde(default)]
     pub registry: RegistryBlock,
     #[serde(default)]

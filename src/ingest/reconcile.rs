@@ -26,7 +26,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -247,6 +247,11 @@ struct TickOutcome {
     desired: Option<Desired>,
 }
 
+/// How often `doublezero latency` is probed, independent of `--subscription-refresh-secs`. Not a
+/// flag: the signal it carries (a device nearer than the one this host is on) moves with network
+/// topology, so no deployment has a reason to want a different number.
+const LATENCY_PROBE_INTERVAL: Duration = Duration::from_secs(300);
+
 pub struct Reconciler {
     cfg: ReconcilerConfig,
     /// Each running receiver with the tape flag it reads. Deliberately one map and not two: a
@@ -270,6 +275,10 @@ pub struct Reconciler {
     /// task's own liveness write, so the reconciler must not deregister on its behalf.
     health: SharedFeedHealth,
     cli_missing_logged: bool,
+    /// When `doublezero latency` was last probed, so [`LATENCY_PROBE_INTERVAL`] can pace it
+    /// independently of `--subscription-refresh-secs`. `None` until the first probe, which is why
+    /// the first tick always takes one.
+    last_latency_probe: Option<Instant>,
     /// The channel filter's own admitted feed-key set for `cfg.enabled`, as of the last completed
     /// tick — **independent of subscription state**, and deliberately not derived from `active`.
     ///
@@ -329,6 +338,7 @@ impl Reconciler {
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
+            last_latency_probe: None,
             last_filter_admitted: HashSet::new(),
             draining: Vec::new(),
         }
@@ -454,7 +464,21 @@ impl Reconciler {
         // The group list is only needed to resolve shred-group IPs; skip it when shreds are
         // disabled or explicitly sourced.
         let need_group_ips = !self.cfg.shred.disabled && self.cfg.shred.explicit_sources.is_empty();
-        match tokio::task::spawn_blocking(move || subscriptions::detect(need_group_ips)).await {
+        // Latency is paced separately from the subscription poll: it is active measurement against
+        // every device, and what it reports (a nearer device than the one this host chose) moves
+        // with network topology, not with a 30s tick. First tick always probes, so `diagnose` has
+        // an answer promptly after start.
+        let probe_latency = self
+            .last_latency_probe
+            .is_none_or(|at| at.elapsed() >= LATENCY_PROBE_INTERVAL);
+        if probe_latency {
+            self.last_latency_probe = Some(Instant::now());
+        }
+        match tokio::task::spawn_blocking(move || {
+            subscriptions::detect(need_group_ips, probe_latency)
+        })
+        .await
+        {
             Ok(Detected::Ok(subs)) => {
                 let (market_data_codes, shred_codes, other_codes) = self.classify_codes(&subs);
                 TickOutcome {

@@ -380,10 +380,12 @@ doublezero-edge diagnose --output table
 doublezero-edge diagnose --jq '.diagnostics.diagnosis.code'
 ```
 
-On a host with no session up, the container also runs `doublezero latency` and `diagnose` reports
-each device's reachability and min/avg/max round trip, nearest first — the second read #133 asks
-for. It is skipped entirely once a session is up, so a healthy host never pays for the probe and
-shows no `latency` block at all (distinct from a probe where nothing answered).
+The container also runs `doublezero latency`, and `diagnose` reports each device's reachability and
+min/avg/max round trip, nearest first. On a host that is down it answers "is anything reachable at
+all"; on one that is up it answers "is something nearer than the device I am on" — compare it with
+the tunnel table's `DEVICE` column. It is probed every 5 minutes rather than every poll (it is
+active measurement, and the answer moves with topology), so the block carries its own
+`probed_at_unix` and is routinely older than the rest of the report.
 
 `diagnose` only reports. When the verdict is `tunnel_down`, its remediation names the retry —
 `doublezero connect multicast` inside the container — which stays a deliberate `docker exec` rather

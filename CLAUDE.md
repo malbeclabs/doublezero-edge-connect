@@ -258,7 +258,18 @@ Modules are grouped by role under `src/`:
   into `parse_status_codes`: that function's `Option<Vec<String>>` contract gates activation
   fleet-wide, and a diagnosis must not be able to move it. Every session field is optional and the
   `subscriptions` array is **reported but never read for activation**, which stays keyed on
-  `multicast_groups` alone.
+  `multicast_groups` alone. `detect` also runs **`doublezero latency --json`** when the caller asks
+  (`probe_latency`) — the #133 read. It is **not** gated on session state: connected, it is what
+  shows a *nearer* device has appeared since this host chose the one it is on. It is paced instead,
+  by `reconcile::LATENCY_PROBE_INTERVAL` (5 min, a constant rather than a flag), because it is
+  active measurement against every device while what it reports moves with network topology, not
+  with a 30s tick; `publish_tick` carries the last probe across the ticks that skip it and dates it
+  `latency_at_unix`, so the figures never read as just-measured. `parse_latency` **locates** the
+  JSON rather than assuming byte 0 — the client's "a new version is available" notice goes to
+  stderr today (`client/doublezero/src/main.rs` hands `check_version` a locked stderr) but
+  historically landed on stdout and malformed exactly this document, a hazard its own source still
+  carries a note about — and soft-fails to "not probed"; `None` (never probed) and `Some([])`
+  (probed, nothing answered) stay distinct all the way to the wire.
 - **`ingest/diagnostics.rs`** — why this process is (or is not) serving data. Exists because `/v1` is
   subscription-gated: on a host whose tunnel never came up it is not listening, so every
   `doublezero-edge` command fails with a transport error and "not running" is indistinguishable from

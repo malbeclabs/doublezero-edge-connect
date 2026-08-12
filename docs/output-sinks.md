@@ -166,10 +166,11 @@ it — `last_ok_at_unix` reports how stale it is, and only a successful poll sta
 and `gating_disabled` run no status call, so they leave it unset rather than dating an empty
 document to now).
 
-A host with no healthy session also gets a `doublezero latency --json` read, reported under
-`latency` (device code/IP, reachability, min/avg/max ns). It is **skipped entirely** once a session
-is up — on a connected host `status` already names the device — so `null` means "not probed" and
-`[]` means "probed, nothing answered".
+A `doublezero latency --json` read is reported under `latency` (device code/IP, reachability,
+min/avg/max ns) with its own `latency_at_unix`. Probed every 5 minutes rather than every tick — it
+is active measurement against every device, while what it reports (a device nearer than the one
+this host is on) moves with topology — and the last result is carried across the ticks that skip
+it. `null` means never probed; `[]` means probed and nothing answered.
 
 `doublezero-edge diagnose` renders this. It only reports: the retry the `tunnel_down` rung names is
 `doublezero connect multicast` inside the container.

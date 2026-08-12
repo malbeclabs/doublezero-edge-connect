@@ -55,9 +55,10 @@ pub struct HostSubs {
     /// tunnel never came up. **Reported only, never an activation input** — activation keys on
     /// `subscribed_codes` alone (see [`Session`]).
     pub sessions: Vec<Session>,
-    /// `doublezero latency --json`, probed only on a host with no healthy session (see
-    /// [`detect`]). `None` means **not probed**, which is a different answer from `Some(vec![])`
-    /// ("probed, no device answered") and must stay distinguishable in the diagnosis.
+    /// `doublezero latency --json`, probed on the caller's cadence (see [`detect`]). `None` means
+    /// **not probed this tick**, which is a different answer from `Some(vec![])` ("probed, no
+    /// device answered") and must stay distinguishable — the snapshot carries the last probe
+    /// forward across the ticks that skip it.
     pub latency: Option<Vec<DeviceLatency>>,
 }
 
@@ -86,11 +87,11 @@ pub struct DeviceLatency {
 /// Parse `doublezero latency --json`. Soft-fail to an empty vec: this is garnish on a diagnosis,
 /// and it must never be able to move what [`parse_status_codes`] decided.
 ///
-/// The document is **located, not assumed to start at byte 0**. The client prints a two-line
-/// "a new version is available" notice when it is behind, and a captured run shows it immediately
-/// above the JSON; whether that lands on stdout or stderr is the client's business and can change,
-/// so a leading non-JSON preamble is skipped rather than failing the parse. Strict parse first, so
-/// the scan only ever runs on output that already failed.
+/// The document is **located, not assumed to start at byte 0**. The client prints an "a new version
+/// is available" notice when it is behind; today that goes to stderr (`client/doublezero/src/main.rs`
+/// hands `check_version` a locked stderr) so stdout is clean, but it used to land on stdout and
+/// malform exactly this JSON — its own source still carries the note about that. Strict parse
+/// first, so the scan only ever runs on output that already failed.
 pub fn parse_latency(stdout: &[u8]) -> Vec<DeviceLatency> {
     if let Ok(rows) = serde_json::from_slice(stdout) {
         return rows;
@@ -343,10 +344,11 @@ pub fn parse_status_sessions(stdout: &[u8]) -> Vec<Session> {
         .collect()
 }
 
-/// Run `doublezero status --json` (always) and `doublezero multicast group list --json-compact`
-/// (only when `need_group_ips`, i.e. shred sources aren't explicitly overridden). See [`Detected`]
-/// for how the three outcomes are classified.
-pub fn detect(need_group_ips: bool) -> Detected {
+/// Run `doublezero status --json` (always), `doublezero multicast group list --json-compact` (only
+/// when `need_group_ips`, i.e. shred sources aren't explicitly overridden), and `doublezero latency
+/// --json` (only when `probe_latency` — the caller's cadence decision, see
+/// [`crate::ingest::reconcile`]). See [`Detected`] for how the three outcomes are classified.
+pub fn detect(need_group_ips: bool, probe_latency: bool) -> Detected {
     let status = match run_cli(&["status", "--json"]) {
         CliOut::Ok(bytes) => bytes,
         CliOut::Missing => return Detected::CliMissing,
@@ -365,18 +367,18 @@ pub fn detect(need_group_ips: bool) -> Detected {
     let sessions = parse_status_sessions(&status);
     let subscribed_codes: HashSet<String> = codes.into_iter().collect();
 
-    // #133 asks for the `latency` read too, but only a host that is *not* connected has a use for
-    // it: on a healthy one `status` already names the device this host landed on. Probing costs a
-    // round of active measurement against every device, so it is skipped entirely once a session
-    // is up — which is the steady state for the whole fleet. A failure degrades to "not probed",
-    // never to an `Unavailable` tick: this cannot be allowed to move activation.
-    let latency = if sessions.iter().any(session_is_healthy) {
-        None
-    } else {
-        match run_cli(&["latency", "--json"]) {
+    // The `latency` read #133 asks for. Useful connected as well as disconnected — connected, it is
+    // what shows a *closer* device has appeared since this host chose one — so it is not gated on
+    // session state. It is gated on cadence instead (`probe_latency`), because it is active
+    // measurement against every device and the thing it reports moves with network topology, not
+    // with a 30s poll. A failure degrades to "not probed", never to an `Unavailable` tick: this
+    // cannot be allowed to move activation, and it runs only after the codes are already decided.
+    let latency = match probe_latency {
+        false => None,
+        true => match run_cli(&["latency", "--json"]) {
             CliOut::Ok(bytes) => Some(parse_latency(&bytes)),
             _ => None,
-        }
+        },
     };
 
     // The group list is only needed to resolve shred-group IPs (market-data IPs come from FEEDS).
@@ -397,12 +399,6 @@ pub fn detect(need_group_ips: bool) -> Detected {
         sessions,
         latency,
     })
-}
-
-/// Whether a session reports the one healthy literal. Mirrors `diagnostics::session_is_up`, which
-/// is the verdict-side copy; this one only decides whether [`detect`] bothers probing latency.
-fn session_is_healthy(s: &Session) -> bool {
-    s.session_status.as_deref() == Some(HEALTHY_SESSION_STATUS)
 }
 
 impl HostSubs {

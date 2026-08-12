@@ -22,7 +22,7 @@ pub fn render_diagnose(body: &Value) -> Result<String, String> {
     }
     if let Some(latency) = &d.latency {
         out.push_str("\n\n");
-        out.push_str(&render_latency(latency));
+        out.push_str(&render_latency(latency, d.latency_at_unix));
     }
     out.push_str("\n\n");
     out.push_str(&render_activation(&d.activation, &d.binds));
@@ -114,12 +114,19 @@ fn render_subscriptions(s: &SubscriptionsBlock) -> String {
     )
 }
 
-/// Only rendered when the container probed — which it does only with no session up, so its very
-/// presence says the tunnel was down at that poll. Sorted by average, nearest first: the question
-/// this answers is "is any device reachable, and which is closest".
-fn render_latency(rows: &[DeviceLatency]) -> String {
+/// Sorted nearest-first among reachable devices. Two questions this answers: on a host that is
+/// down, whether any device responds at all; on one that is up, whether something is now nearer
+/// than the device it is actually on (compare the `DEVICE` column of the tunnel table above).
+///
+/// Stamped with its own time because the container paces this far coarser than the poll, so these
+/// figures are routinely older than the rest of the report and must not read as just-measured.
+fn render_latency(rows: &[DeviceLatency], probed_at: Option<u64>) -> String {
+    let at = match probed_at {
+        Some(v) => format!("  probed_at_unix={v}"),
+        None => String::new(),
+    };
     if rows.is_empty() {
-        return "latency: probed, no device answered".to_string();
+        return format!("latency:{at} probed, no device answered");
     }
     let mut rows: Vec<&DeviceLatency> = rows.iter().collect();
     rows.sort_by_key(|d| (!d.reachable, d.avg_latency_ns.unwrap_or(u64::MAX)));
@@ -137,7 +144,7 @@ fn render_latency(rows: &[DeviceLatency]) -> String {
         })
         .collect();
     format!(
-        "latency: {} device(s) probed\n{}",
+        "latency: {} device(s){at}\n{}",
         rows.len(),
         render::table(
             &["DEVICE", "IP", "REACHABLE", "MIN_MS", "AVG_MS", "MAX_MS"],
@@ -293,6 +300,7 @@ mod tests {
     #[test]
     fn the_latency_block_renders_nearest_reachable_device_first() {
         let mut d = diagnostics_fixture();
+        d["latency_at_unix"] = json!(1782920100);
         d["latency"] = json!([
             {"device_code": "dz-ny7-sw02", "device_ip": "142.215.184.122",
              "min_latency_ns": 18529843, "avg_latency_ns": 23286675,
@@ -306,7 +314,11 @@ mod tests {
         ]);
         let out = render_diagnose(&json!({"diagnostics": d, "status": null})).unwrap();
 
-        assert!(out.contains("latency: 3 device(s) probed"), "{out}");
+        assert!(out.contains("latency: 3 device(s)"), "{out}");
+        assert!(
+            out.contains("probed_at_unix=1782920100"),
+            "the probe is paced coarser than the poll, so it must date itself: {out}"
+        );
         assert!(out.contains("19.980"), "ns must render as ms: {out}");
         let rows: Vec<&str> = out
             .lines()
@@ -329,7 +341,10 @@ mod tests {
     fn an_unprobed_host_renders_no_latency_block_and_an_empty_probe_says_so() {
         let out = render_diagnose(&json!({"diagnostics": diagnostics_fixture(), "status": null}))
             .unwrap();
-        assert!(!out.contains("latency:"), "absent means not probed: {out}");
+        assert!(
+            !out.contains("latency:"),
+            "absent means never probed: {out}"
+        );
 
         let mut d = diagnostics_fixture();
         d["latency"] = json!([]);

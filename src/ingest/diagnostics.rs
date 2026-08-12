@@ -93,9 +93,9 @@ pub struct Polled {
     pub shred_codes: Vec<String>,
     /// Every other subscribed code — a group this host holds that this build has no row for.
     pub other_codes: Vec<String>,
-    /// `doublezero latency`, probed only on a host with no healthy session. `None` is **not
-    /// probed** (the healthy steady state), never "no device answered" — see
-    /// [`crate::ingest::subscriptions::detect`].
+    /// `doublezero latency`, probed on the reconciler's own cadence rather than every tick. `None`
+    /// means this tick did not probe — [`DiagnosticsSnapshot::publish_tick`] carries the previous
+    /// result forward — and is never "no device answered", which is `Some(vec![])`.
     pub latency: Option<Vec<DeviceLatency>>,
 }
 
@@ -123,6 +123,9 @@ pub struct DiagnosticsSnapshot {
     /// How often the reconciler polls, so a remediation can name the real wait rather than a
     /// hardcoded 30s.
     pub refresh_secs: u64,
+    /// Wall clock of the last `doublezero latency` probe. It is paced far coarser than the tick,
+    /// so the figures below are routinely older than `checked_at_unix` and say so.
+    pub latency_at_unix: Option<u64>,
 }
 
 impl DiagnosticsSnapshot {
@@ -138,7 +141,7 @@ impl DiagnosticsSnapshot {
     /// Only a `Detection::Ok` tick stamps `last_ok_at_unix`: it dates the session and code data
     /// above, and `CliMissing`/`GatingDisabled` never ran a status call to produce any. Stamping
     /// those would date an empty document to now and read as freshly-confirmed.
-    pub fn publish_tick(&mut self, polled: Polled, activation: Activation) {
+    pub fn publish_tick(&mut self, mut polled: Polled, activation: Activation) {
         let now = crate::model::now_ns() / 1_000_000_000;
         self.checked_at_unix = Some(now);
         if polled.detection == Detection::Unavailable {
@@ -147,6 +150,13 @@ impl DiagnosticsSnapshot {
         } else {
             if polled.detection == Detection::Ok {
                 self.last_ok_at_unix = Some(now);
+            }
+            // A tick that did not probe must not blank the last one: the probe is paced far coarser
+            // than this poll, so most ticks carry `None` and clearing on each would leave the
+            // figures visible only in the one tick out of many that measured them.
+            match polled.latency.is_some() {
+                true => self.latency_at_unix = Some(now),
+                false => polled.latency = self.polled.latency.take(),
             }
             self.polled = polled;
         }
@@ -207,7 +217,8 @@ impl DiagnosticsSnapshot {
                 "shred_codes": self.polled.shred_codes,
                 "other_codes": self.polled.other_codes,
             },
-            // `null` (not probed) stays distinct from `[]` (probed, nothing answered).
+            "latency_at_unix": self.latency_at_unix,
+            // `null` (never probed) stays distinct from `[]` (probed, nothing answered).
             "latency": self.polled.latency.as_ref().map(|rows| {
                 rows.iter()
                     .map(|d| json!({
@@ -608,6 +619,44 @@ mod tests {
                 "{detection:?} ran no status call to date"
             );
         }
+    }
+
+    /// The probe is paced far coarser than the tick, so most ticks report `latency: None`. Those
+    /// must carry the last measurement forward — clearing on each would make the figures visible
+    /// only in the one tick out of many that actually measured them.
+    #[test]
+    fn a_tick_that_did_not_probe_keeps_the_last_latency() {
+        let probed = vec![DeviceLatency {
+            device_code: Some("dz-ny7-sw01".to_string()),
+            avg_latency_ns: Some(19_979_918),
+            reachable: true,
+            ..DeviceLatency::default()
+        }];
+        let mut s = snap(Detection::Pending);
+        s.publish_tick(
+            Polled {
+                detection: Detection::Ok,
+                latency: Some(probed.clone()),
+                ..Polled::default()
+            },
+            Activation::default(),
+        );
+        let probed_at = s.latency_at_unix.expect("a probing tick dates itself");
+
+        s.publish_tick(
+            Polled {
+                detection: Detection::Ok,
+                latency: None,
+                ..Polled::default()
+            },
+            Activation::default(),
+        );
+        assert_eq!(s.polled.latency.as_deref(), Some(probed.as_slice()));
+        assert_eq!(
+            s.latency_at_unix,
+            Some(probed_at),
+            "the kept figures keep the age of the probe that produced them"
+        );
     }
 
     /// A `doublezero status` blip on a streaming host must not blank what the last good poll knew.
