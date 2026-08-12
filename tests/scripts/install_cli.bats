@@ -166,7 +166,7 @@ container_running() {
   container_running || { echo "# container never reached docker run"; false; }
   grep -q 'setup.deb.sh' "$PM_LOG" || { echo "# never configured the Cloudsmith repo:"; sed 's/^/#   /' "$PM_LOG"; false; }
   grep -q '^apt-get install.*doublezero-edge' "$PM_LOG" || { echo "# never installed doublezero-edge:"; sed 's/^/#   /' "$PM_LOG"; false; }
-  grep -q 'Configuring the malbeclabs/doublezero-mainnet-beta Cloudsmith repository' "$out" \
+  grep -q 'Configuring the malbeclabs/doublezero Cloudsmith repository' "$out" \
     || { echo "# never named the repository before configuring it:"; sed 's/^/#   /' "$out"; false; }
 }
 

@@ -5,7 +5,8 @@
 # (release/.goreleaser.base.client.yaml in the doublezero repo): same musl build, same nfpm
 # completion paths, same signing/publish story. Unlike the client, this package has no
 # environment-specific build variant — the CLI is a plain HTTP client with no ledger coupling, so
-# one build and one nfpm id are published to both the testnet and mainnet-beta repositories.
+# one build and one nfpm id are published to the `doublezero` repository, which is the one hosts
+# running the client already have configured.
 
 version: 2
 
@@ -67,7 +68,7 @@ nfpms:
     ids: [doublezero-edge]
     vendor: doublezero
     homepage: doublezero.xyz
-    maintainer: Malbec Labs <dev@malbeclabs.com>
+    maintainer: Malbec Labs <network-external@malbeclabs.com>
     description: |-
       DoubleZero Edge CLI: a read-only client for a running doublezero-edge-connect bridge's
       /v1 market-data and /admin APIs.

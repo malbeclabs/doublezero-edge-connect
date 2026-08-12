@@ -756,8 +756,14 @@ else
     info "Done. Forwarding shreds. The WebSocket quote sink is idle -- it activates once this host is subscribed to a market-data feed."
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # activates once >=1 market-data feed is subscribed"
   else
-    info "Done. Connected. The WebSocket sink and shred forwarder each activate automatically once this host is subscribed to a group (a market-data feed for WS; an edge-solana-* group for shreds) -- allow up to one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s). Check: sudo docker logs $DZ_NAME"
+    info "Done. Connected."
+    echo
+    echo "  The WebSocket sink and shred forwarder activate once this host is subscribed to a"
+    echo "  group -- a market-data feed for WS, an edge-solana-* group for shreds. Allow up to"
+    echo "  one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s)."
+    echo
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
+    echo "  Logs      : sudo docker logs $DZ_NAME"
   fi
 fi
 echo
@@ -787,11 +793,10 @@ offer_cli_package() {
   elif command -v yum >/dev/null 2>&1; then pm=yum
   fi
 
-  # Which Cloudsmith repo carries the package for this environment (release/.goreleaser.{testnet,
-  # mainnet-beta}.edge-cli.yaml): the CLI has no ledger coupling, so testnet publishes to
-  # doublezero-testnet and every other env (mainnet-beta, devnet) shares doublezero-mainnet-beta.
-  local cs_repo="doublezero-mainnet-beta"
-  [ "$DZ_ENV" = testnet ] && cs_repo="doublezero-testnet"
+  # One repo for every environment: the CLI has no ledger coupling, so both overlays publish here,
+  # and it is the repo a host running the DoubleZero client already trusts — no second key, no
+  # second source file. Per-environment names were tried first and nothing subscribes to them.
+  local cs_repo="doublezero"
 
   if [ -z "$pm" ]; then
     warn "No supported package manager (apt/dnf/yum) found; skipping the doublezero-edge CLI. Install it later: https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.<deb|rpm>.sh"
@@ -813,7 +818,14 @@ offer_cli_package() {
       local want_cli=1
       if [ "$DZ_ASSUME_YES" != 1 ]; then
         if { : <"$TTY"; } 2>/dev/null; then
-          confirm "Install the doublezero-edge CLI too? This runs Cloudsmith's unpinned setup script for malbeclabs/$cs_repo as root (unless already configured), then installs the 'doublezero-edge' package." || want_cli=0
+          # Break the offer across lines: it follows the bridge's own multi-line "Done" block, and
+          # a single long sentence there reads as a wall of text rather than a question.
+          printf '\n' >"$TTY"
+          info "The doublezero-edge CLI is a read-only client for the Edge container."
+          info "It provides an interface to view feed status, the product catalog,"
+          info "candles and order books."
+          printf '\n' >"$TTY"
+          confirm "Also install it? Adds the malbeclabs/$cs_repo package repository if it isn't already configured." || want_cli=0
         else
           want_cli=0
         fi
