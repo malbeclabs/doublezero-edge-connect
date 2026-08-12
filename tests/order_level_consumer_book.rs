@@ -280,3 +280,150 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     }
     assert_eq!(consumer, venue);
 }
+
+/// Mirrors the arbiter's private `MAX_SEEN_ORDER_EVENTS`. A scenario that has to cross the guard's
+/// cap has to name it; a wrong value here makes the test weaker, never wrong.
+const GUARD_CAP: u64 = 1024;
+
+/// The wiring every scenario shares: one order-level market on a two-publisher venue, both arms
+/// synced, racing exactly as the Market-by-Order processor drives it.
+fn harness() -> (
+    Arbiter,
+    broadcast::Receiver<Arc<FeedMessage>>,
+    Publisher,
+    Publisher,
+) {
+    let (tx, rx) = broadcast::channel(4096);
+    let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+    a.set_mode(VENUE, ArbitrationMode::Coordinated);
+    a.set_book_dedup_window(DEDUP_WINDOW_NS);
+    a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
+    let market: BookKey = (VENUE.into(), CATEGORY.into(), CHANNEL, INSTRUMENT);
+    let (fast, slow) = (arm(1), arm(2));
+    a.set_book_synced(&market, fast, true);
+    a.set_book_synced(&market, slow, true);
+    (a, rx, fast, slow)
+}
+
+fn drain_into(rx: &mut broadcast::Receiver<Arc<FeedMessage>>, consumer: &mut Book) {
+    while let Ok(m) = rx.try_recv() {
+        if let FeedMessage::Book(b) = &*m {
+            apply(consumer, b);
+        }
+    }
+}
+
+/// A forced re-baseline republishes the view no single arm owns. If the arm whose batch discharged
+/// the flag is stamped as owning the floors it seeds, that arm is exempt from the size gate and
+/// simply repeats the stale claim the re-baseline was called to correct.
+#[test]
+fn a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim() {
+    let (mut a, mut rx, fast, drifted) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+
+    venue.insert(1, (BookSide::Bid, 100.0, 2.0));
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100),
+        fast,
+        CATEGORY,
+    );
+    // The drifted arm missed the fill, claims 5, and is withheld — then discharges the flag with an
+    // unrelated event and repeats the claim.
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200),
+        drifted,
+        CATEGORY,
+    );
+    venue.insert(2, (BookSide::Ask, 101.0, 4.0));
+    a.emit(
+        batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300),
+        drifted,
+        CATEGORY,
+    );
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_400),
+        drifted,
+        CATEGORY,
+    );
+
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+}
+
+/// A market with more live orders than the guard's cap must not spend the guard on them: nothing
+/// re-seeds a tombstone, and losing one lets a lagging arm's only copy of the add resurrect an order
+/// the venue removed.
+#[test]
+fn a_book_larger_than_the_guard_does_not_resurrect_a_removed_order() {
+    let (mut a, mut rx, fast, slow) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    let dead = change(7, BookSide::Bid, 100.0, 6.0);
+    a.emit(batch(vec![dead], 1_000), fast, CATEGORY);
+    a.emit(
+        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 1_100),
+        fast,
+        CATEGORY,
+    );
+
+    // Well past the cap, and spaced well outside the dedup window: nothing here is a copy anyone is
+    // still racing, so every one of these is free for the guard to forget.
+    for i in 0..(GUARD_CAP + 64) {
+        let id = 100 + i;
+        venue.insert(id, (BookSide::Ask, 200.0 + i as f64, 1.0));
+        a.emit(
+            batch(
+                vec![change(id, BookSide::Ask, 200.0 + i as f64, 1.0)],
+                2_000 + i * 10_000,
+            ),
+            fast,
+            CATEGORY,
+        );
+        drain_into(&mut rx, &mut consumer);
+    }
+
+    // The lagging arm's first and only copy of the add for the order that is already gone.
+    a.emit(batch(vec![dead], 90_000_000), slow, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+}
+
+/// A recovery snapshot larger than the guard's cap seeds its own orders into it. Those are live
+/// floors and re-seed themselves; the tombstones they would displace do not.
+#[test]
+fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
+    let (mut a, mut rx, fast, slow) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    let dead = change(7, BookSide::Bid, 100.0, 6.0);
+    a.emit(batch(vec![dead], 1_000), fast, CATEGORY);
+    a.emit(
+        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 1_100),
+        fast,
+        CATEGORY,
+    );
+
+    // The fast arm gaps and recovers with a book far larger than the cap, containing no order 7.
+    for i in 0..(GUARD_CAP + 77) {
+        let id = 100 + i;
+        venue.insert(id, (BookSide::Ask, 200.0 + i as f64, 1.0));
+    }
+    a.emit(snapshot(&venue, 1_200), fast, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+
+    // Twice, either side of a fast-arm event: a guard the seeding spent would withhold the first
+    // copy behind a forced re-baseline and then publish the second onto the market it just healed.
+    a.emit(batch(vec![dead], 90_000_000), slow, CATEGORY);
+    venue.insert(9, (BookSide::Bid, 50.0, 2.0));
+    a.emit(
+        batch(vec![change(9, BookSide::Bid, 50.0, 2.0)], 91_000_000),
+        fast,
+        CATEGORY,
+    );
+    a.emit(batch(vec![dead], 92_000_000), slow, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+}
