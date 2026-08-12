@@ -192,14 +192,21 @@ fn render_candles(body: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Render as a ladder: asks descending above, bids descending below, so the touch (best bid /
+/// best ask) sits one row apart at the seam and depth falls away from it in both directions —
+/// how a trading UI shows a book, and what makes the spread visible without scrolling past every
+/// bid first. The wire's own `asks` array is ascending-from-best (`asks[0]` is the best ask, per
+/// `best_levels`/`book` in `sinks/api.rs`), so only this table path reverses it for display; the
+/// JSON response (`--output json`, `--jq`) is untouched — machine consumers keep the stable
+/// per-side arrays.
 fn render_book(body: &Value) -> Result<String, String> {
     let parsed: BookResponse = parse(body)?;
     let mut rows: Vec<Vec<String>> = Vec::new();
+    for a in parsed.pricebook.asks.iter().rev() {
+        rows.push(vec!["ask".to_string(), a[0].clone(), a[1].clone()]);
+    }
     for b in &parsed.pricebook.bids {
         rows.push(vec!["bid".to_string(), b[0].clone(), b[1].clone()]);
-    }
-    for a in &parsed.pricebook.asks {
-        rows.push(vec!["ask".to_string(), a[0].clone(), a[1].clone()]);
     }
     let mut out = format!("product_id: {}\n\n", parsed.pricebook.product_id);
     out.push_str(&table(&["SIDE", "PRICE", "SIZE"], &rows));
@@ -401,6 +408,40 @@ mod tests {
         let out = render_candles(&body).unwrap();
         assert!(out.contains("held=true"), "{out}");
         assert!(!out.contains("not currently held"), "{out}");
+    }
+
+    /// The ladder rule: asks descending above, bids descending below, touch at the seam. Three
+    /// levels per side (never one — a single-level fixture can't tell ascending from descending
+    /// apart) with prices that only read correctly under a real reversal of the wire's
+    /// ascending-from-best `asks` array.
+    #[test]
+    fn book_table_renders_as_a_ladder_asks_above_bids_below() {
+        let body = serde_json::json!({
+            "pricebook": {
+                "product_id": "HYPERLIQUID:BTC",
+                "bids": [["0.9100", "1"], ["0.8000", "2"], ["0.0600", "3"]],
+                "asks": [["0.9500", "4"], ["0.9700", "5"], ["0.9900", "6"]],
+                "time": "5"
+            },
+            "coverage": {"levels_returned": 6, "levels_capped_at": 50, "complete": true}
+        });
+        let out = render_book(&body).unwrap();
+        let price_rows: Vec<&str> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ask") || l.trim_start().starts_with("bid"))
+            .collect();
+        let prices: Vec<&str> = price_rows
+            .iter()
+            .map(|l| l.split_whitespace().nth(1).unwrap())
+            .collect();
+        assert_eq!(
+            prices,
+            vec!["0.9900", "0.9700", "0.9500", "0.9100", "0.8000", "0.0600"],
+            "asks must descend to the touch, then bids continue descending away from it: {out}"
+        );
+        // The touch itself: best ask (0.9500) immediately above best bid (0.9100).
+        assert_eq!(price_rows[2].split_whitespace().next().unwrap(), "ask");
+        assert_eq!(price_rows[3].split_whitespace().next().unwrap(), "bid");
     }
 
     #[test]
