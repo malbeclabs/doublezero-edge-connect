@@ -44,7 +44,11 @@ curl -fsSL https://get.doublezero.xyz/connect-devnet | bash
 
 What the script does:
 
-1. Checks preconditions (Linux/amd64, root or `sudo`).
+1. Checks preconditions (Linux/amd64, root or `sudo`) — including whether a **host-level
+   `doublezerod` already holds UDP `44880`**. The container runs its own client, and the two cannot
+   share that port, so the installer offers to stop the host daemon (which disconnects any tunnel it
+   owns) and refuses to start rather than leaving you a container that exits seconds later. Answer
+   non-interactively with `DZ_STOP_HOST_DAEMON=1|0`.
 2. Loads the access secret (a `DZ_`-prefixed token, or a keypair file path) and **verifies its
    access pass onchain before installing anything** — a pure host-side check (no Docker, no CLI)
    over the ledger's public JSON-RPC. If the identity has no access pass for `0.0.0.0` (the any-IP
@@ -205,7 +209,17 @@ says which source actually won, and the one-liner echoes it for you:
 ==> Feed registry: source="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
 ```
 
-Check it yourself any time with `sudo docker logs <name> | grep 'feed registry resolved'`.
+That line only appears at startup, so `/v1/status` reports it too — which is how you check a
+running process, or compare a fleet, without reading logs on each box:
+
+```bash
+doublezero-edge status --jq '.registry'
+# {"source":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
+#  "version":1,"rows":3,"receivers":33}
+```
+
+A `source` of `built-in` on a host you expected to be using the hosted document means the fetch
+failed and it fell back — the string says which.
 
 ## Consume Edge Feeds
 _For Edge Feeds (not solana-shreds)_
@@ -230,10 +244,22 @@ market-data feed is — see [Output sinks](docs/output-sinks.md#query-api-v1)), 
 **[`doublezero-edge`](doublezero-edge/)** is a small CLI client for it, built for scripting and for
 an agent to drive directly.
 
+The installer offers it once the bridge is up; on a host that only queries a remote bridge, install
+it on its own — it is a signed package in the same repository the DoubleZero client comes from, so
+there is no second key to trust:
+
+```bash
+sudo apt install doublezero-edge      # or: sudo dnf install doublezero-edge
+doublezero-edge status --output table
+doublezero-edge products list --jq '.products | length'
+doublezero-edge products candles 'KALSHI:KXBTCPERP' granularity==ONE_MINUTE --output table
+```
+
+Point it at another host with `--url http://<host>:9099` (or `DOUBLEZERO_EDGE_URL`); it needs no
+Docker and no keys. To build from source instead:
+
 ```bash
 cargo build --release -p doublezero-edge
-./target/release/doublezero-edge products list
-./target/release/doublezero-edge products candles HYPERLIQUID:BTC granularity==ONE_MINUTE
 ```
 
 Six commands read `/v1` (all `GET`s), plus a `channels` group that talks to a **separate** surface:
