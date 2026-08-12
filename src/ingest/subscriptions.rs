@@ -55,6 +55,54 @@ pub struct HostSubs {
     /// tunnel never came up. **Reported only, never an activation input** — activation keys on
     /// `subscribed_codes` alone (see [`Session`]).
     pub sessions: Vec<Session>,
+    /// `doublezero latency --json`, probed only on a host with no healthy session (see
+    /// [`detect`]). `None` means **not probed**, which is a different answer from `Some(vec![])`
+    /// ("probed, no device answered") and must stay distinguishable in the diagnosis.
+    pub latency: Option<Vec<DeviceLatency>>,
+}
+
+/// One device's probe result from `doublezero latency --json` — the second read #133 asks for,
+/// alongside `status`. Purely diagnostic, exactly like [`Session`]: nothing here gates a receiver,
+/// a sink or the shred forwarder.
+///
+/// `device_pk` is deliberately not carried: `device_code` is what an operator reads and the
+/// pubkey only lengthens a response served on an unauthenticated surface.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceLatency {
+    #[serde(default)]
+    pub device_code: Option<String>,
+    #[serde(default)]
+    pub device_ip: Option<String>,
+    #[serde(default)]
+    pub min_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub max_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub avg_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub reachable: bool,
+}
+
+/// Parse `doublezero latency --json`. Soft-fail to an empty vec: this is garnish on a diagnosis,
+/// and it must never be able to move what [`parse_status_codes`] decided.
+///
+/// The document is **located, not assumed to start at byte 0**. The client prints a two-line
+/// "a new version is available" notice when it is behind, and a captured run shows it immediately
+/// above the JSON; whether that lands on stdout or stderr is the client's business and can change,
+/// so a leading non-JSON preamble is skipped rather than failing the parse. Strict parse first, so
+/// the scan only ever runs on output that already failed.
+pub fn parse_latency(stdout: &[u8]) -> Vec<DeviceLatency> {
+    if let Ok(rows) = serde_json::from_slice(stdout) {
+        return rows;
+    }
+    let Some(start) = stdout.iter().position(|b| *b == b'[') else {
+        warn!("could not parse `doublezero latency --json`; reporting no latency data");
+        return Vec::new();
+    };
+    serde_json::from_slice(&stdout[start..]).unwrap_or_else(|e| {
+        warn!(%e, "could not parse `doublezero latency --json`; reporting no latency data");
+        Vec::new()
+    })
 }
 
 /// One session from `doublezero status --json`, flattened to the fields an operator reads when a
@@ -317,6 +365,20 @@ pub fn detect(need_group_ips: bool) -> Detected {
     let sessions = parse_status_sessions(&status);
     let subscribed_codes: HashSet<String> = codes.into_iter().collect();
 
+    // #133 asks for the `latency` read too, but only a host that is *not* connected has a use for
+    // it: on a healthy one `status` already names the device this host landed on. Probing costs a
+    // round of active measurement against every device, so it is skipped entirely once a session
+    // is up — which is the steady state for the whole fleet. A failure degrades to "not probed",
+    // never to an `Unavailable` tick: this cannot be allowed to move activation.
+    let latency = if sessions.iter().any(session_is_healthy) {
+        None
+    } else {
+        match run_cli(&["latency", "--json"]) {
+            CliOut::Ok(bytes) => Some(parse_latency(&bytes)),
+            _ => None,
+        }
+    };
+
     // The group list is only needed to resolve shred-group IPs (market-data IPs come from FEEDS).
     // A failure here doesn't invalidate the status-based market-data/WS gating, so it degrades to an
     // empty map (shred sources just won't resolve this tick) rather than an `Unavailable`.
@@ -333,7 +395,14 @@ pub fn detect(need_group_ips: bool) -> Detected {
         subscribed_codes,
         code_ip,
         sessions,
+        latency,
     })
+}
+
+/// Whether a session reports the one healthy literal. Mirrors `diagnostics::session_is_up`, which
+/// is the verdict-side copy; this one only decides whether [`detect`] bothers probing latency.
+fn session_is_healthy(s: &Session) -> bool {
+    s.session_status.as_deref() == Some(HEALTHY_SESSION_STATUS)
 }
 
 impl HostSubs {
@@ -655,6 +724,7 @@ mod tests {
             subscribed_codes: codes.iter().map(|s| s.to_string()).collect(),
             code_ip: code_ip.iter().map(|(c, ip)| (c.to_string(), *ip)).collect(),
             sessions: Vec::new(),
+            latency: None,
         }
     }
 
@@ -796,6 +866,65 @@ mod tests {
         assert_eq!(sessions[0].subscriptions.len(), 1);
         assert_eq!(sessions[0].subscriptions[0].code, "scottsdale");
         assert!(sessions[0].subscriptions[0].subscriber);
+    }
+
+    /// A real `doublezero latency --json` capture, **including the two-line version notice the
+    /// client prints above the JSON when it is behind**. That preamble is exactly why
+    /// `parse_latency` locates the document instead of assuming it starts at byte 0.
+    const LATENCY_JSON_WITH_NOTICE: &str = r#"A new version of the client is available: 0.33.0 -> 0.35.0
+We recommend updating to the latest version for the best experience.
+[
+  {
+    "device_pk": "ETdwWpdQ7fXDHH5ea8feMmWxnZZvSKi4xDvuEGcpEvq3",
+    "device_code": "dz-ny5-sw01",
+    "device_ip": "137.239.213.170",
+    "min_latency_ns": 18379306,
+    "max_latency_ns": 26375145,
+    "avg_latency_ns": 21267917,
+    "reachable": true
+  },
+  {
+    "device_pk": "2hPMFJHh5BPX42ygBvuYYJfCv9q7g3rRR3ZRsUgtaqUi",
+    "device_code": "dz-ny7-sw01",
+    "device_ip": "137.239.213.192",
+    "min_latency_ns": 18656333,
+    "max_latency_ns": 21151629,
+    "avg_latency_ns": 19979918,
+    "reachable": false
+  }
+]"#;
+
+    /// The capture parses whole, and the unknown `device_pk` is ignored rather than rejected —
+    /// same additive-change rule the rest of this module follows.
+    #[test]
+    fn the_latency_capture_parses_past_the_version_notice() {
+        let rows = parse_latency(LATENCY_JSON_WITH_NOTICE.as_bytes());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].device_code.as_deref(), Some("dz-ny5-sw01"));
+        assert_eq!(rows[0].device_ip.as_deref(), Some("137.239.213.170"));
+        assert_eq!(rows[0].avg_latency_ns, Some(21_267_917));
+        assert!(rows[0].reachable);
+        assert!(!rows[1].reachable, "reachable must not default to true");
+    }
+
+    /// The same document with no preamble takes the strict path and gives the identical result —
+    /// the scan is a fallback, not the normal route.
+    #[test]
+    fn a_latency_document_with_no_preamble_parses_identically() {
+        let bare = &LATENCY_JSON_WITH_NOTICE[LATENCY_JSON_WITH_NOTICE.find('[').unwrap()..];
+        assert_eq!(
+            parse_latency(bare.as_bytes()),
+            parse_latency(LATENCY_JSON_WITH_NOTICE.as_bytes())
+        );
+    }
+
+    /// Garbage is no latency data, never a panic and never an error that could reach the tick's
+    /// activation decision.
+    #[test]
+    fn unparseable_latency_output_degrades_to_nothing() {
+        assert!(parse_latency(b"Please start the doublezerod service.").is_empty());
+        assert!(parse_latency(b"").is_empty());
+        assert!(parse_latency(b"[{\"device_code\": ").is_empty());
     }
 
     /// The tail helper keeps the end of a long message (that is where a bail line lands), bounds

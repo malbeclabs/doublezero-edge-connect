@@ -166,6 +166,11 @@ it — `last_ok_at_unix` reports how stale it is, and only a successful poll sta
 and `gating_disabled` run no status call, so they leave it unset rather than dating an empty
 document to now).
 
+A host with no healthy session also gets a `doublezero latency --json` read, reported under
+`latency` (device code/IP, reachability, min/avg/max ns). It is **skipped entirely** once a session
+is up — on a connected host `status` already names the device — so `null` means "not probed" and
+`[]` means "probed, nothing answered".
+
 `doublezero-edge diagnose` renders this. It only reports: the retry the `tunnel_down` rung names is
 `doublezero connect multicast` inside the container.
 
@@ -178,7 +183,8 @@ are exempt: requiring it on the diagnostics read would make the one command a st
 needs harder to run than `curl`.
 
 `GET /admin/diagnostics` is read-only but is the most informative route here (device/metro names,
-subscribed group codes and their multicast IPs, every configured bind, the feed-registry URL). It is
+subscribed group codes and their multicast IPs, the probed devices' codes and IPs, every
+configured bind, the feed-registry URL). It is
 unauthenticated like the rest of the surface, and DNS rebinding can read it — a page served from a
 name re-pointed at `127.0.0.1` is same-origin, so the header above does not stop a *read*. Refusing
 a `Host` that names a DNS name would close that at the cost of `--admin-url http://myhost.local:9098`;

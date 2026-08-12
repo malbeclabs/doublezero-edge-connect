@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use crate::ingest::{
     feeds::FeedKind,
     health::TapeLiveness,
-    subscriptions::{Session, HEALTHY_SESSION_STATUS},
+    subscriptions::{DeviceLatency, Session, HEALTHY_SESSION_STATUS},
 };
 
 /// Written by the reconciler once per tick, read by the admin surface. This process's only writer
@@ -93,6 +93,10 @@ pub struct Polled {
     pub shred_codes: Vec<String>,
     /// Every other subscribed code — a group this host holds that this build has no row for.
     pub other_codes: Vec<String>,
+    /// `doublezero latency`, probed only on a host with no healthy session. `None` is **not
+    /// probed** (the healthy steady state), never "no device answered" — see
+    /// [`crate::ingest::subscriptions::detect`].
+    pub latency: Option<Vec<DeviceLatency>>,
 }
 
 /// What the reconciler is actually running as of that tick — read off its own task maps, not off
@@ -203,6 +207,19 @@ impl DiagnosticsSnapshot {
                 "shred_codes": self.polled.shred_codes,
                 "other_codes": self.polled.other_codes,
             },
+            // `null` (not probed) stays distinct from `[]` (probed, nothing answered).
+            "latency": self.polled.latency.as_ref().map(|rows| {
+                rows.iter()
+                    .map(|d| json!({
+                        "device_code": d.device_code,
+                        "device_ip": d.device_ip,
+                        "min_latency_ns": d.min_latency_ns,
+                        "max_latency_ns": d.max_latency_ns,
+                        "avg_latency_ns": d.avg_latency_ns,
+                        "reachable": d.reachable,
+                    }))
+                    .collect::<Vec<_>>()
+            }),
             "activation": {
                 "receivers": receivers,
                 "ws_on": self.activation.ws_on,

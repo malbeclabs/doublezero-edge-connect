@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   onchain identity. `GET /admin/diagnostics` is unauthenticated like the rest of the admin surface
   and discloses this host's device/metro names, subscribed group codes and their multicast IPs, the
   configured binds and the feed-registry URL — on the loopback default, to the same audience that
-  could already run `doublezero status`. `--admin-url` is now a global flag rather than one on the
-  two `channels` subcommands.
+  could already run `doublezero status`. On a host with no session up the container also reads
+  `doublezero latency` and reports each device's reachability and min/avg/max round trip; it is
+  skipped once a session is up, so `null` (not probed) stays distinct from `[]` (probed, nothing
+  answered). `--admin-url` is now a global flag rather than one on the two `channels` subcommands.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
   exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`

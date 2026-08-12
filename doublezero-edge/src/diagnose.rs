@@ -20,6 +20,10 @@ pub fn render_diagnose(body: &Value) -> Result<String, String> {
         out.push_str("\n\n");
         out.push_str(&render::render_registry_line(&d.registry));
     }
+    if let Some(latency) = &d.latency {
+        out.push_str("\n\n");
+        out.push_str(&render_latency(latency));
+    }
     out.push_str("\n\n");
     out.push_str(&render_activation(&d.activation, &d.binds));
 
@@ -108,6 +112,47 @@ fn render_subscriptions(s: &SubscriptionsBlock) -> String {
         s.shred_codes.join(", "),
         s.other_codes.join(", "),
     )
+}
+
+/// Only rendered when the container probed — which it does only with no session up, so its very
+/// presence says the tunnel was down at that poll. Sorted by average, nearest first: the question
+/// this answers is "is any device reachable, and which is closest".
+fn render_latency(rows: &[DeviceLatency]) -> String {
+    if rows.is_empty() {
+        return "latency: probed, no device answered".to_string();
+    }
+    let mut rows: Vec<&DeviceLatency> = rows.iter().collect();
+    rows.sort_by_key(|d| (!d.reachable, d.avg_latency_ns.unwrap_or(u64::MAX)));
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|d| {
+            vec![
+                or_dash(&d.device_code),
+                or_dash(&d.device_ip),
+                if d.reachable { "yes" } else { "no" }.to_string(),
+                ms(d.min_latency_ns),
+                ms(d.avg_latency_ns),
+                ms(d.max_latency_ns),
+            ]
+        })
+        .collect();
+    format!(
+        "latency: {} device(s) probed\n{}",
+        rows.len(),
+        render::table(
+            &["DEVICE", "IP", "REACHABLE", "MIN_MS", "AVG_MS", "MAX_MS"],
+            &body,
+        )
+    )
+}
+
+/// Nanoseconds as milliseconds — the scale a human reads a network path in; the raw ns stay in
+/// `--output json`.
+fn ms(ns: Option<u64>) -> String {
+    match ns {
+        Some(v) => format!("{:.3}", v as f64 / 1_000_000.0),
+        None => "-".to_string(),
+    }
 }
 
 fn render_activation(a: &ActivationBlock, b: &BindsBlock) -> String {
@@ -241,5 +286,54 @@ mod tests {
         let out = render_diagnose(&body).unwrap();
         assert!(out.starts_with("diagnosis: pending"), "{out}");
         assert!(out.contains("(no sessions reported)"), "{out}");
+    }
+
+    /// The `latency` read #133 asks for, off a real capture. Rendered nearest-first and in ms,
+    /// because the question on a down host is "is anything reachable, and which is closest".
+    #[test]
+    fn the_latency_block_renders_nearest_reachable_device_first() {
+        let mut d = diagnostics_fixture();
+        d["latency"] = json!([
+            {"device_code": "dz-ny7-sw02", "device_ip": "142.215.184.122",
+             "min_latency_ns": 18529843, "avg_latency_ns": 23286675,
+             "max_latency_ns": 31704187, "reachable": true},
+            {"device_code": "dz-ny7-sw01", "device_ip": "137.239.213.192",
+             "min_latency_ns": 18656333, "avg_latency_ns": 19979918,
+             "max_latency_ns": 21151629, "reachable": true},
+            {"device_code": "dz-unreachable", "device_ip": "10.0.0.1",
+             "min_latency_ns": null, "avg_latency_ns": null,
+             "max_latency_ns": null, "reachable": false}
+        ]);
+        let out = render_diagnose(&json!({"diagnostics": d, "status": null})).unwrap();
+
+        assert!(out.contains("latency: 3 device(s) probed"), "{out}");
+        assert!(out.contains("19.980"), "ns must render as ms: {out}");
+        let rows: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.starts_with("latency:"))
+            .collect();
+        let nearest = rows.iter().position(|l| l.contains("dz-ny7-sw01"));
+        let further = rows.iter().position(|l| l.contains("dz-ny7-sw02"));
+        let dead = rows.iter().position(|l| l.contains("dz-unreachable"));
+        assert!(nearest < further, "nearest reachable device first: {out}");
+        assert!(further < dead, "unreachable devices sort last: {out}");
+        assert!(
+            out.contains('-'),
+            "a device with no samples renders a dash: {out}"
+        );
+    }
+
+    /// Not probed and probed-but-silent are different answers: the container skips the probe
+    /// entirely once a session is up, and that must not read as "no device answered".
+    #[test]
+    fn an_unprobed_host_renders_no_latency_block_and_an_empty_probe_says_so() {
+        let out = render_diagnose(&json!({"diagnostics": diagnostics_fixture(), "status": null}))
+            .unwrap();
+        assert!(!out.contains("latency:"), "absent means not probed: {out}");
+
+        let mut d = diagnostics_fixture();
+        d["latency"] = json!([]);
+        let out = render_diagnose(&json!({"diagnostics": d, "status": null})).unwrap();
+        assert!(out.contains("latency: probed, no device answered"), "{out}");
     }
 }

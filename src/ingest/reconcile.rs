@@ -465,6 +465,7 @@ impl Reconciler {
                         market_data_codes,
                         shred_codes,
                         other_codes,
+                        latency: subs.latency.clone(),
                     },
                     desired: Some(self.desired_from_subs(&subs)),
                 }

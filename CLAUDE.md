@@ -643,7 +643,8 @@ Modules are grouped by role under `src/`:
   stays `doublezero connect multicast` inside the container, so nothing on this surface spends the
   container's onchain identity. ⚠️ That route is **unauthenticated like the rest of this surface and
   the most informative one on it**: device/metro names, the tunnel name, every subscribed group code,
-  the subscription rows' multicast IPs, all four binds and the feed-registry URL. On the loopback
+  the subscription rows' multicast IPs, the probed devices' codes and IPs, all four binds and the
+  feed-registry URL. On the loopback
   default that is the same audience that could already run `doublezero status`; a non-loopback bind
   hands it to anyone who can reach the port, and **DNS rebinding** reaches it too (a page served from
   a name re-pointed at `127.0.0.1` is same-origin, so the CSRF header below does not stop it

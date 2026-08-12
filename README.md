@@ -357,8 +357,8 @@ irreversible within the history window.
 >
 > **`GET /admin/diagnostics` is read-only, needs no header, and is the most informative route
 > here** — it reports the device, metro and network this host landed on, every subscribed group
-> code and the subscription rows' multicast IPs, all four configured binds, and the resolved
-> feed-registry origin. On the loopback default that is the same audience that could already run
+> code and the subscription rows' multicast IPs, the DoubleZero devices' codes and IPs from the
+> latency probe, all four configured binds, and the resolved feed-registry origin. On the loopback default that is the same audience that could already run
 > `doublezero status` on the host. Two ways it widens: a non-loopback bind hands it to anyone who
 > can reach the port, and DNS rebinding reaches it too (a page served from a name re-pointed at
 > loopback is same-origin, so the header above does not stop it *reading*). Refusing a `Host` that
@@ -379,6 +379,11 @@ signal, an ordinary `/v1` failure now reads `api_inactive` rather than `api_unre
 doublezero-edge diagnose --output table
 doublezero-edge diagnose --jq '.diagnostics.diagnosis.code'
 ```
+
+On a host with no session up, the container also runs `doublezero latency` and `diagnose` reports
+each device's reachability and min/avg/max round trip, nearest first — the second read #133 asks
+for. It is skipped entirely once a session is up, so a healthy host never pays for the probe and
+shows no `latency` block at all (distinct from a probe where nothing answered).
 
 `diagnose` only reports. When the verdict is `tunnel_down`, its remediation names the retry —
 `doublezero connect multicast` inside the container — which stays a deliberate `docker exec` rather

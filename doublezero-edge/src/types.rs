@@ -342,6 +342,10 @@ pub struct DiagnosticsResponse {
     pub subscriptions: SubscriptionsBlock,
     #[serde(default)]
     pub activation: ActivationBlock,
+    /// `doublezero latency`, probed by the container only when no session is up. Absent (rather
+    /// than empty) means it was not probed, which is the healthy steady state.
+    #[serde(default)]
+    pub latency: Option<Vec<DeviceLatency>>,
     #[serde(default)]
     pub registry: RegistryBlock,
     #[serde(default)]
@@ -436,6 +440,23 @@ pub struct ReceiverEntry {
     pub publisher: u32,
     #[serde(default)]
     pub liveness: String,
+}
+
+/// One device's probe result from the container's `doublezero latency` read.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeviceLatency {
+    #[serde(default)]
+    pub device_code: Option<String>,
+    #[serde(default)]
+    pub device_ip: Option<String>,
+    #[serde(default)]
+    pub min_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub avg_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub max_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub reachable: bool,
 }
 
 /// Which surfaces the container was configured with. Empty means "not configured", which for `api`
