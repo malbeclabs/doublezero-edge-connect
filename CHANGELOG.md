@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apart at the seam instead of split across a screenful. `--output json`/`--jq` are unchanged.
 
 ### Fixed
+- The installers (`scripts/connect*.sh`) could finish with `Done. Connected.` over a tunnel that
+  never came up (#132): a single `doublezero connect multicast` attempt after a fixed 30s sleep
+  loses the race against a cold daemon's device probing, its failure is non-fatal, and the closing
+  banner never consulted the outcome. `connect` is now retried (4 attempts, 15/30/45s apart) and
+  every closing message is gated on the daemon's own reported session — a failed or still-
+  provisioning tunnel is named as such, with the by-hand retry and status commands, and restated
+  as the last line rather than buried above the CLI offer. Exit status is unchanged (0): the
+  container and CLI are installed either way.
+- `docker-entrypoint.sh` matched `session_status` against the literal `"up"`, which matches none of
+  the daemon's live values (`BGP Session Up`, `PIM Adjacency Up`) — so the graceful `doublezero
+  disconnect` on `docker stop` never ran and every restart left the onchain session to expire on
+  its own. It now matches the values' `Up` suffix, as the installers' new probe does.
 - `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows
   span more than one category, even when its own category resolves unambiguously (e.g. Lashay's
   single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
