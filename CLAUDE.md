@@ -272,7 +272,14 @@ Modules are grouped by role under `src/`:
   so `--jq '.diagnosis.code'` and the table view give the same answer and it is unit-testable
   against a captured `doublezero status` document; its rungs are ordered so each is reached only once
   the one above it is ruled out — which is what stops a `CliMissing` host (running from source) being
-  reported as a broken tunnel, and a not-yet-polled process as an empty subscription set.
+  reported as a broken tunnel, and a not-yet-polled process as an empty subscription set. Two rules
+  keep it from over-claiming: a receiver actually **delivering** skips the tunnel rungs entirely
+  (packets are proof, so one upstream rename of `session_status` cannot report `tunnel_down`
+  fleet-wide and point every healthy host at a mutating retry — activation is armored against exactly
+  that rename, and the verdict has to be too), and a document carrying **no** recognized session
+  status reports `tunnel_state_unknown` rather than "down". An `Unavailable` tick likewise keeps the
+  last good sessions/codes and stamps `last_ok_at_unix`, so a `doublezero status` blip on a streaming
+  host reports stale data rather than "zero subscriptions, freshly checked" beside live receivers.
 - **`ingest/reconcile.rs`** — the **activation authority**. `Reconciler::run()` polls `detect()`
   every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
@@ -630,15 +637,22 @@ Modules are grouped by role under `src/`:
   *configured*, the half `activation` cannot answer). `POST /admin/connect` / `POST
   /admin/disconnect` re-run the DoubleZero client verb an operator would otherwise reach through
   `docker exec` — a real capability increase over a channel-filter swap, since it spends the
-  container's onchain identity, contained by four things: a **fixed argv** (a module constant; the
-  routes take no parameters, so no request input reaches the child), the loopback default bind, the
-  CSRF header, and **single-flight** (a second attempt while one runs is `409` — two concurrent
-  `connect`s race onchain user creation, so this is a correctness guard, not politeness). The child
-  runs on a blocking thread behind `tokio::spawn` and the route answers `202` at once (`connect`
-  takes minutes and must never sit on a runtime worker); its outcome lands back in the snapshot as
-  `last_attempt`, since a `202` nothing could follow up on would be useless. ⚠️ There is **no rate
-  limit** — a script looping on `connect` serially re-runs onchain provisioning. The other two
-  routes are `/admin/channels`: `GET`
+  container's onchain identity, contained by five things: a **fixed argv** (a module constant *typed*
+  `&'static [&'static str]`; the routes take no parameters, so no request input reaches the child and
+  a future caller-composed argv is a compile error), the loopback default bind, the CSRF header, a
+  **`Host` that must name an address** (the header alone stops a cross-origin `<form>` but *not* DNS
+  rebinding — a page whose own name is re-pointed at `127.0.0.1` is same-origin and can set any
+  header; a rebound request necessarily carries the attacker's name in `Host`), and **single-flight**
+  (a second attempt while one runs is `409` — two concurrent `connect`s race onchain user creation,
+  so this is a correctness guard, not politeness). The child runs on a blocking thread behind
+  `tokio::spawn` and the route answers `202` at once (`connect` takes minutes and must never sit on a
+  runtime worker); its outcome lands back in the snapshot as `last_attempt`, since a `202` nothing
+  could follow up on would be useless. The wait is **bounded** (`subscriptions::ATTEMPT_TIMEOUT`,
+  kill on overrun) because the gate must always clear — a hung `connect` would otherwise refuse even
+  the `disconnect` that would clear it — and a killed child's output is deliberately not collected,
+  since a grandchild holding the pipe would make that read block for exactly as long as the deadline
+  bounded. ⚠️ There is **no rate limit** — a script looping on `connect` serially re-runs onchain
+  provisioning. The other two routes are `/admin/channels`: `GET`
   reports the channel filter in force plus,
   per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver
   set (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`

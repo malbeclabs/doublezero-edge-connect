@@ -38,11 +38,11 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         channel_filter::ChannelFilter,
-        diagnostics::{Detection, ReceiverState, SharedDiagnostics},
+        diagnostics::{Activation, Detection, Polled, ReceiverState, SharedDiagnostics},
         feeds::{Feed, FeedKind},
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver, sources,
-        subscriptions::{self, Detected, HostSubs, Session},
+        subscriptions::{self, Detected, HostSubs},
     },
     metrics::metrics,
     model::{category_arc, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
@@ -243,12 +243,7 @@ struct Desired {
 /// deliberately adds no second shell-out to the polling path.
 #[derive(Debug, Default)]
 struct TickOutcome {
-    detection: Detection,
-    detail: Option<String>,
-    sessions: Vec<Session>,
-    market_data_codes: Vec<String>,
-    shred_codes: Vec<String>,
-    other_codes: Vec<String>,
+    polled: Polled,
     desired: Option<Desired>,
 }
 
@@ -373,34 +368,29 @@ impl Reconciler {
     /// reconciler's own task maps rather than off the `Desired` that produced them, so an
     /// inconclusive tick reports what is really running instead of what was wanted.
     fn publish_diagnostics(&self, outcome: &TickOutcome) {
-        let receivers: Vec<ReceiverState> = self
-            .active
-            .keys()
-            .map(|k| ReceiverState {
-                venue: k.0,
-                category: k.1,
-                kind: k.2,
-                base_port: k.3,
-                liveness: self.health.liveness(k),
-            })
-            .collect();
-        let mut diag = crate::model::lock(&self.cfg.diagnostics);
-        diag.refresh_secs = self.cfg.refresh.as_secs();
-        diag.publish_tick(
-            outcome.detection,
-            outcome.detail.clone(),
-            outcome.sessions.clone(),
-            outcome.market_data_codes.clone(),
-            outcome.shred_codes.clone(),
-            outcome.other_codes.clone(),
-            receivers,
-            self.ws_task.is_some(),
-            self.api_task.is_some(),
-            self.shred_task
+        let activation = Activation {
+            receivers: self
+                .active
+                .keys()
+                .map(|k| ReceiverState {
+                    venue: k.0,
+                    category: k.1,
+                    kind: k.2,
+                    base_port: k.3,
+                    liveness: self.health.liveness(k),
+                })
+                .collect(),
+            ws_on: self.ws_task.is_some(),
+            api_on: self.api_task.is_some(),
+            shred_sources: self
+                .shred_task
                 .as_ref()
                 .map(|(srcs, _)| srcs.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default(),
-        );
+        };
+        let mut diag = crate::model::lock(&self.cfg.diagnostics);
+        diag.refresh_secs = self.cfg.refresh.as_secs();
+        diag.publish_tick(outcome.polled.clone(), activation);
     }
 
     /// Apply one computed [`Desired`] state. Split out of `tick` so a test can drive this
@@ -454,9 +444,11 @@ impl Reconciler {
     async fn compute_desired(&mut self) -> TickOutcome {
         if self.cfg.gating_disabled {
             return TickOutcome {
-                detection: Detection::GatingDisabled,
+                polled: Polled {
+                    detection: Detection::GatingDisabled,
+                    ..Polled::default()
+                },
                 desired: Some(self.static_desired()),
-                ..TickOutcome::default()
             };
         }
         // The group list is only needed to resolve shred-group IPs; skip it when shreds are
@@ -466,12 +458,14 @@ impl Reconciler {
             Ok(Detected::Ok(subs)) => {
                 let (market_data_codes, shred_codes, other_codes) = self.classify_codes(&subs);
                 TickOutcome {
-                    detection: Detection::Ok,
-                    detail: None,
-                    sessions: subs.sessions.clone(),
-                    market_data_codes,
-                    shred_codes,
-                    other_codes,
+                    polled: Polled {
+                        detection: Detection::Ok,
+                        detail: None,
+                        sessions: subs.sessions.clone(),
+                        market_data_codes,
+                        shred_codes,
+                        other_codes,
+                    },
                     desired: Some(self.desired_from_subs(&subs)),
                 }
             }
@@ -484,22 +478,30 @@ impl Reconciler {
                     self.cli_missing_logged = true;
                 }
                 TickOutcome {
-                    detection: Detection::CliMissing,
+                    polled: Polled {
+                        detection: Detection::CliMissing,
+                        ..Polled::default()
+                    },
                     desired: Some(self.static_desired()),
-                    ..TickOutcome::default()
                 }
             }
             Ok(Detected::Unavailable { detail }) => TickOutcome {
-                detection: Detection::Unavailable,
-                detail,
-                ..TickOutcome::default()
+                polled: Polled {
+                    detection: Detection::Unavailable,
+                    detail,
+                    ..Polled::default()
+                },
+                desired: None,
             },
             Err(e) => {
                 warn!(%e, "subscription detect task failed; keeping current activations");
                 TickOutcome {
-                    detection: Detection::Unavailable,
-                    detail: Some(format!("subscription detect task failed: {e}")),
-                    ..TickOutcome::default()
+                    polled: Polled {
+                        detection: Detection::Unavailable,
+                        detail: Some(format!("subscription detect task failed: {e}")),
+                        ..Polled::default()
+                    },
+                    desired: None,
                 }
             }
         }

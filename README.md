@@ -354,7 +354,10 @@ irreversible within the history window.
 > a browser on this host from POSTing a form to `/admin/channels` — the request would originate
 > from the host itself. Every `POST` therefore also requires an `X-DZ-Admin-Request` header (any
 > value is fine — a form post cannot set an arbitrary header, so requiring one is enough). The
-> `doublezero-edge` commands send it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`.
+> `doublezero-edge` commands send it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`. A
+> `POST` must also address this surface by IP (or `localhost`), never a DNS name — a page whose own
+> name is re-pointed at loopback would otherwise be same-origin with it and able to set that header
+> itself.
 > This matters most on `/admin/connect`, which spends the container's onchain identity: anything
 > that can reach loopback on this host can trigger a provisioning run. Only one attempt runs at a
 > time (a second is refused), but there is no rate limit — a script looping on it would serially

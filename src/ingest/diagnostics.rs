@@ -50,7 +50,7 @@ pub enum Detection {
     Ok,
     /// No `doublezero` binary on this host (running from source). Gating falls open.
     CliMissing,
-    /// The CLI is present but the query failed. `detail` carries what it printed.
+    /// The CLI is present but the query failed; [`Polled::detail`] carries what it printed.
     Unavailable,
     /// `--subscription-gating-disable`: the static always-on model, no poll at all.
     GatingDisabled,
@@ -110,14 +110,13 @@ impl CommandAttempt {
     }
 }
 
-/// Everything the diagnostics route reports, written by the reconciler once per tick.
-#[derive(Debug, Default)]
-pub struct DiagnosticsSnapshot {
+/// What one poll read off `doublezero status --json`. Built by the reconciler, which keeps this as
+/// one value rather than six positional arguments.
+#[derive(Debug, Default, Clone)]
+pub struct Polled {
     pub detection: Detection,
     /// Why detection failed, where the CLI said so (`Detection::Unavailable` only).
     pub detail: Option<String>,
-    /// Wall clock of the last completed tick; `None` before the first.
-    pub checked_at_unix: Option<u64>,
     pub sessions: Vec<Session>,
     /// Subscribed codes that match a feed row this process may run.
     pub market_data_codes: Vec<String>,
@@ -125,10 +124,29 @@ pub struct DiagnosticsSnapshot {
     pub shred_codes: Vec<String>,
     /// Every other subscribed code — a group this host holds that this build has no row for.
     pub other_codes: Vec<String>,
+}
+
+/// What the reconciler is actually running as of that tick — read off its own task maps, not off
+/// the desired set that produced them, so an inconclusive tick reports reality.
+#[derive(Debug, Default)]
+pub struct Activation {
     pub receivers: Vec<ReceiverState>,
     pub ws_on: bool,
     pub api_on: bool,
     pub shred_sources: Vec<String>,
+}
+
+/// Everything the diagnostics route reports, written by the reconciler once per tick.
+#[derive(Debug, Default)]
+pub struct DiagnosticsSnapshot {
+    pub polled: Polled,
+    /// Wall clock of the last completed tick; `None` before the first.
+    pub checked_at_unix: Option<u64>,
+    /// Wall clock of the last tick whose detection actually *succeeded* — the age of `polled`'s
+    /// session and code data, which a failed tick deliberately leaves in place (see
+    /// [`Self::publish_tick`]).
+    pub last_ok_at_unix: Option<u64>,
+    pub activation: Activation,
     /// How often the reconciler polls, so a remediation can name the real wait rather than a
     /// hardcoded 30s.
     pub refresh_secs: u64,
@@ -139,32 +157,25 @@ pub struct DiagnosticsSnapshot {
 }
 
 impl DiagnosticsSnapshot {
-    /// Overwrite the polled half. Leaves `last_attempt` alone — see its doc.
-    #[allow(clippy::too_many_arguments)]
-    pub fn publish_tick(
-        &mut self,
-        detection: Detection,
-        detail: Option<String>,
-        sessions: Vec<Session>,
-        market_data_codes: Vec<String>,
-        shred_codes: Vec<String>,
-        other_codes: Vec<String>,
-        receivers: Vec<ReceiverState>,
-        ws_on: bool,
-        api_on: bool,
-        shred_sources: Vec<String>,
-    ) {
-        self.detection = detection;
-        self.detail = detail;
-        self.checked_at_unix = Some(crate::model::now_ns() / 1_000_000_000);
-        self.sessions = sessions;
-        self.market_data_codes = market_data_codes;
-        self.shred_codes = shred_codes;
-        self.other_codes = other_codes;
-        self.receivers = receivers;
-        self.ws_on = ws_on;
-        self.api_on = api_on;
-        self.shred_sources = shred_sources;
+    /// Publish one tick. Leaves `last_attempt` alone — see its doc.
+    ///
+    /// An `Unavailable` tick updates the detection outcome but **keeps the previous poll's sessions
+    /// and codes**. The transient case is a `doublezero status` blip on a host that is streaming
+    /// fine — likely while a multi-minute `connect` holds the daemon — and blanking them would
+    /// report "zero subscriptions, no sessions, freshly checked" beside five live receivers, which
+    /// is a worse answer than a stale one. `last_ok_at_unix` is what makes the staleness visible;
+    /// the reconciler makes the same distinction for activations, which it also keeps.
+    pub fn publish_tick(&mut self, polled: Polled, activation: Activation) {
+        let now = crate::model::now_ns() / 1_000_000_000;
+        self.checked_at_unix = Some(now);
+        if polled.detection == Detection::Unavailable {
+            self.polled.detection = polled.detection;
+            self.polled.detail = polled.detail;
+        } else {
+            self.polled = polled;
+            self.last_ok_at_unix = Some(now);
+        }
+        self.activation = activation;
     }
 
     /// Whether a connect/disconnect attempt is in flight — the single-flight gate.
@@ -175,6 +186,7 @@ impl DiagnosticsSnapshot {
     /// The `tunnel`, `subscriptions` and `activation` blocks of the diagnostics response.
     pub fn to_json(&self) -> Value {
         let sessions: Vec<Value> = self
+            .polled
             .sessions
             .iter()
             .map(|s| {
@@ -198,6 +210,7 @@ impl DiagnosticsSnapshot {
             })
             .collect();
         let receivers: Vec<Value> = self
+            .activation
             .receivers
             .iter()
             .map(|r| {
@@ -212,22 +225,23 @@ impl DiagnosticsSnapshot {
             .collect();
         json!({
             "tunnel": {
-                "detection": self.detection.label(),
-                "detail": self.detail,
+                "detection": self.polled.detection.label(),
+                "detail": self.polled.detail,
                 "checked_at_unix": self.checked_at_unix,
+                "last_ok_at_unix": self.last_ok_at_unix,
                 "poll_seconds": self.refresh_secs,
                 "sessions": sessions,
             },
             "subscriptions": {
-                "market_data_codes": self.market_data_codes,
-                "shred_codes": self.shred_codes,
-                "other_codes": self.other_codes,
+                "market_data_codes": self.polled.market_data_codes,
+                "shred_codes": self.polled.shred_codes,
+                "other_codes": self.polled.other_codes,
             },
             "activation": {
                 "receivers": receivers,
-                "ws_on": self.ws_on,
-                "api_on": self.api_on,
-                "shred_sources": self.shred_sources,
+                "ws_on": self.activation.ws_on,
+                "api_on": self.activation.api_on,
+                "shred_sources": self.activation.shred_sources,
             },
             "last_attempt": self.last_attempt.as_ref().map(CommandAttempt::to_json),
         })
@@ -272,7 +286,7 @@ impl Diagnosis {
 /// is ruled out — which is what stops it reporting a broken tunnel on a host that never had one to
 /// break (`cli_missing`), or an empty subscription set on a host whose daemon never answered.
 pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
-    match s.detection {
+    match s.polled.detection {
         Detection::Pending => {
             return Diagnosis::new(
                 "pending",
@@ -294,7 +308,11 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
             )
         }
         Detection::Unavailable => {
-            let detail = s.detail.as_deref().unwrap_or("no output was captured");
+            let detail = s
+                .polled
+                .detail
+                .as_deref()
+                .unwrap_or("no output was captured");
             return Diagnosis::new(
                 "daemon_unreachable",
                 format!("`doublezero status` failed: {detail}"),
@@ -316,22 +334,44 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
         Detection::Ok => {}
     }
 
-    if !s.sessions.iter().any(session_is_up) {
+    // Packets arriving is proof the tunnel is up, whatever the status string says — so the two
+    // rungs below are skipped outright when a receiver is delivering. Without that, one upstream
+    // rename of `session_status` would report `tunnel_down` on every healthy host in the fleet and
+    // point each one at the mutating `doublezero-edge connect`. Activation is armored against
+    // exactly that rename (see `subscriptions::parse_status_codes`'s F1 note); the verdict an
+    // operator acts on has to be too.
+    let delivering = s
+        .activation
+        .receivers
+        .iter()
+        .any(|r| r.liveness == TapeLiveness::Up);
+    if !delivering && !s.polled.sessions.iter().any(session_is_up) {
         let reported = s
+            .polled
             .sessions
             .iter()
             .filter_map(|s| s.session_status.as_deref())
             .collect::<Vec<_>>()
             .join(", ");
-        let reported = if reported.is_empty() {
-            "no sessions at all".to_string()
-        } else {
-            format!("session status: {reported}")
-        };
+        // No session reported a status at all: the document parsed but this build did not
+        // recognize the field. "Not up" is a claim the snapshot cannot support, so it isn't made.
+        if reported.is_empty() {
+            return Diagnosis::new(
+                "tunnel_state_unknown",
+                format!(
+                    "`doublezero status` answered but reported no session status for this host \
+                     ({} session entr(ies)), and no receiver is delivering.",
+                    s.polled.sessions.len()
+                ),
+                "Read it directly — `doublezero status` inside the container — since this build \
+                 could not find the field it reads. If the tunnel really is down, \
+                 `doublezero-edge connect` is the retry.",
+            );
+        }
         return Diagnosis::new(
             "tunnel_down",
             format!(
-                "The DoubleZero tunnel is not up — {reported} (healthy is \
+                "The DoubleZero tunnel is not up — session status: {reported} (healthy is \
                  \"{HEALTHY_SESSION_STATUS}\"). No multicast traffic can reach this host."
             ),
             "Run `doublezero-edge connect` to retry `doublezero connect multicast` inside the \
@@ -340,7 +380,7 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
         );
     }
 
-    if s.market_data_codes.is_empty() {
+    if !delivering && s.polled.market_data_codes.is_empty() {
         return Diagnosis::new(
             "no_market_data_subscriptions",
             "The tunnel is up, but this host is subscribed to no multicast group this build \
@@ -362,12 +402,13 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
 /// running — are any of them actually delivering? `prefix` is what the caller already established
 /// about *why* those receivers are running.
 fn traffic_verdict(s: &DiagnosticsSnapshot, ok_code: &'static str, prefix: &str) -> Diagnosis {
-    if !s.receivers.is_empty() && !s.receivers.iter().any(|r| r.liveness == TapeLiveness::Up) {
+    let receivers = &s.activation.receivers;
+    if !receivers.is_empty() && !receivers.iter().any(|r| r.liveness == TapeLiveness::Up) {
         return Diagnosis::new(
             "subscribed_no_traffic",
             format!(
                 "{prefix} {} receiver(s) are running but none has delivered a packet.",
-                s.receivers.len()
+                receivers.len()
             ),
             "A default-deny host firewall dropping the decapsulated inner multicast is the usual \
              cause: allow it on the tunnel interface (e.g. `ufw allow in on doublezero1`). A \
@@ -377,8 +418,8 @@ fn traffic_verdict(s: &DiagnosticsSnapshot, ok_code: &'static str, prefix: &str)
     }
     Diagnosis::new(
         ok_code,
-        format!("{prefix} {} receiver(s) running.", s.receivers.len()),
-        if s.api_on {
+        format!("{prefix} {} receiver(s) running.", receivers.len()),
+        if s.activation.api_on {
             "Nothing to fix — the /v1 query API is up.".to_string()
         } else {
             "The /v1 query API is not up; check --api-bind is set and its port is free.".to_string()
@@ -401,7 +442,10 @@ mod tests {
 
     fn snap(detection: Detection) -> DiagnosticsSnapshot {
         DiagnosticsSnapshot {
-            detection,
+            polled: Polled {
+                detection,
+                ..Polled::default()
+            },
             refresh_secs: 30,
             ..DiagnosticsSnapshot::default()
         }
@@ -423,7 +467,7 @@ mod tests {
     #[test]
     fn the_disconnected_capture_diagnoses_as_tunnel_down() {
         let mut s = snap(Detection::Ok);
-        s.sessions = parse_status_sessions(DISCONNECTED_STATUS_JSON.as_bytes());
+        s.polled.sessions = parse_status_sessions(DISCONNECTED_STATUS_JSON.as_bytes());
         let d = diagnose(&s);
         assert_eq!(d.code, "tunnel_down");
         assert!(
@@ -442,10 +486,10 @@ mod tests {
     #[test]
     fn a_connected_host_with_a_live_receiver_diagnoses_as_ok() {
         let mut s = snap(Detection::Ok);
-        s.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
-        s.market_data_codes = vec!["tiredsolid".to_string()];
-        s.receivers = vec![receiver(TapeLiveness::Up)];
-        s.api_on = true;
+        s.polled.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
+        s.polled.market_data_codes = vec!["tiredsolid".to_string()];
+        s.activation.receivers = vec![receiver(TapeLiveness::Up)];
+        s.activation.api_on = true;
         assert_eq!(diagnose(&s).code, "ok");
     }
 
@@ -463,7 +507,7 @@ mod tests {
     #[test]
     fn a_daemon_down_host_quotes_the_cli_error() {
         let mut s = snap(Detection::Unavailable);
-        s.detail = Some("Please start the doublezerod service.".to_string());
+        s.polled.detail = Some("Please start the doublezerod service.".to_string());
         let d = diagnose(&s);
         assert_eq!(d.code, "daemon_unreachable");
         assert!(d.summary.contains("Please start the doublezerod service."));
@@ -483,8 +527,8 @@ mod tests {
     #[test]
     fn a_connected_host_with_no_market_data_group_reports_no_subscriptions() {
         let mut s = snap(Detection::Ok);
-        s.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
-        s.shred_codes = vec!["edge-solana-shreds".to_string()];
+        s.polled.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
+        s.polled.shred_codes = vec!["edge-solana-shreds".to_string()];
         assert_eq!(diagnose(&s).code, "no_market_data_subscriptions");
     }
 
@@ -494,9 +538,9 @@ mod tests {
     #[test]
     fn receivers_running_with_no_traffic_is_not_ok() {
         let mut s = snap(Detection::Ok);
-        s.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
-        s.market_data_codes = vec!["tiredsolid".to_string()];
-        s.receivers = vec![
+        s.polled.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
+        s.polled.market_data_codes = vec!["tiredsolid".to_string()];
+        s.activation.receivers = vec![
             receiver(TapeLiveness::Down),
             receiver(TapeLiveness::Unregistered),
         ];
@@ -510,9 +554,9 @@ mod tests {
     #[test]
     fn one_live_receiver_among_dead_peers_is_ok() {
         let mut s = snap(Detection::Ok);
-        s.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
-        s.market_data_codes = vec!["tiredsolid".to_string()];
-        s.receivers = vec![receiver(TapeLiveness::Down), receiver(TapeLiveness::Up)];
+        s.polled.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
+        s.polled.market_data_codes = vec!["tiredsolid".to_string()];
+        s.activation.receivers = vec![receiver(TapeLiveness::Down), receiver(TapeLiveness::Up)];
         assert_eq!(diagnose(&s).code, "ok");
     }
 
@@ -521,11 +565,11 @@ mod tests {
     #[test]
     fn gating_disabled_skips_the_tunnel_rungs_but_keeps_the_traffic_one() {
         let mut s = snap(Detection::GatingDisabled);
-        s.receivers = vec![receiver(TapeLiveness::Down)];
+        s.activation.receivers = vec![receiver(TapeLiveness::Down)];
         assert_eq!(diagnose(&s).code, "subscribed_no_traffic");
 
         let mut s = snap(Detection::GatingDisabled);
-        s.receivers = vec![receiver(TapeLiveness::Up)];
+        s.activation.receivers = vec![receiver(TapeLiveness::Up)];
         assert_eq!(diagnose(&s).code, "gating_disabled");
     }
 
@@ -541,21 +585,74 @@ mod tests {
             exit_code: None,
             output_tail: String::new(),
         });
-        s.publish_tick(
-            Detection::Ok,
-            None,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            vec![],
-        );
+        s.publish_tick(Polled::default(), Activation::default());
         assert!(
             s.attempt_running(),
             "the in-flight attempt must survive a tick"
+        );
+    }
+
+    /// A `doublezero status` blip on a streaming host must not blank what the last good poll knew.
+    /// Reporting "zero subscriptions, no sessions, freshly checked" beside live receivers sends an
+    /// operator after a fault that isn't there; `last_ok_at_unix` is what makes the staleness
+    /// visible instead.
+    #[test]
+    fn an_unavailable_tick_keeps_the_last_good_sessions_and_codes() {
+        let mut s = snap(Detection::Pending);
+        s.publish_tick(
+            Polled {
+                detection: Detection::Ok,
+                sessions: parse_status_sessions(STATUS_JSON.as_bytes()),
+                market_data_codes: vec!["tiredsolid".to_string()],
+                ..Polled::default()
+            },
+            Activation::default(),
+        );
+        let ok_at = s.last_ok_at_unix.expect("a successful tick stamps it");
+
+        s.publish_tick(
+            Polled {
+                detection: Detection::Unavailable,
+                detail: Some("Please start the doublezerod service.".to_string()),
+                ..Polled::default()
+            },
+            Activation::default(),
+        );
+        assert_eq!(s.polled.detection, Detection::Unavailable);
+        assert_eq!(s.polled.market_data_codes, vec!["tiredsolid".to_string()]);
+        assert_eq!(s.polled.sessions.len(), 1);
+        assert_eq!(
+            s.last_ok_at_unix,
+            Some(ok_at),
+            "the staleness of the kept data must stay visible"
+        );
+    }
+
+    /// M2: one upstream rename of `session_status` must not report `tunnel_down` fleet-wide.
+    /// Packets arriving is proof the tunnel is up whatever the string says, and a document that
+    /// reports no status at all is unknown rather than down. Activation is armored against exactly
+    /// this rename; the verdict an operator acts on has to be too.
+    #[test]
+    fn an_unrecognized_session_status_never_reports_tunnel_down() {
+        // Every field renamed away: sessions parse, none carries a status.
+        let renamed = br#"[{"multicast_groups":"S:tiredsolid","doublezeroStatus":{"sessionStatus":"BGP Session Up"}}]"#;
+
+        // With traffic flowing, the tunnel is demonstrably up — no tunnel rung at all.
+        let mut s = snap(Detection::Ok);
+        s.polled.sessions = parse_status_sessions(renamed);
+        s.polled.market_data_codes = vec!["tiredsolid".to_string()];
+        s.activation.receivers = vec![receiver(TapeLiveness::Up)];
+        assert_eq!(diagnose(&s).code, "ok");
+
+        // With nothing delivering, "not up" is still a claim the snapshot cannot support.
+        let mut s = snap(Detection::Ok);
+        s.polled.sessions = parse_status_sessions(renamed);
+        let d = diagnose(&s);
+        assert_eq!(d.code, "tunnel_state_unknown");
+        assert!(
+            d.remediation.contains("doublezero status"),
+            "{}",
+            d.remediation
         );
     }
 }

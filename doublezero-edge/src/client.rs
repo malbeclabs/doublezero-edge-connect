@@ -83,12 +83,17 @@ pub fn unreachable_envelope(base_url: &str) -> Value {
 /// `/v1` did not answer but the admin surface did: the container is running and its query API is
 /// simply not activated. Distinct from [`unreachable_envelope`] because the remediations have
 /// nothing in common — one is "start the container", the other is "fix the tunnel".
-pub fn api_inactive_envelope(base_url: &str, summary: &str) -> Value {
+///
+/// Names `admin_url` explicitly. [`same_host`] can only compare host strings, so a `--url` that
+/// reaches a *remote* bridge through a local port forward looks local and the probe fires against
+/// the local container. Saying which process answered is what lets an operator spot that.
+pub fn api_inactive_envelope(base_url: &str, admin_url: &str, summary: &str) -> Value {
     json!({
         "error": "api_inactive",
         "message": format!(
-            "No response at {base_url}, but edge-connect is running — its admin surface answered. \
-             The /v1 API activates only when a market-data feed is subscribed. {summary}"
+            "No response at {base_url}, but edge-connect is running — the admin surface at \
+             {admin_url} answered. The /v1 API activates only when a market-data feed is \
+             subscribed. {summary}"
         ),
         "remediation": "Run `doublezero-edge diagnose` for the full verdict, and \
             `doublezero-edge connect` if it reports the tunnel down.",
@@ -316,7 +321,11 @@ mod tests {
     /// The `api_inactive` story is only useful if it points at the command that explains why.
     #[test]
     fn the_api_inactive_envelope_names_diagnose_and_quotes_the_verdict() {
-        let body = api_inactive_envelope("http://127.0.0.1:9099", "The tunnel is not up.");
+        let body = api_inactive_envelope(
+            "http://127.0.0.1:9099",
+            "http://127.0.0.1:9098",
+            "The tunnel is not up.",
+        );
         assert_eq!(body["error"], "api_inactive");
         assert!(body["message"]
             .as_str()

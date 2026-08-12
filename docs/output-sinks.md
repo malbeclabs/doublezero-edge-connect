@@ -152,25 +152,37 @@ ruled out — so a host with no `doublezero` CLI is never reported as a broken t
 | `pending` | No poll has completed yet |
 | `dz_cli_missing` | No `doublezero` CLI (running from source); gating falls open |
 | `daemon_unreachable` | `doublezero status` failed — quotes what it printed, usually `Please start the doublezerod service.` |
-| `tunnel_down` | No session reports `BGP Session Up` |
+| `tunnel_down` | A session reports a status, and none of them is `BGP Session Up` |
+| `tunnel_state_unknown` | The document parsed but carried no session status this build recognizes — "not up" is a claim the snapshot cannot support |
 | `no_market_data_subscriptions` | Tunnel up, but no subscribed group matches a feed this build serves |
 | `subscribed_no_traffic` | Receivers running, none delivering — usually a default-deny host firewall on `doublezero1` |
 | `gating_disabled` / `ok` | Nothing to fix |
+
+A receiver actually delivering packets is proof the tunnel is up, so the two tunnel rungs are
+skipped outright in that case: one upstream rename of `session_status` must not report
+`tunnel_down` fleet-wide and point every healthy host at a mutating retry. A transient
+`doublezero status` failure keeps the last good session and code data rather than blanking it —
+`last_ok_at_unix` reports how stale it is.
 
 `doublezero-edge diagnose` renders this; `doublezero-edge connect` is the retry the `tunnel_down`
 rung points at.
 
 ### Guards on the mutating routes
 
-`POST` requires an `X-DZ-Admin-Request` header (any value) and refuses a request body. The header is
-not authentication — this surface has none — it rules out a request a browser page on the same host
-could have caused by accident, which a `<form>` cannot produce. `GET` routes are exempt: requiring
-it on the diagnostics read would make the one command a stuck operator most needs harder to run than
-`curl`.
+`POST` requires an `X-DZ-Admin-Request` header (any value), refuses a request body, and requires
+`Host` to name an address rather than a DNS name (`localhost` counts; an absent `Host` counts). The
+header is not authentication — this surface has none — it rules out a request a browser page on the
+same host could have caused by accident, which a `<form>` cannot produce. The `Host` check covers
+the case the header does not: a page whose own name is re-pointed at `127.0.0.1` is *same-origin*
+with this surface and can set any header it likes, but a rebound request necessarily carries the
+attacker's name in `Host`. `GET` routes are exempt from both: requiring them on the diagnostics read
+would make the one command a stuck operator most needs harder to run than `curl`.
 
 `connect`/`disconnect` additionally run a **fixed argv** (a module constant — the routes take no
 parameters, so no request input reaches the child process) and are **single-flight**: a second
 attempt while one is running is `409`, because two concurrent runs would race onchain user creation.
-The child runs on a blocking thread and the route answers `202` immediately; the outcome lands back
-in `GET /admin/diagnostics` under `last_attempt`. There is no rate limit — a script looping on
-`connect` would serially re-run onchain provisioning.
+The child runs on a blocking thread with stdin at `/dev/null`, and the route answers `202`
+immediately; the outcome lands back in `GET /admin/diagnostics` under `last_attempt`. A child that
+never exits is killed after 10 minutes so the single-flight gate always clears — otherwise a hung
+`connect` would refuse even the `disconnect` that would clear it. There is no rate limit: a script
+looping on `connect` would serially re-run onchain provisioning.

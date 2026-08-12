@@ -439,7 +439,11 @@ fn print_v1_unreachable(cli: &Cli, client: &reqwest::blocking::Client, body: &Va
     match probed {
         Some(diag) => {
             let summary = diag["diagnosis"]["summary"].as_str().unwrap_or_default();
-            print_error(&client::api_inactive_envelope(&cli.url, summary));
+            print_error(&client::api_inactive_envelope(
+                &cli.url,
+                &cli.admin_url,
+                summary,
+            ));
         }
         None => print_error(body),
     }

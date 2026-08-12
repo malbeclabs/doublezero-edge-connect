@@ -64,6 +64,13 @@
 //! provisioning/rotation problem that comes with it. What the header actually rules out is not "an
 //! unauthorized caller" but "a request a browser page could have caused by accident" — a
 //! `curl -H 'x-dz-admin-request: 1'` from anyone reaching loopback still succeeds, same as today.
+//!
+//! That header alone does **not** cover DNS rebinding, which is a different attack: a page served
+//! from a name whose record is re-pointed at `127.0.0.1` becomes *same-origin* with this surface,
+//! so it can set any header it likes and read the response too. Tearing down the tunnel or spending
+//! the container's onchain identity is a much worse outcome than swapping a channel filter, so a
+//! `POST` also requires `Host` to name an address rather than a name ([`host_is_an_address`]) — a
+//! rebound request necessarily carries the attacker's name there.
 
 use std::sync::{Arc, Mutex};
 
@@ -94,7 +101,7 @@ const DISCONNECT_ARGV: &[&str] = &["disconnect", "multicast"];
 /// call so a handler test can drive the single-flight and guard behaviour without a `doublezero`
 /// binary on the test host — there is exactly one production implementation
 /// ([`subscriptions::run_cli_reporting`]), installed by [`AdminState::new`].
-type CommandRunner = Arc<dyn Fn(&[&str]) -> (Option<i32>, String) + Send + Sync>;
+type CommandRunner = Arc<dyn Fn(&'static [&'static str]) -> (Option<i32>, String) + Send + Sync>;
 
 /// Which surfaces this process was *configured* with, reported by `GET /admin/diagnostics`. The
 /// "is it even enabled" half of the question — whether a configured sink is currently *activated*
@@ -314,9 +321,22 @@ fn post_command(
     )
 }
 
-/// The two refusals every mutating route on this surface shares — see [`post_channels`] for why
-/// each exists. Returns `None` when the request may proceed.
+/// The three refusals every mutating route on this surface shares — see [`post_channels`] and
+/// [`host_is_an_address`] for why each exists. Returns `None` when the request may proceed.
 fn mutation_guards(req: &Request, route: &str) -> Option<Response> {
+    if !host_is_an_address(req) {
+        return Some(json_status(
+            "403 Forbidden",
+            json!({
+                "error": "host_header_not_an_address",
+                "message": "Request carried a `Host` header naming a DNS name rather than an \
+                    address.",
+                "remediation": "Address this surface by IP and port (e.g. \
+                    http://127.0.0.1:9098). A name is refused because a page in a browser on this \
+                    host can point one at loopback, which would make its requests same-origin.",
+            }),
+        ));
+    }
     if req.header(REQUIRED_HEADER).is_none() {
         return Some(json_status(
             "403 Forbidden",
@@ -346,6 +366,36 @@ fn mutation_guards(req: &Request, route: &str) -> Option<Response> {
         ));
     }
     None
+}
+
+/// Does the request's `Host` name an address rather than a DNS name? Absent counts as yes — a
+/// hand-rolled `curl`/HTTP/1.0 client may omit it, and there is nothing to rebind. Literal
+/// `localhost` counts too: an attacker cannot make their page's origin be `localhost`, and
+/// refusing it would break `--admin-url http://localhost:9098` for no gain.
+///
+/// [`REQUIRED_HEADER`] alone stops a **cross-origin** form post, which is the only shape a page can
+/// produce against `http://127.0.0.1:9098` directly. It does **not** stop DNS rebinding: a page
+/// served from a name whose record is then re-pointed at `127.0.0.1` becomes *same-origin* with
+/// this surface, so it can set any header it likes with no preflight and both mutate and read
+/// freely. That escalated from "swap a channel filter" to "tear down the tunnel, or spend the
+/// container's onchain identity" when the connect routes landed, which is why the check is here.
+/// A rebound request necessarily carries the attacker's **name** in `Host`; a legitimate client
+/// addressing a loopback bind carries an address.
+fn host_is_an_address(req: &Request) -> bool {
+    let Some(host) = req.header("host") else {
+        return true;
+    };
+    let host = host.trim();
+    // An IPv6 literal is bracketed, so the last `:` only separates a port outside brackets.
+    let name = match host.strip_prefix('[') {
+        Some(rest) => return rest.split(']').next().is_some_and(host_is_local_literal),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    host_is_local_literal(name)
+}
+
+fn host_is_local_literal(s: &str) -> bool {
+    s.eq_ignore_ascii_case("localhost") || s.parse::<std::net::IpAddr>().is_ok()
 }
 
 /// `GET /admin/channels` — the channel filter in force, plus which publishers each enabled feed's
@@ -943,8 +993,8 @@ mod tests {
         {
             let mut d = crate::model::lock(&diagnostics);
             d.refresh_secs = 30;
-            d.detection = crate::ingest::diagnostics::Detection::Ok;
-            d.sessions = crate::ingest::subscriptions::parse_status_sessions(
+            d.polled.detection = crate::ingest::diagnostics::Detection::Ok;
+            d.polled.sessions = crate::ingest::subscriptions::parse_status_sessions(
                 crate::ingest::subscriptions::DISCONNECTED_STATUS_JSON.as_bytes(),
             );
         }
@@ -1146,6 +1196,98 @@ mod tests {
             crate::model::lock(&diagnostics).last_attempt.is_none(),
             "a refused request must not have started an attempt"
         );
+    }
+
+    /// The DNS-rebinding guard: a `Host` naming a DNS name is refused on a mutating route, because
+    /// a page whose own name was re-pointed at loopback is *same-origin* with this surface and can
+    /// therefore set [`REQUIRED_HEADER`] itself. Asserts the filter untouched too — the refusal
+    /// must land before anything applies.
+    #[tokio::test]
+    async fn a_post_whose_host_names_a_dns_name_is_refused_and_changes_nothing() {
+        let filter = Arc::new(Mutex::new(ChannelFilter::default()));
+        let feed = sports_row();
+        let base = spawn(filter.clone(), vec![feed]).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/channels"))
+            .header(REQUIRED_HEADER, "1")
+            .header(reqwest::header::HOST, "evil.example")
+            .query(&[("channels", "lashay-4=10")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert_eq!(
+            resp.json::<Value>().await.unwrap()["error"],
+            "host_header_not_an_address"
+        );
+        assert!(
+            crate::model::lock(&filter).is_empty(),
+            "a rebound request must not have applied its spec"
+        );
+    }
+
+    /// The same guard on `/admin/connect`, where the outcome it rules out is a provisioning run —
+    /// and the mirror image: an address-shaped `Host` (what every real client sends against a
+    /// loopback bind) is accepted.
+    #[tokio::test]
+    async fn a_connect_is_refused_by_host_but_accepted_by_address() {
+        let diagnostics: SharedDiagnostics = Default::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = spawn_state(stub_state(diagnostics.clone(), rx, 0)).await;
+        tx.send(()).unwrap();
+        let client = reqwest::Client::new();
+
+        let rebound = client
+            .post(format!("{base}/admin/connect"))
+            .header(REQUIRED_HEADER, "1")
+            .header(reqwest::header::HOST, "attacker.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), 403);
+        assert!(
+            crate::model::lock(&diagnostics).last_attempt.is_none(),
+            "a rebound request must not have started a provisioning run"
+        );
+
+        // reqwest derives Host from the URL, which is `127.0.0.1:<port>` here.
+        let ok = client
+            .post(format!("{base}/admin/connect"))
+            .header(REQUIRED_HEADER, "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 202);
+    }
+
+    #[test]
+    fn host_shapes_a_loopback_client_really_sends_are_accepted() {
+        for host in [
+            "127.0.0.1:9098",
+            "127.0.0.1",
+            "[::1]:9098",
+            "localhost:9098",
+        ] {
+            let req = Request {
+                method: "POST".into(),
+                path: "/admin/connect".into(),
+                params: vec![],
+                content_length: 0,
+                headers: vec![("Host".into(), host.into())],
+            };
+            assert!(host_is_an_address(&req), "{host} must be accepted");
+        }
+        for host in ["evil.example", "evil.example:9098", "sub.evil.example"] {
+            let req = Request {
+                method: "POST".into(),
+                path: "/admin/connect".into(),
+                params: vec![],
+                content_length: 0,
+                headers: vec![("Host".into(), host.into())],
+            };
+            assert!(!host_is_an_address(&req), "{host} must be refused");
+        }
     }
 
     /// M7: covers the same breadth `sinks::api`'s method-refusal pinning does (`PUT`/`PATCH`/

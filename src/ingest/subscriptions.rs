@@ -17,7 +17,9 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     net::{Ipv4Addr, SocketAddrV4},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -426,25 +428,99 @@ fn run_cli(args: &[&str]) -> CliOut {
     }
 }
 
+/// A `POST /admin/{connect,disconnect}` attempt is killed after this long. `connect` legitimately
+/// takes minutes (device latency probing, onchain user creation, activation polling), so this is
+/// generous — it exists only so a child that will *never* return has an end. Without it the admin
+/// surface's single-flight gate would stay closed for the process's life, and the very `disconnect`
+/// that would clear the stuck state is itself refused.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Run one `doublezero <args...>` to completion and report its exit code plus a bounded tail of
-/// everything it printed (stdout and stderr interleaved as two blocks). The seam
-/// [`crate::sinks::admin`]'s `POST /admin/connect` / `POST /admin/disconnect` run their fixed argv
-/// through — **no caller-supplied argument ever reaches this**, and it is never invoked from the
-/// polling path.
-pub fn run_cli_reporting(args: &[&str]) -> (Option<i32>, String) {
-    match std::process::Command::new("doublezero").args(args).output() {
-        Err(e) => (None, format!("could not run `doublezero`: {e}")),
-        Ok(o) => {
-            let mut parts = Vec::new();
-            if let Some(t) = output_tail(&o.stdout) {
-                parts.push(t);
+/// everything it printed. The seam [`crate::sinks::admin`]'s `POST /admin/connect` /
+/// `POST /admin/disconnect` run their fixed argv through — the `&'static` argument type is what
+/// makes a caller-composed argv a compile error rather than a review catch — and it is never
+/// invoked from the polling path.
+///
+/// Three things this does that a plain [`std::process::Command::output`] does not:
+/// - **stdin is `/dev/null`.** A client verb that ever prompts would otherwise block forever on a
+///   descriptor inherited from the bridge.
+/// - **the wait is bounded** by [`ATTEMPT_TIMEOUT`], after which the child is killed and the
+///   attempt reports `None` with no output — the gate must always clear.
+/// - **both pipes are drained on their own threads**, so a child that fills a pipe buffer blocks on
+///   nothing and the deadline above is actually reachable.
+pub fn run_cli_reporting(args: &'static [&'static str]) -> (Option<i32>, String) {
+    use std::process::Stdio;
+
+    let mut child = match std::process::Command::new("doublezero")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return (None, format!("could not run `doublezero`: {e}")),
+    };
+    wait_bounded(&mut child, ATTEMPT_TIMEOUT)
+}
+
+/// Wait for `child` up to `timeout`, killing it and reporting why if it overruns. Split out of
+/// [`run_cli_reporting`] so a test can drive it with a short deadline against a real
+/// never-exiting process — the behaviour that matters is the kill, not the 600s policy number.
+fn wait_bounded(child: &mut std::process::Child, timeout: Duration) -> (Option<i32>, String) {
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s.code(),
+            Err(e) => break kill_after_error(child, &e),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
             }
-            if let Some(t) = output_tail(&o.stderr) {
-                parts.push(t);
-            }
-            (o.status.code(), parts.join("\n"))
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    // A killed child's output is deliberately **not** collected: a grandchild it left behind still
+    // holds the write end, so joining the drain threads would block for exactly as long as the
+    // deadline was meant to bound. The threads are left to finish on their own.
+    if timed_out {
+        return (
+            status,
+            format!("killed after {}s without exiting", timeout.as_secs_f32()),
+        );
+    }
+    let mut parts = Vec::new();
+    for pipe in [stdout, stderr].into_iter().flatten() {
+        if let Some(t) = pipe.join().ok().and_then(|b| output_tail(&b)) {
+            parts.push(t);
         }
     }
+    (status, parts.join("\n"))
+}
+
+/// Read a child pipe to EOF on its own thread — see [`run_cli_reporting`]'s third bullet.
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// `try_wait` erroring means the child's status is unknowable; reap what we can and report no code
+/// rather than spinning on the same error until the deadline.
+fn kill_after_error(child: &mut std::process::Child, e: &std::io::Error) -> Option<i32> {
+    warn!(%e, "could not wait on the `doublezero` child process");
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 #[cfg(test)]
@@ -817,6 +893,38 @@ mod tests {
         assert_eq!(sessions[0].subscriptions.len(), 1);
         assert_eq!(sessions[0].subscriptions[0].code, "scottsdale");
         assert!(sessions[0].subscriptions[0].subscriber);
+    }
+
+    /// The bound that keeps the admin surface's single-flight gate from sticking closed forever: a
+    /// child that never exits is killed and reports a code, so a later `POST` is accepted. Driven
+    /// against `sleep infinity` with the deadline swapped for a short one — the real 600s constant
+    /// is a policy number, and the behaviour under test is the kill, not its duration.
+    ///
+    /// Skipped where `/bin/sh` isn't spawnable; the fixture needs a real process that ignores EOF
+    /// on stdin, which no stub can stand in for.
+    #[test]
+    fn a_child_that_never_exits_is_killed_and_still_reports() {
+        let mut child = match std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let start = std::time::Instant::now();
+        let (code, output) = wait_bounded(&mut child, Duration::from_millis(300));
+        assert_eq!(code, None, "a killed child reports no exit code");
+        assert!(
+            output.contains("killed after"),
+            "the attempt must say why it ended: {output}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the wait must be bounded, not the child's own 60s"
+        );
     }
 
     /// The tail helper keeps the end of a long message (that is where a bail line lands), bounds
