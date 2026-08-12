@@ -74,7 +74,8 @@ curl -s localhost:9099/v1/products | jq .
 Routes: `GET /v1/products` (catalog), `GET /v1/products/{id}` (one product's identity/registry
 fields), `GET /v1/products/{id}/ticker` (recent trades + best bid/ask), `GET
 /v1/products/{id}/candles` (OHLCV, `granularity`/`limit` query params), `GET /v1/products/{id}/book`
-(order book), `GET /v1/best_bid_ask` (best bid/ask across every product), and `GET /v1/status`
+(order book), `GET /v1/best_bid_ask` (best bid/ask, optionally narrowed with a comma-separated
+`product_ids` query param), and `GET /v1/status`
 (per-venue feed health plus history-store stats). `{id}` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`),
 with an `#<channel>.<instrument_id>` suffix needed only where a bare symbol collides across markets.
 The [`doublezero-edge`](../README.md#query-market-data-the-doublezero-edge-cli) CLI is a thin client

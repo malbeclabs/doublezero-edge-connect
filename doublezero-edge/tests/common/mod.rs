@@ -10,6 +10,7 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     thread,
 };
 
@@ -40,6 +41,32 @@ fn serve_one(stream: &mut TcpStream, status_line: &str, body: &str) {
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// As [`mock_server`], but also hands back the raw bytes of the one request it served — for a
+/// test that needs to assert something about what the CLI actually sent (e.g. the query string),
+/// not just how it reacted to the response.
+pub fn mock_server_capture(
+    status_line: &'static str,
+    body: &'static str,
+) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), rx)
 }
 
 /// A `127.0.0.1` address nothing is listening on: bind an ephemeral port, then drop the listener

@@ -168,7 +168,7 @@ fn handle(state: &ApiState, req: &Request) -> Response {
         return products_list(state);
     }
     if path == "/v1/best_bid_ask" {
-        return best_bid_ask(state);
+        return best_bid_ask(state, req);
     }
     if path == "/v1/status" {
         return status(state);
@@ -697,7 +697,13 @@ fn book_response(
 // GET /v1/best_bid_ask
 // ---------------------------------------------------------------------------------------------
 
-fn best_bid_ask(state: &ApiState) -> Response {
+/// The identity `best_bid_ask`'s `product_ids` filter matches on — `(source_id, category,
+/// channel, instrument_id)`, one universe's key (see `products::resolve`'s docs for why category
+/// must be part of it: two disjoint universes under one Source ID can share `(channel,
+/// instrument_id)`).
+type ProductKey = (u16, Arc<str>, u32, u32);
+
+fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
     // Same discipline as `products_list`: snapshot the catalog and drop the `instruments` lock
     // before looping — `best_levels` takes `books`/`depth` per instrument, and materializing a
     // `NormalizedInstrument` clone up front is far cheaper than holding the catalog lock across
@@ -712,8 +718,58 @@ fn best_bid_ask(state: &ApiState) -> Response {
             .entry((i.source_id, i.symbol.to_string()))
             .or_insert(0) += 1;
     }
+
+    // `product_ids==A,B` (comma-separated, matching the emulated tool's own filter) narrows the
+    // response to exactly those identities. Each one is resolved exactly the way
+    // `/v1/products/{id}` resolves its single id — an invalid/unrecognised/ambiguous entry gets
+    // that same error rather than a fourth convention invented just for this list endpoint.
+    // Filtering happens here, before serialization, so `--jq`/`--output json` see the narrowed set
+    // too, not just the table renderer. No parameter (or an empty one) keeps today's behaviour:
+    // every product with a derivable quote.
+    let selected: Option<HashSet<ProductKey>> = match req.query("product_ids") {
+        None => None,
+        Some(raw) => {
+            let ids: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if ids.is_empty() {
+                None
+            } else {
+                let mut keys = HashSet::new();
+                for id in ids {
+                    let Some(parsed) = products::parse(id) else {
+                        return invalid_product_id(id);
+                    };
+                    match products::resolve(&state.instruments, &parsed) {
+                        Resolution::None => return product_not_found(id),
+                        Resolution::Ambiguous(candidates) => {
+                            return ambiguous_response(id, candidates)
+                        }
+                        Resolution::One(p) => {
+                            keys.insert((
+                                p.source_id,
+                                p.category.clone(),
+                                p.channel,
+                                p.instrument_id,
+                            ));
+                        }
+                    }
+                }
+                Some(keys)
+            }
+        }
+    };
+
     let mut pricebooks = Vec::new();
     for i in &instruments {
+        if let Some(keys) = &selected {
+            let key = (i.source_id, i.category.clone(), i.channel, i.instrument_id);
+            if !keys.contains(&key) {
+                continue;
+            }
+        }
         let (bid, ask) = best_levels(state, i);
         if bid.is_none() && ask.is_none() {
             // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
@@ -2414,6 +2470,121 @@ mod tests {
             lashay["asks"][0][0], "0.6300",
             "from BookAccumulator::best_ask, not depth"
         );
+    }
+
+    /// Shared two-product fixture for the `product_ids` filter tests below: both derivable, so a
+    /// bug that silently drops or duplicates rows shows up as a wrong *set*, not just a wrong count.
+    async fn spawn_two_derivable_products() -> String {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+                inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
+            );
+            map.insert(
+                ("PHOENIX".into(), "default".into(), 0u32, 7u32),
+                inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
+            );
+        }
+        depth.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), "BTC".into()),
+            NormalizedDepth {
+                venue: "HYPERLIQUID".into(),
+                source: "HYPERLIQUID".into(),
+                source_id: 1,
+                symbol: "BTC".into(),
+                bids: vec![[100.0, 1.0]],
+                asks: vec![[101.0, 2.0]],
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        depth.lock().unwrap().insert(
+            ("PHOENIX".into(), "SOL".into()),
+            NormalizedDepth {
+                venue: "PHOENIX".into(),
+                source: "PHOENIX".into(),
+                source_id: 2,
+                symbol: "SOL".into(),
+                bids: vec![[10.0, 1.0]],
+                asks: vec![[11.0, 2.0]],
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        spawn(instruments, depth, books, history, health, filter, enabled).await
+    }
+
+    /// `product_ids==A,B` narrows the response to exactly the asked-for products — asserted as a
+    /// set, not just a length, so a filter that happened to keep the right count of the wrong rows
+    /// would still fail this.
+    #[tokio::test]
+    async fn best_bid_ask_product_ids_filter_returns_only_the_asked_for_products() {
+        let base = spawn_two_derivable_products().await;
+        let resp = reqwest::get(format!(
+            "{base}/v1/best_bid_ask?product_ids=HYPERLIQUID:BTC"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let pricebooks = body["pricebooks"].as_array().unwrap();
+        let ids: Vec<&str> = pricebooks
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["HYPERLIQUID:BTC"],
+            "filtered request must return exactly the requested set: {body}"
+        );
+    }
+
+    /// No `product_ids` at all keeps today's behaviour: every derivable product, unfiltered.
+    #[tokio::test]
+    async fn best_bid_ask_with_no_filter_returns_every_product() {
+        let base = spawn_two_derivable_products().await;
+        let resp = reqwest::get(format!("{base}/v1/best_bid_ask"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let pricebooks = body["pricebooks"].as_array().unwrap();
+        let mut ids: Vec<&str> = pricebooks
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["HYPERLIQUID:BTC", "PHOENIX:SOL"],
+            "an unfiltered request must still return every product: {body}"
+        );
+    }
+
+    /// An unknown id in `product_ids` behaves exactly like `/v1/products/{id}` on a miss —
+    /// `product_not_found`, not a silently empty/partial list (a fourth convention this endpoint
+    /// must not invent).
+    #[tokio::test]
+    async fn best_bid_ask_product_ids_unknown_id_404s_like_the_sibling_commands() {
+        let base = spawn_two_derivable_products().await;
+        let resp = reqwest::get(format!(
+            "{base}/v1/best_bid_ask?product_ids=HYPERLIQUID:NOPE"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "product_not_found");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("HYPERLIQUID:NOPE"));
     }
 
     #[tokio::test]

@@ -161,7 +161,8 @@ enum ProductsCommand {
         #[arg(num_args = 0.., value_name = "PRODUCT_ID_AND_ARGS")]
         args: Vec<String>,
     },
-    /// Best bid/ask across products.
+    /// Best bid/ask across products. Narrow it to one or more products with a bare positional id
+    /// (e.g. `HYPERLIQUID:BTC`) or `product_ids==A,B`; omit both for every product.
     #[command(name = "best_bid_ask")]
     BestBidAsk {
         #[arg(num_args = 0.., value_name = "ARGS")]
@@ -219,6 +220,36 @@ fn build_path(endpoint: Endpoint, positionals: &[String]) -> Result<String, Stri
             )
         }
     })
+}
+
+/// `best_bid_ask` accepts a product id two ways — every sibling subcommand (`ticker`, `candles`,
+/// `book`, `get`) takes it as a bare positional, so this one does too, alongside the faithful
+/// `product_ids==A,B` form. A bare positional is folded into `product_ids` (appended to whatever
+/// the caller already gave via `product_ids==...`, so the two forms compose rather than one
+/// silently winning); no positional and no `product_ids` param leaves `params` untouched, keeping
+/// today's "every product" behaviour.
+fn merge_best_bid_ask_params(
+    params: Vec<(String, String)>,
+    positionals: &[String],
+) -> Vec<(String, String)> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for (k, v) in params {
+        if k == "product_ids" {
+            ids.extend(v.split(',').map(|s| s.to_string()));
+        } else {
+            out.push((k, v));
+        }
+    }
+    if let Some(id) = positionals.first() {
+        if !id.is_empty() {
+            ids.push(id.clone());
+        }
+    }
+    if !ids.is_empty() {
+        out.push(("product_ids".to_string(), ids.join(",")));
+    }
+    out
 }
 
 fn main() {
@@ -304,6 +335,12 @@ fn run() -> i32 {
             eprintln!("error: {msg}");
             return 1;
         }
+    };
+
+    let params = if endpoint == Endpoint::BestBidAsk {
+        merge_best_bid_ask_params(params, &positionals)
+    } else {
+        params
     };
 
     let client = match build_http_client() {
@@ -604,6 +641,64 @@ mod tests {
         assert_eq!(
             build_path(Endpoint::BestBidAsk, &[]).unwrap(),
             "/v1/best_bid_ask"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // merge_best_bid_ask_params: the CLI-side half of `best_bid_ask` taking a product — bare
+    // positional folds into `product_ids`, the faithful `product_ids==A,B` form passes through,
+    // and no argument at all leaves the request unfiltered (today's behaviour).
+    // -------------------------------------------------------------------------------------------
+
+    #[test]
+    fn best_bid_ask_with_no_argument_sends_no_product_ids_param() {
+        let out = merge_best_bid_ask_params(vec![], &[]);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn best_bid_ask_folds_a_bare_positional_into_product_ids() {
+        let out = merge_best_bid_ask_params(vec![], &["HYPERLIQUID:BTC".to_string()]);
+        assert_eq!(
+            out,
+            vec![("product_ids".to_string(), "HYPERLIQUID:BTC".to_string())]
+        );
+    }
+
+    #[test]
+    fn best_bid_ask_passes_through_the_faithful_product_ids_form() {
+        let params = vec![("product_ids".to_string(), "A:X,A:Y".to_string())];
+        let out = merge_best_bid_ask_params(params, &[]);
+        assert_eq!(
+            out,
+            vec![("product_ids".to_string(), "A:X,A:Y".to_string())]
+        );
+    }
+
+    /// A bare positional and an explicit `product_ids==...` compose rather than one silently
+    /// overriding the other.
+    #[test]
+    fn best_bid_ask_composes_a_positional_with_an_explicit_product_ids_param() {
+        let params = vec![("product_ids".to_string(), "A:X".to_string())];
+        let out = merge_best_bid_ask_params(params, &["A:Y".to_string()]);
+        assert_eq!(
+            out,
+            vec![("product_ids".to_string(), "A:X,A:Y".to_string())]
+        );
+    }
+
+    /// An unrelated param (e.g. a stray `granularity==...`) must survive untouched alongside the
+    /// folded `product_ids`.
+    #[test]
+    fn best_bid_ask_leaves_unrelated_params_untouched() {
+        let params = vec![("granularity".to_string(), "ONE_MINUTE".to_string())];
+        let out = merge_best_bid_ask_params(params, &["HYPERLIQUID:BTC".to_string()]);
+        assert_eq!(
+            out,
+            vec![
+                ("granularity".to_string(), "ONE_MINUTE".to_string()),
+                ("product_ids".to_string(), "HYPERLIQUID:BTC".to_string()),
+            ]
         );
     }
 }

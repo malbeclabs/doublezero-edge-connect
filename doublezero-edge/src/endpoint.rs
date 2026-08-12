@@ -36,11 +36,14 @@ impl Endpoint {
                 "limit": "positive integer; server default 100, hard cap 350 \
                           (a capped request reports retention.truncated = true)",
             }),
+            Endpoint::BestBidAsk => json!({
+                "product_ids": "comma-separated product ids to filter to (e.g. A:X,A:Y); a bare \
+                                positional id works too. Omit for every product.",
+            }),
             Endpoint::ProductsList
             | Endpoint::ProductGet
             | Endpoint::Ticker
             | Endpoint::Book
-            | Endpoint::BestBidAsk
             | Endpoint::Status
             | Endpoint::ChannelsList
             | Endpoint::ChannelsSet => json!({}),

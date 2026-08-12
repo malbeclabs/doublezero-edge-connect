@@ -271,7 +271,7 @@ Six commands read `/v1` (all `GET`s), plus a `channels` group that talks to a **
 | `products ticker <id>` | Recent trades plus best bid/ask |
 | `products candles <id>` | OHLCV candles (`granularity`/`limit` query params) |
 | `products book <id>` | The order book |
-| `products best_bid_ask` | Best bid/ask across every product |
+| `products best_bid_ask [<id>]` | Best bid/ask, across every product or (with an id / `product_ids==A,B`) a filtered set |
 | `status` | Per-venue feed health, plus `history` (history-store occupancy), `channels` (per-feed channel-filter admission, real bound state and product counts) and `process` (resident memory, CPU time) blocks |
 | `channels list` | The channel filter in force, and what it admits/binds per feed (talks to the admin surface, not `/v1`) |
 | `channels set <spec>` | Replace the channel filter (same syntax as `--channels`/`DZ_CHANNELS`); previews what would be dropped and asks for confirmation unless `--force` (talks to the admin surface, not `/v1`) |

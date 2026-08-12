@@ -4,9 +4,9 @@
 
 mod common;
 
-use std::process::Command;
+use std::{process::Command, time::Duration};
 
-use common::{bin, mock_server, unreachable_url};
+use common::{bin, mock_server, mock_server_capture, unreachable_url};
 
 struct Run {
     status: i32,
@@ -216,6 +216,27 @@ fn template_respects_a_jq_filter() {
         r.stdout.trim().starts_with("\"one of ONE_MINUTE"),
         "{}",
         r.stdout
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// `products best_bid_ask` accepts a product (Coinbase parity gap #2).
+// -------------------------------------------------------------------------------------------
+
+/// A bare positional id on `best_bid_ask` must actually reach the server as `product_ids=...` —
+/// the exact defect being fixed (the CLI parsed the argument but never sent it).
+#[test]
+fn best_bid_ask_sends_a_bare_positional_as_product_ids() {
+    let (url, rx) = mock_server_capture("200 OK", r#"{"pricebooks":[]}"#);
+    let r = run(&["--url", &url, "products", "best_bid_ask", "HYPERLIQUID:BTC"]);
+    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
+    let raw = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the server must have captured a request");
+    let request_line = raw.lines().next().unwrap_or_default();
+    assert!(
+        request_line.contains("product_ids=HYPERLIQUID"),
+        "the positional product id must be sent as product_ids: {request_line}"
     );
 }
 
