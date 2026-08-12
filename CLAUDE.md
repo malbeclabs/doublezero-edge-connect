@@ -399,7 +399,18 @@ Modules are grouped by role under `src/`:
   for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order another
   publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
   order. Tombstones are bounded by `MAX_SEEN_ORDER_EVENTS` and deliberately **not** by the time window,
-  which is what keeps `--arb-book-dedup-window-ms` a cost knob. `dz_mbo_arm_disagreement_total` is the
+  which is what keeps `--arb-book-dedup-window-ms` a cost knob. What the cap costs depends entirely on
+  which entry it takes, which is why the two populations are queued apart: a **live floor** re-seeds
+  itself on that order's next update, so it is evicted first and silently; a **tombstone** is
+  re-seeded by nothing, so it goes only when nothing else is left and forces a re-baseline
+  (`dz_mbo_forced_rebaselines_total{reason="guard_evicted"}`) unless every serving arm has already
+  reported the removal — a *spent* tombstone can race nobody. That ordering is what lets a recovery
+  snapshot larger than the cap (the flagship market is 44,598 orders) seed itself without discarding
+  the guard, and the spent rule is what stops a market with more lifetime deletes than the cap — every
+  busy market — re-baselining forever. A forced re-baseline's seeded floors are owned by **no arm**:
+  what is republished is the pointwise-minimum view of every arm, so stamping the arm whose batch
+  discharged the flag would exempt it from the gate and let it re-assert the stale size the
+  re-baseline was called to correct. `dz_mbo_arm_disagreement_total` is the
   drift observable and is a *monotonic* check — a resting order only shrinks, so a publisher claiming
   **more** than a peer already reported has missed a fill; an interleaved race, where an arm delivers the
   smaller remainder first, is not counted. Both copies are still published rather than preferring the

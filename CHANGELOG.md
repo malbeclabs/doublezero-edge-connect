@@ -29,9 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apart at the seam instead of split across a screenful. `--output json`/`--jq` are unchanged.
 
 ### Fixed
+- The Market-by-Order cross-publisher resurrection guard no longer loses to its own bound. Three
+  ways it did: a forced re-baseline stamped the arm that discharged it as owning the floors it
+  seeded, so that arm — the one whose stale, larger size raised the flag — could re-assert it
+  unchallenged; the eviction that decides whether losing an entry costs anything was scoped by the
+  dedup window, which is the wrong horizon (the guard exists for copies arriving after it) read off
+  the wrong clock (a delete mutated the entry in place, so a tombstone carried its add's timestamp);
+  and a recovery snapshot larger than the guard's cap seeded itself over the tombstones, which is
+  the normal state of a 44,598-order market. Eviction is now scoped by what is evicted — a live
+  floor re-seeds itself and goes silently, a tombstone re-baselines the market and is counted on the
+  existing `dz_mbo_forced_rebaselines_total{reason="guard_evicted"}` — with live floors taken first,
+  and a tombstone every serving arm has reported treated as spent so a busy market's dead orders
+  cannot fill the guard and re-baseline it forever.
 - The Hyperliquid-compatible sink holds the shared book map's mutex — the one the ingest emit path
-  takes on every published batch — for a clone and nothing else; every rendering step now provably
-  runs after the guard drops. The clone is the cheapest snapshot available rather than a fallback:
+  takes on every published batch — for a clone and nothing else; every rendering step runs after the
+  guard drops. The clone is the cheapest snapshot available rather than a fallback:
   measured on the 44,598-order fixture it is ~0.45 ms against ~9.1 ms to fold under the guard.
 - A Hyperliquid-sink market that empties no longer stops being treated as order-level, which silently
   stopped both book channels — permanently for `l4Book`, whose snapshot is only sent once that gate
