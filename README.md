@@ -59,7 +59,11 @@ What the script does:
    tunnel: loads `tun`/`ip_gre`, raises `net.core.rmem_max`, warns about firewalls and
    cloud-provider rules.
 4. Runs the bridge container (`--network host`, `NET_ADMIN`/`NET_RAW`, `/dev/net/tun`) and runs
-   `doublezero connect multicast`.
+   `doublezero connect multicast`, **retried up to 4 times** (15/30/45s apart) — a cold daemon is
+   still probing devices and loses the first attempt. The closing message is gated on the session
+   the daemon actually reports, so a tunnel that failed or is still provisioning is named as such
+   with the commands to retry and re-check; it never reports a connection that isn't there. The
+   exit status stays `0` either way — the container and the CLI are installed regardless.
 5. Once the container is up, offers to install the **[`doublezero-edge` CLI](#query-market-data-the-doublezero-edge-cli)**
    (a signed, dependency-free package) — naming the Cloudsmith repository and package before
    touching anything. Decline at the prompt, or set `DZ_INSTALL_CLI=0`; `DZ_INSTALL_CLI=1` /

@@ -31,8 +31,10 @@ each must stay self-contained (no shared sourced file).
 4. Prep the host kernel/network for GRE: load `tun`/`ip_gre`, raise `net.core.rmem_max`, warn
    about active firewalls and cloud provider rules (AWS/GCP/Azure).
 5. Run the bridge container (`--network host`, `NET_ADMIN`/`NET_RAW`, `/dev/net/tun`), inject the
-   keypair, and run `doublezero connect multicast`.
-6. Print connection URLs and management hints.
+   keypair, and run `doublezero connect multicast` — retried up to 4 times, 15/30/45s apart, since
+   a cold daemon is still probing devices and loses the first attempt.
+6. Print connection URLs and management hints — with the closing message gated on the session the
+   daemon reports, never on `connect`'s exit code alone (see the caveat below).
 
 > **Attendantless:** the only input is the access secret. Provide it via `DZ_SECRET` to run with
 > **no prompts at all**; otherwise you're prompted once. Everything else has a default.
@@ -135,5 +137,13 @@ The bridge serves:
   when the IP was only auto-detected. Provision one with
   `doublezero access-pass set --accesspass-type prepaid --user-payer <IDENTITY> --client-ip <IP>`
   (use `--client-ip 0.0.0.0` to allow any IP). Override the detected IP with `DZ_CLIENT_IP` if needed.
+- **Connect outcome.** `connect` is retried (4 attempts, 15/30/45s apart) and the closing message
+  reflects the session `doublezero status --json` reports, not `connect`'s exit code — which is
+  unreliable in both directions: the CLI returns 0 after printing `Tunnel provisioning in progress`
+  when its own poll times out, and a client-side timeout can outlive a connect the daemon went on
+  to complete. A run that ends without a tunnel says so, names the by-hand retry, and repeats that
+  as its last line. **The exit status is still `0`** in that case (the container and the CLI are
+  installed either way), so anything scripting the one-liner must check `doublezero status` rather
+  than the installer's exit code.
 - **No TLS.** The bridge targets a trusted/local network; terminate TLS at a reverse proxy if you
   expose it.
