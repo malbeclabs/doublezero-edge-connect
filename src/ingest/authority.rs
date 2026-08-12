@@ -93,7 +93,7 @@ fn scope_of(key: &MarketKey) -> ScopeKey {
 /// Cap on distinct arms per **scope**, not per venue: the numbering exists to identify a universe's
 /// mirrors, and a venue carrying two universes runs two independent sets of mirrors. Doubles as the
 /// admission bound — see the module doc.
-const MAX_LABELLED_ARMS: usize = 8;
+pub(crate) const MAX_LABELLED_ARMS: usize = 8;
 
 const ARM_LABELS: [&str; MAX_LABELLED_ARMS] = [
     "arm0", "arm1", "arm2", "arm3", "arm4", "arm5", "arm6", "arm7",
