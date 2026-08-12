@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `scripts/connect.sh` configured a package repository nothing publishes to, so the CLI offer
+  failed and skipped on every run — it now points at `malbeclabs/doublezero`, the repository a
+  host running the DoubleZero client already trusts. The offer's wording and the closing output
+  were also broken up; the package `maintainer` address is set.
 - The channel-departure purge fired on any shrink of the desired feed set, including a plain
   subscription loss (a group unsubscribed, or a `doublezero status` blip that parses fine and
   momentarily stops listing a code) — destroying a channel's catalog/book/history on a one-tick
