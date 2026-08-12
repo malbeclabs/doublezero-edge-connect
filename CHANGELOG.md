@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drifted — and which one is unknowable at the merge point: the larger rewinds a consumer past a
   fill the venue already applied, and preferring the smaller lets a forged size mute a real order.
   The market stops being served from either arm's deltas and is republished whole instead. The same
-  happens when the cross-publisher resurrection guard loses a tracked order at its per-market cap,
-  which would otherwise silently reopen the path that guard exists to close. Both are counted by the
+  happens when the cross-publisher resurrection guard is asked to age out an order a peer's copy could
+  still be racing, which would otherwise silently reopen the path that guard exists to close (an
+  eviction past that horizon costs the guard nothing and is left alone, so a book far larger than the
+  per-market cap still streams normally). Both are counted by the
   new `dz_mbo_forced_rebaselines_total{venue,reason}` (`disagreement` / `guard_evicted`); each costs
   a full republish of the market's book, so a sustained rate is the signal that the per-publisher
   book model is too expensive to keep.

@@ -473,10 +473,12 @@ struct MarketEvents {
     /// delete, so a lagging publisher's first and only copy of an `Add` for an order another publisher
     /// already killed passes every check that book makes. Deliberately **not** expired by the time
     /// window — only by [`MAX_SEEN_ORDER_EVENTS`] — so the guard's reach is an order count rather than a
-    /// clock, which is what keeps the window a cost knob.
+    /// clock, which is what keeps the window a cost knob. When that count binds on an entry a peer could
+    /// still be racing, the market re-baselines (see [`Self::track`]) rather than forgetting silently.
     resting: HashMap<u64, Option<(f64, Publisher)>>,
-    /// `resting`'s keys in insertion order, oldest first, for its own bound.
-    resting_order: VecDeque<u64>,
+    /// `resting`'s keys in insertion order, oldest first, with when each was recorded — for its own
+    /// bound, and to tell an eviction that costs the guard nothing from one that costs it everything.
+    resting_order: VecDeque<(u64, u64)>,
     /// One-shot: why this market can no longer be served from either arm's deltas, drained by the
     /// caller. Set when the guard cannot answer — the arms disagreed, or a tracked order aged out of
     /// `resting` — because from then on neither publisher's stream is known to describe the book a
@@ -549,11 +551,8 @@ impl MarketEvents {
                 EventVerdict::Deliver
             }
             None => {
-                self.track(
-                    ev.order_id,
-                    (size != 0.0).then_some((size, publisher)),
-                    true,
-                );
+                let slot = (size != 0.0).then_some((size, publisher));
+                self.track(ev.order_id, slot, arrival_ns, Some(window_ns));
                 EventVerdict::Deliver
             }
         }
@@ -561,20 +560,29 @@ impl MarketEvents {
 
     /// Track one order's resting state, evicting the oldest to stay within [`MAX_SEEN_ORDER_EVENTS`].
     ///
-    /// An eviction is where the resurrection guard stops being able to answer, so it forces a
-    /// re-baseline — except while `seed`ing from a re-baseline's own orders, which is the one case the
-    /// consumer's book was *just* replaced and the entries being dropped describe the book it no longer
-    /// holds. Without that exemption a book larger than the cap would re-force on its own snapshot.
-    fn track(&mut self, order_id: u64, slot: Option<(f64, Publisher)>, forcing: bool) {
+    /// An eviction only *loses* the guard while a peer's copy of that order could still be racing, which
+    /// is the horizon `window_ns` bounds everywhere else: past it every copy that was coming has already
+    /// arrived, so dropping the entry costs nothing and a book far larger than the cap streams normally.
+    /// Inside it the guard has been asked to forget something it is still needed for, and the market
+    /// re-baselines rather than reopening the resurrection path. Seeding from a re-baseline's own orders
+    /// passes `None`: the consumer's book was just replaced, and forcing there would re-force on every
+    /// snapshot larger than the cap.
+    fn track(
+        &mut self,
+        order_id: u64,
+        slot: Option<(f64, Publisher)>,
+        now: u64,
+        window_ns: Option<u64>,
+    ) {
         if self.resting.insert(order_id, slot).is_none() {
-            self.resting_order.push_back(order_id);
+            self.resting_order.push_back((order_id, now));
         }
         while self.resting_order.len() > MAX_SEEN_ORDER_EVENTS {
-            let Some(old) = self.resting_order.pop_front() else {
+            let Some((old, recorded)) = self.resting_order.pop_front() else {
                 break;
             };
             self.resting.remove(&old);
-            if forcing {
+            if window_ns.is_some_and(|w| now.saturating_sub(recorded) <= w) {
                 self.force(FORCED_GUARD_EVICTED);
             }
         }
@@ -593,12 +601,12 @@ impl MarketEvents {
     /// still never reuses an order id, so a peer's stale `Add` for an order this snapshot does not
     /// contain must still be refused. `changes` seeds the floor with the snapshot's own orders, so a
     /// later peer claiming more is resting for one of them is still caught as drift.
-    fn rebaselined(&mut self, changes: &[BookChange], publisher: Publisher) {
+    fn rebaselined(&mut self, changes: &[BookChange], publisher: Publisher, now: u64) {
         self.seen.clear();
         self.order.clear();
         self.forced = None;
         for c in changes.iter().filter(|c| c.order_id != 0 && c.size != 0.0) {
-            self.track(c.order_id, Some((c.size, publisher)), false);
+            self.track(c.order_id, Some((c.size, publisher)), now, None);
         }
     }
 
@@ -1396,7 +1404,7 @@ impl Arbiter {
         self.book_events
             .entry(key.clone())
             .or_default()
-            .rebaselined(&b.changes, publisher);
+            .rebaselined(&b.changes, publisher, b.recv_ts_ns);
         if let Some(m) = self.book_markets.get_mut(key) {
             m.rebaseline = false;
             m.withheld = 0;
@@ -1446,7 +1454,7 @@ impl Arbiter {
             self.book_events
                 .entry(key.clone())
                 .or_default()
-                .rebaselined(&[], publisher);
+                .rebaselined(&[], publisher, b.recv_ts_ns);
             self.vm(&b.venue).emit[EMIT_BOOK].inc();
             let _ = self.tx.send(Arc::new(FeedMessage::Book(clear_only(b))));
             return true;
@@ -1454,7 +1462,7 @@ impl Arbiter {
         self.book_events
             .entry(key.clone())
             .or_default()
-            .rebaselined(&full.changes, publisher);
+            .rebaselined(&full.changes, publisher, b.recv_ts_ns);
         self.note_book_delivery(key, b, publisher, now);
         self.vm(&b.venue).emit[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(full)));
@@ -4297,8 +4305,9 @@ mod tests {
         assert!(out[0].last, "a re-baseline must terminate its own event");
     }
 
-    /// The cross-publisher guard is bounded, so a tracked order can age out. An eviction must not
-    /// silently reopen the resurrection path: the market degrades to a re-baseline instead.
+    /// The cross-publisher guard is bounded, so a burst larger than the cap ages an order out while a
+    /// peer's copy of it could still be racing. That must not silently reopen the resurrection path:
+    /// the market degrades to a re-baseline instead.
     #[test]
     fn evicting_a_tracked_order_marks_the_market_for_rebaseline() {
         const VENUE: &str = "BookGuardEvicted";
@@ -4325,6 +4334,30 @@ mod tests {
             before + 1,
             "and it must be separable from a disagreement in production"
         );
+    }
+
+    /// Evicting an order no peer could still be racing costs the guard nothing, so a book far larger
+    /// than the cap streams normally instead of re-baselining on every order it adds.
+    #[test]
+    fn evicting_an_order_past_the_race_horizon_does_not_force_a_rebaseline() {
+        const VENUE: &str = "BookGuardAged";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        a.set_book_dedup_window(1_000);
+        let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
+        for oid in 1..=(MAX_SEEN_ORDER_EVENTS as u64 + 64) {
+            a.emit(
+                l3_batch(
+                    VENUE,
+                    vec![order(BookAction::Update, oid, 100.0, 1.0)],
+                    oid * 10_000,
+                ),
+                arm(1),
+            );
+        }
+        let _ = drain_books(&mut rx);
+        let key: MarketKey = (VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        assert!(!a.book_markets[&key].rebaseline);
+        assert_eq!(forced_rebaselines(VENUE, FORCED_GUARD_EVICTED), before);
     }
 
     /// A re-baseline replaces the consumer's book, so prior *events* are no longer duplicates — but the
