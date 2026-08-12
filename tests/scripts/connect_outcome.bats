@@ -40,6 +40,23 @@ run_installer() {
 
 dump() { echo "# --- stdout"; sed 's/^/#   /' "$OUT"; echo "# --- stderr"; sed 's/^/#   /' "$ERR"; }
 
+@test "warm daemon: one attempt, today's banner, nothing retried (all scripts)" {
+  # The happy path must be untouched by the retry loop: connecting on the first attempt
+  # costs exactly one attempt and prints what it always printed.
+  local fails=0
+  for s in "${SCRIPTS[@]}"; do
+    ( run_installer "$s"
+      if [ "$status" -ne 0 ]; then echo "# $s.sh exited $status"; dump; exit 1; fi
+      n="$(connect_attempts)"
+      if [ "$n" -ne 1 ]; then echo "# $s.sh made $n connect attempts on a warm daemon, expected 1"; dump; exit 1; fi
+      if ! grep -q 'Done\. Connected\.' "$OUT"; then echo "# $s.sh didn't print the connected banner"; dump; exit 1; fi
+      if grep -qi 'connect attempt 1/4 failed' "$ERR"; then echo "# $s.sh reported a failure on a clean connect"; dump; exit 1; fi
+      exit 0
+    ) || fails=1
+  done
+  [ "$fails" -eq 0 ]
+}
+
 @test "cold daemon that warms up: retries and reports a real connection (all scripts)" {
   # The issue's exact scenario: the first attempts lose the race against device
   # probing, a later one lands. This is the regression test the fix exists for.
@@ -113,6 +130,42 @@ dump() { echo "# --- stdout"; sed 's/^/#   /' "$OUT"; echo "# --- stderr"; sed '
       if [ "$n" -ne 1 ]; then echo "# $s.sh made $n connect attempts over a live tunnel, expected 1"; dump; exit 1; fi
       if ! grep -q 'doublezero status --json' "$DOCKER_LOG"; then echo "# $s.sh never asked the daemon for the session state"; dump; exit 1; fi
       if ! grep -q 'Done\.' "$OUT"; then echo "# $s.sh didn't recognise the live session"; dump; exit 1; fi
+      exit 0
+    ) || fails=1
+  done
+  [ "$fails" -eq 0 ]
+}
+
+@test "session appears while the run settles: the banner reflects that, not the stale verdict (all scripts)" {
+  # The verdict is reached ~15s before the banner prints (the settle, the status table, the
+  # registry log poll) — exactly the window a mid-provisioning tunnel comes up in. Printing
+  # "not connected" under a status table that shows a live session is the same defect as
+  # #132 with the sign flipped.
+  local fails=0
+  for s in "${SCRIPTS[@]}"; do
+    ( export DZ_TEST_SESSION_UP_AFTER_PROBES=21   # one past the 20-probe post-connect poll
+      run_installer "$s"
+      if [ "$status" -ne 0 ]; then echo "# $s.sh exited $status"; dump; exit 1; fi
+      if ! grep -q 'Done\.' "$OUT"; then echo "# $s.sh never noticed the session that came up"; dump; exit 1; fi
+      if grep -qi 'Not connected yet' "$ERR"; then echo "# $s.sh printed a stale not-connected verdict"; dump; exit 1; fi
+      if grep -qi 'Reminder: this host is NOT connected' "$ERR"; then echo "# $s.sh closed with a stale reminder"; dump; exit 1; fi
+      exit 0
+    ) || fails=1
+  done
+  [ "$fails" -eq 0 ]
+}
+
+@test "container died after starting: blames the container, not the access pass (all scripts)" {
+  # Every probe fails when the container is gone, so the failure text must not send the
+  # operator after access passes and firewall rules for a fault that is neither.
+  local fails=0
+  for s in "${SCRIPTS[@]}"; do
+    ( connect_always_fails
+      export DZ_TEST_CONTAINER_DIES=1
+      run_installer "$s"
+      if [ "$status" -ne 0 ]; then echo "# $s.sh exited $status"; dump; exit 1; fi
+      if ! grep -qi 'container is no longer running' "$ERR"; then echo "# $s.sh never said the container is down"; dump; exit 1; fi
+      if grep -qi 'access pass covers' "$OUT"; then echo "# $s.sh blamed the access pass for a dead container"; dump; exit 1; fi
       exit 0
     ) || fails=1
   done

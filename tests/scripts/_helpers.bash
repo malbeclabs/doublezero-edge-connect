@@ -44,7 +44,10 @@ printf 'docker %s\n' "$*" >>"$DOCKER_LOG"
 case "$1" in
   info) exit 0 ;;
   logs) echo "doublezerod ready"; [ -n "${DZ_TEST_DOCKER_LOG_EXTRA:-}" ] && cat "$DZ_TEST_DOCKER_LOG_EXTRA" 2>/dev/null; exit 0 ;;
-  ps)   echo "stubcontainerid"; exit 0 ;;
+  ps)   # DZ_TEST_CONTAINER_DIES=1 models a container that exits after the readiness
+        # wait (a failed bind, a crash loop): present until the first connect, gone after.
+        if [ "${DZ_TEST_CONTAINER_DIES:-0}" = 1 ] && grep -q 'doublezero connect multicast' "$DOCKER_LOG"; then exit 0; fi
+        echo "stubcontainerid"; exit 0 ;;
   exec) exec "$(dirname "$0")/dz-stub-exec" "$@" ;;
   *)    exit 0 ;;
 esac
@@ -109,13 +112,17 @@ EOF
 #   DZ_TEST_SESSION_UP_AFTER  attempts after which `status --json` reports a live session;
 #                             `never` = never up (default: FAILS+1 — the first accepted
 #                             attempt brings the tunnel up)
-# Attempts are counted from $DOCKER_LOG, so the stub needs no state of its own.
+#   DZ_TEST_SESSION_UP_AFTER_PROBES  when set, overrides the above: the session comes up
+#                             after this many `status --json` probes, which is how a tunnel
+#                             that finishes provisioning mid-run is modelled
+# Both counts come from $DOCKER_LOG, so the stub needs no state of its own.
 install_dz_exec_stub() {
   cat >"$1/dz-stub-exec" <<'EOF'
 #!/usr/bin/env bash
 fails="${DZ_TEST_CONNECT_FAILS:-0}"
 up_after="${DZ_TEST_SESSION_UP_AFTER:-$((fails + 1))}"
 attempts() { grep -c 'doublezero connect multicast' "$DOCKER_LOG" 2>/dev/null || true; }
+probes()   { grep -c 'doublezero status --json' "$DOCKER_LOG" 2>/dev/null || true; }
 case "$*" in
   *"connect multicast"*)
     if [ "$(attempts)" -le "$fails" ]; then
@@ -124,6 +131,10 @@ case "$*" in
     fi
     echo "Connected to DoubleZero" ;;
   *"status --json"*)
+    if [ -n "${DZ_TEST_SESSION_UP_AFTER_PROBES:-}" ]; then
+      up_after=never
+      [ "$(probes)" -ge "$DZ_TEST_SESSION_UP_AFTER_PROBES" ] && up_after=0
+    fi
     if [ "$up_after" != never ] && [ "$(attempts)" -ge "$up_after" ]; then
       echo '[{"response":{"doublezero_status":{"session_status":"BGP Session Up"}}}]'
     else

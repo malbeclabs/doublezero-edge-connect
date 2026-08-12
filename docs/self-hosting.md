@@ -37,11 +37,14 @@ docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
 Any of the bridge's env vars (see [Configure](../README.md#configure-override-the-one-liner))
 can be passed with `-e`.
 
-For a long-lived, detached deployment, cap the container log on disk so it can't fill the host —
-the installer's `docker run` does this for you, but a by-hand run should add it too:
+For a long-lived, detached deployment, cap the container log on disk so it can't fill the host, and
+raise the stop timeout so `docker stop` doesn't `SIGKILL` the entrypoint mid-`doublezero disconnect`
+(docker's default is 10s; releasing the tunnel and its onchain session can take longer). The
+installer's `docker run` does both for you, but a by-hand run should add them too:
 
 ```bash
 docker run -d --restart unless-stopped --network host --cap-add NET_ADMIN --device /dev/net/tun \
+  --stop-timeout 60 \
   --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
   doublezero-edge-connect      # ~60 MB log ceiling (20m x 3 rotated files)
 ```

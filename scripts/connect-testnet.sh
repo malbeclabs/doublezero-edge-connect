@@ -56,9 +56,9 @@ KEYPAIR_DEST="/root/.config/doublezero/id.json"   # client's default keypair pat
 LIVENESS_UDP_PORT=44880
 WS_PORT=8081                                       # bridge WebSocket (PROTOCOL.md)
 RECV_BUF_MAX=268435456                             # recommended net.core.rmem_max for bursty feeds
-CONNECT_ATTEMPTS=4                                 # `doublezero connect` tries (a cold daemon loses the first)
-CONNECT_BACKOFF=(15 30 45)                         # the CONNECT_ATTEMPTS-1 gaps between them
-SESSION_WAIT_SECS=20                               # a session can come up seconds after connect returns
+CONNECT_BACKOFF=(15 30 45)                         # seconds between `doublezero connect` tries
+CONNECT_ATTEMPTS=$(( ${#CONNECT_BACKOFF[@]} + 1 )) # one more try than gaps (a cold daemon loses the first)
+SESSION_POLL_TRIES=20                              # ~1s-apart probes; a session can come up seconds after connect returns
 
 # ----------------------------------------------------------------------------
 # pretty output + prompts (read from the terminal, not the curl pipe)
@@ -605,19 +605,20 @@ fi
 # "Network Unreachable", the CLI's synthesized "disconnected") does not -- so match
 # the suffix, never one literal. Grepping the JSON key rather than the human table
 # avoids depending on column layout, and on jq, which the image doesn't ship.
-DZ_PROBE=()   # `timeout`, when present, bounds a probe against a wedged daemon
-if command -v timeout >/dev/null 2>&1; then DZ_PROBE=(timeout 10); fi
+DZ_PROBE=""   # `timeout`, when present, bounds each probe against a wedged daemon
+if command -v timeout >/dev/null 2>&1; then DZ_PROBE="timeout 3"; fi
 dz_connected() {
   # Capture, then match in-shell: piping into `grep -q` under `set -o pipefail` can
   # report the probe as failed when grep's early exit SIGPIPEs the writer (cf. #70).
   local json
-  json="$($SUDO "${DZ_PROBE[@]}" docker exec "$DZ_NAME" doublezero status --json 2>/dev/null || true)"
+  json="$($SUDO $DZ_PROBE docker exec "$DZ_NAME" doublezero status --json 2>/dev/null || true)"
   [[ "$json" =~ \"session_status\"[[:space:]]*:[[:space:]]*\"[^\"]*[Uu]p\" ]]
 }
 
 # The session comes up some seconds AFTER `connect` returns, so poll rather than guess.
 wait_for_session() {
   local n
+  info "Waiting for the daemon to report a live session..."
   for n in $(seq 1 "$1"); do
     dz_connected && return 0
     sleep 1
@@ -650,7 +651,7 @@ while :; do
   if $SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast; then
     # Exit 0 is not a live tunnel: the CLI also returns 0 after printing "Tunnel
     # provisioning in progress" when its own provisioning poll times out.
-    if wait_for_session "$SESSION_WAIT_SECS"; then CONNECT_STATE=connected; else CONNECT_STATE=pending; fi
+    if wait_for_session "$SESSION_POLL_TRIES"; then CONNECT_STATE=connected; else CONNECT_STATE=pending; fi
     break
   fi
   warn "connect attempt $attempt/$CONNECT_ATTEMPTS failed (on a cold daemon it is still probing devices; also common: no access pass for this IP; provider firewall/NAT; or a default-deny host firewall dropping the decapsulated inner multicast on doublezero1). See the firewall notes above."
@@ -660,7 +661,7 @@ while :; do
 done
 # The last attempt's error can likewise outlive a connect that landed, so ask the
 # daemon before declaring a failure.
-if [ "$CONNECT_STATE" = failed ] && wait_for_session "$SESSION_WAIT_SECS"; then
+if [ "$CONNECT_STATE" = failed ] && wait_for_session "$SESSION_POLL_TRIES"; then
   CONNECT_STATE=connected
 fi
 
@@ -676,13 +677,38 @@ spin_sleep 5 "Waiting for the tunnel to settle"
 $SUDO docker exec "$DZ_NAME" doublezero status || true
 echo
 # Never claim a connection the daemon doesn't report (#132): this banner is the last
-# thing a new user reads, and a container with no tunnel ingests nothing.
+# thing a new user reads, and a container with no tunnel ingests nothing. The reverse
+# matters as much -- everything between the verdict and here (the settle, the status
+# print, the log poll) is time a mid-provisioning tunnel can come up in -- so re-probe
+# rather than print a stale verdict over a session the table above just showed as live.
+if [ "$CONNECT_STATE" != connected ] && dz_connected; then CONNECT_STATE=connected; fi
+
 report_no_tunnel() {
+  # A container that died after the readiness wait (a port bind, a crash loop) fails
+  # every probe too; pointing that operator at access passes and firewalls sends them
+  # after the wrong fault, so name what is actually down.
+  local container_up=""
+  $SUDO docker ps -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q . && container_up=1
+  if [ -z "$container_up" ]; then
+    warn "NOT CONNECTED, and the bridge container is no longer running -- the tunnel never came up because the container itself is down (it may be restarting or exiting on start)."
+    echo
+    echo "  Find out why:"
+    echo "    sudo docker logs $DZ_NAME"
+    echo "    sudo docker ps -a --filter name=$DZ_NAME"
+    return 0
+  fi
   if [ "$CONNECT_STATE" = pending ]; then
     warn "Not connected yet: connect was accepted but the daemon still reports no live session -- the tunnel may be mid-provisioning."
-  else
-    warn "NOT CONNECTED: all $CONNECT_ATTEMPTS connect attempts failed and the daemon reports no session. The bridge container is running, but with no tunnel it ingests no market data -- the WebSocket sink and shred forwarder stay idle."
+    echo
+    echo "  Give it a minute, then check -- it may come up on its own:"
+    echo "    sudo docker exec -it $DZ_NAME doublezero status"
+    echo "  Only if it stays down, connect again:"
+    echo "    sudo docker exec -it $DZ_NAME doublezero connect multicast"
+    echo "  Logs:"
+    echo "    sudo docker logs $DZ_NAME"
+    return 0
   fi
+  warn "NOT CONNECTED: all $CONNECT_ATTEMPTS connect attempts failed and the daemon reports no session. The bridge container is running, but with no tunnel it ingests no market data -- the WebSocket sink and shred forwarder stay idle."
   echo
   echo "  Try again by hand (a warm daemon usually connects immediately):"
   echo "    sudo docker exec -it $DZ_NAME doublezero connect multicast"
@@ -690,9 +716,7 @@ report_no_tunnel() {
   echo "    sudo docker exec -it $DZ_NAME doublezero status"
   echo "  Logs:"
   echo "    sudo docker logs $DZ_NAME"
-  if [ "$CONNECT_STATE" = failed ]; then
-    echo "  If it keeps failing: confirm an access pass covers this host's public IP, and that GRE (IP protocol 47) is permitted by the provider and the host firewall."
-  fi
+  echo "  If it keeps failing: confirm an access pass covers this host's public IP, and that GRE (IP protocol 47) is permitted by the provider and the host firewall."
 }
 
 if [ "$CONNECT_STATE" != connected ]; then
