@@ -756,8 +756,14 @@ else
     info "Done. Forwarding shreds. The WebSocket quote sink is idle -- it activates once this host is subscribed to a market-data feed."
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # activates once >=1 market-data feed is subscribed"
   else
-    info "Done. Connected. The WebSocket sink and shred forwarder each activate automatically once this host is subscribed to a group (a market-data feed for WS; an edge-solana-* group for shreds) -- allow up to one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s). Check: sudo docker logs $DZ_NAME"
+    info "Done. Connected."
+    echo
+    echo "  The WebSocket sink and shred forwarder activate once this host is subscribed to a"
+    echo "  group -- a market-data feed for WS, an edge-solana-* group for shreds. Allow up to"
+    echo "  one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s)."
+    echo
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
+    echo "  Logs      : sudo docker logs $DZ_NAME"
   fi
 fi
 echo
@@ -812,7 +818,14 @@ offer_cli_package() {
       local want_cli=1
       if [ "$DZ_ASSUME_YES" != 1 ]; then
         if { : <"$TTY"; } 2>/dev/null; then
-          confirm "Install the doublezero-edge CLI too? This runs Cloudsmith's unpinned setup script for malbeclabs/$cs_repo as root (unless already configured), then installs the 'doublezero-edge' package." || want_cli=0
+          # Break the offer across lines: it follows the bridge's own multi-line "Done" block, and
+          # a single long sentence there reads as a wall of text rather than a question.
+          printf '\n' >"$TTY"
+          info "The doublezero-edge CLI is a read-only client for the Edge container."
+          info "It provides an interface to view feed status, the product catalog,"
+          info "candles and order books."
+          printf '\n' >"$TTY"
+          confirm "Also install it? Adds the malbeclabs/$cs_repo package repository if it isn't already configured." || want_cli=0
         else
           want_cli=0
         fi
