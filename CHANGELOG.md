@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The Hyperliquid-compatible sink no longer clones a whole book — up to 44,598 orders — while holding
+  the shared book map's mutex, which the ingest emit path takes on every published batch. Only the
+  minimum each channel needs is copied out under it (the folded price levels for `l2Book`, the order
+  set for `l4Book`); the decimal formatting and the JSON run after the guard drops.
+- A Hyperliquid-sink market that empties no longer stops being treated as order-level, which silently
+  stopped both book channels — permanently for `l4Book`, whose snapshot is only sent once that gate
+  passes. Order-level is now a property of the market rather than of what it currently holds.
+- `mantissa: 1` is accepted on an `l2Book` subscription (the venue allows 1, 2 and 5 at `nSigFigs` 5);
+  anything else is still refused rather than coerced.
 - Two Market-by-Order publishers disagreeing about one order's resting quantity no longer publish
   the larger of the two. A resting order only shrinks, so a larger claim means one of the books has
   drifted — and which one is unknowable at the merge point: the larger rewinds a consumer past a
