@@ -29,6 +29,8 @@
 #                                        implies "yes" to the doublezero-edge CLI offer below
 #   DZ_INSTALL_CLI=1|0                   answer the doublezero-edge CLI install prompt
 #                                        non-interactively (1=install, 0=skip)
+#   DZ_STOP_HOST_DAEMON=1|0              answer the "stop the host doublezerod" prompt
+#                                        non-interactively (1=stop it, 0=leave it and abort)
 #   DZ_CLIENT_IP=<ipv4>                  override the public IP used by the access-pass pre-check
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
@@ -72,6 +74,7 @@ DZ_SECRET="${DZ_SECRET:-}"
 DZ_FEEDS="${DZ_FEEDS:-}"
 DZ_ASSUME_YES="${DZ_ASSUME_YES:-0}"
 DZ_INSTALL_CLI="${DZ_INSTALL_CLI:-}"
+DZ_STOP_HOST_DAEMON="${DZ_STOP_HOST_DAEMON:-}"
 KEYPAIR_DEST="/root/.config/doublezero/id.json"   # client's default keypair path (container runs as root)
 LIVENESS_UDP_PORT=44880
 WS_PORT=8081                                       # bridge WebSocket (PROTOCOL.md)
@@ -582,6 +585,82 @@ if [ -n "${DZ_ADMIN_BIND:-}" ]; then
     *) warn "DZ_ADMIN_BIND=$DZ_ADMIN_BIND is not a loopback address. GET/POST /admin/channels has NO authentication -- under --network host this bind is reachable from the network, and POST can change what this process ingests. Recommended: DZ_ADMIN_BIND=127.0.0.1:9098 (or another loopback port), unless you have your own network-level access control in front of it." ;;
   esac
 fi
+
+# ----------------------------------------------------------------------------
+# 4e. host doublezerod / liveness-port precondition (host-side)
+# ----------------------------------------------------------------------------
+# The container runs its OWN doublezerod under --network host, whose liveness manager binds
+# UDP $LIVENESS_UDP_PORT. If the host already has something bound there, the container's daemon
+# fails that bind and the container exits within seconds -- a "successful" install followed by a
+# dead container. The bound port is the actual conflict (whatever put it there breaks the
+# container), so detection checks the port itself; `systemctl is-active` only decides what
+# remediation to OFFER, never whether a conflict exists.
+udp_port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    $SUDO ss -H -lun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  elif command -v netstat >/dev/null 2>&1; then
+    $SUDO netstat -lun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  else
+    return 2
+  fi
+}
+
+check_host_daemon_port() {
+  local rc=0
+  udp_port_in_use "$LIVENESS_UDP_PORT" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    warn "Can't check whether UDP port $LIVENESS_UDP_PORT is free (no ss/netstat installed); if a host daemon already holds it, the container's own doublezerod will fail to bind it and exit right after starting."
+    return 0
+  fi
+  [ "$rc" -ne 0 ] && return 0   # free
+
+  local svc_active=0
+  if command -v systemctl >/dev/null 2>&1 && $SUDO systemctl is-active --quiet doublezerod 2>/dev/null; then
+    svc_active=1
+  fi
+
+  # Not (visibly) the doublezerod service -- there's no safe remediation to offer, so stop here
+  # rather than tell the operator to stop a service that has nothing to do with the conflict.
+  if [ "$svc_active" -ne 1 ]; then
+    die "UDP port $LIVENESS_UDP_PORT is already in use, but systemctl doesn't show doublezerod active, so stopping it would not free the port. Find what's bound there and stop that instead (e.g. sudo ss -lunp | grep ':$LIVENESS_UDP_PORT'), then re-run."
+  fi
+
+  warn "UDP port $LIVENESS_UDP_PORT is already bound (the host's doublezerod is active)."
+  info "The container runs its own doublezerod, and the two can't share that port -- it will exit right after starting."
+  warn "Stopping the host doublezerod disconnects any DoubleZero tunnel it currently holds."
+
+  local accept=0
+  case "$DZ_STOP_HOST_DAEMON" in
+    1) accept=1 ;;
+    0) accept=0 ;;
+    *)
+      if [ "$DZ_ASSUME_YES" = 1 ]; then
+        accept=1
+      # confirm()'s own '[ -r "$TTY" ]' check isn't enough (see the reinstall_existing_instance
+      # note above): a readable /dev/tty inode can still fail to OPEN with no controlling terminal,
+      # and confirm() would then read into an unset 'ans' and abort under 'set -u'. Probe an
+      # actual open first; no controlling terminal means no answer, so this defaults to
+      # declining rather than crashing.
+      elif { : <"$TTY"; } 2>/dev/null; then
+        confirm "Stop and disable the host doublezerod so the container can bind UDP $LIVENESS_UDP_PORT?" && accept=1
+      fi
+      ;;
+  esac
+
+  # Decline, or no way to ask (non-interactive with no explicit answer): refuse rather than start
+  # a container that will just die. Disabling is bundled into the one "stop it" decision below
+  # (not a separate prompt) -- a stop-but-still-enabled daemon would resurrect the same conflict
+  # on the next reboot, which defeats the point of stopping it now.
+  [ "$accept" -eq 1 ] || die "Not stopping the host doublezerod: the container's own doublezerod would still fail to bind UDP $LIVENESS_UDP_PORT and exit right after starting. Stop it yourself, then re-run:
+   sudo systemctl stop doublezerod
+   sudo systemctl disable doublezerod"
+
+  info "Stopping the host doublezerod (disabling it too, so a reboot doesn't resurrect the conflict)..."
+  $SUDO systemctl stop doublezerod    || die "Could not stop the host doublezerod; free UDP $LIVENESS_UDP_PORT manually and re-run."
+  $SUDO systemctl disable doublezerod || warn "Stopped the host doublezerod but could not disable it; it may restart on reboot and re-conflict."
+}
+check_host_daemon_port
 
 # ----------------------------------------------------------------------------
 # 5. cloud detection -> warn about provider-level firewall (script can't fix)

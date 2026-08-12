@@ -73,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when) two candidates would otherwise render identically. The product id format is unchanged.
 
 ### Added
+- `scripts/connect.sh` now checks UDP `44880` (the liveness port the container's own doublezerod
+  binds) before starting the container: a host daemon already bound there previously produced a
+  "successful" install followed by a container that died seconds later. It offers to stop (and
+  disable) the host daemon — only when systemd shows it active, never a service unrelated to the
+  conflict — states that this disconnects any tunnel the host daemon owns, and refuses to start the
+  container on a decline or an unanswered non-interactive run. `DZ_STOP_HOST_DAEMON=1|0` answers
+  non-interactively.
 - `GET /v1/status` carries a new `registry` block: which feed-registry document this process
   resolved (a URL, a bind-mounted file path, or `"built-in"`), its `version`, and its row/receiver
   counts — the same figures the bridge already logs once at startup as "feed registry resolved,"
