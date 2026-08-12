@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
 
 ### Fixed
+- `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows
+  span more than one category, even when its own category resolves unambiguously (e.g. Lashay's
+  single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
+  fallback now filters by `(venue, category)` instead of venue alone.
+- `doublezero-edge` panicked with a broken-pipe error whenever its stdout output was piped into a
+  consumer that stops reading early (`| head`, `| less -q`, a short-circuiting `grep -q`) —
+  completely ordinary usage for a JSON/table-printing CLI. Every stdout write now goes through a
+  handle that exits cleanly (code 0) on `EPIPE` instead of panicking.
 - `scripts/connect.sh` configured a package repository nothing publishes to, so the CLI offer
   failed and skipped on every run — it now points at `malbeclabs/doublezero`, the repository a
   host running the DoubleZero client already trusts. The offer's wording and the closing output

@@ -225,6 +225,54 @@ fn main() {
     std::process::exit(run());
 }
 
+/// Every stdout write in this binary routes through this handle instead of bare `println!`/
+/// `print!`. Rust ignores `SIGPIPE` at startup, so once a downstream reader goes away early
+/// (`| head`, `| less -q`, a `grep -q` that stops after its first match — completely ordinary
+/// for a JSON/table-printing CLI meant to be composed), the next write returns a `BrokenPipe`
+/// error instead of killing the process via the signal, and `println!`'s own writer treats that
+/// error as an `expect()`-worthy bug and panics. This crate is deliberately dependency-light (see
+/// `Cargo.toml`), so rather than add `libc` just to restore the default `SIGPIPE` disposition,
+/// [`StdoutOrExit`] catches `BrokenPipe` itself and exits at code 0 — the far end closing early is
+/// normal operation here, not a failure.
+struct StdoutOrExit(std::io::Stdout);
+
+fn stdout_or_exit() -> StdoutOrExit {
+    StdoutOrExit(std::io::stdout())
+}
+
+impl std::io::Write for StdoutOrExit {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.write(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.flush() {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            result => result,
+        }
+    }
+}
+
+/// Write `line` + `\n` to stdout, exiting cleanly (see [`StdoutOrExit`]) rather than panicking if
+/// the reader on the other end of a pipe has already gone away.
+fn println_or_exit(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(stdout_or_exit(), "{line}");
+}
+
+/// As [`println_or_exit`], without the trailing newline — for the one place (the `channels set`
+/// confirmation prompt) that needs the cursor to stay on the same line; flushes so the prompt is
+/// visible before the subsequent `stdin` read.
+fn print_or_exit(text: &str) {
+    use std::io::Write;
+    let mut out = stdout_or_exit();
+    let _ = write!(out, "{text}");
+    let _ = out.flush();
+}
+
 fn run() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -294,7 +342,7 @@ fn build_http_client() -> Result<reqwest::blocking::Client, String> {
 fn run_completion(shell: Shell) -> i32 {
     let mut cmd = Cli::command();
     let name = cmd.get_name().to_string();
-    generate(shell, &mut cmd, name, &mut std::io::stdout());
+    generate(shell, &mut cmd, name, &mut stdout_or_exit());
     0
 }
 
@@ -390,8 +438,8 @@ fn run_channels_set(
     };
 
     match &preview {
-        Some(drops) => println!("{}", channels::render_drop_preview(drops)),
-        None => println!("(drop preview unavailable; proceeding on the spec alone)"),
+        Some(drops) => println_or_exit(&channels::render_drop_preview(drops)),
+        None => println_or_exit("(drop preview unavailable; proceeding on the spec alone)"),
     }
 
     if !force {
@@ -402,12 +450,10 @@ fn run_channels_set(
             );
             return 1;
         }
-        print!(
+        print_or_exit(
             "Apply this channel filter? Dropped channels' books/history/catalog entries are not \
-                recoverable within the window. Type 'yes' to continue: "
+                recoverable within the window. Type 'yes' to continue: ",
         );
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
         let mut input = String::new();
         let confirmed = std::io::stdin().read_line(&mut input).is_ok()
             && input.trim().eq_ignore_ascii_case("yes");
@@ -438,7 +484,7 @@ fn handle_clap_error(e: &clap::Error) -> i32 {
     use clap::error::ErrorKind::{DisplayHelp, DisplayVersion};
     match e.kind() {
         DisplayHelp | DisplayVersion => {
-            print!("{e}");
+            print_or_exit(&e.to_string());
             0
         }
         _ => {
@@ -455,7 +501,7 @@ fn print_jq(body: &Value, filter: &str) -> i32 {
     match jq::extract(body, filter) {
         Ok(values) => {
             for v in values {
-                println!("{}", serde_json::to_string(&v).unwrap_or_default());
+                println_or_exit(&serde_json::to_string(&v).unwrap_or_default());
             }
             0
         }
@@ -475,7 +521,7 @@ fn emit_template(cli: &Cli, doc: &Value) -> i32 {
     if let Some(filter) = &cli.jq {
         return print_jq(doc, filter);
     }
-    println!("{}", serde_json::to_string_pretty(doc).unwrap_or_default());
+    println_or_exit(&serde_json::to_string_pretty(doc).unwrap_or_default());
     0
 }
 
@@ -487,12 +533,12 @@ fn emit(cli: &Cli, endpoint: Endpoint, body: &Value) -> i32 {
     }
     match cli.output {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(body).unwrap_or_default());
+            println_or_exit(&serde_json::to_string_pretty(body).unwrap_or_default());
             0
         }
         OutputFormat::Table => match render::render_table(endpoint, body) {
             Ok(text) => {
-                println!("{text}");
+                println_or_exit(&text);
                 0
             }
             Err(msg) => {

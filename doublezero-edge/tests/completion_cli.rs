@@ -6,7 +6,10 @@
 
 mod common;
 
-use std::process::Command;
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+};
 
 use common::bin;
 
@@ -97,4 +100,44 @@ fn completion_never_touches_the_network() {
     let r = run(&["--url", "http://127.0.0.1:1", "completion", "bash"]);
     assert_eq!(r.status, 0, "stderr: {}", r.stderr);
     assert!(r.stdout.contains("doublezero-edge"), "{}", r.stdout);
+}
+
+/// Piping to a consumer that stops reading early (`| head`, `| less -q`, ...) is completely
+/// ordinary for this tool and must exit cleanly rather than panic on the resulting `EPIPE`.
+/// Closing our end of the pipe before reading anything guarantees the child's very first write
+/// hits a reader that is already gone — reproducing the bug deterministically needs no server,
+/// config or network. (A variant that reads a prefix first and closes afterward is racy: on a
+/// pipe buffer larger than the ~30KB script, the whole write can complete before the close is
+/// even observed, so it sometimes passes without ever exercising the fix.) This test cannot pass
+/// vacuously: a bare `println!`/`generate()` reliably panics here, so reverting the fix reliably
+/// fails it.
+#[test]
+fn completion_output_survives_an_early_pipe_close() {
+    let mut child = Command::new(bin())
+        .args(["completion", "bash"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn doublezero-edge");
+
+    // Drop our read end without reading anything, before the child gets a chance to write.
+    drop(child.stdout.take().expect("child stdout"));
+
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr")
+        .read_to_string(&mut stderr)
+        .expect("stderr was not UTF-8");
+
+    let status = child.wait().expect("wait for child");
+    assert!(
+        status.success(),
+        "expected a clean exit after the reader closed early, got {status:?}; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("panicked"),
+        "must not panic on a closed pipe: {stderr}"
+    );
 }

@@ -337,11 +337,15 @@ fn decimal_string(value: f64, exponent: i8) -> String {
 /// for its exact identity — never fabricated. A `BookSnapshot` entry for `(venue, channel,
 /// instrument_id)` means the serving row speaks Market-by-Price; failing that, a `DepthSnapshot`
 /// entry for `(venue, symbol)` means Market-by-Order; failing that, fall back to the registry only
-/// when it is unambiguous — a venue with exactly one `FEEDS` kind reports it. A venue with **several**
-/// rows (e.g. one carrying both a Top-of-Book and a Market-by-Price feed) has no book/depth evidence
-/// yet for *this* instrument, so which row actually serves it is unknown — reporting the venue's
-/// Top-of-Book row in that case would be a guess (e.g. an about-to-baseline market-by-price
-/// instrument would misreport as `top_of_book`), which this module's docs promise never to do.
+/// when it is unambiguous — filtered by `(venue, category)`, not venue alone, since one Source ID
+/// can carry several disjoint universes on separate rows (see `ingest/feeds.rs`'s module docs) and
+/// a venue-wide filter can never resolve a venue where one category's rows are single-kind but
+/// another's are not. A category with exactly one `FEEDS` kind reports it. A category with
+/// **several** rows (e.g. the perpetual-futures universe carrying both a Top-of-Book and a
+/// Market-by-Price feed) has no book/depth evidence yet for *this* instrument, so which row
+/// actually serves it is unknown — reporting the category's Top-of-Book row in that case would be
+/// a guess (e.g. an about-to-baseline market-by-price instrument would misreport as
+/// `top_of_book`), which this module's docs promise never to do.
 fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     {
         let books = crate::model::lock(&state.books);
@@ -365,7 +369,7 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     }
     let kinds: HashSet<FeedKind> = feeds()
         .iter()
-        .filter(|f| f.venue == i.venue.as_ref())
+        .filter(|f| f.venue == i.venue.as_ref() && f.category == i.category.as_ref())
         .map(|f| f.kind)
         .collect();
     match kinds.len() {
@@ -1232,8 +1236,8 @@ mod tests {
     async fn products_list_carries_discrete_identity_fields() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
-            inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
+            ("HYPERLIQUID".into(), "perps".into(), 0u32, 41u32),
+            inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
 
@@ -2225,8 +2229,8 @@ mod tests {
     async fn product_detail_returns_the_full_entry() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("PHOENIX".into(), "default".into(), 0u32, 7u32),
-            inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
+            ("PHOENIX".into(), "spot".into(), 0u32, 7u32),
+            inst_in("spot", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
         health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
 
@@ -2480,9 +2484,14 @@ mod tests {
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
-    /// registry only when it is unambiguous (Phoenix carries exactly one `FEEDS` kind); and
-    /// `"unknown"` — never a guess — for a venue with several kinds (Lashay: Top-of-Book +
-    /// Market-by-Price) and no evidence yet for this exact identity.
+    /// registry rung filtered by `(venue, category)` — Lashay's `sports` category carries exactly
+    /// one `FEEDS` kind and resolves it, same as Phoenix's single-category venue; and `"unknown"`
+    /// — never a guess — for Lashay's `perps` category, which genuinely carries two (Top-of-Book +
+    /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
+    /// category per venue could not express the difference the `(venue, category)` filter makes:
+    /// a venue-wide filter would see Lashay's four rows together (three kinds across two
+    /// categories) and report `"unknown"` for `sports` too, which would be a false negative for
+    /// the very venue this fix targets.
     #[tokio::test]
     async fn feed_kind_ladder_prefers_book_then_depth_then_registry_then_unknown() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
@@ -2493,16 +2502,20 @@ mod tests {
                 inst_in("perps", 3, "KALSHI", "BOOKED", 9, 1, -4, -2),
             );
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 2u32),
-                inst(1, "HYPERLIQUID", "DEPTHED", 0, 2, -2, -5),
+                ("HYPERLIQUID".into(), "perps".into(), 0u32, 2u32),
+                inst_in("perps", 1, "HYPERLIQUID", "DEPTHED", 0, 2, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), "default".into(), 0u32, 3u32),
-                inst(2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
+                ("PHOENIX".into(), "spot".into(), 0u32, 3u32),
+                inst_in("spot", 2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
             );
             map.insert(
-                ("KALSHI".into(), "default".into(), 9u32, 4u32),
-                inst(3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
+                ("KALSHI".into(), "perps".into(), 9u32, 4u32),
+                inst_in("perps", 3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
+            );
+            map.insert(
+                ("KALSHI".into(), "sports".into(), 20u32, 5u32),
+                inst_in("sports", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
             );
         }
         books.lock().unwrap().insert(
@@ -2556,7 +2569,14 @@ mod tests {
         assert_eq!(
             kind_of("UNRESOLVED"),
             "unknown",
-            "Lashay has two FEEDS kinds and no evidence yet for this identity — never guess"
+            "Lashay's perps category genuinely has two FEEDS kinds and no evidence yet for this \
+             identity — never guess"
+        );
+        assert_eq!(
+            kind_of("SINGLE_CATEGORY"),
+            "market_by_price",
+            "Lashay's sports category has exactly one FEEDS kind, distinct from its ambiguous \
+             perps category on the same venue"
         );
     }
 
