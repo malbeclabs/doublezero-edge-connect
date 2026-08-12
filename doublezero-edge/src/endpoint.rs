@@ -20,6 +20,14 @@ pub enum Endpoint {
     ChannelsList,
     /// `channels set`'s success body: `POST /admin/channels`'s own `{"applied": [...]}`.
     ChannelsSet,
+    /// `diagnose`'s synthetic body: `{"diagnostics": <GET /admin/diagnostics body>, "status": <GET
+    /// /v1/status body, or null>}` — same two-surface merge as [`Endpoint::ChannelsList`], except
+    /// `/v1` is best-effort here, since it being down is what this command exists to explain.
+    Diagnose,
+    /// `connect`/`disconnect`'s synthetic body: `{"accepted": <the 202 body>, "diagnostics": <the
+    /// poll's last `GET /admin/diagnostics` body, or null under `--no-wait`>, "timed_out": bool}`.
+    Connect,
+    Disconnect,
 }
 
 impl Endpoint {
@@ -51,7 +59,10 @@ impl Endpoint {
             | Endpoint::Book
             | Endpoint::Status
             | Endpoint::ChannelsList
-            | Endpoint::ChannelsSet => json!({}),
+            | Endpoint::ChannelsSet
+            | Endpoint::Diagnose
+            | Endpoint::Connect
+            | Endpoint::Disconnect => json!({}),
         }
     }
 }

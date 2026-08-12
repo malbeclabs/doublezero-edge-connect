@@ -38,10 +38,11 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         channel_filter::ChannelFilter,
+        diagnostics::{Detection, ReceiverState, SharedDiagnostics},
         feeds::{Feed, FeedKind},
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver, sources,
-        subscriptions::{self, Detected, HostSubs},
+        subscriptions::{self, Detected, HostSubs, Session},
     },
     metrics::metrics,
     model::{category_arc, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot},
@@ -217,6 +218,10 @@ pub struct ReconcilerConfig {
     /// survives the sink's own activate/deactivate cycles.
     pub history: Arc<Mutex<Store>>,
     pub shred: ShredParams,
+    /// The shared diagnostics snapshot this reconciler publishes at the end of every tick, and
+    /// `sinks::admin` serves. Write-only from here — nothing in this module ever reads it back, so
+    /// a diagnostics change can never influence what runs.
+    pub diagnostics: SharedDiagnostics,
 }
 
 /// The activation target computed from the current subscriptions.
@@ -230,6 +235,21 @@ struct Desired {
     api_on: bool,
     /// Sorted; empty means the shred forwarder should be off.
     shred_sources: Vec<SocketAddrV4>,
+}
+
+/// One tick's read of the world: the activation target (`None` == inconclusive, keep what is
+/// running) plus everything the diagnostics snapshot reports about *why* that target is what it is.
+/// The two travel together because they come from one `doublezero status` invocation — diagnostics
+/// deliberately adds no second shell-out to the polling path.
+#[derive(Debug, Default)]
+struct TickOutcome {
+    detection: Detection,
+    detail: Option<String>,
+    sessions: Vec<Session>,
+    market_data_codes: Vec<String>,
+    shred_codes: Vec<String>,
+    other_codes: Vec<String>,
+    desired: Option<Desired>,
 }
 
 pub struct Reconciler {
@@ -337,12 +357,50 @@ impl Reconciler {
     }
 
     async fn tick(&mut self) {
-        // `None` == inconclusive this tick (transient CLI error / task join failure): keep the
-        // current activations unchanged rather than tearing everything down on a hiccup.
-        let Some(desired) = self.compute_desired().await else {
-            return;
-        };
-        self.apply_desired(desired).await;
+        let mut outcome = self.compute_desired().await;
+        // A `None` desired set is inconclusive this tick (transient CLI error / task join failure):
+        // keep the current activations unchanged rather than tearing everything down on a hiccup.
+        // The diagnostics snapshot is published either way — an inconclusive tick is precisely the
+        // state an operator needs reported, and it publishes the *actual* activations below rather
+        // than a desired set that was never applied.
+        if let Some(desired) = outcome.desired.take() {
+            self.apply_desired(desired).await;
+        }
+        self.publish_diagnostics(&outcome);
+    }
+
+    /// Write the polled half of the shared diagnostics snapshot. Activation is read back off this
+    /// reconciler's own task maps rather than off the `Desired` that produced them, so an
+    /// inconclusive tick reports what is really running instead of what was wanted.
+    fn publish_diagnostics(&self, outcome: &TickOutcome) {
+        let receivers: Vec<ReceiverState> = self
+            .active
+            .keys()
+            .map(|k| ReceiverState {
+                venue: k.0,
+                category: k.1,
+                kind: k.2,
+                base_port: k.3,
+                liveness: self.health.liveness(k),
+            })
+            .collect();
+        let mut diag = crate::model::lock(&self.cfg.diagnostics);
+        diag.refresh_secs = self.cfg.refresh.as_secs();
+        diag.publish_tick(
+            outcome.detection,
+            outcome.detail.clone(),
+            outcome.sessions.clone(),
+            outcome.market_data_codes.clone(),
+            outcome.shred_codes.clone(),
+            outcome.other_codes.clone(),
+            receivers,
+            self.ws_task.is_some(),
+            self.api_task.is_some(),
+            self.shred_task
+                .as_ref()
+                .map(|(srcs, _)| srcs.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+        );
     }
 
     /// Apply one computed [`Desired`] state. Split out of `tick` so a test can drive this
@@ -393,15 +451,30 @@ impl Reconciler {
         self.apply_shred(desired.shred_sources);
     }
 
-    async fn compute_desired(&mut self) -> Option<Desired> {
+    async fn compute_desired(&mut self) -> TickOutcome {
         if self.cfg.gating_disabled {
-            return Some(self.static_desired());
+            return TickOutcome {
+                detection: Detection::GatingDisabled,
+                desired: Some(self.static_desired()),
+                ..TickOutcome::default()
+            };
         }
         // The group list is only needed to resolve shred-group IPs; skip it when shreds are
         // disabled or explicitly sourced.
         let need_group_ips = !self.cfg.shred.disabled && self.cfg.shred.explicit_sources.is_empty();
         match tokio::task::spawn_blocking(move || subscriptions::detect(need_group_ips)).await {
-            Ok(Detected::Ok(subs)) => Some(self.desired_from_subs(&subs)),
+            Ok(Detected::Ok(subs)) => {
+                let (market_data_codes, shred_codes, other_codes) = self.classify_codes(&subs);
+                TickOutcome {
+                    detection: Detection::Ok,
+                    detail: None,
+                    sessions: subs.sessions.clone(),
+                    market_data_codes,
+                    shred_codes,
+                    other_codes,
+                    desired: Some(self.desired_from_subs(&subs)),
+                }
+            }
             Ok(Detected::CliMissing) => {
                 if !self.cli_missing_logged {
                     warn!(
@@ -410,14 +483,48 @@ impl Reconciler {
                     );
                     self.cli_missing_logged = true;
                 }
-                Some(self.static_desired())
+                TickOutcome {
+                    detection: Detection::CliMissing,
+                    desired: Some(self.static_desired()),
+                    ..TickOutcome::default()
+                }
             }
-            Ok(Detected::Unavailable) => None,
+            Ok(Detected::Unavailable { detail }) => TickOutcome {
+                detection: Detection::Unavailable,
+                detail,
+                ..TickOutcome::default()
+            },
             Err(e) => {
                 warn!(%e, "subscription detect task failed; keeping current activations");
-                None
+                TickOutcome {
+                    detection: Detection::Unavailable,
+                    detail: Some(format!("subscription detect task failed: {e}")),
+                    ..TickOutcome::default()
+                }
             }
         }
+    }
+
+    /// Split the subscribed codes three ways for reporting: the ones matching a feed row this
+    /// process may run, the shred groups, and everything else (a group this host holds that this
+    /// build has no row for — the shape a stale registry produces). Sorted so a diff of two
+    /// diagnostics responses is stable. Reporting only: activation still keys on
+    /// [`HostSubs::market_data_feeds`], which this deliberately mirrors rather than replaces.
+    fn classify_codes(&self, subs: &HostSubs) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let (mut market, mut shred, mut other) = (Vec::new(), Vec::new(), Vec::new());
+        for code in &subs.subscribed_codes {
+            if self.cfg.enabled.iter().any(|f| f.code == *code) {
+                market.push(code.clone());
+            } else if code.starts_with(&self.cfg.shred.code_prefix) {
+                shred.push(code.clone());
+            } else {
+                other.push(code.clone());
+            }
+        }
+        for v in [&mut market, &mut shred, &mut other] {
+            v.sort();
+        }
+        (market, shred, other)
     }
 
     /// A per-tick snapshot of the runtime-mutable channel filter. Cloned rather than held locked
@@ -2227,6 +2334,7 @@ mod tests {
                 rpc_url: None,
                 dedup_window_slots: 1,
             },
+            diagnostics: Default::default(),
         })
     }
 

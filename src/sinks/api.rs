@@ -908,7 +908,7 @@ fn status(state: &ApiState) -> Response {
 /// need log access. `null` only if queried before the registry resolved, which does not happen once
 /// this sink is serving — registry resolution completes in `main` before any receiver or sink
 /// spawns.
-fn registry_block() -> Value {
+pub(crate) fn registry_block() -> Value {
     match crate::ingest::feeds::registry_info() {
         Some(info) => json!({
             "source": info.origin,
@@ -1099,7 +1099,7 @@ fn channels_block(state: &ApiState) -> Value {
 /// `/proc` access on the querying side. `None` (omitted rather than a fabricated `0`) if the
 /// process collector isn't registered for this build/platform (it is Linux-only — see
 /// `metrics::Metrics::new`).
-fn process_block() -> Value {
+pub(crate) fn process_block() -> Value {
     json!({
         "resident_memory_bytes": process_metric("process_resident_memory_bytes"),
         "cpu_seconds_total": process_metric("process_cpu_seconds_total"),

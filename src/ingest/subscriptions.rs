@@ -34,8 +34,13 @@ pub enum Detected {
     Ok(HostSubs),
     /// The `doublezero` binary isn't installed/spawnable — e.g. running the bridge from source.
     CliMissing,
-    /// The CLI is present but the query failed (non-zero exit, unparseable output).
-    Unavailable,
+    /// The CLI is present but the query failed (non-zero exit, unparseable output). Carries the
+    /// tail of what the CLI printed on stderr where there was one: every daemon verb runs
+    /// `requirements::check_daemon` first, so "Please start the doublezerod service." is the actual
+    /// answer on a host whose daemon is down — a line that today only reaches the container log.
+    Unavailable {
+        detail: Option<String>,
+    },
 }
 
 /// The host's current multicast subscriptions plus the code→IP map for groups outside the
@@ -46,10 +51,58 @@ pub struct HostSubs {
     pub subscribed_codes: HashSet<String>,
     /// code → multicast IP, from `doublezero multicast group list` (activated rows only).
     pub code_ip: HashMap<String, Ipv4Addr>,
+    /// The sessions `doublezero status --json` reported, verbatim enough to diagnose a host whose
+    /// tunnel never came up. **Reported only, never an activation input** — activation keys on
+    /// `subscribed_codes` alone (see [`Session`]).
+    pub sessions: Vec<Session>,
 }
 
-/// One entry of `doublezero status --json`. Only `multicast_groups` is read; every other field
-/// (`response`, `current_device`, …) is ignored.
+/// One session from `doublezero status --json`, flattened to the fields an operator reads when a
+/// host serves no data: tunnel state, which device it landed on, and the per-group subscription
+/// rows. Purely diagnostic — nothing here gates a receiver, a sink or the shred forwarder, so an
+/// upstream shape change degrades a diagnosis rather than tearing activations down.
+///
+/// Every field is optional for that reason: the CLI synthesizes a whole entry when the daemon
+/// reports no services (`session_status: "disconnected"`, `tunnel_name: null`, `current_device:
+/// "N/A"`, empty `multicast_groups`), and a future version may carry a different subset again.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub session_status: Option<String>,
+    pub tunnel_name: Option<String>,
+    pub user_type: Option<String>,
+    pub current_device: Option<String>,
+    pub lowest_latency_device: Option<String>,
+    pub metro: Option<String>,
+    pub network: Option<String>,
+    pub reconciler_enabled: Option<bool>,
+    pub multicast_groups: Option<String>,
+    pub subscriptions: Vec<SessionSubscription>,
+}
+
+/// One row of a session's `subscriptions` array — the per-group view the daemon reports beside the
+/// flattened `multicast_groups` string. Reported for diagnosis only; `parse_status_codes` remains
+/// the single activation input.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionSubscription {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub multicast_ip: String,
+    #[serde(default)]
+    pub publisher: bool,
+    #[serde(default)]
+    pub subscriber: bool,
+}
+
+/// The `session_status` a healthy tunnel reports. The daemon CLI compares against this exact
+/// literal itself, and its own synthesized no-services entry reports `"disconnected"` instead —
+/// but the diagnosis reports whatever string actually arrived, so an upstream rename degrades to
+/// "not the healthy value, here it is" rather than to a wrong verdict.
+pub const HEALTHY_SESSION_STATUS: &str = "BGP Session Up";
+
+/// One entry of `doublezero status --json`. `multicast_groups` is the **only** activation input
+/// (see [`parse_status_codes`]); every other field here is read by [`parse_status_sessions`] for
+/// diagnosis and can never affect what runs.
 ///
 /// Modeled as `Option<Option<String>>` so the **key being absent entirely** (the outer
 /// `Option::None`, supplied by `#[serde(default)]`) can never collapse into the **same value** as
@@ -74,6 +127,37 @@ pub struct HostSubs {
 struct StatusEntry {
     #[serde(default, deserialize_with = "present_and_null_ok")]
     multicast_groups: Option<Option<String>>,
+    #[serde(default)]
+    response: Option<StatusResponse>,
+    #[serde(default)]
+    current_device: Option<String>,
+    #[serde(default)]
+    lowest_latency_device: Option<String>,
+    #[serde(default)]
+    metro: Option<String>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    reconciler_enabled: Option<bool>,
+    #[serde(default)]
+    subscriptions: Vec<SessionSubscription>,
+}
+
+/// The nested `response` block of a status entry, holding the tunnel's own state.
+#[derive(Debug, Default, Deserialize)]
+struct StatusResponse {
+    #[serde(default)]
+    doublezero_status: Option<DoubleZeroStatus>,
+    #[serde(default)]
+    tunnel_name: Option<String>,
+    #[serde(default)]
+    user_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DoubleZeroStatus {
+    #[serde(default)]
+    session_status: Option<String>,
 }
 
 /// Deserialize a present field's value as `T` and wrap it in `Some` unconditionally — the seam that
@@ -178,6 +262,39 @@ pub fn parse_status_codes(stdout: &[u8]) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The diagnostic half of the same document [`parse_status_codes`] reads: every session's tunnel
+/// state, flattened. Deliberately a **second, separate pass** rather than a wider return type on
+/// `parse_status_codes` — that function's `Option<Vec<String>>` contract is what gates activation
+/// fleet-wide, and a diagnosis must not be able to move it. An unparseable document yields no
+/// sessions here (and, independently, `None` there).
+pub fn parse_status_sessions(stdout: &[u8]) -> Vec<Session> {
+    let entries: Vec<StatusEntry> = match serde_json::from_slice(stdout) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .into_iter()
+        .map(|e| {
+            let response = e.response.unwrap_or_default();
+            Session {
+                session_status: response
+                    .doublezero_status
+                    .unwrap_or_default()
+                    .session_status,
+                tunnel_name: response.tunnel_name,
+                user_type: response.user_type,
+                current_device: e.current_device,
+                lowest_latency_device: e.lowest_latency_device,
+                metro: e.metro,
+                network: e.network,
+                reconciler_enabled: e.reconciler_enabled,
+                multicast_groups: e.multicast_groups.flatten(),
+                subscriptions: e.subscriptions,
+            }
+        })
+        .collect()
+}
+
 /// Run `doublezero status --json` (always) and `doublezero multicast group list --json-compact`
 /// (only when `need_group_ips`, i.e. shred sources aren't explicitly overridden). See [`Detected`]
 /// for how the three outcomes are classified.
@@ -185,14 +302,19 @@ pub fn detect(need_group_ips: bool) -> Detected {
     let status = match run_cli(&["status", "--json"]) {
         CliOut::Ok(bytes) => bytes,
         CliOut::Missing => return Detected::CliMissing,
-        CliOut::Err => return Detected::Unavailable,
+        CliOut::Err { detail } => return Detected::Unavailable { detail },
     };
     // `None` here means the JSON didn't even parse as the expected shape (a format change), which
     // is transient/`Unavailable` by the same fail-open rule as every other soft-fail in this
     // module — never read as "this host subscribes to nothing" (see `parse_status_codes`'s doc).
     let Some(codes) = parse_status_codes(&status) else {
-        return Detected::Unavailable;
+        return Detected::Unavailable {
+            detail: Some(
+                "`doublezero status --json` output did not match the expected shape".to_string(),
+            ),
+        };
     };
+    let sessions = parse_status_sessions(&status);
     let subscribed_codes: HashSet<String> = codes.into_iter().collect();
 
     // The group list is only needed to resolve shred-group IPs (market-data IPs come from FEEDS).
@@ -210,6 +332,7 @@ pub fn detect(need_group_ips: bool) -> Detected {
     Detected::Ok(HostSubs {
         subscribed_codes,
         code_ip,
+        sessions,
     })
 }
 
@@ -247,8 +370,34 @@ impl HostSubs {
 /// runtime error (transient) so [`detect`] can classify the outcome.
 enum CliOut {
     Ok(Vec<u8>),
-    Err,
+    /// `detail` is the tail of what the CLI printed (stderr first), so a caller can report *why*
+    /// rather than only that something failed — "Please start the doublezerod service." is the
+    /// whole answer on a host whose daemon is down.
+    Err {
+        detail: Option<String>,
+    },
     Missing,
+}
+
+/// How much of a failing `doublezero` invocation's output is kept for reporting. Enough for the
+/// one-line bail messages the daemon CLI actually emits, bounded so a runaway backtrace can't grow
+/// the diagnostics response without limit.
+const MAX_CLI_DETAIL: usize = 2048;
+
+/// The tail of `bytes` as lossy UTF-8, trimmed, capped at [`MAX_CLI_DETAIL`]; `None` if empty.
+fn output_tail(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // Byte-count the tail, then snap forward to a char boundary so a multi-byte sequence is never
+    // split (`String::from_utf8_lossy` already replaced invalid input, so the boundary exists).
+    let start = text.len().saturating_sub(MAX_CLI_DETAIL);
+    let start = (start..text.len())
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(text.len());
+    Some(text[start..].to_string())
 }
 
 fn run_cli(args: &[&str]) -> CliOut {
@@ -256,7 +405,9 @@ fn run_cli(args: &[&str]) -> CliOut {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => CliOut::Missing,
         Err(e) => {
             warn!(?args, %e, "could not run `doublezero`");
-            CliOut::Err
+            CliOut::Err {
+                detail: Some(e.to_string()),
+            }
         }
         Ok(o) if !o.status.success() => {
             warn!(
@@ -265,32 +416,84 @@ fn run_cli(args: &[&str]) -> CliOut {
                 stderr = %String::from_utf8_lossy(&o.stderr).trim(),
                 "`doublezero` exited non-zero"
             );
-            CliOut::Err
+            CliOut::Err {
+                // stderr is where every `eyre::bail!` lands; fall back to stdout for a CLI that
+                // reports its refusal there instead.
+                detail: output_tail(&o.stderr).or_else(|| output_tail(&o.stdout)),
+            }
         }
         Ok(o) => CliOut::Ok(o.stdout),
     }
 }
 
+/// Run one `doublezero <args...>` to completion and report its exit code plus a bounded tail of
+/// everything it printed (stdout and stderr interleaved as two blocks). The seam
+/// [`crate::sinks::admin`]'s `POST /admin/connect` / `POST /admin/disconnect` run their fixed argv
+/// through — **no caller-supplied argument ever reaches this**, and it is never invoked from the
+/// polling path.
+pub fn run_cli_reporting(args: &[&str]) -> (Option<i32>, String) {
+    match std::process::Command::new("doublezero").args(args).output() {
+        Err(e) => (None, format!("could not run `doublezero`: {e}")),
+        Ok(o) => {
+            let mut parts = Vec::new();
+            if let Some(t) = output_tail(&o.stdout) {
+                parts.push(t);
+            }
+            if let Some(t) = output_tail(&o.stderr) {
+                parts.push(t);
+            }
+            (o.status.code(), parts.join("\n"))
+        }
+    }
+}
+
+#[cfg(test)]
+// A real `doublezero status --json` capture from a host subscribed to both shred and
+// market-data groups (the field that matters is `multicast_groups`).
+pub(crate) const STATUS_JSON: &str = r#"[
+  {
+    "response": {
+      "doublezero_status": {"session_status": "BGP Session Up", "last_session_update": 1782920453},
+      "tunnel_name": "doublezero1",
+      "user_type": "Multicast"
+    },
+    "reconciler_enabled": true,
+    "current_device": "tyo002-dz002",
+    "network": "mainnet-beta",
+    "multicast_groups": "S:edge-solana-root,S:edge-solana-retrans-apac,S:edge-solana-shreds,S:tiredsolid,S:scottsdale"
+  }
+]"#;
+
+#[cfg(test)]
+/// The shape `doublezero status --json` reports on the host of #133: the container is up but
+/// the tunnel never came up, so the daemon reports no services and the CLI synthesizes this
+/// whole entry (`status.rs`'s no-services branch — `session_status: "disconnected"`,
+/// `tunnel_name: null`, the three `"N/A"` placeholders, an empty `multicast_groups`).
+pub(crate) const DISCONNECTED_STATUS_JSON: &str = r#"[
+  {
+    "response": {
+      "doublezero_status": {"session_status": "disconnected", "last_session_update": null},
+      "tunnel_name": null,
+      "tunnel_src": null,
+      "tunnel_dst": null,
+      "doublezero_ip": null,
+      "user_type": null
+    },
+    "reconciler_enabled": true,
+    "tenant": "",
+    "current_device": "N/A",
+    "lowest_latency_device": "N/A",
+    "metro": "N/A",
+    "network": "mainnet-beta",
+    "multicast_groups": "",
+    "subscriptions": []
+  }
+]"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ingest::feeds::feeds;
-
-    // A real `doublezero status --json` capture from a host subscribed to both shred and
-    // market-data groups (the field that matters is `multicast_groups`).
-    const STATUS_JSON: &str = r#"[
-      {
-        "response": {
-          "doublezero_status": {"session_status": "BGP Session Up", "last_session_update": 1782920453},
-          "tunnel_name": "doublezero1",
-          "user_type": "Multicast"
-        },
-        "reconciler_enabled": true,
-        "current_device": "tyo002-dz002",
-        "network": "mainnet-beta",
-        "multicast_groups": "S:edge-solana-root,S:edge-solana-retrans-apac,S:edge-solana-shreds,S:tiredsolid,S:scottsdale"
-      }
-    ]"#;
 
     fn codes(json: &str) -> HashSet<String> {
         parse_status_codes(json.as_bytes())
@@ -472,6 +675,7 @@ mod tests {
         HostSubs {
             subscribed_codes: codes.iter().map(|s| s.to_string()).collect(),
             code_ip: code_ip.iter().map(|(c, ip)| (c.to_string(), *ip)).collect(),
+            sessions: Vec::new(),
         }
     }
 
@@ -521,5 +725,112 @@ mod tests {
         // Subscribed to a shred group whose IP the group list didn't provide -> skipped, not panicked.
         let s = subs(&["edge-solana-shreds"], &[]);
         assert!(s.shred_sources("edge-solana-", 7733).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The diagnostic pass. The rule these pin: it is strictly *additive* — reading the session
+    // fields must not move `parse_status_codes`, which is the only thing that decides what runs.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The #133 capture parses as a real zero-subscription answer (`Some(vec![])`, so the
+    /// reconciler correctly runs nothing) **and** yields the tunnel state that explains why. Both
+    /// halves in one test on purpose: the whole point is that a disconnected host is not an
+    /// `Unavailable` host, and reading the second must not have changed the first.
+    #[test]
+    fn the_disconnected_capture_parses_as_zero_subscriptions_and_reports_why() {
+        assert_eq!(
+            parse_status_codes(DISCONNECTED_STATUS_JSON.as_bytes()),
+            Some(Vec::new()),
+            "an empty multicast_groups is a real zero-subscription state, not a parse failure"
+        );
+        let sessions = parse_status_sessions(DISCONNECTED_STATUS_JSON.as_bytes());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_status.as_deref(), Some("disconnected"));
+        assert_ne!(
+            sessions[0].session_status.as_deref(),
+            Some(HEALTHY_SESSION_STATUS)
+        );
+        assert_eq!(sessions[0].tunnel_name, None);
+        assert_eq!(sessions[0].current_device.as_deref(), Some("N/A"));
+        assert_eq!(sessions[0].network.as_deref(), Some("mainnet-beta"));
+    }
+
+    /// The connected capture's nested `response.doublezero_status.session_status` reaches the
+    /// flattened `Session`, alongside the top-level device/network fields.
+    #[test]
+    fn the_connected_capture_reports_a_healthy_session() {
+        let sessions = parse_status_sessions(STATUS_JSON.as_bytes());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].session_status.as_deref(),
+            Some(HEALTHY_SESSION_STATUS)
+        );
+        assert_eq!(sessions[0].tunnel_name.as_deref(), Some("doublezero1"));
+        assert_eq!(sessions[0].user_type.as_deref(), Some("Multicast"));
+        assert_eq!(sessions[0].current_device.as_deref(), Some("tyo002-dz002"));
+        assert_eq!(sessions[0].reconciler_enabled, Some(true));
+    }
+
+    /// A document carrying none of the new fields still parses to a session (all-`None`) rather
+    /// than being dropped — and, critically, still returns the same codes. Version skew in either
+    /// direction degrades the diagnosis, never the activation.
+    #[test]
+    fn a_document_missing_every_session_field_still_parses_and_still_returns_its_codes() {
+        let json = br#"[{"multicast_groups":"S:tiredsolid"}]"#;
+        assert_eq!(
+            parse_status_codes(json),
+            Some(vec!["tiredsolid".to_string()])
+        );
+        let sessions = parse_status_sessions(json);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0],
+            Session {
+                multicast_groups: Some("S:tiredsolid".to_string()),
+                ..Session::default()
+            }
+        );
+    }
+
+    /// The diagnostic pass never reports a session it could not parse — an unparseable document is
+    /// an empty list here, and independently `None` (`Unavailable`) there.
+    #[test]
+    fn an_unparseable_document_yields_no_sessions() {
+        assert!(parse_status_sessions(b"not json").is_empty());
+        assert!(parse_status_sessions(b"").is_empty());
+    }
+
+    /// The `subscriptions` array rides through for reporting. It is deliberately **not** an
+    /// activation input — `parse_status_codes` reads `multicast_groups` and nothing else — so this
+    /// asserts both: the rows are reported, and a document whose `subscriptions` disagree with
+    /// `multicast_groups` still activates on `multicast_groups` alone.
+    #[test]
+    fn subscription_rows_are_reported_but_never_gate_activation() {
+        let json = br#"[{"multicast_groups":"S:tiredsolid",
+            "subscriptions":[{"code":"scottsdale","multicast_ip":"233.84.178.15","subscriber":true,"publisher":false}]}]"#;
+        assert_eq!(
+            parse_status_codes(json),
+            Some(vec!["tiredsolid".to_string()]),
+            "activation must key on multicast_groups alone, never the subscriptions array"
+        );
+        let sessions = parse_status_sessions(json);
+        assert_eq!(sessions[0].subscriptions.len(), 1);
+        assert_eq!(sessions[0].subscriptions[0].code, "scottsdale");
+        assert!(sessions[0].subscriptions[0].subscriber);
+    }
+
+    /// The tail helper keeps the end of a long message (that is where a bail line lands), bounds
+    /// it, and never splits a multi-byte character.
+    #[test]
+    fn the_output_tail_is_bounded_and_char_safe() {
+        assert_eq!(output_tail(b"  \n "), None);
+        assert_eq!(
+            output_tail(b"Please start the doublezerod service.\n").as_deref(),
+            Some("Please start the doublezerod service.")
+        );
+        let long = "é".repeat(MAX_CLI_DETAIL);
+        let tail = output_tail(long.as_bytes()).expect("non-empty");
+        assert!(tail.len() <= MAX_CLI_DETAIL);
+        assert!(tail.chars().all(|c| c == 'é'));
     }
 }

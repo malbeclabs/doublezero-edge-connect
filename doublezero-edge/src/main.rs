@@ -5,20 +5,20 @@
 //!
 //! Every `products`/`status` command is READ-ONLY (a `GET` against `/v1`, which has no
 //! order-placement or mutation path anywhere in `edge-connect` for it to reach) and never needs a
-//! confirmation prompt. `channels` is the one exception: it is a distinct command group over a
-//! distinct, off-by-default admin surface (`--admin-url` / `DZ_ADMIN_BIND`), and `channels set` is
-//! this tool's only mutating command — it changes what the shared process ingests, so it prints
-//! what it would drop and requires confirmation unless `--force`.
+//! confirmation prompt. The commands over the **admin** surface (`--admin-url`) are where that
+//! stops holding: `diagnose` is read-only too, but `channels set`, `connect` and `disconnect` all
+//! mutate — what this process ingests, or the host's tunnel — so each states exactly what it will
+//! do and requires confirmation unless `--force`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
+use doublezero_edge::{channels, client, diagnose, endpoint::Endpoint, jq, params, render};
 use serde_json::{json, Value};
 
 /// doublezero-edge: an agent-facing CLI over a running edge-connect container's /v1 market-data
-/// API (plus its off-by-default admin surface, for `channels`).
+/// API (plus its admin surface, for `diagnose`, `channels`, `connect` and `disconnect`).
 #[derive(Parser)]
 #[command(
     name = "doublezero-edge",
@@ -31,10 +31,13 @@ order-placement or mutation path anywhere in edge-connect for it to reach, so ne
 confirmation prompt — a real difference from the Coinbase Advanced Trade CLI this tool's surface \
 is modelled on, where blast-radius containment (accidentally placing a real order) drives much of \
 the design.\n\n\
-`channels` is separate: it talks to edge-connect's off-by-default admin surface (--admin-url / \
-DZ_ADMIN_BIND) rather than /v1, and `channels set` is this tool's one mutating command — it \
-replaces which channels this process ingests, which drops books/history/catalog state for \
-anything it excludes. It prints what would be dropped and requires confirmation unless --force.\n\n\
+`diagnose`, `channels`, `connect` and `disconnect` are separate: they talk to edge-connect's admin \
+surface (--admin-url, on by default at 127.0.0.1:9098) rather than /v1, which matters because \
+/v1 activates only once a market-data feed is subscribed — on a host whose tunnel never came up it \
+is not listening at all, and `diagnose` is then the command that answers why. The three mutating \
+ones (`channels set` replaces which channels this process ingests; `connect`/`disconnect` re-run \
+the DoubleZero client verb inside the container) each state what they will do and require \
+confirmation unless --force.\n\n\
 Trailing arguments to a products subcommand are either the product id (a bare positional, e.g. \
 HYPERLIQUID:BTC) or a key==value query parameter (e.g. granularity==ONE_MINUTE); the two are told \
 apart by the presence of '==', matched before anything is treated as positional, so a query value \
@@ -49,6 +52,12 @@ struct Cli {
         default_value = "http://127.0.0.1:9099"
     )]
     url: String,
+
+    /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
+    /// container). Unlike `/v1` it is not subscription-gated, so it answers on a host whose tunnel
+    /// never came up — which is what `diagnose` is for.
+    #[arg(long, global = true, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
+    admin_url: String,
 
     /// jq-subset filter applied to the JSON response, e.g. '.trades[0].price' or
     /// '.products[].product_id'. Applies to a successful response only; ignores --output.
@@ -87,12 +96,25 @@ enum Command {
         args: Vec<String>,
     },
     /// Inspect or change which channels of an enabled feed this process ingests. Talks to
-    /// edge-connect's off-by-default admin surface (`--admin-url` / `DZ_ADMIN_BIND`), not `/v1` —
-    /// see the top-level `--help` for why this command group is separate.
+    /// edge-connect's admin surface (`--admin-url` / `DZ_ADMIN_BIND`), not `/v1` — see the
+    /// top-level `--help` for why this command group is separate.
     Channels {
         #[command(subcommand)]
         action: ChannelsCommand,
     },
+    /// Why this container is (or is not) serving data: the tunnel, what this host is subscribed
+    /// to, and which feeds are activated, ending in one verdict. Reads the admin surface, which
+    /// answers even when `/v1` is not activated — so this is the command to run when everything
+    /// else reports `api_unreachable`. Exits 0 whatever the verdict; 3 only if the admin surface
+    /// itself does not answer.
+    Diagnose,
+    /// Ask the container to run `doublezero connect multicast` — the retry path for a `tunnel_down`
+    /// verdict, without a `docker exec`. Mutating: it provisions this host's onchain DoubleZero
+    /// user, so it states what it will run and confirms unless `--force`.
+    Connect(AttemptArgs),
+    /// Ask the container to run `doublezero disconnect multicast`, tearing this host's tunnel
+    /// down. Mutating and disruptive — see the prompt it prints.
+    Disconnect(AttemptArgs),
     /// Print a shell-completion script for `<shell>` to stdout. Local-only — no config file, no
     /// server, no network — so packaging can run it at build time.
     Completion {
@@ -101,11 +123,30 @@ enum Command {
     },
 }
 
-/// The admin surface's base URL. `9098` is edge-connect's own documented example bind
-/// (`docs/superpowers/specs/2026-08-09-channel-floor-and-history-accounting-design.md`); the
-/// surface itself is off unless the container sets `DZ_ADMIN_BIND`, so this default is only ever a
-/// starting point, never a promise the surface is listening.
+/// The flags `connect` and `disconnect` share. They differ only in the verb they run and the
+/// warning they print, so the argument surface is one type.
+#[derive(clap::Args)]
+struct AttemptArgs {
+    /// Skip the confirmation prompt. For a non-interactive caller — interactively, answer the
+    /// prompt.
+    #[arg(long)]
+    force: bool,
+    /// Return as soon as the container accepts the request, without waiting for the client verb to
+    /// finish. Its outcome then shows up under `last_attempt` in `doublezero-edge diagnose`.
+    #[arg(long)]
+    no_wait: bool,
+    /// Seconds to wait for the client verb to finish before giving up on watching it (it keeps
+    /// running in the container regardless).
+    #[arg(long, default_value_t = 180)]
+    timeout: u64,
+}
+
+/// The admin surface's base URL — `--admin-bind`'s own default, which is loopback-only by design.
 const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
+
+/// How often `connect`/`disconnect` re-read `/admin/diagnostics` while waiting. The client verb
+/// takes minutes; this is only how promptly its end is noticed.
+const ATTEMPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Page size `products list --paginate` supplies on the caller's behalf when no `limit==N` was
 /// given — pagination proves nothing in one unbounded request, so `--paginate` must set a page
@@ -115,24 +156,13 @@ const DEFAULT_PAGINATE_LIMIT: u32 = 500;
 #[derive(Subcommand)]
 enum ChannelsCommand {
     /// List each enabled row's channels: channel-filter admission, real bound state, product count.
-    List {
-        /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
-        /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
-        /// since that is otherwise indistinguishable from a wrong port.
-        #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
-        admin_url: String,
-    },
+    List,
     /// Replace the channel filter (same spec syntax as `--channels`/`DZ_CHANNELS`:
     /// `<code>=<id>[,<id>...][;<code>=...]`). Prints what would be dropped and requires
     /// confirmation unless `--force` — the drop is irreversible within the history window.
     Set {
         /// The new channel filter spec. An empty string clears every restriction.
         spec: String,
-        /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
-        /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
-        /// since that is otherwise indistinguishable from a wrong port.
-        #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
-        admin_url: String,
         /// Skip the drop preview's confirmation prompt.
         #[arg(long)]
         force: bool,
@@ -195,15 +225,12 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
             ProductsCommand::Book { args } => (Endpoint::Book, args.clone()),
             ProductsCommand::BestBidAsk { args } => (Endpoint::BestBidAsk, args.clone()),
         },
-        Command::Channels { .. } => {
-            unreachable!(
-                "Command::Channels is dispatched directly by run(), never through resolve()"
-            )
-        }
-        Command::Completion { .. } => {
-            unreachable!(
-                "Command::Completion is dispatched directly by run(), never through resolve()"
-            )
+        Command::Channels { .. }
+        | Command::Diagnose
+        | Command::Connect(_)
+        | Command::Disconnect(_)
+        | Command::Completion { .. } => {
+            unreachable!("this command is dispatched directly by run(), never through resolve()")
         }
     }
 }
@@ -226,9 +253,13 @@ fn build_path(endpoint: Endpoint, positionals: &[String]) -> Result<String, Stri
         Endpoint::Ticker => format!("/v1/products/{}/ticker", require_id()?),
         Endpoint::Candles => format!("/v1/products/{}/candles", require_id()?),
         Endpoint::Book => format!("/v1/products/{}/book", require_id()?),
-        Endpoint::ChannelsList | Endpoint::ChannelsSet => {
+        Endpoint::ChannelsList
+        | Endpoint::ChannelsSet
+        | Endpoint::Diagnose
+        | Endpoint::Connect
+        | Endpoint::Disconnect => {
             unreachable!(
-                "channels commands are dispatched directly by run(), never through build_path"
+                "admin-surface commands are dispatched directly by run(), never through build_path"
             )
         }
     })
@@ -328,10 +359,14 @@ fn run() -> i32 {
         return run_completion(*shell);
     }
 
-    if let Command::Channels { action } = &cli.command {
-        // A distinct command group over a distinct surface (`--admin-url`, never `cli.url`) with
-        // its own confirmation flow — handled entirely separately from the /v1 GET pipeline below.
-        return run_channels(&cli, action);
+    // The admin-surface commands: a distinct surface (`--admin-url`) with their own confirmation
+    // flows, handled separately from the /v1 GET pipeline below.
+    match &cli.command {
+        Command::Channels { action } => return run_channels(&cli, action),
+        Command::Diagnose => return run_diagnose(&cli),
+        Command::Connect(args) => return run_attempt(&cli, args, Attempt::Connect),
+        Command::Disconnect(args) => return run_attempt(&cli, args, Attempt::Disconnect),
+        _ => {}
     }
 
     if let Command::Products {
@@ -381,11 +416,34 @@ fn run() -> i32 {
             print_error(&body);
             exit_code_for_status(status)
         }
-        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+        client::Outcome::Unreachable { body } => print_v1_unreachable(&cli, &client, &body),
+        client::Outcome::Invalid { body, .. } => {
             print_error(&body);
             3
         }
     }
+}
+
+/// Report a `/v1` transport failure, telling the two causes apart: a container that is not running,
+/// and one that is running with `/v1` not activated (it is subscription-gated, so on a host whose
+/// tunnel never came up it is not listening at all — the failure that sends an operator to
+/// `docker ps`, which shows a healthy container and no further clue).
+///
+/// The [`client::same_host`] guard is load-bearing: against a remote bridge with the default
+/// loopback `--admin-url`, an unguarded probe would answer for the *local* container and report its
+/// state as the remote one's — confidently wrong, which is worse than the vague message it replaces.
+fn print_v1_unreachable(cli: &Cli, client: &reqwest::blocking::Client, body: &Value) -> i32 {
+    let probed = client::same_host(&cli.url, &cli.admin_url)
+        .then(|| client::probe_diagnostics(client, &cli.admin_url))
+        .flatten();
+    match probed {
+        Some(diag) => {
+            let summary = diag["diagnosis"]["summary"].as_str().unwrap_or_default();
+            print_error(&client::api_inactive_envelope(&cli.url, summary));
+        }
+        None => print_error(body),
+    }
+    3
 }
 
 /// Build the one HTTP client every command (`/v1` and admin alike) shares.
@@ -458,7 +516,10 @@ fn run_products_list_paginated(cli: &Cli, args: &[String]) -> i32 {
                 print_error(&body);
                 return exit_code_for_status(status);
             }
-            client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+            client::Outcome::Unreachable { body } => {
+                return print_v1_unreachable(cli, &client, &body)
+            }
+            client::Outcome::Invalid { body, .. } => {
                 print_error(&body);
                 return 3;
             }
@@ -486,24 +547,20 @@ fn run_channels(cli: &Cli, action: &ChannelsCommand) -> i32 {
     };
 
     match action {
-        ChannelsCommand::List { admin_url } => run_channels_list(cli, &client, admin_url),
-        ChannelsCommand::Set {
-            spec,
-            admin_url,
-            force,
-        } => run_channels_set(cli, &client, admin_url, spec, *force),
+        ChannelsCommand::List => run_channels_list(cli, &client),
+        ChannelsCommand::Set { spec, force } => run_channels_set(cli, &client, spec, *force),
     }
 }
 
 /// `channels list`: confirm the admin surface answers (naming `DZ_ADMIN_BIND` if it doesn't), then
 /// merge its channel-filter summary with `/v1/status`'s real per-channel liveness into one JSON value so
 /// `--jq`/`--output`/`--template` behave exactly as they do for every other command.
-fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &str) -> i32 {
+fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client) -> i32 {
     if cli.template {
         return emit_template(cli, &Endpoint::ChannelsList.template());
     }
 
-    let admin_body = match client::admin_get(client, admin_url, "/admin/channels") {
+    let admin_body = match client::admin_get(client, &cli.admin_url, "/admin/channels") {
         client::Outcome::Ok { body } => body,
         client::Outcome::Failed { status, body } => {
             print_error(&body);
@@ -521,7 +578,8 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
             print_error(&body);
             return exit_code_for_status(status);
         }
-        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+        client::Outcome::Unreachable { body } => return print_v1_unreachable(cli, client, &body),
+        client::Outcome::Invalid { body, .. } => {
             print_error(&body);
             return 3;
         }
@@ -533,13 +591,7 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
 
 /// `channels set`: preview what the new channel filter would drop (best-effort, from `/v1/status`), require
 /// confirmation unless `--force`, then `POST` the spec to the admin surface.
-fn run_channels_set(
-    cli: &Cli,
-    client: &reqwest::blocking::Client,
-    admin_url: &str,
-    spec: &str,
-    force: bool,
-) -> i32 {
+fn run_channels_set(cli: &Cli, client: &reqwest::blocking::Client, spec: &str, force: bool) -> i32 {
     if cli.template {
         return emit_template(cli, &Endpoint::ChannelsSet.template());
     }
@@ -589,7 +641,7 @@ fn run_channels_set(
         }
     }
 
-    match client::admin_post_channels(client, admin_url, spec) {
+    match client::admin_post_channels(client, &cli.admin_url, spec) {
         client::Outcome::Ok { body } => emit(cli, Endpoint::ChannelsSet, &body),
         client::Outcome::Failed { status, body } => {
             print_error(&body);
@@ -598,6 +650,180 @@ fn run_channels_set(
         client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
             print_error(&body);
             3
+        }
+    }
+}
+
+/// `diagnose`: the admin surface's verdict plus, best-effort, `/v1/status`'s venue health, merged
+/// into one value exactly as `channels list` merges the same two surfaces.
+///
+/// **Exit 0 for any verdict a healthy admin surface produced**, including `tunnel_down`: the report
+/// succeeded, and an agent reads `.diagnostics.diagnosis.code` for the answer. Only the admin
+/// surface itself failing is an error (3) — there is then nothing to report.
+fn run_diagnose(cli: &Cli) -> i32 {
+    if cli.template {
+        return emit_template(cli, &Endpoint::Diagnose.template());
+    }
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
+    };
+
+    let diagnostics = match client::admin_get(&client, &cli.admin_url, "/admin/diagnostics") {
+        client::Outcome::Ok { body } => body,
+        client::Outcome::Failed { status, body } => {
+            print_error(&body);
+            return exit_code_for_status(status);
+        }
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+            print_error(&body);
+            return 3;
+        }
+    };
+
+    // `/v1` being down is the very condition this command explains, so its failure is silent —
+    // a warning here would read as a second fault on top of the one being reported.
+    let status = match client::get(&client, &cli.url, "/v1/status", &[]) {
+        client::Outcome::Ok { body } => body,
+        _ => Value::Null,
+    };
+
+    emit(
+        cli,
+        Endpoint::Diagnose,
+        &json!({ "diagnostics": diagnostics, "status": status }),
+    )
+}
+
+/// Which DoubleZero client verb `connect`/`disconnect` asks the container to run.
+#[derive(Clone, Copy)]
+enum Attempt {
+    Connect,
+    Disconnect,
+}
+
+impl Attempt {
+    fn path(self) -> &'static str {
+        match self {
+            Attempt::Connect => "/admin/connect",
+            Attempt::Disconnect => "/admin/disconnect",
+        }
+    }
+
+    fn endpoint(self) -> Endpoint {
+        match self {
+            Attempt::Connect => Endpoint::Connect,
+            Attempt::Disconnect => Endpoint::Disconnect,
+        }
+    }
+
+    /// What the operator is about to do, in the terms it will actually happen in. `disconnect`
+    /// takes a working tunnel down, and the prompt says so rather than reading as `connect`'s
+    /// mirror image.
+    fn preamble(self) -> &'static str {
+        match self {
+            Attempt::Connect => {
+                "This runs `doublezero connect multicast` inside the edge-connect container: it \
+                 provisions this host's onchain DoubleZero user and brings the tunnel up. It can \
+                 take minutes, and it spends the container's onchain identity."
+            }
+            Attempt::Disconnect => {
+                "This runs `doublezero disconnect multicast` inside the edge-connect container. It \
+                 TEARS DOWN this host's DoubleZero tunnel: every market-data feed stops, the /v1 \
+                 API deactivates, and nothing is served again until the tunnel is reconnected."
+            }
+        }
+    }
+}
+
+/// `connect` / `disconnect`: state what will run, confirm unless `--force`, `POST` it, then watch
+/// `/admin/diagnostics` until the attempt finishes.
+///
+/// Exit code reports the *attempt*, not the request: 0 only when the client verb finished with exit
+/// code 0. A timeout is 1 — the run is unfinished, not successful — while `--no-wait` is 0, since
+/// there the accepted `202` is all that was asked for.
+fn run_attempt(cli: &Cli, args: &AttemptArgs, attempt: Attempt) -> i32 {
+    if cli.template {
+        return emit_template(cli, &attempt.endpoint().template());
+    }
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
+    };
+
+    println_or_exit(attempt.preamble());
+    if !args.force {
+        print_or_exit("Type 'yes' to continue: ");
+        let mut input = String::new();
+        let confirmed = std::io::stdin().read_line(&mut input).is_ok()
+            && input.trim().eq_ignore_ascii_case("yes");
+        if !confirmed {
+            eprintln!("aborted; nothing was run.");
+            return 1;
+        }
+    }
+
+    let accepted = match client::admin_post(&client, &cli.admin_url, attempt.path()) {
+        client::Outcome::Ok { body } => body,
+        client::Outcome::Failed { status, body } => {
+            print_error(&body);
+            return exit_code_for_status(status);
+        }
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+            print_error(&body);
+            return 3;
+        }
+    };
+
+    if args.no_wait {
+        let body = json!({"accepted": accepted, "diagnostics": Value::Null, "timed_out": false});
+        return emit(cli, attempt.endpoint(), &body);
+    }
+
+    let (diagnostics, timed_out) = match watch_attempt(&client, &cli.admin_url, args.timeout) {
+        Ok(result) => result,
+        Err(body) => {
+            print_error(&body);
+            return 3;
+        }
+    };
+    let attempt_failed = timed_out || diagnose::attempt_exit_code(&diagnostics) != Some(0);
+    let body = json!({"accepted": accepted, "diagnostics": diagnostics, "timed_out": timed_out});
+    match emit(cli, attempt.endpoint(), &body) {
+        0 if attempt_failed => 1,
+        code => code,
+    }
+}
+
+/// Poll `/admin/diagnostics` until the attempt reports itself finished, or `timeout_secs` elapses
+/// (the `bool`). `Err` is an admin-surface error envelope: the attempt has become unobservable from
+/// here, which is worth saying immediately rather than spinning out the deadline in silence.
+fn watch_attempt(
+    client: &reqwest::blocking::Client,
+    admin_url: &str,
+    timeout_secs: u64,
+) -> Result<(Value, bool), Value> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        // Sleep first: the `202` has only just returned, so the attempt is certainly still running.
+        std::thread::sleep(ATTEMPT_POLL_INTERVAL);
+        let body = match client::admin_get(client, admin_url, "/admin/diagnostics") {
+            client::Outcome::Ok { body } => body,
+            client::Outcome::Failed { body, .. }
+            | client::Outcome::Invalid { body, .. }
+            | client::Outcome::Unreachable { body } => return Err(body),
+        };
+        if diagnose::attempt_finished(&body) {
+            return Ok((body, false));
+        }
+        if Instant::now() >= deadline {
+            return Ok((body, true));
         }
     }
 }

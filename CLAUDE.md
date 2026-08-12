@@ -250,11 +250,36 @@ Modules are grouped by role under `src/`:
   `multicast group list` (`shred::discovery::parse_group_code_ips`) for the shred groups (market-data
   IPs come from `FEEDS`). Classifies into `market_data_feeds()` (subscribed enabled feeds) and
   `shred_sources()` (subscribed `edge-solana-*` → `ip:port`). Sync `Command` soft-fail; the
-  `Detected` enum distinguishes `CliMissing` (fail open) from `Unavailable` (transient, keep current).
+  `Detected` enum distinguishes `CliMissing` (fail open) from `Unavailable` (transient, keep current;
+  it carries the CLI's stderr tail, since `Please start the doublezerod service.` *is* the answer on
+  a host whose daemon is down). `parse_status_sessions` is a **second, separate pass** over the same
+  document for the session fields (`session_status`, `tunnel_name`, `current_device`,
+  `lowest_latency_device`, `metro`, …) that `ingest::diagnostics` reports. Deliberately not folded
+  into `parse_status_codes`: that function's `Option<Vec<String>>` contract gates activation
+  fleet-wide, and a diagnosis must not be able to move it. Every session field is optional and the
+  `subscriptions` array is **reported but never read for activation**, which stays keyed on
+  `multicast_groups` alone.
+- **`ingest/diagnostics.rs`** — why this process is (or is not) serving data. Exists because `/v1` is
+  subscription-gated: on a host whose tunnel never came up it is not listening, so every
+  `doublezero-edge` command fails with a transport error and "not running" is indistinguishable from
+  "running, correctly serving nothing" (#133). The **admin surface is the one surface that is not
+  subscription-gated**, which is what makes it the place to answer, and this module the state it
+  answers from. `DiagnosticsSnapshot` is plain cached state with **two writers**: `reconcile::tick`
+  publishes the polled half via `publish_tick` (which deliberately leaves `last_attempt` alone —
+  a tick landing mid-attempt must not erase it), and `sinks::admin`'s connect/disconnect route
+  records the attempt half. **Nothing here polls and nothing shells out on the read path**: a
+  diagnostics request is a lock, a clone and the pure `diagnose()` ladder. The ladder is server-side
+  so `--jq '.diagnosis.code'` and the table view give the same answer and it is unit-testable
+  against a captured `doublezero status` document; its rungs are ordered so each is reached only once
+  the one above it is ruled out — which is what stops a `CliMissing` host (running from source) being
+  reported as a broken tunnel, and a not-yet-polled process as an empty subscription set.
 - **`ingest/reconcile.rs`** — the **activation authority**. `Reconciler::run()` polls `detect()`
   every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
-  (spawn/abort). The desired receiver set is the subscribed rows' publishers **narrowed by the
+  (spawn/abort). Each tick also publishes the shared `ingest::diagnostics` snapshot from what that
+  one `detect()` already fetched — **no second shell-out on the polling path** — and publishes it on
+  *every* tick, an inconclusive one included, reading activation back off its own task maps rather
+  than off a `Desired` that was never applied. The desired receiver set is the subscribed rows' publishers **narrowed by the
   channel filter** (`ingest::channel_filter`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
   one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
@@ -597,7 +622,23 @@ Modules are grouped by role under `src/`:
   (`--admin-bind`/`DZ_ADMIN_BIND` defaults to `127.0.0.1:9098`; set empty to disable it outright) —
   the exposure is accepted on the condition that the default never reaches past loopback. **No
   authentication**, and under host networking a wildcard bind is genuinely network-reachable, so an
-  override must stay on loopback, never a bare wildcard. Two routes, both `/admin/channels`: `GET`
+  override must stay on loopback, never a bare wildcard. Four routes. `GET /admin/diagnostics`
+  (read-only, and **needs no `X-DZ-Admin-Request` header** — that header guards mutations, and
+  requiring it on the one command a stuck operator most needs would make it harder to run than
+  `curl`) serves `ingest::diagnostics`' snapshot plus its verdict, reusing `api::process_block` /
+  `api::registry_block` rather than a second copy, and adds a `binds` block (which surfaces were
+  *configured*, the half `activation` cannot answer). `POST /admin/connect` / `POST
+  /admin/disconnect` re-run the DoubleZero client verb an operator would otherwise reach through
+  `docker exec` — a real capability increase over a channel-filter swap, since it spends the
+  container's onchain identity, contained by four things: a **fixed argv** (a module constant; the
+  routes take no parameters, so no request input reaches the child), the loopback default bind, the
+  CSRF header, and **single-flight** (a second attempt while one runs is `409` — two concurrent
+  `connect`s race onchain user creation, so this is a correctness guard, not politeness). The child
+  runs on a blocking thread behind `tokio::spawn` and the route answers `202` at once (`connect`
+  takes minutes and must never sit on a runtime worker); its outcome lands back in the snapshot as
+  `last_attempt`, since a `202` nothing could follow up on would be useless. ⚠️ There is **no rate
+  limit** — a script looping on `connect` serially re-runs onchain provisioning. The other two
+  routes are `/admin/channels`: `GET`
   reports the channel filter in force plus,
   per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver
   set (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
@@ -616,7 +657,8 @@ Modules are grouped by role under `src/`:
   would quietly widen the channel filter to admit-everything while looking, to the caller, like it
   worked). Bind/serve split exactly as `ws`/`api` (a taken port disables this surface without taking
   the tunnel down) but deliberately **not** subscription-gated — an operator must be able to inspect
-  or narrow the channel filter before anything is subscribed at all.
+  or narrow the channel filter, and to diagnose and retry a tunnel, before anything is subscribed at
+  all. That last property is what `GET /admin/diagnostics` rests on.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
   `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by

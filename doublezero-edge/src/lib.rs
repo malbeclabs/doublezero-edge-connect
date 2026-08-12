@@ -8,6 +8,7 @@
 
 pub mod channels;
 pub mod client;
+pub mod diagnose;
 pub mod endpoint;
 pub mod jq;
 pub mod params;

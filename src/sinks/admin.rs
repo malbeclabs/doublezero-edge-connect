@@ -3,13 +3,21 @@
 //!
 //! `/v1` must stay provably read-only — an agent pointed at it cannot change what a shared process
 //! ingests regardless of what it sends (see `api::handle`'s method guard, and its pinning test) — so
-//! runtime changes to the channel filter live here, on their own bind, off unless `--admin-bind` /
-//! `DZ_ADMIN_BIND` is set. There is **no authentication** on this surface: under host networking a
-//! wildcard bind is genuinely network-reachable, so the documented recommendation is a loopback
-//! bind (`127.0.0.1:<port>`), never a bare default-on wildcard — see the flag's doc comment in
-//! `main.rs`.
+//! every runtime change lives here, on its own bind, **on by default at loopback**
+//! (`--admin-bind` / `DZ_ADMIN_BIND`, `127.0.0.1:9098`; set it empty to disable the surface
+//! outright). There is **no authentication**: under host networking a wildcard bind is genuinely
+//! network-reachable, so the exposure is accepted on the condition that the default never reaches
+//! past loopback — see the flag's doc comment in `main.rs`.
 //!
-//! Two endpoints, both scoped to `/admin/channels`:
+//! Four routes. `GET /admin/diagnostics` is why the other three now matter to a first-time
+//! operator: this surface is **not** subscription-gated, so on a host whose tunnel never came up —
+//! where `/v1` is not listening and `doublezero-edge` can only report a transport error — it is the
+//! one thing that answers, and it answers with a verdict ([`crate::ingest::diagnostics`]) rather
+//! than raw state. `POST /admin/connect` and `POST /admin/disconnect` are the retry that verdict
+//! points at, re-running the DoubleZero client verb an operator would otherwise reach through
+//! `docker exec` (root, and the container name). See [`post_command`] for what contains them.
+//!
+//! The other two are scoped to `/admin/channels`:
 //! - `GET` — the channel filter in force (`ChannelFilter::summary`) plus, per feed this process may
 //!   run, which publishers/channels the channel filter currently **admits** (not necessarily
 //!   running — see `get_channels`'s doc for why this surface can't yet say which receivers are
@@ -37,16 +45,20 @@
 //!
 //! Bind/serve is split exactly as [`crate::sinks::ws`] / [`crate::sinks::api`]: a taken port
 //! disables this surface without taking the tunnel down. Unlike those two, this surface is **not**
-//! subscription-gated — an operator must be able to inspect or change the channel filter even when
-//! nothing is currently subscribed, e.g. to prepare a narrowing before subscribing at all — so it is
-//! spawned once at startup, gated only on `--admin-bind` being non-empty.
+//! subscription-gated — an operator must be able to inspect or change the channel filter, and to
+//! diagnose and retry a tunnel, when nothing is currently subscribed at all — so it is spawned once
+//! at startup, gated only on `--admin-bind` being non-empty.
 //!
-//! **CSRF on the mutating endpoint.** Loopback does not protect `POST /admin/channels` from a web
+//! **CSRF on the mutating endpoints.** Loopback does not protect a `POST` here from a web
 //! page open in a browser on the same host: the page can point a plain HTML `<form>` at
 //! `http://127.0.0.1:<port>/admin/channels?channels=<spec>`, and the browser sends that request with
 //! no involvement from this crate at all. A `<form>` (or any request built from the small set of
 //! CORS-"simple" content types) can only carry a handful of fixed headers — it cannot add an
-//! arbitrary one — so `POST` also requires [`REQUIRED_HEADER`] to be present (see `post_channels`).
+//! arbitrary one — so every `POST` here requires [`REQUIRED_HEADER`] to be present
+//! ([`mutation_guards`]). It matters most on `/admin/connect`, where a form post would provision an
+//! onchain user. `GET` routes are exempt: the header guards mutations, and requiring it on the
+//! diagnostics read would make the one command a stuck operator most needs harder to run than
+//! `curl`.
 //! The header only needs to be **present**, not carry a shared-secret value: this surface documents
 //! itself as having no authentication (see above), and a value would imply exactly that, plus the
 //! provisioning/rotation problem that comes with it. What the header actually rules out is not "an
@@ -58,13 +70,52 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::http::{self, Request, Response};
-use crate::ingest::{channel_filter::ChannelFilter, feeds::Feed};
+use crate::ingest::{
+    channel_filter::ChannelFilter,
+    diagnostics::{diagnose, CommandAttempt, SharedDiagnostics},
+    feeds::Feed,
+    subscriptions,
+};
 
 /// Small, operator-only surface: no need for the concurrency `sinks::api`/`sinks::metrics` allow.
 const MAX_CONNS: usize = 8;
+
+/// The two fixed argv this surface may run. **Constants, never composed from request input** — the
+/// endpoints take no parameters at all, so nothing a caller sends can influence what is executed.
+/// `connect multicast` is verbatim what `scripts/connect.sh` runs; `disconnect multicast` is its
+/// scoped counterpart (a bare `doublezero disconnect` would also delete an unrelated IBRL user).
+const CONNECT_ARGV: &[&str] = &["connect", "multicast"];
+const DISCONNECT_ARGV: &[&str] = &["disconnect", "multicast"];
+
+/// How a `POST /admin/{connect,disconnect}` actually runs the client. A field rather than a direct
+/// call so a handler test can drive the single-flight and guard behaviour without a `doublezero`
+/// binary on the test host — there is exactly one production implementation
+/// ([`subscriptions::run_cli_reporting`]), installed by [`AdminState::new`].
+type CommandRunner = Arc<dyn Fn(&[&str]) -> (Option<i32>, String) + Send + Sync>;
+
+/// Which surfaces this process was *configured* with, reported by `GET /admin/diagnostics`. The
+/// "is it even enabled" half of the question — whether a configured sink is currently *activated*
+/// is the `activation` block's job, and the two disagree exactly when subscription gating is doing
+/// its work.
+#[derive(Debug, Default, Clone)]
+pub struct Binds {
+    pub ws: String,
+    pub api: String,
+    pub admin: String,
+    pub metrics: String,
+}
+
+/// Everything [`serve`] needs. A struct rather than a widening argument list — this surface now
+/// carries four unrelated pieces of shared state and positional arguments stop being readable.
+pub struct AdminConfig {
+    pub filter: Arc<Mutex<ChannelFilter>>,
+    pub enabled: Vec<Feed>,
+    pub diagnostics: SharedDiagnostics,
+    pub binds: Binds,
+}
 
 /// Header a mutating request must carry (any value — see [`post_channels`]'s docs for why presence
 /// alone is the right bar). Named on the `doublezero-edge` CLI side too (`client::admin_post_channels`);
@@ -80,6 +131,23 @@ struct AdminState {
     /// The feeds this process may run (`--feed`/`--publisher-port`-selected), for `GET`'s per-feed
     /// report. Fixed for the process's lifetime — only the channel filter changes at runtime.
     enabled: Vec<Feed>,
+    /// Tunnel/subscription/activation state, published by the reconciler each tick. This surface
+    /// reads it and writes only [`crate::ingest::diagnostics::DiagnosticsSnapshot::last_attempt`].
+    diagnostics: SharedDiagnostics,
+    binds: Binds,
+    runner: CommandRunner,
+}
+
+impl AdminState {
+    fn new(cfg: AdminConfig) -> Self {
+        Self {
+            filter: cfg.filter,
+            enabled: cfg.enabled,
+            diagnostics: cfg.diagnostics,
+            binds: cfg.binds,
+            runner: Arc::new(subscriptions::run_cli_reporting),
+        }
+    }
 }
 
 /// Bind the listener up front so the caller (`main`) can decide what a bind failure means — mirrors
@@ -92,12 +160,13 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
 }
 
 /// The accept loop, split out so tests can drive a pre-bound listener.
-pub async fn serve(
-    listener: TcpListener,
-    filter: Arc<Mutex<ChannelFilter>>,
-    enabled: Vec<Feed>,
-) -> Result<()> {
-    let state = Arc::new(AdminState { filter, enabled });
+pub async fn serve(listener: TcpListener, cfg: AdminConfig) -> Result<()> {
+    serve_state(listener, Arc::new(AdminState::new(cfg))).await
+}
+
+/// [`serve`] over an already-built state — the seam a handler test uses to install a stub
+/// [`CommandRunner`] instead of really shelling out to `doublezero`.
+async fn serve_state(listener: TcpListener, state: Arc<AdminState>) -> Result<()> {
     http::serve_loop(
         listener,
         MAX_CONNS,
@@ -107,13 +176,176 @@ pub async fn serve(
 }
 
 /// Answer one parsed request.
-fn handle(state: &AdminState, req: &Request) -> Response {
+fn handle(state: &Arc<AdminState>, req: &Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/admin/channels") => get_channels(state),
         ("POST", "/admin/channels") => post_channels(state, req),
-        (method, "/admin/channels") => method_not_allowed(method),
+        (method, "/admin/channels") => method_not_allowed(method, "/admin/channels"),
+        ("GET", "/admin/diagnostics") => get_diagnostics(state),
+        (method, "/admin/diagnostics") => method_not_allowed(method, "/admin/diagnostics"),
+        ("POST", "/admin/connect") => post_command(state, req, "/admin/connect", CONNECT_ARGV),
+        (method, "/admin/connect") => method_not_allowed(method, "/admin/connect"),
+        ("POST", "/admin/disconnect") => {
+            post_command(state, req, "/admin/disconnect", DISCONNECT_ARGV)
+        }
+        (method, "/admin/disconnect") => method_not_allowed(method, "/admin/disconnect"),
         _ => unknown_endpoint(&req.path),
     }
+}
+
+/// `GET /admin/diagnostics` — why this process is (or is not) serving data, from the state the
+/// reconciler already published. Read-only, so it needs no [`REQUIRED_HEADER`]: that header guards
+/// mutations, and requiring it here would make the one command a stuck operator most needs harder
+/// to run than `curl`.
+///
+/// **No shell-out and no blocking work.** Everything here is a lock, a clone and a pure function
+/// ([`diagnose`]) over cached state, so this route can never add latency to the reconciler's poll
+/// or wedge on a hung `doublezero` invocation — which is exactly the condition it exists to report.
+fn get_diagnostics(state: &Arc<AdminState>) -> Response {
+    let diag = crate::model::lock(&state.diagnostics);
+    let mut body = diag.to_json();
+    let verdict = diagnose(&diag);
+    drop(diag);
+    if let Some(map) = body.as_object_mut() {
+        map.insert("diagnosis".to_string(), verdict.to_json());
+        map.insert("registry".to_string(), crate::sinks::api::registry_block());
+        map.insert("process".to_string(), crate::sinks::api::process_block());
+        map.insert(
+            "binds".to_string(),
+            json!({
+                "ws": state.binds.ws,
+                "api": state.binds.api,
+                "admin": state.binds.admin,
+                "metrics": state.binds.metrics,
+            }),
+        );
+    }
+    ok_json(body)
+}
+
+/// `POST /admin/connect` and `POST /admin/disconnect` — re-run the DoubleZero client verb an
+/// operator would otherwise reach through `docker exec`, which needs root and the container name.
+/// This is the retry path for the `tunnel_down` verdict [`get_diagnostics`] reports.
+///
+/// Four things contain what is genuinely a capability increase over a channel-filter swap (this
+/// spends the container's onchain identity):
+/// - **A fixed argv.** `argv` is one of two module constants. The endpoints accept no parameters,
+///   so no request input reaches the child process — this is not a command runner.
+/// - **The loopback default bind** the whole surface is documented under.
+/// - **[`REQUIRED_HEADER`]**, the same CSRF guard `POST /admin/channels` carries: a browser
+///   `<form>` on this host cannot set it, and a form post that provisioned an onchain user would
+///   be a genuinely bad outcome.
+/// - **Single-flight.** A second attempt while one is running is `409`, not a queued second run:
+///   two concurrent `connect`s race onchain user creation. This is a correctness guard.
+///
+/// The child runs on a blocking thread behind `tokio::spawn`, and the handler answers `202`
+/// immediately: `connect` probes device latency, creates an onchain user and polls for activation,
+/// which takes minutes and must never sit on a runtime worker (nor on this surface's small
+/// connection budget). The attempt's outcome lands back in the diagnostics snapshot, so
+/// `GET /admin/diagnostics` reports what happened — a `202` with no follow-up would be useless.
+fn post_command(
+    state: &Arc<AdminState>,
+    req: &Request,
+    route: &str,
+    argv: &'static [&'static str],
+) -> Response {
+    if let Some(refusal) = mutation_guards(req, route) {
+        return refusal;
+    }
+    let command = format!("doublezero {}", argv.join(" "));
+    {
+        let mut diag = crate::model::lock(&state.diagnostics);
+        if diag.attempt_running() {
+            let running = diag
+                .last_attempt
+                .as_ref()
+                .map(|a| a.command.clone())
+                .unwrap_or_default();
+            return json_status(
+                "409 Conflict",
+                json!({
+                    "error": "attempt_already_running",
+                    "message": format!("`{running}` is still running."),
+                    "remediation": "Wait for it to finish — GET /admin/diagnostics reports the \
+                        attempt's exit code and output once it does. Two concurrent runs would \
+                        race onchain user creation.",
+                }),
+            );
+        }
+        diag.last_attempt = Some(CommandAttempt {
+            command: command.clone(),
+            started_at_unix: crate::model::now_ns() / 1_000_000_000,
+            finished_at_unix: None,
+            exit_code: None,
+            output_tail: String::new(),
+        });
+    }
+
+    info!(%command, "running DoubleZero client verb via the admin surface");
+    let state = state.clone();
+    tokio::spawn(async move {
+        let runner = state.runner.clone();
+        let result = tokio::task::spawn_blocking(move || runner(argv)).await;
+        let (exit_code, output) = match result {
+            Ok(v) => v,
+            Err(e) => (None, format!("the attempt task failed: {e}")),
+        };
+        if exit_code != Some(0) {
+            warn!(?exit_code, output = %output, "DoubleZero client verb did not succeed");
+        }
+        let mut diag = crate::model::lock(&state.diagnostics);
+        if let Some(attempt) = diag.last_attempt.as_mut() {
+            attempt.finished_at_unix = Some(crate::model::now_ns() / 1_000_000_000);
+            attempt.exit_code = exit_code;
+            attempt.output_tail = output;
+        }
+    });
+
+    json_status(
+        "202 Accepted",
+        json!({
+            "accepted": true,
+            "command": command,
+            "message": format!("`{command}` started."),
+            "remediation": "It can take minutes. GET /admin/diagnostics reports its exit code and \
+                output under `last_attempt`, and the verdict once the reconciler's next poll picks \
+                up the new tunnel state.",
+        }),
+    )
+}
+
+/// The two refusals every mutating route on this surface shares — see [`post_channels`] for why
+/// each exists. Returns `None` when the request may proceed.
+fn mutation_guards(req: &Request, route: &str) -> Option<Response> {
+    if req.header(REQUIRED_HEADER).is_none() {
+        return Some(json_status(
+            "403 Forbidden",
+            json!({
+                "error": "missing_admin_header",
+                "message": format!(
+                    "Request did not carry the required `{REQUIRED_HEADER}` header."
+                ),
+                "remediation": format!(
+                    "Add a `{REQUIRED_HEADER}` header (any value) — this is what stops a web \
+                     page's form post from silently reaching {route}; see the \
+                     admin-surface section of the README."
+                ),
+            }),
+        ));
+    }
+    if req.content_length > 0 {
+        return Some(json_status(
+            "400 Bad Request",
+            json!({
+                "error": "unsupported_request_body",
+                "message": "This endpoint does not read a request body.",
+                "remediation": format!(
+                    "Send {route} with no body; any parameters travel as query parameters."
+                ),
+            }),
+        ));
+    }
+    None
 }
 
 /// `GET /admin/channels` — the channel filter in force, plus which publishers each enabled feed's
@@ -191,32 +423,8 @@ fn get_channels(state: &AdminState) -> Response {
 ///   quietly widen the channel filter to admit-everything while looking, to the caller, like it
 ///   worked.
 fn post_channels(state: &AdminState, req: &Request) -> Response {
-    if req.header(REQUIRED_HEADER).is_none() {
-        return json_status(
-            "403 Forbidden",
-            json!({
-                "error": "missing_admin_header",
-                "message": format!(
-                    "Request did not carry the required `{REQUIRED_HEADER}` header."
-                ),
-                "remediation": format!(
-                    "Add a `{REQUIRED_HEADER}` header (any value) — this is what stops a web \
-                     page's form post from silently changing the channel filter; see the \
-                     admin-surface section of the README."
-                ),
-            }),
-        );
-    }
-    if req.content_length > 0 {
-        return json_status(
-            "400 Bad Request",
-            json!({
-                "error": "unsupported_request_body",
-                "message": "This endpoint does not read a request body.",
-                "remediation": "Pass the channel filter spec as a query parameter: \
-                    POST /admin/channels?channels=<spec>.",
-            }),
-        );
+    if let Some(refusal) = mutation_guards(req, "/admin/channels") {
+        return refusal;
     }
     let Some(spec) = req.query("channels") else {
         return json_status(
@@ -272,13 +480,13 @@ fn post_channels(state: &AdminState, req: &Request) -> Response {
     }
 }
 
-fn method_not_allowed(method: &str) -> Response {
+fn method_not_allowed(method: &str, route: &str) -> Response {
     json_status(
         "405 Method Not Allowed",
         json!({
             "error": "method_not_allowed",
-            "message": format!("\"{method}\" is not supported on /admin/channels."),
-            "remediation": "Use GET to read the channel filter or POST to replace it.",
+            "message": format!("\"{method}\" is not supported on {route}."),
+            "remediation": ROUTE_LIST,
         }),
     )
 }
@@ -289,10 +497,13 @@ fn unknown_endpoint(path: &str) -> Response {
         json!({
             "error": "unknown_endpoint",
             "message": format!("\"{path}\" is not a route this surface serves."),
-            "remediation": "Use GET or POST /admin/channels.",
+            "remediation": ROUTE_LIST,
         }),
     )
 }
+
+const ROUTE_LIST: &str = "This surface serves GET/POST /admin/channels, GET /admin/diagnostics, \
+     and POST /admin/connect and /admin/disconnect.";
 
 fn ok_json(v: Value) -> Response {
     json_status("200 OK", v)
@@ -348,12 +559,55 @@ mod tests {
     }
 
     async fn spawn(filter: Arc<Mutex<ChannelFilter>>, enabled: Vec<Feed>) -> String {
+        spawn_state(Arc::new(AdminState::new(AdminConfig {
+            filter,
+            enabled,
+            diagnostics: Default::default(),
+            binds: Binds::default(),
+        })))
+        .await
+    }
+
+    async fn spawn_state(state: Arc<AdminState>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = serve(listener, filter, enabled).await;
+            let _ = serve_state(listener, state).await;
         });
         format!("http://{addr}")
+    }
+
+    /// A state whose [`CommandRunner`] is a stub: it blocks until a token arrives on `release`,
+    /// then reports `exit_code` and the argv it was handed. No test in this module ever spawns a
+    /// real `doublezero` process — the point of the seam.
+    fn stub_state(
+        diagnostics: SharedDiagnostics,
+        release: std::sync::mpsc::Receiver<()>,
+        exit_code: i32,
+    ) -> Arc<AdminState> {
+        let release = Mutex::new(release);
+        Arc::new(AdminState {
+            filter: Arc::new(Mutex::new(ChannelFilter::default())),
+            enabled: vec![],
+            diagnostics,
+            binds: Binds::default(),
+            runner: Arc::new(move |args| {
+                let _ = crate::model::lock(&release).recv();
+                (Some(exit_code), format!("ran {}", args.join(" ")))
+            }),
+        })
+    }
+
+    /// Poll `f` until it holds or the deadline passes — the attempt's completion lands on a
+    /// background task, so a bare assertion right after the `202` would race it.
+    async fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
     }
 
     /// The default (empty) channel filter admits every publisher of every enabled feed, and `GET`
@@ -673,6 +927,224 @@ mod tests {
             after.summary(),
             before.summary(),
             "a body-bearing POST must not silently apply its body as the new channel filter"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // GET /admin/diagnostics + POST /admin/{connect,disconnect}
+    // ---------------------------------------------------------------------------------------------
+
+    /// The route this whole change exists for: it must answer on a process with **nothing
+    /// subscribed** — the exact state in which `/v1` is not listening and every other command
+    /// fails with a transport error — and it must carry a verdict, not just raw state.
+    #[tokio::test]
+    async fn diagnostics_answers_with_a_verdict_when_nothing_is_subscribed() {
+        let diagnostics: SharedDiagnostics = Default::default();
+        {
+            let mut d = crate::model::lock(&diagnostics);
+            d.refresh_secs = 30;
+            d.detection = crate::ingest::diagnostics::Detection::Ok;
+            d.sessions = crate::ingest::subscriptions::parse_status_sessions(
+                crate::ingest::subscriptions::DISCONNECTED_STATUS_JSON.as_bytes(),
+            );
+        }
+        let base = spawn_state(Arc::new(AdminState::new(AdminConfig {
+            filter: Arc::new(Mutex::new(ChannelFilter::default())),
+            enabled: vec![],
+            diagnostics,
+            binds: Binds {
+                api: "127.0.0.1:9099".to_string(),
+                ..Binds::default()
+            },
+        })))
+        .await;
+
+        let body: Value = reqwest::get(format!("{base}/admin/diagnostics"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["diagnosis"]["code"], "tunnel_down");
+        assert_eq!(
+            body["tunnel"]["sessions"][0]["session_status"],
+            "disconnected"
+        );
+        assert_eq!(
+            body["binds"]["api"], "127.0.0.1:9099",
+            "the configured binds must be reported — 'is it even enabled' is half the question"
+        );
+        assert!(
+            !body["registry"].is_null(),
+            "which registry document resolved is otherwise only visible in the startup log: {body}"
+        );
+    }
+
+    /// `GET /admin/diagnostics` is read-only and must **not** require the CSRF header: that header
+    /// guards mutations, and a stuck operator must be able to `curl` the diagnosis plainly.
+    #[tokio::test]
+    async fn diagnostics_needs_no_admin_header() {
+        let base = spawn(Arc::new(Mutex::new(ChannelFilter::default())), vec![]).await;
+        let resp = reqwest::get(format!("{base}/admin/diagnostics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// A `connect` runs the fixed argv, answers `202` immediately (it can take minutes), and the
+    /// outcome lands back in the snapshot — a `202` nothing could follow up on would be useless.
+    #[tokio::test]
+    async fn connect_runs_the_fixed_argv_and_records_its_outcome() {
+        let diagnostics: SharedDiagnostics = Default::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = spawn_state(stub_state(diagnostics.clone(), rx, 0)).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/connect"))
+            .header(REQUIRED_HEADER, "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["command"], "doublezero connect multicast");
+
+        tx.send(()).unwrap();
+        let d = diagnostics.clone();
+        assert!(
+            eventually(|| crate::model::lock(&d)
+                .last_attempt
+                .as_ref()
+                .is_some_and(|a| !a.running()))
+            .await,
+            "the attempt must be recorded as finished"
+        );
+        let attempt = crate::model::lock(&diagnostics)
+            .last_attempt
+            .clone()
+            .unwrap();
+        assert_eq!(attempt.exit_code, Some(0));
+        assert_eq!(
+            attempt.output_tail, "ran connect multicast",
+            "the argv is a module constant; no request input reaches the child process"
+        );
+    }
+
+    /// `disconnect` is the same shape with the scoped counterpart argv — a bare `doublezero
+    /// disconnect` would also delete an unrelated IBRL user on the same host.
+    #[tokio::test]
+    async fn disconnect_runs_the_scoped_argv() {
+        let diagnostics: SharedDiagnostics = Default::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = spawn_state(stub_state(diagnostics.clone(), rx, 0)).await;
+        tx.send(()).unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin/disconnect"))
+            .header(REQUIRED_HEADER, "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        let d = diagnostics.clone();
+        assert!(
+            eventually(|| crate::model::lock(&d)
+                .last_attempt
+                .as_ref()
+                .is_some_and(|a| !a.running()))
+            .await
+        );
+        assert_eq!(
+            crate::model::lock(&diagnostics)
+                .last_attempt
+                .as_ref()
+                .unwrap()
+                .output_tail,
+            "ran disconnect multicast"
+        );
+    }
+
+    /// Single-flight: two concurrent runs would race onchain user creation, so the second is a
+    /// `409` rather than a queued second attempt. The stub blocks until released, which is what
+    /// makes "still running" a real state rather than a timing accident.
+    #[tokio::test]
+    async fn a_second_attempt_while_one_is_running_is_refused() {
+        let diagnostics: SharedDiagnostics = Default::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = spawn_state(stub_state(diagnostics.clone(), rx, 0)).await;
+        let client = reqwest::Client::new();
+
+        let first = client
+            .post(format!("{base}/admin/connect"))
+            .header(REQUIRED_HEADER, "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 202);
+
+        // The first attempt is blocked in the stub, so this one lands mid-flight.
+        let second = client
+            .post(format!("{base}/admin/disconnect"))
+            .header(REQUIRED_HEADER, "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 409);
+        let body: Value = second.json().await.unwrap();
+        assert_eq!(body["error"], "attempt_already_running");
+
+        tx.send(()).unwrap();
+        let d = diagnostics.clone();
+        assert!(eventually(|| !crate::model::lock(&d).attempt_running()).await);
+        assert_eq!(
+            crate::model::lock(&diagnostics)
+                .last_attempt
+                .as_ref()
+                .unwrap()
+                .command,
+            "doublezero connect multicast",
+            "the refused second request must not have replaced the running attempt"
+        );
+    }
+
+    /// The CSRF guard and the body refusal apply to `connect`/`disconnect` exactly as they do to
+    /// `channels` — and here the stakes are higher: a browser form post that provisioned an
+    /// onchain user is the outcome this rules out. Both must refuse **before** anything is spawned,
+    /// which the untouched snapshot pins.
+    #[tokio::test]
+    async fn a_connect_without_the_header_or_with_a_body_is_refused_and_starts_nothing() {
+        let diagnostics: SharedDiagnostics = Default::default();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let base = spawn_state(stub_state(diagnostics.clone(), rx, 0)).await;
+        let client = reqwest::Client::new();
+
+        let no_header = client
+            .post(format!("{base}/admin/connect"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_header.status(), 403);
+        assert_eq!(
+            no_header.json::<Value>().await.unwrap()["error"],
+            "missing_admin_header"
+        );
+
+        let with_body = client
+            .post(format!("{base}/admin/connect"))
+            .header(REQUIRED_HEADER, "1")
+            .body("device=whatever")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(with_body.status(), 400);
+        assert_eq!(
+            with_body.json::<Value>().await.unwrap()["error"],
+            "unsupported_request_body"
+        );
+
+        assert!(
+            crate::model::lock(&diagnostics).last_attempt.is_none(),
+            "a refused request must not have started an attempt"
         );
     }
 

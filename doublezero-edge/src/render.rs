@@ -25,6 +25,8 @@ pub fn render_table(endpoint: Endpoint, body: &Value) -> Result<String, String> 
         Endpoint::Status => render_status(body),
         Endpoint::ChannelsList => crate::channels::render_channels_list(body),
         Endpoint::ChannelsSet => render_channels_set(body),
+        Endpoint::Diagnose => crate::diagnose::render_diagnose(body),
+        Endpoint::Connect | Endpoint::Disconnect => crate::diagnose::render_attempt(body),
     }
 }
 
@@ -331,8 +333,9 @@ pub(crate) fn render_channels_block(channels: &ChannelsBlock) -> String {
 
 /// The `registry` orientation line: which document resolved, its version, and how many rows/
 /// receivers it carries. Deliberately one line — this is orientation for reading the rest of
-/// `status`, not a report in its own right.
-fn render_registry_line(r: &RegistryBlock) -> String {
+/// `status`, not a report in its own right. `pub(crate)` because `diagnose` reports the identical
+/// block off `/admin/diagnostics` and must read the same there.
+pub(crate) fn render_registry_line(r: &RegistryBlock) -> String {
     format!(
         "registry: source={}  version={}  rows={}  receivers={}",
         r.source, r.version, r.rows, r.receivers

@@ -112,3 +112,65 @@ Activation mirrors the WebSocket sink exactly: *configured* by a non-empty `--ap
 (`--api-bind ""` disables it outright), *activated* by the subscription reconciler only once this
 host is subscribed to ≥1 market-data feed, and bound non-fatally — a taken port disables the API for
 that reconcile cycle rather than crash-looping the tunnel.
+
+## Admin surface (`/admin`)
+
+The one **mutating** surface in this crate (`sinks::admin`), deliberately kept off `/v1` so that
+stays provably read-only. It is **on by default at loopback** (`--admin-bind` / `DZ_ADMIN_BIND`,
+`127.0.0.1:9098`; set empty to disable it outright) and — unlike the WebSocket sink and the query
+API — is **not subscription-gated**, which is the property the whole surface hangs on: an operator
+must be able to inspect a channel filter before anything is subscribed, and to diagnose a host that
+is subscribed to nothing at all.
+
+| Route | |
+|---|---|
+| `GET /admin/channels` | The channel filter in force, and which publishers/channels it **admits** (not which receivers are running — `GET /v1/status`'s `channels` block reports real liveness) |
+| `POST /admin/channels?channels=<spec>` | Replace the channel filter, validated by the same parser `--channels` uses at startup. Applies on the reconciler's next tick |
+| `GET /admin/diagnostics` | Tunnel/subscription/activation state plus one verdict — below |
+| `POST /admin/connect`, `POST /admin/disconnect` | Run `doublezero connect multicast` / `doublezero disconnect multicast` inside the container |
+
+### `GET /admin/diagnostics`
+
+Answers "why is nothing being served?" on the one host where nothing else can: `/v1` activates only
+once a market-data feed is subscribed, so on a host whose tunnel never came up it is not listening
+and every query fails with a transport error while `docker ps` shows a healthy container.
+
+The response is cached state plus a pure function — no shell-out on the read path. The reconciler
+already runs `doublezero status --json` every `--subscription-refresh-secs` for activation; this
+reports the session fields it was previously discarding (`session_status`, `tunnel_name`,
+`user_type`, `current_device`, `lowest_latency_device`, `metro`, `network`), the subscribed group
+codes split into market-data / shred / other, the running receivers with their real liveness, which
+sinks are up, the resolved feed-registry document, and the process block. Reading them **cannot**
+move activation: every field is optional and additive, and `multicast_groups` remains the sole
+input to what runs.
+
+`diagnosis` is an ordered ladder over that state, each rung reached only once the one above it is
+ruled out — so a host with no `doublezero` CLI is never reported as a broken tunnel:
+
+| `code` | |
+|---|---|
+| `pending` | No poll has completed yet |
+| `dz_cli_missing` | No `doublezero` CLI (running from source); gating falls open |
+| `daemon_unreachable` | `doublezero status` failed — quotes what it printed, usually `Please start the doublezerod service.` |
+| `tunnel_down` | No session reports `BGP Session Up` |
+| `no_market_data_subscriptions` | Tunnel up, but no subscribed group matches a feed this build serves |
+| `subscribed_no_traffic` | Receivers running, none delivering — usually a default-deny host firewall on `doublezero1` |
+| `gating_disabled` / `ok` | Nothing to fix |
+
+`doublezero-edge diagnose` renders this; `doublezero-edge connect` is the retry the `tunnel_down`
+rung points at.
+
+### Guards on the mutating routes
+
+`POST` requires an `X-DZ-Admin-Request` header (any value) and refuses a request body. The header is
+not authentication — this surface has none — it rules out a request a browser page on the same host
+could have caused by accident, which a `<form>` cannot produce. `GET` routes are exempt: requiring
+it on the diagnostics read would make the one command a stuck operator most needs harder to run than
+`curl`.
+
+`connect`/`disconnect` additionally run a **fixed argv** (a module constant — the routes take no
+parameters, so no request input reaches the child process) and are **single-flight**: a second
+attempt while one is running is `409`, because two concurrent runs would race onchain user creation.
+The child runs on a blocking thread and the route answers `202` immediately; the outcome lands back
+in `GET /admin/diagnostics` under `last_attempt`. There is no rate limit — a script looping on
+`connect` would serially re-run onchain provisioning.
