@@ -236,13 +236,19 @@ fn render_best_bid_ask(body: &Value) -> Result<String, String> {
 
 fn render_status(body: &Value) -> Result<String, String> {
     let parsed: StatusResponse = parse(body)?;
+    let mut out = String::new();
+    if !parsed.registry.source.is_empty() {
+        out.push_str(&render_registry_line(&parsed.registry));
+        out.push_str("\n\n");
+    }
+
     let headers = ["VENUE", "STATUS"];
     let rows: Vec<Vec<String>> = parsed
         .venues
         .iter()
         .map(|v| vec![v.venue.clone(), v.status.clone()])
         .collect();
-    let mut out = table(&headers, &rows);
+    out.push_str(&table(&headers, &rows));
 
     out.push_str("\n\n");
     out.push_str(&render_history_line(&parsed.history));
@@ -314,6 +320,16 @@ pub(crate) fn render_channels_block(channels: &ChannelsBlock) -> String {
         channels.excluded_by_filter
     ));
     sections.join("\n\n")
+}
+
+/// The `registry` orientation line: which document resolved, its version, and how many rows/
+/// receivers it carries. Deliberately one line — this is orientation for reading the rest of
+/// `status`, not a report in its own right.
+fn render_registry_line(r: &RegistryBlock) -> String {
+    format!(
+        "registry: source={}  version={}  rows={}  receivers={}",
+        r.source, r.version, r.rows, r.receivers
+    )
 }
 
 fn render_process_line(p: &ProcessBlock) -> String {
@@ -451,6 +467,36 @@ mod tests {
     fn the_table_does_not_cry_wolf_below_cap() {
         let out = render_status(&fixture_status_healthy()).unwrap();
         assert!(!out.contains("AT CAP"), "{out}");
+    }
+
+    /// The `registry` line is orientation for the rest of `status`: which document, its version,
+    /// and row/receiver counts, on one line.
+    #[test]
+    fn the_registry_line_reports_source_version_and_counts() {
+        let mut body = fixture_status_healthy();
+        body["registry"] = serde_json::json!({
+            "source": "url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
+            "version": 3,
+            "rows": 12,
+            "receivers": 27
+        });
+        let out = render_status(&body).unwrap();
+        assert!(
+            out.contains(
+                "registry: source=url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json  \
+                 version=3  rows=12  receivers=27"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A server predating the `registry` block sends no such key, which deserializes to the
+    /// `Default` (empty `source`) — this must render as no line at all, never a blank
+    /// "registry: source=  version=0  rows=0  receivers=0" guess.
+    #[test]
+    fn the_registry_line_is_omitted_on_an_older_server() {
+        let out = render_status(&fixture_status_healthy()).unwrap();
+        assert!(!out.contains("registry:"), "{out}");
     }
 
     /// `bound` and `allowed` must read as visibly distinct columns, not be collapsed into one

@@ -569,8 +569,12 @@ Modules are grouped by role under `src/`:
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
-- **`sinks/api.rs`**'s `GET /v1/status` carries three accounting blocks beyond per-venue
-  `online`/`offline`: `history` (`history::Store::stats()` verbatim — products tracked/at cap,
+- **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
+  `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
+  bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical
+  figures `main` logs once at startup as "feed registry resolved," read from
+  `ingest::feeds::registry_info()` rather than recomputed, so a fleet-wide check of which document a
+  host is running doesn't need log access), `history` (`history::Store::stats()` verbatim — products tracked/at cap,
   buckets, bucket budget, estimated bytes, window, evictions, late drops), `channels` (per enabled
   row that carries a channel id — every row but a flat one, see `ingest/channel_filter.rs` — its full
   roster with `allowed` from the channel filter alone, `bound` from **real** receiver liveness

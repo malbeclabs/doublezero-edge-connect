@@ -461,15 +461,40 @@ pub struct Loaded {
     version: u32,
 }
 
+/// The resolved registry's provenance and shape — the exact figures [`Loaded::log_resolved`]
+/// announces once at startup, kept alive afterward (see `ingest::feeds::registry_info`) so
+/// `/v1/status` can report them without recomputing anything or reading a log.
+#[derive(Debug, Clone)]
+pub struct RegistryInfo {
+    /// What the rows came from: a URL, a bind-mounted file path, or "built-in" (with a reason
+    /// suffix on a fallback, e.g. `"built-in (fetch of <url> failed)"`).
+    pub origin: String,
+    pub version: u32,
+    pub rows: usize,
+    pub receivers: usize,
+}
+
 impl Loaded {
+    /// Snapshot of what got installed — the identical figures [`log_resolved`](Self::log_resolved)
+    /// announces, for a caller that wants them without going through `tracing`.
+    pub fn info(&self) -> RegistryInfo {
+        RegistryInfo {
+            origin: self.origin.clone(),
+            version: self.version,
+            rows: self.rows.len(),
+            receivers: self.rows.iter().map(|f| f.publishers.len()).sum(),
+        }
+    }
+
     /// Announce the installed registry. Which one a process is running is the first question any
     /// drift investigation asks, and it must not require guessing from behaviour.
     pub fn log_resolved(&self) {
+        let snap = self.info();
         info!(
-            source = self.origin,
-            version = self.version,
-            rows = self.rows.len(),
-            receivers = self.rows.iter().map(|f| f.publishers.len()).sum::<usize>(),
+            source = snap.origin,
+            version = snap.version,
+            rows = snap.rows,
+            receivers = snap.receivers,
             "feed registry resolved"
         );
     }

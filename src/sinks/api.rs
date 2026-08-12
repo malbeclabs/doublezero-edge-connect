@@ -777,7 +777,28 @@ fn status(state: &ApiState) -> Response {
         "history": history_json,
         "channels": channels_block(state),
         "process": process_block(),
+        "registry": registry_block(),
     }))
+}
+
+/// The `registry` block: which feed-registry document this process resolved (a URL, a bind-mounted
+/// file path, or `"built-in"` — see `ingest::registry::Loaded`'s `origin`), its `version`, and how
+/// many rows/receivers it carries. The bridge already logs exactly these figures once at startup
+/// as "feed registry resolved"; this surfaces the same value (`ingest::feeds::registry_info`)
+/// instead of recomputing it, so a fleet-wide check of which document a host is running doesn't
+/// need log access. `null` only if queried before the registry resolved, which does not happen once
+/// this sink is serving — registry resolution completes in `main` before any receiver or sink
+/// spawns.
+fn registry_block() -> Value {
+    match crate::ingest::feeds::registry_info() {
+        Some(info) => json!({
+            "source": info.origin,
+            "version": info.version,
+            "rows": info.rows,
+            "receivers": info.receivers,
+        }),
+        None => Value::Null,
+    }
 }
 
 /// Max distinct symbol prefixes **sent** per channel in [`channel_symbol_prefixes`] — the true
@@ -2430,6 +2451,31 @@ mod tests {
         assert_eq!(phoenix["status"], "offline", "never registered up: {body}");
         assert_eq!(body["history"]["products_tracked"], 1);
         assert_eq!(body["history"]["window_seconds"], 3600);
+    }
+
+    /// `/v1/status`'s `registry` block must carry the *same* figures `ingest::feeds::registry_info`
+    /// holds — not a recomputed guess — so this fetches the built-in document independently
+    /// (`registry::load_built_in`) and compares against the response rather than hardcoding numbers
+    /// that would silently drift alongside the fixture registry.
+    #[tokio::test]
+    async fn status_reports_the_resolved_feed_registry() {
+        // Under this crate's test-build side door, `feeds()` installs the built-in document on
+        // first read (see its docs) — call it so `registry_info()` is populated before we ask.
+        let _ = feeds();
+        let expected = crate::ingest::registry::load_built_in()
+            .expect("the built-in feed registry document is valid")
+            .info();
+
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let r = &body["registry"];
+        assert_eq!(r["source"], expected.origin);
+        assert_eq!(r["version"], expected.version);
+        assert_eq!(r["rows"], expected.rows);
+        assert_eq!(r["receivers"], expected.receivers);
     }
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a

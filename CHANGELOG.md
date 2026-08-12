@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when) two candidates would otherwise render identically. The product id format is unchanged.
 
 ### Added
+- `GET /v1/status` carries a new `registry` block: which feed-registry document this process
+  resolved (a URL, a bind-mounted file path, or `"built-in"`), its `version`, and its row/receiver
+  counts — the same figures the bridge already logs once at startup as "feed registry resolved,"
+  now checkable across a fleet without log access. `doublezero-edge status` renders it as one
+  orientation line. `scripts/connect.sh`'s printed feed-registry line no longer leaks raw ANSI
+  escapes from the container's coloured log output.
 - `doublezero-edge` is now packaged as a signed deb and rpm, built as a static musl binary and
   published to the same repositories as the DoubleZero client — so installing it needs no new key
   and no new trust decision. The package carries the binary and shell completions and nothing else:

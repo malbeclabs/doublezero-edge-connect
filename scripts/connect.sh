@@ -720,7 +720,10 @@ echo
 # briefly only to cover a slow container start.
 registry_line=""
 for _ in $(seq 1 10); do
-  registry_line="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "feed registry resolved" | tail -1 || true)"
+  # `tracing`'s formatter colours this line, and `docker logs` passes those ANSI escapes straight
+  # through -- strip them (a bare CSI-sequence match) so the operator sees plain text, not
+  # "^[[3msource^[[0m^[[2m=^[[0m...".
+  registry_line="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "feed registry resolved" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
   [ -n "$registry_line" ] && break
   sleep 1
 done
