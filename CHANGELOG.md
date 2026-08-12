@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows
+  span more than one category, even when its own category resolves unambiguously (e.g. Lashay's
+  single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
+  fallback now filters by `(venue, category)` instead of venue alone.
 - `doublezero-edge` panicked with a broken-pipe error whenever its stdout output was piped into a
   consumer that stops reading early (`| head`, `| less -q`, a short-circuiting `grep -q`) —
   completely ordinary usage for a JSON/table-printing CLI. Every stdout write now goes through a
