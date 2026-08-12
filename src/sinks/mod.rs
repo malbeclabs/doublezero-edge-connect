@@ -4,8 +4,9 @@
 //!   - [`ws`]      - WebSocket server (PROTOCOL.md wire contract); on by default, off if `--ws-bind` empty.
 //!   - [`metrics`] - Prometheus metrics HTTP endpoint; off by default, on when `--metrics-bind` is set.
 //!   - [`api`]     - read-only `/v1` JSON query API over the rolling history window + snapshots.
-//!   - [`admin`]   - the one mutation path (runtime channel-filter changes); off by default, on when
-//!     `--admin-bind` is set. Deliberately separate from [`api`] so `/v1` stays provably read-only.
+//!   - [`admin`]   - the one mutation path (runtime channel-filter changes); on by default, at
+//!     loopback (`--admin-bind`/`DZ_ADMIN_BIND` default `127.0.0.1:9098`), off when set empty.
+//!     Deliberately separate from [`api`] so `/v1` stays provably read-only.
 //!
 //! Sink activation is uniform: a sink is active when its key config value is non-empty/present.
 //! The WS sink just ships a non-empty default bind, so it is on unless explicitly cleared; the

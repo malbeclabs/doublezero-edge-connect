@@ -93,7 +93,7 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned feed ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a feed whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
 | `DZ_FEED_REGISTRY_URL` | hosted URL (**image default**) | URL to fetch the feed registry document from at startup — the image sets this to `https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used instead and a warning is logged — never fatal. See [Feed registry](#feed-registry) below for how to tell which source actually loaded. |
 | `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, for an air-gapped/locked-down host. The bridge tries `DZ_FEED_REGISTRY_URL` first when it's non-empty, so the installer clears the image's default URL for you whenever you set this without also setting a URL of your own — otherwise the file would be silently shadowed. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
-| `DZ_ADMIN_BIND` | *(off)* | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). Off by default; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you enable it, bind to loopback (e.g. `127.0.0.1:9098`) — never a bare wildcard. Loopback alone does not stop a browser page on the same host from POSTing here, so `POST` also requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it automatically. |
+| `DZ_ADMIN_BIND` | `127.0.0.1:9098` | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). On by default, at loopback; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you override this, stay on loopback — never a bare wildcard. Set empty to disable it outright. Loopback alone does not stop a browser page on the same host from POSTing here, so `POST` also requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it automatically. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt) and imply "yes" to the `doublezero-edge` CLI install offer too. |
 | `DZ_INSTALL_CLI` | *(prompted)* | Answer the `doublezero-edge` CLI install offer non-interactively: `1` installs, `0` skips. Overridden by `DZ_ASSUME_YES=1`. |
@@ -286,10 +286,11 @@ devnet too — the CLI has no ledger coupling).
 
 ### Admin surface (runtime channel changes)
 
-Beyond `/v1`, the bridge optionally serves an **admin** surface — `GET`/`POST /admin/channels` — the
-one runtime-mutation path in edge-connect, letting the channel filter (`--channels`/
-`DZ_CHANNELS`) be replaced without a restart. It is **off by default** (`--admin-bind`/
-`DZ_ADMIN_BIND` empty) and deliberately separate from `/v1`, which stays provably read-only.
+Beyond `/v1`, the bridge serves an **admin** surface — `GET`/`POST /admin/channels` — the one
+runtime-mutation path in edge-connect, letting the channel filter (`--channels`/
+`DZ_CHANNELS`) be replaced without a restart. It is **on by default, at loopback**
+(`--admin-bind`/`DZ_ADMIN_BIND` defaults to `127.0.0.1:9098`; set empty to disable it outright) and
+deliberately separate from `/v1`, which stays provably read-only.
 
 ```bash
 ./target/release/doublezero-edge-connect --iface doublezero1 --admin-bind 127.0.0.1:9098

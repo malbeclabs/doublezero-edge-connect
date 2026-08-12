@@ -195,10 +195,11 @@ pub struct ReconcilerConfig {
     /// Which channels of each feed this process ingests (`--channels`), parsed and validated once in
     /// `main`. Empty by default, which admits every channel of every feed.
     ///
-    /// Shared and mutable: the admin surface (`sinks::admin`, off unless `--admin-bind` is set) can
-    /// replace it at runtime, and this reconciler reads it fresh every tick — a lock acquisition per
-    /// tick is free at `--subscription-refresh-secs` granularity, and this is the only change needed
-    /// for a runtime channel filter swap to reach the existing spawn/abort diff.
+    /// Shared and mutable: the admin surface (`sinks::admin`, on by default at loopback, off when
+    /// `--admin-bind` is set empty) can replace it at runtime, and this reconciler reads it fresh
+    /// every tick — a lock acquisition per tick is free at `--subscription-refresh-secs`
+    /// granularity, and this is the only change needed for a runtime channel filter swap to reach
+    /// the existing spawn/abort diff.
     pub filter: Arc<Mutex<ChannelFilter>>,
     pub iface: String,
     pub recv_buf: usize,

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `--admin-bind`/`DZ_ADMIN_BIND` now defaults to `127.0.0.1:9098` instead of empty, so
+  `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
+  the condition that the default binds loopback only — a wildcard bind still requires an explicit,
+  documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
+
 ### Fixed
 - `scripts/connect.sh` configured a package repository nothing publishes to, so the CLI offer
   failed and skipped on every run — it now points at `malbeclabs/doublezero`, the repository a

@@ -43,11 +43,13 @@
 #                            identical container-side path -- an unreadable path aborts before any
 #                            container starts, rather than being passed through to silently resolve
 #                            to nothing.
-#   DZ_ADMIN_BIND=<host:port> turns on GET/POST /admin/channels, the one runtime-MUTATION path in
-#                            the bridge (lets DZ_CHANNELS be replaced without a restart). It has NO
-#                            authentication, and under this container's --network host a wildcard
-#                            bind is genuinely reachable from the network. Bind loopback, e.g.
-#                            DZ_ADMIN_BIND=127.0.0.1:9098; a non-loopback value is only warned about,
+#   DZ_ADMIN_BIND=<host:port> the bridge binds GET/POST /admin/channels -- the one runtime-MUTATION
+#                            path in the bridge (lets DZ_CHANNELS be replaced without a restart) --
+#                            at 127.0.0.1:9098 by default; set this only to override that address or
+#                            to disable it (empty). It has NO authentication, and under this
+#                            container's --network host a wildcard bind is genuinely reachable from
+#                            the network, so if you override the default, stay on loopback, e.g.
+#                            DZ_ADMIN_BIND=127.0.0.1:9099; a non-loopback value is only warned about,
 #                            never blocked.
 #
 # A DZ_-token-derived keypair is injected straight into the container and is never
@@ -570,8 +572,10 @@ fi
 # 4d. admin surface warning (host-side)
 # ----------------------------------------------------------------------------
 # GET/POST /admin/channels (DZ_ADMIN_BIND) is the one runtime-MUTATION path in the bridge, and it
-# carries NO authentication. Under this container's --network host, a wildcard bind is genuinely
-# reachable from the network -- warn loudly (the script can't enforce a bind choice, only flag one).
+# carries NO authentication. The bridge itself defaults this to 127.0.0.1:9098 (loopback), so this
+# check only fires when DZ_ADMIN_BIND is explicitly overridden on the host -- under this container's
+# --network host, a wildcard bind is genuinely reachable from the network -- warn loudly (the script
+# can't enforce a bind choice, only flag one).
 if [ -n "${DZ_ADMIN_BIND:-}" ]; then
   case "$DZ_ADMIN_BIND" in
     127.*|localhost:*) : ;;
