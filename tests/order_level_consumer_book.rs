@@ -16,9 +16,9 @@ use doublezero_edge_connect::{
     model::{BookAction, BookChange, BookSide, FeedMessage, NormalizedBook},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
@@ -110,6 +110,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
+    a.set_book_replay(Arc::new(Mutex::new(HashMap::new())));
     let market = (VENUE.into(), CHANNEL, INSTRUMENT);
     let (fast, slow) = (arm(1), arm(2));
     a.set_book_synced(&market, fast, true);
@@ -198,7 +199,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
 
     // The fast publisher's host is drained: its receiver exits, which is the moment its claim to be
     // serving this market ends.
-    a.forget_publisher_books(fast);
+    a.forget_publisher_books(VENUE, fast);
 
     // The venue moves on while the only remaining publisher is still recovering, so the consumer's
     // book is stale by the time that publisher resyncs.
@@ -230,6 +231,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
+    a.set_book_replay(Arc::new(Mutex::new(HashMap::new())));
     let market: (Arc<str>, u32, u32) = (VENUE.into(), CHANNEL, INSTRUMENT);
     let (fast, drifted) = (arm(1), arm(2));
     a.set_book_synced(&market, fast, true);

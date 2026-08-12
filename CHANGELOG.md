@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- The Hyperliquid-compatible sink no longer clones a whole book — up to 44,598 orders — while holding
-  the shared book map's mutex, which the ingest emit path takes on every published batch. Only the
-  minimum each channel needs is copied out under it (the folded price levels for `l2Book`, the order
-  set for `l4Book`); the decimal formatting and the JSON run after the guard drops.
+- The Hyperliquid-compatible sink holds the shared book map's mutex — the one the ingest emit path
+  takes on every published batch — for a clone and nothing else; every rendering step now provably
+  runs after the guard drops. The clone is the cheapest snapshot available rather than a fallback:
+  measured on the 44,598-order fixture it is ~0.45 ms against ~9.1 ms to fold under the guard.
 - A Hyperliquid-sink market that empties no longer stops being treated as order-level, which silently
   stopped both book channels — permanently for `l4Book`, whose snapshot is only sent once that gate
   passes. Order-level is now a property of the market rather than of what it currently holds.
@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eviction past that horizon costs the guard nothing and is left alone, so a book far larger than the
   per-market cap still streams normally). Both are counted by the
   new `dz_mbo_forced_rebaselines_total{venue,reason}` (`disagreement` / `guard_evicted`); each costs
-  a full republish of the market's book, so a sustained rate is the signal that the per-publisher
-  book model is too expensive to keep.
+  a full republish of the market's book — rate-limited to one per market per
+  `--arb-book-dedup-window-ms` — so a sustained rate is the signal that the per-publisher book model
+  is too expensive to keep. The republish is the book the wire agreed on, never one publisher's own.
 - A re-baseline no longer wipes the cross-publisher resurrection guard. Only the dedup window is
   stale after one — a venue still never reuses an order id, so a lagging publisher's first and only
   copy of an `Add` for an order a peer already killed must still be refused. The re-baseline's own
