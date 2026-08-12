@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second publisher sharing one port block and separated only by `channel_id` had every market
   enter the catalog twice, one of the pair never getting a book. `publisher_offset` is now a
   row-level registry field so either shape can declare it.
+- `GET /v1/products` returned the catalog in `HashMap` iteration order, which shuffles between
+  calls. It is now sorted server-side by `(channel, instrument_id)` ascending, so every client
+  benefits rather than just a table renderer that happened to sort client-side.
 - The channel-departure purge fired on any shrink of the desired feed set, including a plain
   subscription loss (a group unsubscribed, or a `doublezero status` blip that parses fine and
   momentarily stops listing a code) — destroying a channel's catalog/book/history on a one-tick
