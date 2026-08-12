@@ -240,6 +240,13 @@ pub struct Feed {
 /// compile error and leaves [`feeds()`] the one entry point.
 static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
 
+/// The winning install's provenance (source/version/row+receiver counts) — the same figures
+/// [`registry::Loaded::log_resolved`] logs once at startup, kept here so a running process can
+/// report them (`/v1/status`'s `registry` block) without re-reading logs. Set alongside [`FEEDS`]
+/// and never afterward, for the identical reason: a losing install must not overwrite the winner's
+/// provenance any more than it overwrites its rows.
+static REGISTRY_INFO: OnceLock<registry::RegistryInfo> = OnceLock::new();
+
 /// Resolve the registry document from `source` and install it.
 ///
 /// Called once from `main` before any receiver spawns. A repeat call is ignored rather than
@@ -252,7 +259,9 @@ static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
 /// a one-off in a case that should not happen, and cheaper than making the install fallible.
 pub async fn init(source: registry::Source) -> Result<(), registry::RegistryError> {
     let loaded = registry::load(source).await?;
+    let info = loaded.info();
     if FEEDS.set(loaded.rows).is_ok() {
+        let _ = REGISTRY_INFO.set(info);
         loaded.log_resolved();
     } else {
         warn!(
@@ -269,10 +278,18 @@ pub async fn init(source: registry::Source) -> Result<(), registry::RegistryErro
 /// compiled-in document is itself invalid, which is a build-time defect.
 pub fn init_built_in() {
     let _ = FEEDS.get_or_init(|| {
-        registry::load_built_in()
-            .expect("the built-in feed registry document is valid")
-            .rows
+        let loaded =
+            registry::load_built_in().expect("the built-in feed registry document is valid");
+        let _ = REGISTRY_INFO.set(loaded.info());
+        loaded.rows
     });
+}
+
+/// The resolved registry's provenance, for `/v1/status`'s `registry` block. `None` only before
+/// [`init`]/[`init_built_in`] has run — never true once this process is serving requests, since the
+/// registry resolves before any receiver or sink spawns.
+pub fn registry_info() -> Option<&'static registry::RegistryInfo> {
+    REGISTRY_INFO.get()
 }
 
 /// Every feed row known to the bridge. The one entry point — callers never touch the backing

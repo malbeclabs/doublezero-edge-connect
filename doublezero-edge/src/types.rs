@@ -147,6 +147,9 @@ pub struct StatusResponse {
     /// build/platform (Linux-only) — default rather than fail the whole response.
     #[serde(default)]
     pub process: ProcessBlock,
+    /// Absent on an older server that predates the feed-registry resolution report.
+    #[serde(default)]
+    pub registry: RegistryBlock,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +292,23 @@ pub struct ProcessBlock {
     pub resident_memory_bytes: Option<f64>,
     #[serde(default)]
     pub cpu_seconds_total: Option<f64>,
+}
+
+/// The `registry` block of `/v1/status`: which feed-registry document this process resolved (a
+/// URL, a bind-mounted file path, or `"built-in"`), its `version`, and how many rows/receivers it
+/// carries — the same figures the bridge logs once at startup as "feed registry resolved," so a
+/// fleet-wide check doesn't need log access. Empty `source` (the `Default`) on an older server that
+/// predates this field, rendered as a blank line rather than a guess — see [`crate::render`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RegistryBlock {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub rows: usize,
+    #[serde(default)]
+    pub receivers: usize,
 }
 
 /// `GET /admin/channels`'s response shape — only the field `channels list` needs (the channel

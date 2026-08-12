@@ -233,16 +233,20 @@ struct Args {
     api_bind: String,
 
     /// Admin surface bind address (`GET`/`POST /admin/channels`) — the one mutation path in this
-    /// crate: it lets `--channels`/`DZ_CHANNELS` be replaced at runtime. **Off by default** (empty
-    /// disables it outright), unlike `--api-bind`: a mutation path that defaulted to on is a
-    /// mutation path someone gets by accident. This surface carries **no authentication** and — like
-    /// `--api-bind` — under host networking a wildcard bind is genuinely network-reachable, so the
-    /// recommendation if you enable it at all is a loopback bind (e.g. `127.0.0.1:9098`), never a
+    /// crate: it lets `--channels`/`DZ_CHANNELS` be replaced at runtime. **On by default, at
+    /// loopback** (`127.0.0.1:9098`): the exposure is accepted on the condition that the default
+    /// never reaches past this host. Set empty to disable it outright. This surface carries **no
+    /// authentication**, so — like `--api-bind` — under host networking a wildcard bind is genuinely
+    /// network-reachable; if you override this, stay on loopback (e.g. `127.0.0.1:<port>`), never a
     /// bare wildcard. Loopback alone does not stop a web page open in a browser on this host from
     /// POSTing a form here, so `POST` also requires an `X-DZ-Admin-Request` header (any value — a
     /// form post cannot set it). Deliberately separate from `--api-bind`'s `/v1`, which must stay
     /// provably read-only.
-    #[arg(long = "admin-bind", env = "DZ_ADMIN_BIND", default_value = "")]
+    #[arg(
+        long = "admin-bind",
+        env = "DZ_ADMIN_BIND",
+        default_value = "127.0.0.1:9098"
+    )]
     admin_bind: String,
 
     /// How often (seconds) the subscription reconciler re-reads `doublezero status` and reconciles
@@ -702,11 +706,12 @@ async fn main() -> Result<()> {
         )))
     };
 
-    // Admin surface: the one mutation path in this crate, off unless `--admin-bind` is set. Unlike
-    // the WS sink and the query API, it is **not** subscription-gated — an operator must be able to
-    // inspect or change the channel filter even with nothing currently subscribed — so it is
-    // spawned once here, gated only on the bind being non-empty. A taken port is non-fatal, exactly
-    // like `ws`/`api`: it disables this surface without taking the tunnel down.
+    // Admin surface: the one mutation path in this crate, on by default at loopback
+    // (`127.0.0.1:9098`) and disabled only if `--admin-bind` is set empty. Unlike the WS sink and
+    // the query API, it is **not** subscription-gated — an operator must be able to inspect or
+    // change the channel filter even with nothing currently subscribed — so it is spawned once
+    // here, gated only on the bind being non-empty. A taken port is non-fatal, exactly like
+    // `ws`/`api`: it disables this surface without taking the tunnel down.
     let admin_srv = if args.admin_bind.is_empty() {
         info!("admin surface disabled (empty --admin-bind)");
         None
@@ -801,12 +806,20 @@ mod tests {
         assert_eq!(all.len(), feeds::feeds().len());
     }
 
-    /// The admin surface is off unless explicitly bound. A mutation path that defaults to on is a
-    /// mutation path someone gets by accident — unlike `--api-bind`, which is loopback-on by
-    /// default because `/v1` is read-only.
+    /// The admin surface defaults on — but only at loopback, never a wildcard: that is the
+    /// condition the exposure was accepted under. Same shape as `--api-bind`'s default now, unlike
+    /// the old off-by-default policy this replaces.
     #[test]
-    fn the_admin_surface_is_off_by_default() {
-        assert!(Args::parse_from(["x"]).admin_bind.is_empty());
+    fn the_admin_surface_defaults_to_loopback_never_a_wildcard() {
+        let bind = Args::parse_from(["x"]).admin_bind;
+        assert!(
+            bind.starts_with("127.0.0.1:"),
+            "admin surface must default to loopback, got {bind:?}"
+        );
+        assert!(
+            !bind.starts_with("0.0.0.0"),
+            "admin surface must never default to a wildcard bind, got {bind:?}"
+        );
     }
 
     // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`). Includes the

@@ -569,8 +569,12 @@ Modules are grouped by role under `src/`:
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
-- **`sinks/api.rs`**'s `GET /v1/status` carries three accounting blocks beyond per-venue
-  `online`/`offline`: `history` (`history::Store::stats()` verbatim — products tracked/at cap,
+- **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
+  `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
+  bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical
+  figures `main` logs once at startup as "feed registry resolved," read from
+  `ingest::feeds::registry_info()` rather than recomputed, so a fleet-wide check of which document a
+  host is running doesn't need log access), `history` (`history::Store::stats()` verbatim — products tracked/at cap,
   buckets, bucket budget, estimated bytes, window, evictions, late drops), `channels` (per enabled
   row that carries a channel id — every row but a flat one, see `ingest/channel_filter.rs` — its full
   roster with `allowed` from the channel filter alone, `bound` from **real** receiver liveness
@@ -589,11 +593,12 @@ Modules are grouped by role under `src/`:
   host with neither the metrics endpoint nor `/proc` access enabled; `None`, never a fabricated `0`,
   when the collector isn't registered — it's Linux-only, see `metrics::Metrics::new`).
 - **`sinks/admin.rs`** — the **one mutation path** in this crate, entirely separate from `/v1`
-  (which must stay provably read-only) and off unless `--admin-bind`/`DZ_ADMIN_BIND` is set — empty
-  by default, unlike `--api-bind`: a mutation surface that defaulted on is one an operator gets by
-  accident. **No authentication**, and under host networking a wildcard bind is genuinely
-  network-reachable, so the documented recommendation is a loopback bind (`127.0.0.1:9098`), never a
-  bare wildcard. Two routes, both `/admin/channels`: `GET` reports the channel filter in force plus,
+  (which must stay provably read-only) and **on by default, at loopback**
+  (`--admin-bind`/`DZ_ADMIN_BIND` defaults to `127.0.0.1:9098`; set empty to disable it outright) —
+  the exposure is accepted on the condition that the default never reaches past loopback. **No
+  authentication**, and under host networking a wildcard bind is genuinely network-reachable, so an
+  override must stay on loopback, never a bare wildcard. Two routes, both `/admin/channels`: `GET`
+  reports the channel filter in force plus,
   per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver
   set (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
   field says so rather than the response naming the field "bound" and inviting the exact mistake

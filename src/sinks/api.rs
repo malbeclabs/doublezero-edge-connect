@@ -266,10 +266,14 @@ fn products_list(state: &ApiState) -> Response {
     // this guard across ~3 lock acquisitions per instrument (here, times a catalog that can run into
     // the thousands) would contend against ingest for the whole response build; the same discipline
     // `sinks/ws.rs::replay_scoped` documents (take-then-drop before any further work).
-    let instruments: Vec<NormalizedInstrument> = {
+    let mut instruments: Vec<NormalizedInstrument> = {
         let map = crate::model::lock(&state.instruments);
         map.values().cloned().collect()
     };
+    // The backing map is a `HashMap`, so its iteration order is unspecified and shuffles between
+    // calls. Sort deterministically by `(channel, instrument_id)` so every client benefits, not
+    // just one that happens to sort client-side.
+    instruments.sort_by_key(|i| (i.channel, i.instrument_id));
     let mut counts: HashMap<(u16, String), usize> = HashMap::new();
     for i in &instruments {
         *counts
@@ -773,7 +777,28 @@ fn status(state: &ApiState) -> Response {
         "history": history_json,
         "channels": channels_block(state),
         "process": process_block(),
+        "registry": registry_block(),
     }))
+}
+
+/// The `registry` block: which feed-registry document this process resolved (a URL, a bind-mounted
+/// file path, or `"built-in"` — see `ingest::registry::Loaded`'s `origin`), its `version`, and how
+/// many rows/receivers it carries. The bridge already logs exactly these figures once at startup
+/// as "feed registry resolved"; this surfaces the same value (`ingest::feeds::registry_info`)
+/// instead of recomputing it, so a fleet-wide check of which document a host is running doesn't
+/// need log access. `null` only if queried before the registry resolved, which does not happen once
+/// this sink is serving — registry resolution completes in `main` before any receiver or sink
+/// spawns.
+fn registry_block() -> Value {
+    match crate::ingest::feeds::registry_info() {
+        Some(info) => json!({
+            "source": info.origin,
+            "version": info.version,
+            "rows": info.rows,
+            "receivers": info.receivers,
+        }),
+        None => Value::Null,
+    }
 }
 
 /// Max distinct symbol prefixes **sent** per channel in [`channel_symbol_prefixes`] — the true
@@ -1232,6 +1257,50 @@ mod tests {
         // has no `BookSnapshot`/`DepthSnapshot` entry for it, so which row serves it is genuinely
         // unknown — see `feed_kind_ladder_prefers_book_then_depth_then_registry_then_unknown`.
         assert_eq!(p["feed_kind"], "unknown");
+    }
+
+    /// `/v1/products` reads from a `HashMap`, whose iteration order is unspecified and shuffles
+    /// between calls. This asserts the actual rendered *sequence* — not just that the same set
+    /// comes back — from a fixture inserted in an order that differs from the sorted one, which is
+    /// the only way a test can catch an ordering regression: a "same set" check passes whether or
+    /// not the endpoint sorts.
+    #[tokio::test]
+    async fn products_list_is_sorted_by_channel_then_instrument_id() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        // Insertion order deliberately does not match the expected sorted order below.
+        let fixtures = [
+            ("P1", 0u32, 99u32),
+            ("P5", 2u32, 5u32),
+            ("P3", 1u32, 50u32),
+            ("P2", 0u32, 3u32),
+            ("P4", 1u32, 10u32),
+        ];
+        {
+            let mut map = instruments.lock().unwrap();
+            for (symbol, channel, instrument_id) in fixtures {
+                map.insert(
+                    (
+                        "HYPERLIQUID".into(),
+                        "default".into(),
+                        channel,
+                        instrument_id,
+                    ),
+                    inst(1, "HYPERLIQUID", symbol, channel, instrument_id, -2, -5),
+                );
+            }
+        }
+
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/products")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let products = body["products"].as_array().unwrap();
+        let symbols: Vec<&str> = products
+            .iter()
+            .map(|p| p["symbol"].as_str().unwrap())
+            .collect();
+        // Ascending by (channel, instrument_id): (0,3) (0,99) (1,10) (1,50) (2,5).
+        assert_eq!(symbols, vec!["P2", "P1", "P4", "P3", "P5"]);
     }
 
     #[tokio::test]
@@ -2382,6 +2451,31 @@ mod tests {
         assert_eq!(phoenix["status"], "offline", "never registered up: {body}");
         assert_eq!(body["history"]["products_tracked"], 1);
         assert_eq!(body["history"]["window_seconds"], 3600);
+    }
+
+    /// `/v1/status`'s `registry` block must carry the *same* figures `ingest::feeds::registry_info`
+    /// holds — not a recomputed guess — so this fetches the built-in document independently
+    /// (`registry::load_built_in`) and compares against the response rather than hardcoding numbers
+    /// that would silently drift alongside the fixture registry.
+    #[tokio::test]
+    async fn status_reports_the_resolved_feed_registry() {
+        // Under this crate's test-build side door, `feeds()` installs the built-in document on
+        // first read (see its docs) — call it so `registry_info()` is populated before we ask.
+        let _ = feeds();
+        let expected = crate::ingest::registry::load_built_in()
+            .expect("the built-in feed registry document is valid")
+            .info();
+
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/status")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let r = &body["registry"];
+        assert_eq!(r["source"], expected.origin);
+        assert_eq!(r["version"], expected.version);
+        assert_eq!(r["rows"], expected.rows);
+        assert_eq!(r["receivers"], expected.receivers);
     }
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a

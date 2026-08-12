@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `--admin-bind`/`DZ_ADMIN_BIND` now defaults to `127.0.0.1:9098` instead of empty, so
+  `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
+  the condition that the default binds loopback only — a wildcard bind still requires an explicit,
+  documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
+
 ### Fixed
 - `scripts/connect.sh` configured a package repository nothing publishes to, so the CLI offer
   failed and skipped on every run — it now points at `malbeclabs/doublezero`, the repository a
@@ -17,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second publisher sharing one port block and separated only by `channel_id` had every market
   enter the catalog twice, one of the pair never getting a book. `publisher_offset` is now a
   row-level registry field so either shape can declare it.
+- `GET /v1/products` returned the catalog in `HashMap` iteration order, which shuffles between
+  calls. It is now sorted server-side by `(channel, instrument_id)` ascending, so every client
+  benefits rather than just a table renderer that happened to sort client-side.
 - The channel-departure purge fired on any shrink of the desired feed set, including a plain
   subscription loss (a group unsubscribed, or a `doublezero status` blip that parses fine and
   momentarily stops listing a code) — destroying a channel's catalog/book/history on a one-tick
@@ -64,6 +73,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when) two candidates would otherwise render identically. The product id format is unchanged.
 
 ### Added
+- `scripts/connect.sh` now checks UDP `44880` (the liveness port the container's own doublezerod
+  binds) before starting the container: a host daemon already bound there previously produced a
+  "successful" install followed by a container that died seconds later. It offers to stop (and
+  disable) the host daemon — only when systemd shows it active, never a service unrelated to the
+  conflict — states that this disconnects any tunnel the host daemon owns, and refuses to start the
+  container on a decline or an unanswered non-interactive run. `DZ_STOP_HOST_DAEMON=1|0` answers
+  non-interactively.
+- `GET /v1/status` carries a new `registry` block: which feed-registry document this process
+  resolved (a URL, a bind-mounted file path, or `"built-in"`), its `version`, and its row/receiver
+  counts — the same figures the bridge already logs once at startup as "feed registry resolved,"
+  now checkable across a fleet without log access. `doublezero-edge status` renders it as one
+  orientation line. `scripts/connect.sh`'s printed feed-registry line no longer leaks raw ANSI
+  escapes from the container's coloured log output.
 - `doublezero-edge` is now packaged as a signed deb and rpm, built as a static musl binary and
   published to the same repositories as the DoubleZero client — so installing it needs no new key
   and no new trust decision. The package carries the binary and shell completions and nothing else:
