@@ -31,12 +31,17 @@ FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# The repo is a Cargo workspace: `shred-proxy/` is a sibling member crate. Cargo needs every
-# member's manifest present to resolve the workspace, so we copy only the member's manifest — not
-# its sources, which the scoped `-p doublezero-edge-connect` build never compiles. Leaving the
-# sources out keeps edits to shred-proxy from busting this image's build cache; the shred-proxy
-# binary is released separately.
+# The repo is a Cargo workspace: `shred-proxy/` and `doublezero-edge/` are sibling member crates.
+# Cargo needs every member's manifest present to resolve the workspace, so we copy only each
+# member's manifest — not its sources, which the scoped `-p doublezero-edge-connect` build never
+# compiles. Leaving the sources out keeps edits to those crates from busting this image's build
+# cache; both binaries are released separately.
+#
+# A new workspace member MUST be added here. Without its manifest the workspace fails to resolve and
+# the build dies with a bare "No such file or directory" — and nothing else catches it, because the
+# test suites bind-mount the whole tree rather than exercising this selective copy.
 COPY shred-proxy/Cargo.toml ./shred-proxy/Cargo.toml
+COPY doublezero-edge/Cargo.toml ./doublezero-edge/Cargo.toml
 # Cache the cargo registry and the target dir across builds (BuildKit cache mounts) for fast
 # rebuilds. The target dir lives in the cache mount (not in the image layer), so the binary
 # must be copied out within this same RUN before the mount goes away.
@@ -93,7 +98,18 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/bridge-entrypoint.sh
 # default in src/main.rs); override with `-e RUST_LOG=debug` to get verbose output.
 ENV RUST_LOG=warn,doublezero_edge_connect=info
 
-# Documentational: host networking ignores published ports, but this records the WS port (8081).
-EXPOSE 8081
+# The hosted feed registry, as an image ENV rather than a compiled-in clap default: the binary
+# stays neutral (running from source reaches no network) while the container is opinionated,
+# inspectable via `docker inspect`, and overridable with `-e DZ_FEED_REGISTRY_URL=...` or a
+# bind-mounted file (`-e DZ_FEED_REGISTRY=<path>`). A host that can't reach the URL falls back to
+# the built-in document silently by design — see the "feed registry resolved" log line at startup
+# (src/ingest/registry.rs) for which source actually loaded.
+ENV DZ_FEED_REGISTRY_URL=https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json
+
+# Documentational: host networking ignores published ports (EXPOSE opens nothing by itself), but
+# this records the surfaces a default config can listen on. Always-on: 8081 (WS, --ws-bind) and
+# 9099 (query API, --api-bind). Off unless configured: 9090 (metrics, --metrics-bind, empty
+# default) and 9098 (admin, --admin-bind, empty default — no authentication; bind loopback only).
+EXPOSE 8081 9099 9090 9098
 
 ENTRYPOINT ["bridge-entrypoint.sh"]

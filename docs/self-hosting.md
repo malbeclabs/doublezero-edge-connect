@@ -37,11 +37,14 @@ docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun \
 Any of the bridge's env vars (see [Configure](../README.md#configure-override-the-one-liner))
 can be passed with `-e`.
 
-For a long-lived, detached deployment, cap the container log on disk so it can't fill the host —
-the installer's `docker run` does this for you, but a by-hand run should add it too:
+For a long-lived, detached deployment, cap the container log on disk so it can't fill the host, and
+raise the stop timeout so `docker stop` doesn't `SIGKILL` the entrypoint mid-`doublezero disconnect`
+(docker's default is 10s; releasing the tunnel and its onchain session can take longer). The
+installer's `docker run` does both for you, but a by-hand run should add them too:
 
 ```bash
 docker run -d --restart unless-stopped --network host --cap-add NET_ADMIN --device /dev/net/tun \
+  --stop-timeout 60 \
   --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
   doublezero-edge-connect      # ~60 MB log ceiling (20m x 3 rotated files)
 ```
@@ -60,3 +63,15 @@ a `:sha-<commit>` tag for precise pinning.
 
 > **No TLS.** edge-connect targets a trusted/local network (the same stance as the DoubleZero
 > overlay). Terminate TLS at a reverse proxy if you must expose it.
+
+## Feed registry
+
+The image sets `DZ_FEED_REGISTRY_URL` to the hosted document
+(`https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`); building/running from
+source instead gets the `clap` default, which is empty — no network call unless you pass
+`--feed-registry-url`/`DZ_FEED_REGISTRY_URL` yourself. Override with a different URL, or with
+`--feed-registry <path>`/`DZ_FEED_REGISTRY <path>` (a bind-mounted file, in Docker) — note the
+bridge tries the URL first when it's non-empty, so pass an empty `--feed-registry-url ""` alongside
+the file if you've also set a URL. A URL that can't be reached or fails validation falls back to
+the built-in document silently by design; check `sudo docker logs <container> | grep 'feed
+registry resolved'` (or the equivalent for a bare process) to see which source actually loaded.

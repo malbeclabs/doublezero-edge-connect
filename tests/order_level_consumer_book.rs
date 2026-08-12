@@ -13,10 +13,10 @@ use doublezero_edge_connect::{
         arbiter::{Arbiter, Publisher, TRADE_DEDUP_WINDOW},
         feeds::ArbitrationMode,
     },
-    model::{BookAction, BookChange, BookSide, FeedMessage, NormalizedBook},
+    model::{BookAction, BookChange, BookKey, BookReplay, BookSide, FeedMessage, NormalizedBook},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr},
     sync::{Arc, Mutex},
 };
@@ -25,6 +25,7 @@ use tokio::sync::broadcast;
 const VENUE: &str = "HYPERLIQUID";
 const CHANNEL: u32 = 1;
 const INSTRUMENT: u32 = 7;
+const CATEGORY: &str = "perp";
 const DEDUP_WINDOW_NS: u64 = 1_000;
 
 /// One order's resting state: which side, at what price, in what quantity.
@@ -66,6 +67,7 @@ fn batch(changes: Vec<BookChange>, recv_ns: u64) -> FeedMessage {
         symbol: "BTC".into(),
         channel: CHANNEL,
         instrument_id: INSTRUMENT,
+        category: CATEGORY.into(),
         changes,
         snapshot: false,
         last: true,
@@ -110,8 +112,8 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
-    a.set_book_replay(Arc::new(Mutex::new(HashMap::new())));
-    let market = (VENUE.into(), CHANNEL, INSTRUMENT);
+    a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
+    let market = (VENUE.into(), CATEGORY.into(), CHANNEL, INSTRUMENT);
     let (fast, slow) = (arm(1), arm(2));
     a.set_book_synced(&market, fast, true);
     a.set_book_synced(&market, slow, true);
@@ -128,8 +130,8 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
 
     // Both publishers install their books. The first through is published; the peer's copy is a
     // re-baseline for a market someone is already serving, so it is dropped.
-    a.emit(snapshot(&venue, 1_000), fast);
-    a.emit(snapshot(&venue, 1_001), slow);
+    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
 
     // Ordinary flow, every event mirrored by both publishers.
     let events = [
@@ -141,8 +143,8 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     for (i, &(id, side, px, sz)) in events.iter().enumerate() {
         let t = 2_000 + i as u64 * 10;
         venue.insert(id, (side, px, sz));
-        a.emit(batch(vec![change(id, side, px, sz)], t), fast);
-        a.emit(batch(vec![change(id, side, px, sz)], t + 1), slow);
+        a.emit(batch(vec![change(id, side, px, sz)], t), fast, CATEGORY);
+        a.emit(batch(vec![change(id, side, px, sz)], t + 1), slow, CATEGORY);
     }
 
     // A partial fill both publishers see: order 1 goes from 5 to 2. Same id, same action, same
@@ -152,10 +154,12 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.emit(
         batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 2_100),
         fast,
+        CATEGORY,
     );
     a.emit(
         batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 2_101),
         slow,
+        CATEGORY,
     );
 
     // The slow publisher re-sends its copy of an earlier event long past the dedup window. It is a
@@ -163,6 +167,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.emit(
         batch(vec![change(3, BookSide::Ask, 101.0, 7.0)], 9_000_000),
         slow,
+        CATEGORY,
     );
 
     // Order 2 is cancelled. Only the fast publisher's copy lands.
@@ -170,6 +175,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.emit(
         batch(vec![change(2, BookSide::Bid, 99.0, 0.0)], 9_000_100),
         fast,
+        CATEGORY,
     );
     drain(&mut consumer);
     assert_eq!(consumer, venue, "steady-state racing must not drift");
@@ -179,7 +185,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
 
     // The fast publisher gaps and recovers too. With no peer serving, its re-baseline goes out — and
     // its snapshot does not contain the cancelled order 2.
-    a.emit(snapshot(&venue, 9_000_200), fast);
+    a.emit(snapshot(&venue, 9_000_200), fast, CATEGORY);
     drain(&mut consumer);
     assert_eq!(
         consumer, venue,
@@ -193,6 +199,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.emit(
         batch(vec![change(2, BookSide::Bid, 99.0, 3.0)], 9_100_000),
         slow,
+        CATEGORY,
     );
     drain(&mut consumer);
     assert_eq!(consumer, venue, "a dead order must not be resurrected");
@@ -205,7 +212,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // book is stale by the time that publisher resyncs.
     venue.insert(3, (BookSide::Ask, 101.0, 4.0));
     venue.remove(&4);
-    a.emit(snapshot(&venue, 9_200_000), slow);
+    a.emit(snapshot(&venue, 9_200_000), slow, CATEGORY);
     drain(&mut consumer);
     assert_eq!(
         consumer, venue,
@@ -217,6 +224,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.emit(
         batch(vec![change(5, BookSide::Bid, 98.0, 9.0)], 9_300_000),
         slow,
+        CATEGORY,
     );
     drain(&mut consumer);
     assert_eq!(consumer, venue);
@@ -231,8 +239,8 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
-    a.set_book_replay(Arc::new(Mutex::new(HashMap::new())));
-    let market: (Arc<str>, u32, u32) = (VENUE.into(), CHANNEL, INSTRUMENT);
+    a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
+    let market: BookKey = (VENUE.into(), CATEGORY.into(), CHANNEL, INSTRUMENT);
     let (fast, drifted) = (arm(1), arm(2));
     a.set_book_synced(&market, fast, true);
     a.set_book_synced(&market, drifted, true);
@@ -241,7 +249,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     let mut consumer = Book::new();
 
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
-    a.emit(snapshot(&venue, 1_000), fast);
+    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
 
     // The venue fills order 1 down to 2. The drifted publisher missed that fill and reports the
     // order still resting at 5.
@@ -249,10 +257,12 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     a.emit(
         batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100),
         fast,
+        CATEGORY,
     );
     a.emit(
         batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200),
         drifted,
+        CATEGORY,
     );
 
     // Whatever comes next re-baselines the market rather than resuming either arm's deltas.
@@ -260,6 +270,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     a.emit(
         batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300),
         fast,
+        CATEGORY,
     );
 
     while let Ok(m) = rx.try_recv() {

@@ -37,8 +37,8 @@ use tracing::{info, warn};
 use crate::{
     metrics::metrics,
     model::{
-        now_ns, BookAccumulator, BookAction, BookSide, BookSnapshot, CountedLevel, FeedMessage,
-        NormalizedBook, NormalizedTrade, ReplayScope, Side,
+        now_ns, BookAccumulator, BookAction, BookKey, BookSide, BookSnapshot, CountedLevel,
+        FeedMessage, NormalizedBook, NormalizedTrade, ReplayScope, Side,
     },
 };
 
@@ -73,9 +73,6 @@ fn inbound_limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig
         .max_message_size(Some(64 * 1024))
         .max_frame_size(Some(64 * 1024))
 }
-
-/// A market in the shared replay map: `(venue, channel, instrument_id)`.
-type MarketKey = (Arc<str>, u32, u32);
 
 /// Longest client text echoed back in an error frame, so a hostile client cannot amplify its own
 /// input into our output.
@@ -661,7 +658,7 @@ fn sent(channel: &'static str) {
 /// is what keeps that honest for a market whose changes are price-aggregated: this sink reads only the
 /// order population, so such a market would render as an *empty* book, telling the consumer to discard
 /// levels the bridge holds.
-fn publishable(key: &MarketKey, acc: &BookAccumulator, coin: &str) -> bool {
+fn publishable(key: &BookKey, acc: &BookAccumulator, coin: &str) -> bool {
     key.0.as_ref() == VENUE
         && acc.symbol().as_ref() == coin
         && acc.baselined()
@@ -677,7 +674,7 @@ fn publishable(key: &MarketKey, acc: &BookAccumulator, coin: &str) -> bool {
 /// closure exists to keep that discipline visible at the call site, not to push work under the guard.
 fn take_market<T>(
     books: &BookSnapshot,
-    key: &MarketKey,
+    key: &BookKey,
     coin: &str,
     take: impl FnOnce(&BookAccumulator) -> T,
 ) -> Option<T> {
@@ -694,7 +691,7 @@ fn take_market<T>(
 fn take_markets<T>(
     books: &BookSnapshot,
     coin: &str,
-    take: impl Fn(&MarketKey, &BookAccumulator) -> T,
+    take: impl Fn(&BookKey, &BookAccumulator) -> T,
 ) -> Vec<T> {
     let guard = crate::model::lock(books);
     guard
@@ -736,7 +733,7 @@ fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
         Sub::L4Book { coin } => take_markets(books, coin, |key, acc| (key.clone(), acc.clone()))
             .into_iter()
             .map(|(key, acc)| {
-                let b = acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders);
+                let b = acc.to_book(&key, ReplayScope::Orders);
                 ("l4Book", render_l4book_snapshot(&b, coin))
             })
             .collect(),
@@ -773,7 +770,12 @@ fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static 
                 .changes
                 .first()
                 .is_some_and(|c| c.action == BookAction::Clear);
-            let key = (b.venue.clone(), b.channel, b.instrument_id);
+            let key = (
+                b.venue.clone(),
+                b.category.clone(),
+                b.channel,
+                b.instrument_id,
+            );
             // Only these two cases need book state; an ordinary `l4Book` diff is rendered from the
             // batch alone and takes no lock.
             let market = (l2 || (l4 && rebaseline))
@@ -786,7 +788,7 @@ fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static 
             let snapshot = market
                 .as_ref()
                 .filter(|_| l4 && rebaseline)
-                .map(|acc| acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders));
+                .map(|acc| acc.to_book(&key, ReplayScope::Orders));
             for sub in subs {
                 match sub {
                     Sub::L2Book {
@@ -954,7 +956,6 @@ fn subscription_response(method: &'static str, sub: &Sub) -> WsMessage {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -987,6 +988,19 @@ mod tests {
         book_with(changes)
     }
 
+    const TEST_CATEGORY: &str = "perps";
+
+    use crate::model::BookReplay;
+
+    /// The shared replay map a test hands the sink, holding exactly the markets listed.
+    fn replay(markets: Vec<(BookKey, BookAccumulator)>) -> BookSnapshot {
+        let mut r = BookReplay::default();
+        for (k, acc) in markets {
+            r.insert(k, acc);
+        }
+        Arc::new(Mutex::new(r))
+    }
+
     fn book_with(changes: Vec<BookChange>) -> NormalizedBook {
         NormalizedBook {
             venue: VENUE.into(),
@@ -1002,6 +1016,7 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            category: TEST_CATEGORY.into(),
         }
     }
 
@@ -1011,13 +1026,13 @@ mod tests {
         acc
     }
 
-    fn key() -> (Arc<str>, u32, u32) {
-        (Arc::from(VENUE), 0, 7)
+    fn key() -> BookKey {
+        (Arc::from(VENUE), Arc::from(TEST_CATEGORY), 0, 7)
     }
 
     /// The order set the sink copies out under the lock, in the form the renderer receives it.
     fn order_set(acc: &BookAccumulator) -> NormalizedBook {
-        acc.to_book(&key().0, key().1, key().2, ReplayScope::Orders)
+        acc.to_book(&key(), ReplayScope::Orders)
     }
 
     fn normalized_trade(
@@ -1037,11 +1052,14 @@ mod tests {
             size,
             aggressor_side: if buy { Side::Buy } else { Side::Sell },
             trade_id,
+            channel: 0,
+            instrument_id: 7,
             cumulative_volume: 0.0,
             source_ts_ns: 1_700_000_000_000_000_000,
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            category: TEST_CATEGORY.into(),
         }
     }
 
@@ -1481,7 +1499,7 @@ mod tests {
             order_id: 1,
         }]));
         assert!(!acc.baselined());
-        let books = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+        let books = replay(vec![(key(), acc)]);
         assert!(bootstrap(
             &books,
             &Sub::L2Book {
@@ -1518,7 +1536,7 @@ mod tests {
             },
         ]));
         assert!(acc.baselined() && !acc.is_order_level());
-        let books = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+        let books = replay(vec![(key(), acc)]);
         assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).is_empty());
         assert!(bootstrap(
             &books,
@@ -1555,7 +1573,7 @@ mod tests {
             size: 2.0,
             order_id: 12,
         }]));
-        let books = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+        let books = replay(vec![(key(), acc)]);
         assert_eq!(
             bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).len(),
             1
@@ -1580,10 +1598,10 @@ mod tests {
     /// `MAX_SUBS`.
     #[test]
     fn one_book_message_serves_every_subscription_of_the_market() {
-        let books = Arc::new(Mutex::new(HashMap::from([(
+        let books = replay(vec![(
             key(),
             accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]),
-        )])));
+        )]);
         let subs = vec![
             Sub::L2Book {
                 coin: "BTC".into(),
@@ -1631,7 +1649,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let books: BookSnapshot = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+        let books: BookSnapshot = replay(vec![(key(), acc)]);
 
         // Everything the two book channels need, copied out under the lock — never the accumulator.
         let (fold, time) = take_market(&books, &key(), "BTC", |a| {
@@ -1639,13 +1657,16 @@ mod tests {
         })
         .unwrap();
         let snapshot = take_market(&books, &key(), "BTC", |a| {
-            a.to_book(&key().0, key().1, key().2, ReplayScope::Orders)
+            a.to_book(&key(), ReplayScope::Orders)
         })
         .unwrap();
 
         // An ingest apply in flight, holding the map for as long as the renders below take.
         let mut held = crate::model::lock(&books);
-        held.insert((Arc::from(VENUE), 0, 8), BookAccumulator::new("ETH".into()));
+        held.insert(
+            (Arc::from(VENUE), Arc::from(TEST_CATEGORY), 0, 8),
+            BookAccumulator::new("ETH".into()),
+        );
 
         let (tx, rx) = std::sync::mpsc::channel();
         let rendering = std::thread::spawn(move || {
@@ -1676,7 +1697,7 @@ mod tests {
     }
 
     async fn spawn(
-        books: HashMap<(Arc<str>, u32, u32), BookAccumulator>,
+        books: Vec<(BookKey, BookAccumulator)>,
     ) -> (
         broadcast::Sender<Arc<FeedMessage>>,
         std::net::SocketAddr,
@@ -1685,7 +1706,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
-        let srv = tokio::spawn(serve(listener, tx.clone(), Arc::new(Mutex::new(books))));
+        let srv = tokio::spawn(serve(listener, tx.clone(), replay(books)));
         (tx, addr, srv)
     }
 
@@ -1712,7 +1733,7 @@ mod tests {
     /// not subscribe to.
     #[tokio::test]
     async fn a_client_receives_its_subscription_and_nothing_else() {
-        let books = HashMap::from([(key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]))]);
+        let books = vec![(key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]))];
         let (tx, addr, srv) = spawn(books).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -1769,7 +1790,7 @@ mod tests {
     /// An unrecognized frame is answered with Hyperliquid's error envelope, and a ping with a pong.
     #[tokio::test]
     async fn unknown_frames_get_the_error_envelope() {
-        let (_tx, addr, srv) = spawn(HashMap::new()).await;
+        let (_tx, addr, srv) = spawn(vec![]).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -1797,7 +1818,7 @@ mod tests {
     /// receive a fresh snapshot rather than diffs that leave its stale orders resting forever.
     #[tokio::test]
     async fn a_rebaseline_becomes_an_l4book_snapshot() {
-        let books = HashMap::from([(key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]))]);
+        let books = vec![(key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]))];
         let (tx, addr, srv) = spawn(books).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -1828,7 +1849,7 @@ mod tests {
     /// A trades subscriber receives prints and no book frames.
     #[tokio::test]
     async fn a_trades_subscriber_receives_only_prints() {
-        let (tx, addr, srv) = spawn(HashMap::new()).await;
+        let (tx, addr, srv) = spawn(vec![]).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
@@ -1860,7 +1881,7 @@ mod tests {
     /// what the normalized sink does.
     #[tokio::test]
     async fn crossing_the_inbound_rate_limit_ends_the_connection() {
-        let (_tx, addr, srv) = spawn(HashMap::new()).await;
+        let (_tx, addr, srv) = spawn(vec![]).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();

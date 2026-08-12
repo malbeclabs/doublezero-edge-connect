@@ -49,6 +49,7 @@ case "$1" in
     esac
     exit 0 ;;
   run)     : >"$DOCKER_LOG.ran"; exit 0 ;; # remember the fresh container now exists
+  exec)    exec "$(dirname "$0")/dz-stub-exec" "$@" ;;   # shared daemon model (see _helpers.bash)
   ps)
     # After `docker run`, every ps refers to the new container -> it's up (so the
     # installer's "Container exited early" guard passes).

@@ -1,0 +1,65 @@
+name: release.edge-cli
+
+# Builds and publishes the `doublezero-edge` CLI package (see release/.goreleaser.base.edge-cli.yaml)
+# to the existing malbeclabs Cloudsmith repos, the same ones the DoubleZero client publishes into —
+# so a host that already trusts that source needs no second key or repo file.
+#
+# Modeled on release.client.yml in the doublezero repo: same toolchain, same goreleaser-pro
+# invocation, same two secrets. Namespaced tag (`doublezero-edge/v*`, matching the
+# `monorepo.tag_prefix` in the goreleaser config) so it never collides with this repo's existing
+# `shred-proxy-v*` tag stream.
+on:
+  push:
+    tags:
+      - "doublezero-edge/v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-targets: |
+            target
+            target/x86_64-unknown-linux-musl/release
+
+      # musl-tools provides musl-gcc, the linker the static build's CC/linker env points at
+      # (release/.goreleaser.base.edge-cli.yaml). rpm is nfpm's rpm-building dependency.
+      - name: Install dependencies for rpm packaging and musl static build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm musl-tools
+
+      # One artifact, published to both environments' repos: the CLI has no ledger coupling, so
+      # unlike the client it needs no env-specific build variant (see the design doc).
+      - name: Build and publish (testnet)
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser-pro
+          args: release -f release/.goreleaser.testnet.edge-cli.yaml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          CLOUDSMITH_TOKEN: ${{ secrets.CLOUDSMITH_TOKEN }}
+
+      - name: Build and publish (mainnet-beta)
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser-pro
+          args: release -f release/.goreleaser.mainnet-beta.edge-cli.yaml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          CLOUDSMITH_TOKEN: ${{ secrets.CLOUDSMITH_TOKEN }}

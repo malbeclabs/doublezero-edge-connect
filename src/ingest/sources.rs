@@ -119,18 +119,6 @@ pub fn source_label(source_id: u16) -> &'static str {
     label
 }
 
-/// The short, CLI-facing name for a source — the registry's `Short Name` column.
-///
-/// Defaults to the uppercase of the registry name, which is correct for every row whose short name
-/// is just its name. Add an explicit arm here for any row where upstream assigns something else.
-pub fn short_name(source: &str) -> String {
-    #[allow(clippy::match_single_binding)]
-    match source {
-        // Explicit overrides from the registry's Short Name column go here.
-        _ => source.to_uppercase(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,24 +253,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The default short name is the uppercase of the registry name; an explicit row overrides it.
-    /// Registry names are already uppercase, so this is the identity for every assigned row until
-    /// upstream assigns a short name that differs from the name itself.
-    #[test]
-    fn short_name_defaults_to_uppercase() {
-        assert_eq!(short_name("HYPERLIQUID"), "HYPERLIQUID");
-        assert_eq!(short_name("PHOENIX"), "PHOENIX");
-        for id in 0u16..1024 {
-            if let Some(name) = source_name(id) {
-                assert_eq!(short_name(name), name, "id {id} short name drifted");
-            }
-        }
-    }
-
-    #[test]
-    fn short_name_handles_an_unregistered_source() {
-        assert_eq!(short_name("Nonesuch"), "NONESUCH");
     }
 }

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `--admin-bind`/`DZ_ADMIN_BIND` now defaults to `127.0.0.1:9098` instead of empty, so
+  `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
+  the condition that the default binds loopback only — a wildcard bind still requires an explicit,
+  documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
+### Added
+- `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
+  products remain; `doublezero-edge products list --paginate` follows it until the catalog is
+  exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`
+  returns every product in one response exactly as before.
+- `GET /v1/best_bid_ask` accepts a comma-separated `product_ids` query parameter, filtering the
+  response before serialization; `doublezero-edge products best_bid_ask` accepts a bare product id
+  or `product_ids==A,B`, matching the sibling subcommands' positional-id convention. An unknown id
+  404s exactly like `/v1/products/{id}` does, rather than a new convention. No parameter keeps
+  today's behaviour: every product.
+
+### Changed
+- `doublezero-edge products book --output table` now renders as a ladder — asks descending
+  above, bids descending below — instead of every bid then every ask, so the touch sits one row
+  apart at the seam instead of split across a screenful. `--output json`/`--jq` are unchanged.
+
 ### Fixed
 - The Hyperliquid-compatible sink holds the shared book map's mutex — the one the ingest emit path
   takes on every published batch — for a clone and nothing else; every rendering step now provably
@@ -41,6 +62,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PEER_SERVING_NS` stays only as the backstop for a publisher that goes quiet without
   deregistering. A gap-and-recover cycle is sub-second, so the timer never bound on it — and a
   suppressed re-baseline is never retried, which wedged the market for the life of the process.
+- The installers (`scripts/connect*.sh`) could finish with `Done. Connected.` over a tunnel that
+  never came up (#132): a single `doublezero connect multicast` attempt after a fixed 30s sleep
+  loses the race against a cold daemon's device probing, its failure is non-fatal, and the closing
+  banner never consulted the outcome. `connect` is now retried (4 attempts, 15/30/45s apart) and
+  every closing message is gated on the daemon's own reported session — a failed or still-
+  provisioning tunnel is named as such, with the by-hand retry and status commands, and restated
+  as the last line rather than buried above the CLI offer. Exit status is unchanged (0): the
+  container and CLI are installed either way.
+- `docker-entrypoint.sh` matched `session_status` against the literal `"up"`, which matches none of
+  the daemon's live values (`BGP Session Up`, `PIM Adjacency Up`) — so the graceful `doublezero
+  disconnect` on `docker stop` never ran and every restart left the onchain session to expire on
+  its own. It now matches the values' `Up` suffix, as the installers' new probe does.
+- `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows
+  span more than one category, even when its own category resolves unambiguously (e.g. Lashay's
+  single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
+  fallback now filters by `(venue, category)` instead of venue alone.
+- `doublezero-edge` panicked with a broken-pipe error whenever its stdout output was piped into a
+  consumer that stops reading early (`| head`, `| less -q`, a short-circuiting `grep -q`) —
+  completely ordinary usage for a JSON/table-printing CLI. Every stdout write now goes through a
+  handle that exits cleanly (code 0) on `EPIPE` instead of panicking.
+- `scripts/connect.sh` configured a package repository nothing publishes to, so the CLI offer
+  failed and skipped on every run — it now points at `malbeclabs/doublezero`, the repository a
+  host running the DoubleZero client already trusts. The offer's wording and the closing output
+  were also broken up; the package `maintainer` address is set.
+- A mirror publisher's `publisher_offset` (the entry directly below) only ever resolved on a
+  `derived` row; an `explicit` row could not declare one at all, so a live feed mirrored by a
+  second publisher sharing one port block and separated only by `channel_id` had every market
+  enter the catalog twice, one of the pair never getting a book. `publisher_offset` is now a
+  row-level registry field so either shape can declare it.
+- `GET /v1/products` returned the catalog in `HashMap` iteration order, which shuffles between
+  calls. It is now sorted server-side by `(channel, instrument_id)` ascending, so every client
+  benefits rather than just a table renderer that happened to sort client-side.
+- The channel-departure purge fired on any shrink of the desired feed set, including a plain
+  subscription loss (a group unsubscribed, or a `doublezero status` blip that parses fine and
+  momentarily stops listing a code) — destroying a channel's catalog/book/history on a one-tick
+  blip that used to be harmless (an unsubscribe only ever stopped receiver tasks before this
+  reconciler purged anything). The purge is now driven solely by an explicit channel-filter
+  narrowing (`--channels` at startup, or `POST /admin/channels`); a subscription loss still stops
+  the receivers, but leaves their data alone to resync onto once the subscription returns.
+- A mirror publisher that raises every channel id by a fixed offset on the same ports (registry
+  `derived.publisher_offset`) minted a second catalog/history/book entry under the raised id, half
+  of which a departure purge could never reach (it purges by the registry's roster id alone),
+  leaving them served forever. Ingest now canonicalises the wire channel to the base id for every
+  consumer-facing identity — catalog, history, book, product id — while producer-side state (books,
+  sequence tracking, reset counts) stays keyed on the raw wire channel, since the two arms are
+  independently sequenced.
+- `doublezero-edge`'s `client::get`/`classify` treated a `2xx` response with an undecodable body
+  as success, printing the synthesized `invalid_response` envelope to stdout with exit code 0 —
+  pointing `--url` at the wrong port (e.g. the WebSocket) made `products list` "succeed" with
+  garbage. A decode failure is now a distinct `Outcome::Invalid`, refused regardless of status,
+  same as an unreachable server.
+- `channels list`/`channels set` indexed the `/v1/status` `channels` block directly, so a body
+  missing that key (a server predating it) failed to deserialize instead of defaulting — losing
+  the drop preview and, without `--force`, refusing `channels set` outright, on exactly the server
+  skew `#[serde(default)]` exists to tolerate. Both now default a missing key to an empty object.
+- `--publisher-port` combined with `--channels` could narrow an enabled feed to zero publishers
+  with no warning (a channel-filter clause can be individually valid against the whole registry
+  while naming a channel `--publisher-port` already excluded), silently taking the WS sink, query
+  API and history feeder down. Startup now refuses that combination.
+- The same combination via `POST /admin/channels` returned `200` and emptied the feed on the
+  reconciler's next tick. It now returns `400` and leaves the prior channel filter in force.
+- `POST /admin/channels` accepted a bodyless request with a query string, which a plain HTML
+  `<form>` post can produce with no attacker involvement beyond an open web page on the admin-bound
+  host — loopback does not stop a request that originates on the host itself. `POST` now also
+  requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it
+  automatically.
+- `candles`/`retention` answered an evicted product exactly like one genuinely holding no trades
+  (both an empty candle list and `oldest == newest == now, truncated == false`), so a busy market
+  bumped from the history store by the `MAX_PRODUCTS` cap read as quiet. `retention` now carries a
+  `held` field distinguishing "the store no longer tracks this product" from "no trades in this
+  window," and `MAX_PRODUCTS` is raised 1,024 -> 8,192 (see `history.rs`'s docs for the memory
+  arithmetic).
+- `products::resolve`'s ambiguity error rendered two candidates identically when two universes
+  under one Source ID happened to share both symbol and `(channel, instrument_id)` — the one case
+  the disambiguating suffix cannot break — naming no market a caller could actually ask for.
+  `resolve` is now category-aware internally and the error appends the category when (and only
+  when) two candidates would otherwise render identically. The product id format is unchanged.
+
+### Added
+- `scripts/connect.sh` now checks UDP `44880` (the liveness port the container's own doublezerod
+  binds) before starting the container: a host daemon already bound there previously produced a
+  "successful" install followed by a container that died seconds later. It offers to stop (and
+  disable) the host daemon — only when systemd shows it active, never a service unrelated to the
+  conflict — states that this disconnects any tunnel the host daemon owns, and refuses to start the
+  container on a decline or an unanswered non-interactive run. `DZ_STOP_HOST_DAEMON=1|0` answers
+  non-interactively.
+- `GET /v1/status` carries a new `registry` block: which feed-registry document this process
+  resolved (a URL, a bind-mounted file path, or `"built-in"`), its `version`, and its row/receiver
+  counts — the same figures the bridge already logs once at startup as "feed registry resolved,"
+  now checkable across a fleet without log access. `doublezero-edge status` renders it as one
+  orientation line. `scripts/connect.sh`'s printed feed-registry line no longer leaks raw ANSI
+  escapes from the container's coloured log output.
+- `doublezero-edge` is now packaged as a signed deb and rpm, built as a static musl binary and
+  published to the same repositories as the DoubleZero client — so installing it needs no new key
+  and no new trust decision. The package carries the binary and shell completions and nothing else:
+  no dependencies, no maintainer scripts, no unit files, which is what makes it safe for
+  `scripts/connect.sh` to offer from a prompt. A `completion` subcommand generates the bundled
+  scripts at build time.
+- `scripts/connect.sh` offers to install that package once the bridge is up. The prompt states what
+  it will do — run the vendor's repository setup script as root, then install one package — before
+  doing any of it. `DZ_INSTALL_CLI=1|0` answers non-interactively. Declining, a package-manager
+  failure, or a run with no terminal all leave the bridge running and the installer exiting success:
+  the bridge is the product and the CLI is a convenience.
+- The image now defaults `DZ_FEED_REGISTRY_URL` to the hosted feed registry, overridable with `-e`
+  or by bind-mounting a document. A host that cannot reach it falls back to the built-in copy
+  silently by design, so `connect.sh` prints which source actually resolved.
+- A rolling one-hour, in-memory market-data history (`src/history.rs`): 1-second OHLCV buckets plus
+  a bounded ring of recent prints, per product, fed from the post-arbiter broadcast — so every print
+  arriving here is already deduplicated on `trade_id` and gated by the tape leader, one copy per
+  print. Pre-aggregating into fixed one-second buckets keeps the footprint independent of trade rate
+  (a product costs the same whether it prints once a second or five hundred times). **The window
+  lives in memory only and is gone the moment the process restarts** — there is no persistence of
+  any kind, and no retention beyond the hour. Bounded two ways, since a per-product cap alone
+  doesn't bound total memory: `MAX_PRODUCTS` (1,024, a pure cardinality guard on the tracked-product
+  map) and an aggregate `MAX_BUCKETS_ACROSS_PRODUCTS` (2^20) bucket budget across every product —
+  the bound that actually holds, at ~121 MiB worst case together with the print-ring bound — both
+  evicting the least-recently-traded product first.
+- A read-only `/v1` HTTP query API (`src/sinks/api.rs`), a sibling output sink to the WebSocket and
+  Prometheus endpoints: the instrument catalog (`GET /v1/products`, `/v1/products/{id}`), OHLCV
+  candles (`/v1/products/{id}/candles`), recent trades + best bid/ask (`/v1/products/{id}/ticker`),
+  an order book (`/v1/products/{id}/book`), best bid/ask across products (`/v1/best_bid_ask`), and
+  feed/history status (`/v1/status`). Binds `127.0.0.1:9099` by default (`--api-bind` /
+  `DZ_API_BIND`; empty disables it outright); the subscription reconciler activates it under the
+  **same condition as the WebSocket sink** (≥1 market-data feed subscribed) and binds it
+  non-fatally, so a taken port disables the API without crash-looping the tunnel. **No
+  authentication and no TLS**, matching every other service surface here — the loopback default is
+  load-bearing, since the container runs host networking and a wildcard bind would be genuinely
+  network-reachable; terminate at a reverse proxy if this must be exposed. The catalog is not
+  necessarily every instrument the feed defines: a product appears once its source is known, which
+  for a publisher whose reference data carries its own Source ID is at definition time, but for one
+  whose reference data carries no Source ID of its own is only after its first price — so a
+  defined-but-never-traded instrument on the latter kind of publisher is absent from `/v1/products`
+  until it prints, and both publisher generations can be live at once. Every response that could be
+  mistaken for complete carries an honest coverage/retention block rather than a guess (an
+  unbaselined `book`, a depth slice truncated at the wire's own cap, a `candles` page cut short by
+  `limit`).
+- **`doublezero-edge`**, a new read-only host-side CLI (its own workspace member) that queries that
+  API: `products list`, `products get`, `products ticker`, `products candles`, `products book`,
+  `products best_bid_ask`, and `status` — seven commands, modelled on the Coinbase Advanced Trade
+  CLI's `key==value`/`--jq`/`--template`/`--output table` surface. `--url` (`DOUBLEZERO_EDGE_URL`,
+  default `http://127.0.0.1:9099`) points it at a remote container. There is no order-placement or
+  mutation path anywhere in edge-connect for it to reach, so unlike the tool it emulates, no command
+  here ever needs a confirmation prompt. It builds on macOS as well as Linux; the bridge itself does
+  not, since it uses `SO_TIMESTAMPNS` via `nix` with no `cfg` gate — the reason this is a separate
+  workspace member rather than a bin in the bridge crate.
+
+### Fixed
+- The query API's history feeder resolved a `trade`'s product by matching `(venue, symbol)` against
+  the instrument catalog, dropping any trade whose symbol matched more than one market. On a
+  price-aggregated venue whose redundant publisher arms carry an identical instrument set under
+  distinct channel ids, *every* symbol matches twice, so every trade was silently dropped: zero
+  candles and zero ticker history for that venue's whole product set, indistinguishable from a
+  market that simply had not traded. `trade` now carries its own `channel`/`instrument_id` (see
+  Added, below), so the feeder keys straight off the message instead of guessing from a
+  possibly-ambiguous symbol; the lookup this replaces is removed entirely.
+- A trade's venue-supplied `source_ts_ns` more than a few seconds ahead of its own receive time, or
+  older than the history window, is no longer trusted into the query API's rolling store. The store's
+  late-print rejection compares only against a product's own high-water mark, which it never resets:
+  one implausible print latched it permanently, late-dropping every subsequent, correctly-timed print
+  for that product before it ever reached the print ring — so both `/candles` and `/ticker` emptied
+  out for it with no recovery. An implausible timestamp now falls back to the trade's own receive
+  time, the same fallback already used for the `source_ts_ns == 0` sentinel.
+- The feed registry validated a document's `venue` for resolvability only, which admits a legacy
+  alias for one Source ID even though only its canonical name ever reaches the wire. A document
+  naming the alias validated cleanly and then silently split every downstream lookup keyed on the
+  venue string (the arbitration mode, the channel-filter purge, `--feed <venue>` selection). The
+  venue must now round-trip through its canonical name.
+- A `--feed-registry` file that could not be read degraded to the built-in document with only a
+  warning, so an unmounted volume or a typo'd path started the container healthy on a stale
+  topology instead of refusing. That read failure is now fatal, matching the parse errors beside it
+  and the file source's documented contract.
+- An `explicit` publisher list left empty in the document installed a row with zero publishers —
+  no error, no receivers, and a healthy-looking `rows=1 receivers=0` log line. It is now rejected
+  the same way an empty `derived` roster already was.
+- The feed registry fetch had no bound on response size, so a hostile or compromised endpoint could
+  OOM the process instead of ever reaching the built-in fallback, and then crash-loop re-fetching on
+  restart. The fetch is now capped, checking both a declared `Content-Length` and the accumulated
+  body as it streams in, so a chunked response with no declared length is covered too.
+- A departed channel's catalog/book/history purge ran right after its receiver's `abort()` call,
+  but `abort()` only cancels a task at its next `.await`; a receiver already past
+  `recv_any().await` can still run the rest of its synchronous body and re-insert the very state
+  the purge just removed — permanently, since a channel is never diffed as departing twice. The
+  purge now waits for the receiver's `JoinHandle` to report finished before running, with a bounded
+  fallback so one that never does (e.g. wedged in a blocking call) can't leak its state forever.
+
+### Added
+- `trade` carries `channel`/`instrument_id`, the same identity pair `instrument`/`book` already carry.
+  Purely additive — existing fields are unchanged, and the fields are ignored harmlessly by any
+  consumer that doesn't read them yet. `0` on a source with no channel concept of its own (the public
+  WS backstops resolve the real value from the edge catalog where one exists).
+- `dz_history_unattributable_trades_total{venue}` counts a trade the query API's history store
+  dropped because its declared `(venue, channel, instrument_id)` names no known instrument — a
+  definition race, belt-and-braces alongside the fix above. Should stay flat at zero.
+- `dz_history_feed_lagged_total` counts the query API's history feeder falling behind the broadcast
+  and dropping messages (`Lagged`) — a hole in the rolling window, not a crash.
 
 ### Changed
 - An instrument whose reference data carries its own Source ID (the newer feed-spec generation) is

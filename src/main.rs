@@ -17,7 +17,7 @@ use clap::Parser;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use doublezero_edge_connect::{ingest, metrics, model, shred, sinks};
+use doublezero_edge_connect::{history, ingest, metrics, model, shred, sinks};
 use ingest::{
     arbiter::{Arbiter, SharedArbiter, TRADE_DEDUP_WINDOW},
     feeds,
@@ -47,6 +47,35 @@ struct Args {
         value_delimiter = ','
     )]
     publisher_ports: Vec<u16>,
+
+    /// Channels to ingest, scoped per group code: `lashay-4=10,11;lashay-1=2`. An unmentioned
+    /// feed ingests every channel. Ids are the contract and are validated against the feed's
+    /// roster at startup; channel *names* are not mirrored here — they live in the publisher's
+    /// inventory by design and have already moved once. Use `doublezero-edge channels list` to
+    /// see what a bound channel actually contains.
+    ///
+    /// Only feeds whose publisher derives a port per channel can be narrowed: there the excluded
+    /// channel's socket is never bound and the kernel discards its traffic. Narrowing a feed whose
+    /// publishers bind one base port flat is refused at startup — `channel_id` identifies mirrors
+    /// there, not markets (see `ingest::channel_filter`).
+    ///
+    /// Validated against the whole registry, not against the `--feed`/`--publisher-port` selection:
+    /// a clause naming a feed those already excluded is legal, filters nothing, and is warned about
+    /// at startup.
+    #[arg(long, env = "DZ_CHANNELS", default_value = "")]
+    channels: String,
+
+    /// URL to fetch the feed registry document from at startup. The precursor to reading it from
+    /// the DoubleZero ledger. On failure the built-in document is used and a warning is logged — a
+    /// container that will not boot because a registry host blipped is worse than one running a
+    /// slightly stale document. A document that *parses* but fails validation is fatal.
+    #[arg(long, env = "DZ_FEED_REGISTRY_URL", default_value = "")]
+    feed_registry_url: String,
+
+    /// Path to a feed registry document, for a bind-mounted file. Ignored when
+    /// `--feed-registry-url` is set.
+    #[arg(long, env = "DZ_FEED_REGISTRY", default_value = "")]
+    feed_registry: String,
 
     /// Interface to join the groups on - a name (e.g. "doublezero1") or an IPv4 address.
     /// Names are resolved to their IPv4 (as in edge-multicast-ref).
@@ -201,6 +230,32 @@ struct Args {
     #[arg(long = "metrics-bind", env = "METRICS_BIND", default_value = "")]
     metrics_bind: String,
 
+    /// Query API bind address (`GET /v1/...`). Loopback by default: under host networking a wildcard
+    /// bind is genuinely network-reachable and this API has no authentication. Empty disables it.
+    #[arg(
+        long = "api-bind",
+        env = "DZ_API_BIND",
+        default_value = "127.0.0.1:9099"
+    )]
+    api_bind: String,
+
+    /// Admin surface bind address (`GET`/`POST /admin/channels`) — the one mutation path in this
+    /// crate: it lets `--channels`/`DZ_CHANNELS` be replaced at runtime. **On by default, at
+    /// loopback** (`127.0.0.1:9098`): the exposure is accepted on the condition that the default
+    /// never reaches past this host. Set empty to disable it outright. This surface carries **no
+    /// authentication**, so — like `--api-bind` — under host networking a wildcard bind is genuinely
+    /// network-reachable; if you override this, stay on loopback (e.g. `127.0.0.1:<port>`), never a
+    /// bare wildcard. Loopback alone does not stop a web page open in a browser on this host from
+    /// POSTing a form here, so `POST` also requires an `X-DZ-Admin-Request` header (any value — a
+    /// form post cannot set it). Deliberately separate from `--api-bind`'s `/v1`, which must stay
+    /// provably read-only.
+    #[arg(
+        long = "admin-bind",
+        env = "DZ_ADMIN_BIND",
+        default_value = "127.0.0.1:9098"
+    )]
+    admin_bind: String,
+
     /// How often (seconds) the subscription reconciler re-reads `doublezero status` and reconciles
     /// which market-data receivers, the WebSocket sink, and shred sources are active. Subscriptions
     /// change rarely, so the default is coarse.
@@ -312,25 +367,27 @@ fn parse_win_rate(s: &str) -> Result<f64, String> {
 /// Resolve the `--feed` selection to a list of feeds: empty selection means all known feeds.
 fn select_feeds(selection: &[String]) -> Result<Vec<&'static feeds::Feed>> {
     if selection.is_empty() {
-        return Ok(feeds::FEEDS.iter().collect());
+        return Ok(feeds::feeds().iter().collect());
     }
     let mut chosen = Vec::new();
-    // Dedup on `(venue, kind)` — the identity of a FEED ROW, unique across `FEEDS` (see
-    // `feeds::tests::venue_kind_pairs_are_unique`), so a repeated `--feed` name selects each row
-    // once. The reconciler's own key is finer (`(venue, kind, publisher)`); narrowing the
-    // publisher set is `filter_publishers`'s job, not this function's.
+    // Dedup on `(venue, category, kind)` — the identity of a FEED ROW, unique across the registry
+    // (see `feeds::tests::venue_category_kind_triples_are_unique`), so a repeated `--feed` name
+    // selects each row once. The category is load-bearing, not decoration: one venue can carry two
+    // rows of the same kind on disjoint universes, and dedup on `(venue, kind)` would drop the
+    // second of them silently. The reconciler's own key is finer (it adds the publisher);
+    // narrowing the publisher set is `filter_publishers`'s job, not this function's.
     let mut seen = std::collections::HashSet::new();
     for name in selection {
-        let matches: Vec<&'static feeds::Feed> = feeds::FEEDS
+        let matches: Vec<&'static feeds::Feed> = feeds::feeds()
             .iter()
             .filter(|f| f.venue.eq_ignore_ascii_case(name))
             .collect();
         if matches.is_empty() {
-            let known: Vec<&str> = feeds::FEEDS.iter().map(|f| f.venue).collect();
+            let known: Vec<&str> = feeds::feeds().iter().map(|f| f.venue).collect();
             bail!("unknown feed '{name}'; known feeds: {}", known.join(", "));
         }
         for f in matches {
-            if seen.insert((f.venue, f.kind)) {
+            if seen.insert((f.venue, f.category, f.kind)) {
                 chosen.push(f);
             }
         }
@@ -375,7 +432,7 @@ fn filter_publishers(
         });
     }
     if !unmatched.is_empty() {
-        let mut known: Vec<u16> = feeds::FEEDS
+        let mut known: Vec<u16> = feeds::feeds()
             .iter()
             .flat_map(|f| f.publishers.iter().map(|p| p.base_port()))
             .collect();
@@ -401,6 +458,38 @@ fn join_ports(ports: &[u16]) -> String {
         .join(", ")
 }
 
+/// Fail startup if the channel filter, applied to the already `--feed`/`--publisher-port`-narrowed
+/// `enabled` set, admits zero publishers of some enabled feed.
+///
+/// `ChannelFilter::parse` validates a clause against the **whole** registry, so a spec valid there
+/// can still cross with `--feed`/`--publisher-port`'s narrowing to leave a feed with nothing
+/// admitted: e.g. `--publisher-port` keeps only one derived channel's publisher, and `--channels`
+/// then names a different (individually valid) channel on that same code. The existing loop above
+/// this call only warns when a clause's *code* is absent from `enabled` entirely — it says nothing
+/// when the code is present but every one of its admitted ids was narrowed away by
+/// `--publisher-port`. The result is a feed silently left with no publisher, which takes the WS
+/// sink, query API and history feeder down with it if it was the only market-data feed running —
+/// with no warning at all. A channel filter that silently admits nothing is worse than one that
+/// refuses to start.
+fn check_channel_filter_covers_enabled(
+    enabled: &[feeds::Feed],
+    filter: &ingest::channel_filter::ChannelFilter,
+) -> Result<()> {
+    for f in enabled {
+        if filter.publishers_for(f).is_empty() {
+            bail!(
+                "channel filter admits no publisher of enabled feed {} ({}, code {}); \
+                 --publisher-port and --channels together leave it with zero publishers - \
+                 narrow one of them less aggressively",
+                f.venue,
+                f.category,
+                f.code
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // RUST_LOG, when set, is honored verbatim. Unset, we default to a quiet base of `warn`
@@ -417,11 +506,63 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     info!(?args, "starting doublezero-edge-connect");
 
+    // Resolve the feed registry before anything reads it. The rows are data supplied to the
+    // container, not compiled-in constants: which group carries which feed, on which ports, is the
+    // publisher's to change and it must not need a rebuild here.
+    //
+    // A rejected document degrades or refuses depending on where it came from. A `--feed-registry-url`
+    // failure of any kind — unreachable, malformed, a version this build predates, a validation error
+    // — warns and falls back to the built-in copy, which is by construction last-known-good: a remote
+    // registry is infrastructure that can move underneath a running fleet, and since this resolves
+    // only at startup, refusing would not kill the fleet when the document changed but each process
+    // at its next reschedule, far from the cause. A `--feed-registry` file is an operator's explicit
+    // instruction about this one container, so a document that was read but rejected is fatal here.
+    feeds::init(ingest::registry::Source::from_flags(
+        &args.feed_registry_url,
+        &args.feed_registry,
+    ))
+    .await?;
+
     let enabled = filter_publishers(select_feeds(&args.feeds)?, &args.publisher_ports)?;
+
+    // The channel filter, parsed once here against the registry that was just resolved and fatal
+    // on any error: a channel filter that silently filters nothing is worse than one that refuses
+    // to start, since the symptom is a process quietly ingesting markets nobody asked for. It is
+    // handed to the reconciler as an *input* to the desired receiver set — `reconcile` stays the
+    // single activation authority.
+    let filter = ingest::channel_filter::ChannelFilter::parse(&args.channels)?;
+    if !filter.is_empty() {
+        info!(channels = ?filter.summary(), "channel filter active (excluded channels bind no socket)");
+        // The channel filter validates against the whole registry, but `--feed`/`--publisher-port`
+        // narrow what this process runs. A clause naming a feed those already excluded is legal and
+        // filters nothing — not fatal, since the operator gave two explicit instructions and the
+        // narrower one simply wins, but it must not be silent: an unbound channel and an unbound
+        // feed look identical from outside.
+        for code in filter.codes() {
+            if !enabled.iter().any(|f| f.code == code) {
+                warn!(
+                    code,
+                    "channel filter names a group code that --feed/--publisher-port already \
+                     excluded; the clause filters nothing"
+                );
+            }
+        }
+    }
+    // A code present in `enabled` can still end up with zero admitted publishers once
+    // `--publisher-port` and `--channels` are combined - the warn loop above only catches a code
+    // absent entirely. Fatal, not a warning: see the function's docs.
+    check_channel_filter_covers_enabled(&enabled, &filter)?;
+
     info!(
-        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), f.publishers.len())).collect::<Vec<_>>(),
+        feeds = ?enabled.iter().map(|f| (f.venue, f.kind.label(), filter.publishers_for(f).len())).collect::<Vec<_>>(),
         "ingesting feeds"
     );
+
+    // Wrapped here (after the plain-value startup logging above, which wants a snapshot, not a
+    // guard) so the reconciler and the admin surface (below) share one instance to swap at runtime:
+    // a `POST /admin/channels` replaces its contents in place, and the reconciler reads a fresh
+    // clone every tick (see `ingest::reconcile::Reconciler::filter`).
+    let filter: Arc<Mutex<ingest::channel_filter::ChannelFilter>> = Arc::new(Mutex::new(filter));
 
     // Force the metrics registry to initialize up front (registering the process collector and all
     // metric families) so the very first recorded sample lands in a ready registry, whether or not
@@ -436,7 +577,12 @@ async fn main() -> Result<()> {
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
-    let books: model::BookSnapshot = Arc::new(Mutex::new(HashMap::new()));
+    let books: model::BookSnapshot = Arc::new(Mutex::new(model::BookReplay::default()));
+    // Rolling one-hour trade history behind the `/v1` query API. Built once here (like the three
+    // snapshot maps above) so it survives the API sink's own activate/deactivate cycles - a
+    // subscription blip that briefly takes the sink down must not reset the window it comes back up
+    // to. The reconciler owns feeding it (only while the sink is up) and reading it (the API sink).
+    let history: Arc<Mutex<history::Store>> = Arc::new(Mutex::new(history::Store::new()));
     // Single-arm authority tunables for `Sticky` venues, plus the cross-arm matcher's pairing window,
     // validated here at startup and handed to the arbiter.
     let authority_cfg = ingest::authority::AuthorityConfig {
@@ -450,7 +596,7 @@ async fn main() -> Result<()> {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
         // Every registry venue, not just the selected ones: a message's venue comes from the wire
         // SourceID, so a venue can reach the arbiter without its own feed being ingested.
-        for f in ingest::feeds::FEEDS {
+        for f in ingest::feeds::feeds() {
             a.set_mode(f.venue, f.arbitration);
         }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
@@ -600,6 +746,33 @@ async fn main() -> Result<()> {
         )))
     };
 
+    // Admin surface: the one mutation path in this crate, on by default at loopback
+    // (`127.0.0.1:9098`) and disabled only if `--admin-bind` is set empty. Unlike the WS sink and
+    // the query API, it is **not** subscription-gated — an operator must be able to inspect or
+    // change the channel filter even with nothing currently subscribed — so it is spawned once
+    // here, gated only on the bind being non-empty. A taken port is non-fatal, exactly like
+    // `ws`/`api`: it disables this surface without taking the tunnel down.
+    let admin_srv = if args.admin_bind.is_empty() {
+        info!("admin surface disabled (empty --admin-bind)");
+        None
+    } else {
+        match sinks::admin::bind(&args.admin_bind).await {
+            Ok(listener) => {
+                info!(bind = %args.admin_bind, "admin surface enabled (mutating — no authentication)");
+                Some(tokio::spawn(sinks::admin::serve(
+                    listener,
+                    filter.clone(),
+                    enabled.clone(),
+                )))
+            }
+            Err(e) => {
+                warn!(bind = %args.admin_bind, %e,
+                    "admin surface failed to bind (port in use?); staying off");
+                None
+            }
+        }
+    };
+
     // The subscription reconciler owns market-data receivers, the WebSocket sink, and the shred
     // forwarder: it polls `doublezero status` and activates/deactivates them as the host's
     // subscriptions change (default-on with fail-open; `--subscription-gating-disable` forces the
@@ -612,12 +785,15 @@ async fn main() -> Result<()> {
             depth,
             books,
             enabled,
+            filter,
             iface: args.iface.clone(),
             recv_buf: args.recv_buf,
             refresh: std::time::Duration::from_secs(args.subscription_refresh_secs),
             gating_disabled: args.subscription_gating_disable,
             ws_bind: args.ws_bind.clone(),
             ws_cfg,
+            api_bind: args.api_bind.clone(),
+            history,
             shred: shred_params,
         })
         .run(),
@@ -647,6 +823,12 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
+        // The admin surface (when enabled) loops forever; its arm resolves only on a task panic or a
+        // fatal accept error (a bind failure was already handled non-fatally above).
+        r = async { match admin_srv {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
     }
     Ok(())
 }
@@ -655,19 +837,66 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_selection_is_all_feeds() {
-        let all = select_feeds(&[]).unwrap();
-        assert_eq!(all.len(), feeds::FEEDS.len());
+    /// `main` installs the registry before anything reads it; a unit test has no `main`, so it
+    /// installs the built-in document itself. Idempotent, so every test can call it.
+    fn registry() {
+        feeds::init_built_in();
     }
 
-    // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`).
-    fn keys(sel: &[&feeds::Feed]) -> Vec<(&'static str, feeds::FeedKind)> {
-        sel.iter().map(|f| (f.venue, f.kind)).collect()
+    #[test]
+    fn empty_selection_is_all_feeds() {
+        registry();
+        let all = select_feeds(&[]).unwrap();
+        assert_eq!(all.len(), feeds::feeds().len());
+    }
+
+    /// The admin surface defaults on — but only at loopback, never a wildcard: that is the
+    /// condition the exposure was accepted under. Same shape as `--api-bind`'s default now, unlike
+    /// the old off-by-default policy this replaces.
+    #[test]
+    fn the_admin_surface_defaults_to_loopback_never_a_wildcard() {
+        let bind = Args::parse_from(["x"]).admin_bind;
+        assert!(
+            bind.starts_with("127.0.0.1:"),
+            "admin surface must default to loopback, got {bind:?}"
+        );
+        assert!(
+            !bind.starts_with("0.0.0.0"),
+            "admin surface must never default to a wildcard bind, got {bind:?}"
+        );
+    }
+
+    // The identity that maps 1:1 to a spawned receiver (the reconciler's `FeedKey`). Includes the
+    // category: a venue can carry two rows of one kind on disjoint universes, so `(venue, kind)`
+    // would collapse them and hide exactly the dedup bug this checks for.
+    fn keys(sel: &[&feeds::Feed]) -> Vec<(&'static str, &'static str, feeds::FeedKind)> {
+        sel.iter().map(|f| (f.venue, f.category, f.kind)).collect()
+    }
+
+    /// Selecting a venue must select **every** row it owns, including two rows of one kind on
+    /// disjoint universes — dedup on `(venue, kind)` would silently drop the second.
+    #[test]
+    fn a_venue_with_two_rows_of_one_kind_selects_both() {
+        registry();
+        let sel = select_feeds(&["KALSHI".to_string()]).unwrap();
+        let mut mbp: Vec<&str> = sel
+            .iter()
+            .filter(|f| f.kind == feeds::FeedKind::MarketByPrice)
+            .map(|f| f.category)
+            .collect();
+        mbp.sort_unstable();
+        // The categories themselves, not a count: a count of 2 would also be satisfied by the same
+        // universe selected twice, which is the opposite failure and equally wrong.
+        assert_eq!(
+            mbp,
+            vec!["perps", "sports"],
+            "both universes must be selected, each once"
+        );
     }
 
     #[test]
     fn repeated_name_selects_same_as_single() {
+        registry();
         let once = select_feeds(&["HYPERLIQUID".to_string()]).unwrap();
         let twice = select_feeds(&["HYPERLIQUID".to_string(), "HYPERLIQUID".to_string()]).unwrap();
         // Repeating a name must spawn the same receivers (same keys, same order) as passing it once.
@@ -678,6 +907,7 @@ mod tests {
 
     #[test]
     fn distinct_names_union_without_dup() {
+        registry();
         let sel = select_feeds(&[
             "HYPERLIQUID".to_string(),
             "PHOENIX".to_string(),
@@ -698,11 +928,13 @@ mod tests {
 
     #[test]
     fn unknown_name_still_errors() {
+        registry();
         assert!(select_feeds(&["Nope".to_string()]).is_err());
     }
 
     #[test]
     fn empty_publisher_selection_keeps_every_publisher() {
+        registry();
         let all = filter_publishers(select_feeds(&[]).unwrap(), &[]).unwrap();
         let hl_tob = all
             .iter()
@@ -711,7 +943,7 @@ mod tests {
         // Compare against the registry, not a literal: this test is about the empty selection
         // being a no-op, and a hardcoded count silently turns it into a fleet-size assertion that
         // has to be edited every time a publisher is onboarded (`feeds.rs` already pins the set).
-        let registry = feeds::FEEDS
+        let registry = feeds::feeds()
             .iter()
             .find(|f| f.venue == "HYPERLIQUID" && f.kind == feeds::FeedKind::TopOfBook)
             .unwrap();
@@ -720,6 +952,7 @@ mod tests {
 
     #[test]
     fn publisher_selection_narrows_by_base_port() {
+        registry();
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201, 9401]).unwrap();
         let hl_tob = sel
             .iter()
@@ -733,6 +966,7 @@ mod tests {
     /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201).
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
+        registry();
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9401]).unwrap();
         assert!(!sel.iter().any(|f| f.venue == "PHOENIX"));
         assert!(sel.iter().any(|f| f.venue == "HYPERLIQUID"));
@@ -743,6 +977,7 @@ mod tests {
     /// venue is `--feed`'s job.
     #[test]
     fn base_ports_are_not_unique_across_feeds() {
+        registry();
         let sel = filter_publishers(select_feeds(&[]).unwrap(), &[9201]).unwrap();
         let venues: std::collections::HashSet<&str> = sel.iter().map(|f| f.venue).collect();
         assert!(venues.contains("HYPERLIQUID"));
@@ -758,6 +993,72 @@ mod tests {
 
     #[test]
     fn unknown_publisher_base_port_is_an_error() {
+        registry();
         assert!(filter_publishers(select_feeds(&[]).unwrap(), &[1234]).is_err());
+    }
+
+    /// The regression this pins: a `--publisher-port` + `--channels` combination that empties an
+    /// enabled feed while both, taken alone, are valid against the whole registry. `--publisher-port`
+    /// keeps only the sports (`lashay-4`) feed's channel-10 publisher; `--channels lashay-4=11` is a
+    /// perfectly valid clause against the full 31-channel roster, but channel 11's publisher was
+    /// never in the narrowed `enabled` set to begin with, so it admits nothing.
+    #[test]
+    fn a_publisher_port_and_channel_filter_combo_that_empties_a_feed_is_refused() {
+        registry();
+        let sports = feeds::feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row");
+        let chan10_port = sports
+            .publishers
+            .iter()
+            .find(|p| p.channel == Some(10))
+            .expect("channel 10 is in the sports roster")
+            .base_port();
+
+        let enabled = filter_publishers(
+            select_feeds(&[sports.venue.to_string()]).unwrap(),
+            &[chan10_port],
+        )
+        .unwrap();
+        assert_eq!(
+            enabled.len(),
+            1,
+            "only the sports feed's channel-10 publisher should remain"
+        );
+
+        // Individually valid against the whole registry (11 is in the sports roster), but it names
+        // a channel that --publisher-port already excluded.
+        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=11").unwrap();
+
+        let err = check_channel_filter_covers_enabled(&enabled, &filter)
+            .expect_err("a feed left with zero admitted publishers must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("lashay-4"), "{msg}");
+    }
+
+    /// The same combination when the filter still admits the surviving publisher must pass.
+    #[test]
+    fn a_channel_filter_that_still_admits_the_narrowed_publisher_is_fine() {
+        registry();
+        let sports = feeds::feeds()
+            .iter()
+            .find(|f| f.category == "sports")
+            .expect("the built-in registry has a sports row");
+        let chan10_port = sports
+            .publishers
+            .iter()
+            .find(|p| p.channel == Some(10))
+            .expect("channel 10 is in the sports roster")
+            .base_port();
+
+        let enabled = filter_publishers(
+            select_feeds(&[sports.venue.to_string()]).unwrap(),
+            &[chan10_port],
+        )
+        .unwrap();
+
+        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=10").unwrap();
+        assert!(check_channel_filter_covers_enabled(&enabled, &filter).is_ok());
     }
 }

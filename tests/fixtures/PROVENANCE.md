@@ -353,9 +353,10 @@ protocol's intent. All three are publisher-side, not decoder-side.
    so they would never arbitrate against each other. Treated as a defect of the publisher being
    retired; the sharded feed above does channels correctly (zero instrument-id overlap between them).
 2. **Symbols overflow the 16-byte symbol field on the sharded feed.** 2,312 of its definitions carry
-   no NUL terminator, and `EAVE-27JAN01-YES` is the truncation of two *different* instrument ids.
-   `InstrumentSnapshot` and `DepthSnapshot` are keyed `(venue, symbol)`, so a collision makes two
-   markets clobber each other.
+   no NUL terminator, and `EAVE-27JAN01-YES` is the truncation of two *different* instrument ids
+   (1165 and 1403, both channel 120). `InstrumentSnapshot` is now keyed on the `(venue, channel,
+   instrument_id)` identity rather than this display label, so both markets survive; `DepthSnapshot`
+   (Market-by-Order only, unaffected by this feed) is still keyed `(venue, symbol)`.
 3. **No `BookClear`, `InstrumentReset`, `BatchBoundary` or `EndOfSession`** in either capture, so
    those four types remain offset-test-only — the status `codec_mbo`'s `InstrumentReset`/`Heartbeat`/
    `EndOfSession` have. Three are exceptional events and a quiet window explaining their absence is
@@ -399,3 +400,37 @@ cargo run --example pcap2frames -- mbp.pcap --protocol mbp --group <group> \
 
 Keep at least one multi-channel set and one dense-delta set; the fixture tests assert both shapes.
 Record the source IP, capture date, frame counts and observed `depth_bound` above.
+
+## Schema v3 reference data — `tob_v3`, `mbp_perps_v3`, `sports_v3`
+
+Cut 2026-08-11 from the mainnet capture warehouse
+(`s3://malbeclabs-multicast-pcap-warehouse/mainnet-beta/aws-cmh-mn-recorder1-16.59.144.33/2026/08/11/18/`),
+refdata plane only, ~12 KB each:
+
+| fixture | group | port | frames | sources |
+|---|---|---|---|---|
+| `tob_v3.refdata.bin` | `233.84.178.3` | 41000 | 114 | `148.51.121.69`, `148.51.120.6` |
+| `mbp_perps_v3.refdata.bin` | `233.84.178.4` | 42000 | 113 | `148.51.120.6`, `148.51.121.69` |
+| `sports_v3.refdata.bin` | `233.84.178.20` | 44041 | 13 | `148.51.121.250`, `148.51.121.209` |
+
+**What they establish, and why they were cut.** Every frame carries `schema_version = 3`, and the
+symbol field is the widened one: `sports_v3` holds 99 distinct symbols up to **33 characters**, far
+past the 16-byte field that made the older fixtures truncate. So the symbol collision recorded above —
+one cut-off symbol standing for two instrument ids — **cannot occur on this schema**, which is what
+retires the argument that trade dedup keyed on `(venue, symbol)` can silently drop a second market's
+fills. These fixtures are the evidence for that claim; without them it rests on an upstream assertion.
+
+**Both arms are present in every set** — unlike the older captures, these are simultaneous, so an
+interleaved two-arm fixture can be cut from this warehouse when one is needed.
+
+### Regenerating
+
+```
+aws s3api get-object --bucket malbeclabs-multicast-pcap-warehouse \
+  --key <prefix>/capture_<group>_000001.pcap --range bytes=0-12000000 slice.pcap
+tshark -r slice.pcap -Y 'udp.dstport==<refdata port>' -T fields -e data.data
+```
+
+Concatenate the payloads; the fixture is raw frames back to back, split by magic like every other set
+here. A ranged fetch is deliberate — the warehouse objects are 50 MB each and a refdata cycle is
+seconds.

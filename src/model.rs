@@ -38,23 +38,53 @@ impl Side {
 /// first time it is seen, not per message.
 pub fn venue_arc(venue: &'static str) -> Arc<str> {
     static INTERN: OnceLock<RwLock<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
-    let map = INTERN.get_or_init(|| RwLock::new(HashMap::new()));
-    // Steady state: the venue is already interned -> shared read lock, clone the cached `Arc`.
-    if let Some(arc) = map.read().unwrap_or_else(|e| e.into_inner()).get(venue) {
+    intern_static(&INTERN, venue)
+}
+
+/// The same interner for a feed **category** (`ingest::feeds::Feed::category`), which the arbiter's
+/// tape gate pairs with the venue to key one entry per *universe* rather than per venue. Interned
+/// for exactly the reason venues are: that key is built on the trade hot path, once per print, and
+/// `Arc::from(&str)` there would allocate and copy per message.
+///
+/// A separate map from [`venue_arc`]'s on purpose — the two namespaces overlap ("perps" is no
+/// venue, but nothing stops a future registry name colliding), and sharing one map would hand out
+/// the same `Arc` for both, quietly making a venue and a category equal by pointer for anything
+/// that ever compares them.
+pub fn category_arc(category: &'static str) -> Arc<str> {
+    static INTERN: OnceLock<RwLock<HashMap<&'static str, Arc<str>>>> = OnceLock::new();
+    intern_static(&INTERN, category)
+}
+
+/// Shared body of the two interners above: a `&'static str` keyed cache of `Arc<str>`, read under a
+/// shared lock in steady state and written once per distinct string.
+fn intern_static(
+    intern: &OnceLock<RwLock<HashMap<&'static str, Arc<str>>>>,
+    s: &'static str,
+) -> Arc<str> {
+    let map = intern.get_or_init(|| RwLock::new(HashMap::new()));
+    // Steady state: already interned -> shared read lock, clone the cached `Arc`.
+    if let Some(arc) = map.read().unwrap_or_else(|e| e.into_inner()).get(s) {
         return arc.clone();
     }
-    // First sighting of this venue: take the write lock and insert (re-checking under the lock in
-    // case another task interned it in the race window).
+    // First sighting: take the write lock and insert (re-checking under the lock in case another
+    // task interned it in the race window).
     map.write()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(venue)
-        .or_insert_with(|| Arc::from(venue))
+        .entry(s)
+        .or_insert_with(|| Arc::from(s))
         .clone()
 }
 
 /// Serde default for `source` on payloads written before the field existed. `Arc<str>` has no
 /// `Default`, so the field needs an explicit default function rather than `#[serde(default)]`.
 pub fn empty_source() -> Arc<str> {
+    Arc::from("")
+}
+
+/// Default for the producer-side-only `category` field carried by [`NormalizedInstrument`] and
+/// [`NormalizedTrade`] (`#[serde(skip)]` — see their docs for why it must never reach the wire).
+/// `Arc<str>` has no `Default`, so this needs the same explicit function [`empty_source`] does.
+pub fn empty_category() -> Arc<str> {
     Arc::from("")
 }
 
@@ -115,6 +145,28 @@ pub struct NormalizedTrade {
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
+    /// The publisher's `channel_id`: the instrument set this feed carries. Filterable. `0` for a
+    /// source whose wire has no channel concept of its own (the public WS backstops) — see
+    /// `ingest::public_feeder::resolve_instrument`, which resolves the real value from the edge
+    /// catalog instead where one exists.
+    #[serde(default)]
+    pub channel: u32,
+    /// Instrument id, unique within `channel`. Additive alongside `channel` (see its doc): together
+    /// they are the identity `history::Key` groups on, closing the gap that let a price-aggregated
+    /// venue's mirrored arms (identical instrument set, distinct `channel`) drop every trade rather
+    /// than risk misattributing one to the wrong arm.
+    #[serde(default)]
+    pub instrument_id: u32,
+    /// The instrument **universe** this trade's row carries (`ingest::feeds::Feed::category`),
+    /// stamped by the emitting processor from its `FrameCtx::category` and read back by
+    /// `ingest::reconcile::feed_history` to key `history::Key` on the same grain
+    /// `model::BookKey`/`authority::MarketKey` already use. Producer-side only: two disjoint
+    /// universes under one Source ID can share `(channel, instrument_id)`, so without this a
+    /// history lookup or a channel purge cannot tell which universe a trade or a stored product
+    /// belongs to. Never serialized — PROTOCOL.md carries no category, and a consumer has no use
+    /// for a producer-side arbitration key.
+    #[serde(skip, default = "empty_category")]
+    pub category: Arc<str>,
     pub price: f64,
     pub size: f64,
     /// `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.
@@ -264,6 +316,12 @@ pub struct NormalizedBook {
     pub channel: u32,
     /// Instrument id, unique within `channel`.
     pub instrument_id: u32,
+    /// The instrument **universe** this batch's row carries, stamped by the emitting processor from
+    /// its `FrameCtx::category` — the same field, for the same reason, as
+    /// [`NormalizedInstrument::category`]: it completes the [`BookKey`] a sink needs to resolve this
+    /// batch's market in [`BookSnapshot`]. Never serialized.
+    #[serde(skip, default = "empty_category")]
+    pub category: Arc<str>,
     pub changes: Vec<BookChange>,
     /// Advisory: this batch is part of a rebuild rather than ordinary activity. Deliberately NOT
     /// what re-baselines a consumer — `changes[0].action == Clear` is.
@@ -306,6 +364,16 @@ pub struct NormalizedInstrument {
     /// Instrument id, unique within `channel`.
     #[serde(default)]
     pub instrument_id: u32,
+    /// The instrument **universe** this definition's row carries
+    /// (`ingest::feeds::Feed::category`), stamped by the emitting processor from its
+    /// `FrameCtx::category`. Part of `InstrumentSnapshot`'s key (see there) for the same reason
+    /// `BookKey` already carries it: two disjoint universes under one Source ID can share
+    /// `(channel, instrument_id)`, and a category-blind catalog either overwrites one universe's
+    /// definition with the other's or, on lookup, resolves the wrong one. Never serialized —
+    /// PROTOCOL.md carries no category, and a consumer has no use for a producer-side
+    /// arbitration key.
+    #[serde(skip, default = "empty_category")]
+    pub category: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
 }
@@ -374,17 +442,34 @@ impl FeedMessage {
     }
 }
 
-/// Latest known instrument definitions, keyed by `(venue, symbol)`, shared between the
-/// receivers (which update it) and the WebSocket server (which replays it to each new
-/// subscriber so reference data arrives before quotes - otherwise a client that connects
+/// Latest known instrument definitions, keyed by `(venue, category, channel, instrument_id)`,
+/// shared between the receivers (which update it) and the WebSocket server (which replays it to
+/// each new subscriber so reference data arrives before quotes - otherwise a client that connects
 /// mid-stream sees a quote first and has to guess the price/qty precision).
 ///
-/// The `(venue, symbol)` key disambiguates the same symbol across *different* venues (e.g.
-/// `SOL-PERP` on Hyperliquid vs. Phoenix). It does NOT distinguish by protocol/feed: when one
-/// venue is served by multiple feeds (e.g. Hyperliquid TOB + MBO), both write the same entry
-/// (last-writer-wins). Those feeds are expected to agree on precision; `upsert_instrument` in
-/// `processor.rs` warns if their exponents diverge.
-pub type InstrumentSnapshot = Arc<Mutex<HashMap<(Arc<str>, Arc<str>), NormalizedInstrument>>>;
+/// The key is [`NormalizedBook`]/[`NormalizedInstrument`]'s wire identity triple **prefixed with
+/// the arbitration scope** (`category`), exactly [`BookKey`]/`ingest::authority::MarketKey` —
+/// and, as there, that shared grain is load-bearing, not incidental: two disjoint instrument
+/// universes under one Source ID have independent id spaces and can collide on `(channel,
+/// instrument_id)`. A category-blind key (the triple alone) let one universe's `upsert_instrument`
+/// silently overwrite the other's definition, and — since only one survived — no lookup fix on
+/// top could have recovered it: `sinks/api.rs`'s market resolution would return whichever universe
+/// happened to write last, for every request, regardless of which one the caller actually meant.
+/// `category` is never serialized (see [`NormalizedInstrument::category`]) — readers destructure
+/// the key exactly as [`BookReplay`] does.
+///
+/// Within one category the key is still not `(venue, symbol)`: `symbol` is a display label — on
+/// the price-aggregated protocol a fixed 16-byte wire field the publisher fills by keeping a
+/// ticker's rightmost 16 bytes with no hash and no length check, so two genuinely different
+/// markets on a venue with a long ticker can and do collide on it (confirmed against a real
+/// capture — see `tests/fixtures/PROVENANCE.md`). It also does NOT distinguish by protocol/feed
+/// *within* one category: when one venue is served by multiple feeds of the same universe sharing
+/// a channel/instrument id (e.g. Hyperliquid TOB + MBO both reporting `channel=0`, both the
+/// registry's default category), both write the same entry (last-writer-wins). Those feeds are
+/// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
+/// diverge.
+pub type InstrumentSnapshot =
+    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
@@ -453,6 +538,10 @@ const MAX_PENDING_CHANGES: usize = 8192;
 /// Cap on resting orders one market's replay state holds — the same ceiling `ingest::book`'s own
 /// `MAX_ORDERS_PER_BOOK` puts on the producer, so a well-behaved market never reaches it.
 const MAX_ACCUMULATED_ORDERS: usize = 1 << 18;
+
+/// Return type of [`BookAccumulator::top_levels`]: `(bids, asks, true bid count, true ask count)`
+/// — named so clippy's `type_complexity` lint doesn't flag the bare tuple at the signature.
+pub type TopLevels = (Vec<(f64, f64)>, Vec<(f64, f64)>, usize, usize);
 
 impl BookAccumulator {
     pub fn new(symbol: Arc<str>) -> Self {
@@ -606,8 +695,24 @@ impl BookAccumulator {
         &self.symbol
     }
 
-    /// Timestamp of the latest book event folded in (ns since epoch), 0 if unknown — the same stamp
-    /// [`Self::to_book`] carries, readable without materializing the book.
+    /// The current best bid (highest price), as `(price, size)`. Cheap — reads the top of the
+    /// accumulator's own tree rather than materializing the whole book via [`Self::to_book`], which
+    /// a caller that only wants the inside market (e.g. a `best_bid_ask`-style query) should never
+    /// have to pay for. Available regardless of [`Self::baselined`]: reporting only the touched top
+    /// level as "the best currently known" does not claim completeness the way replaying the whole
+    /// book as a re-baseline would.
+    pub fn best_bid(&self) -> Option<(f64, f64)> {
+        self.bids.values().next_back().copied()
+    }
+
+    /// The current best ask (lowest price), as `(price, size)`. See [`Self::best_bid`].
+    pub fn best_ask(&self) -> Option<(f64, f64)> {
+        self.asks.values().next().copied()
+    }
+
+    /// The accumulator's last-applied event time. A caller that only needs a level slice (see
+    /// [`Self::top_levels`]) rather than a full materialization shouldn't have to call
+    /// [`Self::to_book`] — which stamps this same value — just to read it.
     pub fn source_ts_ns(&self) -> u64 {
         self.source_ts_ns
     }
@@ -646,18 +751,27 @@ impl BookAccumulator {
             .collect()
     }
 
+    /// The best `n` levels per side, best-first (bids high-to-low, asks low-to-high), plus each
+    /// side's **true** level count. Cheap regardless of book size — reads straight off the
+    /// accumulator's own `BTreeMap`s and takes at most `n` per side, the same discipline
+    /// [`Self::best_bid`]/[`Self::best_ask`] use for the inside market — so a capped caller (e.g.
+    /// `sinks/api.rs::book`, which serves at most a fixed per-side cap) never pays for
+    /// [`Self::to_book`]'s full materialization of the book's real size just to keep a handful of
+    /// rows. The counts are the true, uncapped per-side sizes rather than `min(len, n)`, because a
+    /// capped caller needs the real count to tell an honest truncation from a complete book.
+    pub fn top_levels(&self, n: usize) -> TopLevels {
+        let bids: Vec<(f64, f64)> = self.bids.values().rev().take(n).copied().collect();
+        let asks: Vec<(f64, f64)> = self.asks.values().take(n).copied().collect();
+        (bids, asks, self.bids.len(), self.asks.len())
+    }
+
     /// Materialize the current state as a re-baseline: `clear` first, then the whole book best-first —
     /// as price levels under [`ReplayScope::Levels`], or as individual orders (each carrying its
     /// `order_id`) under [`ReplayScope::Orders`]. Stamps `snapshot`/`last`, so only call it when
     /// [`Self::baselined`] holds — otherwise it claims completeness for a book that is missing every
     /// level which has not moved.
-    pub fn to_book(
-        &self,
-        venue: &Arc<str>,
-        channel: u32,
-        instrument_id: u32,
-        scope: ReplayScope,
-    ) -> NormalizedBook {
+    pub fn to_book(&self, key: &BookKey, scope: ReplayScope) -> NormalizedBook {
+        let (venue, category, channel, instrument_id) = key;
         let mut changes = Vec::with_capacity(self.bids.len() + self.asks.len() + 1);
         changes.push(BookChange {
             action: BookAction::Clear,
@@ -703,8 +817,9 @@ impl BookAccumulator {
             source: venue.clone(),
             source_id: self.source_id,
             symbol: self.symbol.clone(),
-            channel,
-            instrument_id,
+            channel: *channel,
+            instrument_id: *instrument_id,
+            category: category.clone(),
             changes,
             snapshot: true,
             last: true,
@@ -716,14 +831,99 @@ impl BookAccumulator {
     }
 }
 
-/// Accumulated book state per `(venue, channel, instrument_id)`, replayed on connect and on each
-/// subscribe. Written by the arbiter on the authority gate's admit decision, so it always holds the
-/// authoritative arm's book rather than a discarded arm's copy.
+/// Accumulated book state per market, replayed on connect and on each subscribe. Written by the
+/// arbiter on the authority gate's admit decision, so it always holds the authoritative arm's book
+/// rather than a discarded arm's copy.
+///
+/// Keyed identically to `ingest::authority::MarketKey` — `(venue, category, channel, instrument_id)`
+/// — and that shared grain is load-bearing, not incidental. The gate's own per-market state
+/// (`BookMarket`, `StickyAuthority::markets`) carries the arbitration scope because two instrument
+/// universes under one Source ID have independent id spaces and can collide on
+/// `(channel, instrument_id)`. A narrower key here would (a) merge two unrelated markets into one
+/// accumulator, which the replay path then serves to every new client as full state, and (b) break
+/// the invariant that a market's accumulators, its replay entry and its authority state are dropped
+/// **together** — evicting one universe's market would delete the other's live entry while its
+/// `last_admitted` survived, so it would never re-baseline and would stay `!baselined()`, invisible
+/// to new clients for the life of the process. The `category` is never serialized: readers
+/// destructure the key (`sinks/ws.rs`) and the wire carries only what PROTOCOL.md defines.
 ///
 /// The writer owns two obligations the `depth` replay map already discharges (`arbiter.rs`): purge a
 /// market's entry on session reset, or an ended session's book is replayed to a new client as an
 /// authoritative re-baseline; and bound the entry count, since the key is wire-supplied.
-pub type BookSnapshot = Arc<Mutex<HashMap<(Arc<str>, u32, u32), BookAccumulator>>>;
+pub type BookSnapshot = Arc<Mutex<BookReplay>>;
+
+/// A market's replay key: the arbitration scope plus the wire identity. Structurally
+/// `ingest::authority::MarketKey`, and required to stay so — see [`BookSnapshot`].
+pub type BookKey = (Arc<str>, Arc<str>, u32, u32);
+
+/// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
+pub type BookMap = HashMap<BookKey, BookAccumulator>;
+
+/// The replay state behind [`BookSnapshot`]: every market's accumulated book, keyed on the full
+/// [`BookKey`] (arbitration scope plus wire identity).
+///
+/// `sinks/ws.rs` iterates. `sinks/api.rs` resolves a market from a `NormalizedInstrument`, which
+/// carries `category` (see its doc) alongside the wire identity, so its
+/// `feed_kind_for`/`best_levels`/`book` handlers build the full `BookKey` directly and look it up
+/// with [`get`](Self::get) in one hash hit — no ambiguity, no scan. A prior version kept a second
+/// index from wire identity alone to full key, for a caller with no category to disambiguate with;
+/// nothing calls that path anymore (every production lookup already has the category), so it was
+/// removed rather than kept live on the hot path for no reader.
+#[derive(Default)]
+pub struct BookReplay {
+    books: BookMap,
+}
+
+impl BookReplay {
+    /// Replace one market's accumulator (the re-baseline path).
+    pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) {
+        self.books.insert(key, acc);
+    }
+
+    /// The accumulator for `key`, created with `f` when the market is new (the streaming path).
+    pub fn entry_or_insert_with(
+        &mut self,
+        key: &BookKey,
+        f: impl FnOnce() -> BookAccumulator,
+    ) -> &mut BookAccumulator {
+        self.books.entry(key.clone()).or_insert_with(f)
+    }
+
+    /// Drop one market. The eviction and session-reset path.
+    pub fn remove(&mut self, key: &BookKey) -> Option<BookAccumulator> {
+        self.books.remove(key)
+    }
+
+    pub fn get(&self, key: &BookKey) -> Option<&BookAccumulator> {
+        self.books.get(key)
+    }
+
+    pub fn contains_key(&self, key: &BookKey) -> bool {
+        self.books.contains_key(key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&BookKey, &BookAccumulator)> {
+        self.books.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.books.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.books.is_empty()
+    }
+
+    // Deliberately no `forget_channel` (or any other multi-market removal) here. This map is one
+    // third of a triple this crate keeps in lockstep — a market's accumulator lives in
+    // `ingest::arbiter::Arbiter::book_markets`, its replay entry here, and its
+    // `ingest::authority::StickyAuthority::last_admitted` in the arbiter's `books` — and only the
+    // arbiter can drop all three together. `Arbiter::reset_book_for_market` /
+    // `Arbiter::forget_channel_books` are the seams; a caller reaching in here directly (as an
+    // earlier version of the channel-departure purge did) leaves `last_admitted` behind, so a
+    // restored channel whose arm is unchanged never re-baselines and a market silently stays
+    // hidden from every new client. See those methods' docs.
+}
 
 /// Lock a shared `Mutex`, recovering the guard even if a previous holder panicked while holding it.
 ///
@@ -785,6 +985,13 @@ mod tests {
         assert_eq!(round.order_id, 42);
     }
 
+    const TEST_CATEGORY: &str = "testcategory";
+
+    /// The replay key a test's accumulator materializes under.
+    fn bkey(venue: &Arc<str>, channel: u32, instrument_id: u32) -> BookKey {
+        (venue.clone(), TEST_CATEGORY.into(), channel, instrument_id)
+    }
+
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "KALSHI".into(),
@@ -793,6 +1000,7 @@ mod tests {
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
+            category: TEST_CATEGORY.into(),
             changes,
             snapshot,
             last,
@@ -1005,7 +1213,7 @@ mod tests {
             true,
         ));
 
-        let out = acc.to_book(&venue, 2, 41, ReplayScope::Levels);
+        let out = acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels);
         assert!(out.snapshot && out.last);
         assert_eq!(out.symbol.as_ref(), "KXBTCPERP");
         assert_eq!(
@@ -1054,7 +1262,7 @@ mod tests {
 
         acc.apply(&book(vec![bid(0.61, 10.0)], false, true));
         assert_eq!(
-            acc.to_book(&venue, 2, 41, ReplayScope::Levels)
+            acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels)
                 .changes
                 .len(),
             2
@@ -1075,7 +1283,7 @@ mod tests {
             true,
             false,
         ));
-        let mid = acc.to_book(&venue, 2, 41, ReplayScope::Levels);
+        let mid = acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels);
         assert_eq!(
             mid.changes,
             vec![
@@ -1094,7 +1302,8 @@ mod tests {
         // The closing batch commits the whole event at once.
         acc.apply(&book(vec![bid(0.71, 2.0)], true, true));
         assert_eq!(
-            acc.to_book(&venue, 2, 41, ReplayScope::Levels).changes,
+            acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels)
+                .changes,
             vec![
                 BookChange {
                     action: BookAction::Clear,
@@ -1149,7 +1358,7 @@ mod tests {
             false,
             true,
         ));
-        let out = acc.to_book(&venue, 2, 41, ReplayScope::Levels);
+        let out = acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels);
         assert_eq!(
             out.changes,
             vec![
@@ -1179,7 +1388,8 @@ mod tests {
         let mut acc = BookAccumulator::new("KXBTCPERP".into());
         acc.apply(&book(vec![], false, true));
         assert_eq!(
-            acc.to_book(&venue, 2, 41, ReplayScope::Levels).source_ts_ns,
+            acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels)
+                .source_ts_ns,
             1_781_019_263_715_344_015
         );
 
@@ -1187,7 +1397,8 @@ mod tests {
         unknown.source_ts_ns = 0;
         acc.apply(&unknown);
         assert_eq!(
-            acc.to_book(&venue, 2, 41, ReplayScope::Levels).source_ts_ns,
+            acc.to_book(&bkey(&venue, 2, 41), ReplayScope::Levels)
+                .source_ts_ns,
             1_781_019_263_715_344_015
         );
     }
@@ -1264,9 +1475,10 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            category: crate::model::empty_category(),
         });
 
-        let out = acc.to_book(&venue, 0, 41, ReplayScope::Levels);
+        let out = acc.to_book(&bkey(&venue, 0, 41), ReplayScope::Levels);
         assert_eq!(
             out.source_id, 1,
             "the id the producer resolved, not a placeholder"
@@ -1463,7 +1675,7 @@ mod tests {
             true,
         ));
 
-        let levels = acc.to_book(&venue, 0, 1, ReplayScope::Levels);
+        let levels = acc.to_book(&bkey(&venue, 0, 1), ReplayScope::Levels);
         let updates = |b: &NormalizedBook| -> Vec<BookChange> {
             b.changes
                 .iter()
@@ -1479,7 +1691,7 @@ mod tests {
             "a price level carries no order identity"
         );
 
-        let orders = updates(&acc.to_book(&venue, 0, 1, ReplayScope::Orders));
+        let orders = updates(&acc.to_book(&bkey(&venue, 0, 1), ReplayScope::Orders));
         assert_eq!(
             orders.iter().map(|c| c.order_id).collect::<Vec<_>>(),
             vec![1, 2],

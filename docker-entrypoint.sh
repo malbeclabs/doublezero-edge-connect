@@ -28,13 +28,20 @@ BRIDGE_PID=""
 SIGNALED=0
 
 # True iff doublezerod reports a live tunnel. `doublezero status --json` emits an
-# array whose entries carry `response.doublezero_status.session_status`
-# (up/down/unknown); we match a session of `up`. Grepping the JSON field (a stable
-# key) rather than the human table avoids depending on column layout — and on jq,
-# which the image doesn't ship. `timeout` bounds a probe against a wedged daemon.
+# array whose entries carry `response.doublezero_status.session_status`, whose live
+# values END in "Up" ("BGP Session Up", "PIM Adjacency Up") while every failure value
+# ("BGP Session Down", "Network Unreachable", the CLI's synthesized "disconnected")
+# does not — so match the suffix, never the literal "up", which matches no live value
+# at all and would skip the graceful disconnect below on every `docker stop`.
+# Grepping the JSON field (a stable key) rather than the human table avoids depending
+# on column layout — and on jq, which the image doesn't ship. `timeout` bounds a probe
+# against a wedged daemon.
+# Capture, then match in-shell: piping into `grep -q` under `set -o pipefail` can
+# report the probe as failed when grep's early exit SIGPIPEs the writer.
 dz_connected() {
-    timeout 5 doublezero status --json 2>/dev/null \
-        | grep -qiE '"session_status"[[:space:]]*:[[:space:]]*"up"'
+    local json
+    json="$(timeout 5 doublezero status --json 2>/dev/null || true)"
+    [[ "$json" =~ \"session_status\"[[:space:]]*:[[:space:]]*\"[^\"]*[Uu]p\" ]]
 }
 
 # Graceful shutdown: disconnect from DoubleZero *while the daemon is still up*,

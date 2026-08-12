@@ -86,8 +86,10 @@ Modules are grouped by role under `src/`:
   `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
-  (WebSocket, on by default) and `hyperliquid` (the same data in Hyperliquid's own schema, off by
-  default). A new feature is a sibling module here + a spawn in `main.rs`.
+  (WebSocket, on by default), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
+  off by default), `admin` (the one mutation path in this crate — see below) and `hyperliquid` (the
+  same data in Hyperliquid's own schema, off by default). A new feature is a sibling module here +
+  a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
   market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
@@ -118,26 +120,119 @@ Modules are grouped by role under `src/`:
     `--shred-dedup-window-slots`.
 - **root** — `model` (shared wire types/clocks/snapshots) and `main`.
 
-- **`ingest/feeds.rs`** — the hardcoded feed registry: each `Feed` is one multicast group mapped to one
+- **`ingest/registry.rs` + `ingest/registry.json`** — the feed registry as **data**. The rows are a
+  JSON document resolved once at startup from one of three sources in precedence order —
+  `--feed-registry-url` (the precursor to reading the DoubleZero ledger, which drops in as a fourth
+  `Source`), `--feed-registry <path>` (a bind-mounted file), else the `include_str!`-ed built-in copy
+  — parsed, validated, expanded and **leaked into `'static`**, which is what keeps `FeedKey`, the
+  metric labels and every `&'static str` field unchanged downstream. ⚠️ **Never add a channel roster,
+  port base or group `code` as a Rust constant.** Those numbers live in a publisher inventory that
+  changes without our involvement (the same allocation was decided four times upstream in dated
+  specs, each reversing the last), and compiling them in makes every upstream change a rebuild while
+  making a stale copy invisible — a wrong port binds a socket that stays silent. **A rejected document
+  degrades or refuses depending on where it came from, and the asymmetry is the point:** a `Url`
+  failure of *any* kind (unreachable, malformed, a `version` this build predates, a validation error)
+  warns and falls back to the built-in copy, because a remote registry is infrastructure that moves
+  underneath a running fleet and — since resolution is startup-only — refusing would not kill the
+  fleet when the document changed but each process at its next reschedule, far from the cause; a host
+  that is *up* serving one new field must never be worse than one that is down. A `File` (an
+  operator's explicit instruction about this one container) or the built-in copy is **fatal**.
+  The binary's own `clap` default for `--feed-registry-url` is empty (running from source reaches
+  no network); the **image** bakes in the hosted URL as a `Dockerfile` `ENV` instead, so it stays
+  inspectable via `docker inspect` and overridable with `-e` without a rebuild either way — a `File`
+  source wins only when the URL is empty, so an operator combining a bind-mounted file with the
+  image must clear `DZ_FEED_REGISTRY_URL` too (`scripts/connect.sh` does this automatically when
+  `DZ_FEED_REGISTRY` is set and the operator hasn't set a URL of their own). `Loaded::log_resolved`
+  is the one place that announces which source actually won (`"feed registry resolved"`,
+  `source`/`version`/`rows`/`receivers`); `connect.sh` greps it after startup and echoes it, since
+  the URL-failure fallback above is silent by design and that log line is the only signal.
+  There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
+  `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
+  `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
+  Validation covers the structural per-row rules (non-empty `code`/`category`, a `venue` that
+  `sources::source_id_of` resolves, base ports unique within a row, a non-empty roster, no port
+  overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
+  planes, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key from a
+  silently two-port block whose book never syncs into a startup error) **and the four cross-row
+  invariants** — `(venue, category, kind)` uniqueness,
+  one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
+  cannot resolve last-write-wins by document order), `emit_trades` agreeing with
+  `reconcile::tape_rank_is_some`, and global `(group, port)` uniqueness. Those four used to be
+  `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
+  document could be supplied at runtime. The rest is upstream policy this process cannot verify.
+  `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a channel
+  roster plus per-plane bases and expands to `base + channel_id` on every plane (one channel is an
+  independent state machine — its own `Reset Count`, sequence series, manifest seq and snapshot cycle
+  — so one channel is one `FeedPublisher` and one receiver task); a roster that repeats an id
+  collapses it and says so. There is **no hot reload**: books and reference data are keyed to the
+  topology in effect when they were built.
+- **`ingest/feeds.rs`** — the registry **types** plus the one accessor. `feeds()` returns the rows
+  installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
+  `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
+  rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
   venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
   identity is its **base port** (`FeedPublisher::base_port()`, the block's mktdata port) — the
   `publisher` metric label, the log field and the reconciler/health task-key component; there are
-  deliberately no host names in the registry. `FEEDS` is the built-in list; add a row to ingest
-  another venue (sibling-protocol rows are added once their live endpoints are known). `--feed
+  deliberately no host names in the registry. Add a row to the **document** to ingest another venue
+  (sibling-protocol rows are added once their live endpoints are known). `--feed
   <venue>` selects a subset of venues and `--publisher-port <port>` narrows the publishers within
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
   the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
   venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
   ride separate groups with separate codes. The two **Lashay** perps rows (`lashay-1` TOB
-  `233.84.178.3:7576/7577`, `lashay-2` MBP `233.84.178.4:31000/41000/51000`, both `Sticky`, both
+  `233.84.178.3:31000/41000`, `lashay-2` MBP `233.84.178.4:32000/42000/52000` — **all three rows'
+  ports confirmed against live captures on 2026-08-09**, after all three were found misprovisioned
+  (see the port-provenance note in `registry.json`) — both `Sticky`, both
   claiming the tape) are exactly that case. Both groups are **live and activated** (testnet and
   mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
   that does not match its live group fails **silently** — no warning, no failed bind, just a
-  permanently-zero `dz_receiver_up`; `feeds::tests::lashay_rows_match_the_deployment` pins both rows
-  against the deployment so a transcription slip fails the build instead.
+  permanently-zero `dz_receiver_up`. ⚠️ **No test can catch that**, and one used to claim it did:
+  `feeds::tests::the_lashay_rows_expand_consistently_with_the_document` (formerly named
+  `..._match_the_deployment`) asserts the document against literals written beside it — the code
+  agreeing with itself. It catches a later edit that moves a value, never a value that was wrong when
+  written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
+  sibling row's block, with the build green throughout. **The external check is a packet capture**, and
+  the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
+  port moves. A third **Lashay** row
+  (`lashay-4`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
+  under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
+  (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
+  own deployment inventory on 2026-08-09. `33000`/`43000` is the **top-of-book sibling's** base, and a
+  market-by-price row built on it joins the right group and receives nothing, which reads as a dead
+  publisher rather than as a misconfiguration — this row carried those bases until that check. A
+  second publisher takes the same roster with every id offset by **+100** and the ports untouched: the
+  port names the league, so a subscriber binds one socket per league and hears both publishers on it,
+  while `channel_id` names the league *and* the publisher so the two are sequenced separately. Never argue that the
+  universes are separate because their `channel_id` ranges do not overlap — the allocation is
+  mid-migration, the numbering is owned upstream and nothing here enforces it; the `category` is the
+  only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from
+  (`None` on an explicit block) — the fact the channel filter below is built on.
+- **`ingest/channel_filter.rs`** — the **channel filter**: which channels of an activated feed this
+  process decodes (`--channels`/`DZ_CHANNELS`, e.g. `lashay-4=10,11`). It is an **allowlist**, not a
+  threshold — the old name, "floor", implied a minimum, which is backwards: it restricts a set, and
+  every unmentioned feed keeps admitting everything. Sits between the two filters either side of it
+  — `reconcile` picks which *feeds* run, `sinks::ws`'s `SubFilter` picks what one *client* receives —
+  and is process-global and ops-owned, since it scopes books, history and CPU for everyone. It acts
+  **only** where the publisher derives a port per channel: an excluded channel is never bound and the
+  kernel discards its traffic before userspace, which is why it costs nothing and is the reason that
+  derivation exists upstream. Narrowing a row whose publishers bind one base port **flat** is
+  **refused at startup**, not implemented as a frame-header test: there `channel_id` identifies
+  mirrors, so every publisher carries the complete universe and narrowing would give up redundancy
+  without reducing a single decoded message. Keyed **by group code, never globally** (one global flag
+  would filter to a league and silently half-blind an unrelated mirrored feed), and takes **numeric
+  ids only** — channel *names* live in the publisher's inventory by design and a copy here would
+  drift exactly as four superseded port allocations did. Every id is validated against the **loaded
+  document's** roster and an unknown id or code is fatal at startup, because a channel filter that
+  silently filters nothing is worse than one that refuses to start. Parsed once in `main`; the
+  reconciler consumes it as an *input* to the desired receiver set (`feed_keys`), so `reconcile`
+  remains the single activation authority and its spawn/abort diff is unchanged. **Two mechanisms,
+  one validator:** `--channels`/`DZ_CHANNELS` only sets the *initial* value of a shared
+  `Arc<Mutex<ChannelFilter>>`; `sinks::admin`'s `POST /admin/channels` can replace it at runtime
+  through the identical `ChannelFilter::parse`, so nothing reachable after startup can admit a row
+  startup itself would have refused.
 - **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
   (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
   authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never
@@ -161,10 +256,13 @@ Modules are grouped by role under `src/`:
 - **`ingest/reconcile.rs`** — the **activation authority**. `Reconciler::run()` polls `detect()`
   every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
-  (spawn/abort). Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
+  (spawn/abort). The desired receiver set is the subscribed rows' publishers **narrowed by the
+  channel filter** (`ingest::channel_filter`) — an input to the set, not a second authority. Owns all `JoinHandle`s; teardown is `abort()` (clean — sockets close on drop). Reaps
   finished handles so a died feed respawns. Fail-open / `--subscription-gating-disable` route through
   one `static_desired()`. Also the **trade-tape row owner**: `tape_owners` ranks the running receivers
-  per venue (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
+  per `(venue, category)` — one owner per *universe*, since rows sharing a Source ID can carry
+  instrument sets that mirror nothing and a venue-wide rank mutes the loser's tape outright —
+  (`TopOfBook` over `MarketByPrice`, base port breaking ties; MBO/Midpoint never rank) and
   `apply_feeds` publishes the result onto a `TapeOwner` (`Arc<AtomicBool>`) each processor reads per
   print, so ownership moves **without a respawn** — a respawn would drop a healthy publisher's books
   and reference data whenever a *peer* feed's subscription changed. The flag is stored **with** the
@@ -177,6 +275,15 @@ Modules are grouped by role under `src/`:
   row, so an incumbent keeps the tape until the newcomer really registers rather than bouncing on
   activation; above a dead one, so a cold start where nothing has bound falls back to rank instead of
   leaving the venue ownerless). Changes are counted by `dz_tape_owner_changes_total{venue}`.
+  `forget_departing_channel` is the other half of a channel-filter narrowing (static at startup, or via
+  `sinks::admin`'s `POST /admin/channels` at runtime): once a channel's receiver key actually leaves
+  `plan()`'s desired set — never before, per the `N1` `debug_assert!` guarding reordering — it purges
+  that departing row's own `(venue, category, channel)` slice from all three: the catalog
+  (`InstrumentSnapshot`, a `retain`), the book (routed through `Arbiter::forget_channel_books`, never
+  a direct replay-map delete, so the accumulator/replay/`StickyAuthority` triple drops together), and
+  `history::Store::forget_channel`. Category-precise throughout so a departing channel can never
+  over-drop a live peer universe sharing the same numeric id — see `ingest/feeds.rs`'s
+  mid-migration warning on `channel_id`.
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
@@ -188,7 +295,9 @@ Modules are grouped by role under `src/`:
   on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
   ticking when market data is wedged). `FrameCtx` carries the shared `arbiter` (not a raw `tx`);
   `ctx.emit(msg)` routes through it tagged `Publisher::Edge(src_ip)`.
-- **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, kind, base port)`,
+- **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
+  (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
+  universes),
   aggregated to the **venue**-level `status`/`dz_feed_up` PROTOCOL.md promises, so one wedged
   publisher never takes a venue down while a peer streams. Only quote-bearing kinds count
   (`carries_venue_status`; MBO is depth-only and must neither declare an outage nor mask one), with a
@@ -202,8 +311,8 @@ Modules are grouped by role under `src/`:
   the `Publisher` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
-  `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher)` (quotes → quote
-  floor, depth → depth floor, trades → the per-venue **tape leader** then the window, `book` → the
+  `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher, category)` (quotes → quote
+  floor, depth → depth floor, trades → the per-`(venue, category)` **tape leader** then the window, `book` → the
   single-arm authority gate below, `Instrument` → a rate limit on the precision pair per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
@@ -217,12 +326,14 @@ Modules are grouped by role under `src/`:
   `Contest{winner, lead_ns}` drops the losing cross-source copy and records the head-to-head
   lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
-  plain collapse. The **tape leader** (`tape_leader`, `Sticky` venues only) is the arm-level twin of
+  plain collapse. The **tape leader** (`tape_leader`, keyed `(venue, category)`, `Sticky` venues only —
+  the `category` `emit` parameter is the feed row's, never a wire field: PROTOCOL.md is a consumer
+  contract and this is producer-side keying) is the arm-level twin of
   the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
   sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
   venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
   **id-independent**. Four rules: first arm to print leads (a TOB-only deployment carries no `book`
-  traffic, so `venue_leader()` is `None` forever and electing first would mute the tape); an arm the
+  traffic, so `scope_leader()` is `None` forever and electing first would mute the tape); an arm the
   authority *tracks* displaces one it does not (the slot is first-come on an unauthenticated wire);
   the book-*elected* arm takes over, **once per election** rather than per print (arm identity is
   shared across a venue's rows — one source IP per publisher host, both protocols — and re-honouring
@@ -233,8 +344,11 @@ Modules are grouped by role under `src/`:
   `dz_tape_arm_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
-  no-dark-start already exposes for `book` — and the gate is venue-wide, so arms that *sharded* prints
-  rather than mirroring them would lose the non-serving arm's fills. `no_id_owner` is skipped entirely
+  no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
+  that *sharded* prints rather than mirroring them would lose the non-serving arm's fills (giving them
+  distinct categories is the registry's job). The two `books` lookups inside it read the authority at
+  the same `(venue, category)` grain, so the deferral can only ever name an arm elected on *this*
+  universe. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
   `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`
@@ -302,7 +416,15 @@ Modules are grouped by role under `src/`:
   deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
   arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
   every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
-  dropped (`dz_book_dropped_total`). **Speed and silence are per arm, venue-wide; health is per market**
+  dropped (`dz_book_dropped_total`). The gate is keyed on `(venue, category)` — `authority::ScopeKey`,
+  which also prefixes `MarketKey` — never on the venue alone: one Source ID can carry universes that
+  mirror nothing, and a venue-wide election drops the losing universe's whole book stream permanently
+  (the only escape is leader silence, and a leader streaming its own universe is never silent).
+  **Speed and silence are per arm, across that arm's universe; health is per market**. The arm-ordinal
+  cap (`MAX_LABELLED_ARMS`, 8) is likewise **per scope**, so a venue carrying N universes admits up to
+  `8 x N` arms — the forged-flood bound still holds per universe, which is the grain that decides
+  anything, and the metric label set stays `{venue, arm}` (`dz_arm_markets_held` sums a venue's
+  universes; two universes' `arm0` are different publishers)
   (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
   overrides the elected arm for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the arm that last reached the wire for this market" re-baselines the consumer**: a
@@ -321,14 +443,23 @@ Modules are grouped by role under `src/`:
   Per-market state is capped by `MAX_BOOK_MARKETS` (`dz_book_markets_evicted_total`) and eviction drops
   the accumulators, the replay entry **and** `StickyAuthority`'s own per-market entry together — that
   pairing is what makes eviction safe rather than a corruption primitive, since losing `last_admitted` is
-  what forces the re-baseline. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
+  what forces the re-baseline. All three are keyed at the **same grain** (`MarketKey`, scope included);
+  a narrower replay key would break exactly that pairing, because two universes with independent id
+  spaces can share a `(channel, instrument_id)` — evicting one would delete the other's *live* entry
+  while its `last_admitted` survived, so it would never re-baseline and would stay invisible to new
+  clients (`arbiter::tests::evicting_one_universes_market_spares_the_others_replay_entry`).
+  `sinks/ws.rs` and `sinks/api.rs` skip the scope element: it is a producer-side key that never
+  reaches the wire. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
   processor scopes `EndOfSession` per arm and channel, handing those markets to the peer). `arm_race` is the **only** producer of the matched-lead
   samples the speed re-election consumes: it pairs the two arms' copies of the same **trade** by content
-  (`(venue, symbol, price bits, size bits, aggressor)`, FIFO per signature so identical repeats pair in
-  order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time. Trades only — a
+  (`((venue, category), symbol, price bits, size bits, aggressor)`, FIFO per signature so identical
+  repeats pair in order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time.
+  Pairs form **within one scope**: it is the sole producer of the election's evidence and that election
+  is per universe, so a cross-universe pair would mint a foreign publisher into a scope's admission
+  slots and could elect an arm serving no `book` there. Trades only — a
   level update's cross-arm-common fields recur on a coarse price grid and would mis-pair constantly — and
   **edge arms the authority already tracks only** (`Arbiter::race_eligible`): the public backstop decodes
-  from parsed JSON and serves no `book`, and an untracked publisher would spend one of the venue's eight
+  from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
   non-negative). The only `FEEDS` row of that kind is `lashay-2`, whose group is live, so these series
@@ -518,12 +649,65 @@ Modules are grouped by role under `src/`:
   the process; unlike `ws`'s, no reconciler respawns it), and the client limits are constants, of which
   the inbound rate cap is the load-bearing one — a subscribe frame is tens of bytes and costs a whole
   book to answer, and the `subs.contains` guard cannot see an unsubscribe-then-resubscribe loop.
+- **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
+  `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
+  bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical
+  figures `main` logs once at startup as "feed registry resolved," read from
+  `ingest::feeds::registry_info()` rather than recomputed, so a fleet-wide check of which document a
+  host is running doesn't need log access), `history` (`history::Store::stats()` verbatim — products tracked/at cap,
+  buckets, bucket budget, estimated bytes, window, evictions, late drops), `channels` (per enabled
+  row that carries a channel id — every row but a flat one, see `ingest/channel_filter.rs` — its full
+  roster with `allowed` from the channel filter alone, `bound` from **real** receiver liveness
+  (`SharedFeedHealth::liveness`, keyed exactly as the reconciler's own receiver map — an
+  admitted-but-unsubscribed channel reads `Unregistered`/`Down` here rather than a false "bound",
+  the exact field the admin surface's own `GET` had to caveat instead of fix, since it has no
+  liveness handle at all), `products` from `history::products_for` at the same `(venue, category,
+  channel)` grain, plus `label` (registry-supplied, display-only) or, failing that, live-derived
+  `symbol_prefixes` — one linear pass over the whole instrument catalog per request (not per
+  channel), ranked by how many instruments carry each prefix (alphabetical tiebreak) and capped at
+  8 sent, with `symbol_prefixes_total` reporting the true distinct count regardless of the cap so a
+  client can render an exact remainder; both fields omitted rather than sent empty/null so a bare
+  channel id reads as "no signal yet," never an error), and `process`
+  (resident memory + cumulative CPU time read straight off the Prometheus **process collector**,
+  deliberately independent of `--metrics-bind` so it still answers over `--url` against a remote
+  host with neither the metrics endpoint nor `/proc` access enabled; `None`, never a fabricated `0`,
+  when the collector isn't registered — it's Linux-only, see `metrics::Metrics::new`).
+- **`sinks/admin.rs`** — the **one mutation path** in this crate, entirely separate from `/v1`
+  (which must stay provably read-only) and **on by default, at loopback**
+  (`--admin-bind`/`DZ_ADMIN_BIND` defaults to `127.0.0.1:9098`; set empty to disable it outright) —
+  the exposure is accepted on the condition that the default never reaches past loopback. **No
+  authentication**, and under host networking a wildcard bind is genuinely network-reachable, so an
+  override must stay on loopback, never a bare wildcard. Two routes, both `/admin/channels`: `GET`
+  reports the channel filter in force plus,
+  per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver
+  set (this surface has no handle on the reconciler's `active` map or `SharedFeedHealth`, so a `note`
+  field says so rather than the response naming the field "bound" and inviting the exact mistake
+  `sinks/api.rs`'s own `channels` block above had to fix); `POST ?channels=<spec>` replaces the
+  shared `Arc<Mutex<ChannelFilter>>` through the identical `ChannelFilter::parse` the startup path
+  uses — so nothing here can admit a row startup would have refused — taking effect on the
+  reconciler's *next* tick via the existing spawn/abort diff, which is also what purges a departing
+  channel's catalog/book/history state (`reconcile::forget_departing_channel`, above), not the
+  instant the handler returns. The spec travels as a **query parameter, not a body**: this crate's
+  hand-rolled `sinks::http` scaffolding never reads one, so `POST` refuses two distinct caller
+  mistakes rather than silently misfiring on the natural instinct to `POST` a body — a **missing**
+  `channels` parameter (400, distinct from present-and-empty, which is how an operator explicitly
+  clears the channel filter) and a **non-empty request body** (400, detected via `Content-Length` —
+  otherwise silently ignored, which is how `curl -d` or a library's default `post(url, data=...)`
+  would quietly widen the channel filter to admit-everything while looking, to the caller, like it
+  worked). Bind/serve split exactly as `ws`/`api` (a taken port disables this surface without taking
+  the tunnel down) but deliberately **not** subscription-gated — an operator must be able to inspect
+  or narrow the channel filter before anything is subscribed at all.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
-  `now_ns()` / `now_mono_ns()` clocks. The `InstrumentSnapshot` and `DepthSnapshot` are both keyed by
-  **`(venue, symbol)`** so feeds sharing a symbol don't clobber each other; `BookSnapshot` is keyed by
-  **`(venue, channel, instrument_id)`** — a market-by-price `symbol` is a truncated display label and
-  collides across markets, so it is not an identity.
+  `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by
+  **`(venue, channel, instrument_id)`** and `BookSnapshot` by that **prefixed with the arbitration
+  scope** (`(venue, category, channel, instrument_id)` — exactly `authority::MarketKey`) — a
+  market-by-price `symbol` is a truncated display label
+  that collides across markets (confirmed against a real capture — two distinct instrument_ids
+  sharing one truncated symbol, see `tests/fixtures/PROVENANCE.md`), so it is not an identity; a
+  `(venue, symbol)`-keyed map would have the second market's insert silently destroy the first's
+  entry. `DepthSnapshot` (Market-by-Order only) is still keyed **`(venue, symbol)`** — unconfirmed
+  whether that feed's own truncated symbols can collide the same way; not addressed here.
   `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
   absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
   reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`
@@ -597,3 +781,41 @@ Modules are grouped by role under `src/`:
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
   `wss://` client in `ingest/ws_feeder.rs` (public HL feed), which uses rustls + bundled webpki roots.
+
+## Packaging and release (the `doublezero-edge` CLI)
+
+The bridge stays a container; only `doublezero-edge` (the read-only `/v1`/`/admin` CLI, a separate
+workspace member — see `doublezero-edge/`) ships as a **signed deb/rpm**, modeled end-to-end on the
+DoubleZero client's own CLI packaging (`release/.goreleaser.base.client.yaml` in the `doublezero`
+repo) so it reuses that signing and distribution rather than inventing a second path:
+
+- **`release/.goreleaser.base.edge-cli.yaml`** (+ `testnet`/`mainnet-beta` overlays that each add
+  only a `cloudsmiths:` block) — `builder: rust`, `--package=doublezero-edge`, target
+  `x86_64-unknown-linux-musl` with `CC_x86_64_unknown_linux_musl=musl-gcc`. **Static by design**: a
+  glibc build on the CI image would fail on an older host we don't control. `before.hooks` generate
+  the three shell-completion files from `doublezero-edge completion <bash|zsh|fish>` (a plain
+  `clap_complete` subcommand in `doublezero-edge/src/main.rs` that runs with no config file, no
+  server, no network — packaging depends on that). `nfpms:` bundles the binary at `/usr/bin` plus
+  those three completions and **nothing else**: no `dependencies:`, no `scripts:`, no unit files.
+  That inertness — pinned from the built artifact, not the config, by `tests/packaging.bats`
+  (`dpkg -c`/`rpm -qlp` list exactly those four paths; `ldd` reports the binary as not dynamically
+  linked) — is what makes the package safe to install unattended from a shell prompt; a future
+  maintainer script is a design decision to revisit, not a detail to slip in.
+- **`.github/workflows/release.edge-cli.yml`** — tag-triggered on `doublezero-edge/v*` (the
+  `monorepo.tag_prefix`, namespaced so it never collides with this repo's `shred-proxy-v*` tags),
+  mirrors `release.client.yml`: installs `rpm` + `musl-tools`, runs goreleaser-pro twice (once per
+  overlay) with `GORELEASER_KEY` + `CLOUDSMITH_TOKEN`.
+- **Cloudsmith, existing repos.** Publishes into `doublezero-testnet` / `doublezero-mainnet-beta`
+  (org `malbeclabs`) — the same repos the DoubleZero client already publishes into — not a new one,
+  so a host that already trusts that source installs `doublezero-edge` with no second key or source
+  file. **One artifact serves both environments**: the CLI is a plain HTTP client with no ledger
+  coupling, so unlike the client it needs no env-specific build variant.
+- **`scripts/connect.sh`** offers the package only *after* the bridge container is confirmed
+  healthy, and only ever warns on decline or failure — the container is the product, the CLI a
+  convenience (see `tests/scripts/install_cli.bats`). It names the repo and package before touching
+  anything; `DZ_INSTALL_CLI=1|0` and `DZ_ASSUME_YES=1` answer non-interactively. It also clears the
+  image's default `DZ_FEED_REGISTRY_URL` when an operator sets `DZ_FEED_REGISTRY` without a URL of
+  their own — see the `ingest/registry.rs` entry above (`tests/scripts/feed_registry.bats`).
+
+Adding a fourth environment or changing the completion paths means editing the base file once; the
+overlays exist only to hold each environment's `cloudsmiths:` block.
