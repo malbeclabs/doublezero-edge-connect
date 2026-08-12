@@ -300,15 +300,16 @@ impl ReceiverRegistration {
         }
     }
 
-    /// Note a publisher whose order-level books this receiver is feeding. Bounded by the same
-    /// [`MAX_PUBLISHERS`] the processors bound their per-source state with, since the source IP is
-    /// spoofable; past it a forged source simply keeps its standing until the market is evicted.
+    /// Note a publisher whose order-level books this receiver is feeding. Bounded like the processors'
+    /// own per-source state, oldest evicted first: the source IP is spoofable, and refusing new entries
+    /// at the cap would let 256 forged datagrams stop a real publisher's standing being released on
+    /// exit — the wedge this exists to close.
     fn note_publisher(&mut self, publisher: IpAddr) {
-        if self.key.1 != FeedKind::MarketByOrder
-            || self.publishers.len() >= MAX_PUBLISHERS
-            || self.publishers.contains(&publisher)
-        {
+        if self.key.1 != FeedKind::MarketByOrder || self.publishers.contains(&publisher) {
             return;
+        }
+        if self.publishers.len() >= MAX_PUBLISHERS {
+            self.publishers.remove(0);
         }
         self.publishers.push(publisher);
     }
@@ -332,7 +333,7 @@ impl Drop for ReceiverRegistration {
         if !self.publishers.is_empty() {
             let mut a = lock(arbiter);
             for &ip in &self.publishers {
-                a.forget_publisher_books(Publisher::Edge(ip));
+                a.forget_publisher_books(venue, Publisher::Edge(ip));
             }
         }
         self.health.deregister(self.key, |venue_up| {

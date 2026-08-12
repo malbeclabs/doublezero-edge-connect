@@ -476,9 +476,10 @@ struct MarketEvents {
     /// clock, which is what keeps the window a cost knob. When that count binds on an entry a peer could
     /// still be racing, the market re-baselines (see [`Self::track`]) rather than forgetting silently.
     resting: HashMap<u64, Option<(f64, Publisher)>>,
-    /// `resting`'s keys in insertion order, oldest first, with when each was recorded — for its own
-    /// bound, and to tell an eviction that costs the guard nothing from one that costs it everything.
-    resting_order: VecDeque<(u64, u64)>,
+    /// `resting`'s keys in insertion order, oldest first, each with the time it was **delivered** —
+    /// `None` for one seeded from a re-baseline. That is what tells an eviction that costs the guard
+    /// nothing from one that costs it everything.
+    resting_order: VecDeque<(u64, Option<u64>)>,
     /// One-shot: why this market can no longer be served from either arm's deltas, drained by the
     /// caller. Set when the guard cannot answer — the arms disagreed, or a tracked order aged out of
     /// `resting` — because from then on neither publisher's stream is known to describe the book a
@@ -499,6 +500,34 @@ enum EventVerdict {
     /// two books has drifted. Neither copy is published: the larger rewinds the consumer past a fill
     /// the venue already applied, the smaller lets a forged size mute a real order.
     Disagreement,
+}
+
+/// How an order came to be tracked, which is the whole of whether losing it costs the guard anything.
+#[derive(Clone, Copy)]
+enum Tracked {
+    /// Delivered to the wire, with a peer's copy still plausibly in flight for `window_ns`.
+    Delivered { at: u64, window_ns: u64 },
+    /// Seeded from a re-baseline's own book. Nothing is racing it — the consumer already holds this
+    /// state — so evicting it is free. Stamping seeds as deliveries instead would make every book
+    /// larger than the cap re-arm, through its own seeding, the re-baseline it just discharged.
+    Seeded,
+}
+
+impl Tracked {
+    fn delivered_at(self) -> Option<u64> {
+        match self {
+            Tracked::Delivered { at, .. } => Some(at),
+            Tracked::Seeded => None,
+        }
+    }
+
+    /// Whether evicting an entry delivered at `other` loses a guard this delivery still needs.
+    fn races_with(self, other: Option<u64>) -> bool {
+        let (Tracked::Delivered { at, window_ns }, Some(o)) = (self, other) else {
+            return false;
+        };
+        at.saturating_sub(o) <= window_ns
+    }
 }
 
 impl MarketEvents {
@@ -552,7 +581,11 @@ impl MarketEvents {
             }
             None => {
                 let slot = (size != 0.0).then_some((size, publisher));
-                self.track(ev.order_id, slot, arrival_ns, Some(window_ns));
+                let how = Tracked::Delivered {
+                    at: arrival_ns,
+                    window_ns,
+                };
+                self.track(ev.order_id, slot, how);
                 EventVerdict::Deliver
             }
         }
@@ -564,25 +597,17 @@ impl MarketEvents {
     /// is the horizon `window_ns` bounds everywhere else: past it every copy that was coming has already
     /// arrived, so dropping the entry costs nothing and a book far larger than the cap streams normally.
     /// Inside it the guard has been asked to forget something it is still needed for, and the market
-    /// re-baselines rather than reopening the resurrection path. Seeding from a re-baseline's own orders
-    /// passes `None`: the consumer's book was just replaced, and forcing there would re-force on every
-    /// snapshot larger than the cap.
-    fn track(
-        &mut self,
-        order_id: u64,
-        slot: Option<(f64, Publisher)>,
-        now: u64,
-        window_ns: Option<u64>,
-    ) {
+    /// re-baselines rather than reopening the resurrection path.
+    fn track(&mut self, order_id: u64, slot: Option<(f64, Publisher)>, how: Tracked) {
         if self.resting.insert(order_id, slot).is_none() {
-            self.resting_order.push_back((order_id, now));
+            self.resting_order.push_back((order_id, how.delivered_at()));
         }
         while self.resting_order.len() > MAX_SEEN_ORDER_EVENTS {
-            let Some((old, recorded)) = self.resting_order.pop_front() else {
+            let Some((old, delivered)) = self.resting_order.pop_front() else {
                 break;
             };
             self.resting.remove(&old);
-            if window_ns.is_some_and(|w| now.saturating_sub(recorded) <= w) {
+            if how.races_with(delivered) {
                 self.force(FORCED_GUARD_EVICTED);
             }
         }
@@ -601,12 +626,12 @@ impl MarketEvents {
     /// still never reuses an order id, so a peer's stale `Add` for an order this snapshot does not
     /// contain must still be refused. `changes` seeds the floor with the snapshot's own orders, so a
     /// later peer claiming more is resting for one of them is still caught as drift.
-    fn rebaselined(&mut self, changes: &[BookChange], publisher: Publisher, now: u64) {
+    fn rebaselined(&mut self, changes: &[BookChange], publisher: Publisher) {
         self.seen.clear();
         self.order.clear();
         self.forced = None;
         for c in changes.iter().filter(|c| c.order_id != 0 && c.size != 0.0) {
-            self.track(c.order_id, Some((c.size, publisher)), now, None);
+            self.track(c.order_id, Some((c.size, publisher)), Tracked::Seeded);
         }
     }
 
@@ -831,6 +856,10 @@ struct BookMarket {
     /// Batches withheld waiting for that event boundary. `last` is mandatory on the wire but the wire
     /// is unauthenticated, so the wait is bounded — see [`MAX_WITHHELD_BATCHES`].
     withheld: u32,
+    /// When this market last discharged a *forced* re-baseline, which rate-limits the next one. One
+    /// datagram can raise the flag and each discharge costs a whole book, so without it the counter is
+    /// a lever rather than an observable.
+    rebaselined_ns: u64,
 }
 
 /// The `dz_arm_authority_transfers_total` reason for an admitted `book` batch, or `None` when nothing
@@ -1043,19 +1072,22 @@ impl Arbiter {
         peer.synced = synced;
     }
 
-    /// Drop a departed publisher's book standing across every market — the seam a Market-by-Order
-    /// receiver's registration calls as it exits.
+    /// Drop a departed publisher's claim to be serving `venue`'s order-level markets — the seam a
+    /// Market-by-Order receiver's registration calls as it exits.
     ///
     /// Departure is the authoritative signal and [`PEER_SERVING_NS`] is only its backstop, for a
     /// publisher that goes quiet without deregistering: a gap-and-recover cycle is sub-second, so the
     /// timer never binds on it, and a suppressed re-baseline is never retried — the surviving arm's
     /// market wedges for the life of the process.
-    pub fn forget_publisher_books(&mut self, publisher: Publisher) {
-        for arms in self.book_sync.values_mut() {
-            arms.remove(&publisher);
-        }
-        for market in self.book_markets.values_mut() {
-            market.arms.remove(&publisher);
+    ///
+    /// Scoped to the venue, and to the sync claims only. One publisher host serves several protocols
+    /// from one source IP (the tape-arm gate rests on that), so a venue-blind sweep would let an
+    /// exiting Market-by-Order receiver tear down the same host's live Market-by-Price state.
+    pub fn forget_publisher_books(&mut self, venue: &str, publisher: Publisher) {
+        for (key, arms) in self.book_sync.iter_mut() {
+            if key.0.as_ref() == venue {
+                arms.remove(&publisher);
+            }
         }
     }
 
@@ -1300,9 +1332,6 @@ impl Arbiter {
     /// A change with no order identity (`order_id == 0`) is un-collapsable and always published.
     fn emit_order_level_book(&mut self, key: MarketKey, b: &NormalizedBook, publisher: Publisher) {
         let now = now_mono_ns();
-        // Fold every arm's own stream, not just the winning copies: a forced re-baseline republishes
-        // one arm's whole book, which exists only if that arm's copies were accumulated all along.
-        self.accumulate_book(&key, publisher, b);
         if b.changes
             .first()
             .is_some_and(|c| c.action == BookAction::Clear)
@@ -1356,9 +1385,6 @@ impl Arbiter {
             }
         }
         let forced = events.forced.take();
-        if let Some(reason) = forced {
-            self.force_rebaseline(&key, &b.venue, reason);
-        }
         let venue = b.venue.as_ref();
         if deduped > 0 {
             metrics()
@@ -1377,6 +1403,14 @@ impl Arbiter {
                 .mbo_arm_disagreement
                 .with_label_values(&[venue])
                 .inc_by(disagreed);
+        }
+        if let Some(reason) = forced {
+            // This batch's surviving changes go with it: a `Disagreement` drops one change out of a
+            // logical event, and publishing the rest with `last` intact hands the consumer half an
+            // event as a whole one. The re-baseline that follows carries the market's whole book.
+            self.force_rebaseline(&key, &b.venue, reason);
+            self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+            return;
         }
         if kept.is_empty() {
             return;
@@ -1404,7 +1438,7 @@ impl Arbiter {
         self.book_events
             .entry(key.clone())
             .or_default()
-            .rebaselined(&b.changes, publisher, b.recv_ts_ns);
+            .rebaselined(&b.changes, publisher);
         if let Some(m) = self.book_markets.get_mut(key) {
             m.rebaseline = false;
             m.withheld = 0;
@@ -1425,13 +1459,24 @@ impl Arbiter {
     }
 
     /// Discharge a forced re-baseline on `publisher`'s batch, returning whether the caller should go on
-    /// to publish that batch as usual.
+    /// to publish that batch onto it.
     ///
     /// Ordinary events are withheld meanwhile: while the flag is set neither arm's deltas are known to
     /// describe the book a consumer holds, so publishing them is the guess the flag exists to refuse.
     /// The wait for a completed logical event, and its bound, are the authority path's — a `to_book` of
     /// a half-applied event goes out stamped `last` as a torn book, and `last` is a promise made by an
     /// unauthenticated producer.
+    ///
+    /// **Republished from the shared replay map, never from an arm's own accumulator.** The replay map
+    /// holds what actually reached the wire; an arm's accumulator holds whatever that source sent, and
+    /// on an unauthenticated wire republishing it as `snapshot`/`last` would let one forged datagram —
+    /// a size claim large enough to be a disagreement — buy the wholesale replacement of a market's
+    /// book with a fabricated one. What the flag protects is the consumer, and full state it already
+    /// agreed with is what does that.
+    ///
+    /// Rate-limited to one republish per market per dedup window: a single datagram can raise the flag
+    /// and each discharge costs a whole book, both to serialize and in time held on the shared arbiter
+    /// mutex. Inside the window the market keeps withholding, so it is a delay and not a mute.
     fn serve_forced_rebaseline(
         &mut self,
         key: &MarketKey,
@@ -1439,22 +1484,30 @@ impl Arbiter {
         publisher: Publisher,
         now: u64,
     ) -> bool {
+        let window = self.book_dedup_window_ns;
         if let Some(m) = self.book_markets.get_mut(key) {
-            if !b.last && m.withheld < MAX_WITHHELD_BATCHES {
+            let too_soon = m.rebaselined_ns != 0 && now.saturating_sub(m.rebaselined_ns) < window;
+            if too_soon || (!b.last && m.withheld < MAX_WITHHELD_BATCHES) {
                 m.withheld += 1;
                 self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                 return false;
             }
             m.rebaseline = false;
             m.withheld = 0;
+            m.rebaselined_ns = now;
         }
-        let Some(full) = self.rebaseline_book(key, publisher) else {
+        let Some(full) = self.rebaseline_from_replay(key) else {
             // Nothing complete to republish: empty the consumer's book and let this batch rebuild onto
-            // it, exactly as the single-arm gate degrades.
+            // it, exactly as the single-arm gate degrades. The replay entry goes with it — left in
+            // place it would keep claiming completeness and bootstrap a new client with the orders
+            // live consumers were just told to discard.
+            if let Some(replay) = &self.book_replay {
+                model::lock(replay).remove(key);
+            }
             self.book_events
                 .entry(key.clone())
                 .or_default()
-                .rebaselined(&[], publisher, b.recv_ts_ns);
+                .rebaselined(&[], publisher);
             self.vm(&b.venue).emit[EMIT_BOOK].inc();
             let _ = self.tx.send(Arc::new(FeedMessage::Book(clear_only(b))));
             return true;
@@ -1462,11 +1515,24 @@ impl Arbiter {
         self.book_events
             .entry(key.clone())
             .or_default()
-            .rebaselined(&full.changes, publisher, b.recv_ts_ns);
-        self.note_book_delivery(key, b, publisher, now);
+            .rebaselined(&full.changes, publisher);
         self.vm(&b.venue).emit[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(full)));
-        false
+        true
+    }
+
+    /// The market's book as the wire has delivered it, as a `clear`-led re-baseline. `None` when no
+    /// replay map is wired or its accumulator is not [`BookAccumulator::baselined`] — seeded mid-stream
+    /// it holds only what has moved since, and publishing that as `snapshot` would tell the consumer to
+    /// discard every level it is missing. Materialized under the shared lock rather than cloned out of
+    /// it, for the reason `sinks/hyperliquid.rs` does the same.
+    fn rebaseline_from_replay(&self, key: &MarketKey) -> Option<NormalizedBook> {
+        let replay = self.book_replay.as_ref()?;
+        let out = model::lock(replay)
+            .get(key)
+            .filter(|acc| acc.baselined())
+            .map(|acc| acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders));
+        out
     }
 
     /// Record that `publisher` reached the wire for this market, and mark the market order-level. Both
@@ -4113,6 +4179,10 @@ mod tests {
         let (tx, rx) = broadcast::channel(1024);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         a.set_mode(venue, ArbitrationMode::Coordinated);
+        // Wired exactly as `main.rs` wires it: a forced re-baseline republishes from this map.
+        a.set_book_replay(Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )));
         let key: MarketKey = (venue.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
         for &p in arms {
             a.set_book_synced(&key, p, true);
@@ -4294,15 +4364,114 @@ mod tests {
             before_forced + 1
         );
 
-        // The next completed logical event re-baselines rather than resuming the delta stream.
+        // The next completed logical event re-baselines rather than resuming the delta stream, then
+        // lands on top of it — the batch is published, just not onto a book nobody vouches for.
         a.emit(
             l3_batch(VENUE, vec![order(BookAction::Update, 9, 99.0, 1.0)], 1_200),
             arm(1),
         );
         let out = drain_books(&mut rx);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert_eq!(out[0].changes[0].action, BookAction::Clear);
         assert!(out[0].last, "a re-baseline must terminate its own event");
+        assert_eq!(out[1].changes[0].order_id, 9);
+    }
+
+    /// A forged source can raise a disagreement against any real order for the price of one datagram,
+    /// so the re-baseline that follows must republish what the wire agreed on and never the raising
+    /// arm's own book — otherwise the cheapest input on the wire buys wholesale replacement of a
+    /// market's book with a fabricated one.
+    #[test]
+    fn a_forced_rebaseline_republishes_the_wire_not_an_arms_own_book() {
+        const VENUE: &str = "BookForgedInjection";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 1, 100.0, 5.0)],
+                1_000,
+            ),
+            arm(1),
+        );
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 2, 99.0, 4.0)], 1_100),
+            arm(1),
+        );
+        // The forged arm's own snapshot is suppressed while a peer serves, then it claims ten times the
+        // resting quantity the wire holds for a real order.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 999, 1.0, 7.0)],
+                1_200,
+            ),
+            arm(2),
+        );
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 1, 100.0, 50.0)],
+                1_300,
+            ),
+            arm(2),
+        );
+        let _ = drain_books(&mut rx);
+
+        // And discharges the flag it raised.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 3, 98.0, 1.0)], 1_400),
+            arm(2),
+        );
+        let out = drain_books(&mut rx);
+        let published: Vec<(u64, f64)> = out
+            .iter()
+            .flat_map(|b| b.changes.iter().map(|c| (c.order_id, c.size)))
+            .collect();
+        assert_eq!(
+            published,
+            vec![(0, 0.0), (1, 5.0), (2, 4.0), (3, 1.0)],
+            "the wire's own book, then the triggering batch onto it"
+        );
+    }
+
+    /// A book far larger than the guard's cap must stay proportional: each published change costs one
+    /// input change. Re-baselining republishes the whole book, so a mechanism that re-arms itself —
+    /// through its own seeding, say — turns a 44k-order market into a republish every other batch, and
+    /// no test whose book fits inside the cap can see it.
+    #[test]
+    fn a_book_larger_than_the_guard_stays_proportional_to_its_input() {
+        const VENUE: &str = "BookOverCapProportional";
+        const ORDERS: u64 = MAX_SEEN_ORDER_EVENTS as u64 * 2;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        a.set_book_dedup_window(1_000);
+        let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
+        let mut install = vec![clear_both()];
+        install.extend((1..=ORDERS).map(|oid| order(BookAction::Update, oid, 100.0, 1.0)));
+        a.emit(l3_batch(VENUE, install, 1_000), arm(1));
+        // Spaced well outside the window, so nothing a peer could be racing is ever evicted: every
+        // force here would be the seeding of the install re-arming the guard against itself.
+        for oid in 1..=ORDERS {
+            a.emit(
+                l3_batch(
+                    VENUE,
+                    vec![order(BookAction::Update, oid, 100.0, 2.0)],
+                    2_000 + oid * 10_000,
+                ),
+                arm(1),
+            );
+        }
+        let published: usize = drain_books(&mut rx).iter().map(|b| b.changes.len()).sum();
+        let key: MarketKey = (VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+        assert_eq!(
+            forced_rebaselines(VENUE, FORCED_GUARD_EVICTED),
+            before,
+            "a re-baseline's own seeding must not re-arm the eviction that discharged it"
+        );
+        assert!(!a.book_markets[&key].rebaseline);
+        assert!(
+            published <= (ORDERS as usize + 1) * 2,
+            "{published} changes published for {ORDERS} input changes"
+        );
     }
 
     /// The cross-publisher guard is bounded, so a burst larger than the cap ages an order out while a
@@ -4430,7 +4599,7 @@ mod tests {
         );
         let _ = drain_books(&mut rx);
 
-        a.forget_publisher_books(arm(1));
+        a.forget_publisher_books(VENUE, arm(1));
         a.emit(
             l3_batch(
                 VENUE,

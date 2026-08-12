@@ -77,9 +77,12 @@ Client limits are fixed rather than configurable (64 clients, 256 subscriptions 
 control frames per minute, a 20s heartbeat with a 60s idle reap). The rate limit is the one that
 matters: a subscribe frame is tens of bytes and can cost a whole book to answer. The shared book
 map's mutex is the one the ingest emit path takes on every published batch, so the sink does exactly
-one thing under it: copy out the minimum a render needs — the folded price levels for `l2Book`, the
-order set for `l4Book`, never the accumulator itself. The decimal formatting and the JSON, both
-O(book), run after the guard drops, so a 44k-order render cannot stall receivers on *every* feed.
+one thing under it: clone the market's accumulator. Every rendering step — the price fold, the order
+set, the decimal formatting, the JSON — runs after the guard drops. The clone is the cheapest
+snapshot on offer and not a fallback: on the 44,598-order fixture it costs ~0.45 ms against ~9.1 ms
+to fold under the guard and ~5.6 ms to materialize the order set there. It is still O(book) inside a
+process-wide mutex, so enabling this sink on a very large book is a measurable cost to *every* feed's
+ingest; a copy-on-write accumulator would remove it and has not been built.
 Observability is `dz_hl_sink_clients` and `dz_hl_sink_messages_total{channel}`. There is **no TLS**,
 as with the rest of the service surface.
 
