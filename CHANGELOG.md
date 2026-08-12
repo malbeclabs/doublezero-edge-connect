@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `doublezero-edge` panicked with a broken-pipe error whenever its stdout output was piped into a
+  consumer that stops reading early (`| head`, `| less -q`, a short-circuiting `grep -q`) —
+  completely ordinary usage for a JSON/table-printing CLI. Every stdout write now goes through a
+  handle that exits cleanly (code 0) on `EPIPE` instead of panicking.
 - `scripts/connect.sh` configured a package repository nothing publishes to, so the CLI offer
   failed and skipped on every run — it now points at `malbeclabs/doublezero`, the repository a
   host running the DoubleZero client already trusts. The offer's wording and the closing output
