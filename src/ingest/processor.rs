@@ -114,7 +114,7 @@ impl SeqEvents {
 /// forged source IP and grow the map without limit (memory-exhaustion DoS). Real deployments have a
 /// handful of mirrored publishers, so this is set far above that; once full, the least-recently-
 /// inserted publisher is evicted (it simply re-anchors its sequence on its next frame).
-const MAX_PUBLISHERS: usize = 256;
+pub(crate) const MAX_PUBLISHERS: usize = 256;
 
 /// Per-publisher reference-data state, bounded exactly like the per-publisher sequence map.
 ///
