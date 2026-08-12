@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// doublezero-edge: an agent-facing CLI over a running edge-connect container's /v1 market-data
 /// API (plus its off-by-default admin surface, for `channels`).
@@ -107,6 +107,11 @@ enum Command {
 /// starting point, never a promise the surface is listening.
 const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
 
+/// Page size `products list --paginate` supplies on the caller's behalf when no `limit==N` was
+/// given — pagination proves nothing in one unbounded request, so `--paginate` must set a page
+/// size itself to actually walk more than one page. A caller's own `limit==N` always wins.
+const DEFAULT_PAGINATE_LIMIT: u32 = 500;
+
 #[derive(Subcommand)]
 enum ChannelsCommand {
     /// List each enabled row's channels: channel-filter admission, real bound state, product count.
@@ -136,10 +141,17 @@ enum ChannelsCommand {
 
 #[derive(Subcommand)]
 enum ProductsCommand {
-    /// List every known product.
+    /// List every known product. `--paginate` follows the server's `cursor` until the catalog is
+    /// exhausted, accumulating every page into one response (`limit==N` sets the page size; the
+    /// default is unlimited — a single response with no cursor at all).
     List {
         #[arg(num_args = 0.., value_name = "ARGS")]
         args: Vec<String>,
+        /// Follow `cursor`s until the catalog is exhausted, accumulating every page into one
+        /// response — matches the Coinbase Advanced Trade CLI's `--paginate`. Without it, a
+        /// `limit==N` with more remaining returns just the first page and its `cursor`.
+        #[arg(long)]
+        paginate: bool,
     },
     /// One product's identity and registry-derived fields.
     Get {
@@ -161,7 +173,8 @@ enum ProductsCommand {
         #[arg(num_args = 0.., value_name = "PRODUCT_ID_AND_ARGS")]
         args: Vec<String>,
     },
-    /// Best bid/ask across products.
+    /// Best bid/ask across products. Narrow it to one or more products with a bare positional id
+    /// (e.g. `HYPERLIQUID:BTC`) or `product_ids==A,B`; omit both for every product.
     #[command(name = "best_bid_ask")]
     BestBidAsk {
         #[arg(num_args = 0.., value_name = "ARGS")]
@@ -175,7 +188,7 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
     match command {
         Command::Status { args } => (Endpoint::Status, args.clone()),
         Command::Products { action } => match action {
-            ProductsCommand::List { args } => (Endpoint::ProductsList, args.clone()),
+            ProductsCommand::List { args, .. } => (Endpoint::ProductsList, args.clone()),
             ProductsCommand::Get { args } => (Endpoint::ProductGet, args.clone()),
             ProductsCommand::Ticker { args } => (Endpoint::Ticker, args.clone()),
             ProductsCommand::Candles { args } => (Endpoint::Candles, args.clone()),
@@ -219,6 +232,36 @@ fn build_path(endpoint: Endpoint, positionals: &[String]) -> Result<String, Stri
             )
         }
     })
+}
+
+/// `best_bid_ask` accepts a product id two ways — every sibling subcommand (`ticker`, `candles`,
+/// `book`, `get`) takes it as a bare positional, so this one does too, alongside the faithful
+/// `product_ids==A,B` form. A bare positional is folded into `product_ids` (appended to whatever
+/// the caller already gave via `product_ids==...`, so the two forms compose rather than one
+/// silently winning); no positional and no `product_ids` param leaves `params` untouched, keeping
+/// today's "every product" behaviour.
+fn merge_best_bid_ask_params(
+    params: Vec<(String, String)>,
+    positionals: &[String],
+) -> Vec<(String, String)> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for (k, v) in params {
+        if k == "product_ids" {
+            ids.extend(v.split(',').map(|s| s.to_string()));
+        } else {
+            out.push((k, v));
+        }
+    }
+    if let Some(id) = positionals.first() {
+        if !id.is_empty() {
+            ids.push(id.clone());
+        }
+    }
+    if !ids.is_empty() {
+        out.push(("product_ids".to_string(), ids.join(",")));
+    }
+    out
 }
 
 fn main() {
@@ -291,6 +334,18 @@ fn run() -> i32 {
         return run_channels(&cli, action);
     }
 
+    if let Command::Products {
+        action: ProductsCommand::List {
+            args,
+            paginate: true,
+        },
+    } = &cli.command
+    {
+        // Drives more than one request itself (following `cursor`), so it can't go through the
+        // generic single-request pipeline below.
+        return run_products_list_paginated(&cli, args);
+    }
+
     let (endpoint, raw_args) = resolve(&cli.command);
     let (params, positionals) = params::split(&raw_args);
 
@@ -304,6 +359,12 @@ fn run() -> i32 {
             eprintln!("error: {msg}");
             return 1;
         }
+    };
+
+    let params = if endpoint == Endpoint::BestBidAsk {
+        merge_best_bid_ask_params(params, &positionals)
+    } else {
+        params
     };
 
     let client = match build_http_client() {
@@ -344,6 +405,71 @@ fn run_completion(shell: Shell) -> i32 {
     let name = cmd.get_name().to_string();
     generate(shell, &mut cmd, name, &mut stdout_or_exit());
     0
+}
+
+/// `products list --paginate`: follow the server's `cursor` until the catalog is exhausted,
+/// accumulating every page's `products` into one response — same envelope shape as an unpaginated
+/// call (no `cursor` key), so `--jq`/`--output`/`--template` behave identically either way.
+fn run_products_list_paginated(cli: &Cli, args: &[String]) -> i32 {
+    if cli.template {
+        return emit_template(cli, &Endpoint::ProductsList.template());
+    }
+
+    let (mut params, _positionals) = params::split(args);
+    // A caller's own `limit==N` wins; otherwise supply this CLI's own page size, since one
+    // unbounded request would return everything in a single page and `--paginate` would issue
+    // exactly one request — proving nothing about the flag. We drive the cursor ourselves, so any
+    // `cursor==...` the caller passed is dropped rather than silently starting mid-catalog.
+    if !params.iter().any(|(k, _)| k == "limit") {
+        params.push(("limit".to_string(), DEFAULT_PAGINATE_LIMIT.to_string()));
+    }
+    params.retain(|(k, _)| k != "cursor");
+
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
+    };
+
+    let mut accumulated: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut req_params = params.clone();
+        if let Some(c) = &cursor {
+            req_params.push(("cursor".to_string(), c.clone()));
+        }
+        match client::get(&client, &cli.url, "/v1/products", &req_params) {
+            client::Outcome::Ok { body } => {
+                if let Some(products) = body.get("products").and_then(Value::as_array) {
+                    accumulated.extend(products.iter().cloned());
+                }
+                cursor = body
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            client::Outcome::Failed { status, body } => {
+                print_error(&body);
+                return exit_code_for_status(status);
+            }
+            client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+                print_error(&body);
+                return 3;
+            }
+        }
+    }
+
+    emit(
+        cli,
+        Endpoint::ProductsList,
+        &json!({ "products": accumulated }),
+    )
 }
 
 /// `channels list` / `channels set`. Both talk to the admin surface (`--admin-url`), never
@@ -604,6 +730,64 @@ mod tests {
         assert_eq!(
             build_path(Endpoint::BestBidAsk, &[]).unwrap(),
             "/v1/best_bid_ask"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // merge_best_bid_ask_params: the CLI-side half of `best_bid_ask` taking a product — bare
+    // positional folds into `product_ids`, the faithful `product_ids==A,B` form passes through,
+    // and no argument at all leaves the request unfiltered (today's behaviour).
+    // -------------------------------------------------------------------------------------------
+
+    #[test]
+    fn best_bid_ask_with_no_argument_sends_no_product_ids_param() {
+        let out = merge_best_bid_ask_params(vec![], &[]);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn best_bid_ask_folds_a_bare_positional_into_product_ids() {
+        let out = merge_best_bid_ask_params(vec![], &["HYPERLIQUID:BTC".to_string()]);
+        assert_eq!(
+            out,
+            vec![("product_ids".to_string(), "HYPERLIQUID:BTC".to_string())]
+        );
+    }
+
+    #[test]
+    fn best_bid_ask_passes_through_the_faithful_product_ids_form() {
+        let params = vec![("product_ids".to_string(), "A:X,A:Y".to_string())];
+        let out = merge_best_bid_ask_params(params, &[]);
+        assert_eq!(
+            out,
+            vec![("product_ids".to_string(), "A:X,A:Y".to_string())]
+        );
+    }
+
+    /// A bare positional and an explicit `product_ids==...` compose rather than one silently
+    /// overriding the other.
+    #[test]
+    fn best_bid_ask_composes_a_positional_with_an_explicit_product_ids_param() {
+        let params = vec![("product_ids".to_string(), "A:X".to_string())];
+        let out = merge_best_bid_ask_params(params, &["A:Y".to_string()]);
+        assert_eq!(
+            out,
+            vec![("product_ids".to_string(), "A:X,A:Y".to_string())]
+        );
+    }
+
+    /// An unrelated param (e.g. a stray `granularity==...`) must survive untouched alongside the
+    /// folded `product_ids`.
+    #[test]
+    fn best_bid_ask_leaves_unrelated_params_untouched() {
+        let params = vec![("granularity".to_string(), "ONE_MINUTE".to_string())];
+        let out = merge_best_bid_ask_params(params, &["HYPERLIQUID:BTC".to_string()]);
+        assert_eq!(
+            out,
+            vec![
+                ("granularity".to_string(), "ONE_MINUTE".to_string()),
+                ("product_ids".to_string(), "HYPERLIQUID:BTC".to_string()),
+            ]
         );
     }
 }

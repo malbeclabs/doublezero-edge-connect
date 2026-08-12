@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
+### Added
+- `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
+  products remain; `doublezero-edge products list --paginate` follows it until the catalog is
+  exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`
+  returns every product in one response exactly as before.
+- `GET /v1/best_bid_ask` accepts a comma-separated `product_ids` query parameter, filtering the
+  response before serialization; `doublezero-edge products best_bid_ask` accepts a bare product id
+  or `product_ids==A,B`, matching the sibling subcommands' positional-id convention. An unknown id
+  404s exactly like `/v1/products/{id}` does, rather than a new convention. No parameter keeps
+  today's behaviour: every product.
+
+### Changed
+- `doublezero-edge products book --output table` now renders as a ladder — asks descending
+  above, bids descending below — instead of every bid then every ask, so the touch sits one row
+  apart at the seam instead of split across a screenful. `--output json`/`--jq` are unchanged.
 
 ### Fixed
 - `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows

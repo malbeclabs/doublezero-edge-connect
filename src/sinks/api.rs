@@ -165,10 +165,10 @@ fn handle(state: &ApiState, req: &Request) -> Response {
 
     let path = req.path.as_str();
     if path == "/v1/products" {
-        return products_list(state);
+        return products_list(state, req);
     }
     if path == "/v1/best_bid_ask" {
-        return best_bid_ask(state);
+        return best_bid_ask(state, req);
     }
     if path == "/v1/status" {
         return status(state);
@@ -259,7 +259,7 @@ fn is_ambiguous(state: &ApiState, source_id: u16, symbol: &Arc<str>) -> bool {
 // GET /v1/products, GET /v1/products/{id}
 // ---------------------------------------------------------------------------------------------
 
-fn products_list(state: &ApiState) -> Response {
+fn products_list(state: &ApiState, req: &Request) -> Response {
     // Snapshot the catalog into an owned `Vec` and drop the lock immediately — `product_entry`
     // (via `feed_kind_for`) takes the `books` then `depth` locks per instrument, and this map is
     // also the one the ingest hot path's `upsert_instrument` writes on every refdata burst. Holding
@@ -280,7 +280,61 @@ fn products_list(state: &ApiState) -> Response {
             .entry((i.source_id, i.symbol.to_string()))
             .or_insert(0) += 1;
     }
-    let products: Vec<Value> = instruments
+
+    // `limit`/`cursor` page the catalog — the same shape the emulated tool's own paginated list
+    // endpoints use. Unset `limit` keeps today's behaviour (every product, one response, no
+    // `cursor` field): a page size is never imposed unless the caller asks for one. Pagination
+    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own, so this
+    // sorts on exactly `InstrumentSnapshot`'s own key (`(venue, category, channel,
+    // instrument_id)`), the one tuple that already uniquely identifies every entry.
+    instruments.sort_by(|a, b| {
+        (
+            a.venue.as_ref(),
+            a.category.as_ref(),
+            a.channel,
+            a.instrument_id,
+        )
+            .cmp(&(
+                b.venue.as_ref(),
+                b.category.as_ref(),
+                b.channel,
+                b.instrument_id,
+            ))
+    });
+
+    let limit = match req.query("limit") {
+        None => None,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => return invalid_products_limit(s),
+        },
+    };
+    let offset = match req.query("cursor") {
+        None => 0,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return invalid_cursor(s),
+        },
+    };
+
+    let total = instruments.len();
+    let page: &[NormalizedInstrument] = {
+        let start = offset.min(total);
+        match limit {
+            None => &instruments[start..],
+            Some(n) => &instruments[start..(start + n).min(total)],
+        }
+    };
+    // A `cursor` is reported only when strictly more remain past this page — an exhausted
+    // catalog (or an unbounded request) carries none, so a caller can stop on its absence alone
+    // rather than guessing from an empty `products` array (which a genuinely empty catalog also
+    // produces).
+    let next_cursor = limit.and_then(|n| {
+        let next = offset + n;
+        (next < total).then_some(next)
+    });
+
+    let products: Vec<Value> = page
         .iter()
         .map(|i| {
             let ambiguous = counts
@@ -291,7 +345,12 @@ fn products_list(state: &ApiState) -> Response {
             product_entry(state, i, ambiguous)
         })
         .collect();
-    ok_json(json!({ "products": products }))
+
+    let mut body = json!({ "products": products });
+    if let Some(cursor) = next_cursor {
+        body["cursor"] = json!(cursor.to_string());
+    }
+    ok_json(body)
 }
 
 /// One product's identity + registry-derived fields. Carries the discrete identity fields
@@ -697,7 +756,13 @@ fn book_response(
 // GET /v1/best_bid_ask
 // ---------------------------------------------------------------------------------------------
 
-fn best_bid_ask(state: &ApiState) -> Response {
+/// The identity `best_bid_ask`'s `product_ids` filter matches on — `(source_id, category,
+/// channel, instrument_id)`, one universe's key (see `products::resolve`'s docs for why category
+/// must be part of it: two disjoint universes under one Source ID can share `(channel,
+/// instrument_id)`).
+type ProductKey = (u16, Arc<str>, u32, u32);
+
+fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
     // Same discipline as `products_list`: snapshot the catalog and drop the `instruments` lock
     // before looping — `best_levels` takes `books`/`depth` per instrument, and materializing a
     // `NormalizedInstrument` clone up front is far cheaper than holding the catalog lock across
@@ -712,8 +777,58 @@ fn best_bid_ask(state: &ApiState) -> Response {
             .entry((i.source_id, i.symbol.to_string()))
             .or_insert(0) += 1;
     }
+
+    // `product_ids==A,B` (comma-separated, matching the emulated tool's own filter) narrows the
+    // response to exactly those identities. Each one is resolved exactly the way
+    // `/v1/products/{id}` resolves its single id — an invalid/unrecognised/ambiguous entry gets
+    // that same error rather than a fourth convention invented just for this list endpoint.
+    // Filtering happens here, before serialization, so `--jq`/`--output json` see the narrowed set
+    // too, not just the table renderer. No parameter (or an empty one) keeps today's behaviour:
+    // every product with a derivable quote.
+    let selected: Option<HashSet<ProductKey>> = match req.query("product_ids") {
+        None => None,
+        Some(raw) => {
+            let ids: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if ids.is_empty() {
+                None
+            } else {
+                let mut keys = HashSet::new();
+                for id in ids {
+                    let Some(parsed) = products::parse(id) else {
+                        return invalid_product_id(id);
+                    };
+                    match products::resolve(&state.instruments, &parsed) {
+                        Resolution::None => return product_not_found(id),
+                        Resolution::Ambiguous(candidates) => {
+                            return ambiguous_response(id, candidates)
+                        }
+                        Resolution::One(p) => {
+                            keys.insert((
+                                p.source_id,
+                                p.category.clone(),
+                                p.channel,
+                                p.instrument_id,
+                            ));
+                        }
+                    }
+                }
+                Some(keys)
+            }
+        }
+    };
+
     let mut pricebooks = Vec::new();
     for i in &instruments {
+        if let Some(keys) = &selected {
+            let key = (i.source_id, i.category.clone(), i.channel, i.instrument_id);
+            if !keys.contains(&key) {
+                continue;
+            }
+        }
         let (bid, ask) = best_levels(state, i);
         if bid.is_none() && ask.is_none() {
             // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
@@ -1072,6 +1187,29 @@ fn invalid_limit(got: &str) -> Response {
     )
 }
 
+/// `products list`'s own `limit` — unlike `candles`, there is no hard cap here (an unset `limit`
+/// is genuinely unbounded), so the remedy differs from [`invalid_limit`]'s.
+fn invalid_products_limit(got: &str) -> Response {
+    error_json(
+        "400 Bad Request",
+        "invalid_limit",
+        format!("\"{got}\" is not a valid limit."),
+        "Use a positive integer, or omit it to return every product in one response.",
+    )
+}
+
+/// `cursor` present but not a value this endpoint produced (a parse failure). Silently starting
+/// over from the first page would hide a caller's typo'd or stale cursor.
+fn invalid_cursor(got: &str) -> Response {
+    error_json(
+        "400 Bad Request",
+        "invalid_cursor",
+        format!("\"{got}\" is not a valid cursor."),
+        "Use the \"cursor\" value from a prior /v1/products response, or omit it for the first \
+         page.",
+    )
+}
+
 /// An ambiguous bare id is an error that names its alternatives — never a silent pick. `candidates`
 /// is surfaced both in `message` (for a human/log line) and as its own array (for a caller that
 /// wants to machine-parse the choices without re-deriving them).
@@ -1305,6 +1443,109 @@ mod tests {
             .collect();
         // Ascending by (channel, instrument_id): (0,3) (0,99) (1,10) (1,50) (2,5).
         assert_eq!(symbols, vec!["P2", "P1", "P4", "P3", "P5"]);
+    }
+
+    /// Three products, `limit=2`: more rows than one page, so ascending vs. paginated order can
+    /// actually differ. First page returns 2 products plus a `cursor`; following that cursor
+    /// returns the third and no further `cursor` — and the two pages together equal the
+    /// unpaginated (unlimited) response.
+    #[tokio::test]
+    async fn products_list_limit_and_cursor_page_through_the_catalog() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 1u32),
+                inst(1, "HYPERLIQUID", "AAA", 0, 1, -2, -5),
+            );
+            map.insert(
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 2u32),
+                inst(1, "HYPERLIQUID", "BBB", 0, 2, -2, -5),
+            );
+            map.insert(
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 3u32),
+                inst(1, "HYPERLIQUID", "CCC", 0, 3, -2, -5),
+            );
+        }
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+
+        let unpaginated = reqwest::get(format!("{base}/v1/products"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let mut unpaginated_ids: Vec<String> = unpaginated["products"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap().to_string())
+            .collect();
+        unpaginated_ids.sort();
+        assert_eq!(unpaginated_ids.len(), 3);
+        assert!(
+            unpaginated["cursor"].is_null(),
+            "an unbounded request must carry no cursor: {unpaginated}"
+        );
+
+        let page1 = reqwest::get(format!("{base}/v1/products?limit=2"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let page1_products = page1["products"].as_array().unwrap();
+        assert_eq!(page1_products.len(), 2, "{page1}");
+        let cursor = page1["cursor"]
+            .as_str()
+            .expect("more remain past a 2-of-3 first page")
+            .to_string();
+
+        let page2 = reqwest::get(format!("{base}/v1/products?limit=2&cursor={cursor}"))
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let page2_products = page2["products"].as_array().unwrap();
+        assert_eq!(page2_products.len(), 1, "{page2}");
+        assert!(
+            page2["cursor"].is_null(),
+            "the catalog is exhausted after the second page: {page2}"
+        );
+
+        let mut paginated_ids: Vec<String> = page1_products
+            .iter()
+            .chain(page2_products.iter())
+            .map(|p| p["product_id"].as_str().unwrap().to_string())
+            .collect();
+        paginated_ids.sort();
+        assert_eq!(
+            paginated_ids, unpaginated_ids,
+            "accumulating every page must equal the unpaginated response"
+        );
+    }
+
+    /// A malformed/zero `limit` and an unparseable `cursor` are both rejected with a named remedy
+    /// rather than silently substituted — the same strictness `candles`' own `limit` gets.
+    #[tokio::test]
+    async fn products_list_rejects_a_bad_limit_or_cursor() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+
+        let resp = reqwest::get(format!("{base}/v1/products?limit=0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_limit");
+
+        let resp = reqwest::get(format!("{base}/v1/products?cursor=not-a-number"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_cursor");
     }
 
     #[tokio::test]
@@ -2414,6 +2655,121 @@ mod tests {
             lashay["asks"][0][0], "0.6300",
             "from BookAccumulator::best_ask, not depth"
         );
+    }
+
+    /// Shared two-product fixture for the `product_ids` filter tests below: both derivable, so a
+    /// bug that silently drops or duplicates rows shows up as a wrong *set*, not just a wrong count.
+    async fn spawn_two_derivable_products() -> String {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+                inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
+            );
+            map.insert(
+                ("PHOENIX".into(), "default".into(), 0u32, 7u32),
+                inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
+            );
+        }
+        depth.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), "BTC".into()),
+            NormalizedDepth {
+                venue: "HYPERLIQUID".into(),
+                source: "HYPERLIQUID".into(),
+                source_id: 1,
+                symbol: "BTC".into(),
+                bids: vec![[100.0, 1.0]],
+                asks: vec![[101.0, 2.0]],
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        depth.lock().unwrap().insert(
+            ("PHOENIX".into(), "SOL".into()),
+            NormalizedDepth {
+                venue: "PHOENIX".into(),
+                source: "PHOENIX".into(),
+                source_id: 2,
+                symbol: "SOL".into(),
+                bids: vec![[10.0, 1.0]],
+                asks: vec![[11.0, 2.0]],
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        spawn(instruments, depth, books, history, health, filter, enabled).await
+    }
+
+    /// `product_ids==A,B` narrows the response to exactly the asked-for products — asserted as a
+    /// set, not just a length, so a filter that happened to keep the right count of the wrong rows
+    /// would still fail this.
+    #[tokio::test]
+    async fn best_bid_ask_product_ids_filter_returns_only_the_asked_for_products() {
+        let base = spawn_two_derivable_products().await;
+        let resp = reqwest::get(format!(
+            "{base}/v1/best_bid_ask?product_ids=HYPERLIQUID:BTC"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let pricebooks = body["pricebooks"].as_array().unwrap();
+        let ids: Vec<&str> = pricebooks
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["HYPERLIQUID:BTC"],
+            "filtered request must return exactly the requested set: {body}"
+        );
+    }
+
+    /// No `product_ids` at all keeps today's behaviour: every derivable product, unfiltered.
+    #[tokio::test]
+    async fn best_bid_ask_with_no_filter_returns_every_product() {
+        let base = spawn_two_derivable_products().await;
+        let resp = reqwest::get(format!("{base}/v1/best_bid_ask"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let pricebooks = body["pricebooks"].as_array().unwrap();
+        let mut ids: Vec<&str> = pricebooks
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["HYPERLIQUID:BTC", "PHOENIX:SOL"],
+            "an unfiltered request must still return every product: {body}"
+        );
+    }
+
+    /// An unknown id in `product_ids` behaves exactly like `/v1/products/{id}` on a miss —
+    /// `product_not_found`, not a silently empty/partial list (a fourth convention this endpoint
+    /// must not invent).
+    #[tokio::test]
+    async fn best_bid_ask_product_ids_unknown_id_404s_like_the_sibling_commands() {
+        let base = spawn_two_derivable_products().await;
+        let resp = reqwest::get(format!(
+            "{base}/v1/best_bid_ask?product_ids=HYPERLIQUID:NOPE"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "product_not_found");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("HYPERLIQUID:NOPE"));
     }
 
     #[tokio::test]
