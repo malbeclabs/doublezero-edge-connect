@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Two Market-by-Order publishers disagreeing about one order's resting quantity no longer publish
+  the larger of the two. A resting order only shrinks, so a larger claim means one of the books has
+  drifted — and which one is unknowable at the merge point: the larger rewinds a consumer past a
+  fill the venue already applied, and preferring the smaller lets a forged size mute a real order.
+  The market stops being served from either arm's deltas and is republished whole instead. The same
+  happens when the cross-publisher resurrection guard loses a tracked order at its per-market cap,
+  which would otherwise silently reopen the path that guard exists to close. Both are counted by the
+  new `dz_mbo_forced_rebaselines_total{venue,reason}` (`disagreement` / `guard_evicted`); each costs
+  a full republish of the market's book, so a sustained rate is the signal that the per-publisher
+  book model is too expensive to keep.
+- A re-baseline no longer wipes the cross-publisher resurrection guard. Only the dedup window is
+  stale after one — a venue still never reuses an order id, so a lagging publisher's first and only
+  copy of an `Add` for an order a peer already killed must still be refused. The re-baseline's own
+  orders now seed the guard, so a peer claiming more than the snapshot holds is still caught as
+  drift. Session and instrument boundaries keep dropping it outright: a new id space is the one case
+  where that is correct.
+- A departed Market-by-Order publisher no longer suppresses a surviving arm's re-baseline for 30s.
+  Its receiver's exit is the authoritative departure signal and now releases its book standing;
+  `PEER_SERVING_NS` stays only as the backstop for a publisher that goes quiet without
+  deregistering. A gap-and-recover cycle is sub-second, so the timer never bound on it — and a
+  suppressed re-baseline is never retried, which wedged the market for the life of the process.
+
 ### Changed
 - An instrument whose reference data carries its own Source ID (the newer feed-spec generation) is
   now named the moment its definition is decoded, instead of waiting on a price. `instrument`
