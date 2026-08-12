@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// doublezero-edge: an agent-facing CLI over a running edge-connect container's /v1 market-data
 /// API (plus its off-by-default admin surface, for `channels`).
@@ -107,6 +107,11 @@ enum Command {
 /// starting point, never a promise the surface is listening.
 const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
 
+/// Page size `products list --paginate` supplies on the caller's behalf when no `limit==N` was
+/// given — pagination proves nothing in one unbounded request, so `--paginate` must set a page
+/// size itself to actually walk more than one page. A caller's own `limit==N` always wins.
+const DEFAULT_PAGINATE_LIMIT: u32 = 500;
+
 #[derive(Subcommand)]
 enum ChannelsCommand {
     /// List each enabled row's channels: channel-filter admission, real bound state, product count.
@@ -136,10 +141,17 @@ enum ChannelsCommand {
 
 #[derive(Subcommand)]
 enum ProductsCommand {
-    /// List every known product.
+    /// List every known product. `--paginate` follows the server's `cursor` until the catalog is
+    /// exhausted, accumulating every page into one response (`limit==N` sets the page size; the
+    /// default is unlimited — a single response with no cursor at all).
     List {
         #[arg(num_args = 0.., value_name = "ARGS")]
         args: Vec<String>,
+        /// Follow `cursor`s until the catalog is exhausted, accumulating every page into one
+        /// response — matches the Coinbase Advanced Trade CLI's `--paginate`. Without it, a
+        /// `limit==N` with more remaining returns just the first page and its `cursor`.
+        #[arg(long)]
+        paginate: bool,
     },
     /// One product's identity and registry-derived fields.
     Get {
@@ -176,7 +188,7 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
     match command {
         Command::Status { args } => (Endpoint::Status, args.clone()),
         Command::Products { action } => match action {
-            ProductsCommand::List { args } => (Endpoint::ProductsList, args.clone()),
+            ProductsCommand::List { args, .. } => (Endpoint::ProductsList, args.clone()),
             ProductsCommand::Get { args } => (Endpoint::ProductGet, args.clone()),
             ProductsCommand::Ticker { args } => (Endpoint::Ticker, args.clone()),
             ProductsCommand::Candles { args } => (Endpoint::Candles, args.clone()),
@@ -322,6 +334,18 @@ fn run() -> i32 {
         return run_channels(&cli, action);
     }
 
+    if let Command::Products {
+        action: ProductsCommand::List {
+            args,
+            paginate: true,
+        },
+    } = &cli.command
+    {
+        // Drives more than one request itself (following `cursor`), so it can't go through the
+        // generic single-request pipeline below.
+        return run_products_list_paginated(&cli, args);
+    }
+
     let (endpoint, raw_args) = resolve(&cli.command);
     let (params, positionals) = params::split(&raw_args);
 
@@ -381,6 +405,71 @@ fn run_completion(shell: Shell) -> i32 {
     let name = cmd.get_name().to_string();
     generate(shell, &mut cmd, name, &mut stdout_or_exit());
     0
+}
+
+/// `products list --paginate`: follow the server's `cursor` until the catalog is exhausted,
+/// accumulating every page's `products` into one response — same envelope shape as an unpaginated
+/// call (no `cursor` key), so `--jq`/`--output`/`--template` behave identically either way.
+fn run_products_list_paginated(cli: &Cli, args: &[String]) -> i32 {
+    if cli.template {
+        return emit_template(cli, &Endpoint::ProductsList.template());
+    }
+
+    let (mut params, _positionals) = params::split(args);
+    // A caller's own `limit==N` wins; otherwise supply this CLI's own page size, since one
+    // unbounded request would return everything in a single page and `--paginate` would issue
+    // exactly one request — proving nothing about the flag. We drive the cursor ourselves, so any
+    // `cursor==...` the caller passed is dropped rather than silently starting mid-catalog.
+    if !params.iter().any(|(k, _)| k == "limit") {
+        params.push(("limit".to_string(), DEFAULT_PAGINATE_LIMIT.to_string()));
+    }
+    params.retain(|(k, _)| k != "cursor");
+
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
+    };
+
+    let mut accumulated: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut req_params = params.clone();
+        if let Some(c) = &cursor {
+            req_params.push(("cursor".to_string(), c.clone()));
+        }
+        match client::get(&client, &cli.url, "/v1/products", &req_params) {
+            client::Outcome::Ok { body } => {
+                if let Some(products) = body.get("products").and_then(Value::as_array) {
+                    accumulated.extend(products.iter().cloned());
+                }
+                cursor = body
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            client::Outcome::Failed { status, body } => {
+                print_error(&body);
+                return exit_code_for_status(status);
+            }
+            client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+                print_error(&body);
+                return 3;
+            }
+        }
+    }
+
+    emit(
+        cli,
+        Endpoint::ProductsList,
+        &json!({ "products": accumulated }),
+    )
 }
 
 /// `channels list` / `channels set`. Both talk to the admin surface (`--admin-url`), never

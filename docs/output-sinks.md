@@ -71,7 +71,8 @@ never mutates anything: every route is a `GET`.
 curl -s localhost:9099/v1/products | jq .
 ```
 
-Routes: `GET /v1/products` (catalog), `GET /v1/products/{id}` (one product's identity/registry
+Routes: `GET /v1/products` (catalog; optional `limit`/`cursor` paging — unset `limit` returns every
+product in one response, no page size imposed unless asked), `GET /v1/products/{id}` (one product's identity/registry
 fields), `GET /v1/products/{id}/ticker` (recent trades + best bid/ask), `GET
 /v1/products/{id}/candles` (OHLCV, `granularity`/`limit` query params), `GET /v1/products/{id}/book`
 (order book), `GET /v1/best_bid_ask` (best bid/ask, optionally narrowed with a comma-separated

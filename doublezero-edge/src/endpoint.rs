@@ -40,8 +40,13 @@ impl Endpoint {
                 "product_ids": "comma-separated product ids to filter to (e.g. A:X,A:Y); a bare \
                                 positional id works too. Omit for every product.",
             }),
-            Endpoint::ProductsList
-            | Endpoint::ProductGet
+            Endpoint::ProductsList => json!({
+                "limit": "positive integer page size; unset returns every product in one \
+                          response (no server-side page size unless asked)",
+                "cursor": "opaque pagination cursor from a prior response's \"cursor\" field; \
+                           omit for the first page. See --paginate to follow it automatically.",
+            }),
+            Endpoint::ProductGet
             | Endpoint::Ticker
             | Endpoint::Book
             | Endpoint::Status

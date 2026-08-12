@@ -4,9 +4,9 @@
 
 mod common;
 
-use std::{process::Command, time::Duration};
+use std::{process::Command, sync::atomic::Ordering, time::Duration};
 
-use common::{bin, mock_server, mock_server_capture, unreachable_url};
+use common::{bin, mock_server, mock_server_capture, mock_server_sequence, unreachable_url};
 
 struct Run {
     status: i32,
@@ -237,6 +237,51 @@ fn best_bid_ask_sends_a_bare_positional_as_product_ids() {
     assert!(
         request_line.contains("product_ids=HYPERLIQUID"),
         "the positional product id must be sent as product_ids: {request_line}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// `products list --paginate` follows cursors (Coinbase parity gap #3).
+// -------------------------------------------------------------------------------------------
+
+/// Two pages, three products total: `--paginate` must issue more than one request and the
+/// accumulated result must equal what a single unpaginated response with all three would have
+/// been — asserted directly against a fixture built to prove exactly that (never just a count,
+/// which one request repeated could also produce).
+#[test]
+fn paginate_follows_the_cursor_and_accumulates_every_page() {
+    let page1 = r#"{"products":[
+        {"product_id":"A:X","source_id":1,"source":"A","symbol":"X","channel":0,"instrument_id":1,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"},
+        {"product_id":"A:Y","source_id":1,"source":"A","symbol":"Y","channel":0,"instrument_id":2,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}
+    ],"cursor":"2"}"#;
+    let page2 = r#"{"products":[
+        {"product_id":"A:Z","source_id":1,"source":"A","symbol":"Z","channel":0,"instrument_id":3,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}
+    ]}"#;
+    let (url, served) = mock_server_sequence(vec![("200 OK", page1), ("200 OK", page2)]);
+
+    let r = run(&[
+        "--url",
+        &url,
+        "--jq",
+        ".products[].product_id",
+        "products",
+        "list",
+        "--paginate",
+    ]);
+    assert_eq!(r.status, 0, "stderr: {}", r.stderr);
+
+    let mut got: Vec<&str> = r.stdout.lines().collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec!["\"A:X\"", "\"A:Y\"", "\"A:Z\""],
+        "the accumulated result must equal what an unpaginated response with all three would be: {}",
+        r.stdout
+    );
+
+    assert!(
+        served.load(Ordering::SeqCst) > 1,
+        "--paginate must issue more than one request, or the flag proves nothing"
     );
 }
 

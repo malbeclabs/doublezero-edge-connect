@@ -266,7 +266,7 @@ Six commands read `/v1` (all `GET`s), plus a `channels` group that talks to a **
 
 | Command | What it returns |
 |---|---|
-| `products list` | The product catalog |
+| `products list` | The product catalog (`limit`/`cursor` query params; `--paginate` follows cursors and accumulates every page) |
 | `products get <id>` | One product's identity and registry-derived fields |
 | `products ticker <id>` | Recent trades plus best bid/ask |
 | `products candles <id>` | OHLCV candles (`granularity`/`limit` query params) |
