@@ -196,13 +196,14 @@ fn normalize(s: SubIn) -> Result<Sub, String> {
                 }
             }
             // `mantissa` refines the bucket in the fifth significant digit, so it is meaningless at a
-            // coarser `nSigFigs` and the publisher rejects the pair rather than ignoring it.
+            // coarser `nSigFigs` and the venue rejects the pair rather than ignoring it. `1` is the
+            // identity bucket the venue accepts; our own publisher refuses it, so we are the laxer.
             match (n_sig_figs, mantissa) {
                 (_, None) => {}
-                (Some(5), Some(2 | 5)) => {}
+                (Some(5), Some(1 | 2 | 5)) => {}
                 (_, Some(m)) => {
                     return Err(format!(
-                        "Invalid subscription: mantissa {m} requires nSigFigs 5 and must be 2 or 5"
+                        "Invalid subscription: mantissa {m} must be 1, 2 or 5 at nSigFigs 5"
                     ))
                 }
             }
@@ -456,8 +457,10 @@ fn l4_order<'a>(coin: &'a str, side: BookSide, px: f64, sz: f64, oid: u64) -> L4
 /// Render the whole resting book, order by order with the venue's own ids — what an `l4Book`
 /// subscriber receives before any diff, and what re-baselines it afterwards (the channel has no
 /// clear, so a producer re-baseline becomes another snapshot).
-fn render_l4book_snapshot(acc: &BookAccumulator, key: &MarketKey, coin: &str) -> String {
-    let b = acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders);
+///
+/// Takes the materialized order set rather than the accumulator, so the caller can produce it under
+/// the shared lock and release before any of this runs.
+fn render_l4book_snapshot(b: &NormalizedBook, coin: &str) -> String {
     let time = ms_or_now(b.source_ts_ns);
     let (mut bids, mut asks) = (Vec::new(), Vec::new());
     for c in &b.changes {
@@ -665,26 +668,35 @@ fn publishable(key: &MarketKey, acc: &BookAccumulator, coin: &str) -> bool {
         && acc.is_order_level()
 }
 
-/// Clone one market's accumulator **out from under** the shared lock, which the arbiter's emit path
-/// takes on every published batch. Everything downstream — the fold, the decimal formatting, the JSON
-/// — is O(book) and would stall every ingest receiver, on every feed, if it ran while holding this.
-fn take_market(books: &BookSnapshot, key: &MarketKey, coin: &str) -> Option<BookAccumulator> {
+/// Copy what a render needs out of one market, under the shared lock and no longer — the arbiter's
+/// emit path takes this same mutex on every published batch. `take` must be the minimum each channel
+/// needs (`price_fold` for `l2Book`, `to_book` for `l4Book`) and never the accumulator itself, whose
+/// clone is O(resting orders); the decimal formatting and the JSON run after the guard drops.
+fn take_market<T>(
+    books: &BookSnapshot,
+    key: &MarketKey,
+    coin: &str,
+    take: impl FnOnce(&BookAccumulator) -> T,
+) -> Option<T> {
     let guard = crate::model::lock(books);
     guard
         .get(key)
         .filter(|acc| publishable(key, acc, coin))
-        .cloned()
+        .map(take)
 }
 
-/// Every market of this venue matching `coin`, cloned out from under the lock as above. Scans the
-/// map, so it is for a subscribe or a recovery — never the steady stream, which resolves one market by
-/// its own key.
-fn take_markets(books: &BookSnapshot, coin: &str) -> Vec<(MarketKey, BookAccumulator)> {
+/// The same copy-out for every market of this venue matching `coin`. Scans the map, so it is for a
+/// subscribe or a recovery — never the steady stream, which resolves one market by its own key.
+fn take_markets<T>(
+    books: &BookSnapshot,
+    coin: &str,
+    take: impl Fn(&MarketKey, &BookAccumulator) -> T,
+) -> Vec<T> {
     let guard = crate::model::lock(books);
     guard
         .iter()
         .filter(|(key, acc)| publishable(key, acc, coin))
-        .map(|(key, acc)| (key.clone(), acc.clone()))
+        .map(|(key, acc)| take(key, acc))
         .collect()
 }
 
@@ -706,28 +718,30 @@ fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
             n_sig_figs,
             mantissa,
             n_levels,
-        } => take_markets(books, coin)
-            .into_iter()
-            .map(|(_, acc)| {
-                let (bids, asks) = acc.price_fold();
-                let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
-                let time = ms_or_now(acc.source_ts_ns());
-                ("l2Book", render_l2book(&bids, &asks, coin, view, time))
+        } => {
+            let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
+            take_markets(books, coin, |_, acc| {
+                (acc.price_fold(), ms_or_now(acc.source_ts_ns()))
             })
-            .collect(),
-        Sub::L4Book { coin } => take_markets(books, coin)
             .into_iter()
-            .map(|(key, acc)| ("l4Book", render_l4book_snapshot(&acc, &key, coin)))
-            .collect(),
+            .map(|((bids, asks), time)| ("l2Book", render_l2book(&bids, &asks, coin, view, time)))
+            .collect()
+        }
+        Sub::L4Book { coin } => take_markets(books, coin, |key, acc| {
+            acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders)
+        })
+        .into_iter()
+        .map(|b| ("l4Book", render_l4book_snapshot(&b, coin)))
+        .collect(),
     }
 }
 
 /// Every frame one broadcast message produces across a client's subscriptions.
 ///
 /// Filtering on venue and coin happens before any rendering, and the book state is resolved **once**
-/// per message: one lock acquisition, one clone, one `price_fold` shared by every `l2Book`
-/// subscription of that market (the fold is O(resting orders) and independent of the view, so folding
-/// per subscription would let one client multiply a 44k-order book by `MAX_SUBS`).
+/// per message: one lock acquisition, one `price_fold` shared by every `l2Book` subscription of that
+/// market (the fold is O(resting orders) and independent of the view, so folding per subscription
+/// would let one client multiply a 44k-order book by `MAX_SUBS`).
 fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     match m {
@@ -755,13 +769,18 @@ fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static 
             let key = (b.venue.clone(), b.channel, b.instrument_id);
             // Only these two cases need book state; an ordinary `l4Book` diff is rendered from the
             // batch alone and takes no lock.
-            let market = (l2 || (l4 && rebaseline))
-                .then(|| take_market(books, &key, coin))
-                .flatten();
-            let fold = market
-                .as_ref()
-                .filter(|_| l2)
-                .map(BookAccumulator::price_fold);
+            let (fold, snapshot) = (l2 || (l4 && rebaseline))
+                .then(|| {
+                    take_market(books, &key, coin, |acc| {
+                        (
+                            l2.then(|| (acc.price_fold(), ms_or_now(acc.source_ts_ns()))),
+                            (l4 && rebaseline)
+                                .then(|| acc.to_book(&key.0, key.1, key.2, ReplayScope::Orders)),
+                        )
+                    })
+                })
+                .flatten()
+                .unwrap_or((None, None));
             for sub in subs {
                 match sub {
                     Sub::L2Book {
@@ -770,18 +789,17 @@ fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static 
                         mantissa,
                         n_levels,
                     } if c == coin => {
-                        if let (Some(acc), Some((bids, asks))) = (&market, &fold) {
+                        if let Some(((bids, asks), time)) = &fold {
                             let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
-                            let time = ms_or_now(acc.source_ts_ns());
-                            out.push(("l2Book", render_l2book(bids, asks, c, view, time)));
+                            out.push(("l2Book", render_l2book(bids, asks, c, view, *time)));
                         }
                     }
                     Sub::L4Book { coin: c } if c == coin => {
                         if rebaseline {
                             out.extend(
-                                market
+                                snapshot
                                     .as_ref()
-                                    .map(|acc| ("l4Book", render_l4book_snapshot(acc, &key, c))),
+                                    .map(|b| ("l4Book", render_l4book_snapshot(b, c))),
                             );
                         } else {
                             out.extend(render_l4book_diff(b, c).map(|f| ("l4Book", f)));
@@ -991,6 +1009,11 @@ mod tests {
         (Arc::from(VENUE), 0, 7)
     }
 
+    /// The order set the sink copies out under the lock, in the form the renderer receives it.
+    fn order_set(acc: &BookAccumulator) -> NormalizedBook {
+        acc.to_book(&key().0, key().1, key().2, ReplayScope::Orders)
+    }
+
     fn normalized_trade(
         venue: &str,
         symbol: &str,
@@ -1106,6 +1129,26 @@ mod tests {
             r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":""}}"#,
         ] {
             assert!(parse_control(f).is_err(), "must reject {f}");
+        }
+    }
+
+    /// Hyperliquid accepts a `mantissa` of 1, 2 or 5, and only at `nSigFigs` 5.
+    #[test]
+    fn every_legal_mantissa_is_accepted_and_the_rest_refused() {
+        for m in [1, 2, 5] {
+            let f = format!(
+                r#"{{"method":"subscribe","subscription":{{"type":"l2Book","coin":"BTC","nSigFigs":5,"mantissa":{m}}}}}"#
+            );
+            let Ok(Control::Subscribe(Sub::L2Book { mantissa, .. })) = parse_control(&f) else {
+                panic!("mantissa {m} must be accepted")
+            };
+            assert_eq!(mantissa, Some(m));
+        }
+        for m in [0, 3, 4, 6, 10] {
+            let f = format!(
+                r#"{{"method":"subscribe","subscription":{{"type":"l2Book","coin":"BTC","nSigFigs":5,"mantissa":{m}}}}}"#
+            );
+            assert!(parse_control(&f).is_err(), "mantissa {m} must be refused");
         }
     }
 
@@ -1262,7 +1305,7 @@ mod tests {
             (BookSide::Ask, 101.0, 2.0, 22),
         ]);
         let v: serde_json::Value =
-            serde_json::from_str(&render_l4book_snapshot(&acc, &key(), "BTC")).unwrap();
+            serde_json::from_str(&render_l4book_snapshot(&order_set(&acc), "BTC")).unwrap();
         assert_eq!(v["channel"], "l4Book");
         let snap = &v["data"]["Snapshot"];
         assert_eq!(snap["coin"], "BTC");
@@ -1289,7 +1332,7 @@ mod tests {
     fn l4book_orders_carry_no_fabricated_timestamp() {
         let acc = accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]);
         let v: serde_json::Value =
-            serde_json::from_str(&render_l4book_snapshot(&acc, &key(), "BTC")).unwrap();
+            serde_json::from_str(&render_l4book_snapshot(&order_set(&acc), "BTC")).unwrap();
         assert_eq!(v["data"]["Snapshot"]["levels"][0][0]["timestamp"], 0);
         assert_eq!(
             v["data"]["Snapshot"]["levels"][0][0]["user"],
@@ -1483,6 +1526,49 @@ mod tests {
         .is_empty());
     }
 
+    /// An order-level market that empties is still order-level. Derived from the current population
+    /// instead, an emptied book stops publishing on both channels — permanently for `l4Book`, whose
+    /// snapshot is only sent once this gate passes.
+    #[test]
+    fn an_emptied_order_book_keeps_publishing_on_both_channels() {
+        let mut acc = accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]);
+        acc.apply(&book_with(vec![BookChange {
+            action: BookAction::Delete,
+            side: BookSide::Bid,
+            price: 100.0,
+            size: 0.0,
+            order_id: 11,
+        }]));
+        assert!(acc.price_fold().0.is_empty(), "the book is now empty");
+        assert!(acc.baselined() && acc.is_order_level());
+
+        acc.apply(&book_with(vec![BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price: 101.0,
+            size: 2.0,
+            order_id: 12,
+        }]));
+        let books = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+        assert_eq!(
+            bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).len(),
+            1
+        );
+        assert_eq!(
+            bootstrap(
+                &books,
+                &Sub::L2Book {
+                    coin: "BTC".into(),
+                    n_sig_figs: None,
+                    mantissa: None,
+                    n_levels: 20
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
     /// One book message serves every subscription of that market — and the `l2Book` fold behind them
     /// is computed once, not once per subscription, so a client cannot multiply a whole book by
     /// `MAX_SUBS`.
@@ -1519,6 +1605,67 @@ mod tests {
         assert_eq!(
             out.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
             vec!["l2Book", "l4Book"]
+        );
+    }
+
+    /// `Arbiter::apply_book_replay` takes this same mutex on every published batch, so only the
+    /// copy-out may run under it — the formatting and the JSON, both O(book), must not. Pinned by
+    /// holding the map for the whole render: a render that reached for it would time out here.
+    #[test]
+    fn rendering_does_not_hold_the_shared_book_lock() {
+        let acc = accumulated(
+            (0u32..5_000)
+                .map(|i| {
+                    (
+                        BookSide::Bid,
+                        100.0 - f64::from(i) / 100.0,
+                        1.0,
+                        u64::from(i) + 1,
+                    )
+                })
+                .collect(),
+        );
+        let books: BookSnapshot = Arc::new(Mutex::new(HashMap::from([(key(), acc)])));
+
+        // Everything the two book channels need, copied out under the lock — never the accumulator.
+        let (fold, time) = take_market(&books, &key(), "BTC", |a| {
+            (a.price_fold(), ms_or_now(a.source_ts_ns()))
+        })
+        .unwrap();
+        let snapshot = take_market(&books, &key(), "BTC", |a| {
+            a.to_book(&key().0, key().1, key().2, ReplayScope::Orders)
+        })
+        .unwrap();
+
+        // An ingest apply in flight, holding the map for as long as the renders below take.
+        let mut held = crate::model::lock(&books);
+        held.insert((Arc::from(VENUE), 0, 8), BookAccumulator::new("ETH".into()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rendering = std::thread::spawn(move || {
+            let l2 = render_l2book(&fold.0, &fold.1, "BTC", l2_view(None, None, 100), time);
+            tx.send((l2, render_l4book_snapshot(&snapshot, "BTC")))
+        });
+        let (l2, l4) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a render must not wait on the shared book lock");
+        drop(held);
+        rendering.join().unwrap().unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&l2).unwrap()["data"]["levels"][0]
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&l4).unwrap()["data"]["Snapshot"]["levels"]
+                [0]
+            .as_array()
+            .unwrap()
+            .len(),
+            5_000
         );
     }
 
@@ -1763,6 +1910,46 @@ mod tests {
             frame,
             include_str!("../../tests/fixtures/hl_l2book_golden.json").trim_end(),
             "regenerate tests/fixtures/hl_l2book_golden.json from this renderer"
+        );
+    }
+
+    /// The `l4Book` goldens, pinned the same way. This channel has no Nautilus reader, so the
+    /// publisher's own field spellings are the whole contract — and they are **mixed** by derive:
+    /// only `L4Order` carries `rename_all`, so `limitPx` sits beside `book_diffs`.
+    #[test]
+    fn golden_l4book_frames_match_the_committed_fixtures() {
+        let acc = accumulated(vec![
+            (BookSide::Bid, 100.5, 5.0, 1),
+            (BookSide::Bid, 100.5, 3.0, 2),
+            (BookSide::Bid, 99.0, 1.0, 3),
+            (BookSide::Ask, 101.0, 2.0, 4),
+        ]);
+        assert_eq!(
+            render_l4book_snapshot(&order_set(&acc), "BTC"),
+            include_str!("../../tests/fixtures/hl_l4book_snapshot_golden.json").trim_end(),
+            "regenerate tests/fixtures/hl_l4book_snapshot_golden.json from this renderer"
+        );
+
+        let b = book_with(vec![
+            BookChange {
+                action: BookAction::Update,
+                side: BookSide::Bid,
+                price: 100.5,
+                size: 4.0,
+                order_id: 1,
+            },
+            BookChange {
+                action: BookAction::Delete,
+                side: BookSide::Ask,
+                price: 101.0,
+                size: 0.0,
+                order_id: 4,
+            },
+        ]);
+        assert_eq!(
+            render_l4book_diff(&b, "BTC").unwrap(),
+            include_str!("../../tests/fixtures/hl_l4book_updates_golden.json").trim_end(),
+            "regenerate tests/fixtures/hl_l4book_updates_golden.json from this renderer"
         );
     }
 }

@@ -1,9 +1,11 @@
-//! Our Hyperliquid-compatible output must deserialize into the types NautilusTrader parses.
+//! Our Hyperliquid-compatible output must deserialize into the types its consumer parses.
 //!
-//! These mirror `crates/adapters/hyperliquid/src/websocket/messages.rs` at **v1.227.0**, the version
-//! pinned by the reference consumer, and `common/enums.rs` for the side spelling. They are a copy, so
-//! they go stale silently: when bumping the supported Nautilus version, re-read those files and update
-//! these first.
+//! For `l2Book`/`trades` these mirror NautilusTrader's
+//! `crates/adapters/hyperliquid/src/websocket/messages.rs` at **v1.227.0**, the version pinned by the
+//! reference consumer, and `common/enums.rs` for the side spelling. `l4Book` has no Nautilus reader,
+//! so those types mirror the DoubleZero publisher's own (`malbeclabs/hyperliquid`,
+//! `app/publisher/server/src/types/mod.rs` + `types/node_data.rs`) instead. They are a copy, so they
+//! go stale silently: when bumping either reference, re-read those files and update these first.
 //!
 //! Every field here is required with no `serde(default)` upstream, which is the point — a field we
 //! rename or retype fails our build instead of a trader's session. Nautilus sets no
@@ -108,4 +110,122 @@ fn a_trade_frame_parses_as_nautilus_parses_it() {
 fn a_spelled_out_side_would_not_parse() {
     let bad = r#"{"channel":"trades","data":[{"coin":"BTC","side":"buy","px":"1","sz":"1","hash":"0x0","time":1,"tid":1,"users":["",""]}]}"#;
     assert!(serde_json::from_str::<HyperliquidWsMessage>(bad).is_err());
+}
+
+// --- l4Book: the publisher's types, not Nautilus's ---
+
+/// The casing is mixed on purpose: only `L4Order` carries `rename_all = "camelCase"` upstream, so
+/// `limitPx` sits beside `L4BookUpdates`'s `book_diffs`. Do not "fix" one to match the other.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct L4Order {
+    coin: String,
+    side: HyperliquidSide,
+    limit_px: String,
+    sz: String,
+    oid: u64,
+    #[allow(dead_code)]
+    timestamp: u64,
+    #[allow(dead_code)]
+    trigger_condition: String,
+    #[allow(dead_code)]
+    is_trigger: bool,
+    #[allow(dead_code)]
+    trigger_px: String,
+    #[allow(dead_code)]
+    is_position_tpsl: bool,
+    #[allow(dead_code)]
+    reduce_only: bool,
+    #[allow(dead_code)]
+    order_type: String,
+}
+
+/// `OrderDiff`'s container `rename_all` renames the *variants*, so the tags are lowercase and the
+/// unit variant is a bare string, not an object.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum OrderDiff {
+    New { sz: String },
+    Remove,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeDataOrderDiff {
+    #[allow(dead_code)]
+    user: String,
+    oid: u64,
+    px: String,
+    #[allow(dead_code)]
+    coin: String,
+    raw_book_diff: OrderDiff,
+}
+
+#[derive(Debug, Deserialize)]
+struct L4BookUpdates {
+    #[allow(dead_code)]
+    time: u64,
+    #[allow(dead_code)]
+    height: u64,
+    order_statuses: Vec<serde_json::Value>,
+    book_diffs: Vec<NodeDataOrderDiff>,
+}
+
+/// Externally tagged with verbatim variant names: the publisher's enum carries no serde attribute.
+#[derive(Debug, Deserialize)]
+enum L4Book {
+    Snapshot {
+        coin: String,
+        #[allow(dead_code)]
+        time: u64,
+        #[allow(dead_code)]
+        height: u64,
+        levels: [Vec<L4Order>; 2],
+    },
+    Updates(L4BookUpdates),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "channel", content = "data")]
+enum L4Envelope {
+    #[serde(rename = "l4Book")]
+    L4Book(L4Book),
+}
+
+/// The golden `l4Book` snapshot must parse as the publisher's `L4Book::Snapshot`.
+#[test]
+fn a_golden_l4book_snapshot_parses_as_the_publisher_emits_it() {
+    let frame = include_str!("fixtures/hl_l4book_snapshot_golden.json");
+    let L4Envelope::L4Book(L4Book::Snapshot { coin, levels, .. }) =
+        serde_json::from_str(frame.trim_end()).expect("must parse into the publisher's shape")
+    else {
+        panic!("must dispatch as a Snapshot")
+    };
+    assert_eq!(coin, "BTC");
+    let (bids, asks) = (&levels[0], &levels[1]);
+    assert_eq!(bids[0].oid, 1);
+    assert_eq!(bids[0].limit_px, "100.5", "camelCase on the order only");
+    assert_eq!(bids[0].sz, "5");
+    assert_eq!(bids[0].coin, "BTC");
+    assert_eq!(bids[0].side, HyperliquidSide::Buy);
+    assert_eq!(asks[0].oid, 4);
+    assert_eq!(asks[0].side, HyperliquidSide::Sell);
+}
+
+/// The golden `l4Book` updates frame: snake_case throughout, and `remove` as a bare string.
+#[test]
+fn a_golden_l4book_updates_frame_parses_as_the_publisher_emits_it() {
+    let frame = include_str!("fixtures/hl_l4book_updates_golden.json");
+    let L4Envelope::L4Book(L4Book::Updates(u)) =
+        serde_json::from_str(frame.trim_end()).expect("must parse into the publisher's shape")
+    else {
+        panic!("must dispatch as Updates")
+    };
+    assert!(u.order_statuses.is_empty());
+    assert_eq!(u.book_diffs[0].oid, 1);
+    assert_eq!(u.book_diffs[0].px, "100.5");
+    assert_eq!(
+        u.book_diffs[0].raw_book_diff,
+        OrderDiff::New { sz: "4".into() }
+    );
+    assert_eq!(u.book_diffs[1].raw_book_diff, OrderDiff::Remove);
 }

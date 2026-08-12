@@ -409,6 +409,8 @@ pub struct BookAccumulator {
     /// the venue's order id. Empty for a price-aggregated market, whose changes carry `order_id == 0`
     /// and live in `bids`/`asks`; the two populations never coexist for one market.
     orders: HashMap<u64, (bool, i128, f64, f64)>,
+    /// Whether this market is order-level — see [`BookAccumulator::is_order_level`].
+    order_level: bool,
     /// Changes of a logical event still awaiting its `last` batch — see [`BookAccumulator::apply`].
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
@@ -459,6 +461,7 @@ impl BookAccumulator {
             bids: std::collections::BTreeMap::new(),
             asks: std::collections::BTreeMap::new(),
             orders: HashMap::new(),
+            order_level: false,
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
@@ -519,6 +522,8 @@ impl BookAccumulator {
             // **both** populations — routing it by id would leave every order of a re-baselined-away
             // book resting in the replay map forever.
             if c.order_id != 0 {
+                // A `Clear` names a side, so an id on it is a producer bug rather than evidence.
+                self.order_level |= !matches!(c.action, BookAction::Clear);
                 match c.action {
                     BookAction::Delete => {
                         self.orders.remove(&c.order_id);
@@ -585,11 +590,15 @@ impl BookAccumulator {
         }
     }
 
-    /// Whether this market's book is order-level, i.e. whether it holds orders rather than price
-    /// levels. This is what an unset `book_scope` follows, so a client is bootstrapped at the same
-    /// granularity the market streams.
+    /// Whether this market's book is order-level, i.e. whether its changes name orders rather than
+    /// price levels. This is what an unset `book_scope` follows, so a client is bootstrapped at the
+    /// same granularity the market streams.
+    ///
+    /// A property of the market, not of what it currently holds: an order-level book that empties is
+    /// still order-level, and reading it off the population would silently stop the Hyperliquid
+    /// sink publishing such a market. A fresh accumulator starts unknown, which is what a reset wants.
     pub fn is_order_level(&self) -> bool {
-        !self.orders.is_empty()
+        self.order_level
     }
 
     /// The market's display label, as last seen on the wire.

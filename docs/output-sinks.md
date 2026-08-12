@@ -44,7 +44,7 @@ Three channels, subscribed with Hyperliquid's own control frame
 
 | Channel | Contract |
 |---|---|
-| `l2Book` | Snapshot-per-update: every frame carries the whole top-N of both sides, `px`/`sz` as strings and `n` as the resting-order count at that price. Honours `nSigFigs` (2–5), `mantissa` (2 or 5, only at `nSigFigs` 5) and `nLevels` (default 20, clamped to 100). Bids bucket down and asks bucket up, so aggregation never invents a price better than the book holds. |
+| `l2Book` | Snapshot-per-update: every frame carries the whole top-N of both sides, `px`/`sz` as strings and `n` as the resting-order count at that price. Honours `nSigFigs` (2–5), `mantissa` (1, 2 or 5, only at `nSigFigs` 5) and `nLevels` (default 20, clamped to 100). Bids bucket down and asks bucket up, so aggregation never invents a price better than the book holds. |
 | `l4Book` | The whole resting book order by order, then order diffs — each carrying the **venue's own order id**. Externally tagged `{"Snapshot":{…}}` / `{"Updates":{…}}`, matching the contract DoubleZero's own Hyperliquid publisher defines. A producer re-baseline arrives as another `Snapshot`, since the channel has no clear. |
 | `trades` | Our `trade`, in Hyperliquid's envelope: string price and size, the aggressor side spelled `B`/`A`, and the venue's own `tid`. |
 
@@ -75,10 +75,13 @@ as if it were whole.
 
 Client limits are fixed rather than configurable (64 clients, 256 subscriptions each, 600 inbound
 control frames per minute, a 20s heartbeat with a 60s idle reap). The rate limit is the one that
-matters: a subscribe frame is tens of bytes and can cost a whole book to answer. Rendering never runs
-while the shared book map is locked — that mutex is the one the ingest emit path takes, so holding it
-across a book render would stall receivers on *every* feed. Observability is `dz_hl_sink_clients` and
-`dz_hl_sink_messages_total{channel}`. There is **no TLS**, as with the rest of the service surface.
+matters: a subscribe frame is tens of bytes and can cost a whole book to answer. The shared book
+map's mutex is the one the ingest emit path takes on every published batch, so the sink does exactly
+one thing under it: copy out the minimum a render needs — the folded price levels for `l2Book`, the
+order set for `l4Book`, never the accumulator itself. The decimal formatting and the JSON, both
+O(book), run after the guard drops, so a 44k-order render cannot stall receivers on *every* feed.
+Observability is `dz_hl_sink_clients` and `dz_hl_sink_messages_total{channel}`. There is **no TLS**,
+as with the rest of the service surface.
 
 ## Metrics (Prometheus)
 
