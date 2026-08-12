@@ -331,7 +331,6 @@ stays provably read-only.
 |---|---|
 | `GET`/`POST /admin/channels` | Read or replace the channel filter (`--channels`/`DZ_CHANNELS`) without a restart |
 | `GET /admin/diagnostics` | Tunnel, subscription and activation state plus one verdict — see [When nothing is being served](#when-nothing-is-being-served-doublezero-edge-diagnose) |
-| `POST /admin/connect`, `POST /admin/disconnect` | Run `doublezero connect multicast` / `doublezero disconnect multicast` inside the container |
 
 ```bash
 ./target/release/doublezero-edge-connect --iface doublezero1 --admin-bind 127.0.0.1:9098
@@ -354,16 +353,17 @@ irreversible within the history window.
 > a browser on this host from POSTing a form to `/admin/channels` — the request would originate
 > from the host itself. Every `POST` therefore also requires an `X-DZ-Admin-Request` header (any
 > value is fine — a form post cannot set an arbitrary header, so requiring one is enough). The
-> `doublezero-edge` commands send it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`. A
-> `POST` must also address this surface by IP (or `localhost`), never a DNS name — a page whose own
-> name is re-pointed at loopback would otherwise be same-origin with it and able to set that header
-> itself.
-> This matters most on `/admin/connect`, which spends the container's onchain identity: anything
-> that can reach loopback on this host can trigger a provisioning run. Only one attempt runs at a
-> time (a second is refused), but there is no rate limit — a script looping on it would serially
-> re-run onchain provisioning. `GET /admin/diagnostics` is read-only and needs no header, but does
-> report operator-facing identifiers (the resolved feed-registry origin, and the device, metro and
-> network this host landed on).
+> `doublezero-edge` commands send it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`.
+>
+> **`GET /admin/diagnostics` is read-only, needs no header, and is the most informative route
+> here** — it reports the device, metro and network this host landed on, every subscribed group
+> code and the subscription rows' multicast IPs, all four configured binds, and the resolved
+> feed-registry origin. On the loopback default that is the same audience that could already run
+> `doublezero status` on the host. Two ways it widens: a non-loopback bind hands it to anyone who
+> can reach the port, and DNS rebinding reaches it too (a page served from a name re-pointed at
+> loopback is same-origin, so the header above does not stop it *reading*). Refusing a `Host` that
+> names a DNS name would close the second at the cost of `--admin-url http://myhost.local:9098`;
+> the read is left open deliberately. Nothing on this surface can change the tunnel.
 
 ### When nothing is being served (`doublezero-edge diagnose`)
 
@@ -378,13 +378,11 @@ signal, an ordinary `/v1` failure now reads `api_inactive` rather than `api_unre
 ```bash
 doublezero-edge diagnose --output table
 doublezero-edge diagnose --jq '.diagnostics.diagnosis.code'
-doublezero-edge connect        # re-runs `doublezero connect multicast` in the container
 ```
 
-`connect` (and its counterpart `disconnect`, which tears the tunnel down) replaces a `docker exec`
-that needs root and the container name. Both state what they will run, confirm unless `--force`, and
-then wait for the client verb to finish, reporting its exit code — `--no-wait` returns on the
-container's `202` instead.
+`diagnose` only reports. When the verdict is `tunnel_down`, its remediation names the retry —
+`doublezero connect multicast` inside the container — which stays a deliberate `docker exec` rather
+than something an HTTP surface with no authentication can trigger.
 
 The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
 `doublezero-edge` builds and runs on macOS as well as Linux; the bridge itself does not (it uses

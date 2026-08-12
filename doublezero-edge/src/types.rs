@@ -343,8 +343,6 @@ pub struct DiagnosticsResponse {
     #[serde(default)]
     pub activation: ActivationBlock,
     #[serde(default)]
-    pub last_attempt: Option<AttemptBlock>,
-    #[serde(default)]
     pub registry: RegistryBlock,
     #[serde(default)]
     pub binds: BindsBlock,
@@ -370,6 +368,11 @@ pub struct TunnelBlock {
     pub detail: Option<String>,
     #[serde(default)]
     pub checked_at_unix: Option<u64>,
+    /// When the last *successful* poll landed. Diverges from `checked_at_unix` exactly when a tick
+    /// failed and the server kept the previous poll's data, which is the only thing that makes the
+    /// sessions below readable as stale rather than current.
+    #[serde(default)]
+    pub last_ok_at_unix: Option<u64>,
     #[serde(default)]
     pub poll_seconds: u64,
     #[serde(default)]
@@ -388,6 +391,8 @@ pub struct TunnelSession {
     pub user_type: Option<String>,
     #[serde(default)]
     pub current_device: Option<String>,
+    #[serde(default)]
+    pub lowest_latency_device: Option<String>,
     #[serde(default)]
     pub metro: Option<String>,
     #[serde(default)]
@@ -431,23 +436,6 @@ pub struct ReceiverEntry {
     pub publisher: u32,
     #[serde(default)]
     pub liveness: String,
-}
-
-/// The last `POST /admin/connect`/`/admin/disconnect` run, as `GET /admin/diagnostics` reports it.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct AttemptBlock {
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub started_at_unix: u64,
-    #[serde(default)]
-    pub finished_at_unix: Option<u64>,
-    #[serde(default)]
-    pub running: bool,
-    #[serde(default)]
-    pub exit_code: Option<i32>,
-    #[serde(default)]
-    pub output_tail: String,
 }
 
 /// Which surfaces the container was configured with. Empty means "not configured", which for `api`

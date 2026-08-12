@@ -192,15 +192,7 @@ pub fn admin_post_channels(
     admin_post_with(client, admin_url, "/admin/channels", &[("channels", spec)])
 }
 
-/// `POST {admin_url}{path}` with no query parameters and no body — `/admin/connect` and
-/// `/admin/disconnect`, which take neither (the argv they run is a server-side constant). Same
-/// `X-DZ-Admin-Request` guard and same bodyless request as [`admin_post_channels`].
-pub fn admin_post(client: &reqwest::blocking::Client, admin_url: &str, path: &str) -> Outcome {
-    admin_post_with(client, admin_url, path, &[])
-}
-
-/// The one POST both admin mutations run through. An empty `query` leaves the URL untouched
-/// (`reqwest` drops a query string it serialized to nothing), so `/admin/connect` goes out bare.
+/// The one POST this CLI's admin mutation runs through.
 fn admin_post_with(
     client: &reqwest::blocking::Client,
     admin_url: &str,
@@ -461,32 +453,6 @@ mod tests {
         // all: a bodyless POST that still sent "Content-Length: 0" would technically satisfy the
         // server's `content_length > 0` check, but the task brief calls this out as a real defect
         // to catch rather than assume away, so it is pinned here explicitly.
-        let head = raw.split("\r\n\r\n").next().unwrap_or(&raw);
-        assert!(
-            !head.to_lowercase().contains("content-length"),
-            "a bodyless POST must not send a Content-Length header at all: {head}"
-        );
-        assert!(
-            head.to_lowercase().contains("x-dz-admin-request"),
-            "the CSRF-defeating header must be sent on every admin POST: {head}"
-        );
-    }
-
-    /// `/admin/connect` takes no parameters at all, so the POST must carry neither a query string
-    /// nor a body — the server 400s a nonzero `Content-Length` on this route too.
-    #[test]
-    fn a_bodyless_admin_post_sends_no_query_string_and_no_body() {
-        let (base, rx) = capture_one_request();
-        let client = reqwest::blocking::Client::new();
-        let outcome = admin_post(&client, &base, "/admin/connect");
-        assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
-        let raw = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("captured request");
-        assert_eq!(
-            raw.lines().next().unwrap_or_default(),
-            "POST /admin/connect HTTP/1.1"
-        );
         let head = raw.split("\r\n\r\n").next().unwrap_or(&raw);
         assert!(
             !head.to_lowercase().contains("content-length"),

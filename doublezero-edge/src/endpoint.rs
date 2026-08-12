@@ -24,10 +24,6 @@ pub enum Endpoint {
     /// /v1/status body, or null>}` — same two-surface merge as [`Endpoint::ChannelsList`], except
     /// `/v1` is best-effort here, since it being down is what this command exists to explain.
     Diagnose,
-    /// `connect`/`disconnect`'s synthetic body: `{"accepted": <the 202 body>, "diagnostics": <the
-    /// poll's last `GET /admin/diagnostics` body, or null under `--no-wait`>, "timed_out": bool}`.
-    Connect,
-    Disconnect,
 }
 
 impl Endpoint {
@@ -60,9 +56,7 @@ impl Endpoint {
             | Endpoint::Status
             | Endpoint::ChannelsList
             | Endpoint::ChannelsSet
-            | Endpoint::Diagnose
-            | Endpoint::Connect
-            | Endpoint::Disconnect => json!({}),
+            | Endpoint::Diagnose => json!({}),
         }
     }
 }

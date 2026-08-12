@@ -6,19 +6,18 @@
 //! Every `products`/`status` command is READ-ONLY (a `GET` against `/v1`, which has no
 //! order-placement or mutation path anywhere in `edge-connect` for it to reach) and never needs a
 //! confirmation prompt. The commands over the **admin** surface (`--admin-url`) are where that
-//! stops holding: `diagnose` is read-only too, but `channels set`, `connect` and `disconnect` all
-//! mutate — what this process ingests, or the host's tunnel — so each states exactly what it will
-//! do and requires confirmation unless `--force`.
+//! stops holding: `diagnose` is read-only too, but `channels set` mutates what this process
+//! ingests, so it states exactly what it will do and requires confirmation unless `--force`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use doublezero_edge::{channels, client, diagnose, endpoint::Endpoint, jq, params, render};
+use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
 use serde_json::{json, Value};
 
 /// doublezero-edge: an agent-facing CLI over a running edge-connect container's /v1 market-data
-/// API (plus its admin surface, for `diagnose`, `channels`, `connect` and `disconnect`).
+/// API (plus its admin surface, for `diagnose` and `channels`).
 #[derive(Parser)]
 #[command(
     name = "doublezero-edge",
@@ -31,13 +30,12 @@ order-placement or mutation path anywhere in edge-connect for it to reach, so ne
 confirmation prompt — a real difference from the Coinbase Advanced Trade CLI this tool's surface \
 is modelled on, where blast-radius containment (accidentally placing a real order) drives much of \
 the design.\n\n\
-`diagnose`, `channels`, `connect` and `disconnect` are separate: they talk to edge-connect's admin \
-surface (--admin-url, on by default at 127.0.0.1:9098) rather than /v1, which matters because \
-/v1 activates only once a market-data feed is subscribed — on a host whose tunnel never came up it \
-is not listening at all, and `diagnose` is then the command that answers why. The three mutating \
-ones (`channels set` replaces which channels this process ingests; `connect`/`disconnect` re-run \
-the DoubleZero client verb inside the container) each state what they will do and require \
-confirmation unless --force.\n\n\
+`diagnose` and `channels` are separate: they talk to edge-connect's admin surface (--admin-url, on \
+by default at 127.0.0.1:9098) rather than /v1, which matters because /v1 activates only once a \
+market-data feed is subscribed — on a host whose tunnel never came up it is not listening at all, \
+and `diagnose` is then the command that answers why. `diagnose` only reports; the one mutating \
+command, `channels set`, replaces which channels this process ingests and requires confirmation \
+unless --force.\n\n\
 Trailing arguments to a products subcommand are either the product id (a bare positional, e.g. \
 HYPERLIQUID:BTC) or a key==value query parameter (e.g. granularity==ONE_MINUTE); the two are told \
 apart by the presence of '==', matched before anything is treated as positional, so a query value \
@@ -108,13 +106,6 @@ enum Command {
     /// else reports `api_unreachable`. Exits 0 whatever the verdict; 3 only if the admin surface
     /// itself does not answer.
     Diagnose,
-    /// Ask the container to run `doublezero connect multicast` — the retry path for a `tunnel_down`
-    /// verdict, without a `docker exec`. Mutating: it provisions this host's onchain DoubleZero
-    /// user, so it states what it will run and confirms unless `--force`.
-    Connect(AttemptArgs),
-    /// Ask the container to run `doublezero disconnect multicast`, tearing this host's tunnel
-    /// down. Mutating and disruptive — see the prompt it prints.
-    Disconnect(AttemptArgs),
     /// Print a shell-completion script for `<shell>` to stdout. Local-only — no config file, no
     /// server, no network — so packaging can run it at build time.
     Completion {
@@ -123,30 +114,8 @@ enum Command {
     },
 }
 
-/// The flags `connect` and `disconnect` share. They differ only in the verb they run and the
-/// warning they print, so the argument surface is one type.
-#[derive(clap::Args)]
-struct AttemptArgs {
-    /// Skip the confirmation prompt. For a non-interactive caller — interactively, answer the
-    /// prompt.
-    #[arg(long)]
-    force: bool,
-    /// Return as soon as the container accepts the request, without waiting for the client verb to
-    /// finish. Its outcome then shows up under `last_attempt` in `doublezero-edge diagnose`.
-    #[arg(long)]
-    no_wait: bool,
-    /// Seconds to wait for the client verb to finish before giving up on watching it (it keeps
-    /// running in the container regardless).
-    #[arg(long, default_value_t = 180)]
-    timeout: u64,
-}
-
 /// The admin surface's base URL — `--admin-bind`'s own default, which is loopback-only by design.
 const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
-
-/// How often `connect`/`disconnect` re-read `/admin/diagnostics` while waiting. The client verb
-/// takes minutes; this is only how promptly its end is noticed.
-const ATTEMPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Page size `products list --paginate` supplies on the caller's behalf when no `limit==N` was
 /// given — pagination proves nothing in one unbounded request, so `--paginate` must set a page
@@ -225,11 +194,7 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
             ProductsCommand::Book { args } => (Endpoint::Book, args.clone()),
             ProductsCommand::BestBidAsk { args } => (Endpoint::BestBidAsk, args.clone()),
         },
-        Command::Channels { .. }
-        | Command::Diagnose
-        | Command::Connect(_)
-        | Command::Disconnect(_)
-        | Command::Completion { .. } => {
+        Command::Channels { .. } | Command::Diagnose | Command::Completion { .. } => {
             unreachable!("this command is dispatched directly by run(), never through resolve()")
         }
     }
@@ -253,11 +218,7 @@ fn build_path(endpoint: Endpoint, positionals: &[String]) -> Result<String, Stri
         Endpoint::Ticker => format!("/v1/products/{}/ticker", require_id()?),
         Endpoint::Candles => format!("/v1/products/{}/candles", require_id()?),
         Endpoint::Book => format!("/v1/products/{}/book", require_id()?),
-        Endpoint::ChannelsList
-        | Endpoint::ChannelsSet
-        | Endpoint::Diagnose
-        | Endpoint::Connect
-        | Endpoint::Disconnect => {
+        Endpoint::ChannelsList | Endpoint::ChannelsSet | Endpoint::Diagnose => {
             unreachable!(
                 "admin-surface commands are dispatched directly by run(), never through build_path"
             )
@@ -364,8 +325,6 @@ fn run() -> i32 {
     match &cli.command {
         Command::Channels { action } => return run_channels(&cli, action),
         Command::Diagnose => return run_diagnose(&cli),
-        Command::Connect(args) => return run_attempt(&cli, args, Attempt::Connect),
-        Command::Disconnect(args) => return run_attempt(&cli, args, Attempt::Disconnect),
         _ => {}
     }
 
@@ -700,136 +659,6 @@ fn run_diagnose(cli: &Cli) -> i32 {
         Endpoint::Diagnose,
         &json!({ "diagnostics": diagnostics, "status": status }),
     )
-}
-
-/// Which DoubleZero client verb `connect`/`disconnect` asks the container to run.
-#[derive(Clone, Copy)]
-enum Attempt {
-    Connect,
-    Disconnect,
-}
-
-impl Attempt {
-    fn path(self) -> &'static str {
-        match self {
-            Attempt::Connect => "/admin/connect",
-            Attempt::Disconnect => "/admin/disconnect",
-        }
-    }
-
-    fn endpoint(self) -> Endpoint {
-        match self {
-            Attempt::Connect => Endpoint::Connect,
-            Attempt::Disconnect => Endpoint::Disconnect,
-        }
-    }
-
-    /// What the operator is about to do, in the terms it will actually happen in. `disconnect`
-    /// takes a working tunnel down, and the prompt says so rather than reading as `connect`'s
-    /// mirror image.
-    fn preamble(self) -> &'static str {
-        match self {
-            Attempt::Connect => {
-                "This runs `doublezero connect multicast` inside the edge-connect container: it \
-                 provisions this host's onchain DoubleZero user and brings the tunnel up. It can \
-                 take minutes, and it spends the container's onchain identity."
-            }
-            Attempt::Disconnect => {
-                "This runs `doublezero disconnect multicast` inside the edge-connect container. It \
-                 TEARS DOWN this host's DoubleZero tunnel: every market-data feed stops, the /v1 \
-                 API deactivates, and nothing is served again until the tunnel is reconnected."
-            }
-        }
-    }
-}
-
-/// `connect` / `disconnect`: state what will run, confirm unless `--force`, `POST` it, then watch
-/// `/admin/diagnostics` until the attempt finishes.
-///
-/// Exit code reports the *attempt*, not the request: 0 only when the client verb finished with exit
-/// code 0. A timeout is 1 — the run is unfinished, not successful — while `--no-wait` is 0, since
-/// there the accepted `202` is all that was asked for.
-fn run_attempt(cli: &Cli, args: &AttemptArgs, attempt: Attempt) -> i32 {
-    if cli.template {
-        return emit_template(cli, &attempt.endpoint().template());
-    }
-    let client = match build_http_client() {
-        Ok(client) => client,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            return 1;
-        }
-    };
-
-    println_or_exit(attempt.preamble());
-    if !args.force {
-        print_or_exit("Type 'yes' to continue: ");
-        let mut input = String::new();
-        let confirmed = std::io::stdin().read_line(&mut input).is_ok()
-            && input.trim().eq_ignore_ascii_case("yes");
-        if !confirmed {
-            eprintln!("aborted; nothing was run.");
-            return 1;
-        }
-    }
-
-    let accepted = match client::admin_post(&client, &cli.admin_url, attempt.path()) {
-        client::Outcome::Ok { body } => body,
-        client::Outcome::Failed { status, body } => {
-            print_error(&body);
-            return exit_code_for_status(status);
-        }
-        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
-            print_error(&body);
-            return 3;
-        }
-    };
-
-    if args.no_wait {
-        let body = json!({"accepted": accepted, "diagnostics": Value::Null, "timed_out": false});
-        return emit(cli, attempt.endpoint(), &body);
-    }
-
-    let (diagnostics, timed_out) = match watch_attempt(&client, &cli.admin_url, args.timeout) {
-        Ok(result) => result,
-        Err(body) => {
-            print_error(&body);
-            return 3;
-        }
-    };
-    let attempt_failed = timed_out || diagnose::attempt_exit_code(&diagnostics) != Some(0);
-    let body = json!({"accepted": accepted, "diagnostics": diagnostics, "timed_out": timed_out});
-    match emit(cli, attempt.endpoint(), &body) {
-        0 if attempt_failed => 1,
-        code => code,
-    }
-}
-
-/// Poll `/admin/diagnostics` until the attempt reports itself finished, or `timeout_secs` elapses
-/// (the `bool`). `Err` is an admin-surface error envelope: the attempt has become unobservable from
-/// here, which is worth saying immediately rather than spinning out the deadline in silence.
-fn watch_attempt(
-    client: &reqwest::blocking::Client,
-    admin_url: &str,
-    timeout_secs: u64,
-) -> Result<(Value, bool), Value> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        // Sleep first: the `202` has only just returned, so the attempt is certainly still running.
-        std::thread::sleep(ATTEMPT_POLL_INTERVAL);
-        let body = match client::admin_get(client, admin_url, "/admin/diagnostics") {
-            client::Outcome::Ok { body } => body,
-            client::Outcome::Failed { body, .. }
-            | client::Outcome::Invalid { body, .. }
-            | client::Outcome::Unreachable { body } => return Err(body),
-        };
-        if diagnose::attempt_finished(&body) {
-            return Ok((body, false));
-        }
-        if Instant::now() >= deadline {
-            return Ok((body, true));
-        }
-    }
 }
 
 /// clap's own `--help`/`--version`/usage errors: the two "not actually an error" kinds print to

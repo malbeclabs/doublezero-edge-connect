@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subscriptions, activations — ending in one verdict an agent reads as `.diagnostics.diagnosis.code`.
   It reads the admin surface, which is not subscription-gated, so it answers on exactly the host
   where every `/v1` command fails. Exits 0 whatever the verdict; 3 only if the admin surface itself
-  does not answer. `doublezero-edge connect`/`disconnect` re-run the DoubleZero client verb inside
-  the container (confirmation required unless `--force`), waiting for its exit code unless
-  `--no-wait`. `--admin-url` is now a global flag rather than one on the two `channels` subcommands.
+  does not answer. It only ever *reports*: retrying a down tunnel stays where it already is,
+  `doublezero connect multicast` inside the container, so nothing here can spend the container's
+  onchain identity. `GET /admin/diagnostics` is unauthenticated like the rest of the admin surface
+  and discloses this host's device/metro names, subscribed group codes and their multicast IPs, the
+  configured binds and the feed-registry URL — on the loopback default, to the same audience that
+  could already run `doublezero status`. `--admin-url` is now a global flag rather than one on the
+  two `channels` subcommands.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
   exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`

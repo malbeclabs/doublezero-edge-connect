@@ -9,11 +9,10 @@
 //! the state it answers from.
 //!
 //! Two halves:
-//! - [`DiagnosticsSnapshot`] — plain cached state. The reconciler publishes it at the end of every
-//!   tick from what it already fetched ([`DiagnosticsSnapshot::publish_tick`]); the admin surface's
-//!   connect/disconnect route records its attempt into the same struct. **Nothing here polls, and
-//!   nothing here shells out on the read path** — a diagnostics request is a lock, a clone and a
-//!   pure function.
+//! - [`DiagnosticsSnapshot`] — plain cached state, written by the reconciler at the end of every
+//!   tick from what it already fetched ([`DiagnosticsSnapshot::publish_tick`]). **Nothing here
+//!   polls, and nothing here shells out on the read path** — a diagnostics request is a lock, a
+//!   clone and a pure function.
 //! - [`diagnose`] — an ordered ladder from that state to one `{code, summary, remediation}`
 //!   verdict. Server-side on purpose: an agent reading `.diagnosis.code` and an operator reading
 //!   the table then get the same answer, and the ladder is unit-testable against a captured
@@ -34,8 +33,8 @@ use crate::ingest::{
     subscriptions::{Session, HEALTHY_SESSION_STATUS},
 };
 
-/// Shared with the reconciler (which writes the tick half) and the admin surface (which reads it
-/// and writes the attempt half).
+/// Written by the reconciler once per tick, read by the admin surface. This process's only writer
+/// is [`DiagnosticsSnapshot::publish_tick`]; every HTTP path over it is read-only.
 pub type SharedDiagnostics = Arc<Mutex<DiagnosticsSnapshot>>;
 
 /// What the last completed subscription poll produced. Mirrors
@@ -80,36 +79,6 @@ pub struct ReceiverState {
     pub liveness: TapeLiveness,
 }
 
-/// One `POST /admin/connect` or `POST /admin/disconnect` run. `finished_at_unix == None` means it
-/// is still running, which is also what makes the endpoint single-flight.
-#[derive(Debug, Clone)]
-pub struct CommandAttempt {
-    /// The exact argv that was run, for display — a constant in `sinks::admin`, never composed
-    /// from request input.
-    pub command: String,
-    pub started_at_unix: u64,
-    pub finished_at_unix: Option<u64>,
-    pub exit_code: Option<i32>,
-    pub output_tail: String,
-}
-
-impl CommandAttempt {
-    pub fn running(&self) -> bool {
-        self.finished_at_unix.is_none()
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "command": self.command,
-            "started_at_unix": self.started_at_unix,
-            "finished_at_unix": self.finished_at_unix,
-            "running": self.running(),
-            "exit_code": self.exit_code,
-            "output_tail": self.output_tail,
-        })
-    }
-}
-
 /// What one poll read off `doublezero status --json`. Built by the reconciler, which keeps this as
 /// one value rather than six positional arguments.
 #[derive(Debug, Default, Clone)]
@@ -150,21 +119,21 @@ pub struct DiagnosticsSnapshot {
     /// How often the reconciler polls, so a remediation can name the real wait rather than a
     /// hardcoded 30s.
     pub refresh_secs: u64,
-    /// The last connect/disconnect attempt, if any. Deliberately **not** touched by
-    /// [`Self::publish_tick`]: the two halves of this struct have different writers, and a tick
-    /// landing mid-attempt must not erase it.
-    pub last_attempt: Option<CommandAttempt>,
 }
 
 impl DiagnosticsSnapshot {
-    /// Publish one tick. Leaves `last_attempt` alone — see its doc.
+    /// Publish one tick.
     ///
     /// An `Unavailable` tick updates the detection outcome but **keeps the previous poll's sessions
     /// and codes**. The transient case is a `doublezero status` blip on a host that is streaming
-    /// fine — likely while a multi-minute `connect` holds the daemon — and blanking them would
-    /// report "zero subscriptions, no sessions, freshly checked" beside five live receivers, which
-    /// is a worse answer than a stale one. `last_ok_at_unix` is what makes the staleness visible;
-    /// the reconciler makes the same distinction for activations, which it also keeps.
+    /// fine, and blanking them would report "zero subscriptions, no sessions, freshly checked"
+    /// beside five live receivers, which is a worse answer than a stale one. `last_ok_at_unix` is
+    /// what makes the staleness visible; the reconciler makes the same distinction for activations,
+    /// which it also keeps.
+    ///
+    /// Only a `Detection::Ok` tick stamps `last_ok_at_unix`: it dates the session and code data
+    /// above, and `CliMissing`/`GatingDisabled` never ran a status call to produce any. Stamping
+    /// those would date an empty document to now and read as freshly-confirmed.
     pub fn publish_tick(&mut self, polled: Polled, activation: Activation) {
         let now = crate::model::now_ns() / 1_000_000_000;
         self.checked_at_unix = Some(now);
@@ -172,15 +141,12 @@ impl DiagnosticsSnapshot {
             self.polled.detection = polled.detection;
             self.polled.detail = polled.detail;
         } else {
+            if polled.detection == Detection::Ok {
+                self.last_ok_at_unix = Some(now);
+            }
             self.polled = polled;
-            self.last_ok_at_unix = Some(now);
         }
         self.activation = activation;
-    }
-
-    /// Whether a connect/disconnect attempt is in flight — the single-flight gate.
-    pub fn attempt_running(&self) -> bool {
-        self.last_attempt.as_ref().is_some_and(|a| a.running())
     }
 
     /// The `tunnel`, `subscriptions` and `activation` blocks of the diagnostics response.
@@ -243,7 +209,6 @@ impl DiagnosticsSnapshot {
                 "api_on": self.activation.api_on,
                 "shred_sources": self.activation.shred_sources,
             },
-            "last_attempt": self.last_attempt.as_ref().map(CommandAttempt::to_json),
         })
     }
 }
@@ -337,7 +302,7 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
     // Packets arriving is proof the tunnel is up, whatever the status string says — so the two
     // rungs below are skipped outright when a receiver is delivering. Without that, one upstream
     // rename of `session_status` would report `tunnel_down` on every healthy host in the fleet and
-    // point each one at the mutating `doublezero-edge connect`. Activation is armored against
+    // send each one to reconnect a tunnel that was never down. Activation is armored against
     // exactly that rename (see `subscriptions::parse_status_codes`'s F1 note); the verdict an
     // operator acts on has to be too.
     let delivering = s
@@ -365,7 +330,7 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
                 ),
                 "Read it directly — `doublezero status` inside the container — since this build \
                  could not find the field it reads. If the tunnel really is down, \
-                 `doublezero-edge connect` is the retry.",
+                 `doublezero connect multicast` there is the retry.",
             );
         }
         return Diagnosis::new(
@@ -374,9 +339,9 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
                 "The DoubleZero tunnel is not up — session status: {reported} (healthy is \
                  \"{HEALTHY_SESSION_STATUS}\"). No multicast traffic can reach this host."
             ),
-            "Run `doublezero-edge connect` to retry `doublezero connect multicast` inside the \
-             container. If it fails, the usual causes are a missing access pass for this host's \
-             IP, or a provider firewall/NAT blocking the tunnel.",
+            "Retry the tunnel with `doublezero connect multicast` inside the container. If it \
+             fails, the usual causes are a missing access pass for this host's IP, or a provider \
+             firewall/NAT blocking the tunnel.",
         );
     }
 
@@ -403,7 +368,21 @@ pub fn diagnose(s: &DiagnosticsSnapshot) -> Diagnosis {
 /// about *why* those receivers are running.
 fn traffic_verdict(s: &DiagnosticsSnapshot, ok_code: &'static str, prefix: &str) -> Diagnosis {
     let receivers = &s.activation.receivers;
-    if !receivers.is_empty() && !receivers.iter().any(|r| r.liveness == TapeLiveness::Up) {
+    // Zero receivers is its own answer, never `ok`. Reaching here means the feeds were expected to
+    // be running — a subscribed group, or gating off entirely — so an empty set is a selection that
+    // excluded everything (`--feed`, `--publisher-port`, or a channel filter narrower than the
+    // row's roster), not a healthy idle state. Its remediation is the opposite of the no-traffic
+    // rung's: nothing bound a socket, so no firewall can be at fault.
+    if receivers.is_empty() {
+        return Diagnosis::new(
+            "no_receivers_running",
+            format!("{prefix} No receiver is running, so nothing is being decoded."),
+            "Every publisher of the subscribed row is excluded by this process's own selection. \
+             Check `--feed`/`--publisher-port` and the channel filter (`--channels`, or \
+             `GET /admin/channels` for the one in force) against the groups this host holds.",
+        );
+    }
+    if !receivers.iter().any(|r| r.liveness == TapeLiveness::Up) {
         return Diagnosis::new(
             "subscribed_no_traffic",
             format!(
@@ -476,8 +455,8 @@ mod tests {
             d.summary
         );
         assert!(
-            d.remediation.contains("doublezero-edge connect"),
-            "the remediation must name the retry this CLI offers: {}",
+            d.remediation.contains("doublezero connect multicast"),
+            "the remediation must name the retry verb: {}",
             d.remediation
         );
     }
@@ -573,23 +552,45 @@ mod tests {
         assert_eq!(diagnose(&s).code, "gating_disabled");
     }
 
-    /// A tick must never erase an attempt recorded by the admin surface — the two halves of the
-    /// snapshot have different writers, and losing the attempt is how a `202` becomes unobservable.
+    /// A subscribed row whose every publisher this process excluded runs no receiver at all. The
+    /// traffic rung's `!is_empty()` guard used to skip that case straight to `ok` — "nothing to
+    /// fix" on a host serving nothing, which is the one answer this module exists to prevent.
     #[test]
-    fn publishing_a_tick_preserves_a_recorded_attempt() {
-        let mut s = snap(Detection::Pending);
-        s.last_attempt = Some(CommandAttempt {
-            command: "doublezero connect multicast".to_string(),
-            started_at_unix: 1,
-            finished_at_unix: None,
-            exit_code: None,
-            output_tail: String::new(),
-        });
-        s.publish_tick(Polled::default(), Activation::default());
-        assert!(
-            s.attempt_running(),
-            "the in-flight attempt must survive a tick"
-        );
+    fn a_subscribed_row_with_every_publisher_excluded_is_not_ok() {
+        let mut s = snap(Detection::Ok);
+        s.polled.sessions = parse_status_sessions(STATUS_JSON.as_bytes());
+        s.polled.market_data_codes = vec!["tiredsolid".to_string()];
+        s.activation.api_on = true;
+        assert!(s.activation.receivers.is_empty());
+        let d = diagnose(&s);
+        assert_eq!(d.code, "no_receivers_running");
+        assert!(d.remediation.contains("--channels"), "{}", d.remediation);
+
+        // Same shape with gating off: nothing selected, so nothing runs.
+        let s = snap(Detection::GatingDisabled);
+        assert_eq!(diagnose(&s).code, "no_receivers_running");
+    }
+
+    /// `last_ok_at_unix` dates the session and code data. `CliMissing` and `GatingDisabled` never
+    /// run a status call, so stamping them would date an empty document to now and render as
+    /// freshly-confirmed beside a verdict that consulted nothing.
+    #[test]
+    fn only_a_successful_poll_stamps_the_last_ok_time() {
+        for detection in [Detection::CliMissing, Detection::GatingDisabled] {
+            let mut s = snap(Detection::Pending);
+            s.publish_tick(
+                Polled {
+                    detection,
+                    ..Polled::default()
+                },
+                Activation::default(),
+            );
+            assert!(s.checked_at_unix.is_some(), "{detection:?} was checked");
+            assert_eq!(
+                s.last_ok_at_unix, None,
+                "{detection:?} ran no status call to date"
+            );
+        }
     }
 
     /// A `doublezero status` blip on a streaming host must not blank what the last good poll knew.

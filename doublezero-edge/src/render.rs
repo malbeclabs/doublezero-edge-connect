@@ -26,7 +26,6 @@ pub fn render_table(endpoint: Endpoint, body: &Value) -> Result<String, String> 
         Endpoint::ChannelsList => crate::channels::render_channels_list(body),
         Endpoint::ChannelsSet => render_channels_set(body),
         Endpoint::Diagnose => crate::diagnose::render_diagnose(body),
-        Endpoint::Connect | Endpoint::Disconnect => crate::diagnose::render_attempt(body),
     }
 }
 

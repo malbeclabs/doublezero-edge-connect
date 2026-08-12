@@ -127,7 +127,6 @@ is subscribed to nothing at all.
 | `GET /admin/channels` | The channel filter in force, and which publishers/channels it **admits** (not which receivers are running — `GET /v1/status`'s `channels` block reports real liveness) |
 | `POST /admin/channels?channels=<spec>` | Replace the channel filter, validated by the same parser `--channels` uses at startup. Applies on the reconciler's next tick |
 | `GET /admin/diagnostics` | Tunnel/subscription/activation state plus one verdict — below |
-| `POST /admin/connect`, `POST /admin/disconnect` | Run `doublezero connect multicast` / `doublezero disconnect multicast` inside the container |
 
 ### `GET /admin/diagnostics`
 
@@ -156,33 +155,31 @@ ruled out — so a host with no `doublezero` CLI is never reported as a broken t
 | `tunnel_state_unknown` | The document parsed but carried no session status this build recognizes — "not up" is a claim the snapshot cannot support |
 | `no_market_data_subscriptions` | Tunnel up, but no subscribed group matches a feed this build serves |
 | `subscribed_no_traffic` | Receivers running, none delivering — usually a default-deny host firewall on `doublezero1` |
+| `no_receivers_running` | Feeds were expected to run but none does: `--feed`/`--publisher-port`/the channel filter excluded every publisher of a subscribed row |
 | `gating_disabled` / `ok` | Nothing to fix |
 
 A receiver actually delivering packets is proof the tunnel is up, so the two tunnel rungs are
 skipped outright in that case: one upstream rename of `session_status` must not report
-`tunnel_down` fleet-wide and point every healthy host at a mutating retry. A transient
-`doublezero status` failure keeps the last good session and code data rather than blanking it —
-`last_ok_at_unix` reports how stale it is.
+`tunnel_down` fleet-wide and send every healthy host to reconnect a tunnel that was never down. A
+transient `doublezero status` failure keeps the last good session and code data rather than blanking
+it — `last_ok_at_unix` reports how stale it is, and only a successful poll stamps it (`cli_missing`
+and `gating_disabled` run no status call, so they leave it unset rather than dating an empty
+document to now).
 
-`doublezero-edge diagnose` renders this; `doublezero-edge connect` is the retry the `tunnel_down`
-rung points at.
+`doublezero-edge diagnose` renders this. It only reports: the retry the `tunnel_down` rung names is
+`doublezero connect multicast` inside the container.
 
-### Guards on the mutating routes
+### Guards on the mutating route
 
-`POST` requires an `X-DZ-Admin-Request` header (any value), refuses a request body, and requires
-`Host` to name an address rather than a DNS name (`localhost` counts; an absent `Host` counts). The
-header is not authentication — this surface has none — it rules out a request a browser page on the
-same host could have caused by accident, which a `<form>` cannot produce. The `Host` check covers
-the case the header does not: a page whose own name is re-pointed at `127.0.0.1` is *same-origin*
-with this surface and can set any header it likes, but a rebound request necessarily carries the
-attacker's name in `Host`. `GET` routes are exempt from both: requiring them on the diagnostics read
-would make the one command a stuck operator most needs harder to run than `curl`.
+`POST /admin/channels` requires an `X-DZ-Admin-Request` header (any value) and refuses a request
+body. The header is not authentication — this surface has none — it rules out a request a browser
+page on the same host could have caused by accident, which a `<form>` cannot produce. `GET` routes
+are exempt: requiring it on the diagnostics read would make the one command a stuck operator most
+needs harder to run than `curl`.
 
-`connect`/`disconnect` additionally run a **fixed argv** (a module constant — the routes take no
-parameters, so no request input reaches the child process) and are **single-flight**: a second
-attempt while one is running is `409`, because two concurrent runs would race onchain user creation.
-The child runs on a blocking thread with stdin at `/dev/null`, and the route answers `202`
-immediately; the outcome lands back in `GET /admin/diagnostics` under `last_attempt`. A child that
-never exits is killed after 10 minutes so the single-flight gate always clears — otherwise a hung
-`connect` would refuse even the `disconnect` that would clear it. There is no rate limit: a script
-looping on `connect` would serially re-run onchain provisioning.
+`GET /admin/diagnostics` is read-only but is the most informative route here (device/metro names,
+subscribed group codes and their multicast IPs, every configured bind, the feed-registry URL). It is
+unauthenticated like the rest of the surface, and DNS rebinding can read it — a page served from a
+name re-pointed at `127.0.0.1` is same-origin, so the header above does not stop a *read*. Refusing
+a `Host` that names a DNS name would close that at the cost of `--admin-url http://myhost.local:9098`;
+the read is left open deliberately. Nothing on this surface can change the tunnel.

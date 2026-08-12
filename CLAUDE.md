@@ -264,10 +264,9 @@ Modules are grouped by role under `src/`:
   `doublezero-edge` command fails with a transport error and "not running" is indistinguishable from
   "running, correctly serving nothing" (#133). The **admin surface is the one surface that is not
   subscription-gated**, which is what makes it the place to answer, and this module the state it
-  answers from. `DiagnosticsSnapshot` is plain cached state with **two writers**: `reconcile::tick`
-  publishes the polled half via `publish_tick` (which deliberately leaves `last_attempt` alone —
-  a tick landing mid-attempt must not erase it), and `sinks::admin`'s connect/disconnect route
-  records the attempt half. **Nothing here polls and nothing shells out on the read path**: a
+  answers from. `DiagnosticsSnapshot` is plain cached state with exactly **one writer**,
+  `reconcile::tick` via `publish_tick`; every HTTP path over it is read-only. **Nothing here polls
+  and nothing shells out on the read path**: a
   diagnostics request is a lock, a clone and the pure `diagnose()` ladder. The ladder is server-side
   so `--jq '.diagnosis.code'` and the table view give the same answer and it is unit-testable
   against a captured `doublezero status` document; its rungs are ordered so each is reached only once
@@ -275,11 +274,17 @@ Modules are grouped by role under `src/`:
   reported as a broken tunnel, and a not-yet-polled process as an empty subscription set. Two rules
   keep it from over-claiming: a receiver actually **delivering** skips the tunnel rungs entirely
   (packets are proof, so one upstream rename of `session_status` cannot report `tunnel_down`
-  fleet-wide and point every healthy host at a mutating retry — activation is armored against exactly
-  that rename, and the verdict has to be too), and a document carrying **no** recognized session
-  status reports `tunnel_state_unknown` rather than "down". An `Unavailable` tick likewise keeps the
-  last good sessions/codes and stamps `last_ok_at_unix`, so a `doublezero status` blip on a streaming
-  host reports stale data rather than "zero subscriptions, freshly checked" beside live receivers.
+  fleet-wide and send every healthy host to reconnect a tunnel that was never down — activation is
+  armored against exactly that rename, and the verdict has to be too), and a document carrying **no**
+  recognized session status reports `tunnel_state_unknown` rather than "down". An `Unavailable` tick
+  likewise keeps the last good sessions/codes, so a `doublezero status` blip on a streaming host
+  reports stale data rather than "zero subscriptions, freshly checked" beside live receivers; only a
+  successful poll stamps `last_ok_at_unix`, which is what dates that kept data (`CliMissing` and
+  `GatingDisabled` ran no status call, so they leave it unset rather than dating an empty document to
+  now). **Zero receivers is never `ok`**: reaching the traffic rung means feeds were expected to run,
+  so an empty set is `no_receivers_running` — a selection (`--feed`, `--publisher-port`, the channel
+  filter) that excluded every publisher of a subscribed row, whose remedy is the opposite of the
+  no-traffic rung's firewall advice since nothing ever bound a socket.
 - **`ingest/reconcile.rs`** — the **activation authority**. `Reconciler::run()` polls `detect()`
   every `--subscription-refresh-secs`, computes the desired set (market-data receivers, WS on iff a
   market-data feed is subscribed, shred sources), and applies the diff via a pure `plan()`
@@ -629,29 +634,23 @@ Modules are grouped by role under `src/`:
   (`--admin-bind`/`DZ_ADMIN_BIND` defaults to `127.0.0.1:9098`; set empty to disable it outright) —
   the exposure is accepted on the condition that the default never reaches past loopback. **No
   authentication**, and under host networking a wildcard bind is genuinely network-reachable, so an
-  override must stay on loopback, never a bare wildcard. Four routes. `GET /admin/diagnostics`
+  override must stay on loopback, never a bare wildcard. Three routes. `GET /admin/diagnostics`
   (read-only, and **needs no `X-DZ-Admin-Request` header** — that header guards mutations, and
   requiring it on the one command a stuck operator most needs would make it harder to run than
   `curl`) serves `ingest::diagnostics`' snapshot plus its verdict, reusing `api::process_block` /
   `api::registry_block` rather than a second copy, and adds a `binds` block (which surfaces were
-  *configured*, the half `activation` cannot answer). `POST /admin/connect` / `POST
-  /admin/disconnect` re-run the DoubleZero client verb an operator would otherwise reach through
-  `docker exec` — a real capability increase over a channel-filter swap, since it spends the
-  container's onchain identity, contained by five things: a **fixed argv** (a module constant *typed*
-  `&'static [&'static str]`; the routes take no parameters, so no request input reaches the child and
-  a future caller-composed argv is a compile error), the loopback default bind, the CSRF header, a
-  **`Host` that must name an address** (the header alone stops a cross-origin `<form>` but *not* DNS
-  rebinding — a page whose own name is re-pointed at `127.0.0.1` is same-origin and can set any
-  header; a rebound request necessarily carries the attacker's name in `Host`), and **single-flight**
-  (a second attempt while one runs is `409` — two concurrent `connect`s race onchain user creation,
-  so this is a correctness guard, not politeness). The child runs on a blocking thread behind
-  `tokio::spawn` and the route answers `202` at once (`connect` takes minutes and must never sit on a
-  runtime worker); its outcome lands back in the snapshot as `last_attempt`, since a `202` nothing
-  could follow up on would be useless. The wait is **bounded** (`subscriptions::ATTEMPT_TIMEOUT`,
-  kill on overrun) because the gate must always clear — a hung `connect` would otherwise refuse even
-  the `disconnect` that would clear it — and a killed child's output is deliberately not collected,
-  since a grandchild holding the pipe would make that read block for exactly as long as the deadline
-  bounded. ⚠️ There is **no rate limit** — a script looping on `connect` serially re-runs onchain
+  *configured*, the half `activation` cannot answer). It only ever *reports* — retrying a down tunnel
+  stays `doublezero connect multicast` inside the container, so nothing on this surface spends the
+  container's onchain identity. ⚠️ That route is **unauthenticated like the rest of this surface and
+  the most informative one on it**: device/metro names, the tunnel name, every subscribed group code,
+  the subscription rows' multicast IPs, all four binds and the feed-registry URL. On the loopback
+  default that is the same audience that could already run `doublezero status`; a non-loopback bind
+  hands it to anyone who can reach the port, and **DNS rebinding** reaches it too (a page served from
+  a name re-pointed at `127.0.0.1` is same-origin, so the CSRF header below does not stop it
+  *reading*). Refusing a `Host` that names a DNS name would close that at the cost of
+  `--admin-url http://myhost.local:9098`; the read is left open deliberately and the trade is stated
+  here, in the flag's doc and in the module docs rather than left to be inferred. The other two
+  routes are `/admin/channels`: `GET`
   provisioning. The other two routes are `/admin/channels`: `GET`
   reports the channel filter in force plus,
   per enabled row, which publishers/channels it **admits** — explicitly *not* the running receiver

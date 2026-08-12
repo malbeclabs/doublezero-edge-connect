@@ -242,6 +242,12 @@ struct Args {
     /// POSTing a form here, so `POST` also requires an `X-DZ-Admin-Request` header (any value — a
     /// form post cannot set it). Deliberately separate from `--api-bind`'s `/v1`, which must stay
     /// provably read-only.
+    ///
+    /// It also serves `GET /admin/diagnostics`, which is unauthenticated like the rest of this
+    /// surface and reports this host's device/metro names, subscribed group codes and their
+    /// multicast IPs, every configured bind, and the feed-registry URL. On the loopback default
+    /// that is the same audience that could already run `doublezero status`; a non-loopback bind
+    /// hands it to anyone who can reach the port.
     #[arg(
         long = "admin-bind",
         env = "DZ_ADMIN_BIND",
