@@ -1536,7 +1536,6 @@ impl Arbiter {
             .entry(publisher)
             .or_default()
             .last_seen_ns = now;
-        self.sync_book_arms(&key, now);
         if b.changes
             .first()
             .is_some_and(|c| c.action == BookAction::Clear)
@@ -1569,6 +1568,7 @@ impl Arbiter {
         }
         let window = self.book_dedup_window_ns;
         let events = self.book_events.entry(key.clone()).or_default();
+        Self::refresh_serving(&self.book_sync, events, &key, now);
         let mut kept: Vec<BookChange> = Vec::new();
         let (mut deduped, mut disagreed, mut resurrected) = (0u64, 0u64, 0u64);
         for c in &b.changes {
@@ -1641,16 +1641,20 @@ impl Arbiter {
     /// arm has reported the removal and it is therefore spent. Without it a tombstone is held for an
     /// arm that has departed, and a market with more lifetime deletes than the guard's cap — which is
     /// every busy market — would re-baseline forever.
-    fn sync_book_arms(&mut self, key: &MarketKey, now: u64) {
-        let peers = self.book_sync.get(key);
-        // `get_mut`, not `entry`: a market with no race state yet has no tombstone to spend either,
-        // and the admit path below creates the entry a moment later. Keeps a key clone and an insert
-        // off every published batch.
-        let Some(events) = self.book_events.get_mut(key) else {
-            return;
-        };
+    ///
+    /// Takes the two fields rather than `&mut self` so the caller passes the race state it already
+    /// holds. `serving` is read only while a batch is admitted, and refreshing it through a separate
+    /// lookup ahead of that left the batch that *creates* the race state — every batch after a
+    /// [`Self::reset_book_events_for_market`], whose arms are still serving — admitted with `serving`
+    /// at zero, where every tombstone it makes is trivially spent and evicting one is silent.
+    fn refresh_serving(
+        book_sync: &HashMap<MarketKey, HashMap<Publisher, PeerState>>,
+        events: &mut MarketEvents,
+        key: &MarketKey,
+        now: u64,
+    ) {
         events.serving = 0;
-        for (&p, st) in peers.into_iter().flatten() {
+        for (&p, st) in book_sync.get(key).into_iter().flatten() {
             // The same "in sync and actually on the wire" test the `Clear`-led suppression applies,
             // except on arrival rather than on a published batch: an arm whose copies all lose the
             // race publishes nothing, and it is exactly that arm a tombstone exists to refuse.
@@ -1713,7 +1717,11 @@ impl Arbiter {
     ///
     /// Rate-limited to one republish per market per dedup window: a single datagram can raise the flag
     /// and each discharge costs a whole book, both to serialize and in time held on the shared arbiter
-    /// mutex. Inside the window the market keeps withholding, so it is a delay and not a mute.
+    /// mutex. ⚠️ A withheld batch is **lost, not delayed** — it never reaches the replay map the next
+    /// re-baseline is materialized from, so the consumer's book simply skips those changes until some
+    /// producer sends a `Clear`-led re-baseline of its own. Known and left: closing it means advancing
+    /// the replay accumulator with changes that did not reach the wire, which is the forged-size
+    /// injection the paragraph above exists to refuse.
     fn serve_forced_rebaseline(
         &mut self,
         key: &MarketKey,
@@ -5629,6 +5637,38 @@ mod tests {
         assert!(
             forced_rebaselines(VENUE, FORCED_GUARD_EVICTED) > before,
             "and it must be separable from a disagreement in production"
+        );
+    }
+
+    /// A session reset drops a market's race state while its arms keep serving, so the batch that
+    /// re-creates that state is not the market's first batch on the wire. Admitting it with `serving` at
+    /// zero makes every tombstone in it trivially spent, and the resurrection guard is then lost to an
+    /// eviction that says nothing.
+    #[test]
+    fn the_batch_that_creates_a_markets_race_state_still_knows_who_is_serving() {
+        const VENUE: &str = "BookGuardResetBatch";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        for p in [arm(1), arm(2)] {
+            a.emit(
+                l3_batch(VENUE, vec![order(BookAction::Update, 1, 100.0, 1.0)], 1_000),
+                p,
+                TEST_CATEGORY,
+            );
+        }
+        a.reset_book_events_for_market(&key);
+        let _ = drain_books(&mut rx);
+        let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
+        // One batch, one order past the dead population's cap. Arm 2 has reported none of these
+        // removals, so the tombstone the last one evicts is still open for its copy.
+        let removals = (1..=(MAX_GUARDED_ORDERS as u64 + 1))
+            .map(|oid| order(BookAction::Delete, oid, 100.0, 0.0))
+            .collect();
+        a.emit(l3_batch(VENUE, removals, 2_000), arm(1), TEST_CATEGORY);
+        assert!(
+            forced_rebaselines(VENUE, FORCED_GUARD_EVICTED) > before,
+            "a tombstone evicted on the batch that re-created the race state must still force"
         );
     }
 
