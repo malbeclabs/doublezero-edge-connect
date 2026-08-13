@@ -501,7 +501,7 @@ struct MarketEvents {
     /// can hold it: a venue never reuses an `order_id`, but `ingest::book`'s per-publisher set cannot
     /// see a *peer's* delete, so a lagging publisher's first and only copy of an `Add` for an order
     /// another publisher already killed passes every check that book makes. Deliberately **not**
-    /// expired by the time window — only by [`MAX_SEEN_ORDER_EVENTS`] — so the guard's reach is an
+    /// expired by the time window — only by [`MAX_GUARDED_ORDERS`] — so the guard's reach is an
     /// order count rather than a clock, which is what keeps the window a cost knob.
     resting: HashMap<u64, Slot>,
     /// Eviction order for the live floors and for the tombstones, oldest first, **separately bounded**
@@ -525,7 +525,7 @@ struct MarketEvents {
     /// that mask and of the authority's own per-scope arm cap.
     arms: Vec<Publisher>,
     /// Which of `arms` are serving right now — synced, and on the wire within [`PEER_SERVING_NS`].
-    /// Refreshed per batch from `book_sync` (`Arbiter::refresh_serving`), so a gapped or departed arm
+    /// Refreshed per batch from `book_sync` ([`Self::refresh_serving`]), so a gapped or departed arm
     /// stops holding tombstones un-spent while a lagging one, whose copies are dropped as duplicates
     /// rather than published, still counts.
     serving: u8,
@@ -675,6 +675,33 @@ impl MarketEvents {
     /// bounds the guard's cost rather than proving nothing is in flight.
     fn spent(&self, reported_by: u8) -> bool {
         self.serving & !reported_by == 0
+    }
+
+    /// Point this market's race state at the arms serving it, which is what tells a tombstone when
+    /// every arm has reported the removal and it is therefore spent. Without it a tombstone is held
+    /// for an arm that has departed, and a market with more lifetime deletes than the guard's cap —
+    /// which is every busy market — would re-baseline forever.
+    ///
+    /// Called on the batch being admitted, from the race state the caller already holds, because
+    /// `serving` is read only while a batch is admitted: refreshed through a separate lookup ahead of
+    /// that, the batch which *creates* this state — every batch after an
+    /// `Arbiter::reset_book_events_for_market`, whose arms are still serving — was admitted with
+    /// `serving` at zero, where every tombstone it makes is trivially spent and evicting one is
+    /// silent.
+    fn refresh_serving(&mut self, peers: Option<&HashMap<Publisher, PeerState>>, now: u64) {
+        self.serving = 0;
+        for (&p, st) in peers.into_iter().flatten() {
+            // The same "in sync and actually on the wire" test the `Clear`-led suppression applies,
+            // except on arrival rather than on a published batch: an arm whose copies all lose the
+            // race publishes nothing, and it is exactly that arm a tombstone exists to refuse.
+            if st.synced
+                && st.last_seen_ns != 0
+                && now.saturating_sub(st.last_seen_ns) <= PEER_SERVING_NS
+            {
+                let bit = self.arm_bit(p);
+                self.serving |= bit;
+            }
+        }
     }
 
     /// Hold each tracked population to [`MAX_GUARDED_ORDERS`], separately.
@@ -1567,8 +1594,9 @@ impl Arbiter {
             return;
         }
         let window = self.book_dedup_window_ns;
+        let peers = self.book_sync.get(&key);
         let events = self.book_events.entry(key.clone()).or_default();
-        Self::refresh_serving(&self.book_sync, events, &key, now);
+        events.refresh_serving(peers, now);
         let mut kept: Vec<BookChange> = Vec::new();
         let (mut deduped, mut disagreed, mut resurrected) = (0u64, 0u64, 0u64);
         for c in &b.changes {
@@ -1611,13 +1639,21 @@ impl Arbiter {
         }
         if let Some(reason) = forced {
             self.force_rebaseline(&key, &b.venue, reason);
-            // Only a `Disagreement` takes the batch with it: it drops one change out of a logical
-            // event, and publishing the rest with `last` intact hands the consumer half an event as a
-            // whole one. A guard eviction drops nothing from the batch — and the dead population's cap
-            // can only be crossed by a removal, so discarding the batch would strand the very order
-            // whose delete raised the flag: the re-baseline republishes it as live and the seed marks
-            // it live in the guard too, so nothing ever removes it again.
-            if reason == FORCED_DISAGREEMENT {
+            // **A delivered removal must reach the wire, whatever raised the flag.** The re-baseline
+            // below is materialized from the replay map, so an order whose delete never got there is
+            // republished as live and then re-seeded as a live floor: the guard forgets it ever died
+            // and nothing removes it again. Dropping the batch is only safe when it removed nothing —
+            // which is what makes `forced`'s reason the wrong axis to decide on, since it is one-shot
+            // and first-cause-wins, so a batch that crosses the guard's cap *and* disagrees carries
+            // the `guard_evicted` label either way.
+            //
+            // The cost of publishing is that a `Disagreement`'s dropped change leaves a logical event
+            // torn, stamped `last`. That is the lesser harm: every surviving change is one order's own
+            // absolute state, and the flag just set has the next batch republish the market whole,
+            // whereas a stranded order is permanent. Depends on `last` being set (both processors
+            // always set it): a non-final batch buffers in the accumulator, so its removal would not
+            // reach a re-baseline materialized before the event terminates.
+            if !kept.iter().any(|c| c.order_id != 0 && c.size == 0.0) {
                 self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                 return;
             }
@@ -1635,37 +1671,6 @@ impl Arbiter {
         };
         self.note_book_delivery(&key, b, publisher, now);
         self.publish_book(&key, out);
-    }
-
-    /// Point a market's race state at the arms serving it, which is what tells a tombstone when every
-    /// arm has reported the removal and it is therefore spent. Without it a tombstone is held for an
-    /// arm that has departed, and a market with more lifetime deletes than the guard's cap — which is
-    /// every busy market — would re-baseline forever.
-    ///
-    /// Takes the two fields rather than `&mut self` so the caller passes the race state it already
-    /// holds. `serving` is read only while a batch is admitted, and refreshing it through a separate
-    /// lookup ahead of that left the batch that *creates* the race state — every batch after a
-    /// [`Self::reset_book_events_for_market`], whose arms are still serving — admitted with `serving`
-    /// at zero, where every tombstone it makes is trivially spent and evicting one is silent.
-    fn refresh_serving(
-        book_sync: &HashMap<MarketKey, HashMap<Publisher, PeerState>>,
-        events: &mut MarketEvents,
-        key: &MarketKey,
-        now: u64,
-    ) {
-        events.serving = 0;
-        for (&p, st) in book_sync.get(key).into_iter().flatten() {
-            // The same "in sync and actually on the wire" test the `Clear`-led suppression applies,
-            // except on arrival rather than on a published batch: an arm whose copies all lose the
-            // race publishes nothing, and it is exactly that arm a tombstone exists to refuse.
-            if st.synced
-                && st.last_seen_ns != 0
-                && now.saturating_sub(st.last_seen_ns) <= PEER_SERVING_NS
-            {
-                let bit = events.arm_bit(p);
-                events.serving |= bit;
-            }
-        }
     }
 
     /// Publish a producer's own `Clear`-led re-baseline and re-point the market's race state at it.

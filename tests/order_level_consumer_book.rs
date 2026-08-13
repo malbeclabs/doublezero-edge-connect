@@ -477,9 +477,68 @@ fn a_guard_eviction_does_not_leak_the_removal_that_raised_it() {
         fast,
         CATEGORY,
     );
-    drain_into(&mut rx, &mut consumer);
+    // No arm sent a `Clear`, so one on the wire is the eviction the loop above was built to cause.
+    // Without this the scenario passes vacuously if [`GUARDED_ORDERS`] ever stops matching the cap.
+    let mut rebaselined = false;
+    while let Ok(m) = rx.try_recv() {
+        if let FeedMessage::Book(b) = &*m {
+            rebaselined |= b
+                .changes
+                .first()
+                .is_some_and(|c| c.action == BookAction::Clear);
+            apply(&mut consumer, b);
+        }
+    }
+    assert!(rebaselined, "the loop must have crossed the guard's cap");
     assert_eq!(
         consumer, venue,
         "and the forced re-baseline must not revive it"
     );
+}
+
+/// `forced` is one-shot and first-cause-wins, so the reason it carries does not say what the batch
+/// contained. One batch can both remove an order and claim a drifted size for another — and dropping it
+/// strands the removal exactly as a guard eviction did, whatever label the flag ended up with.
+#[test]
+fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
+    let (mut a, mut rx, fast, drifted) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    venue.insert(2, (BookSide::Bid, 99.0, 3.0));
+    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001), drifted, CATEGORY);
+
+    // Order 1 is filled down to 2. The drifted arm misses that fill.
+    venue.insert(1, (BookSide::Bid, 100.0, 2.0));
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100),
+        fast,
+        CATEGORY,
+    );
+
+    // Its next batch cancels order 2 — its own first and only copy of that removal — and in the same
+    // logical event repeats the stale size for order 1.
+    venue.remove(&2);
+    a.emit(
+        batch(
+            vec![
+                change(2, BookSide::Bid, 99.0, 0.0),
+                change(1, BookSide::Bid, 100.0, 5.0),
+            ],
+            1_200,
+        ),
+        drifted,
+        CATEGORY,
+    );
+
+    // An unrelated event discharges the re-baseline the disagreement forced.
+    venue.insert(3, (BookSide::Ask, 101.0, 4.0));
+    a.emit(
+        batch(vec![change(3, BookSide::Ask, 101.0, 4.0)], 1_300),
+        fast,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
 }

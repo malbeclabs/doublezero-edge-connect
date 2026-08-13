@@ -41,12 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing `dz_mbo_forced_rebaselines_total{reason="guard_evicted"}` — with the two populations
   bounded apart so neither starves the other, and a tombstone every serving arm has reported treated
   as spent so a busy market's dead orders cannot fill the guard and re-baseline it forever.
-- A tombstone eviction that re-baselines the market no longer discards the batch that raised it. Only
-  a tombstone-creating removal can cross that bound, so the discarded batch always carried the delete
-  for the order the eviction was about: the order stayed live in the republished book and the seed
-  marked it live in the guard too, so nothing removed it again. Reachable while a peer is synced and
-  recently on the wire but has stopped reporting removals. A disagreement still takes its batch with
-  it — that one drops a change out of a logical event, so the rest cannot go out stamped `last`.
+- A forced re-baseline no longer discards a batch that removed an order. Only a tombstone-creating
+  removal can cross the guard's dead-order bound, so the batch a `guard_evicted` force discarded always
+  carried the delete for the order the eviction was about — and the same is reachable from a
+  `disagreement` on a batch that both cancels one order and claims a drifted size for another. Either
+  way the order stayed live in the republished book and the seed marked it live in the guard too, so
+  nothing removed it again. A batch that removed nothing is still dropped, which keeps a disagreement's
+  torn logical event off the wire wherever the removal does not make dropping it worse.
 - The serving-arm set the guard reads to decide whether a tombstone is spent is now refreshed on the
   batch that creates a market's race state, not from the one after it. A session reset drops that
   state while the arms keep serving, so the batch re-creating it treated every tombstone it made as
