@@ -183,6 +183,18 @@ const _: () = assert!(ARM_BITS <= u8::BITS as usize);
 /// mirrored publishers.
 const DEFAULT_BOOK_DEDUP_WINDOW_NS: u64 = 1_000_000_000; // 1s
 
+/// Minimum interval between one market's forced re-baselines ([`Arbiter::serve_forced_rebaseline`]).
+/// A single datagram can raise the flag and each discharge costs a whole book — O(book) inside the
+/// shared arbiter mutex, then serialized to every client — so it is rate-limited.
+///
+/// **Its own constant, not [`DEFAULT_BOOK_DEDUP_WINDOW_NS`], which it used to share.** They are two
+/// different quantities that happened to hold the same number: the window is how long a delivered
+/// event is remembered, and widening it to stop healthy arms manufacturing false disagreements
+/// (250 ms -> 1 s) silently quadrupled how much of a real disagreement's stream is skipped — batches
+/// withheld here are lost, not delayed. Kept at the interval that was in force when the two were the
+/// same value, so the cost of a real disagreement is what it was measured at.
+const FORCED_REBASELINE_MIN_INTERVAL_NS: u64 = 250_000_000; // 250ms
+
 /// Which ingest source produced an update — the floor's per-tick leader identity. The edge
 /// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
 /// a single logical source with no multicast IP. Two distinct edge publishers therefore race as
@@ -2349,9 +2361,9 @@ impl Arbiter {
     /// book with a fabricated one. What the flag protects is the consumer, and full state it already
     /// agreed with is what does that.
     ///
-    /// Rate-limited to one republish per market per dedup window: a single datagram can raise the flag
-    /// and each discharge costs a whole book, both to serialize and in time held on the shared arbiter
-    /// mutex. ⚠️ A withheld batch is **lost, not delayed** — it never reaches the replay map the next
+    /// Rate-limited to one republish per market per [`FORCED_REBASELINE_MIN_INTERVAL_NS`]: a single
+    /// datagram can raise the flag and each discharge costs a whole book, both to serialize and in time
+    /// held on the shared arbiter mutex. ⚠️ A withheld batch is **lost, not delayed** — it never reaches the replay map the next
     /// re-baseline is materialized from, so the consumer's book simply skips those changes until some
     /// producer sends a `Clear`-led re-baseline of its own. Known and left: closing it means advancing
     /// the replay accumulator with changes that did not reach the wire, which is the forged-size
@@ -2363,9 +2375,9 @@ impl Arbiter {
         publisher: Publisher,
         now: u64,
     ) -> bool {
-        let window = self.book_dedup_window_ns;
         if let Some(m) = self.book_markets.get_mut(key) {
-            let too_soon = m.rebaselined_ns != 0 && now.saturating_sub(m.rebaselined_ns) < window;
+            let too_soon = m.rebaselined_ns != 0
+                && now.saturating_sub(m.rebaselined_ns) < FORCED_REBASELINE_MIN_INTERVAL_NS;
             if too_soon || (!b.last && m.withheld < MAX_WITHHELD_BATCHES) {
                 m.withheld += 1;
                 self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
@@ -6235,6 +6247,64 @@ mod tests {
             consumer_book(&mut rx).get(&1),
             Some(&2.0),
             "a discharged re-baseline must not hand the raising arm a free pass on its own claim"
+        );
+    }
+
+    /// A forced re-baseline's rate limit is its own quantity, not the dedup window's. The two shared a
+    /// number until the window was widened for its dedup reach — which is right for that job and
+    /// silently quadrupled how much of a real disagreement's stream is skipped, since a batch withheld
+    /// here is lost rather than delayed. A window set far below the limit must not shorten it.
+    #[test]
+    fn the_rebaseline_rate_limit_does_not_follow_the_dedup_window() {
+        const VENUE: &str = "BookRebaselineRate";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        // A microsecond: were the limit still this value, the second re-baseline below would go out.
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let claim = |p, size, at| {
+            (
+                l3_batch(VENUE, vec![order(BookAction::Update, 1, 100.0, size)], at),
+                p,
+            )
+        };
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 1, 100.0, 5.0)],
+                1_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let (m, p) = claim(arm(1), 2.0, 1_100); // the fill arm 2 misses
+        a.emit(m, p, TEST_CATEGORY);
+        let (m, p) = claim(arm(2), 5.0, 1_200); // disagreement -> the market must re-baseline
+        a.emit(m, p, TEST_CATEGORY);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 8, 99.0, 1.0)], 1_300),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        assert!(
+            !a.book_markets[&key].rebaseline,
+            "the first re-baseline is served"
+        );
+        // Arm 2 repeats its stale claim, raising the flag a second time inside the rate limit.
+        let (m, p) = claim(arm(2), 5.0, 1_400);
+        a.emit(m, p, TEST_CATEGORY);
+        assert!(a.book_markets[&key].rebaseline, "and it is raised again");
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 9, 98.0, 1.0)], 1_500),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        assert!(
+            a.book_markets[&key].rebaseline,
+            "a second re-baseline inside the limit is withheld whatever the dedup window is set to"
+        );
+        assert!(
+            !consumer_book(&mut rx).contains_key(&9),
+            "and the batch that would have discharged it is withheld with it"
         );
     }
 

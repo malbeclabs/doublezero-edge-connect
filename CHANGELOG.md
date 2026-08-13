@@ -13,6 +13,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
 ### Fixed
+- The resurrection guard's out-of-queue sweep is scheduled rather than triggered on every batch. The
+  threshold was clamped to half the per-market tombstone cap, so above that population it sat *below*
+  the population itself and the comparison was true forever: a full scan of the market's tombstone map
+  per datagram, held under the one arbiter mutex every receiver on every feed takes to emit. Measured
+  synthetically at 141 µs a batch with 36,768 tombstones held, against 6.9 µs on a market in step —
+  and one datagram from a source the market has never seen is enough to start the population climbing.
+  The clamp's other, undocumented job was keeping a sweep ahead of the eviction that disowns a market,
+  which is now explicit at that eviction and holds for a batch large enough to cross the cap on its
+  own. After: 3.7 µs at 36,768 and 5.5 µs at the cap.
+- `dz_mbo_guarded_tombstones_max` no longer reads zero while a market holds the real maximum. It
+  followed the market holding it back down, so when that market's arms caught up and it retired, the
+  gauge reported the shrunken figure — full headroom — while a market that had gone quiet still held
+  its whole population, which is the market the gauge exists to find. It now re-seats on the largest
+  survivor, as it already did when the holding market was dropped.
+- A forced re-baseline's rate limit no longer follows `--arb-book-dedup-window-ms`. The two shared a
+  value, so widening the window for its dedup reach (250 ms → 1 s, above) quadrupled how much of a
+  real disagreement's stream a market skips — batches withheld there are lost, not delayed. It is a
+  fixed 250 ms now. On the real capture the wider window drops **one** batch against 24–217 at 250 ms,
+  because the false disagreements stop happening at all; this is about the worst case per
+  disagreement, not the observed total.
 - The resurrection guard's retirement no longer stalls on a removal one arm never reports. It ran
   head-of-queue over the removal order, so an arm whose snapshot anchor post-dates a removal — it
   never held that order, so it never reports it — blocked every tombstone behind it for the life of
@@ -59,9 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   below the arms' real separation, a stale copy of an add for an order the leader has since partially
   filled reads as a size *disagreement* between two healthy publishers, forcing a re-baseline whose
   withheld batches are lost. On the real two-publisher capture this is worth 500 ms → 2 s of tolerated
-  inter-arm lag, and it takes the disagreements those healthy arms manufactured to zero. Costs nothing
-  — `seen` is capped at 1024 events per market independently of the window, which is also why a value
-  much above a second is inert on a busy market: 1 s and 10 s measure identically.
+  inter-arm lag, and it takes the disagreements those healthy arms manufactured to zero. Costs no
+  memory — `seen` is capped at 1024 events per market independently of the window, which is also why a
+  value much above a second is inert on a busy market: 1 s and 10 s measure identically. It did cost
+  something else, now fixed below: the same value was the forced re-baseline's rate limit, whose
+  withheld batches are lost rather than delayed, so a real disagreement skipped up to 1 s of a
+  market's stream instead of 250 ms.
 
 ### Added
 - `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above,
