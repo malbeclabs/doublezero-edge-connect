@@ -542,30 +542,46 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
     );
 }
 
-/// One venue event every [`SPACING_NS`], so a lag of L nanoseconds leaves `L / SPACING_NS` removals in
-/// flight — the population the resurrection guard has to hold.
-const SPACING_NS: u64 = 100_000; // 10k events/s, an unremarkable rate for the flagship market
+/// One venue event every [`SPACING_NS`], whatever an order's lifecycle costs. A lag of L therefore
+/// leaves `L / SPACING_NS` events inside the guard's own [`GUARD_CAP`] count bound, and
+/// `0.875 * L / (SPACING_NS * events_per_order)` removals inside its tombstone population.
+const SPACING_NS: u64 = 100_000; // 10k events/s — a stress rate, ~11x the flagship market's ~890/s
 
 /// Drive `pairs` orders through both arms with the slow one `lag_ns` behind **in arrival order**, not
 /// merely in its timestamps, and return the consumer's book beside the venue's. Every eighth order is
 /// never removed, so the end state is a book rather than an empty map.
-fn replay_with_lag(pairs: u64, lag_ns: u64) -> (Book, Book) {
+///
+/// `partial_fills` inserts a size-decreasing step in each order's life (add 1.0 → fill 0.5 → remove).
+/// Without it every order is only ever seen at `1.0` and then `0.0`, so a stale copy arriving past the
+/// dedup window either hits a tombstone (refused) or matches the floor exactly (idempotent) — the
+/// replay **structurally cannot produce a `Disagreement`**, which is the mechanism behind the real
+/// capture's divergence, and a regression at any lag would pass. With it, an order's lifecycle costs
+/// three events rather than two, which is what a caller measuring the tombstone population has to
+/// divide by.
+fn replay_with_lag(pairs: u64, lag_ns: u64, partial_fills: bool) -> (Book, Book) {
     let (mut a, mut rx, fast, slow) = harness();
-    a.set_book_dedup_window(250_000_000); // the shipped --arb-book-dedup-window-ms
+    a.set_book_dedup_window(1_000_000_000); // the shipped --arb-book-dedup-window-ms
     let (mut venue, mut consumer) = (Book::new(), Book::new());
     a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
     a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
 
+    let per_order = if partial_fills { 3 } else { 2 };
     let mut arrivals: Vec<(u64, bool, BookChange)> = Vec::new();
     for i in 0..pairs {
-        let (id, at) = (100 + i, 10_000 + i * SPACING_NS);
+        let (id, at) = (100 + i, 10_000 + i * per_order * SPACING_NS);
         let px = 200.0 + (i % 50) as f64;
-        let add = change(id, BookSide::Ask, px, 1.0);
-        let mut events = vec![(at, add)];
+        let resting = if partial_fills { 0.5 } else { 1.0 };
+        let mut events = vec![(at, change(id, BookSide::Ask, px, 1.0))];
+        if partial_fills {
+            events.push((at + SPACING_NS, change(id, BookSide::Ask, px, 0.5)));
+        }
         if i % 8 == 0 {
-            venue.insert(id, (BookSide::Ask, px, 1.0));
+            venue.insert(id, (BookSide::Ask, px, resting));
         } else {
-            events.push((at + SPACING_NS / 2, change(id, BookSide::Ask, px, 0.0)));
+            events.push((
+                at + (per_order - 1) * SPACING_NS,
+                change(id, BookSide::Ask, px, 0.0),
+            ));
         }
         for (t, c) in events {
             arrivals.push((t, true, c));
@@ -581,35 +597,45 @@ fn replay_with_lag(pairs: u64, lag_ns: u64) -> (Book, Book) {
     (consumer, venue)
 }
 
-/// A lagging arm holds every tombstone the leader makes open until it catches up, so the population
-/// the guard has to hold is the removals inside that lag — thousands on a busy market, where the
-/// per-market count it used to be bounded by was 512. Crossing that count must no longer cost the
-/// market anything.
+/// A lagging arm holds every tombstone the leader makes open until it catches up, so the population the
+/// guard has to hold is the removals inside that lag — thousands on a busy market, where the per-market
+/// count it used to be bounded by was 512. Crossing that count must no longer cost the market anything.
+///
+/// Orders that are added and cancelled without ever trading, deliberately: a lag wide enough to hold
+/// more than 512 removals is necessarily wider than [`GUARD_CAP`] events, and past that a *filled*
+/// order's stale add reads as a size disagreement rather than as a duplicate — which is the count cap
+/// binding, a different limit measured by the sweep below. This one is about the tombstones.
 #[test]
 fn a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing() {
-    // 600ms of removals in flight against a cap of GUARDED_ORDERS.
-    let (consumer, venue) = replay_with_lag(GUARDED_ORDERS * 4, 60 * SPACING_NS * 10);
+    // 300ms of lag at two events per order: ~1,300 removals in flight, against an old cap of 512.
+    let (consumer, venue) = replay_with_lag(GUARDED_ORDERS * 8, 300 * SPACING_NS * 10, false);
     assert_eq!(consumer, venue);
 }
 
 /// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
 /// to keep a consumer's book identical to the venue's.
 ///
-/// **Before this guard was sized by the arms' lag rather than by a per-market count of 512, that
-/// figure was 150 ms** — 512 removals at this rate, and this sweep reproduces the same cliff a real
-/// two-publisher capture showed at 153 ms, where the consumer ended 994 orders wrong and never
-/// self-healed. It now holds to **1 s**, the last step below: 10,000 removals in flight, five times
-/// the widest separation those publishers ever showed. Measured further out, it is still exact at 4 s
-/// and gives way at 8 s, which is the per-market tombstone cap (65,536 removals, 6.5 s at this rate) —
-/// and gives way by going *dark*, not by publishing a book that is wrong.
+/// **The measured figure is 100 ms at this event rate**, and what sets it is the guard's
+/// [`MAX_SEEN_ORDER_EVENTS`] **count** bound, not the 1 s time window: 1,024 events at 10k events/s is
+/// 102 ms, and the sweep is exact at 100 ms and gives way at 150. Past that an arm's copy of an add for
+/// an order the leader has already partially filled is no longer recognized as a duplicate — it reads
+/// as a second publisher claiming a larger resting size, a false `dz_mbo_arm_disagreement_total`, and
+/// the batches withheld behind the re-baseline it forces are lost rather than delayed. `docs/metrics.md`
+/// states that ceiling as `min(flag, 1024 / event_rate)`; this is it, measured.
 ///
-/// Above the 250 ms dedup window the arms stop recognizing each other's copies at all, so the steps
-/// past it are also what pins that the guard — not the window — is what keeps the book correct.
+/// **Scaling to the real market, that is ~1.15 s**, since the flagship runs ~890 changes/s rather than
+/// this stress rate — which is why a real two-publisher capture holds to 500 ms with the same build
+/// while this sweep, at eleven times the event rate, gives way at a tenth of that. Compare the figures
+/// through the event rate, never directly.
+///
+/// The sweep is exact again at 1.5 s and beyond: a run that long ends shortly after a forced
+/// re-baseline, which republishes the whole book. That is an artifact of where the replay stops, not
+/// recovered correctness, so the assertion deliberately stops at the cliff.
 #[test]
-fn the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag() {
-    for lag_ms in [10u64, 50, 150, 300, 600, 1_000] {
+fn the_consumer_book_matches_the_venue_up_to_a_hundred_millisecond_inter_arm_lag() {
+    for lag_ms in [10u64, 50, 100] {
         let pairs = (lag_ms * 1_000_000 / SPACING_NS).max(GUARDED_ORDERS) * 2;
-        let (consumer, venue) = replay_with_lag(pairs, lag_ms * 1_000_000);
+        let (consumer, venue) = replay_with_lag(pairs, lag_ms * 1_000_000, true);
         assert_eq!(consumer, venue, "diverged at {lag_ms}ms of inter-arm lag");
     }
 }

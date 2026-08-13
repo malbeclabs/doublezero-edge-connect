@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
 ### Fixed
+- The resurrection guard's retirement no longer stalls on a removal one arm never reports. Retirement
+  is head-of-queue and accepts only a reported removal, so an arm whose snapshot anchor post-dates a
+  removal — it never held that order, so it never reports it — blocked every tombstone behind it for
+  the life of the market, and the population reverted from the arms' lag spread to the market's whole
+  history, exiting only at the per-market cap where the market is disowned. An arm's own `Clear`-led
+  re-baseline now settles every tombstone its snapshot does **not** name, whether or not that
+  re-baseline reached the consumer: the arm no longer holds those orders and a venue never reuses an
+  id, so it can never contradict them. An order the snapshot does name keeps its hold.
+- A market disowned by the process-wide tombstone ceiling is announced when it happens rather than on
+  its next batch. That market is not the one being admitted and need never send another — a market
+  whose arms drifted apart and then both went quiet is exactly how one comes to hold the most
+  tombstones — so its consumers kept a book that silently stopped updating while a client connecting a
+  second later got none at all.
+- A disowning survives `MAX_BOOK_MARKETS` eviction. The record lived on the per-market state eviction
+  drops, and the order-level memo is re-derived from batch content, so an evicted market came back
+  reading as ordinary and resumed serving deltas onto a book nothing vouches for.
 - The Market-by-Order resurrection guard no longer corrupts a consumer's book when the two
   publishers drift far apart. It was bounded by a per-market count of 512 removed orders, which is a
   count standing in for a *time* tolerance, and past it — 150 ms of inter-arm lag on a busy market,
@@ -29,8 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a consumer that ended 994 orders wrong at 300 ms of inter-arm lag, permanently, now holds the venue's
   book exactly, and the guard's eviction never fires at any lag tested. With the wider dedup window
   below, first divergence on that capture moves from **153 ms to 2 s** — exact at every step through
-  1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` asserts 1 s independently, though it
-  never partially fills an order and so cannot produce the size disagreement the real capture shows.
+  1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` now partially fills every order, so
+  it can produce the size disagreement the real capture shows; it asserts **100 ms** at its own event
+  rate, which is not the capture's figure scaled down but the *other* limit — `seen` is capped at 1024
+  events per market whatever the window, and that sweep runs at 10k events/s against the flagship's
+  ~890/s, putting the same bound at ~1.15 s there. Compare the two through the event rate, never
+  directly. A separate replay, of orders cancelled without ever trading, still pins that holding more
+  than the old 512 tombstones costs the market nothing.
 
 ### Changed
 - `--arb-book-dedup-window-ms` now defaults to 1000 (was 250). The window stopped being the guard's
@@ -43,11 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   much above a second is inert on a busy market: 1 s and 10 s measure identically.
 
 ### Added
-- `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above, and
-  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling.
-  ⚠️ That gauge is an aggregate, and the cap a single market hits first is the per-market 65,536 — six
-  per cent of it — so a market walking to a blackout does not show up as falling headroom there; alarm
-  on the invalidation counter. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"`
+- `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above,
+  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling, and
+  `dz_mbo_guarded_tombstones_market` reports the largest single market's population against the
+  per-market cap — **the one to alert on**, since that cap fires at a sixteenth of the aggregate and a
+  market walking to a blackout is flat headroom on the sum. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"`
   label, which no longer has a behaviour behind it.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
