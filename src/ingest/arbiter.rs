@@ -510,6 +510,18 @@ enum Slot {
 #[derive(Default)]
 struct GuardBudget {
     held: usize,
+    /// The largest tombstone population any one market holds, and which market holds it.
+    ///
+    /// Tracked separately because `held` is a sum against a ceiling sixteen times
+    /// [`MAX_MARKET_TOMBSTONES`], which is the cap that actually fires first: a single market walking
+    /// to its own cap — and to the blackout that follows — is flat headroom on the aggregate.
+    ///
+    /// A lagging high-water rather than a true maximum, which would cost a scan of every tracked market
+    /// per batch. It follows the market that set it exactly while that market keeps being observed, is
+    /// raised by any market that overtakes it, and is zeroed when that market's population is dropped —
+    /// so it errs stale-high, never stale-low, which is the direction an alert can live with.
+    peak: usize,
+    peak_market: Option<MarketKey>,
 }
 
 impl GuardBudget {
@@ -538,6 +550,26 @@ impl GuardBudget {
 
     fn over(&self) -> bool {
         self.held > MAX_TOMBSTONES_TOTAL
+    }
+
+    /// Note one market's tombstone population, keeping the per-market high-water in O(1).
+    fn observe_market(&mut self, key: &MarketKey, n_dead: usize) {
+        let mine = self.peak_market.as_ref() == Some(key);
+        if n_dead > self.peak || (mine && n_dead != self.peak) {
+            self.peak = n_dead;
+            self.peak_market = (n_dead > 0).then(|| key.clone());
+            metrics().mbo_guarded_tombstones_market.set(n_dead as i64);
+        }
+    }
+
+    /// Drop the high-water when the market that set it loses its population. Whichever market is
+    /// largest now re-raises it on its next batch.
+    fn forget_market(&mut self, key: &MarketKey) {
+        if self.peak_market.as_ref() == Some(key) {
+            self.peak = 0;
+            self.peak_market = None;
+            metrics().mbo_guarded_tombstones_market.set(0);
+        }
     }
 
     /// Recount from the populations themselves. The running total is an optimization; without this it
@@ -1690,6 +1722,7 @@ impl Arbiter {
     fn drop_book_events(&mut self, key: &MarketKey) {
         if let Some(events) = self.book_events.remove(key) {
             self.guard.release(events.n_dead);
+            self.guard.forget_market(key);
         }
     }
 
@@ -1858,6 +1891,7 @@ impl Arbiter {
         }
         let forced = events.forced.take();
         let invalidated = std::mem::take(&mut events.invalidated);
+        budget.observe_market(&key, events.n_dead);
         let venue = b.venue.as_ref();
         if deduped > 0 {
             metrics()
@@ -5693,6 +5727,10 @@ mod tests {
             .get()
     }
 
+    fn guarded_tombstones_market() -> i64 {
+        metrics().mbo_guarded_tombstones_market.get()
+    }
+
     fn resurrections(venue: &str) -> u64 {
         metrics()
             .book_resurrections_dropped
@@ -6299,6 +6337,52 @@ mod tests {
             invalidations(VENUE),
             before,
             "and it costs the market nothing"
+        );
+        // The aggregate is a sum against a ceiling sixteen times the per-market cap, so it is not what
+        // an operator can watch a market walk to its own blackout on. The high-water is.
+        assert_eq!(guarded_tombstones_market(), (MAX_GUARDED_ORDERS * 4) as i64);
+
+        // A second, smaller market must not lower it, and the leader's own retirement must.
+        const OTHER_INSTRUMENT: u32 = BOOK_INSTRUMENT + 1;
+        let other: MarketKey = mkey(VENUE, OTHER_INSTRUMENT);
+        a.set_book_synced(&other, arm(1), true);
+        a.set_book_synced(&other, arm(2), true);
+        a.emit(
+            book(
+                VENUE,
+                OTHER_INSTRUMENT,
+                vec![order(BookAction::Update, 1, 100.0, 1.0)],
+                true,
+                3_000,
+            ),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            book(
+                VENUE,
+                OTHER_INSTRUMENT,
+                (1..=8u64)
+                    .map(|oid| order(BookAction::Delete, oid, 100.0, 0.0))
+                    .collect(),
+                true,
+                4_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(a.book_events[&other].n_dead, 8);
+        assert_eq!(
+            guarded_tombstones_market(),
+            (MAX_GUARDED_ORDERS * 4) as i64,
+            "the high-water follows the biggest market, not the last one observed"
+        );
+        a.reset_book_events_for_market(&key);
+        assert_eq!(
+            guarded_tombstones_market(),
+            0,
+            "and it is dropped with the market that set it"
         );
     }
 
