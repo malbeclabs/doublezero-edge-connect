@@ -1638,7 +1638,12 @@ impl Arbiter {
     /// every busy market — would re-baseline forever.
     fn sync_book_arms(&mut self, key: &MarketKey, now: u64) {
         let peers = self.book_sync.get(key);
-        let events = self.book_events.entry(key.clone()).or_default();
+        // `get_mut`, not `entry`: a market with no race state yet has no tombstone to spend either,
+        // and the admit path below creates the entry a moment later. Keeps a key clone and an insert
+        // off every published batch.
+        let Some(events) = self.book_events.get_mut(key) else {
+            return;
+        };
         events.serving = 0;
         for (&p, st) in peers.into_iter().flatten() {
             // The same "in sync and actually on the wire" test the `Clear`-led suppression applies,
