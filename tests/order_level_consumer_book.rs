@@ -465,6 +465,31 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
     // One order past the cap. Chunked only so the scenario is a few dozen batches rather than 131,072
     // of them; what matters is that the slow arm reports none of these removals, so none of the
     // tombstones can be retired and the cap is what gives way.
+    // Every `Clear`-led batch's size: a disowning is a bare one, and republishing our own view — the
+    // behaviour this replaced — is a whole book.
+    fn drain(
+        rx: &mut broadcast::Receiver<Arc<FeedMessage>>,
+        consumer: &mut Book,
+        clears: &mut Vec<usize>,
+    ) {
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Book(b) = &*m {
+                if b.changes
+                    .first()
+                    .is_some_and(|c| c.action == BookAction::Clear)
+                {
+                    clears.push(b.changes.len());
+                }
+                apply(consumer, b);
+            }
+        }
+    }
+    // The producers' own install re-baselines, drained and discarded: what follows must be the only
+    // `Clear` the market sees.
+    let mut clears: Vec<usize> = Vec::new();
+    drain(&mut rx, &mut consumer, &mut clears);
+    clears.clear();
+
     const CHUNK: u64 = 2_048;
     for c in 0..=(MARKET_TOMBSTONES / CHUNK) {
         let (base, at) = (100 + c * CHUNK, 10_000 + c * 10_000);
@@ -478,36 +503,34 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
             .collect();
         a.emit(batch(adds, at), fast, CATEGORY);
         a.emit(batch(deletes, at + 1_000), fast, CATEGORY);
-        drain_into(&mut rx, &mut consumer);
+        // Up to the disowning the consumer tracks the venue exactly: every removal that crossed the
+        // guard while it could still answer reached the wire, including the one that broke it.
+        let before = clears.is_empty();
+        drain(&mut rx, &mut consumer, &mut clears);
+        if before && clears.is_empty() {
+            assert_eq!(
+                consumer, venue,
+                "a guard eviction must not swallow the removals that raised it"
+            );
+        }
     }
     assert_eq!(
-        consumer, venue,
-        "a guard eviction must not swallow the removals that raised it"
+        clears,
+        vec![1],
+        "disowning is a bare clear, told exactly once"
     );
+    assert!(consumer.is_empty(), "the consumer is told to drop the book");
 
     // The lagging arm's first and only copy of the add for the order that is already gone, and the
-    // fast arm streaming on. The market is disowned, so neither reaches the consumer — and nothing
-    // republishes the book we stopped vouching for.
+    // fast arm streaming on. The market is disowned, so neither reaches the consumer.
     a.emit(batch(vec![stale_add], 90_000_000), slow, CATEGORY);
     a.emit(
         batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_100_000),
         fast,
         CATEGORY,
     );
-    let mut republished = 0usize;
-    while let Ok(m) = rx.try_recv() {
-        if let FeedMessage::Book(b) = &*m {
-            if b.changes
-                .first()
-                .is_some_and(|c| c.action == BookAction::Clear)
-            {
-                republished = republished.max(b.changes.len());
-            }
-            apply(&mut consumer, b);
-        }
-    }
-    assert_eq!(republished, 0, "a disowned market must republish nothing");
-    assert_eq!(consumer, venue, "and must not resurrect a dead order");
+    drain(&mut rx, &mut consumer, &mut clears);
+    assert!(consumer.is_empty(), "and stays dark, holding no dead order");
 
     // A producer's own snapshot is what ends the outage, and it is the venue's book, not ours.
     venue.insert(3, (BookSide::Ask, 105.0, 2.0));

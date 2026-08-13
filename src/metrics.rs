@@ -1121,8 +1121,6 @@ mod tests {
             "dz_mbo_forced_rebaselines_total",
             "dz_mbo_market_invalidations_total",
             "dz_mbo_guarded_tombstones",
-            "dz_mbo_market_invalidations_total",
-            "dz_mbo_guarded_tombstones",
             "dz_hl_sink_clients",
             "dz_hl_sink_messages_total",
             "dz_shred_wins_total",

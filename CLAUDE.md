@@ -400,11 +400,13 @@ Modules are grouped by role under `src/`:
   publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
   order. Tombstones are deliberately **not** expired by the time window, which is what keeps
   `--arb-book-dedup-window-ms` a cost knob; **what retires one is the arms, not a clock or a count** —
-  every publisher `book_sync` holds for the market (`known`) has either reported the removal or been
-  seen past it, the latter from a per-arm **watermark** on the timeline of first arrivals, advanced
-  only where that arm's copy was recognized as a *duplicate* (past the dedup window a stale copy *is* a
-  first delivery, so crediting one would advance a lagging arm to the present and retire the tombstones
-  it is about to race). That makes the population "the removals inside the arms' current lag spread",
+  every arm still arriving for the market (`known`, aged out on the same `PEER_SERVING_NS` arrival test
+  `serving` uses, since a source that spoke once and vanished would otherwise pin the quorum forever)
+  has reported the removal. Reporting is the **only** evidence accepted: anything weaker infers an
+  arm's position in the venue stream from something else it sent, and on this wire that is spoofable —
+  one datagram echoing a just-published event from a lagging arm's address would retire that arm's
+  whole backlog and let its genuine stale `Add` through as live. That makes the population "the
+  removals inside the arms' current lag spread",
   which is what the guard actually needs; a per-market **count** — what it used to be, 512 — is a count
   standing in for a *time* tolerance and is simultaneously far too much for a quiet market and far too
   little for a busy one. Measured: at 150 ms of inter-arm lag on a busy market it gave way, against
@@ -420,11 +422,19 @@ Modules are grouped by role under `src/`:
   own view is not an answer to "the guard could not answer", since that view is exactly what the guard
   failed to protect — it would hand the consumer the resurrections stamped `snapshot`/`last` and
   re-seed them as live floors, so nothing removes them again. So `Arbiter::invalidate_market` drops the
-  market's race state, replay entry and accumulators and publishes **nothing** until a producer sends a
-  `Clear`-led re-baseline of its own. ⚠️ That is a real availability cost: for a *healthy* publisher
-  the next such batch is its next **recovery**, not its next snapshot rotation (`book.rs` drops a
-  snapshot whose anchor it has already applied), so the market can be dark for tens of seconds or
-  longer. Eviction — as opposed to retirement — asks only about the *serving* arms, which is
+  market's race state, replay entry and accumulators, tells consumers to drop the book with a bare
+  `Clear` (`announce_disowned`, sent from the next batch since a `Clear` still needs a message's header
+  fields — leaving them holding a book that silently stops updating while a client connecting a second
+  later gets none at all is two consumers of one feed in contradictory states, neither told anything),
+  and publishes **nothing** further until a producer sends a `Clear`-led re-baseline of its own.
+  ⚠️ That is a real availability cost: for a *healthy* publisher the next such batch is its next
+  **recovery**, not its next snapshot rotation (`book.rs` drops a snapshot whose anchor it has already
+  applied), so the market can be dark for tens of seconds or longer. The **process-wide** ceiling is
+  `Arbiter`'s (`shed_over_budget`), never `MarketEvents`', because it is the only scope that can charge
+  it to the market actually holding the tombstones: charging the market being *admitted* — the obvious
+  O(1) choice — would let one market's arms drifting apart disown every other order-level market in
+  turn, each on its next removal and each returning only its own handful, while the hoarder kept
+  everything it held. Eviction — as opposed to retirement — asks only about the *serving* arms, which is
   `book_sync`'s `synced` plus arrival within `PEER_SERVING_NS`; arrival, not a *published* batch,
   because a mirror whose copies all lose the race publishes nothing and is exactly the arm the guard is
   held open for. The two masks are the whole distinction: a gapped or departed arm must not be retired

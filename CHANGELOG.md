@@ -19,13 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against 186 ms measured between the real publishers — it evicted a tombstone a lagging arm could
   still race and then re-baselined the market from our own accumulated view, which is the view the
   guard had just failed to protect: the resurrected orders were republished as a complete book and
-  re-seeded as live, and nothing removed them again. Now a tombstone is retired once every publisher
-  the market knows has reported the removal or been seen past it, the population is bounded
-  process-wide instead of per market (the same aggregate memory, spent where the guard needs it), and
-  a guard that genuinely cannot answer **disowns** the market — state and replay entry dropped,
-  nothing published until a producer re-baselines it — rather than republishing our own view. A
-  synthetic two-arm lag sweep that diverged at 150 ms is now exact to 1 s, and to 4 s when driven
-  further.
+  re-seeded as live, and nothing removed them again. Now a tombstone is retired as soon as every arm
+  still reaching the market has reported the removal, so the population sizes itself to the arms' lag;
+  it is bounded process-wide instead of per market (the same aggregate memory, spent where the guard
+  needs it), with the ceiling charged to the market holding the tombstones rather than to whichever
+  market records the next removal; and a guard that genuinely cannot answer **disowns** the market —
+  state and replay entry dropped, consumers told to drop the book, nothing published until a producer
+  re-baselines it — rather than republishing our own view. A synthetic two-arm lag sweep that diverged
+  at 150 ms is now exact to 1 s, and to 4 s when driven further.
 
 ### Added
 - `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above, and
