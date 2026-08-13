@@ -771,15 +771,9 @@ impl BookAccumulator {
     /// [`Self::baselined`] holds — otherwise it claims completeness for a book that is missing every
     /// level which has not moved.
     pub fn to_book(&self, key: &BookKey, scope: ReplayScope) -> NormalizedBook {
-        let (venue, category, channel, instrument_id) = key;
-        let mut changes = Vec::with_capacity(self.bids.len() + self.asks.len() + 1);
-        changes.push(BookChange {
-            action: BookAction::Clear,
-            side: BookSide::Both,
-            price: 0.0,
-            size: 0.0,
-            order_id: 0,
-        });
+        let mut out = self.to_clear(key);
+        let changes = &mut out.changes;
+        changes.reserve(self.bids.len() + self.asks.len() + self.orders.len());
         let level = |side: BookSide, price: f64, size: f64, order_id: u64| BookChange {
             action: BookAction::Update,
             side,
@@ -812,6 +806,15 @@ impl BookAccumulator {
                 }
             }
         }
+        out
+    }
+
+    /// This market's header carrying a bare `clear` and nothing else: what tells a consumer to drop the
+    /// book. Separate from [`Self::to_book`] rather than a call to it, because a disowning has to be
+    /// able to say so *without* materializing the book it stopped vouching for — 44k orders on the
+    /// flagship market, allocated only to be thrown away.
+    pub fn to_clear(&self, key: &BookKey) -> NormalizedBook {
+        let (venue, category, channel, instrument_id) = key;
         NormalizedBook {
             venue: venue.clone(),
             source: venue.clone(),
@@ -820,7 +823,13 @@ impl BookAccumulator {
             channel: *channel,
             instrument_id: *instrument_id,
             category: category.clone(),
-            changes,
+            changes: vec![BookChange {
+                action: BookAction::Clear,
+                side: BookSide::Both,
+                price: 0.0,
+                size: 0.0,
+                order_id: 0,
+            }],
             snapshot: true,
             last: true,
             source_ts_ns: self.source_ts_ns,

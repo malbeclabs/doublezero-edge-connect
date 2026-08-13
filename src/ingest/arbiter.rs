@@ -1862,7 +1862,7 @@ impl Arbiter {
             // Nothing but a producer's own re-baseline can re-establish this market: what we hold is
             // the state the guard stopped vouching for, and the deltas arriving now are the ones it
             // can no longer place against it.
-            self.announce_disowned(&key, b);
+            self.announce_disowned(&key, clear_only(b));
             self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
             return;
         }
@@ -1953,7 +1953,7 @@ impl Arbiter {
         // guard while it could still answer.
         if invalidated {
             self.invalidate_market(&key, &b.venue);
-            self.announce_disowned(&key, b);
+            self.announce_disowned(&key, clear_only(b));
         }
         self.shed_over_budget();
     }
@@ -2004,6 +2004,11 @@ impl Arbiter {
     /// That is tens of seconds in the observed capture and unbounded in principle, so
     /// `dz_mbo_market_invalidations_total` is an alarm, not a throughput figure.
     fn invalidate_market(&mut self, key: &MarketKey, venue: &str) {
+        // Built here, from state this call is about to drop, so a market that goes quiet after being
+        // disowned is still told about it. `shed_over_budget` disowns a market that is not the one
+        // being admitted, and the market whose arms drifted apart and then both fell silent is exactly
+        // how one comes to hold the most tombstones in the process.
+        let announcement = self.disown_clear(key);
         self.drop_book_events(key);
         if let Some(replay) = &self.book_replay {
             model::lock(replay).remove(key);
@@ -2026,6 +2031,25 @@ impl Arbiter {
             .mbo_market_invalidations
             .with_label_values(&[venue])
             .inc();
+        if let Some(clear) = announcement {
+            self.announce_disowned(key, clear);
+        }
+    }
+
+    /// A bare `clear` carrying this market's header, from whatever accumulated book is still around to
+    /// supply one. `None` for a market that has never been accumulated — nothing was published for it,
+    /// so there is nothing to tell a consumer to drop.
+    fn disown_clear(&self, key: &MarketKey) -> Option<NormalizedBook> {
+        if let Some(acc) = self
+            .book_markets
+            .get(key)
+            .and_then(|m| m.arms.values().next())
+        {
+            return Some(acc.to_clear(key));
+        }
+        let replay = self.book_replay.as_ref()?;
+        let out = model::lock(replay).get(key).map(|acc| acc.to_clear(key));
+        out
     }
 
     /// Tell the consumer to drop a disowned market's book, once.
@@ -2035,17 +2059,18 @@ impl Arbiter {
     /// one that silently stops updating — two consumers of one feed in contradictory states, neither
     /// told anything, and a frozen L3 book is indistinguishable from a quiet market from the outside.
     ///
-    /// Sent from a batch rather than at the moment of disowning because a bare `Clear` still needs a
-    /// message's `venue`/`symbol`/`source` header, which the key alone does not carry. For the market
-    /// that filled the process-wide budget that is its next batch — microseconds away, since holding
-    /// the most tombstones in the process is what it was disowned for.
-    fn announce_disowned(&mut self, key: &MarketKey, b: &NormalizedBook) {
+    /// `clear` carries this market's header, which the key alone does not: from the triggering batch
+    /// where there is one, otherwise reconstructed by [`Self::disown_clear`] — because
+    /// [`Self::shed_over_budget`] disowns a market other than the one being admitted, and that market
+    /// need never send another batch. Waiting for one is how the two contradictory consumer states
+    /// above become permanent.
+    fn announce_disowned(&mut self, key: &MarketKey, clear: NormalizedBook) {
         match self.book_markets.get_mut(key) {
             Some(m) if !m.disowned_announced => m.disowned_announced = true,
             _ => return,
         }
-        self.vm(&b.venue).emit[EMIT_BOOK].inc();
-        let _ = self.tx.send(Arc::new(FeedMessage::Book(clear_only(b))));
+        self.vm(&clear.venue).emit[EMIT_BOOK].inc();
+        let _ = self.tx.send(Arc::new(FeedMessage::Book(clear)));
     }
 
     /// Publish a producer's own `Clear`-led re-baseline and re-point the market's race state at it.
@@ -6469,6 +6494,47 @@ mod tests {
         );
         assert_eq!(invalidations(BYSTANDER), before);
         assert_eq!(a.book_events[&bystander_key].n_dead, 100);
+    }
+
+    /// The market the process-wide ceiling disowns is not the market being admitted, and it need never
+    /// send another batch — a market whose arms drifted apart and then both went quiet is precisely how
+    /// one comes to hold the most tombstones in the process. Announced only from a batch, its consumers
+    /// keep a book that silently stops updating while a client connecting a second later gets none at
+    /// all: the contradictory pair the announcement exists to close.
+    #[test]
+    fn a_market_disowned_by_the_ceiling_is_announced_without_waiting_for_a_batch() {
+        const VENUE: &str = "BookGuardQuietHog";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 1, 100.0, 1.0)],
+                1_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        a.emit(removals(VENUE, 10..=109, 2_000), arm(1), TEST_CATEGORY);
+        let _ = drain_books(&mut rx);
+        // Stand the population up at the ceiling rather than paying 16 saturated markets for it, as
+        // `the_process_wide_ceiling_disowns_the_market_holding_the_tombstones` does.
+        a.book_events.get_mut(&key).expect("race state").n_dead = MAX_TOMBSTONES_TOTAL + 1;
+        a.guard.held = MAX_TOMBSTONES_TOTAL + 1;
+
+        a.shed_over_budget();
+
+        let sent = drain_books(&mut rx);
+        assert_eq!(
+            sent.len(),
+            1,
+            "a disowned market must tell its consumers rather than go quiet"
+        );
+        assert_eq!(sent[0].changes.len(), 1);
+        assert_eq!(sent[0].changes[0].action, BookAction::Clear);
+        assert_eq!(&*sent[0].symbol, "BTC", "and carry the market's own header");
+        assert_eq!(sent[0].instrument_id, BOOK_INSTRUMENT);
     }
 
     /// A running total that has slipped must cost a recount, not the whole product. Shedding trusts
