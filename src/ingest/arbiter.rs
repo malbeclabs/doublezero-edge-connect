@@ -143,24 +143,30 @@ const MAX_MARKET_TOMBSTONES: usize = 65_536;
 /// 8.4M tombstones, so this is an eighth of that (~60 MB at ~56 bytes of map and queue per entry).
 const MAX_TOMBSTONES_TOTAL: usize = 1 << 20;
 
-/// Floor and ceiling on the population at which a market sweeps for settled tombstones out of queue
-/// order ([`MarketEvents::sweep_settled`]); between them the threshold doubles after each sweep, which
-/// is what makes the sweep O(1) amortized per tombstone.
+/// Floor on the population at which a market sweeps for settled tombstones out of queue order
+/// ([`MarketEvents::sweep_settled`]); above it the threshold doubles after each sweep, which is what
+/// makes the sweep O(1) amortized per tombstone.
 ///
 /// The floor is small because the slack it permits is paid on **every** market at once: at
 /// [`MAX_BOOK_MARKETS`] a floor of 16 is a quarter of [`MAX_TOMBSTONES_TOTAL`], so a fleet of stalled
-/// markets cannot reach the process-wide ceiling on the slack alone. The ceiling is what keeps a
-/// doubling that found nothing — a sweep run before the peer had reported anything — from setting the
-/// next one past the per-market cap, where `bound` would disown the market first.
+/// markets cannot reach the process-wide ceiling on the slack alone.
+///
+/// There is deliberately **no ceiling**. One used to cap the threshold at half the per-market cap, so
+/// that a doubling which found nothing could not schedule the next sweep past the point where `bound`
+/// disowns the market. Above that population the clamp put the threshold *below* `n_dead`, where
+/// `retire_settled`'s comparison is true on every batch and the schedule is a per-batch trigger — a
+/// full scan of the tombstone map per datagram, under the one mutex every receiver takes to emit.
+/// The eviction edge holds that guarantee directly now ([`MarketEvents::bound`]), which is where it
+/// belongs: a threshold that has to sit under the population to protect an eviction is not a
+/// threshold.
+const SWEEP_FLOOR: usize = 16;
+
 /// Population above which [`MarketEvents::assert_consistent`] skips its O(population) half. Only the
 /// tests that deliberately drive a market to its cap are above it, and they would go quadratic.
 const AUDIT_POPULATION: usize = 4096;
 
 /// Tracked markets above which [`Arbiter::assert_budget_consistent`] skips the same way.
 const AUDIT_MARKETS: usize = 256;
-
-const SWEEP_FLOOR: usize = 16;
-const SWEEP_CEILING: usize = MAX_MARKET_TOMBSTONES / 2;
 
 /// Width of a tombstone's reporter mask. Matches the authority's own per-scope arm cap, which gates
 /// admission before a batch reaches the race state, so no eligible arm goes without a bit.
@@ -647,8 +653,14 @@ struct MarketEvents {
     n_live: usize,
     n_dead: usize,
     /// The `n_dead` at which [`Self::sweep_settled`] next runs, doubling after each sweep so the sweep
-    /// costs O(1) amortized per tombstone.
+    /// costs O(1) amortized per tombstone. Always **above** the population a sweep leaves behind: at or
+    /// below it the comparison in [`Self::retire_settled`] is true on every batch and the schedule
+    /// becomes a per-batch trigger.
     sweep_at: usize,
+    /// Full scans run, for the cost tests. The population every other test here measures says nothing
+    /// about the work per batch, which is where this guard's scheduling defect lived.
+    #[cfg(test)]
+    sweeps: u32,
     /// Arms this market has seen, **append-only**: an arm's index here is its bit in a tombstone's
     /// reporter mask, so the list may never be reordered or compacted. Capped at eight, the width of
     /// that mask and of the authority's own per-scope arm cap.
@@ -891,6 +903,10 @@ impl MarketEvents {
     /// doubled since the last sweep, so it costs O(1) amortized per tombstone and nothing at all on a
     /// market whose arms are keeping up.
     fn sweep_settled(&mut self, budget: &mut GuardBudget) {
+        #[cfg(test)]
+        {
+            self.sweeps += 1;
+        }
         let known = self.known;
         let mut retired = 0usize;
         self.resting.retain(|_, slot| match slot {
@@ -902,7 +918,13 @@ impl MarketEvents {
         });
         self.n_dead -= retired;
         budget.release(retired);
-        self.sweep_at = (2 * self.n_dead).clamp(SWEEP_FLOOR, SWEEP_CEILING);
+        self.sweep_at = (2 * self.n_dead).max(SWEEP_FLOOR);
+        debug_assert!(
+            self.sweep_at > self.n_dead,
+            "a sweep that leaves {} scheduled the next one at {}, which triggers on every batch",
+            self.n_dead,
+            self.sweep_at
+        );
         self.compact();
         self.assert_consistent();
     }
@@ -973,6 +995,18 @@ impl MarketEvents {
     /// actually holding the tombstones: charging the admitting market would let one market's growth
     /// disown every other market in turn, each on its next removal, while the market that filled the
     /// budget keeps its own.
+    ///
+    /// **A tombstone is swept for before it is evicted unsettled**, so a market is never disowned for a
+    /// removal the arms had all reported. [`Self::retire_settled`]'s scheduled sweep cannot carry that:
+    /// it runs once per batch, before that batch is applied, and one batch can take the population from
+    /// under the threshold to past the cap.
+    ///
+    /// The sweep is at the eviction itself rather than at the cap, because the two are not the same
+    /// edge: an eviction whose tombstone every serving arm has passed is free, and a market pinned at
+    /// its cap shedding free tombstones would otherwise rescan its whole map per datagram — the same
+    /// per-batch scan the scheduling half exists to remove, moved rather than fixed (measured: 278 µs a
+    /// batch against 3.6). Bounded to about two scans a batch even at the cap: the second finds nothing
+    /// the first left, and the eviction that follows disowns the market, which stops the third.
     fn bound(&mut self, budget: &mut GuardBudget) {
         while self.n_live > MAX_GUARDED_ORDERS {
             let Some(id) = Self::pop(&mut self.live, &self.resting, |s| {
@@ -983,6 +1017,7 @@ impl MarketEvents {
             self.resting.remove(&id);
             self.n_live -= 1;
         }
+        let mut swept = false;
         while self.n_dead > MAX_MARKET_TOMBSTONES {
             let Some(id) = Self::pop(&mut self.dead, &self.resting, |s| {
                 matches!(s, Slot::Tomb(_))
@@ -993,6 +1028,15 @@ impl MarketEvents {
                 Some(&Slot::Tomb(by)) => Self::settled(self.serving, by),
                 _ => true,
             };
+            if !free && !swept && !self.invalidated {
+                // `serving` is a subset of `known`, so a tombstone unsettled against the first is
+                // unsettled against the second: the sweep cannot take this one, and what it does take
+                // is room enough not to have to. Put the entry back in removal order first.
+                self.dead.push_front(id);
+                swept = true;
+                self.sweep_settled(budget);
+                continue;
+            }
             self.resting.remove(&id);
             self.n_dead -= 1;
             budget.release(1);
@@ -1082,10 +1126,6 @@ impl MarketEvents {
         debug_assert!(
             self.live.len() >= self.n_live,
             "the live queue lost a floor"
-        );
-        debug_assert!(
-            self.sweep_at <= SWEEP_CEILING,
-            "a sweep scheduled past the ceiling"
         );
         if self.resting.len() > AUDIT_POPULATION {
             return;
@@ -6400,8 +6440,10 @@ mod tests {
             arm(1),
             TEST_CATEGORY,
         );
-        // Later removals both arms report must not carry order 7 out with them.
-        for oid in 10..=20u64 {
+        // Later removals both arms report must not carry order 7 out with them. Enough of them to put
+        // the population past the sweep's own slack, or the assertion below holds without a sweep
+        // having run at all.
+        for oid in 10..=40u64 {
             let removal = l3_batch(
                 VENUE,
                 vec![order(BookAction::Delete, oid, 100.0, 0.0)],
@@ -6435,14 +6477,20 @@ mod tests {
     /// Retired head-of-queue only, each such order holds every removal behind it and the market's whole
     /// removal history walks it to the per-market cap, where it is disowned and dark until a producer
     /// re-baselines it.
+    ///
+    /// Run at the batch sizes a publisher actually sends, and asserted against the set the arms have
+    /// yet to mirror rather than against the market's history: the population is the unmirrored quarter
+    /// plus the round still in flight, which is the claim. Head-of-queue retirement alone holds every
+    /// removal behind the first unmirrored one, so it lands near the whole history instead.
     #[test]
     fn arms_snapshotting_from_different_anchors_do_not_walk_a_market_to_a_blackout() {
         const VENUE: &str = "BookGuardAnchors";
+        const ROUNDS: u64 = 40;
+        const BATCH: u64 = 250;
         let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
         a.set_book_dedup_window(1_000);
         let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
         let before = invalidations(VENUE);
-        let round = MAX_MARKET_TOMBSTONES as u64 / 2 + 1_000;
         a.emit(
             l3_batch(
                 VENUE,
@@ -6452,8 +6500,8 @@ mod tests {
             arm(2),
             TEST_CATEGORY,
         );
-        for r in 0..2u64 {
-            let ids = (r * round + 1)..=((r + 1) * round);
+        for r in 0..ROUNDS {
+            let ids = (r * BATCH + 1)..=((r + 1) * BATCH);
             let at = 2_000 + r * 10_000;
             a.emit(removals(VENUE, ids.clone(), at), arm(1), TEST_CATEGORY);
             // Arm 2 reports every removal but the orders its own snapshot never held.
@@ -6461,7 +6509,7 @@ mod tests {
                 .filter(|oid| oid % 4 != 0)
                 .map(|oid| order(BookAction::Delete, oid, 100.0, 0.0))
                 .collect();
-            a.emit(l3_batch(VENUE, mirrored, at), arm(2), TEST_CATEGORY);
+            a.emit(l3_batch(VENUE, mirrored, at + 1_000), arm(2), TEST_CATEGORY);
         }
         let _ = drain_books(&mut rx);
         assert_eq!(
@@ -6469,10 +6517,134 @@ mod tests {
             before,
             "two arms with different anchors must not black the market out"
         );
+        // Twice the unmirrored set, because the sweep threshold doubles: between two sweeps the
+        // population may reach twice what the last one left. What it may not do is track the market's
+        // history, which is what head-of-queue retirement alone gives.
+        let unmirrored = (ROUNDS * BATCH / 4) as usize;
         assert!(
-            a.book_events[&key].n_dead < (round * 2) as usize,
-            "the population is what the arms have yet to mirror, not the market's history: {} held",
+            a.book_events[&key].n_dead <= 2 * unmirrored + BATCH as usize,
+            "the population is the quarter the arms have yet to mirror ({unmirrored}), not the \
+             market's {} removals: {} held",
+            ROUNDS * BATCH,
             a.book_events[&key].n_dead
+        );
+    }
+
+    /// The sweep is a **schedule**, not a permanent trigger. `sweep_at` used to be clamped to half the
+    /// per-market cap, so above that population it sat *below* `n_dead` and `retire_settled`'s
+    /// comparison was true forever: a full `HashMap::retain` over the whole tombstone map per datagram,
+    /// held under the one arbiter mutex every receiver on every feed takes to emit.
+    ///
+    /// Asserts the **work**, not the population. Every other test around this guard measures the
+    /// population and none measured the work, which is how the clamp shipped.
+    ///
+    /// Run at the cap as well as under it: a market pinned there sheds a tombstone every serving arm
+    /// has passed on every batch, which is free, and a sweep placed at the *cap* rather than at an
+    /// unsettled eviction rescans the whole map for each of them — the same defect a step further
+    /// along (measured: 278 µs a batch against 5.5).
+    #[test]
+    fn a_market_the_arms_cannot_settle_does_not_rescan_on_every_batch() {
+        const BATCHES: u64 = 20;
+        for population in [
+            MAX_MARKET_TOMBSTONES as u64 / 2 + 4_000,
+            MAX_MARKET_TOMBSTONES as u64,
+        ] {
+            let venue: &'static str =
+                Box::leak(format!("BookGuardSweepCost{population}").into_boxed_str());
+            let (mut a, mut rx) = racing(venue, &[arm(1), arm(2)]);
+            a.set_book_dedup_window(1_000);
+            let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
+            // Arm 2 is synced and has never reached this market, so it holds the retirement quorum
+            // open and reports nothing: no tombstone here can ever be retired.
+            a.emit(
+                removals(venue, 1..=population, 1_000),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            let before = a.book_events[&key].sweeps;
+            for i in 0..BATCHES {
+                let oid = population + 1 + i;
+                a.emit(
+                    removals(venue, oid..=oid, 2_000 + i * 10_000),
+                    arm(1),
+                    TEST_CATEGORY,
+                );
+            }
+            let _ = drain_books(&mut rx);
+            let sweeps = a.book_events[&key].sweeps - before;
+            assert!(
+                sweeps <= 2,
+                "{sweeps} full scans over {BATCHES} one-change batches at a population of \
+                 {population}: the threshold is triggering rather than scheduling"
+            );
+        }
+    }
+
+    /// And the schedule it sets is above the population it left, which is what makes it a threshold.
+    /// Pinned here as well as by `sweep_settled`'s own post-condition, so the property is named rather
+    /// than only enforced under `debug_assertions`.
+    #[test]
+    fn a_sweep_schedules_the_next_one_above_the_population_it_left() {
+        const VENUE: &str = "BookGuardSweepSchedule";
+        const POPULATION: u64 = MAX_MARKET_TOMBSTONES as u64 / 2 + 4_000;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        a.emit(
+            removals(VENUE, 1..=POPULATION, 1_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        // The second batch is the one that sweeps: the first found the population at zero.
+        a.emit(
+            removals(VENUE, (POPULATION + 1)..=(POPULATION + 1), 2_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        let events = &a.book_events[&key];
+        assert!(events.sweeps > 0, "the population must have swept at all");
+        assert!(
+            events.sweep_at > events.n_dead,
+            "the next sweep is scheduled at {} against a population of {}",
+            events.sweep_at,
+            events.n_dead
+        );
+    }
+
+    /// The cap sweeps before it evicts. One batch can carry the population from below the per-market
+    /// cap to past it, so the tombstone `bound` reaches for may be one a sweep would have retired for
+    /// nothing — and evicting a tombstone no serving arm has passed disowns the market, dark until a
+    /// producer re-baselines it. The scheduled sweep cannot cover this: it runs once per batch, before
+    /// the batch that overshoots has been applied.
+    #[test]
+    fn the_cap_sweeps_before_it_evicts_rather_than_disowning_a_settled_tombstone() {
+        const VENUE: &str = "BookGuardCapSweep";
+        const HELD: u64 = MAX_MARKET_TOMBSTONES as u64 * 3 / 4;
+        const OVERSHOOT: u64 = MAX_MARKET_TOMBSTONES as u64 / 2;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let before = invalidations(VENUE);
+        a.emit(removals(VENUE, 1..=HELD, 1_000), arm(1), TEST_CATEGORY);
+        // Arm 2 mirrors everything but order 1, which its own snapshot never held. Every other
+        // tombstone is now settled and free to retire — but order 1 is at the head of the queue.
+        a.emit(removals(VENUE, 2..=HELD, 2_000), arm(2), TEST_CATEGORY);
+        // One batch that takes the population past the cap.
+        a.emit(
+            removals(VENUE, (HELD + 1)..=(HELD + OVERSHOOT), 3_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(
+            invalidations(VENUE),
+            before,
+            "a market must not be disowned for tombstones a sweep would have retired"
+        );
+        assert!(
+            !a.invalidated_markets.contains_key(&key),
+            "and it must still be served"
         );
     }
 
