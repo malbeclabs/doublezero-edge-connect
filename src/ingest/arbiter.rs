@@ -1610,12 +1610,17 @@ impl Arbiter {
                 .inc_by(disagreed);
         }
         if let Some(reason) = forced {
-            // This batch's surviving changes go with it: a `Disagreement` drops one change out of a
-            // logical event, and publishing the rest with `last` intact hands the consumer half an
-            // event as a whole one. The re-baseline that follows carries the market's whole book.
             self.force_rebaseline(&key, &b.venue, reason);
-            self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
-            return;
+            // Only a `Disagreement` takes the batch with it: it drops one change out of a logical
+            // event, and publishing the rest with `last` intact hands the consumer half an event as a
+            // whole one. A guard eviction drops nothing from the batch — and the dead population's cap
+            // can only be crossed by a removal, so discarding the batch would strand the very order
+            // whose delete raised the flag: the re-baseline republishes it as live and the seed marks
+            // it live in the guard too, so nothing ever removes it again.
+            if reason == FORCED_DISAGREEMENT {
+                self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
+                return;
+            }
         }
         if kept.is_empty() {
             return;

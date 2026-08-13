@@ -285,6 +285,10 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
 /// cap has to name it; a wrong value here makes the test weaker, never wrong.
 const GUARD_CAP: u64 = 1024;
 
+/// Mirrors the arbiter's private `MAX_GUARDED_ORDERS`: the live floors and the tombstones are bounded
+/// apart, each to half of [`GUARD_CAP`].
+const GUARDED_ORDERS: u64 = GUARD_CAP / 2;
+
 /// The wiring every scenario shares: one order-level market on a two-publisher venue, both arms
 /// synced, racing exactly as the Market-by-Order processor drives it.
 fn harness() -> (
@@ -426,4 +430,56 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     a.emit(batch(vec![dead], 92_000_000), slow, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
+}
+
+/// The dead population's cap can only be crossed by a batch that carries a removal, so the batch that
+/// raises a guard eviction is always the batch that killed an order. Discarding it leaves that order
+/// resting in the consumer's book, the forced re-baseline republishes it as live, and the seed marks it
+/// live in the guard too — nothing removes it again.
+#[test]
+fn a_guard_eviction_does_not_leak_the_removal_that_raised_it() {
+    let (mut a, mut rx, fast, slow) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    // Both arms install their books. The peer's copy is dropped as a re-baseline for a market someone
+    // is already serving, which is still the moment it starts counting as serving — and from here it
+    // reports none of the removals below, so every tombstone stays open for a copy it has yet to send.
+    venue.insert(1, (BookSide::Bid, 90.0, 1.0));
+    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
+
+    // One order past the cap, each add and its delete in their own batch: the delete that crosses the
+    // cap evicts the oldest tombstone, which no peer has reported and is therefore not spent.
+    for i in 0..=GUARDED_ORDERS {
+        let (id, at) = (100 + i, 10_000 + i * 10_000);
+        a.emit(
+            batch(vec![change(id, BookSide::Ask, 200.0, 1.0)], at),
+            fast,
+            CATEGORY,
+        );
+        a.emit(
+            batch(vec![change(id, BookSide::Ask, 200.0, 0.0)], at + 1_000),
+            fast,
+            CATEGORY,
+        );
+        drain_into(&mut rx, &mut consumer);
+    }
+    assert_eq!(
+        consumer, venue,
+        "a guard eviction must not swallow the removal that raised it"
+    );
+
+    // And the re-baseline that eviction forced must not bless the leak: it republishes what reached
+    // the wire, then re-seeds every order in it as a live floor.
+    venue.insert(2, (BookSide::Bid, 91.0, 1.0));
+    a.emit(
+        batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_000_000),
+        fast,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer, venue,
+        "and the forced re-baseline must not revive it"
+    );
 }
