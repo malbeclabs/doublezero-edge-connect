@@ -431,15 +431,26 @@ Modules are grouped by role under `src/`:
   across `MAX_BOOK_MARKETS`) with `MAX_MARKET_TOMBSTONES` (65,536) as the per-market backstop, since a
   per-market cap large enough for a busy market is no bound at all once multiplied out. Reaching either
   cap **invalidates** the market rather than forcing a re-baseline
-  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones`): republishing our
+  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones_market`, the
+  per-market high-water — the aggregate `dz_mbo_guarded_tombstones` is a sum against a ceiling sixteen
+  times the cap that fires first, so one market walking to a blackout reads as flat headroom there):
+  republishing our
   own view is not an answer to "the guard could not answer", since that view is exactly what the guard
   failed to protect — it would hand the consumer the resurrections stamped `snapshot`/`last` and
   re-seed them as live floors, so nothing removes them again. So `Arbiter::invalidate_market` drops the
   market's race state, replay entry and accumulators, tells consumers to drop the book with a bare
-  `Clear` (`announce_disowned`, sent from the next batch since a `Clear` still needs a message's header
-  fields — leaving them holding a book that silently stops updating while a client connecting a second
-  later gets none at all is two consumers of one feed in contradictory states, neither told anything),
-  and publishes **nothing** further until a producer sends a `Clear`-led re-baseline of its own.
+  `Clear` (`announce_disowned`) and publishes **nothing** further until a producer sends a `Clear`-led
+  re-baseline of its own. The `Clear` needs a message's header fields, which the key alone does not
+  carry, so it is built from an accumulator (`BookAccumulator::to_clear`, header-only — materializing
+  the 44k-order book a disowning just stopped vouching for would be the wrong price) **before** the
+  state holding it is dropped, never deferred to the market's next batch: `shed_over_budget` disowns a
+  market other than the one being admitted, and a market whose arms drifted apart and then both went
+  quiet is precisely how one comes to hold the most tombstones. Leaving consumers holding a book that
+  silently stops updating while a client connecting a second later gets none at all is two consumers of
+  one feed in contradictory states, neither told anything. The record of the disowning lives in a
+  bounded set of its own rather than on the per-market state, because `MAX_BOOK_MARKETS` eviction drops
+  that state and the `order_level` memo is re-derived from batch content — an evicted market would come
+  back reading as ordinary and resume serving deltas onto a book nothing vouches for.
   ⚠️ That is a real availability cost: for a *healthy* publisher the next such batch is its next
   **recovery**, not its next snapshot rotation (`book.rs` drops a snapshot whose anchor it has already
   applied), so the market can be dark for tens of seconds or longer. The **process-wide** ceiling is
