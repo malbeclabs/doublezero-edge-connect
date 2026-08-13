@@ -2239,13 +2239,12 @@ impl Arbiter {
     /// it resumes on its next batch without a producer re-baseline — rather than growing without bound
     /// on a wire-supplied key.
     fn mark_invalidated(&mut self, key: &MarketKey) {
-        if self
-            .invalidated_markets
-            .insert(key.clone(), false)
-            .is_some()
-        {
+        // `contains_key` first, not the `insert`'s own return: inserting to find out re-arms
+        // `announced` on a market already disowned, which would announce the disowning a second time.
+        if self.invalidated_markets.contains_key(key) {
             return;
         }
+        self.invalidated_markets.insert(key.clone(), false);
         self.invalidated_order.push_back(key.clone());
         while self.invalidated_order.len() > MAX_BOOK_MARKETS {
             if let Some(old) = self.invalidated_order.pop_front() {
