@@ -152,6 +152,13 @@ const MAX_TOMBSTONES_TOTAL: usize = 1 << 20;
 /// markets cannot reach the process-wide ceiling on the slack alone. The ceiling is what keeps a
 /// doubling that found nothing — a sweep run before the peer had reported anything — from setting the
 /// next one past the per-market cap, where `bound` would disown the market first.
+/// Population above which [`MarketEvents::assert_consistent`] skips its O(population) half. Only the
+/// tests that deliberately drive a market to its cap are above it, and they would go quadratic.
+const AUDIT_POPULATION: usize = 4096;
+
+/// Tracked markets above which [`Arbiter::assert_budget_consistent`] skips the same way.
+const AUDIT_MARKETS: usize = 256;
+
 const SWEEP_FLOOR: usize = 16;
 const SWEEP_CEILING: usize = MAX_MARKET_TOMBSTONES / 2;
 
@@ -867,6 +874,7 @@ impl MarketEvents {
         if self.n_dead > self.sweep_at {
             self.sweep_settled(budget);
         }
+        self.assert_consistent();
     }
 
     /// Retire every settled tombstone, wherever it sits in the queue, and set the population at which
@@ -896,6 +904,7 @@ impl MarketEvents {
         budget.release(retired);
         self.sweep_at = (2 * self.n_dead).clamp(SWEEP_FLOOR, SWEEP_CEILING);
         self.compact();
+        self.assert_consistent();
     }
 
     /// Point this market's race state at the arms `book_sync` holds for it, which is what tells a
@@ -947,6 +956,7 @@ impl MarketEvents {
                 self.serving |= bit;
             }
         }
+        self.assert_consistent();
     }
 
     /// Hold the live floors to [`MAX_GUARDED_ORDERS`] and the tombstones to
@@ -989,8 +999,12 @@ impl MarketEvents {
             if !free {
                 self.invalidated = true;
             }
+            // Placed inside the loop, not after `compact`: an eviction that leaves the counters wrong
+            // still reads as consistent once the queues have been rebuilt around them.
+            self.assert_consistent();
         }
         self.compact();
+        self.assert_consistent();
     }
 
     /// The oldest queued id whose slot still matches `want`, dropping the stale entries ahead of it.
@@ -1033,6 +1047,61 @@ impl MarketEvents {
             self.live.shrink_to(2 * self.n_live.max(MAX_GUARDED_ORDERS));
             self.dead.shrink_to(2 * self.n_dead.max(MAX_GUARDED_ORDERS));
         }
+    }
+
+    /// The quantities this struct derives by hand, checked against the state they describe.
+    ///
+    /// Seven of the nine defects review has found in this guard were one of these disagreeing with
+    /// reality — a counter not mirrored on some drop path, a queue that lost an entry, a mask
+    /// clobbered instead of folded — rather than the retirement rule being wrong. Pinning those one
+    /// scenario at a time is what let each of them ship green, so they are asserted on **every**
+    /// mutation path instead: every test that touches this struct is now also an accounting test.
+    ///
+    /// Compiled out of release builds. The O(population) half is skipped on a market large enough for
+    /// it to matter, which is only the tests that deliberately drive one to its cap — everywhere else
+    /// it runs.
+    fn assert_consistent(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        debug_assert!(self.arms.len() <= ARM_BITS, "arms past the mask width");
+        debug_assert_eq!(
+            self.serving & !self.known,
+            0,
+            "a serving arm is always known"
+        );
+        debug_assert_eq!(
+            self.seen.len(),
+            self.order.len(),
+            "seen and its order disagree"
+        );
+        debug_assert!(
+            self.dead.len() >= self.n_dead,
+            "the dead queue lost a tombstone"
+        );
+        debug_assert!(
+            self.live.len() >= self.n_live,
+            "the live queue lost a floor"
+        );
+        debug_assert!(
+            self.sweep_at <= SWEEP_CEILING,
+            "a sweep scheduled past the ceiling"
+        );
+        if self.resting.len() > AUDIT_POPULATION {
+            return;
+        }
+        let (mut live, mut dead) = (0usize, 0usize);
+        for slot in self.resting.values() {
+            match slot {
+                Slot::Floor(..) => live += 1,
+                Slot::Tomb(_) => dead += 1,
+            }
+        }
+        debug_assert_eq!(self.n_live, live, "n_live disagrees with the floors held");
+        debug_assert_eq!(
+            self.n_dead, dead,
+            "n_dead disagrees with the tombstones held"
+        );
     }
 
     /// Record why this market must re-baseline. First cause wins: the flag is one-shot and a second
@@ -1994,6 +2063,7 @@ impl Arbiter {
             self.announce_disowned(&key, || clear_only(b));
         }
         self.shed_over_budget();
+        self.assert_budget_consistent();
     }
 
     /// Hold the tombstones across every market to [`MAX_TOMBSTONES_TOTAL`] by disowning the market
@@ -2005,6 +2075,19 @@ impl Arbiter {
     /// drifting apart would black out every *other* order-level market in turn. Disowning the largest
     /// holder returns its whole population at once, so this is not a per-batch scan: it runs only at
     /// the ceiling and drops well below it each time.
+    /// The process-wide tombstone total against the markets actually holding them.
+    ///
+    /// The running total is mirrored by hand on every take and release across seven drop paths, and a
+    /// slip in it is what disowns markets that did nothing. [`Self::shed_over_budget`] recounts at the
+    /// ceiling so a slip degrades rather than persists; this is what says a slip happened at all.
+    fn assert_budget_consistent(&self) {
+        if !cfg!(debug_assertions) || self.book_events.len() > AUDIT_MARKETS {
+            return;
+        }
+        let held: usize = self.book_events.values().map(|e| e.n_dead).sum();
+        debug_assert_eq!(self.guard.held, held, "the guard budget slipped");
+    }
+
     fn shed_over_budget(&mut self) {
         if self.guard.over() {
             let held = self.book_events.values().map(|e| e.n_dead).sum();
