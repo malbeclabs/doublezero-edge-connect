@@ -400,21 +400,23 @@ Modules are grouped by role under `src/`:
   publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
   order. Tombstones are deliberately **not** expired by the time window, which is what keeps
   `--arb-book-dedup-window-ms` a cost knob; **what retires one is the arms, not a clock or a count** —
-  every arm the market still counts (`known`: arriving within `PEER_SERVING_NS`, **or** reporting its
-  book in sync) has reported the removal. The arrival half ages out because a source that spoke once and
-  vanished — one forged datagram is enough — would pin the quorum forever; the `synced` half
-  deliberately does not, because a peer in sync with nothing on the wire *here yet* is the likeliest
-  source of a stale `Add` there is, and ageing it out lets that arm's first and only copy resurrect a
-  removed order (`a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`). ⚠️ Nothing expires
-  that flag short of the receiver exiting, so a publisher whose upstream stops while our receiver stays
-  bound holds each of its markets to `MAX_MARKET_TOMBSTONES` — memory and process-budget pressure, not a
-  blackout, since `serving` *does* age out and the eviction that follows reads as settled. Two things
-  besides a report retire a tombstone, and both are facts about an arm's own book rather than about the
-  clock: a snapshot re-seeding the order as live, and an arm's dropped `Clear`-led re-baseline, which
-  settles every tombstone that snapshot does **not** name (that arm no longer holds those orders and a
-  venue never reuses an id, so it can never contradict them). Without the second, two arms synced from
-  different snapshot anchors stall retirement permanently — the peer never reports a removal for an
-  order it never held — and the population reverts to the market's whole history. Reporting is otherwise
+  every arm the market still counts (`known`) has reported the removal. `known` is **every arm arriving
+  within `PEER_SERVING_NS`, plus a synced arm that has never reached this market at all** — that one
+  arm because its first copy is the likeliest stale `Add` there is, and ageing it out lets that copy
+  resurrect a removed order (`a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`). Every
+  other arm ages out on arrival, and must: a source that spoke once and vanished is minted by one
+  forged datagram, and nothing clears `synced` short of the receiver exiting, so a publisher whose
+  upstream dies behind a bound socket would otherwise hold every market it was synced on to
+  `MAX_MARKET_TOMBSTONES` — and sixteen of those reach the process-wide ceiling, where
+  `shed_over_budget` disowns the largest holder without asking whether its tombstones were settled.
+  One quiet publisher, a rolling venue-wide blackout. Retirement runs **head-of-queue per batch plus a
+  full sweep out of queue order** on a threshold that doubles after each sweep (O(1) amortized per
+  tombstone, nothing at all while the arms keep up). The sweep is not an optimization: `dead` is in
+  removal order, so head-only retirement lets one removal an arm never reports block every tombstone
+  behind it, and nothing re-supplies a report for an order that arm never held — two arms synced from
+  different snapshot anchors is the ordinary way there, and the population then grows with the market's
+  whole history rather than the arms' lag spread. **It changes only where retirement looks, never what
+  counts as evidence.** Reporting is
   the **only** evidence accepted: anything weaker infers an
   arm's position in the venue stream from something else it sent, and on this wire that is spoofable —
   one datagram echoing a just-published event from a lagging arm's address would retire that arm's
@@ -431,7 +433,7 @@ Modules are grouped by role under `src/`:
   across `MAX_BOOK_MARKETS`) with `MAX_MARKET_TOMBSTONES` (65,536) as the per-market backstop, since a
   per-market cap large enough for a busy market is no bound at all once multiplied out. Reaching either
   cap **invalidates** the market rather than forcing a re-baseline
-  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones_market`, the
+  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones_max`, the
   per-market high-water — the aggregate `dz_mbo_guarded_tombstones` is a sum against a ceiling sixteen
   times the cap that fires first, so one market walking to a blackout reads as flat headroom there):
   republishing our
@@ -439,8 +441,11 @@ Modules are grouped by role under `src/`:
   failed to protect — it would hand the consumer the resurrections stamped `snapshot`/`last` and
   re-seed them as live floors, so nothing removes them again. So `Arbiter::invalidate_market` drops the
   market's race state, replay entry and accumulators, tells consumers to drop the book with a bare
-  `Clear` (`announce_disowned`) and publishes **nothing** further until a producer sends a `Clear`-led
-  re-baseline of its own. The `Clear` needs a message's header fields, which the key alone does not
+  `Clear` (`announce_disowned`, once — the flag lives with the record, not on the evictable per-market
+  state) and publishes **nothing** further until a producer sends a `Clear`-led re-baseline of its own.
+  A market carrying that record also **routes as order-level** whatever its next batch contains, since
+  a producer's re-baseline for an *empty* book is a bare `Clear` with no order id and would otherwise
+  reach the single-arm authority, which cannot discharge the record. The `Clear` needs a message's header fields, which the key alone does not
   carry, so it is built from an accumulator (`BookAccumulator::to_clear`, header-only — materializing
   the 44k-order book a disowning just stopped vouching for would be the wrong price) **before** the
   state holding it is dropped, never deferred to the market's next batch: `shed_over_budget` disowns a

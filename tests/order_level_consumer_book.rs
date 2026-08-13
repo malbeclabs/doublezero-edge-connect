@@ -545,7 +545,7 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
 /// One venue event every [`SPACING_NS`], whatever an order's lifecycle costs. A lag of L therefore
 /// leaves `L / SPACING_NS` events inside the guard's own [`GUARD_CAP`] count bound, and
 /// `0.875 * L / (SPACING_NS * events_per_order)` removals inside its tombstone population.
-const SPACING_NS: u64 = 100_000; // 10k events/s — a stress rate, ~11x the flagship market's ~890/s
+const SPACING_NS: u64 = 1_120_000; // ~890 events/s, the flagship market's measured change rate
 
 /// Drive `pairs` orders through both arms with the slow one `lag_ns` behind **in arrival order**, not
 /// merely in its timestamps, and return the consumer's book beside the venue's. Every eighth order is
@@ -615,25 +615,23 @@ fn a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing() {
 /// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
 /// to keep a consumer's book identical to the venue's.
 ///
-/// **The measured figure is 100 ms at this event rate**, and what sets it is the guard's
-/// [`MAX_SEEN_ORDER_EVENTS`] **count** bound, not the 1 s time window: 1,024 events at 10k events/s is
-/// 102 ms, and the sweep is exact at 100 ms and gives way at 150. Past that an arm's copy of an add for
-/// an order the leader has already partially filled is no longer recognized as a duplicate — it reads
-/// as a second publisher claiming a larger resting size, a false `dz_mbo_arm_disagreement_total`, and
-/// the batches withheld behind the re-baseline it forces are lost rather than delayed. `docs/metrics.md`
-/// states that ceiling as `min(flag, 1024 / event_rate)`; this is it, measured.
+/// **Before this guard was sized by the arms' lag rather than by a per-market count of 512, that
+/// figure was 150 ms**, reproducing the same cliff a real two-publisher capture showed at 153 ms,
+/// where the consumer ended 994 orders wrong and never self-healed. It now holds to **1 s**, the last
+/// step below — twice the 500 ms at which that capture first diverges, and five times the widest
+/// separation those publishers ever showed.
 ///
-/// **Scaling to the real market, that is ~1.15 s**, since the flagship runs ~890 changes/s rather than
-/// this stress rate — which is why a real two-publisher capture holds to 500 ms with the same build
-/// while this sweep, at eleven times the event rate, gives way at a tenth of that. Compare the figures
-/// through the event rate, never directly.
-///
-/// The sweep is exact again at 1.5 s and beyond: a run that long ends shortly after a forced
-/// re-baseline, which republishes the whole book. That is an artifact of where the replay stops, not
-/// recovered correctness, so the assertion deliberately stops at the cliff.
+/// What sets the ceiling is the guard's [`GUARD_CAP`] **count** bound, not the 1 s dedup window: past
+/// 1,024 events in flight (1.15 s at this rate) an arm's copy of an add for an order the leader has
+/// already partially filled is no longer recognized as a duplicate — it reads as a second publisher
+/// claiming a larger resting size, a false `dz_mbo_arm_disagreement_total`, and the batches withheld
+/// behind the re-baseline it forces are lost rather than delayed. Measured: exact at 1 s, 223 orders
+/// wrong at 1.2 s. `docs/metrics.md` states that ceiling as `min(flag, 1024 / event_rate)`; this is it.
+/// It is also why raising the window alone buys nothing here, and why [`SPACING_NS`] has to be the
+/// real market's rate for the figure to mean anything.
 #[test]
-fn the_consumer_book_matches_the_venue_up_to_a_hundred_millisecond_inter_arm_lag() {
-    for lag_ms in [10u64, 50, 100] {
+fn the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag() {
+    for lag_ms in [10u64, 50, 100, 200, 300, 500, 800, 1_000] {
         let pairs = (lag_ms * 1_000_000 / SPACING_NS).max(GUARDED_ORDERS) * 2;
         let (consumer, venue) = replay_with_lag(pairs, lag_ms * 1_000_000, true);
         assert_eq!(consumer, venue, "diverged at {lag_ms}ms of inter-arm lag");

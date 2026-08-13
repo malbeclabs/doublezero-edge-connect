@@ -13,14 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
 ### Fixed
-- The resurrection guard's retirement no longer stalls on a removal one arm never reports. Retirement
-  is head-of-queue and accepts only a reported removal, so an arm whose snapshot anchor post-dates a
-  removal — it never held that order, so it never reports it — blocked every tombstone behind it for
-  the life of the market, and the population reverted from the arms' lag spread to the market's whole
-  history, exiting only at the per-market cap where the market is disowned. An arm's own `Clear`-led
-  re-baseline now settles every tombstone its snapshot does **not** name, whether or not that
-  re-baseline reached the consumer: the arm no longer holds those orders and a venue never reuses an
-  id, so it can never contradict them. An order the snapshot does name keeps its hold.
+- The resurrection guard's retirement no longer stalls on a removal one arm never reports. It ran
+  head-of-queue over the removal order, so an arm whose snapshot anchor post-dates a removal — it
+  never held that order, so it never reports it — blocked every tombstone behind it for the life of
+  the market, and the population reverted from the arms' lag spread to the market's whole history,
+  exiting only at the per-market cap where the market is disowned. Retirement now also sweeps out of
+  queue order, on a threshold that doubles after each sweep so it costs O(1) amortized per tombstone
+  and nothing at all while the arms keep up. **What counts as evidence is unchanged** — every arm
+  still reaching the market must have reported the removal — so a forged datagram buys exactly what
+  it bought before: one arm's bit on the one order it names.
 - A market disowned by the process-wide tombstone ceiling is announced when it happens rather than on
   its next batch. That market is not the one being admitted and need never send another — a market
   whose arms drifted apart and then both went quiet is exactly how one comes to hold the most
@@ -46,12 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   book exactly, and the guard's eviction never fires at any lag tested. With the wider dedup window
   below, first divergence on that capture moves from **153 ms to 2 s** — exact at every step through
   1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` now partially fills every order, so
-  it can produce the size disagreement the real capture shows; it asserts **100 ms** at its own event
-  rate, which is not the capture's figure scaled down but the *other* limit — `seen` is capped at 1024
-  events per market whatever the window, and that sweep runs at 10k events/s against the flagship's
-  ~890/s, putting the same bound at ~1.15 s there. Compare the two through the event rate, never
-  directly. A separate replay, of orders cancelled without ever trading, still pins that holding more
-  than the old 512 tombstones costs the market nothing.
+  it can produce the size disagreement the real capture shows, and it runs at the flagship's measured
+  ~890 changes/s rather than a stress rate, so its figure is comparable to the capture's. It holds to
+  1 s and is 223 orders wrong at 1.2 s — the ceiling being `seen`'s 1024-event cap (1.15 s at that
+  rate), not the dedup window. A separate replay, of orders cancelled without ever trading, pins that
+  holding more than the old 512 tombstones costs the market nothing.
 
 ### Changed
 - `--arb-book-dedup-window-ms` now defaults to 1000 (was 250). The window stopped being the guard's
@@ -66,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above,
   `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling, and
-  `dz_mbo_guarded_tombstones_market` reports the largest single market's population against the
+  `dz_mbo_guarded_tombstones_max` reports the largest single market's population against the
   per-market cap — **the one to alert on**, since that cap fires at a sixteenth of the aggregate and a
   market walking to a blackout is flat headroom on the sum. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"`
   label, which no longer has a behaviour behind it.

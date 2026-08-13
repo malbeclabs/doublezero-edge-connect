@@ -220,7 +220,7 @@ pub struct Metrics {
     /// The largest tombstone population any single market holds, against the per-market cap — which is
     /// a sixteenth of the process-wide one, and so the cap that fires first. Unlabelled: the market is
     /// wire-supplied and there are up to 16,384 of them.
-    pub mbo_guarded_tombstones_market: IntGauge,
+    pub mbo_guarded_tombstones_max: IntGauge,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -752,9 +752,9 @@ impl Metrics {
                  tracked market, against a process-wide ceiling of 1048576. Sized by how far the \
                  publishers lag each other; reaching the ceiling is what invalidates markets.",
             ),
-            mbo_guarded_tombstones_market: gauge(
+            mbo_guarded_tombstones_max: gauge(
                 &registry,
-                "dz_mbo_guarded_tombstones_market",
+                "dz_mbo_guarded_tombstones_max",
                 "The largest tombstone population any single order-level market holds, against a \
                  per-market cap of 65536 — a sixteenth of the process-wide ceiling, and so the cap \
                  that fires first. Alert on this rather than on the aggregate: one market walking to \
@@ -1078,7 +1078,7 @@ mod tests {
             .with_label_values(&["HYPERLIQUID"])
             .inc();
         m.mbo_guarded_tombstones.set(7);
-        m.mbo_guarded_tombstones_market.set(3);
+        m.mbo_guarded_tombstones_max.set(3);
         m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
@@ -1134,7 +1134,7 @@ mod tests {
             "dz_mbo_forced_rebaselines_total",
             "dz_mbo_market_invalidations_total",
             "dz_mbo_guarded_tombstones",
-            "dz_mbo_guarded_tombstones_market",
+            "dz_mbo_guarded_tombstones_max",
             "dz_hl_sink_clients",
             "dz_hl_sink_messages_total",
             "dz_shred_wins_total",
