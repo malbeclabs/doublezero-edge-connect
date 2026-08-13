@@ -1223,6 +1223,14 @@ pub struct Arbiter {
     book_sync: HashMap<MarketKey, HashMap<Publisher, PeerState>>,
     /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
     book_events: HashMap<MarketKey, MarketEvents>,
+    /// Markets disowned and not yet re-baselined by a producer, held **outside** `book_markets` and
+    /// deliberately not dropped with it: `MAX_BOOK_MARKETS` eviction takes the whole `BookMarket`, and
+    /// `order_level` is re-derived from the next batch's content, so a market that carried the flag
+    /// there would come back reading as ordinary and resume serving deltas onto a book nothing vouches
+    /// for. Bounded by the same cap, oldest first, with `invalidated_order` as the eviction queue;
+    /// losing the oldest entry degrades to exactly that, which is what the cap costs.
+    invalidated_markets: HashSet<MarketKey>,
+    invalidated_order: VecDeque<MarketKey>,
     /// Tombstones held across every market in `book_events`, bounded by [`MAX_TOMBSTONES_TOTAL`].
     guard: GuardBudget,
     /// How long a delivered order event is remembered (`--arb-book-dedup-window-ms`).
@@ -1275,10 +1283,6 @@ struct BookMarket {
     /// datagram can raise the flag and each discharge costs a whole book, so without it the counter is
     /// a lever rather than an observable.
     rebaselined_ns: u64,
-    /// The market is disowned and publishes nothing until a producer re-baselines it — see
-    /// [`Arbiter::invalidate_market`]. Unlike `rebaseline` this cannot be discharged from our own
-    /// state, which is the whole point of it.
-    invalidated: bool,
     /// Whether the bare `Clear` telling consumers to drop that book has gone out
     /// ([`Arbiter::announce_disowned`]).
     disowned_announced: bool,
@@ -1458,6 +1462,8 @@ impl Arbiter {
             book_replay: None,
             book_sync: HashMap::new(),
             book_events: HashMap::new(),
+            invalidated_markets: HashSet::new(),
+            invalidated_order: VecDeque::new(),
             guard: GuardBudget::default(),
             book_dedup_window_ns: DEFAULT_BOOK_DEDUP_WINDOW_NS,
         }
@@ -1819,7 +1825,7 @@ impl Arbiter {
             .entry(publisher)
             .or_default()
             .last_seen_ns = now;
-        let invalid = self.book_markets.get(&key).is_some_and(|m| m.invalidated);
+        let invalid = self.invalidated_markets.contains(&key);
         if b.changes
             .first()
             .is_some_and(|c| c.action == BookAction::Clear)
@@ -2014,6 +2020,7 @@ impl Arbiter {
             model::lock(replay).remove(key);
         }
         self.books.forget_market(key);
+        self.mark_invalidated(key);
         if !self.book_markets.contains_key(key) {
             self.track_book_market(key);
         }
@@ -2024,7 +2031,6 @@ impl Arbiter {
             // Kept: the market is still order-level, and losing that memo would route its next bare
             // `Clear` — the one batch that ends the outage — through the single-arm authority instead.
             m.order_level = true;
-            m.invalidated = true;
             m.disowned_announced = false;
         }
         metrics()
@@ -2034,6 +2040,29 @@ impl Arbiter {
         if let Some(clear) = announcement {
             self.announce_disowned(key, clear);
         }
+    }
+
+    /// Record that `key` is disowned, evicting the oldest such record to stay within
+    /// [`MAX_BOOK_MARKETS`]. A forgotten record degrades that market to the pre-existing behaviour —
+    /// it resumes on its next batch without a producer re-baseline — rather than growing without bound
+    /// on a wire-supplied key.
+    fn mark_invalidated(&mut self, key: &MarketKey) {
+        if !self.invalidated_markets.insert(key.clone()) {
+            return;
+        }
+        self.invalidated_order.push_back(key.clone());
+        while self.invalidated_order.len() > MAX_BOOK_MARKETS {
+            if let Some(old) = self.invalidated_order.pop_front() {
+                self.invalidated_markets.remove(&old);
+            }
+        }
+    }
+
+    /// Discharge the record: a producer has re-established the market with a `Clear`-led re-baseline,
+    /// which is the only thing that can. `invalidated_order` keeps the entry as slack, bounded by its
+    /// own cap above.
+    fn clear_invalidated(&mut self, key: &MarketKey) {
+        self.invalidated_markets.remove(key);
     }
 
     /// A bare `clear` carrying this market's header, from whatever accumulated book is still around to
@@ -2065,6 +2094,12 @@ impl Arbiter {
     /// need never send another batch. Waiting for one is how the two contradictory consumer states
     /// above become permanent.
     fn announce_disowned(&mut self, key: &MarketKey, clear: NormalizedBook) {
+        // The once-guard lives on the `BookMarket`, which eviction takes; re-admit the key so an
+        // evicted disowning still announces. A repeat `Clear` costs a consumer nothing — it has no
+        // book left to drop — where a swallowed one leaves it holding a frozen book forever.
+        if !self.book_markets.contains_key(key) {
+            self.track_book_market(key);
+        }
         match self.book_markets.get_mut(key) {
             Some(m) if !m.disowned_announced => m.disowned_announced = true,
             _ => return,
@@ -2085,10 +2120,10 @@ impl Arbiter {
             .entry(key.clone())
             .or_default()
             .rebaselined(&b.changes, &mut self.guard);
+        self.clear_invalidated(key);
         if let Some(m) = self.book_markets.get_mut(key) {
             m.rebaseline = false;
             m.withheld = 0;
-            m.invalidated = false;
             m.disowned_announced = false;
         }
         self.note_book_delivery(key, b, publisher, now);
@@ -6535,6 +6570,57 @@ mod tests {
         assert_eq!(sent[0].changes[0].action, BookAction::Clear);
         assert_eq!(&*sent[0].symbol, "BTC", "and carry the market's own header");
         assert_eq!(sent[0].instrument_id, BOOK_INSTRUMENT);
+    }
+
+    /// `MAX_BOOK_MARKETS` eviction takes the whole `BookMarket`, and `order_level` is re-derived from
+    /// the next batch's content — so a disowning recorded only there comes back reading as an ordinary
+    /// market and resumes serving deltas onto a book nothing vouches for, with no producer re-baseline
+    /// and no `Clear`.
+    #[test]
+    fn evicting_a_disowned_market_does_not_let_it_resume_serving_deltas() {
+        const VENUE: &str = "BookGuardEvictedDisown";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 1, 100.0, 1.0)],
+                1_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        a.invalidate_market(&key, VENUE);
+        let _ = drain_books(&mut rx);
+        for i in 0..(MAX_BOOK_MARKETS as u32 + 1) {
+            a.track_book_market(&mkey(VENUE, 10_000 + i));
+        }
+        assert!(!a.book_markets.contains_key(&key), "the market is evicted");
+
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 2, 100.0, 3.0)], 5_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        assert!(
+            drain_books(&mut rx)
+                .iter()
+                .all(|b| b.changes.iter().all(|c| c.action == BookAction::Clear)),
+            "a disowned market must publish nothing but the clear, however it lost its state"
+        );
+
+        // And a producer's own re-baseline is still what ends it.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 5, 97.0, 2.0)],
+                6_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(consumer_book(&mut rx), BTreeMap::from([(5, 2.0)]));
     }
 
     /// A running total that has slipped must cost a recount, not the whole product. Shedding trusts
