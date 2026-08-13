@@ -525,7 +525,7 @@ struct MarketEvents {
     /// that mask and of the authority's own per-scope arm cap.
     arms: Vec<Publisher>,
     /// Which of `arms` are serving right now — synced, and on the wire within [`PEER_SERVING_NS`].
-    /// Refreshed per batch from `book_sync` (`Arbiter::sync_book_arms`), so a gapped or departed arm
+    /// Refreshed per batch from `book_sync` (`Arbiter::refresh_serving`), so a gapped or departed arm
     /// stops holding tombstones un-spent while a lagging one, whose copies are dropped as duplicates
     /// rather than published, still counts.
     serving: u8,
