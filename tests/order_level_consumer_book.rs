@@ -285,9 +285,13 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
 /// cap has to name it; a wrong value here makes the test weaker, never wrong.
 const GUARD_CAP: u64 = 1024;
 
-/// Mirrors the arbiter's private `MAX_GUARDED_ORDERS`: the live floors and the tombstones are bounded
-/// apart, each to half of [`GUARD_CAP`].
+/// Mirrors the arbiter's private `MAX_GUARDED_ORDERS`: the live resting-quantity floors, bounded
+/// apart from the tombstones and to half of [`GUARD_CAP`].
 const GUARDED_ORDERS: u64 = GUARD_CAP / 2;
+
+/// Mirrors the arbiter's private `MAX_MARKET_TOMBSTONES`: how many removed orders one market's
+/// resurrection guard holds before it can no longer answer.
+const MARKET_TOMBSTONES: u64 = 65_536;
 
 /// The wiring every scenario shares: one order-level market on a two-publisher venue, both arms
 /// synced, racing exactly as the Market-by-Order processor drives it.
@@ -432,12 +436,13 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     assert_eq!(consumer, venue);
 }
 
-/// The dead population's cap can only be crossed by a batch that carries a removal, so the batch that
-/// raises a guard eviction is always the batch that killed an order. Discarding it leaves that order
-/// resting in the consumer's book, the forced re-baseline republishes it as live, and the seed marks it
-/// live in the guard too — nothing removes it again.
+/// Past the guard's cap the merge point can no longer tell a lagging arm's stale `Add` from a live
+/// one, and **our own accumulated view is not an answer to that** — it is what the guard was
+/// protecting. Republishing it hands the consumer whatever resurrections got in, stamped as a
+/// complete book, and re-seeds them as live orders nothing will remove again. The market must go dark
+/// instead, and the removals that reached the wire on the way must still have reached it.
 #[test]
-fn a_guard_eviction_does_not_leak_the_removal_that_raised_it() {
+fn an_unanswerable_guard_does_not_republish_our_own_view() {
     let (mut a, mut rx, fast, slow) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
@@ -448,52 +453,142 @@ fn a_guard_eviction_does_not_leak_the_removal_that_raised_it() {
     a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
     a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
 
-    // One order past the cap, each add and its delete in their own batch: the delete that crosses the
-    // cap evicts the oldest tombstone, which no peer has reported and is therefore not spent.
-    for i in 0..=GUARDED_ORDERS {
-        let (id, at) = (100 + i, 10_000 + i * 10_000);
-        a.emit(
-            batch(vec![change(id, BookSide::Ask, 200.0, 1.0)], at),
-            fast,
-            CATEGORY,
-        );
-        a.emit(
-            batch(vec![change(id, BookSide::Ask, 200.0, 0.0)], at + 1_000),
-            fast,
-            CATEGORY,
-        );
+    // The order the lagging arm is still holding an add for, killed by the fast arm before it starts.
+    let stale_add = change(7, BookSide::Bid, 100.0, 6.0);
+    a.emit(batch(vec![stale_add], 2_000), fast, CATEGORY);
+    a.emit(
+        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 2_100),
+        fast,
+        CATEGORY,
+    );
+
+    // One order past the cap. Chunked only so the scenario is a few dozen batches rather than 131,072
+    // of them; what matters is that the slow arm reports none of these removals, so none of the
+    // tombstones can be retired and the cap is what gives way.
+    const CHUNK: u64 = 2_048;
+    for c in 0..=(MARKET_TOMBSTONES / CHUNK) {
+        let (base, at) = (100 + c * CHUNK, 10_000 + c * 10_000);
+        let ids = base..base + CHUNK;
+        let adds = ids
+            .clone()
+            .map(|id| change(id, BookSide::Ask, 200.0, 1.0))
+            .collect();
+        let deletes = ids
+            .map(|id| change(id, BookSide::Ask, 200.0, 0.0))
+            .collect();
+        a.emit(batch(adds, at), fast, CATEGORY);
+        a.emit(batch(deletes, at + 1_000), fast, CATEGORY);
         drain_into(&mut rx, &mut consumer);
     }
     assert_eq!(
         consumer, venue,
-        "a guard eviction must not swallow the removal that raised it"
+        "a guard eviction must not swallow the removals that raised it"
     );
 
-    // And the re-baseline that eviction forced must not bless the leak: it republishes what reached
-    // the wire, then re-seeds every order in it as a live floor.
-    venue.insert(2, (BookSide::Bid, 91.0, 1.0));
+    // The lagging arm's first and only copy of the add for the order that is already gone, and the
+    // fast arm streaming on. The market is disowned, so neither reaches the consumer — and nothing
+    // republishes the book we stopped vouching for.
+    a.emit(batch(vec![stale_add], 90_000_000), slow, CATEGORY);
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_000_000),
+        batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_100_000),
         fast,
         CATEGORY,
     );
-    // No arm sent a `Clear`, so one on the wire is the eviction the loop above was built to cause.
-    // Without this the scenario passes vacuously if [`GUARDED_ORDERS`] ever stops matching the cap.
-    let mut rebaselined = false;
+    let mut republished = 0usize;
     while let Ok(m) = rx.try_recv() {
         if let FeedMessage::Book(b) = &*m {
-            rebaselined |= b
-                .changes
+            if b.changes
                 .first()
-                .is_some_and(|c| c.action == BookAction::Clear);
+                .is_some_and(|c| c.action == BookAction::Clear)
+            {
+                republished = republished.max(b.changes.len());
+            }
             apply(&mut consumer, b);
         }
     }
-    assert!(rebaselined, "the loop must have crossed the guard's cap");
+    assert_eq!(republished, 0, "a disowned market must republish nothing");
+    assert_eq!(consumer, venue, "and must not resurrect a dead order");
+
+    // A producer's own snapshot is what ends the outage, and it is the venue's book, not ours.
+    venue.insert(3, (BookSide::Ask, 105.0, 2.0));
+    a.emit(snapshot(&venue, 91_000_000), fast, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
     assert_eq!(
         consumer, venue,
-        "and the forced re-baseline must not revive it"
+        "a producer re-baseline must re-establish it"
     );
+}
+
+/// One venue event every [`SPACING_NS`], so a lag of L nanoseconds leaves `L / SPACING_NS` removals in
+/// flight — the population the resurrection guard has to hold.
+const SPACING_NS: u64 = 100_000; // 10k events/s, an unremarkable rate for the flagship market
+
+/// Drive `pairs` orders through both arms with the slow one `lag_ns` behind **in arrival order**, not
+/// merely in its timestamps, and return the consumer's book beside the venue's. Every eighth order is
+/// never removed, so the end state is a book rather than an empty map.
+fn replay_with_lag(pairs: u64, lag_ns: u64) -> (Book, Book) {
+    let (mut a, mut rx, fast, slow) = harness();
+    a.set_book_dedup_window(250_000_000); // the shipped --arb-book-dedup-window-ms
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
+
+    let mut arrivals: Vec<(u64, bool, BookChange)> = Vec::new();
+    for i in 0..pairs {
+        let (id, at) = (100 + i, 10_000 + i * SPACING_NS);
+        let px = 200.0 + (i % 50) as f64;
+        let add = change(id, BookSide::Ask, px, 1.0);
+        let mut events = vec![(at, add)];
+        if i % 8 == 0 {
+            venue.insert(id, (BookSide::Ask, px, 1.0));
+        } else {
+            events.push((at + SPACING_NS / 2, change(id, BookSide::Ask, px, 0.0)));
+        }
+        for (t, c) in events {
+            arrivals.push((t, true, c));
+            arrivals.push((t + lag_ns, false, c));
+        }
+    }
+    arrivals.sort_by_key(|&(t, is_fast, _)| (t, !is_fast));
+    for (t, is_fast, c) in arrivals {
+        let arm = if is_fast { fast } else { slow };
+        a.emit(batch(vec![c], t), arm, CATEGORY);
+        drain_into(&mut rx, &mut consumer);
+    }
+    (consumer, venue)
+}
+
+/// A lagging arm holds every tombstone the leader makes open until it catches up, so the population
+/// the guard has to hold is the removals inside that lag — thousands on a busy market, where the
+/// per-market count it used to be bounded by was 512. Crossing that count must no longer cost the
+/// market anything.
+#[test]
+fn a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing() {
+    // 600ms of removals in flight against a cap of GUARDED_ORDERS.
+    let (consumer, venue) = replay_with_lag(GUARDED_ORDERS * 4, 60 * SPACING_NS * 10);
+    assert_eq!(consumer, venue);
+}
+
+/// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
+/// to keep a consumer's book identical to the venue's.
+///
+/// **Before this guard was sized by the arms' lag rather than by a per-market count of 512, that
+/// figure was 150 ms** — 512 removals at this rate, and this sweep reproduces the same cliff a real
+/// two-publisher capture showed at 153 ms, where the consumer ended 994 orders wrong and never
+/// self-healed. It now holds to **1 s**, the last step below: 10,000 removals in flight, five times
+/// the widest separation those publishers ever showed. Measured further out, it is still exact at 4 s
+/// and gives way at 8 s, which is the per-market tombstone cap (65,536 removals, 6.5 s at this rate) —
+/// and gives way by going *dark*, not by publishing a book that is wrong.
+///
+/// Above the 250 ms dedup window the arms stop recognizing each other's copies at all, so the steps
+/// past it are also what pins that the guard — not the window — is what keeps the book correct.
+#[test]
+fn the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag() {
+    for lag_ms in [10u64, 50, 150, 300, 600, 1_000] {
+        let pairs = (lag_ms * 1_000_000 / SPACING_NS).max(GUARDED_ORDERS) * 2;
+        let (consumer, venue) = replay_with_lag(pairs, lag_ms * 1_000_000);
+        assert_eq!(consumer, venue, "diverged at {lag_ms}ms of inter-arm lag");
+    }
 }
 
 /// `forced` is one-shot and first-cause-wins, so the reason it carries does not say what the batch

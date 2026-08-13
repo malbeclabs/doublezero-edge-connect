@@ -207,10 +207,16 @@ pub struct Metrics {
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
     pub book_resurrections_dropped: IntCounterVec,
-    /// Order-level markets forced to re-baseline because the cross-publisher guard could not answer:
-    /// `disagreement` (two arms claimed different resting state) or `guard_evicted` (a tracked order
-    /// aged out at the per-market cap).
+    /// Order-level markets forced to re-baseline because two arms claimed different resting state for
+    /// one order (`reason="disagreement"`).
     pub mbo_forced_rebaselines: IntCounterVec,
+    /// Order-level markets disowned because the resurrection guard lost a tombstone no serving arm had
+    /// passed. The market publishes nothing until a producer re-baselines it, so this is an
+    /// availability alarm, not a throughput figure.
+    pub mbo_market_invalidations: IntCounterVec,
+    /// Tombstones the resurrection guard holds across every tracked market, against the process-wide
+    /// ceiling. The headroom to watch: it is readable long before the guard runs out of it.
+    pub mbo_guarded_tombstones: IntGauge,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -722,10 +728,25 @@ impl Metrics {
                 "dz_mbo_forced_rebaselines_total",
                 "Order-level markets withheld and re-baselined because the cross-publisher guard \
                  could not answer. reason=disagreement: two arms claimed different resting state for \
-                 one order, so neither is known to be right. reason=guard_evicted: a tracked order \
-                 aged out at the per-market cap, reopening the resurrection path. A sustained rate on \
-                 either is the signal to reconsider the per-publisher book model.",
+                 one order, so neither is known to be right. A sustained rate is the signal to \
+                 reconsider the per-publisher book model.",
                 &["venue", "reason"],
+            ),
+            mbo_market_invalidations: counter_vec(
+                &registry,
+                "dz_mbo_market_invalidations_total",
+                "Order-level markets disowned because the resurrection guard lost a tombstone no \
+                 serving arm had passed, so a lagging publisher's stale add for that order could no \
+                 longer be refused. The market's state is dropped and nothing is published for it \
+                 until a publisher re-baselines it, which is an outage for that market.",
+                &["venue"],
+            ),
+            mbo_guarded_tombstones: gauge(
+                &registry,
+                "dz_mbo_guarded_tombstones",
+                "Removed orders the cross-publisher resurrection guard is holding across every \
+                 tracked market, against a process-wide ceiling of 1048576. Sized by how far the \
+                 publishers lag each other; reaching the ceiling is what invalidates markets.",
             ),
             trades_no_id: counter_vec(
                 &registry,
@@ -1041,6 +1062,10 @@ mod tests {
         m.mbo_forced_rebaselines
             .with_label_values(&["HYPERLIQUID", "disagreement"])
             .inc();
+        m.mbo_market_invalidations
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_guarded_tombstones.set(7);
         m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
@@ -1094,6 +1119,10 @@ mod tests {
             "dz_mbo_arm_disagreement_total",
             "dz_book_resurrections_dropped_total",
             "dz_mbo_forced_rebaselines_total",
+            "dz_mbo_market_invalidations_total",
+            "dz_mbo_guarded_tombstones",
+            "dz_mbo_market_invalidations_total",
+            "dz_mbo_guarded_tombstones",
             "dz_hl_sink_clients",
             "dz_hl_sink_messages_total",
             "dz_shred_wins_total",
