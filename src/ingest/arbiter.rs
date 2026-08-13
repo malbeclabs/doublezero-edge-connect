@@ -877,10 +877,18 @@ impl MarketEvents {
     /// the second a tombstone is held for an arm that has departed, and a market with more lifetime
     /// deletes than the guard's cap — which is every busy market — would be invalidated forever.
     ///
-    /// Both masks age out on arrival, and `known` **must**: an arm is entered into `book_sync` by one
-    /// batch and removed only when its receiver exits, so a source that spoke once and vanished — a
-    /// forged datagram is enough — would otherwise sit in the retirement quorum for the life of the
-    /// process, retire nothing, and take the market to its cap.
+    /// `known`'s arrival term **must** age out: a source that spoke once and vanished is entered into
+    /// `book_sync` by that one datagram — a forged one is enough — and would otherwise sit in the
+    /// retirement quorum for the life of the process, retire nothing, and take the market to its cap.
+    ///
+    /// Its `synced` term deliberately does not, and that is the one arm ageing would cost most: a peer
+    /// in sync with nothing on the wire *here yet* is the likeliest source of a stale `Add` there is,
+    /// and dropping it lets that arm's first and only copy of an add resurrect an order the venue
+    /// removed (`a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`). Nothing expires the
+    /// flag short of the receiver exiting, so a publisher whose upstream stops while the receiver stays
+    /// bound holds this market's tombstones to [`MAX_MARKET_TOMBSTONES`] — memory, and pressure on the
+    /// process-wide budget, but **not** a blackout: `serving` ages out on arrival, so the eviction that
+    /// follows reads as settled and invalidates nothing.
     ///
     /// Called on the batch being admitted, from the race state the caller already holds, because
     /// `serving` is read only while a batch is admitted: refreshed through a separate lookup ahead of
@@ -6307,6 +6315,36 @@ mod tests {
             "the population is the arms' lag spread, not the market's history: {} held",
             a.book_events[&key].n_dead
         );
+    }
+
+    /// `known` counts a synced arm that has sent nothing for this market yet, and ageing that term out
+    /// on arrival like the other one would cost the guard exactly the arm it is held open for: a peer
+    /// in sync whose *first* copy for the market is an add for an order its faster peer already killed.
+    /// The price is that nothing expires the flag short of the receiver exiting, so a publisher whose
+    /// upstream stops while the receiver stays bound holds the market's tombstones to the per-market
+    /// cap — memory, not a blackout, since `serving` does age out and the eviction reads as settled.
+    #[test]
+    fn a_synced_arm_with_nothing_on_the_wire_yet_holds_the_retirement_quorum() {
+        const VENUE: &str = "BookGuardSyncedSilent";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let before = invalidations(VENUE);
+        // Arm 2 is synced and has never reached the wire for this market.
+        a.emit(removals(VENUE, 1..=64, 1_000), arm(1), TEST_CATEGORY);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 9, 100.0, 1.0)], 2_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(
+            a.book_events[&key].n_dead, 64,
+            "a synced peer's copy is exactly what a tombstone is held for"
+        );
+        // And it costs the market nothing when that arm departs rather than arriving: `serving` ages
+        // out on arrival, so the eviction at the cap reads as settled.
+        assert_eq!(invalidations(VENUE), before);
     }
 
     /// The tombstone budget is process-wide, so one busy market holds what its own arms' lag needs
