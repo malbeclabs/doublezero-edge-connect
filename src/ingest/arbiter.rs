@@ -581,12 +581,13 @@ impl GuardBudget {
         self.held > MAX_TOMBSTONES_TOTAL
     }
 
-    /// Note one market's tombstone population, keeping the per-market high-water in O(1).
+    /// Raise the per-market high-water onto `key`, in O(1). A market that *falls* below the figure it
+    /// holds is [`Arbiter::observe_market_peak`]'s to re-seat: only that scope can see what the
+    /// remaining markets hold.
     fn observe_market(&mut self, key: &MarketKey, n_dead: usize) {
-        let mine = self.peak_market.as_ref() == Some(key);
-        if n_dead > self.peak || (mine && n_dead != self.peak) {
+        if n_dead > self.peak {
             self.peak = n_dead;
-            self.peak_market = (n_dead > 0).then(|| key.clone());
+            self.peak_market = Some(key.clone());
             metrics().mbo_guarded_tombstones_max.set(n_dead as i64);
         }
     }
@@ -596,8 +597,8 @@ impl GuardBudget {
         self.peak_market.as_ref() == Some(key)
     }
 
-    /// Re-seat the high-water on `(key, n_dead)`, the largest market left after the one holding it was
-    /// dropped.
+    /// Re-seat the high-water on `(key, n_dead)`, the largest market left once the one holding it
+    /// stopped describing the figure — dropped, or retired below it.
     fn reseat_peak(&mut self, largest: Option<(MarketKey, usize)>) {
         let (key, n_dead) = largest.unzip();
         self.peak = n_dead.unwrap_or(0);
@@ -1876,17 +1877,41 @@ impl Arbiter {
         };
         self.guard.release(events.n_dead);
         if self.guard.peaks(key) {
-            // One scan of the tracked markets, on a path that runs on a disowning, a session reset or
-            // an eviction — never per batch. Leaving the figure at zero instead would report full
-            // headroom exactly when `shed_over_budget`, which disowns the largest holder, is running.
-            let largest = self
-                .book_events
-                .iter()
-                .max_by_key(|(_, e)| e.n_dead)
-                .filter(|(_, e)| e.n_dead > 0)
-                .map(|(k, e)| (k.clone(), e.n_dead));
+            // Leaving the figure at zero instead would report full headroom exactly when
+            // `shed_over_budget`, which disowns the largest holder, is running.
+            let largest = self.largest_tombstone_holder();
             self.guard.reseat_peak(largest);
         }
+    }
+
+    /// The market holding the most tombstones, and how many — one pass over the tracked markets.
+    fn largest_tombstone_holder(&self) -> Option<(MarketKey, usize)> {
+        self.book_events
+            .iter()
+            .max_by_key(|(_, e)| e.n_dead)
+            .filter(|(_, e)| e.n_dead > 0)
+            .map(|(k, e)| (k.clone(), e.n_dead))
+    }
+
+    /// Note one market's tombstone population against the per-market high-water
+    /// (`dz_mbo_guarded_tombstones_max`).
+    ///
+    /// A **shrink** of the market that holds the figure re-seats it from the markets themselves, and
+    /// that is the whole reason this sits on [`Arbiter`] rather than on [`GuardBudget`]. Lowered to the
+    /// shrunken market's own population instead, the gauge reports the headroom of a market whose arms
+    /// just caught up while a quiet one sits on the real maximum — and the quiet holder, whose
+    /// tombstones nothing will ever report, is the market this gauge exists to find. It reads zero
+    /// outright when the holder retires to nothing.
+    ///
+    /// One pass over the tracked markets, taken on the largest holder's own batches and only when it
+    /// actually fell; every other batch stays O(1).
+    fn observe_market_peak(&mut self, key: &MarketKey, n_dead: usize) {
+        if self.guard.peaks(key) && n_dead < self.guard.peak {
+            let largest = self.largest_tombstone_holder();
+            self.guard.reseat_peak(largest);
+            return;
+        }
+        self.guard.observe_market(key, n_dead);
     }
 
     /// Drop one market's tracked `book` state — the session-reset seam, mirroring
@@ -2046,7 +2071,8 @@ impl Arbiter {
         }
         let forced = events.forced.take();
         let invalidated = std::mem::take(&mut events.invalidated);
-        budget.observe_market(&key, events.n_dead);
+        let n_dead = events.n_dead;
+        self.observe_market_peak(&key, n_dead);
         let venue = b.venue.as_ref();
         if deduped > 0 {
             metrics()
@@ -6792,6 +6818,60 @@ mod tests {
             a.guard.peak, 8,
             "and dropping the market that set it re-seats on the largest survivor, never on zero"
         );
+    }
+
+    /// The high-water must not follow the market that holds it back down. When that market's arms catch
+    /// up and it retires to nothing, the figure it leaves behind is the *next* largest holder's — and a
+    /// market that has gone quiet holding tombstones nobody will report is exactly what this gauge
+    /// exists to find. Reported as the shrunken market's own population it reads as full headroom while
+    /// a market sits on the real maximum, and dropping the holder is not the only way the figure can
+    /// stop describing it.
+    #[test]
+    fn the_high_water_re_seats_when_the_market_holding_it_retires_rather_than_reading_zero() {
+        const VENUE: &str = "BookGuardPeakShrink";
+        const QUIET_INSTRUMENT: u32 = BOOK_INSTRUMENT + 1;
+        const QUIET: u64 = 50;
+        const BUSY: u64 = 200;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let busy: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let quiet: MarketKey = mkey(VENUE, QUIET_INSTRUMENT);
+        a.set_book_synced(&quiet, arm(1), true);
+        a.set_book_synced(&quiet, arm(2), true);
+        // The quiet market's peer never reports, so it holds its tombstones and then goes silent.
+        let quiet_removals = |ids: std::ops::RangeInclusive<u64>, at: u64| {
+            book(
+                VENUE,
+                QUIET_INSTRUMENT,
+                ids.map(|oid| order(BookAction::Delete, oid, 100.0, 0.0))
+                    .collect(),
+                true,
+                at,
+            )
+        };
+        a.emit(quiet_removals(1..=QUIET, 1_000), arm(1), TEST_CATEGORY);
+        // The busy market takes the high-water, then both its arms report every removal.
+        a.emit(removals(VENUE, 1..=BUSY, 2_000), arm(1), TEST_CATEGORY);
+        assert_eq!(a.guard.peak, BUSY as usize, "the busy market holds it");
+        a.emit(removals(VENUE, 1..=BUSY, 3_000), arm(2), TEST_CATEGORY);
+        // One more batch, on which retirement takes the whole settled population.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 9_000, 100.0, 1.0)],
+                4_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(a.book_events[&busy].n_dead, 0, "the busy market retired");
+        assert_eq!(a.book_events[&quiet].n_dead, QUIET as usize);
+        assert_eq!(
+            a.guard.peak, QUIET as usize,
+            "the high-water re-seats on the largest survivor, never on the shrunken market"
+        );
+        assert_eq!(a.guard.peak_market.as_ref(), Some(&quiet));
     }
 
     /// The process-wide ceiling must fall on the market holding the tombstones, never on whichever
