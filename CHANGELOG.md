@@ -25,14 +25,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs it), with the ceiling charged to the market holding the tombstones rather than to whichever
   market records the next removal; and a guard that genuinely cannot answer **disowns** the market —
   state and replay entry dropped, consumers told to drop the book, nothing published until a producer
-  re-baselines it — rather than republishing our own view. A synthetic two-arm lag sweep that diverged
-  at 150 ms is now exact to 1 s, and to 4 s when driven further.
+  re-baselines it — rather than republishing our own view. Replaying the two real captured publishers,
+  a consumer that ended 994 orders wrong at 300 ms of inter-arm lag, permanently, now holds the venue's
+  book exactly, and the guard's eviction never fires at any lag tested. With the wider dedup window
+  below, first divergence on that capture moves from **153 ms to 2 s** — exact at every step through
+  1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` asserts 1 s independently, though it
+  never partially fills an order and so cannot produce the size disagreement the real capture shows.
+
+### Changed
+- `--arb-book-dedup-window-ms` now defaults to 1000 (was 250). The window stopped being the guard's
+  reach, so what it governs now is whether a lagging arm's copy is recognized as a duplicate at all:
+  below the arms' real separation, a stale copy of an add for an order the leader has since partially
+  filled reads as a size *disagreement* between two healthy publishers, forcing a re-baseline whose
+  withheld batches are lost. On the real two-publisher capture this is worth 500 ms → 2 s of tolerated
+  inter-arm lag, and it takes the disagreements those healthy arms manufactured to zero. Costs nothing
+  — `seen` is capped at 1024 events per market independently of the window, which is also why a value
+  much above a second is inert on a busy market: 1 s and 10 s measure identically.
 
 ### Added
 - `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above, and
-  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling, so the
-  headroom is visible before it runs out. `dz_mbo_forced_rebaselines_total` loses its
-  `reason="guard_evicted"` label, which no longer has a behaviour behind it.
+  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling.
+  ⚠️ That gauge is an aggregate, and the cap a single market hits first is the per-market 65,536 — six
+  per cent of it — so a market walking to a blackout does not show up as falling headroom there; alarm
+  on the invalidation counter. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"`
+  label, which no longer has a behaviour behind it.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
   exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`

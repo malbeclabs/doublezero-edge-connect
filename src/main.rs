@@ -336,13 +336,15 @@ struct Args {
     arb_match_window_secs: u64,
 
     /// Milliseconds a delivered order-level book event is remembered so a slower publisher's copy is
-    /// recognized as a duplicate. Correctness does not depend on it — a removed order id is never
-    /// re-added regardless (`ingest::book`) — so this trades memory against redundant work, not
-    /// against a corrupt book.
+    /// recognized as a duplicate. A removed order id is never re-added regardless (`ingest::book`),
+    /// so this does not gate resurrection — but set below the arms' separation it turns a lagging
+    /// copy of a partially-filled order into a false size disagreement, which costs a forced
+    /// re-baseline and the batches withheld behind it. A per-market count cap of 1024 events bounds
+    /// the reach independently, so values much above a second are inert on a busy market.
     #[arg(
         long = "arb-book-dedup-window-ms",
         env = "DZ_ARB_BOOK_DEDUP_WINDOW_MS",
-        default_value_t = 250,
+        default_value_t = 1000,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     arb_book_dedup_window_ms: u64,

@@ -115,9 +115,12 @@ const PEER_SERVING_NS: u64 = 30_000_000_000; // 30s
 ///
 /// Sized against the **product** with [`MAX_BOOK_MARKETS`], not against one market: a per-market cap
 /// the size of [`TRADE_DEDUP_WINDOW`] would put the aggregate ceiling in the tens of gigabytes on a
-/// wire that mints market keys freely. 1024 events is several seconds of a busy market's order flow at
-/// the 250 ms default window, so the time bound is what normally binds; on a market fast enough for the
-/// count to bind first, an evicted event costs a redundant emission, not a corrupt book.
+/// wire that mints market keys freely. On a market fast enough to fill it, an evicted event costs a
+/// redundant emission, not a corrupt book.
+///
+/// It is the other half of the dedup window, and the binding half above a second: the effective reach
+/// is `min(window, 1024 / event_rate)`, and the right-hand term is about 1.15 s on the flagship market.
+/// That is what [`DEFAULT_BOOK_DEDUP_WINDOW_NS`] is sized to, and why raising it further is inert.
 const MAX_SEEN_ORDER_EVENTS: usize = 1024;
 
 /// Cap on the live resting-quantity floors one market tracks. A floor's eviction is silent — the
@@ -147,7 +150,13 @@ const _: () = assert!(ARM_BITS <= u8::BITS as usize);
 
 /// Default order-event dedup window, matching `main.rs`'s `--arb-book-dedup-window-ms` so an arbiter
 /// built without the flag races on the same window the shipped binary does.
-const DEFAULT_BOOK_DEDUP_WINDOW_NS: u64 = 250_000_000; // 250ms
+///
+/// Sized to [`MAX_SEEN_ORDER_EVENTS`] at the flagship market's rate, because past that the count
+/// evicts first and a wider window is inert. Below it, a lagging arm's copy of an add for an order the
+/// leader has since partially filled stops being recognized as a duplicate and reads as a size
+/// *disagreement* instead — a forced re-baseline whose withheld batches are lost, from two healthy
+/// mirrored publishers.
+const DEFAULT_BOOK_DEDUP_WINDOW_NS: u64 = 1_000_000_000; // 1s
 
 /// Which ingest source produced an update — the floor's per-tick leader identity. The edge
 /// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
@@ -530,6 +539,14 @@ impl GuardBudget {
     fn over(&self) -> bool {
         self.held > MAX_TOMBSTONES_TOTAL
     }
+
+    /// Recount from the populations themselves. The running total is an optimization; without this it
+    /// is a correctness dependency one line deep, and an over-count that no market can pay off leaves
+    /// every order-level market in the process disowned on every batch, forever.
+    fn resync(&mut self, held: usize) {
+        self.held = held;
+        self.publish();
+    }
 }
 
 /// One order-level market's cross-publisher race state: the events recently delivered to the wire, and
@@ -735,7 +752,14 @@ impl MarketEvents {
     /// replaces — the stale entry its add left in `live` is skipped when it surfaces.
     fn tombstone(&mut self, order_id: u64, by: u8, budget: &mut GuardBudget) {
         match self.resting.insert(order_id, Slot::Tomb(by)) {
-            Some(Slot::Tomb(_)) => {}
+            // The insert has already replaced the reporter mask, so fold the old one back in: losing
+            // an arm's bit turns a settled tombstone into one nothing will ever settle, which stalls
+            // every tombstone queued behind it.
+            Some(Slot::Tomb(had)) => {
+                if let Some(Slot::Tomb(by)) = self.resting.get_mut(&order_id) {
+                    *by |= had;
+                }
+            }
             prior => {
                 self.n_live -= usize::from(matches!(prior, Some(Slot::Floor(..))));
                 self.n_dead += 1;
@@ -1862,6 +1886,10 @@ impl Arbiter {
     /// holder returns its whole population at once, so this is not a per-batch scan: it runs only at
     /// the ceiling and drops well below it each time.
     fn shed_over_budget(&mut self) {
+        if self.guard.over() {
+            let held = self.book_events.values().map(|e| e.n_dead).sum();
+            self.guard.resync(held);
+        }
         while self.guard.over() {
             let Some(worst) = self
                 .book_events
@@ -6091,9 +6119,11 @@ mod tests {
         let bystander_key: MarketKey = mkey(BYSTANDER, BOOK_INSTRUMENT);
         a.guard.take_n(bystander.n_dead);
         a.book_events.insert(bystander_key.clone(), bystander);
-        // Stand the budget up at the ceiling: shedding the hog must bring it back under, and reaching
-        // the ceiling for real costs 16 saturated markets, which is not a unit test.
-        a.guard.held = MAX_TOMBSTONES_TOTAL + 500;
+        // Stand the hog's *population* up at the ceiling, not just the counter: reaching it for real
+        // costs 16 saturated markets, which is not a unit test, and `shed_over_budget` recounts from
+        // the populations before it sheds anything.
+        a.book_events.get_mut(&key).expect("hog race state").n_dead = MAX_TOMBSTONES_TOTAL + 500;
+        a.guard.held = MAX_TOMBSTONES_TOTAL + 600;
         let before = invalidations(BYSTANDER);
 
         a.shed_over_budget();
@@ -6103,6 +6133,35 @@ mod tests {
         );
         assert_eq!(invalidations(BYSTANDER), before);
         assert_eq!(a.book_events[&bystander_key].n_dead, 100);
+    }
+
+    /// A running total that has slipped must cost a recount, not the whole product. Shedding trusts
+    /// the total, and no market can pay off a debt it never incurred, so an over-count with nothing
+    /// behind it would disown the largest holder on every batch until none was left and then keep
+    /// disowning whichever market next recorded a removal — every order-level market in the process
+    /// dark, permanently, with no in-process recovery.
+    #[test]
+    fn an_overcounted_budget_costs_a_recount_rather_than_every_market() {
+        const VENUE: &str = "BookGuardSlip";
+        let (mut a, _rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 1, 100.0, 1.0)], 1),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        a.emit(removals(VENUE, 1..=100, 2_000), arm(1), TEST_CATEGORY);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let before = invalidations(VENUE);
+        // The debt no population backs.
+        a.guard.held = MAX_TOMBSTONES_TOTAL + 1;
+
+        a.shed_over_budget();
+        a.shed_over_budget();
+
+        assert_eq!(invalidations(VENUE), before, "no market pays for the slip");
+        assert!(a.book_events.contains_key(&key), "and none is disowned");
+        assert_eq!(a.guard.held, 100, "the total is recounted from the markets");
     }
 
     /// The process-wide budget is a running total, so every path that adds or drops a tombstone has to
