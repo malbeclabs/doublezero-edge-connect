@@ -531,11 +531,11 @@ struct GuardBudget {
     /// A lagging high-water rather than a true maximum, which would cost a scan of every tracked market
     /// per batch: it follows the market that set it exactly while that market keeps being observed, and
     /// is raised by any market that overtakes it. So it reads stale-**high** for a market that has gone
-    /// quiet, which is the direction an alert can live with. It must never read stale-low, which is why
-    /// dropping the market that set it re-seats the figure on the largest survivor
-    /// ([`Arbiter::drop_book_events`]) instead of zeroing it — the process-wide shed disowns the
-    /// *largest* holder, so zeroing would report full headroom at the exact instant the process is at
-    /// its ceiling.
+    /// quiet — the direction an alert can live with — and lags by one batch after the leader shrinks.
+    /// What it must never do is read *zero* while the process is at its ceiling, which is why dropping
+    /// the market that set it re-seats the figure on the largest survivor
+    /// ([`Arbiter::drop_book_events`]) rather than zeroing it: the process-wide shed disowns the
+    /// *largest* holder, so zeroing there would report full headroom at exactly the wrong moment.
     peak: usize,
     peak_market: Option<MarketKey>,
 }
@@ -1899,7 +1899,7 @@ impl Arbiter {
             // Nothing but a producer's own re-baseline can re-establish this market: what we hold is
             // the state the guard stopped vouching for, and the deltas arriving now are the ones it
             // can no longer place against it.
-            self.announce_disowned(&key, clear_only(b));
+            self.announce_disowned(&key, || clear_only(b));
             self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
             return;
         }
@@ -1990,7 +1990,7 @@ impl Arbiter {
         // guard while it could still answer.
         if invalidated {
             self.invalidate_market(&key, &b.venue);
-            self.announce_disowned(&key, clear_only(b));
+            self.announce_disowned(&key, || clear_only(b));
         }
         self.shed_over_budget();
     }
@@ -2068,7 +2068,7 @@ impl Arbiter {
             .with_label_values(&[venue])
             .inc();
         if let Some(clear) = announcement {
-            self.announce_disowned(key, clear);
+            self.announce_disowned(key, || clear);
         }
     }
 
@@ -2132,13 +2132,17 @@ impl Arbiter {
     /// [`Self::shed_over_budget`] disowns a market other than the one being admitted, and that market
     /// need never send another batch. Waiting for one is how the two contradictory consumer states
     /// above become permanent.
-    fn announce_disowned(&mut self, key: &MarketKey, clear: NormalizedBook) {
+    ///
+    /// `clear` is a closure because the guard below refuses on every batch of a market's whole dark
+    /// period, and building it eagerly there would clone a full batch each time for nothing.
+    fn announce_disowned(&mut self, key: &MarketKey, clear: impl FnOnce() -> NormalizedBook) {
         // The once-guard lives with the record rather than on the `BookMarket`, so eviction cannot lose
         // it and re-announce a market whose consumers were already told.
         match self.invalidated_markets.get_mut(key) {
             Some(announced @ false) => *announced = true,
             _ => return,
         }
+        let clear = clear();
         self.vm(&clear.venue).emit[EMIT_BOOK].inc();
         let _ = self.tx.send(Arc::new(FeedMessage::Book(clear)));
     }
