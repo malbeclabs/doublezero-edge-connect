@@ -724,6 +724,38 @@ impl MarketEvents {
         }
     }
 
+    /// Note that `publisher` has re-baselined its own book onto a snapshot, `held` being the orders that
+    /// snapshot names.
+    ///
+    /// Every tombstone the snapshot does **not** name is settled for that arm: its book no longer holds
+    /// the order, a venue never reuses an id, and a change for an id a book does not hold produces
+    /// nothing — so that arm can never contradict the removal. An order the snapshot *does* name is the
+    /// opposite case and must keep its hold, because the arm is still carrying that order forward and
+    /// the changes that killed it are exactly what it has yet to deliver.
+    ///
+    /// This is what stops one unreported removal stalling retirement for the life of the market:
+    /// [`Self::retire_settled`] is head-of-queue, so an arm that never reports one removal — a peer
+    /// whose snapshot anchor simply post-dates it — otherwise blocks every tombstone behind it, and the
+    /// population grows with the market's whole history instead of the arms' lag spread.
+    fn report_rebaseline(&mut self, publisher: Publisher, held: &[BookChange]) {
+        let bit = self.arm_bit(publisher);
+        if bit == 0 {
+            return;
+        }
+        let held: HashSet<u64> = held
+            .iter()
+            .filter(|c| c.order_id != 0)
+            .map(|c| c.order_id)
+            .collect();
+        for (id, slot) in self.resting.iter_mut() {
+            if let Slot::Tomb(by) = slot {
+                if !held.contains(id) {
+                    *by |= bit;
+                }
+            }
+        }
+    }
+
     /// Track one order's resting floor, `by` the arm that claimed it (`None` for a re-baseline's seed).
     fn track_floor(
         &mut self,
@@ -1771,6 +1803,14 @@ impl Arbiter {
                     })
                 });
             if peer_serving {
+                // Dropped for the consumer, but still evidence about this arm: it has just installed a
+                // book, and every tombstone that book does not name is one it can no longer contradict.
+                // Without this an arm whose snapshot anchor post-dates a removal never reports that
+                // removal, and head-of-queue retirement stalls behind it until the per-market cap
+                // disowns the market.
+                if let Some(events) = self.book_events.get_mut(&key) {
+                    events.report_rebaseline(publisher, &b.changes);
+                }
                 self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                 return;
             }
@@ -5653,6 +5693,13 @@ mod tests {
             .get()
     }
 
+    fn resurrections(venue: &str) -> u64 {
+        metrics()
+            .book_resurrections_dropped
+            .with_label_values(&[venue])
+            .get()
+    }
+
     fn invalidations(venue: &str) -> u64 {
         metrics()
             .mbo_market_invalidations
@@ -6055,6 +6102,173 @@ mod tests {
             a.book_events[&key].n_dead
         );
         assert_eq!(a.guard.held, a.book_events[&key].n_dead);
+    }
+
+    /// Retirement is head-of-queue, so one removal an arm never reports blocks every tombstone behind
+    /// it and the population grows with the market's whole history rather than the arms' lag spread —
+    /// with the per-market cap, where the market is disowned, as the only exit. An arm that re-baselines
+    /// onto a snapshot settles every tombstone that snapshot does not name.
+    #[test]
+    fn a_rebaselining_arm_settles_the_tombstones_it_cannot_contradict() {
+        const VENUE: &str = "BookGuardStall";
+        const N: u64 = 200;
+        const UNREPORTED: u64 = 100;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        // Arm 2 is on the wire, so it counts for retirement.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 9_000, 100.0, 1.0)], 1),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        for oid in 1..=N {
+            let at = oid * 10_000;
+            a.emit(
+                l3_batch(VENUE, vec![order(BookAction::Update, oid, 100.0, 1.0)], at),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            let removal = l3_batch(
+                VENUE,
+                vec![order(BookAction::Delete, oid, 100.0, 0.0)],
+                at + 1_000,
+            );
+            a.emit(removal.clone(), arm(1), TEST_CATEGORY);
+            if oid != UNREPORTED {
+                a.emit(removal, arm(2), TEST_CATEGORY);
+            }
+        }
+        assert!(
+            a.book_events[&key].n_dead >= (N - UNREPORTED) as usize,
+            "one unreported removal must be what stalls this, not something else: {} held",
+            a.book_events[&key].n_dead
+        );
+        // Arm 2 recovers onto a snapshot holding none of those ids. Arm 1 is serving, so the
+        // re-baseline is dropped — and it is still evidence about arm 2's own book.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 9_000, 100.0, 1.0)],
+                N * 10_000 + 5_000,
+            ),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        // Arm 1's next batch is where the unblocked head retires.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 9_001, 100.0, 1.0)],
+                N * 10_000 + 6_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(
+            a.book_events[&key].n_dead, 0,
+            "a re-baselined arm cannot contradict a removal its own book does not carry"
+        );
+        assert_eq!(a.guard.held, a.book_events[&key].n_dead);
+    }
+
+    /// An arm still holding an order must keep its hold on that order's tombstone: it is carrying the
+    /// order forward from an anchor that predates the removal, so the changes that killed it are
+    /// exactly what it has yet to deliver — and a stale non-zero one in between is the resurrection
+    /// this guard exists to refuse.
+    #[test]
+    fn a_rebaselining_arm_keeps_its_hold_on_an_order_its_snapshot_still_carries() {
+        const VENUE: &str = "BookGuardAnchorHold";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 5.0)], 1_000),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Delete, 7, 100.0, 0.0)], 2_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        // Arm 2's snapshot still carries order 7, so it has not passed the removal.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 7, 100.0, 5.0)],
+                3_000,
+            ),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 8, 100.0, 1.0)], 4_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(
+            a.book_events[&key].n_dead, 1,
+            "an arm that still holds the order has not settled its tombstone"
+        );
+        // And the stale change it has yet to deliver is still refused.
+        let before = resurrections(VENUE);
+        let _ = drain_books(&mut rx);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 3.0)], 5_000),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        assert_eq!(resurrections(VENUE), before + 1);
+        assert!(!consumer_book(&mut rx).contains_key(&7));
+    }
+
+    /// The route that reaches the stall in production: two arms recovering from different snapshot
+    /// anchors. An order in arm 1's book and absent from arm 2's newer one is removed by arm 1 and
+    /// tombstoned, and arm 2 — synced and serving — never reports it, because it never held it. Held
+    /// head-of-queue, the market's whole removal history then walks it to the per-market cap, where it
+    /// is disowned and dark until a producer re-baselines it.
+    #[test]
+    fn arms_snapshotting_from_different_anchors_do_not_walk_a_market_to_a_blackout() {
+        const VENUE: &str = "BookGuardAnchors";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let before = invalidations(VENUE);
+        let half = MAX_MARKET_TOMBSTONES as u64 / 2 + 1;
+        // Arm 2 is on the wire and reports none of arm 1's removals: its snapshot never held those ids.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 1_000_000, 100.0, 1.0)], 1),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        a.emit(removals(VENUE, 1..=half, 2_000), arm(1), TEST_CATEGORY);
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 1_000_000, 100.0, 1.0)],
+                3_000,
+            ),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            removals(VENUE, (half + 1)..=(half * 2), 4_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        assert_eq!(
+            invalidations(VENUE),
+            before,
+            "two arms with different anchors must not black the market out"
+        );
+        assert!(
+            a.book_events[&key].n_dead <= half as usize,
+            "the population is the arms' lag spread, not the market's history: {} held",
+            a.book_events[&key].n_dead
+        );
     }
 
     /// The tombstone budget is process-wide, so one busy market holds what its own arms' lag needs
