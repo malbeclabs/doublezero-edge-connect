@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
 ### Added
+- `doublezero-edge diagnose` reports why the container is (or is not) serving data — tunnel,
+  subscriptions, activations — ending in one verdict an agent reads as `.diagnostics.diagnosis.code`.
+  It reads the admin surface, which is not subscription-gated, so it answers on exactly the host
+  where every `/v1` command fails. Exits 0 whatever the verdict; 3 only if the admin surface itself
+  does not answer. It only ever *reports*: retrying a down tunnel stays where it already is,
+  `doublezero connect multicast` inside the container, so nothing here can spend the container's
+  onchain identity. `GET /admin/diagnostics` is unauthenticated like the rest of the admin surface
+  and discloses this host's device/metro names, subscribed group codes and their multicast IPs, the
+  configured binds and the feed-registry URL — on the loopback default, to the same audience that
+  could already run `doublezero status`. The container also reads `doublezero latency` and reports
+  each device's reachability and min/avg/max round trip, nearest first — on a down host, whether
+  anything is reachable; on a connected one, whether a nearer device has appeared since it chose
+  the one it is on. Probed every 5 minutes rather than every poll and bounded at 20s, so a stalled
+  probe cannot wedge the reconciler's tick; the block carries its own `latency_at_unix`, and `null`
+  (never probed) stays distinct from `[]` (probed, nothing answered).
+  `--admin-url` is now a global flag rather than one on the two `channels` subcommands.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
   exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`
@@ -45,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   span more than one category, even when its own category resolves unambiguously (e.g. Lashay's
   single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
   fallback now filters by `(venue, category)` instead of venue alone.
+- `doublezero-edge`'s admin-surface connection failure still said the surface is "off unless
+  DZ_ADMIN_BIND is set", which stopped being true when that bind defaulted to `127.0.0.1:9098`.
 - `doublezero-edge` panicked with a broken-pipe error whenever its stdout output was piped into a
   consumer that stops reading early (`| head`, `| less -q`, a short-circuiting `grep -q`) —
   completely ordinary usage for a JSON/table-printing CLI. Every stdout write now goes through a

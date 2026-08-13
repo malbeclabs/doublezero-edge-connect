@@ -328,6 +328,155 @@ pub struct AdminApplyResponse {
     pub applied: Vec<String>,
 }
 
+/// `GET /admin/diagnostics`'s body — why this process is (or is not) serving data. **Every** field
+/// below defaults, right down to the verdict: this is the one command an operator runs when
+/// everything else has failed, so a block a newer bridge added (or an older one never sent) must
+/// cost them a line of the table, never the whole report.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DiagnosticsResponse {
+    #[serde(default)]
+    pub diagnosis: Diagnosis,
+    #[serde(default)]
+    pub tunnel: TunnelBlock,
+    #[serde(default)]
+    pub subscriptions: SubscriptionsBlock,
+    #[serde(default)]
+    pub activation: ActivationBlock,
+    /// `doublezero latency`, probed by the container on its own coarse cadence. Absent (rather
+    /// than empty) means it has never probed; empty means it probed and nothing answered.
+    #[serde(default)]
+    pub latency: Option<Vec<DeviceLatency>>,
+    /// When that probe ran. Routinely older than `tunnel.checked_at_unix`, since the probe is
+    /// paced far coarser than the subscription poll.
+    #[serde(default)]
+    pub latency_at_unix: Option<u64>,
+    #[serde(default)]
+    pub registry: RegistryBlock,
+    #[serde(default)]
+    pub binds: BindsBlock,
+}
+
+/// The verdict. `code` is the stable machine-readable one an agent reads via `--jq`; the other two
+/// are prose for a human.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Diagnosis {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TunnelBlock {
+    #[serde(default)]
+    pub detection: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub checked_at_unix: Option<u64>,
+    /// When the last *successful* poll landed. Diverges from `checked_at_unix` exactly when a tick
+    /// failed and the server kept the previous poll's data, which is the only thing that makes the
+    /// sessions below readable as stale rather than current.
+    #[serde(default)]
+    pub last_ok_at_unix: Option<u64>,
+    #[serde(default)]
+    pub poll_seconds: u64,
+    #[serde(default)]
+    pub sessions: Vec<TunnelSession>,
+}
+
+/// One `doublezero status` session, passed through as the client reported it. Every field is
+/// optional because the client itself omits or stubs them (`"N/A"`) depending on session state.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TunnelSession {
+    #[serde(default)]
+    pub session_status: Option<String>,
+    #[serde(default)]
+    pub tunnel_name: Option<String>,
+    #[serde(default)]
+    pub user_type: Option<String>,
+    #[serde(default)]
+    pub current_device: Option<String>,
+    #[serde(default)]
+    pub lowest_latency_device: Option<String>,
+    #[serde(default)]
+    pub metro: Option<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SubscriptionsBlock {
+    #[serde(default)]
+    pub market_data_codes: Vec<String>,
+    #[serde(default)]
+    pub shred_codes: Vec<String>,
+    /// Subscribed groups this build has no feed row for — the ones a `no_market_data_subscriptions`
+    /// verdict is asking the operator to look at.
+    #[serde(default)]
+    pub other_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ActivationBlock {
+    #[serde(default)]
+    pub receivers: Vec<ReceiverEntry>,
+    #[serde(default)]
+    pub ws_on: bool,
+    #[serde(default)]
+    pub api_on: bool,
+    #[serde(default)]
+    pub shred_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReceiverEntry {
+    #[serde(default)]
+    pub venue: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub kind: String,
+    /// The publisher's base port, which is a publisher's whole identity in the registry.
+    #[serde(default)]
+    pub publisher: u32,
+    #[serde(default)]
+    pub liveness: String,
+}
+
+/// One device's probe result from the container's `doublezero latency` read.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeviceLatency {
+    #[serde(default)]
+    pub device_code: Option<String>,
+    #[serde(default)]
+    pub device_ip: Option<String>,
+    #[serde(default)]
+    pub min_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub avg_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub max_latency_ns: Option<u64>,
+    #[serde(default)]
+    pub reachable: bool,
+}
+
+/// Which surfaces the container was configured with. Empty means "not configured", which for `api`
+/// is a genuinely different answer from "configured but not activated" (`ActivationBlock::api_on`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BindsBlock {
+    #[serde(default)]
+    pub ws: String,
+    #[serde(default)]
+    pub api: String,
+    #[serde(default)]
+    pub admin: String,
+    #[serde(default)]
+    pub metrics: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +506,28 @@ mod tests {
         assert_eq!(p.product_id, "HYPERLIQUID:BTC");
         assert_eq!(p.price_increment, "0.01");
         assert_eq!(p.feed_kind, "top_of_book");
+    }
+
+    /// The diagnostics body is the report an operator falls back to when nothing else works, so
+    /// version skew in either direction must cost at most a block: a body carrying only a verdict
+    /// (an older bridge) and one carrying a block this build has never heard of both parse.
+    #[test]
+    fn a_diagnostics_body_parses_with_blocks_missing_and_with_blocks_unknown() {
+        let sparse: DiagnosticsResponse =
+            serde_json::from_str(r#"{"diagnosis":{"code":"tunnel_down"}}"#).unwrap();
+        assert_eq!(sparse.diagnosis.code, "tunnel_down");
+        assert!(sparse.activation.receivers.is_empty());
+
+        let future: DiagnosticsResponse = serde_json::from_str(
+            r#"{"diagnosis":{"code":"ok","summary":"s","remediation":"r"},
+                "activation":{"receivers":[{"venue":"LASHAY","kind":"market_by_price",
+                                            "publisher":32000,"liveness":"up","arm":"a"}],
+                              "ws_on":true,"api_on":true},
+                "peering":{"nothing":"this build knows"}}"#,
+        )
+        .unwrap();
+        assert_eq!(future.activation.receivers[0].publisher, 32000);
+        assert!(future.activation.api_on);
     }
 
     #[test]

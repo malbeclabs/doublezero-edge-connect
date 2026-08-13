@@ -15,6 +15,7 @@ pub mod codec_common;
 pub mod codec_mbo;
 pub mod codec_mbp;
 pub mod codec_midpoint;
+pub mod diagnostics;
 pub mod feeds;
 pub mod health;
 pub mod phoenix_feeder;

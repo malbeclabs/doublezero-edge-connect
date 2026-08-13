@@ -112,3 +112,83 @@ Activation mirrors the WebSocket sink exactly: *configured* by a non-empty `--ap
 (`--api-bind ""` disables it outright), *activated* by the subscription reconciler only once this
 host is subscribed to ≥1 market-data feed, and bound non-fatally — a taken port disables the API for
 that reconcile cycle rather than crash-looping the tunnel.
+
+## Admin surface (`/admin`)
+
+The one **mutating** surface in this crate (`sinks::admin`), deliberately kept off `/v1` so that
+stays provably read-only. It is **on by default at loopback** (`--admin-bind` / `DZ_ADMIN_BIND`,
+`127.0.0.1:9098`; set empty to disable it outright) and — unlike the WebSocket sink and the query
+API — is **not subscription-gated**, which is the property the whole surface hangs on: an operator
+must be able to inspect a channel filter before anything is subscribed, and to diagnose a host that
+is subscribed to nothing at all.
+
+| Route | |
+|---|---|
+| `GET /admin/channels` | The channel filter in force, and which publishers/channels it **admits** (not which receivers are running — `GET /v1/status`'s `channels` block reports real liveness) |
+| `POST /admin/channels?channels=<spec>` | Replace the channel filter, validated by the same parser `--channels` uses at startup. Applies on the reconciler's next tick |
+| `GET /admin/diagnostics` | Tunnel/subscription/activation state plus one verdict — below |
+
+### `GET /admin/diagnostics`
+
+Answers "why is nothing being served?" on the one host where nothing else can: `/v1` activates only
+once a market-data feed is subscribed, so on a host whose tunnel never came up it is not listening
+and every query fails with a transport error while `docker ps` shows a healthy container.
+
+The response is cached state plus a pure function — no shell-out on the read path. The reconciler
+already runs `doublezero status --json` every `--subscription-refresh-secs` for activation; this
+reports the session fields it was previously discarding (`session_status`, `tunnel_name`,
+`user_type`, `current_device`, `lowest_latency_device`, `metro`, `network`), the subscribed group
+codes split into market-data / shred / other, the running receivers with their real liveness, which
+sinks are up, the resolved feed-registry document, and the process block. Reading them **cannot**
+move activation: every field is optional and additive, and `multicast_groups` remains the sole
+input to what runs.
+
+`diagnosis` is an ordered ladder over that state, each rung reached only once the one above it is
+ruled out — so a host with no `doublezero` CLI is never reported as a broken tunnel:
+
+| `code` | |
+|---|---|
+| `pending` | No poll has completed yet |
+| `dz_cli_missing` | No `doublezero` CLI (running from source); gating falls open |
+| `daemon_unreachable` | `doublezero status` failed — quotes what it printed, usually `Please start the doublezerod service.` |
+| `tunnel_down` | A session reports a status, and none of them is `BGP Session Up` |
+| `tunnel_state_unknown` | The document parsed but carried no session status this build recognizes — "not up" is a claim the snapshot cannot support |
+| `no_market_data_subscriptions` | Tunnel up, but no subscribed group matches a feed this build serves |
+| `subscribed_no_traffic` | Receivers running, none delivering — usually a default-deny host firewall on `doublezero1` |
+| `no_receivers_running` | Feeds were expected to run but none does: `--feed`/`--publisher-port`/the channel filter excluded every publisher of a subscribed row |
+| `gating_disabled` / `ok` | Nothing to fix |
+
+A receiver actually delivering packets is proof the tunnel is up, so the two tunnel rungs are
+skipped outright in that case: one upstream rename of `session_status` must not report
+`tunnel_down` fleet-wide and send every healthy host to reconnect a tunnel that was never down. A
+transient `doublezero status` failure keeps the last good session and code data rather than blanking
+it — `last_ok_at_unix` reports how stale it is, and only a successful poll stamps it (`cli_missing`
+and `gating_disabled` run no status call, so they leave it unset rather than dating an empty
+document to now).
+
+A `doublezero latency --json` read is reported under `latency` (device code/IP, reachability,
+min/avg/max ns) with its own `latency_at_unix`. Bounded at 20s and killed on overrun — it runs
+inline in the reconciler's tick, so a stall would otherwise stop receivers being respawned as well
+as freezing the diagnostic. Probed every 5 minutes rather than every tick — it
+is active measurement against every device, while what it reports (a device nearer than the one
+this host is on) moves with topology — and the last result is carried across the ticks that skip
+it. `null` means never probed; `[]` means probed and nothing answered.
+
+`doublezero-edge diagnose` renders this. It only reports: the retry the `tunnel_down` rung names is
+`doublezero connect multicast` inside the container.
+
+### Guards on the mutating route
+
+`POST /admin/channels` requires an `X-DZ-Admin-Request` header (any value) and refuses a request
+body. The header is not authentication — this surface has none — it rules out a request a browser
+page on the same host could have caused by accident, which a `<form>` cannot produce. `GET` routes
+are exempt: requiring it on the diagnostics read would make the one command a stuck operator most
+needs harder to run than `curl`.
+
+`GET /admin/diagnostics` is read-only but is the most informative route here (device/metro names,
+subscribed group codes and their multicast IPs, the probed devices' codes and IPs, every
+configured bind, the feed-registry URL). It is
+unauthenticated like the rest of the surface, and DNS rebinding can read it — a page served from a
+name re-pointed at `127.0.0.1` is same-origin, so the header above does not stop a *read*. Refusing
+a `Host` that names a DNS name would close that at the cost of `--admin-url http://myhost.local:9098`;
+the read is left open deliberately. Nothing on this surface can change the tunnel.
