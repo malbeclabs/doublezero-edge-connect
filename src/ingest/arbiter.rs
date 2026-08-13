@@ -2077,7 +2077,11 @@ impl Arbiter {
     /// it resumes on its next batch without a producer re-baseline — rather than growing without bound
     /// on a wire-supplied key.
     fn mark_invalidated(&mut self, key: &MarketKey) {
-        if self.invalidated_markets.insert(key.clone(), false).is_some() {
+        if self
+            .invalidated_markets
+            .insert(key.clone(), false)
+            .is_some()
+        {
             return;
         }
         self.invalidated_order.push_back(key.clone());
@@ -6329,7 +6333,11 @@ mod tests {
         let before = resurrections(VENUE);
         let _ = drain_books(&mut rx);
         a.emit(
-            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 3.0)], 500_000),
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 7, 100.0, 3.0)],
+                500_000,
+            ),
             arm(2),
             TEST_CATEGORY,
         );
@@ -6352,7 +6360,11 @@ mod tests {
         let before = invalidations(VENUE);
         let round = MAX_MARKET_TOMBSTONES as u64 / 2 + 1_000;
         a.emit(
-            l3_batch(VENUE, vec![order(BookAction::Update, 1_000_000, 100.0, 1.0)], 1),
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 1_000_000, 100.0, 1.0)],
+                1,
+            ),
             arm(2),
             TEST_CATEGORY,
         );
@@ -6424,7 +6436,10 @@ mod tests {
             TEST_CATEGORY,
         );
         a.emit(removals(VENUE, 1..=64, 2_000), arm(1), TEST_CATEGORY);
-        assert_eq!(a.book_events[&key].n_dead, 64, "held while it is still there");
+        assert_eq!(
+            a.book_events[&key].n_dead, 64,
+            "held while it is still there"
+        );
         // `PEER_SERVING_NS` is a monotonic-clock reach, so age the arm out by its recorded arrival.
         a.book_sync
             .get_mut(&key)
@@ -6687,7 +6702,11 @@ mod tests {
         }
         let _ = drain_books(&mut rx);
 
-        a.emit(l3_batch(VENUE, vec![clear_both()], 5_000), arm(1), TEST_CATEGORY);
+        a.emit(
+            l3_batch(VENUE, vec![clear_both()], 5_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
         assert!(
             !a.invalidated_markets.contains_key(&key),
             "the producer's own re-baseline is what ends the outage"
