@@ -685,11 +685,15 @@ mod tests {
             recv_ts_ns: 2,
             kernel_rx_ts_ns: 3,
             ws_send_ts_ns: 0,
-            category: crate::model::empty_category(),
+            category: "default".into(),
         });
         let f = prepare(&b).expect("serializes");
         assert_eq!(f.kind, "book");
         assert_eq!(f.channel, Some(2));
+        assert!(
+            !f.payload.contains("category"),
+            "category is producer-side only and must never reach the wire"
+        );
         assert!(f.payload.contains(r#""ws_send_ts_ns":"#));
         assert!(
             !f.payload.contains(r#""ws_send_ts_ns":0"#),

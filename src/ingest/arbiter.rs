@@ -48,7 +48,9 @@ use tracing::warn;
 use crate::{
     ingest::{
         arm_race::ArmRace,
-        authority::{AuthorityConfig, MarketKey, ScopeKey, StickyAuthority, OTHER_ARM},
+        authority::{
+            AuthorityConfig, MarketKey, ScopeKey, StickyAuthority, MAX_LABELLED_ARMS, OTHER_ARM,
+        },
         feeds::ArbitrationMode,
     },
     metrics::metrics,
@@ -117,6 +119,17 @@ const PEER_SERVING_NS: u64 = 30_000_000_000; // 30s
 /// the 250 ms default window, so the time bound is what normally binds; on a market fast enough for the
 /// count to bind first, an evicted event costs a redundant emission, not a corrupt book.
 const MAX_SEEN_ORDER_EVENTS: usize = 1024;
+
+/// Cap on each of the two tracked-order populations — live floors and tombstones — so the pair keeps
+/// the aggregate ceiling one shared budget had while neither can starve the other. A market with more
+/// lifetime removals than the cap, which is every busy market, would otherwise hold nothing but
+/// tombstones and stop catching drift between the arms entirely.
+const MAX_GUARDED_ORDERS: usize = MAX_SEEN_ORDER_EVENTS / 2;
+
+/// Width of a tombstone's reporter mask. Matches the authority's own per-scope arm cap, which gates
+/// admission before a batch reaches the race state, so no eligible arm goes without a bit.
+const ARM_BITS: usize = MAX_LABELLED_ARMS;
+const _: () = assert!(ARM_BITS <= u8::BITS as usize);
 
 /// Default order-event dedup window, matching `main.rs`'s `--arb-book-dedup-window-ms` so an arbiter
 /// built without the flag races on the same window the shipped binary does.
@@ -461,11 +474,13 @@ enum Slot {
     /// larger claim challenged whichever arm makes it — including the one whose batch discharged the
     /// re-baseline, which would otherwise re-assert its own stale size unopposed.
     Floor(f64, Option<Publisher>),
-    /// A **tombstone**: the order is gone, and these are the arms that have said so. Once every arm
-    /// serving this market has reported the removal no stale copy of the order can still be in
-    /// flight, and the tombstone is spent — which is what keeps a busy market's dead orders from
-    /// filling the guard and re-baselining it forever.
-    Tomb(Vec<Publisher>),
+    /// A **tombstone**: the order is gone, and a bit per arm of [`MarketEvents::arms`] that has said
+    /// so. Once every *serving* arm has, the tombstone is **spent**: no arm that could still deliver a
+    /// stale copy is unaccounted for, so dropping it is free. That is what keeps a busy market's dead
+    /// orders — which outnumber the cap within seconds — from filling the guard and re-baselining it
+    /// forever. A bitmask rather than a publisher list because there is one of these per tracked dead
+    /// order per market, and the product with [`MAX_BOOK_MARKETS`] is the ceiling that matters.
+    Tomb(u8),
 }
 
 /// One order-level market's cross-publisher race state: the events recently delivered to the wire, and
@@ -489,23 +504,31 @@ struct MarketEvents {
     /// expired by the time window — only by [`MAX_SEEN_ORDER_EVENTS`] — so the guard's reach is an
     /// order count rather than a clock, which is what keeps the window a cost knob.
     resting: HashMap<u64, Slot>,
-    /// Eviction order for the live floors and for the tombstones, oldest first and kept **apart**
-    /// because what the cap costs depends entirely on which it takes: a live floor re-seeds itself on
-    /// that order's next update, while nothing re-seeds a tombstone. Floors therefore go first and
-    /// silently; a tombstone goes only when nothing else is left, and re-baselines the market unless
-    /// it was spent.
+    /// Eviction order for the live floors and for the tombstones, oldest first, **separately bounded**
+    /// because what the cap costs depends entirely on which population it takes: a live floor re-seeds
+    /// itself on that order's next update, while nothing re-seeds a tombstone. One shared budget with
+    /// tombstones preferred would leave a market with more lifetime removals than the cap — every busy
+    /// market — holding nothing but tombstones, and drift between the arms would stop being detected
+    /// at all.
     ///
     /// A removal moves its id from `live` to `dead`, so a tombstone ages from when the order died
     /// rather than from the add it replaced — a long-resting order deleted a moment ago would
     /// otherwise look ancient. Entries are removed lazily: an id whose slot no longer matches the
-    /// queue it surfaces from is skipped, and [`Self::compact`] bounds the slack.
+    /// queue it surfaces from is skipped, and [`Self::compact`] bounds the slack. `n_live`/`n_dead`
+    /// count the real populations, since the queues carry that slack.
     live: VecDeque<u64>,
     dead: VecDeque<u64>,
-    /// Arms currently serving this market, so a tombstone can tell when every one of them has
-    /// reported the removal. Written from `book_sync` rather than learned from deliveries: the arm a
-    /// tombstone exists to refuse is precisely one that has reported sync and not yet delivered its
-    /// copy. Bounded because `book_sync` itself is — an ineligible arm never enters it.
+    n_live: usize,
+    n_dead: usize,
+    /// Arms this market has seen, **append-only**: an arm's index here is its bit in a tombstone's
+    /// reporter mask, so the list may never be reordered or compacted. Capped at eight, the width of
+    /// that mask and of the authority's own per-scope arm cap.
     arms: Vec<Publisher>,
+    /// Which of `arms` are serving right now — synced, and on the wire within [`PEER_SERVING_NS`].
+    /// Refreshed per batch from `book_sync` (`Arbiter::sync_book_arms`), so a gapped or departed arm
+    /// stops holding tombstones un-spent while a lagging one, whose copies are dropped as duplicates
+    /// rather than published, still counts.
+    serving: u8,
     /// One-shot: why this market can no longer be served from either arm's deltas, drained by the
     /// caller. Set when the guard cannot answer — the arms disagreed, or a tombstone a peer could
     /// still race was evicted — because from then on neither publisher's stream is known to describe
@@ -539,11 +562,12 @@ impl MarketEvents {
         window_ns: u64,
     ) -> EventVerdict {
         self.expire(arrival_ns, window_ns);
+        let size = f64::from_bits(ev.size_bits);
         if self.seen.contains_key(&ev) {
             // Collapsed as a duplicate, but it still says this arm has seen the order die — and that
             // is what spends the tombstone. Skipping it here would hold every tombstone for an arm
             // whose copy arrived inside the dedup window, which is the common case.
-            if ev.size_bits == 0f64.to_bits() {
+            if size == 0.0 {
                 self.report_removal(ev.order_id, publisher);
             }
             return EventVerdict::Duplicate;
@@ -555,7 +579,7 @@ impl MarketEvents {
                 self.seen.remove(&old);
             }
         }
-        let size = f64::from_bits(ev.size_bits);
+        let bit = self.arm_bit(publisher);
         match self.resting.get_mut(&ev.order_id) {
             // Tombstoned. A non-zero size would resurrect it; a repeat of the removal is a no-op the
             // consumer can absorb, so it goes out — and it spends the tombstone one arm further.
@@ -563,13 +587,11 @@ impl MarketEvents {
                 if size != 0.0 {
                     return EventVerdict::Resurrection;
                 }
-                if !by.contains(&publisher) {
-                    by.push(publisher);
-                }
+                *by |= bit;
                 EventVerdict::Deliver
             }
             Some(_) if size == 0.0 => {
-                self.tombstone(ev.order_id, publisher);
+                self.tombstone(ev.order_id, bit);
                 EventVerdict::Deliver
             }
             Some(Slot::Floor(seen_size, seen_by)) => {
@@ -587,7 +609,7 @@ impl MarketEvents {
             }
             None => {
                 if size == 0.0 {
-                    self.tombstone(ev.order_id, publisher);
+                    self.tombstone(ev.order_id, bit);
                 } else {
                     self.track_floor(ev.order_id, size, Some(publisher));
                 }
@@ -596,66 +618,94 @@ impl MarketEvents {
         }
     }
 
+    /// This arm's bit in a tombstone's reporter mask, assigning one on first sight. `0` past the
+    /// eighth arm — a market that has seen more than the authority's own per-scope cap is being fed a
+    /// forged source, and an unassigned arm simply never spends a tombstone.
+    fn arm_bit(&mut self, publisher: Publisher) -> u8 {
+        if let Some(i) = self.arms.iter().position(|&p| p == publisher) {
+            return 1 << i;
+        }
+        if self.arms.len() >= ARM_BITS {
+            return 0;
+        }
+        self.arms.push(publisher);
+        1 << (self.arms.len() - 1)
+    }
+
     /// Note that `publisher` has reported this order gone, if it is tombstoned.
     fn report_removal(&mut self, order_id: u64, publisher: Publisher) {
+        let bit = self.arm_bit(publisher);
         if let Some(Slot::Tomb(by)) = self.resting.get_mut(&order_id) {
-            if !by.contains(&publisher) {
-                by.push(publisher);
-            }
+            *by |= bit;
         }
     }
 
     /// Track one order's resting floor, `by` the arm that claimed it (`None` for a re-baseline's seed).
     fn track_floor(&mut self, order_id: u64, size: f64, by: Option<Publisher>) {
-        if self
-            .resting
-            .insert(order_id, Slot::Floor(size, by))
-            .is_none()
-        {
-            self.live.push_back(order_id);
+        match self.resting.insert(order_id, Slot::Floor(size, by)) {
+            Some(Slot::Floor(..)) => {}
+            // Either new or resurrected by the wire's own snapshot: in both cases it belongs in the
+            // live queue, and in the second the tombstone it replaced no longer counts.
+            prior => {
+                self.n_dead -= usize::from(matches!(prior, Some(Slot::Tomb(_))));
+                self.n_live += 1;
+                self.live.push_back(order_id);
+            }
         }
         self.bound();
     }
 
     /// Record one order as gone, queued for eviction from when it died rather than from the add it
     /// replaces — the stale entry its add left in `live` is skipped when it surfaces.
-    fn tombstone(&mut self, order_id: u64, by: Publisher) {
-        self.resting.insert(order_id, Slot::Tomb(vec![by]));
-        self.dead.push_back(order_id);
+    fn tombstone(&mut self, order_id: u64, by: u8) {
+        match self.resting.insert(order_id, Slot::Tomb(by)) {
+            Some(Slot::Tomb(_)) => {}
+            prior => {
+                self.n_live -= usize::from(matches!(prior, Some(Slot::Floor(..))));
+                self.n_dead += 1;
+                self.dead.push_back(order_id);
+            }
+        }
         self.bound();
     }
 
-    /// Whether every arm serving this market has reported this order's removal, which is when no stale
-    /// copy of it can still be in flight and the tombstone costs nothing to drop.
-    fn spent(&self, reported_by: &[Publisher]) -> bool {
-        self.arms.iter().all(|a| reported_by.contains(a))
+    /// Whether every arm serving this market has reported this order's removal, which is when no arm
+    /// that could still deliver a stale copy is unaccounted for and the tombstone costs nothing to
+    /// drop. On an unauthenticated wire a forged copy of a real removal spends an arm's bit, so this
+    /// bounds the guard's cost rather than proving nothing is in flight.
+    fn spent(&self, reported_by: u8) -> bool {
+        self.serving & !reported_by == 0
     }
 
-    /// Hold the tracked orders to [`MAX_SEEN_ORDER_EVENTS`], taking live floors before tombstones.
+    /// Hold each tracked population to [`MAX_GUARDED_ORDERS`], separately.
     ///
     /// A live floor's eviction is silent: the order's next update re-seeds it, so the guard loses only
-    /// drift detection until then, and a book far larger than the cap streams normally. A tombstone's
-    /// is not: nothing re-seeds it, so unless it is spent the market re-baselines rather than
-    /// reopening the resurrection path it was holding shut. That ordering is also what lets a
-    /// re-baseline larger than the cap seed itself without discarding the guard it must keep.
+    /// drift detection until then, and a book far larger than the cap streams normally — which is what
+    /// lets a re-baseline larger than the cap seed itself. A tombstone's is not: nothing re-seeds it,
+    /// so unless it is spent the market re-baselines rather than reopening the resurrection path it
+    /// was holding shut.
     fn bound(&mut self) {
-        while self.resting.len() > MAX_SEEN_ORDER_EVENTS {
-            if let Some(id) = Self::pop(&mut self.live, &self.resting, |s| {
+        while self.n_live > MAX_GUARDED_ORDERS {
+            let Some(id) = Self::pop(&mut self.live, &self.resting, |s| {
                 matches!(s, Slot::Floor(..))
-            }) {
-                self.resting.remove(&id);
-                continue;
-            }
+            }) else {
+                break;
+            };
+            self.resting.remove(&id);
+            self.n_live -= 1;
+        }
+        while self.n_dead > MAX_GUARDED_ORDERS {
             let Some(id) = Self::pop(&mut self.dead, &self.resting, |s| {
                 matches!(s, Slot::Tomb(_))
             }) else {
                 break;
             };
             let spent = match self.resting.get(&id) {
-                Some(Slot::Tomb(by)) => self.spent(by),
+                Some(Slot::Tomb(by)) => self.spent(*by),
                 _ => true,
             };
             self.resting.remove(&id);
+            self.n_dead -= 1;
             if !spent {
                 self.force(FORCED_GUARD_EVICTED);
             }
@@ -680,14 +730,14 @@ impl MarketEvents {
 
     /// Drop the stale entries a tombstoning leaves behind, so the queues stay proportional to the
     /// state they order rather than to the market's whole history. Amortized O(1): the scan costs one
-    /// pass per [`MAX_SEEN_ORDER_EVENTS`] pushes.
+    /// pass per [`MAX_GUARDED_ORDERS`] pushes.
     fn compact(&mut self) {
-        if self.live.len() > 2 * MAX_SEEN_ORDER_EVENTS {
+        if self.live.len() > 2 * MAX_GUARDED_ORDERS {
             let resting = &self.resting;
             self.live
                 .retain(|id| matches!(resting.get(id), Some(Slot::Floor(..))));
         }
-        if self.dead.len() > 2 * MAX_SEEN_ORDER_EVENTS {
+        if self.dead.len() > 2 * MAX_GUARDED_ORDERS {
             let resting = &self.resting;
             self.dead
                 .retain(|id| matches!(resting.get(id), Some(Slot::Tomb(_))));
@@ -717,12 +767,10 @@ impl MarketEvents {
         self.seen.clear();
         self.order.clear();
         self.forced = None;
+        // A tombstoned order named by the snapshot is seeded like any other: what is republished is
+        // what the consumer now holds, and refusing to track it would leave the guard rejecting every
+        // later change to an order the consumer can see.
         for c in changes.iter().filter(|c| c.order_id != 0 && c.size != 0.0) {
-            // A tombstoned order cannot be in a book the wire agreed on — its removal was published —
-            // so a seed naming one is refused rather than reopening the guard it would overwrite.
-            if matches!(self.resting.get(&c.order_id), Some(Slot::Tomb(_))) {
-                continue;
-            }
             self.track_floor(c.order_id, c.size, None);
         }
     }
@@ -934,6 +982,10 @@ struct PeerState {
     /// Monotonic time of this publisher's last *published* batch for the market; `0` until it publishes
     /// one, which is what keeps a source that only ever sent reference data from claiming to serve.
     last_batch_ns: u64,
+    /// Monotonic time of this publisher's last order-level batch for the market, published or not.
+    /// A mirror whose copies always lose the race publishes nothing, so `last_batch_ns` never moves
+    /// for it — and it is exactly that arm the resurrection guard is held open for.
+    last_seen_ns: u64,
 }
 
 /// Per-market state behind the `book` authority gate.
@@ -1478,7 +1530,13 @@ impl Arbiter {
     /// A change with no order identity (`order_id == 0`) is un-collapsable and always published.
     fn emit_order_level_book(&mut self, key: MarketKey, b: &NormalizedBook, publisher: Publisher) {
         let now = now_mono_ns();
-        self.sync_book_arms(&key);
+        self.book_sync
+            .entry(key.clone())
+            .or_default()
+            .entry(publisher)
+            .or_default()
+            .last_seen_ns = now;
+        self.sync_book_arms(&key, now);
         if b.changes
             .first()
             .is_some_and(|c| c.action == BookAction::Clear)
@@ -1578,13 +1636,22 @@ impl Arbiter {
     /// arm has reported the removal and it is therefore spent. Without it a tombstone is held for an
     /// arm that has departed, and a market with more lifetime deletes than the guard's cap — which is
     /// every busy market — would re-baseline forever.
-    fn sync_book_arms(&mut self, key: &MarketKey) {
-        let arms: Vec<Publisher> = self
-            .book_sync
-            .get(key)
-            .map(|m| m.keys().copied().collect())
-            .unwrap_or_default();
-        self.book_events.entry(key.clone()).or_default().arms = arms;
+    fn sync_book_arms(&mut self, key: &MarketKey, now: u64) {
+        let peers = self.book_sync.get(key);
+        let events = self.book_events.entry(key.clone()).or_default();
+        events.serving = 0;
+        for (&p, st) in peers.into_iter().flatten() {
+            // The same "in sync and actually on the wire" test the `Clear`-led suppression applies,
+            // except on arrival rather than on a published batch: an arm whose copies all lose the
+            // race publishes nothing, and it is exactly that arm a tombstone exists to refuse.
+            if st.synced
+                && st.last_seen_ns != 0
+                && now.saturating_sub(st.last_seen_ns) <= PEER_SERVING_NS
+            {
+                let bit = events.arm_bit(p);
+                events.serving |= bit;
+            }
+        }
     }
 
     /// Publish a producer's own `Clear`-led re-baseline and re-point the market's race state at it.
@@ -5501,10 +5568,16 @@ mod tests {
         let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
         a.set_book_dedup_window(1_000);
         let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
-        // Only arm 1 reports each removal, so every tombstone stays live for arm 2's copy. Ids churn
-        // 2us apart against a 1us window: every one of them is outside the dedup window, which is
-        // exactly the horizon a peer's stale copy is *not* bounded by.
-        for oid in 1..=(MAX_SEEN_ORDER_EVENTS as u64 + 1) {
+        // Arm 2 is serving — synced and on the wire — but reports none of the removals below, so every
+        // tombstone stays open for the copy it has yet to deliver.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 1, 100.0, 1.0)], 1),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        // Ids churn 2us apart against a 1us window: every one of them is outside the dedup window,
+        // which is exactly the horizon a peer's stale copy is *not* bounded by.
+        for oid in 1..=(MAX_GUARDED_ORDERS as u64 + 1) {
             let at = oid * 2_000;
             a.emit(
                 l3_batch(VENUE, vec![order(BookAction::Update, oid, 100.0, 1.0)], at),
@@ -5557,7 +5630,7 @@ mod tests {
         let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
         a.set_book_dedup_window(1_000);
         let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
-        for oid in 1..=(MAX_SEEN_ORDER_EVENTS as u64 + 64) {
+        for oid in 1..=(MAX_GUARDED_ORDERS as u64 + 64) {
             a.emit(
                 l3_batch(
                     VENUE,
@@ -5583,7 +5656,7 @@ mod tests {
         let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
         a.set_book_dedup_window(1_000);
         let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
-        for oid in 1..=(MAX_SEEN_ORDER_EVENTS as u64 + 1) {
+        for oid in 1..=(MAX_GUARDED_ORDERS as u64 + 1) {
             let at = oid * 2_000;
             a.emit(
                 l3_batch(VENUE, vec![order(BookAction::Update, oid, 100.0, 1.0)], at),
@@ -5608,12 +5681,97 @@ mod tests {
         assert_eq!(forced_rebaselines(VENUE, FORCED_GUARD_EVICTED), before);
     }
 
+    /// A market's dead orders outnumber its live ones within seconds, so the two populations are
+    /// bounded apart. Under one shared budget with tombstones preferred, a market past the cap holds
+    /// nothing but tombstones and drift between the arms stops being detected at all.
+    #[test]
+    fn drift_is_still_caught_after_a_caps_worth_of_removals() {
+        const VENUE: &str = "BookGuardStarvation";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let before = disagreements(VENUE);
+        for oid in 1..=(MAX_GUARDED_ORDERS as u64 * 2) {
+            let at = oid * 2_000;
+            a.emit(
+                l3_batch(VENUE, vec![order(BookAction::Update, oid, 100.0, 1.0)], at),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            a.emit(
+                l3_batch(
+                    VENUE,
+                    vec![order(BookAction::Delete, oid, 100.0, 0.0)],
+                    at + 1_000,
+                ),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            let _ = drain_books(&mut rx);
+        }
+        // A fresh order and a peer claiming more is resting for it than the arm that added it.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 9_999, 98.0, 10.0)],
+                9_000_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![order(BookAction::Update, 9_999, 98.0, 99.0)],
+                9_001_000,
+            ),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        assert_eq!(
+            disagreements(VENUE),
+            before + 1,
+            "a market past the cap must still catch a drifted arm"
+        );
+    }
+
+    /// A gapped peer stops being one a tombstone waits for. Holding tombstones open for an arm that
+    /// is not serving would put a busy market into a permanent forced re-baseline — one whole book
+    /// republished per dedup window — reachable from a single desync report.
+    #[test]
+    fn a_peer_that_is_not_serving_does_not_hold_tombstones_open() {
+        const VENUE: &str = "BookGuardGappedPeer";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_dedup_window(1_000);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        a.set_book_synced(&key, arm(2), false);
+        let before = forced_rebaselines(VENUE, FORCED_GUARD_EVICTED);
+        for oid in 1..=(MAX_GUARDED_ORDERS as u64 + 1) {
+            let at = oid * 2_000;
+            a.emit(
+                l3_batch(VENUE, vec![order(BookAction::Update, oid, 100.0, 1.0)], at),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            a.emit(
+                l3_batch(
+                    VENUE,
+                    vec![order(BookAction::Delete, oid, 100.0, 0.0)],
+                    at + 1_000,
+                ),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            let _ = drain_books(&mut rx);
+        }
+        assert_eq!(forced_rebaselines(VENUE, FORCED_GUARD_EVICTED), before);
+    }
+
     /// A recovery snapshot larger than the guard's cap must not evict the guard wholesale on its way
     /// in. Its own orders are live floors, which re-seed themselves; the tombstones it would displace
     /// do not, and losing one reopens the resurrection path for the peer copy still to arrive.
     #[test]
     fn a_rebaseline_larger_than_the_cap_keeps_the_resurrection_guard() {
-        for orders in [101u64, MAX_SEEN_ORDER_EVENTS as u64 + 77] {
+        for orders in [101u64, MAX_GUARDED_ORDERS as u64 + 77] {
             let venue: &'static str =
                 Box::leak(format!("BookBigRebaseline{orders}").into_boxed_str());
             let (mut a, mut rx) = racing(venue, &[arm(1), arm(2)]);
@@ -5692,6 +5850,51 @@ mod tests {
         assert!(
             drain_books(&mut rx).is_empty(),
             "a re-baseline must not reopen the resurrection path"
+        );
+    }
+
+    /// A re-baseline republishes the wire's own book unfiltered, so an order it names is one the
+    /// consumer now holds — even one the guard has tombstoned. Refusing to seed it leaves the guard
+    /// rejecting every later change to an order every consumer can see, and the consumer holding a
+    /// quantity the venue has already reduced.
+    #[test]
+    fn a_rebaseline_seeds_an_order_it_had_tombstoned() {
+        const VENUE: &str = "BookRebaselineTombstoned";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 7, 100.0, 5.0)],
+                1_000,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Delete, 7, 100.0, 0.0)], 1_100),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        // The arm gaps and recovers, and its book still holds order 7 — so the fill that follows must
+        // land on the consumer's copy of it.
+        a.emit(
+            l3_batch(
+                VENUE,
+                vec![clear_both(), order(BookAction::Update, 7, 100.0, 5.0)],
+                1_200,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 3.0)], 1_300),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!(
+            consumer_book(&mut rx).get(&7),
+            Some(&3.0),
+            "a consumer must not be left holding a quantity the venue already reduced"
         );
     }
 
