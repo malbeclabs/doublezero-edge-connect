@@ -12,7 +12,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
+### Fixed
+- The Market-by-Order resurrection guard no longer corrupts a consumer's book when the two
+  publishers drift far apart. It was bounded by a per-market count of 512 removed orders, which is a
+  count standing in for a *time* tolerance, and past it — 150 ms of inter-arm lag on a busy market,
+  against 186 ms measured between the real publishers — it evicted a tombstone a lagging arm could
+  still race and then re-baselined the market from our own accumulated view, which is the view the
+  guard had just failed to protect: the resurrected orders were republished as a complete book and
+  re-seeded as live, and nothing removed them again. Now a tombstone is retired once every publisher
+  the market knows has reported the removal or been seen past it, the population is bounded
+  process-wide instead of per market (the same aggregate memory, spent where the guard needs it), and
+  a guard that genuinely cannot answer **disowns** the market — state and replay entry dropped,
+  nothing published until a producer re-baselines it — rather than republishing our own view. A
+  synthetic two-arm lag sweep that diverged at 150 ms is now exact to 1 s, and to 4 s when driven
+  further.
+
 ### Added
+- `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above, and
+  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling, so the
+  headroom is visible before it runs out. `dz_mbo_forced_rebaselines_total` loses its
+  `reason="guard_evicted"` label, which no longer has a behaviour behind it.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
   exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`

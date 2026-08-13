@@ -398,22 +398,41 @@ Modules are grouped by role under `src/`:
   (`dz_book_resurrections_dropped_total`): a `size == 0` event tombstones the order and any later change
   for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order another
   publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
-  order. Tombstones are bounded by an order count and deliberately **not** by the time window, which is
-  what keeps `--arb-book-dedup-window-ms` a cost knob. What the cap costs depends entirely on which
-  entry it takes, so the two populations are queued and bounded **apart**, `MAX_GUARDED_ORDERS` each:
-  a **live floor** re-seeds itself on that order's next update, so its eviction is silent, which is
-  what lets a recovery snapshot larger than the cap (the flagship market is 44,598 orders) seed itself
-  without discarding the guard; a **tombstone** is re-seeded by nothing, so its eviction forces a
-  re-baseline (`dz_mbo_forced_rebaselines_total{reason="guard_evicted"}`) unless every *serving* arm
-  has already reported the removal, leaving no arm that could still deliver a stale copy unaccounted
-  for — a **spent** tombstone. One shared budget with tombstones preferred would leave every busy
-  market holding nothing but tombstones, and drift between the arms would stop being detected at all.
-  ⚠️ Serving is `book_sync`'s `synced` plus arrival within `PEER_SERVING_NS` — arrival, not a
-  *published* batch, because a mirror whose copies all lose the race publishes nothing and is exactly
-  the arm the guard is held open for; a gapped or departed arm drops out, or one desync report would
-  put a busy market into a permanent forced re-baseline. And a forged copy of a real removal spends an
-  arm's bit, so "spent" bounds the guard's cost rather than proving nothing is in flight — the
-  unauthenticated wire's price, as elsewhere here. A forced re-baseline's seeded floors are owned by **no arm**:
+  order. Tombstones are deliberately **not** expired by the time window, which is what keeps
+  `--arb-book-dedup-window-ms` a cost knob; **what retires one is the arms, not a clock or a count** —
+  every publisher `book_sync` holds for the market (`known`) has either reported the removal or been
+  seen past it, the latter from a per-arm **watermark** on the timeline of first arrivals, advanced
+  only where that arm's copy was recognized as a *duplicate* (past the dedup window a stale copy *is* a
+  first delivery, so crediting one would advance a lagging arm to the present and retire the tombstones
+  it is about to race). That makes the population "the removals inside the arms' current lag spread",
+  which is what the guard actually needs; a per-market **count** — what it used to be, 512 — is a count
+  standing in for a *time* tolerance and is simultaneously far too much for a quiet market and far too
+  little for a busy one. Measured: at 150 ms of inter-arm lag on a busy market it gave way, against
+  186 ms between the real publishers. The two populations are queued and bounded **apart** — a **live
+  floor** re-seeds itself on that order's next update, so its eviction is silent (which is what lets a
+  recovery snapshot larger than the cap, the flagship market being 44,598 orders, seed itself without
+  discarding the guard), while a **tombstone** is re-seeded by nothing — and the tombstones are bounded
+  **process-wide** (`MAX_TOMBSTONES_TOTAL`, 1 Mi, an eighth of what the old per-market cap permitted
+  across `MAX_BOOK_MARKETS`) with `MAX_MARKET_TOMBSTONES` (65,536) as the per-market backstop, since a
+  per-market cap large enough for a busy market is no bound at all once multiplied out. Reaching either
+  cap **invalidates** the market rather than forcing a re-baseline
+  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones`): republishing our
+  own view is not an answer to "the guard could not answer", since that view is exactly what the guard
+  failed to protect — it would hand the consumer the resurrections stamped `snapshot`/`last` and
+  re-seed them as live floors, so nothing removes them again. So `Arbiter::invalidate_market` drops the
+  market's race state, replay entry and accumulators and publishes **nothing** until a producer sends a
+  `Clear`-led re-baseline of its own. ⚠️ That is a real availability cost: for a *healthy* publisher
+  the next such batch is its next **recovery**, not its next snapshot rotation (`book.rs` drops a
+  snapshot whose anchor it has already applied), so the market can be dark for tens of seconds or
+  longer. Eviction — as opposed to retirement — asks only about the *serving* arms, which is
+  `book_sync`'s `synced` plus arrival within `PEER_SERVING_NS`; arrival, not a *published* batch,
+  because a mirror whose copies all lose the race publishes nothing and is exactly the arm the guard is
+  held open for. The two masks are the whole distinction: a gapped or departed arm must not be retired
+  around (it is the likeliest source of a stale `Add` there is) but must not hold the population open
+  forever either, or one desync report would put a busy market into permanent invalidation. And a
+  forged copy of a real removal spends an arm's bit, so this bounds the guard's cost rather than proving
+  nothing is in flight — the unauthenticated wire's price, as elsewhere here.
+  A forced re-baseline's seeded floors are owned by **no arm**:
   what is republished is the pointwise-minimum view of every arm, so stamping the arm whose batch
   discharged the flag would exempt it from the gate and let it re-assert the stale size the
   re-baseline was called to correct. `dz_mbo_arm_disagreement_total` is the
