@@ -935,7 +935,8 @@ impl MarketEvents {
             // A synced peer that has never been on the wire here counts for retirement anyway: its
             // first copy for this market is the likeliest stale `Add` there is. One that *was* on the
             // wire and stopped does not — see above.
-            if !arriving && !(st.synced && st.last_seen_ns == 0) {
+            let synced_and_never_arrived = st.synced && st.last_seen_ns == 0;
+            if !(arriving || synced_and_never_arrived) {
                 continue;
             }
             let bit = self.arm_bit(p);
