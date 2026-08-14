@@ -8,7 +8,7 @@ The rule the replacement is held to: **the implementation diff touches none of t
 
 A test is **behaviour** if its assertions are things a WebSocket consumer can observe: what reaches the broadcast, whether a message is published at all, and whether a book rebuilt the way PROTOCOL.md tells a consumer to rebuild it matches the venue's. A test that reads a private field of the arbiter, a guard counter or a metric to decide whether it passed is **mechanism**, whatever its name says — it cannot survive the removal of the thing it reads.
 
-Everything about quotes, depth, trades, midpoints, market-by-price levels, codecs, the registry, the reconciler, shreds and the CLI is out of scope and not listed.
+Everything about quotes, depth, trades, midpoints, market-by-price levels, codecs, the registry, the reconciler, shreds and the CLI is out of scope and not listed. So is the **single-arm authority gate** (`src/ingest/authority.rs` and the `book_publishes_one_arm_*` / arm-transfer / arm-eligibility tests in `arbiter.rs`) — a neighbouring gate that decides which arm serves a *price-aggregated* market, not the resurrection guard. It is out of scope for the classification, not for the diff: it shares `MarketKey` and the accumulator/replay/`last_admitted` eviction pairing, so a replacement that re-keys per-market state lands on it. If your diff touches those, they need their own read.
 
 ## Behaviour
 
@@ -40,7 +40,11 @@ Already there:
 - `the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag`
 - `a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal`
 
-⚠️ The assertions are behavioural but three of the **scenario sizes** are derived from private constants mirrored at the top of the file (`GUARD_CAP`, `GUARDED_ORDERS`, `MARKET_TOMBSTONES`). A replacement that changes what bounds the guard has to re-derive those numbers even where the assertion itself stands — and the last four tests above are named for a cap that may no longer exist. Renaming them is not a contract change; weakening what they assert is.
+⚠️ Two caveats on this list.
+
+The **scenario sizes** of five of them are derived from private constants mirrored at the top of the file (`GUARD_CAP`, `GUARDED_ORDERS`, `MARKET_TOMBSTONES`). A replacement that changes what bounds the guard has to re-derive those numbers even where the assertion itself stands, and `a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`, `a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order` and `a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing` are named for a cap that may no longer exist. Renaming those three is not a contract change; weakening what they assert is.
+
+`a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing` and `the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag` compare the consumer's book to the venue's **only at the end of the run**, and their trailing arm replays the venue's whole life in order — so a stale copy it publishes is corrected by its own next copy, and both pass with the racing guard removed outright. They measure the *lag ceiling* honestly and detect over-suppression; they are not evidence that under-suppression is caught. The scenarios added for this net assert after every arrival instead (`arrival_lagged_stream`), which is the form to copy. Strengthening the two older ones is a change to an existing test and was deliberately left out of this phase.
 
 ### `src/ingest/arbiter.rs`
 
@@ -57,6 +61,7 @@ Already there:
 - `an_interleaved_race_is_not_a_disagreement`
 - `a_single_publisher_streams_unimpeded`
 - `simultaneous_recoveries_produce_exactly_one_rebaseline`
+- `an_evicted_market_still_routes_as_order_level` — decides on the broadcast (one message, not two), and it is the only check that an evicted market re-derives its routing from batch content. Reverting it to the single-arm authority emits `clear_only` plus the batch, which tells every consumer to drop a live book. It also asserts a private `seen`/`resting` bound, so it cannot pass *unchanged* if those fields go — but the consumer-visible half has to survive in some form.
 
 ### Elsewhere
 
@@ -76,9 +81,16 @@ Downstream of the merge point, so a replacement should not reach them — but th
 All in `src/ingest/arbiter.rs`, all reading guard internals, a guard metric or a private field. A later phase deletes them with the code they describe; none of them is evidence the product still works.
 
 - Retirement and the arm masks — `a_tombstone_every_arm_reported_is_retired_on_the_spot`, `an_unreported_removal_does_not_hold_the_tombstones_behind_it`, `arms_snapshotting_from_different_anchors_do_not_walk_a_market_to_a_blackout`, `a_market_the_arms_cannot_settle_does_not_rescan_on_every_batch`, `a_sweep_schedules_the_next_one_above_the_population_it_left`, `a_synced_arm_with_nothing_on_the_wire_yet_holds_the_retirement_quorum`, `an_arm_that_stopped_arriving_leaves_the_retirement_quorum`, `a_peer_that_is_not_serving_does_not_hold_tombstones_open`, `the_batch_that_creates_a_markets_race_state_still_knows_who_is_serving`
-- Caps, budgets and their accounting — `one_market_may_hold_more_tombstones_than_the_old_per_market_cap`, `the_cap_sweeps_before_it_evicts_rather_than_disowning_a_settled_tombstone`, `the_high_water_re_seats_when_the_market_holding_it_retires_rather_than_reading_zero`, `the_process_wide_ceiling_disowns_the_market_holding_the_tombstones`, `an_overcounted_budget_costs_a_recount_rather_than_every_market`, `guarded_tombstones_are_counted_exactly`, `drift_is_still_caught_after_a_caps_worth_of_removals`, `the_racing_window_is_bounded_by_event_count`, `evicting_a_live_floor_does_not_force_a_rebaseline`, `eviction_drops_the_racing_state_too`, `an_evicted_market_still_routes_as_order_level`
+- Caps, budgets and their accounting — `one_market_may_hold_more_tombstones_than_the_old_per_market_cap`, `the_cap_sweeps_before_it_evicts_rather_than_disowning_a_settled_tombstone`, `the_high_water_re_seats_when_the_market_holding_it_retires_rather_than_reading_zero`, `the_process_wide_ceiling_disowns_the_market_holding_the_tombstones`, `an_overcounted_budget_costs_a_recount_rather_than_every_market`, `guarded_tombstones_are_counted_exactly`, `drift_is_still_caught_after_a_caps_worth_of_removals`, `evicting_a_live_floor_does_not_force_a_rebaseline`
 - Disowning bookkeeping — `a_flapping_market_does_not_discharge_its_own_disowning`
 - Counters and rate limits — `a_content_disagreement_is_counted`, `the_rebaseline_rate_limit_does_not_follow_the_dedup_window`
+**Two of these are bounds, not mechanism. Re-point them; do not delete them.** The wire is unauthenticated, so `order_id`, `channel` and `instrument_id` are all attacker-supplied, and these are the only assertions that the two per-market maps they key cannot grow without limit:
+
+- `the_racing_window_is_bounded_by_event_count` — the sole check that `seen`/`resting` stay within `MAX_SEEN_ORDER_EVENTS`, the per-market bound against an `order_id` flood.
+- `eviction_drops_the_racing_state_too` — the sole check that `book_sync` and `book_events` are evicted with `MAX_BOOK_MARKETS`. `book_markets_are_bounded` covers `book_markets`, `book_order`, the replay map and the authority map, and none of those two. `book_sync` is also what the re-baseline suppression reads, which is behaviour.
+
+Whatever bounds the replacement puts on the state that replaces these needs an equivalent test landing in the same change.
+
 - Neighbouring, and only listed so nobody mistakes them for the guard: `src/ingest/book.rs::the_removed_set_is_bounded` (the per-book removed-id set, defence in depth behind the merge point) and `src/ingest/processor.rs::a_gapped_book_reports_itself_unsynced` (the sync report the arm masks consume — if the replacement stops consuming it, this one goes with it).
 
 ## Both
