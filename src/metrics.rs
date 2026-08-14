@@ -192,6 +192,35 @@ pub struct Metrics {
     /// key is wire-supplied, so this is the forged-market backstop: an evicted market loses its replay
     /// bootstrap, and its next batch re-baselines the consumer from whatever it accumulates again.
     pub book_markets_evicted: IntCounterVec,
+    /// Removed order ids an MBO book forgot at its resurrection-guard cap. Non-zero reopens the
+    /// resurrection path for a copy arriving later than that many removals.
+    pub mbo_removed_evicted: IntCounter,
+    /// Order-level `book` events collapsed because another publisher delivered the same venue event
+    /// first. In steady state this is the whole stream of every publisher but the fastest, so it is a
+    /// throughput figure rather than a fault.
+    pub book_events_deduped: IntCounterVec,
+    /// Two publishers reported the same venue event with different resulting state: the identity
+    /// matched and the content did not, which is the signature of a book that has silently drifted.
+    /// Any sustained non-zero rate is a correctness alarm.
+    pub mbo_arm_disagreement: IntCounterVec,
+    /// Order-level changes dropped because the market had already published that order as gone — a
+    /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
+    /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
+    pub book_resurrections_dropped: IntCounterVec,
+    /// Order-level markets forced to re-baseline because two arms claimed different resting state for
+    /// one order (`reason="disagreement"`).
+    pub mbo_forced_rebaselines: IntCounterVec,
+    /// Order-level markets disowned because the resurrection guard lost a tombstone no serving arm had
+    /// passed. The market publishes nothing until a producer re-baselines it, so this is an
+    /// availability alarm, not a throughput figure.
+    pub mbo_market_invalidations: IntCounterVec,
+    /// Tombstones the resurrection guard holds across every tracked market, against the process-wide
+    /// ceiling. The headroom to watch: it is readable long before the guard runs out of it.
+    pub mbo_guarded_tombstones: IntGauge,
+    /// The largest tombstone population any single market holds, against the per-market cap — which is
+    /// a sixteenth of the process-wide one, and so the cap that fires first. Unlabelled: the market is
+    /// wire-supplied and there are up to 16,384 of them.
+    pub mbo_guarded_tombstones_max: IntGauge,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -238,6 +267,12 @@ pub struct Metrics {
     pub ws_rate_limited: IntCounter,
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
+
+    // --- Hyperliquid-compatible sink (off by default) ---
+    /// Currently-connected clients of the Hyperliquid-compatible sink.
+    pub hl_sink_clients: IntGauge,
+    /// Frames sent by the Hyperliquid-compatible sink, by `channel` (l2Book/l4Book/trades).
+    pub hl_sink_messages: IntCounterVec,
 
     // --- Public WS input feeders (per-venue backstops; off by default) ---
     /// Feeder health per `venue`: 1 while the public WebSocket session is connected, 0 while
@@ -660,6 +695,71 @@ impl Metrics {
                  reached; an evicted market loses its replay bootstrap.",
                 &["venue"],
             ),
+            mbo_removed_evicted: counter(
+                &registry,
+                "dz_mbo_removed_evicted_total",
+                "Removed order ids forgotten because a book's resurrection guard hit its cap. \
+                 Non-zero means a very late duplicate could resurrect a dead order; sustained \
+                 non-zero means the cap is too small for this venue's churn.",
+            ),
+            book_events_deduped: counter_vec(
+                &registry,
+                "dz_book_events_deduped_total",
+                "Order-level book events collapsed because another publisher delivered the same \
+                 venue event first. In steady state this is the whole stream of every publisher but \
+                 the fastest, so it is a throughput figure, not a fault.",
+                &["venue"],
+            ),
+            book_resurrections_dropped: counter_vec(
+                &registry,
+                "dz_book_resurrections_dropped_total",
+                "Order-level changes dropped because the market had already published that order as \
+                 gone. A venue never reuses an order id, so each one is a lagging publisher's stale \
+                 copy refused before it could resurrect a dead order in every consumer's book — the \
+                 guard order-level racing rests on, working.",
+                &["venue"],
+            ),
+            mbo_arm_disagreement: counter_vec(
+                &registry,
+                "dz_mbo_arm_disagreement_total",
+                "Two publishers reported the same venue event with different resulting state. The \
+                 identity matched and the content did not, which is the signature of a book that has \
+                 silently drifted. Any sustained non-zero rate is a correctness alarm.",
+                &["venue"],
+            ),
+            mbo_forced_rebaselines: counter_vec(
+                &registry,
+                "dz_mbo_forced_rebaselines_total",
+                "Order-level markets withheld and re-baselined because the cross-publisher guard \
+                 could not answer. reason=disagreement: two arms claimed different resting state for \
+                 one order, so neither is known to be right. A sustained rate is the signal to \
+                 reconsider the per-publisher book model.",
+                &["venue", "reason"],
+            ),
+            mbo_market_invalidations: counter_vec(
+                &registry,
+                "dz_mbo_market_invalidations_total",
+                "Order-level markets disowned because the resurrection guard lost a tombstone no \
+                 serving arm had passed, so a lagging publisher's stale add for that order could no \
+                 longer be refused. The market's state is dropped and nothing is published for it \
+                 until a publisher re-baselines it, which is an outage for that market.",
+                &["venue"],
+            ),
+            mbo_guarded_tombstones: gauge(
+                &registry,
+                "dz_mbo_guarded_tombstones",
+                "Removed orders the cross-publisher resurrection guard is holding across every \
+                 tracked market, against a process-wide ceiling of 1048576. Sized by how far the \
+                 publishers lag each other; reaching the ceiling is what invalidates markets.",
+            ),
+            mbo_guarded_tombstones_max: gauge(
+                &registry,
+                "dz_mbo_guarded_tombstones_max",
+                "The largest tombstone population any single order-level market holds, against a \
+                 per-market cap of 65536 — a sixteenth of the process-wide ceiling, and so the cap \
+                 that fires first. Alert on this rather than on the aggregate: one market walking to \
+                 its own cap, and to a blackout, is flat headroom on the sum.",
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -721,6 +821,17 @@ impl Metrics {
                 &registry,
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
+            ),
+            hl_sink_clients: gauge(
+                &registry,
+                "dz_hl_sink_clients",
+                "Clients connected to the Hyperliquid-compatible sink",
+            ),
+            hl_sink_messages: counter_vec(
+                &registry,
+                "dz_hl_sink_messages_total",
+                "Frames sent by the Hyperliquid-compatible sink, by channel",
+                &["channel"],
             ),
             ws_feeder_up: gauge_vec(
                 &registry,
@@ -950,6 +1061,25 @@ mod tests {
             .inc();
         m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
         m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
+        m.mbo_removed_evicted.inc();
+        m.book_events_deduped
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_arm_disagreement
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.book_resurrections_dropped
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_forced_rebaselines
+            .with_label_values(&["HYPERLIQUID", "disagreement"])
+            .inc();
+        m.mbo_market_invalidations
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_guarded_tombstones.set(7);
+        m.mbo_guarded_tombstones_max.set(3);
+        m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -997,6 +1127,16 @@ mod tests {
             "dz_arm_unmatched_trades_total",
             "dz_book_dropped_total",
             "dz_book_markets_evicted_total",
+            "dz_mbo_removed_evicted_total",
+            "dz_book_events_deduped_total",
+            "dz_mbo_arm_disagreement_total",
+            "dz_book_resurrections_dropped_total",
+            "dz_mbo_forced_rebaselines_total",
+            "dz_mbo_market_invalidations_total",
+            "dz_mbo_guarded_tombstones",
+            "dz_mbo_guarded_tombstones_max",
+            "dz_hl_sink_clients",
+            "dz_hl_sink_messages_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
             "dz_history_unattributable_trades_total",

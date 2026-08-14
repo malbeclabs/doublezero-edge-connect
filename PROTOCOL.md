@@ -33,8 +33,10 @@ On each new connection the producer:
    whose reference data carries its own Source ID, every symbol it defines is replayed, priced or
    not (see [*A symbol appears only once its source is
    known*](#a-symbol-appears-only-once-its-source-is-known)).
-2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and
-   for a Market-by-Price venue a `book` re-baseline (a `clear` plus the complete level set).
+2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and a
+   `book` re-baseline (a `clear` plus the complete book) for every market that has one. See
+   `book_scope` under [*Subscriptions & filtering*](#subscriptions--filtering) for the granularity of
+   that re-baseline on an order-level market.
 3. **Streams** `quote`/`trade`/`midpoint`/`depth`/`book` messages as they arrive, fanned out to all
    connected consumers.
 
@@ -56,7 +58,7 @@ Every message is a JSON object tagged by a `type` field (`snake_case`):
 | `trade`      | A trade print (last sale).               |
 | `midpoint`   | A single derived mid price.              |
 | `depth`      | A full order-book depth snapshot.        |
-| `book`       | A batch of incremental order-book level changes. |
+| `book`       | A batch of incremental order-book changes, price-aggregated or order-level. |
 | `status`     | A venue-level feed-health transition.    |
 
 Consumers **must ignore unknown `type` values and unknown fields** (forward compatibility).
@@ -239,12 +241,12 @@ first** (bids high→low, asks low→high).
 client that connects mid-stream is replayed the latest `depth` per symbol on connect (after the
 `instrument` definitions).
 
-> **Why the producer reconstructs the book.** The Market-by-Order feed is an order-by-order *delta*
-> stream with its own snapshot+delta recovery. Re-serving those raw deltas would break this
-> protocol's central guarantee that every message is full state and self-heals. So the producer
-> runs the L3 book reconstruction and recovery **internally** and exposes only the derived,
-> full-state `depth` (and `trade`) product. Raw order add/cancel/execute events are intentionally
-> **not** on the wire.
+> **Market-by-Order produces `depth` *and* `book`.** The producer runs that feed's snapshot+delta
+> recovery internally and derives both products from the same reconstructed L3 book: this full-state
+> top-*N* `depth`, and the order-level [`book`](#book) carrying the venue's own `order_id`. Neither
+> re-serves the upstream's raw add/cancel/execute events — a `book` change is the *resulting state* of
+> one order, so a consumer needs no delta arithmetic, and a recovery still surfaces only as a
+> re-baseline.
 
 ### `book`
 
@@ -257,7 +259,9 @@ client that connects mid-stream is replayed the latest `depth` per symbol on con
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
 ```
 
-A batch of **incremental** price-level changes for one instrument, derived in the producer from the DZ Edge Market-by-Price feed. Unlike `depth`, a `book` message is not full state: apply the changes in order to the book you already hold.
+A batch of **incremental** book changes for one instrument, derived in the producer from a DZ Edge order-book feed. Unlike `depth`, a `book` message is not full state: apply the changes in order to the book you already hold.
+
+A change is either **price-aggregated** (`order_id: 0`, from the Market-by-Price feed) or **order-level** (a non-zero `order_id`, the venue's own, from the Market-by-Order feed). The two never mix within a market, and `order_id` is what says which you are reading.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -268,11 +272,12 @@ A batch of **incremental** price-level changes for one instrument, derived in th
 | `symbol` | string | **Display label.** Not guaranteed unique — see *Identity* below. |
 | `channel` | uint32 | The publisher's channel id: the instrument set this feed carries. Filterable. |
 | `instrument_id` | uint32 | Instrument id, unique within `channel`. |
-| `changes` | object[] | Level changes, in order. `{ "action", "side", "price", "size" }`. |
+| `changes` | object[] | Book changes, in order. `{ "action", "side", "price", "size", "order_id" }`. |
 | `changes[].action` | string | `"clear"`, `"update"`, or `"delete"`. |
 | `changes[].side` | string | `"bid"`, `"ask"`, or `"both"` (`"both"` only on a `clear`). |
-| `changes[].price` | number | Price of the level (decimal). Ignored for a `clear`. |
-| `changes[].size` | number | The level's **absolute** resulting size (decimal), not a delta. `0` on a `delete`. |
+| `changes[].price` | number | Price of the level or order (decimal). Ignored for a `clear`. |
+| `changes[].size` | number | The **absolute** resulting size (decimal), not a delta — of the level for a price-aggregated change, of the order for an order-level one. `0` on a `delete`. |
+| `changes[].order_id` | uint64 | The venue's order id for an order-level change, or `0` when the change is price-aggregated and carries no order identity. |
 | `snapshot` | bool | Advisory: this batch is part of a rebuild. **Not** what re-baselines you. |
 | `last` | bool | This is the final batch of a logical book event. |
 | `source_ts_ns` | uint64 | Timestamp of the latest applied book event; `0` if unknown. |
@@ -288,7 +293,14 @@ A batch of **incremental** price-level changes for one instrument, derived in th
 
 **Gap detection is the producer's job.** The producer runs the upstream feed's snapshot+delta recovery internally, per publisher, and re-serves only sequences it has verified as contiguous. There are no sequence numbers on the wire and a consumer needs no gap machinery of its own: a recovery surfaces as a re-baseline.
 
-**One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed. The producer elects one authoritative publisher per market and republishes only its stream, so a consumer sees one coherent book and never has to merge two. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow. A consumer that honors `clear` therefore needs nothing else in either case: it is never told which publisher it is reading and never has to detect the change.
+**One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed, and a consumer sees one coherent book from them, never two to merge. How that happens depends on whether the changes carry an `order_id`, but the consumer contract is the same either way and it is never told which publisher it is reading.
+
+- **Price-aggregated.** The producer elects one authoritative publisher per market and republishes only its stream. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow.
+- **Order-level.** Every publisher stamps the venue's own `order_id`, so the producer instead publishes each venue event's first arrival and collapses the rest: a consumer gets each event once, from whichever publisher was fastest for *that* event. A change for an order the producer has already published as gone is refused, so a lagging publisher cannot resurrect it. A publisher recovering by snapshot republishes its whole book only when no peer is both healthy and currently serving the market, so a recovery cannot wipe a book another publisher is keeping current — while a publisher that stops reaching the producer cannot block the recovery either.
+
+Either way a consumer that honors `clear` needs nothing else.
+
+**The bootstrap matches the market.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a stream of different granularity. `book_scope` under *Subscriptions & filtering* overrides that for a consumer that folds the stream itself.
 
 ### `status`
 
@@ -398,7 +410,7 @@ A consumer may send control messages (JSON text frames) to filter the stream. **
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string, "book_scope"?: "levels" | "orders" }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
 
 `source` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them, so a
 disagreeing pair matches nothing; supply one.
@@ -431,6 +443,8 @@ Unknown/malformed control messages get `{"channel":"error","error":"unrecognized
 are otherwise ignored.
 
 Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
+
+**`book_scope` selects the granularity of that `book` replay, not which messages arrive.** Omitted — the default, and the only possibility on the connect-time replay — it **follows the market**: an order-level market is bootstrapped as every resting order with its `order_id`, a price-aggregated one as price levels carrying `order_id: 0`. That is what a consumer needs, because a bootstrap and a stream of different granularity cannot be reconciled: an order-level change carries one *order's* absolute size, and applying it as a level's size corrupts the book. `"levels"` asks for the price fold of an order-level market anyway, which is useful only to a consumer that folds the live stream itself; `"orders"` asks for orders explicitly. It is a rendering choice rather than a filter dimension, so it neither excludes messages nor forms part of a subscription's identity — changing scope is an `unsubscribe` followed by a `subscribe`.
 
 ## Heartbeat & liveness
 
@@ -477,7 +491,9 @@ on connect:
       "book":                                        # incremental; apply in order
         book = book_for(msg.venue, msg.channel, msg.instrument_id)
         for c in msg.changes:                        # "clear" re-baselines, not msg.snapshot
-          apply(book, c.action, c.side, c.price, c.size)
+          # c.order_id == 0 keys the change by price; non-zero keys it by the venue's order id.
+          # The bootstrap arrives at the same granularity, so one dispatcher covers both.
+          apply(book, c.action, c.side, c.price, c.size, c.order_id)
         if msg.last: publish(book)                   # honor `last` or you wedge
       _: ignore        # unknown type
     # ignore unknown fields throughout
@@ -505,7 +521,8 @@ on connect:
   `book` data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
-- **`depth` is deprecated.** It is the full-state top-*N* product served from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally. `depth` is removed in v2, when the Market-by-Order feed migrates to `book`. Until then both are served: `book` for Market-by-Price feeds, `depth` for Market-by-Order ones. New consumers should implement `book`.
+- **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally and — on that feed — at order level. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement `book`.
+- **Additive in this revision, so still v1:** `order_id` on a `book` change, and `book_scope` on a subscription. Nothing is withdrawn, and a consumer that ignores both reads the same price-aggregated books it read before.
 - **Breaking within v1: what `venue` contains changed**, and emission is now gated on a Source ID
   having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
   no removed ones) but change *values* an existing consumer may depend on — see [`source`,

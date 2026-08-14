@@ -12,7 +12,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
+### Fixed
+- The resurrection guard's out-of-queue sweep is scheduled rather than triggered on every batch. The
+  threshold was clamped to half the per-market tombstone cap, so above that population it sat *below*
+  the population itself and the comparison was true forever: a full scan of the market's tombstone map
+  per datagram, held under the one arbiter mutex every receiver on every feed takes to emit. Measured
+  synthetically at 141 µs a batch with 36,768 tombstones held, against 6.9 µs on a market in step —
+  and one datagram from a source the market has never seen is enough to start the population climbing.
+  The clamp's other, undocumented job was keeping a sweep ahead of the eviction that disowns a market,
+  which is now explicit at that eviction and holds for a batch large enough to cross the cap on its
+  own. After: 3.7 µs at 36,768 and 5.5 µs at the cap.
+- `dz_mbo_guarded_tombstones_max` no longer reads zero while a market holds the real maximum. It
+  followed the market holding it back down, so when that market's arms caught up and it retired, the
+  gauge reported the shrunken figure — full headroom — while a market that had gone quiet still held
+  its whole population, which is the market the gauge exists to find. It now re-seats on the largest
+  survivor, as it already did when the holding market was dropped.
+- A forced re-baseline's rate limit no longer follows `--arb-book-dedup-window-ms`. The two shared a
+  value, so widening the window for its dedup reach (250 ms → 1 s, above) quadrupled how much of a
+  real disagreement's stream a market skips — batches withheld there are lost, not delayed. It is a
+  fixed 250 ms now. On the real capture the wider window drops **one** batch against 24–217 at 250 ms,
+  because the false disagreements stop happening at all; this is about the worst case per
+  disagreement, not the observed total.
+- The resurrection guard's retirement no longer stalls on a removal one arm never reports. It ran
+  head-of-queue over the removal order, so an arm whose snapshot anchor post-dates a removal — it
+  never held that order, so it never reports it — blocked every tombstone behind it for the life of
+  the market, and the population reverted from the arms' lag spread to the market's whole history,
+  exiting only at the per-market cap where the market is disowned. Retirement now also sweeps out of
+  queue order, on a threshold that doubles after each sweep so it costs O(1) amortized per tombstone
+  and nothing at all while the arms keep up. **What counts as evidence is unchanged** — every arm
+  still reaching the market must have reported the removal — so a forged datagram buys exactly what
+  it bought before: one arm's bit on the one order it names.
+- A market disowned by the process-wide tombstone ceiling is announced when it happens rather than on
+  its next batch. That market is not the one being admitted and need never send another — a market
+  whose arms drifted apart and then both went quiet is exactly how one comes to hold the most
+  tombstones — so its consumers kept a book that silently stopped updating while a client connecting a
+  second later got none at all.
+- A disowning survives `MAX_BOOK_MARKETS` eviction. The record lived on the per-market state eviction
+  drops, and the order-level memo is re-derived from batch content, so an evicted market came back
+  reading as ordinary and resumed serving deltas onto a book nothing vouches for.
+- The Market-by-Order resurrection guard no longer corrupts a consumer's book when the two
+  publishers drift far apart. It was bounded by a per-market count of 512 removed orders, which is a
+  count standing in for a *time* tolerance, and past it — 150 ms of inter-arm lag on a busy market,
+  against 186 ms measured between the real publishers — it evicted a tombstone a lagging arm could
+  still race and then re-baselined the market from our own accumulated view, which is the view the
+  guard had just failed to protect: the resurrected orders were republished as a complete book and
+  re-seeded as live, and nothing removed them again. Now a tombstone is retired as soon as every arm
+  still reaching the market has reported the removal, so the population sizes itself to the arms' lag;
+  it is bounded process-wide instead of per market (the same aggregate memory, spent where the guard
+  needs it), with the ceiling charged to the market holding the tombstones rather than to whichever
+  market records the next removal; and a guard that genuinely cannot answer **disowns** the market —
+  state and replay entry dropped, consumers told to drop the book, nothing published until a producer
+  re-baselines it — rather than republishing our own view. Replaying the two real captured publishers,
+  a consumer that ended 994 orders wrong at 300 ms of inter-arm lag, permanently, now holds the venue's
+  book exactly, and the guard's eviction never fires at any lag tested. With the wider dedup window
+  below, first divergence on that capture moves from **153 ms to 2 s** — exact at every step through
+  1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` now partially fills every order, so
+  it can produce the size disagreement the real capture shows, and it runs at the flagship's measured
+  ~890 changes/s rather than a stress rate, so its figure is comparable to the capture's. It holds to
+  1 s and is 223 orders wrong at 1.2 s — the ceiling being `seen`'s 1024-event cap (1.15 s at that
+  rate), not the dedup window. A separate replay, of orders cancelled without ever trading, pins that
+  holding more than the old 512 tombstones costs the market nothing.
+
+### Changed
+- `--arb-book-dedup-window-ms` now defaults to 1000 (was 250). The window stopped being the guard's
+  reach, so what it governs now is whether a lagging arm's copy is recognized as a duplicate at all:
+  below the arms' real separation, a stale copy of an add for an order the leader has since partially
+  filled reads as a size *disagreement* between two healthy publishers, forcing a re-baseline whose
+  withheld batches are lost. On the real two-publisher capture this is worth 500 ms → 2 s of tolerated
+  inter-arm lag, and it takes the disagreements those healthy arms manufactured to zero. Costs no
+  memory — `seen` is capped at 1024 events per market independently of the window, which is also why a
+  value much above a second is inert on a busy market: 1 s and 10 s measure identically. It did cost
+  something else, now fixed below: the same value was the forced re-baseline's rate limit, whose
+  withheld batches are lost rather than delayed, so a real disagreement skipped up to 1 s of a
+  market's stream instead of 250 ms.
+
 ### Added
+- `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above,
+  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling, and
+  `dz_mbo_guarded_tombstones_max` reports the largest single market's population against the
+  per-market cap — **the one to alert on**, since that cap fires at a sixteenth of the aggregate and a
+  market walking to a blackout is flat headroom on the sum. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"`
+  label, which no longer has a behaviour behind it.
 - `GET /v1/products` accepts `limit`/`cursor` query parameters and reports a `cursor` when more
   products remain; `doublezero-edge products list --paginate` follows it until the catalog is
   exhausted, accumulating every page into one response. Default stays unlimited: omitting `limit`
@@ -29,6 +109,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apart at the seam instead of split across a screenful. `--output json`/`--jq` are unchanged.
 
 ### Fixed
+- The Market-by-Order cross-publisher resurrection guard no longer loses to its own bound. Three
+  ways it did: a forced re-baseline stamped the arm that discharged it as owning the floors it
+  seeded, so that arm — the one whose stale, larger size raised the flag — could re-assert it
+  unchallenged; the eviction that decides whether losing an entry costs anything was scoped by the
+  dedup window, which is the wrong horizon (the guard exists for copies arriving after it) read off
+  the wrong clock (a delete mutated the entry in place, so a tombstone carried its add's timestamp);
+  and a recovery snapshot larger than the guard's cap seeded itself over the tombstones, which is
+  the normal state of a 44,598-order market. Eviction is now scoped by what is evicted — a live
+  floor re-seeds itself and goes silently, a tombstone re-baselines the market and is counted on the
+  existing `dz_mbo_forced_rebaselines_total{reason="guard_evicted"}` — with the two populations
+  bounded apart so neither starves the other, and a tombstone every serving arm has reported treated
+  as spent so a busy market's dead orders cannot fill the guard and re-baseline it forever.
+- A forced re-baseline no longer discards a batch that removed an order. Only a tombstone-creating
+  removal can cross the guard's dead-order bound, so the batch a `guard_evicted` force discarded always
+  carried the delete for the order the eviction was about — and the same is reachable from a
+  `disagreement` on a batch that both cancels one order and claims a drifted size for another. Either
+  way the order stayed live in the republished book and the seed marked it live in the guard too, so
+  nothing removed it again. A batch that removed nothing is still dropped, which keeps a disagreement's
+  torn logical event off the wire wherever the removal does not make dropping it worse.
+- The serving-arm set the guard reads to decide whether a tombstone is spent is now refreshed on the
+  batch that creates a market's race state, not from the one after it. A session reset drops that
+  state while the arms keep serving, so the batch re-creating it treated every tombstone it made as
+  spent and evicted one without re-baselining.
+- The Hyperliquid-compatible sink holds the shared book map's mutex — the one the ingest emit path
+  takes on every published batch — for a clone and nothing else; every rendering step runs after the
+  guard drops. The clone is the cheapest snapshot available rather than a fallback:
+  measured on the 44,598-order fixture it is ~0.45 ms against ~9.1 ms to fold under the guard.
+- A Hyperliquid-sink market that empties no longer stops being treated as order-level, which silently
+  stopped both book channels — permanently for `l4Book`, whose snapshot is only sent once that gate
+  passes. Order-level is now a property of the market rather than of what it currently holds.
+- `mantissa: 1` is accepted on an `l2Book` subscription (the venue allows 1, 2 and 5 at `nSigFigs` 5);
+  anything else is still refused rather than coerced.
+- Two Market-by-Order publishers disagreeing about one order's resting quantity no longer publish
+  the larger of the two. A resting order only shrinks, so a larger claim means one of the books has
+  drifted — and which one is unknowable at the merge point: the larger rewinds a consumer past a
+  fill the venue already applied, and preferring the smaller lets a forged size mute a real order.
+  The market stops being served from either arm's deltas and is republished whole instead. The same
+  happens when the cross-publisher resurrection guard is asked to age out an order a peer's copy could
+  still be racing, which would otherwise silently reopen the path that guard exists to close (an
+  eviction past that horizon costs the guard nothing and is left alone, so a book far larger than the
+  per-market cap still streams normally). Both are counted by the
+  new `dz_mbo_forced_rebaselines_total{venue,reason}` (`disagreement` / `guard_evicted`); each costs
+  a full republish of the market's book — rate-limited to one per market per
+  `--arb-book-dedup-window-ms` — so a sustained rate is the signal that the per-publisher book model
+  is too expensive to keep. The republish is the book the wire agreed on, never one publisher's own.
+- A re-baseline no longer wipes the cross-publisher resurrection guard. Only the dedup window is
+  stale after one — a venue still never reuses an order id, so a lagging publisher's first and only
+  copy of an `Add` for an order a peer already killed must still be refused. The re-baseline's own
+  orders now seed the guard, so a peer claiming more than the snapshot holds is still caught as
+  drift. Session and instrument boundaries keep dropping it outright: a new id space is the one case
+  where that is correct.
+- A departed Market-by-Order publisher no longer suppresses a surviving arm's re-baseline for 30s.
+  Its receiver's exit is the authoritative departure signal and now releases its book standing;
+  `PEER_SERVING_NS` stays only as the backstop for a publisher that goes quiet without
+  deregistering. A gap-and-recover cycle is sub-second, so the timer never bound on it — and a
+  suppressed re-baseline is never retried, which wedged the market for the life of the process.
 - The installers (`scripts/connect*.sh`) could finish with `Done. Connected.` over a tunnel that
   never came up (#132): a single `doublezero connect multicast` attempt after a fixed 30s sleep
   loses the race against a cold daemon's device probing, its failure is non-fatal, and the closing
@@ -280,6 +416,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes this — see above.)
 
 ### Added
+- **A Hyperliquid-compatible output sink** (`--hl-ws-bind` / `HL_WS_BIND`, off by default): the same
+  market data in Hyperliquid's own WebSocket schema — `l2Book` (full depth with the per-level order
+  count), `l4Book` (order-level snapshot then diffs, carrying the venue's order ids) and `trades` —
+  so an existing Hyperliquid client consumes edge-connect by changing one URL. A rendering, not a
+  second protocol: PROTOCOL.md is unaffected. See
+  [Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink), including what a stock
+  NautilusTrader client can and cannot receive.
+- **Market-by-Order now serves the order-level `book` alongside its existing `depth`.** The bridge no
+  longer throws the order identity away: every change carries the venue's own `order_id`, a snapshot
+  install re-baselines as a `clear` plus the full order set, and `depth` keeps working unchanged for
+  the consumers on it. PROTOCOL.md stays **v1** — both additions are fields a consumer may ignore.
+- `order_id` on a `book` change: the venue's order id for an order-level change, `0` when the change
+  is price-aggregated (Market-by-Price) and carries no order identity.
+- `book_scope` on a subscription (`"levels"` | `"orders"`): the granularity of the `book` bootstrap.
+  Omitted — the default, and the only possibility on the connect-time replay — it **follows the
+  market**, so an order-level market is bootstrapped as orders and a price-aggregated one as levels. A
+  bootstrap and a stream of different granularity cannot be reconciled: an order-level change carries
+  one *order's* absolute size, and applying it as a level's size corrupts the book.
+- Order-level `book` events are **raced across publishers on venue event identity** rather than served
+  by one elected arm: each event is published once, from whichever publisher delivered it first. What
+  carries correctness is a per-order guard at the merge point, not the dedup window — a change for an
+  order the producer has already published as gone is refused, so an arbitrarily late copy costs a
+  redundant emission and cannot resurrect a dead order. A publisher recovering by snapshot republishes
+  its whole book only when no peer is both synced and actually serving the market, so a recovery cannot
+  wipe a live book and a departed publisher cannot block one either.
+  `--arb-book-dedup-window-ms` (default 250) tunes how long a delivered event is remembered.
+- `dz_book_events_deduped_total{venue}`, `dz_book_resurrections_dropped_total{venue}`,
+  `dz_mbo_arm_disagreement_total{venue}` and `dz_mbo_removed_evicted_total`. The disagreement counter
+  is the one to alert on: it fires when a publisher claims more resting quantity for an order than a
+  peer already reported, which is a book that has silently drifted. See `docs/metrics.md`.
 - Every message now carries `source` and `source_id` alongside `venue`. The subscription filter
   accepts `source` as an alias for `venue`; supplying both ANDs them.
 - `dz_source_id_changed_total{venue}` counts a publisher changing an instrument's Source ID

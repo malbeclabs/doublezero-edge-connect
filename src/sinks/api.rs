@@ -2024,6 +2024,7 @@ mod tests {
             side,
             price,
             size,
+            order_id: 0,
         }
     }
 
@@ -2049,6 +2050,7 @@ mod tests {
             recv_ts_ns: 0,
             kernel_rx_ts_ns: 0,
             ws_send_ts_ns: 0,
+            category: crate::model::empty_category(),
         }
     }
 
@@ -2083,6 +2085,7 @@ mod tests {
                         side: BookSide::Both,
                         price: 0.0,
                         size: 0.0,
+                        order_id: 0,
                     },
                     level_update(BookSide::Bid, 0.61, 100.0),
                     level_update(BookSide::Ask, 0.63, 50.0),
@@ -2153,6 +2156,7 @@ mod tests {
                 side: BookSide::Both,
                 price: 0.0,
                 size: 0.0,
+                order_id: 0,
             }];
             // One more bid level than the per-side cap allows.
             for i in 0..(MAX_LEVELS_PER_SIDE + 1) {
@@ -2218,6 +2222,7 @@ mod tests {
                     side: BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 }],
                 true,
             ));
@@ -2301,6 +2306,7 @@ mod tests {
                         side: BookSide::Both,
                         price: 0.0,
                         size: 0.0,
+                        order_id: 0,
                     },
                     level_update(BookSide::Bid, 0.61, 10.0),
                     level_update(BookSide::Ask, 0.63, 20.0),
@@ -2321,6 +2327,7 @@ mod tests {
                         side: BookSide::Both,
                         price: 0.0,
                         size: 0.0,
+                        order_id: 0,
                     },
                     level_update(BookSide::Bid, 0.11, 100.0),
                     level_update(BookSide::Ask, 0.13, 200.0),
@@ -2611,6 +2618,7 @@ mod tests {
                             side: BookSide::Both,
                             price: 0.0,
                             size: 0.0,
+                            order_id: 0,
                         },
                         // Two levels per side, deliberately: with only one, "best" and "worst"
                         // would be indistinguishable and a swapped best_bid()/best_ask() (highest

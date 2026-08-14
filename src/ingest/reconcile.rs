@@ -1428,6 +1428,7 @@ mod tests {
         symbol: &str,
         channel: u32,
         instrument_id: u32,
+        category: &str,
         changes: Vec<crate::model::BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(crate::model::NormalizedBook {
@@ -1437,6 +1438,7 @@ mod tests {
             symbol: symbol.into(),
             channel,
             instrument_id,
+            category: category.into(),
             changes,
             snapshot: false,
             last: true,
@@ -1470,11 +1472,13 @@ mod tests {
                 symbol,
                 channel,
                 instrument_id,
+                category,
                 vec![crate::model::BookChange {
                     action: crate::model::BookAction::Clear,
                     side: crate::model::BookSide::Both,
                     price: 0.0,
                     size: 0.0,
+                    order_id: 0,
                 }],
             ),
             publisher,
@@ -1487,11 +1491,13 @@ mod tests {
                 symbol,
                 channel,
                 instrument_id,
+                category,
                 vec![crate::model::BookChange {
                     action: crate::model::BookAction::Update,
                     side: crate::model::BookSide::Bid,
                     price: 0.5,
                     size: 10.0,
+                    order_id: 0,
                 }],
             ),
             publisher,

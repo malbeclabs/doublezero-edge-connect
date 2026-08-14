@@ -10,7 +10,8 @@ data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks four ed
 sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
-re-serves it as full-state `depth`), and **Market-by-Price** (magic `0x4442`; the bridge
+re-serves it both as full-state `depth` and as the order-level incremental `book`, carrying the venue's
+own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
 reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
 row selects it, on a group that is live). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
@@ -86,8 +87,9 @@ Modules are grouped by role under `src/`:
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
   (WebSocket, on by default), `api` (read-only `/v1` query API), `metrics` (Prometheus `/metrics`,
-  off by default) and `admin` (the one mutation path in this crate — see below). A new feature is a
-  sibling module here + a spawn in `main.rs`.
+  off by default), `admin` (the one mutation path in this crate — see below) and `hyperliquid` (the
+  same data in Hyperliquid's own schema, off by default). A new feature is a sibling module here +
+  a spawn in `main.rs`.
 - **`shred/`** — the Solana **shred forwarder** (peer of `ingest/`/`sinks/`, separate from the
   market-data pipeline — no `FeedMessage`, no WebSocket, no market-data decode). Joins the DoubleZero
   `edge-solana-*` shred multicast groups, combines them, and fans each raw datagram out to local
@@ -379,8 +381,113 @@ Modules are grouped by role under `src/`:
   book replayed to a new client). The *quote* floor is
   deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
-- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**,
-  in *both* arbitration modes with no `mode_for` branch (#105): one `source_ts` tick can hold several
+  The `Book` arm has **two** gates, chosen by what the wire supplies rather than by venue name. A batch
+  carrying a non-zero `order_id` (or for a market whose `BookMarket::order_level` memo says an earlier one
+  did — that covers a bare `clear`) on a `Coordinated` venue is **raced per venue event**; everything else
+  takes the single-arm authority below. Routing on *content* rather than on a report is deliberate: an
+  evicted market re-routes on its next order-level batch instead of reverting to the authority for good,
+  and a forged sync report cannot divert a price-aggregated market off that gate. Racing keys on
+  `OrderEvent` = `(order_id, action, price bits, size bits)` per market — never `per_instrument_seq`,
+  which is per publisher (measured: three unrelated bases for one execution). **`size_bits` is part of
+  the identity, not content compared afterwards**: successive partial fills of one order share id, action
+  and resting price and differ only there, so omitting it would collapse the second fill as a duplicate
+  and leave every consumer holding a quantity the venue already reduced. A partly-duplicate batch is
+  republished **filtered** to its surviving changes, because a change carries an order's absolute quantity
+  and re-delivering a stale one walks the consumer back.
+  **`MarketEvents::resting` is the resurrection guard, and this is the only scope that can hold it**
+  (`dz_book_resurrections_dropped_total`): a `size == 0` event tombstones the order and any later change
+  for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order another
+  publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
+  order. Tombstones are deliberately **not** expired by the time window, which is what keeps
+  `--arb-book-dedup-window-ms` a cost knob; **what retires one is the arms, not a clock or a count** —
+  every arm the market still counts (`known`) has reported the removal. `known` is **every arm arriving
+  within `PEER_SERVING_NS`, plus a synced arm that has never reached this market at all** — that one
+  arm because its first copy is the likeliest stale `Add` there is, and ageing it out lets that copy
+  resurrect a removed order (`a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`). Every
+  other arm ages out on arrival, and must: a source that spoke once and vanished is minted by one
+  forged datagram, and nothing clears `synced` short of the receiver exiting, so a publisher whose
+  upstream dies behind a bound socket would otherwise hold every market it was synced on to
+  `MAX_MARKET_TOMBSTONES` — and sixteen of those reach the process-wide ceiling, where
+  `shed_over_budget` disowns the largest holder without asking whether its tombstones were settled.
+  One quiet publisher, a rolling venue-wide blackout. Retirement runs **head-of-queue per batch plus a
+  full sweep out of queue order** on a threshold that doubles after each sweep (O(1) amortized per
+  tombstone, nothing at all while the arms keep up). The sweep is not an optimization: `dead` is in
+  removal order, so head-only retirement lets one removal an arm never reports block every tombstone
+  behind it, and nothing re-supplies a report for an order that arm never held — two arms synced from
+  different snapshot anchors is the ordinary way there, and the population then grows with the market's
+  whole history rather than the arms' lag spread. **It changes only where retirement looks, never what
+  counts as evidence.** Reporting is
+  the **only** evidence accepted: anything weaker infers an
+  arm's position in the venue stream from something else it sent, and on this wire that is spoofable —
+  one datagram echoing a just-published event from a lagging arm's address would retire that arm's
+  whole backlog and let its genuine stale `Add` through as live. That makes the population "the
+  removals inside the arms' current lag spread",
+  which is what the guard actually needs; a per-market **count** — what it used to be, 512 — is a count
+  standing in for a *time* tolerance and is simultaneously far too much for a quiet market and far too
+  little for a busy one. Measured: at 150 ms of inter-arm lag on a busy market it gave way, against
+  186 ms between the real publishers. The two populations are queued and bounded **apart** — a **live
+  floor** re-seeds itself on that order's next update, so its eviction is silent (which is what lets a
+  recovery snapshot larger than the cap, the flagship market being 44,598 orders, seed itself without
+  discarding the guard), while a **tombstone** is re-seeded by nothing — and the tombstones are bounded
+  **process-wide** (`MAX_TOMBSTONES_TOTAL`, 1 Mi, an eighth of what the old per-market cap permitted
+  across `MAX_BOOK_MARKETS`) with `MAX_MARKET_TOMBSTONES` (65,536) as the per-market backstop, since a
+  per-market cap large enough for a busy market is no bound at all once multiplied out. Reaching either
+  cap **invalidates** the market rather than forcing a re-baseline
+  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones_max`, the
+  per-market high-water — the aggregate `dz_mbo_guarded_tombstones` is a sum against a ceiling sixteen
+  times the cap that fires first, so one market walking to a blackout reads as flat headroom there):
+  republishing our
+  own view is not an answer to "the guard could not answer", since that view is exactly what the guard
+  failed to protect — it would hand the consumer the resurrections stamped `snapshot`/`last` and
+  re-seed them as live floors, so nothing removes them again. So `Arbiter::invalidate_market` drops the
+  market's race state, replay entry and accumulators, tells consumers to drop the book with a bare
+  `Clear` (`announce_disowned`, once — the flag lives with the record, not on the evictable per-market
+  state) and publishes **nothing** further until a producer sends a `Clear`-led re-baseline of its own.
+  A market carrying that record also **routes as order-level** whatever its next batch contains, since
+  a producer's re-baseline for an *empty* book is a bare `Clear` with no order id and would otherwise
+  reach the single-arm authority, which cannot discharge the record. The `Clear` needs a message's header fields, which the key alone does not
+  carry, so it is built from an accumulator (`BookAccumulator::to_clear`, header-only — materializing
+  the 44k-order book a disowning just stopped vouching for would be the wrong price) **before** the
+  state holding it is dropped, never deferred to the market's next batch: `shed_over_budget` disowns a
+  market other than the one being admitted, and a market whose arms drifted apart and then both went
+  quiet is precisely how one comes to hold the most tombstones. Leaving consumers holding a book that
+  silently stops updating while a client connecting a second later gets none at all is two consumers of
+  one feed in contradictory states, neither told anything. The record of the disowning lives in a
+  bounded set of its own rather than on the per-market state, because `MAX_BOOK_MARKETS` eviction drops
+  that state and the `order_level` memo is re-derived from batch content — an evicted market would come
+  back reading as ordinary and resume serving deltas onto a book nothing vouches for.
+  ⚠️ That is a real availability cost: for a *healthy* publisher the next such batch is its next
+  **recovery**, not its next snapshot rotation (`book.rs` drops a snapshot whose anchor it has already
+  applied), so the market can be dark for tens of seconds or longer. The **process-wide** ceiling is
+  `Arbiter`'s (`shed_over_budget`), never `MarketEvents`', because it is the only scope that can charge
+  it to the market actually holding the tombstones: charging the market being *admitted* — the obvious
+  O(1) choice — would let one market's arms drifting apart disown every other order-level market in
+  turn, each on its next removal and each returning only its own handful, while the hoarder kept
+  everything it held. Eviction — as opposed to retirement — asks only about the *serving* arms, which is
+  `book_sync`'s `synced` plus arrival within `PEER_SERVING_NS`; arrival, not a *published* batch,
+  because a mirror whose copies all lose the race publishes nothing and is exactly the arm the guard is
+  held open for. The two masks are the whole distinction: a gapped or departed arm must not be retired
+  around (it is the likeliest source of a stale `Add` there is) but must not hold the population open
+  forever either, or one desync report would put a busy market into permanent invalidation. And a
+  forged copy of a real removal spends an arm's bit, so this bounds the guard's cost rather than proving
+  nothing is in flight — the unauthenticated wire's price, as elsewhere here.
+  A forced re-baseline's seeded floors are owned by **no arm**:
+  what is republished is the pointwise-minimum view of every arm, so stamping the arm whose batch
+  discharged the flag would exempt it from the gate and let it re-assert the stale size the
+  re-baseline was called to correct. `dz_mbo_arm_disagreement_total` is the
+  drift observable and is a *monotonic* check — a resting order only shrinks, so a publisher claiming
+  **more** than a peer already reported has missed a fill; an interleaved race, where an arm delivers the
+  smaller remainder first, is not counted. Both copies are still published rather than preferring the
+  smaller: the peer could be the drifted one, and dropping the larger would let a forged small size mute a
+  real publisher's order. A `Clear`-led batch never races — it is published only when no peer is **both**
+  synced and recently on the wire (`PEER_SERVING_NS`). The flag alone would let a departed publisher
+  suppress this product's only self-heal forever; requiring a delivery also settles the both-recovering
+  race, since whichever arm publishes first records one. A session boundary restarts the venue's id space,
+  so `reset_book_events_for_market` clears the tombstones — narrower than `reset_book_for_market` on
+  purpose, since a peer that missed the session end is still serving that market.
+- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**
+  for a price-aggregated market, in *both* arbitration modes with no `mode_for` branch (#105): one
+  `source_ts` tick can hold several
   deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
   arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
   every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
@@ -457,8 +564,11 @@ Modules are grouped by role under `src/`:
   `side` maps `bid->buy`/`ask->sell`. No `FEEDS` row depends on it (off until enabled).
 - **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
-  `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`
-  + trades), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
+  `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`,
+  the order-level `book` and trades — `emit_book` mirrors `emit_depth`'s gates exactly, and each book's
+  sync state is reported to the arbiter *before* the frame's emissions so the re-baseline suppression has
+  a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy arm and
+  suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
   incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
@@ -529,7 +639,17 @@ Modules are grouped by role under `src/`:
   bodies legally grew, and the whole feed would decode to `Other`.
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
-  Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth`.
+  Codec-agnostic (`DeltaOp`/raw ints) so it's unit-tested in isolation; derives top-N `depth` **and**
+  the order-level changes the `book` product is built from — `on_delta_reporting` appends one
+  `OrderChange` (raw ints, absolute resulting quantity) per applied event and nothing for one it
+  rejects, and `order_set` materializes the whole book, deterministically ordered so two publishers'
+  copies compare byte-for-byte. The removed-order set (`MAX_REMOVED_ORDERS`,
+  `dz_mbo_removed_evicted_total`) is **defence in depth, not the cross-publisher guard**: one book sees
+  one publisher's stream, where the sequence check already rejects a repeat, so what it catches is a
+  forged `Add` re-using a dead id at a contiguous sequence. The racing guard is at the merge point
+  (`arbiter.rs`), the only scope with the shared identity to see a *peer's* delete. A refused `Add`
+  still consumes its sequence number, or the next contiguous delta would read as a gap. Session and
+  instrument resets, and a snapshot install, all clear the set: each is a fresh id space.
 - **`ingest/pricebook.rs`** — `PriceBook`: per-instrument **price-keyed** book + the market-by-price
   snapshot+delta recovery machine (`AwaitingSnapshot`/`BuildingSnapshot`/`Ready`/`Gap`). A **sibling**
   of `book.rs`, not a reuse: the wire is already price-aggregated and each level carries its absolute
@@ -569,6 +689,42 @@ Modules are grouped by role under `src/`:
   listener is bound via `ws::bind()` (separate from `ws::serve()`) so the reconciler can treat a bind
   failure as non-fatal — a taken port disables the sink but leaves the tunnel running — and activate
   the sink only once a market-data feed is subscribed.
+- **`sinks/hyperliquid.rs`** — the **Hyperliquid-compatible** sink (`--hl-ws-bind`, off by default,
+  **not** subscription-gated): the same broadcast re-served in *Hyperliquid's* schema so an existing
+  Hyperliquid client needs only a URL change. A **rendering, not a second pipeline** — no ingest state,
+  no dedup identity, no arbitration input — so it is documented in `docs/output-sinks.md` and **never**
+  in PROTOCOL.md, which is the contract for our own protocol only. Scoped to `VENUE = "HYPERLIQUID"`
+  (`coin` is our `symbol`), with `bind()` split from `serve()` like `ws`'s. Three channels off the
+  order-keyed `BookAccumulator` in the shared `BookSnapshot`: `l2Book` (snapshot-per-update from
+  `price_fold()` — whose per-level order count is the whole reason the accumulator is order-keyed;
+  honours `nSigFigs`/`mantissa`/`nLevels`), `l4Book` (`to_book(ReplayScope::Orders)` as the publisher's
+  externally-tagged `{"Snapshot":…}`, then `{"Updates":…}` order diffs) and `trades`. Two references
+  define the wire and one rule settles them: **NautilusTrader v1.227.0 wins for anything it parses**
+  (`l2Book`/`trades` field names and types, the `B`/`A` side spelling, `{"channel":"pong"}` for its
+  30s `{"method":"ping"}`), and the **DZ Hyperliquid publisher** (`malbeclabs/hyperliquid`,
+  `app/publisher/server/src`) is the only authority for `l4Book`, the significant-figure arithmetic and
+  the `nLevels` extension. ⚠️ **No rendering happens under the shared `BookSnapshot` lock** — that is
+  the mutex the arbiter's `apply_book_replay` takes on every published batch, so a book render held
+  across it stalls every receiver on every feed; `take_market`/`take_markets` clone the accumulator out
+  (itself O(book), and the cheapest snapshot on offer — measured ~0.45 ms against ~9.1 ms to fold
+  under the guard) and every rendering step runs after the guard drops, and the `price_fold` behind a client's `l2Book`
+  subscriptions is computed **once per market per message** (it is view-independent, so folding per
+  subscription would let one client multiply a 44k-order book by `MAX_SUBS`). Both book channels are
+  gated on `baselined() && is_order_level()`: an
+  `l2Book` frame *replaces* a Nautilus consumer's book wholesale and an `l4Book` snapshot claims
+  completeness, so a market accumulated mid-stream must be withheld, not published as if whole — and a
+  price-aggregated market, whose orders this sink cannot read, would render as an empty book. An
+  out-of-range `nSigFigs`/`mantissa` is **rejected** rather than coerced (a substituted bucket yields
+  prices that look like the venue's and are not); `nLevels` only truncates, so it clamps. The schema's
+  account-model fields (`users`/`hash`, an order's `user`/`timestamp`/`orderType`/`tif`/`cloid`,
+  `height`, `order_statuses`) have no counterpart on the MBO wire and are null/zero/empty — parseable,
+  never meaningful. `timestamp` is deliberately `0` rather than the book's event time: that stamp is one
+  instant shared by every order in a snapshot, which a consumer ageing orders reads as real. Order diffs
+  are `new`/`remove` only, since `update{origSz,newSz}` would need a prior quantity we do not carry.
+  The accept loop never propagates an error (this task's `Err` reaches `main`'s `select!` and would exit
+  the process; unlike `ws`'s, no reconciler respawns it), and the client limits are constants, of which
+  the inbound rate cap is the load-bearing one — a subscribe frame is tens of bytes and costs a whole
+  book to answer, and the `subs.contains` guard cannot see an unsubscribe-then-resubscribe loop.
 - **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
   `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
   bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical
@@ -631,7 +787,16 @@ Modules are grouped by role under `src/`:
   `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
   absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
   reference consumer's book dispatcher branches on the action and never reads the advisory `snapshot`
-  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookSnapshot`
+  flag) and `last` is mandatory on the final batch or a buffering consumer wedges. `BookChange` carries
+  `order_id` (`0` = price-aggregated), and `BookAccumulator` keys order-level changes by it while keeping
+  the price maps for the aggregated kind; `price_fold` folds the orders into levels **with a count per
+  level**, which a price-keyed accumulator structurally cannot produce, and `to_book(ReplayScope)`
+  materializes either rendering, and `is_order_level` is what an unset `book_scope` follows so a client's
+  bootstrap matches the granularity the market streams. A `Clear` names a *side*, so it always carries
+  `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
+  of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
+  `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
+  baseline. `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
@@ -664,10 +829,12 @@ Modules are grouped by role under `src/`:
   `InstrumentReset`/`Heartbeat`/`EndOfSession` have **no fixture** (offset-test-only — confirm
   against a live frame before a live MBO feed). No `FEEDS` row uses these kinds until their
   endpoints are confirmed.
-- **MBO is re-served as derived full-state `depth`, never raw deltas.** The bridge reconstructs the
-  L3 book and runs snapshot+delta recovery internally (`book.rs`), so the WS contract's "every
-  message is full state and self-heals" guarantee holds. Do not expose order add/cancel/execute
-  events on the wire.
+- **MBO is re-served as two derived products, never raw deltas.** The bridge reconstructs the L3 book
+  and runs snapshot+delta recovery internally (`book.rs`), then derives full-state `depth` (top-N) and
+  the order-level incremental `book` from it. A `book` change is one order's **absolute resulting
+  state**, not the wire's add/cancel/execute event, and a recovery still surfaces only as a
+  `Clear`-led re-baseline — do not expose the raw order events. `depth` is additive and unchanged:
+  there are testers on it, and deleting it is its own change (PROTOCOL.md v2).
 - **Four latency timestamps** ride every quote: `source_ts_ns` (venue), `kernel_rx_ts_ns`
   (`SO_TIMESTAMPNS`, captured in the driver softirq — best-effort, falls back to 0), `recv_ts_ns`
   (user-space post-decode), `ws_send_ts_ns` (stamped in `sinks/ws.rs` just before send). `0` is
@@ -683,7 +850,9 @@ Modules are grouped by role under `src/`:
   the shred forwarder) when the reconciler sees the host subscribed to the relevant group. ws
   (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only
   *activated* when a market-data feed is subscribed; the public WS input feeder is **off** by
-  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated. README has the
+  default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated, and neither is
+  the Hyperliquid-compatible sink (**off**, on when `--hl-ws-bind` is non-empty) — it renders whatever
+  the broadcast carries, so it has no group of its own to be subscribed to. README has the
   full activation tables.
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
