@@ -249,6 +249,12 @@ struct Args {
     /// POSTing a form here, so `POST` also requires an `X-DZ-Admin-Request` header (any value — a
     /// form post cannot set it). Deliberately separate from `--api-bind`'s `/v1`, which must stay
     /// provably read-only.
+    ///
+    /// It also serves `GET /admin/diagnostics`, which is unauthenticated like the rest of this
+    /// surface and reports this host's device/metro names, subscribed group codes and their
+    /// multicast IPs, every configured bind, and the feed-registry URL. On the loopback default
+    /// that is the same audience that could already run `doublezero status`; a non-loopback bind
+    /// hands it to anyone who can reach the port.
     #[arg(
         long = "admin-bind",
         env = "DZ_ADMIN_BIND",
@@ -754,6 +760,15 @@ async fn main() -> Result<()> {
     // change the channel filter even with nothing currently subscribed — so it is spawned once
     // here, gated only on the bind being non-empty. A taken port is non-fatal, exactly like
     // `ws`/`api`: it disables this surface without taking the tunnel down.
+    //
+    // It is also where `GET /admin/diagnostics` lives, for the same reason: on a host whose tunnel
+    // never came up, no market-data feed is subscribed, so `/v1` is not listening and this is the
+    // only surface that can answer why (see `ingest::diagnostics`).
+    let diagnostics: ingest::diagnostics::SharedDiagnostics =
+        Arc::new(Mutex::new(ingest::diagnostics::DiagnosticsSnapshot {
+            refresh_secs: args.subscription_refresh_secs,
+            ..Default::default()
+        }));
     let admin_srv = if args.admin_bind.is_empty() {
         info!("admin surface disabled (empty --admin-bind)");
         None
@@ -763,8 +778,17 @@ async fn main() -> Result<()> {
                 info!(bind = %args.admin_bind, "admin surface enabled (mutating — no authentication)");
                 Some(tokio::spawn(sinks::admin::serve(
                     listener,
-                    filter.clone(),
-                    enabled.clone(),
+                    sinks::admin::AdminConfig {
+                        filter: filter.clone(),
+                        enabled: enabled.clone(),
+                        diagnostics: diagnostics.clone(),
+                        binds: sinks::admin::Binds {
+                            ws: args.ws_bind.clone(),
+                            api: args.api_bind.clone(),
+                            admin: args.admin_bind.clone(),
+                            metrics: args.metrics_bind.clone(),
+                        },
+                    },
                 )))
             }
             Err(e) => {
@@ -797,6 +821,7 @@ async fn main() -> Result<()> {
             api_bind: args.api_bind.clone(),
             history,
             shred: shred_params,
+            diagnostics,
         })
         .run(),
     );

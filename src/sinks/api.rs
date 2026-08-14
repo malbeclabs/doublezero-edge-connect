@@ -908,7 +908,7 @@ fn status(state: &ApiState) -> Response {
 /// need log access. `null` only if queried before the registry resolved, which does not happen once
 /// this sink is serving — registry resolution completes in `main` before any receiver or sink
 /// spawns.
-fn registry_block() -> Value {
+pub(crate) fn registry_block() -> Value {
     match crate::ingest::feeds::registry_info() {
         Some(info) => json!({
             "source": info.origin,
@@ -1099,34 +1099,41 @@ fn channels_block(state: &ApiState) -> Value {
 /// `/proc` access on the querying side. `None` (omitted rather than a fabricated `0`) if the
 /// process collector isn't registered for this build/platform (it is Linux-only — see
 /// `metrics::Metrics::new`).
-fn process_block() -> Value {
+/// `gather()` walks and encodes **every** family in the registry — per-venue children included —
+/// so the two figures below are pulled from one pass, not one each.
+pub(crate) fn process_block() -> Value {
+    let mut resident = None;
+    let mut cpu = None;
+    for family in crate::metrics::metrics().registry().gather() {
+        match family.name() {
+            "process_resident_memory_bytes" => resident = sole_sample(&family),
+            "process_cpu_seconds_total" => cpu = sole_sample(&family),
+            _ => continue,
+        }
+        if resident.is_some() && cpu.is_some() {
+            break;
+        }
+    }
     json!({
-        "resident_memory_bytes": process_metric("process_resident_memory_bytes"),
-        "cpu_seconds_total": process_metric("process_cpu_seconds_total"),
+        "resident_memory_bytes": resident,
+        "cpu_seconds_total": cpu,
     })
 }
 
-/// The single sample value of the first metric family named `name` in the default registry, or
-/// `None` if it isn't present. Both process-collector families this module reads are gauges/
-/// counters with exactly one (unlabelled) sample. Dispatches on the family's own
-/// [`prometheus::proto::MetricType`] rather than probing each variant, since — with this crate's
-/// `default-features = false` build (no `protobuf` feature) — every [`prometheus::proto::Metric`]
-/// carries all five typed sub-messages unconditionally (each defaulted to zero when unused, not an
-/// `Option`), so there is nothing to probe.
-fn process_metric(name: &str) -> Option<f64> {
+/// The single sample value of a metric family, or `None` if it carries none. Both process-collector
+/// families this module reads are gauges/counters with exactly one (unlabelled) sample. Dispatches
+/// on the family's own [`prometheus::proto::MetricType`] rather than probing each variant, since —
+/// with this crate's `default-features = false` build (no `protobuf` feature) — every
+/// [`prometheus::proto::Metric`] carries all five typed sub-messages unconditionally (each
+/// defaulted to zero when unused, not an `Option`), so there is nothing to probe.
+fn sole_sample(family: &prometheus::proto::MetricFamily) -> Option<f64> {
     use prometheus::proto::MetricType;
-    for family in crate::metrics::metrics().registry().gather() {
-        if family.name() != name {
-            continue;
-        }
-        let metric = family.get_metric().first()?;
-        return match family.get_field_type() {
-            MetricType::GAUGE => Some(metric.get_gauge().get_value()),
-            MetricType::COUNTER => Some(metric.get_counter().get_value()),
-            _ => None,
-        };
+    let metric = family.get_metric().first()?;
+    match family.get_field_type() {
+        MetricType::GAUGE => Some(metric.get_gauge().get_value()),
+        MetricType::COUNTER => Some(metric.get_counter().get_value()),
+        _ => None,
     }
-    None
 }
 
 // ---------------------------------------------------------------------------------------------

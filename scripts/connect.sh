@@ -585,7 +585,7 @@ fi
 if [ -n "${DZ_ADMIN_BIND:-}" ]; then
   case "$DZ_ADMIN_BIND" in
     127.*|localhost:*) : ;;
-    *) warn "DZ_ADMIN_BIND=$DZ_ADMIN_BIND is not a loopback address. GET/POST /admin/channels has NO authentication -- under --network host this bind is reachable from the network, and POST can change what this process ingests. Recommended: DZ_ADMIN_BIND=127.0.0.1:9098 (or another loopback port), unless you have your own network-level access control in front of it." ;;
+    *) warn "DZ_ADMIN_BIND=$DZ_ADMIN_BIND is not a loopback address. The admin surface has NO authentication -- under --network host this bind is reachable from the network. POST /admin/channels can change what this process ingests, and GET /admin/diagnostics reports this host's device/metro, subscribed group codes and their multicast IPs, every configured bind and the feed-registry URL. Recommended: DZ_ADMIN_BIND=127.0.0.1:9098 (or another loopback port), unless you have your own network-level access control in front of it." ;;
   esac
 fi
 

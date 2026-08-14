@@ -101,7 +101,7 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned feed ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a feed whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
 | `DZ_FEED_REGISTRY_URL` | hosted URL (**image default**) | URL to fetch the feed registry document from at startup — the image sets this to `https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used instead and a warning is logged — never fatal. See [Feed registry](#feed-registry) below for how to tell which source actually loaded. |
 | `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, for an air-gapped/locked-down host. The bridge tries `DZ_FEED_REGISTRY_URL` first when it's non-empty, so the installer clears the image's default URL for you whenever you set this without also setting a URL of your own — otherwise the file would be silently shadowed. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
-| `DZ_ADMIN_BIND` | `127.0.0.1:9098` | Bind address for the **admin surface** (`GET`/`POST /admin/channels`), the one runtime-mutation path — it lets `DZ_CHANNELS` be replaced without a restart (see [Admin surface](#admin-surface-runtime-channel-changes) below). On by default, at loopback; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you override this, stay on loopback — never a bare wildcard. Set empty to disable it outright. Loopback alone does not stop a browser page on the same host from POSTing here, so `POST` also requires an `X-DZ-Admin-Request` header (any value); `doublezero-edge channels set` sends it automatically. |
+| `DZ_ADMIN_BIND` | `127.0.0.1:9098` | Bind address for the **admin surface** — the runtime-mutation path (`DZ_CHANNELS` replaced without a restart, `doublezero connect`/`disconnect` re-run) plus `GET /admin/diagnostics`, the one surface that answers when nothing is subscribed (see [Admin surface](#admin-surface) below). On by default, at loopback; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you override this, stay on loopback — never a bare wildcard. Set empty to disable it outright. Loopback alone does not stop a browser page on the same host from POSTing here, so every `POST` also requires an `X-DZ-Admin-Request` header (any value); the `doublezero-edge` commands send it automatically. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt) and imply "yes" to the `doublezero-edge` CLI install offer too. |
 | `DZ_INSTALL_CLI` | *(prompted)* | Answer the `doublezero-edge` CLI install offer non-interactively: `1` installs, `0` skips. Overridden by `DZ_ASSUME_YES=1`. |
@@ -115,7 +115,7 @@ the container, so the bridge is tuned entirely from the one-liner. Common ones: 
 `DZ_RECV_BUF`, `WS_BIND` and the `WS_*` limits, `METRICS_BIND` (turn on the Prometheus `/metrics`
 endpoint — off by default), `DZ_API_BIND` (the read-only `/v1` query API), `DZ_ADMIN_BIND` and
 `DZ_CHANNELS` (the runtime-mutable channel filter — see [Admin
-surface](#admin-surface-runtime-channel-changes)), `DZ_FEED_REGISTRY`/`DZ_FEED_REGISTRY_URL` (the
+surface](#admin-surface)), `DZ_FEED_REGISTRY`/`DZ_FEED_REGISTRY_URL` (the
 feed registry document sources — see the table above), `RUST_LOG`, the shred forwarder's
 `DZ_SHRED_*` (notably `DZ_SHRED_DEDUP_MODE` and `DZ_SHRED_RPC_URL`), and the reconciler's
 `DZ_SUBSCRIPTION_REFRESH_SECS` / `DZ_SUBSCRIPTION_GATING_DISABLE`. The full list with defaults is
@@ -169,11 +169,17 @@ The complete installer reference (every variable, the devnet GHCR login, keypair
 ## Manage
 
 ```bash
+doublezero-edge diagnose                                         # why is nothing being served?
 sudo docker logs -f doublezero-edge-connect                      # bridge + daemon logs
 sudo docker exec -it doublezero-edge-connect doublezero status   # tunnel status
 sudo docker exec -it doublezero-edge-connect doublezero latency  # device latencies
 sudo docker stop doublezero-edge-connect && sudo docker rm doublezero-edge-connect  # disconnect & remove
 ```
+
+Ran the one-liner and see no data? Start with `doublezero-edge diagnose` — it answers even when the
+tunnel is down, needs neither root nor the container name, and tells you which of the three
+`docker exec` reads above is worth running. See
+[When nothing is being served](#when-nothing-is-being-served-doublezero-edge-diagnose).
 
 > **No TLS.** The bridge targets a trusted/local network; terminate TLS at a reverse proxy if you
 > expose it.
@@ -272,7 +278,7 @@ Docker and no keys. To build from source instead:
 cargo build --release -p doublezero-edge
 ```
 
-Six commands read `/v1` (all `GET`s), plus a `channels` group that talks to a **separate** surface:
+Six commands read `/v1` (all `GET`s), plus four that talk to a **separate** surface:
 
 | Command | What it returns |
 |---|---|
@@ -285,6 +291,8 @@ Six commands read `/v1` (all `GET`s), plus a `channels` group that talks to a **
 | `status` | Per-venue feed health, plus `history` (history-store occupancy), `channels` (per-feed channel-filter admission, real bound state and product counts) and `process` (resident memory, CPU time) blocks |
 | `channels list` | The channel filter in force, and what it admits/binds per feed (talks to the admin surface, not `/v1`) |
 | `channels set <spec>` | Replace the channel filter (same syntax as `--channels`/`DZ_CHANNELS`); previews what would be dropped and asks for confirmation unless `--force` (talks to the admin surface, not `/v1`) |
+| `diagnose` | Why the container is (or is not) serving data — one verdict plus the tunnel, subscription and activation state behind it. Answers when `/v1` does not (admin surface, not `/v1`) |
+| `connect` / `disconnect` | Re-run `doublezero connect multicast` / `doublezero disconnect multicast` inside the container; confirms unless `--force` (admin surface, not `/v1`) |
 
 `<id>` is `SOURCE:SYMBOL` (e.g. `HYPERLIQUID:BTC`); add `#<channel>.<instrument_id>` only if a bare
 symbol collides across markets — the CLI reports the candidates when it does. Point it at a
@@ -300,8 +308,9 @@ path anywhere in edge-connect for `/v1` to reach, so unlike the trading CLI its 
 on, neither ever needs a confirmation prompt. **Candles and tickers cover a rolling one hour, held
 in memory** — the window does not survive a bridge restart and nothing here is ever written to disk.
 
-**`channels` is the one exception**, and talks to a different, off-by-default surface entirely — see
-[Admin surface](#admin-surface-runtime-channel-changes) below.
+**`channels set`, `connect` and `disconnect` are the exceptions**, and talk to a different surface
+entirely — see [Admin surface](#admin-surface) below. `diagnose` reads that same surface but changes
+nothing.
 
 ### Install the CLI alone
 
@@ -320,13 +329,18 @@ sudo apt install doublezero-edge
 Testnet package: swap `doublezero-mainnet-beta` for `doublezero-testnet` (mainnet-beta serves
 devnet too — the CLI has no ledger coupling).
 
-### Admin surface (runtime channel changes)
+### Admin surface
 
-Beyond `/v1`, the bridge serves an **admin** surface — `GET`/`POST /admin/channels` — the one
-runtime-mutation path in edge-connect, letting the channel filter (`--channels`/
-`DZ_CHANNELS`) be replaced without a restart. It is **on by default, at loopback**
-(`--admin-bind`/`DZ_ADMIN_BIND` defaults to `127.0.0.1:9098`; set empty to disable it outright) and
-deliberately separate from `/v1`, which stays provably read-only.
+Beyond `/v1`, the bridge serves an **admin** surface — the runtime-mutation path in edge-connect,
+and the one surface that is **not** subscription-gated, so it answers on a host serving nothing at
+all. It is **on by default, at loopback** (`--admin-bind`/`DZ_ADMIN_BIND` defaults to
+`127.0.0.1:9098`; set empty to disable it outright) and deliberately separate from `/v1`, which
+stays provably read-only.
+
+| Route | |
+|---|---|
+| `GET`/`POST /admin/channels` | Read or replace the channel filter (`--channels`/`DZ_CHANNELS`) without a restart |
+| `GET /admin/diagnostics` | Tunnel, subscription and activation state plus one verdict — see [When nothing is being served](#when-nothing-is-being-served-doublezero-edge-diagnose) |
 
 ```bash
 ./target/release/doublezero-edge-connect --iface doublezero1 --admin-bind 127.0.0.1:9098
@@ -334,7 +348,7 @@ doublezero-edge channels list
 doublezero-edge channels set 'lashay-4=10,11'
 ```
 
-`GET` reports the channel filter in force and, per feed, which publishers/channels it admits (not
+`GET /admin/channels` reports the channel filter in force and, per feed, which publishers/channels it admits (not
 necessarily **bound** — a feed's group must also be subscribed for an admitted publisher to actually
 receive traffic; `status` above reports real liveness). `POST ?channels=<spec>` validates through the
 exact same parser `--channels`/`DZ_CHANNELS` uses at startup, so nothing here can admit a feed startup
@@ -347,9 +361,45 @@ irreversible within the history window.
 > (`127.0.0.1:9098`, `doublezero-edge`'s own default), never a bare wildcard, unless you have your
 > own network-level access control in front of it. Loopback alone does not stop a web page open in
 > a browser on this host from POSTing a form to `/admin/channels` — the request would originate
-> from the host itself. `POST` therefore also requires an `X-DZ-Admin-Request` header (any value is
-> fine — a form post cannot set an arbitrary header, so requiring one is enough). `doublezero-edge
-> channels set` sends it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`.
+> from the host itself. Every `POST` therefore also requires an `X-DZ-Admin-Request` header (any
+> value is fine — a form post cannot set an arbitrary header, so requiring one is enough). The
+> `doublezero-edge` commands send it for you; a raw `curl` needs `-H 'X-DZ-Admin-Request: 1'`.
+>
+> **`GET /admin/diagnostics` is read-only, needs no header, and is the most informative route
+> here** — it reports the device, metro and network this host landed on, every subscribed group
+> code and the subscription rows' multicast IPs, the DoubleZero devices' codes and IPs from the
+> latency probe, all four configured binds, and the resolved feed-registry origin. On the loopback default that is the same audience that could already run
+> `doublezero status` on the host. Two ways it widens: a non-loopback bind hands it to anyone who
+> can reach the port, and DNS rebinding reaches it too (a page served from a name re-pointed at
+> loopback is same-origin, so the header above does not stop it *reading*). Refusing a `Host` that
+> names a DNS name would close the second at the cost of `--admin-url http://myhost.local:9098`;
+> the read is left open deliberately. Nothing on this surface can change the tunnel.
+
+### When nothing is being served (`doublezero-edge diagnose`)
+
+`/v1` is subscription-gated, so on a host whose tunnel never came up it is not listening at all and
+every query fails with a transport error — while `docker ps` shows a healthy container. The admin
+surface is **not** gated that way and answers in exactly that state, so `diagnose` reads it and
+reports one verdict (`.diagnosis.code` — `tunnel_down`, `no_market_data_subscriptions`,
+`subscribed_no_traffic`, `ok`, ...) with the tunnel, subscription and activation state behind it. It
+exits 0 whatever the verdict, and 3 only if the admin surface itself does not answer. On that same
+signal, an ordinary `/v1` failure now reads `api_inactive` rather than `api_unreachable`.
+
+```bash
+doublezero-edge diagnose --output table
+doublezero-edge diagnose --jq '.diagnostics.diagnosis.code'
+```
+
+The container also runs `doublezero latency`, and `diagnose` reports each device's reachability and
+min/avg/max round trip, nearest first. On a host that is down it answers "is anything reachable at
+all"; on one that is up it answers "is something nearer than the device I am on" — compare it with
+the tunnel table's `DEVICE` column. It is probed every 5 minutes rather than every poll (it is
+active measurement, and the answer moves with topology), so the block carries its own
+`probed_at_unix` and is routinely older than the rest of the report.
+
+`diagnose` only reports. When the verdict is `tunnel_down`, its remediation names the retry —
+`doublezero connect multicast` inside the container — which stays a deliberate `docker exec` rather
+than something an HTTP surface with no authentication can trigger.
 
 The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
 `doublezero-edge` builds and runs on macOS as well as Linux; the bridge itself does not (it uses

@@ -26,7 +26,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -38,6 +38,7 @@ use crate::{
     ingest::{
         arbiter::SharedArbiter,
         channel_filter::ChannelFilter,
+        diagnostics::{Activation, Detection, Polled, ReceiverState, SharedDiagnostics},
         feeds::{Feed, FeedKind},
         health::{FeedHealth, SharedFeedHealth, TapeLiveness},
         receiver, sources,
@@ -217,6 +218,10 @@ pub struct ReconcilerConfig {
     /// survives the sink's own activate/deactivate cycles.
     pub history: Arc<Mutex<Store>>,
     pub shred: ShredParams,
+    /// The shared diagnostics snapshot this reconciler publishes at the end of every tick, and
+    /// `sinks::admin` serves. Write-only from here — nothing in this module ever reads it back, so
+    /// a diagnostics change can never influence what runs.
+    pub diagnostics: SharedDiagnostics,
 }
 
 /// The activation target computed from the current subscriptions.
@@ -231,6 +236,21 @@ struct Desired {
     /// Sorted; empty means the shred forwarder should be off.
     shred_sources: Vec<SocketAddrV4>,
 }
+
+/// One tick's read of the world: the activation target (`None` == inconclusive, keep what is
+/// running) plus everything the diagnostics snapshot reports about *why* that target is what it is.
+/// The two travel together because they come from one `doublezero status` invocation — diagnostics
+/// deliberately adds no second shell-out to the polling path.
+#[derive(Debug, Default)]
+struct TickOutcome {
+    polled: Polled,
+    desired: Option<Desired>,
+}
+
+/// How often `doublezero latency` is probed, independent of `--subscription-refresh-secs`. Not a
+/// flag: the signal it carries (a device nearer than the one this host is on) moves with network
+/// topology, so no deployment has a reason to want a different number.
+const LATENCY_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct Reconciler {
     cfg: ReconcilerConfig,
@@ -255,6 +275,10 @@ pub struct Reconciler {
     /// task's own liveness write, so the reconciler must not deregister on its behalf.
     health: SharedFeedHealth,
     cli_missing_logged: bool,
+    /// When `doublezero latency` was last probed, so [`LATENCY_PROBE_INTERVAL`] can pace it
+    /// independently of `--subscription-refresh-secs`. `None` until the first probe, which is why
+    /// the first tick always takes one.
+    last_latency_probe: Option<Instant>,
     /// The channel filter's own admitted feed-key set for `cfg.enabled`, as of the last completed
     /// tick — **independent of subscription state**, and deliberately not derived from `active`.
     ///
@@ -314,6 +338,7 @@ impl Reconciler {
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
+            last_latency_probe: None,
             last_filter_admitted: HashSet::new(),
             draining: Vec::new(),
         }
@@ -337,12 +362,45 @@ impl Reconciler {
     }
 
     async fn tick(&mut self) {
-        // `None` == inconclusive this tick (transient CLI error / task join failure): keep the
-        // current activations unchanged rather than tearing everything down on a hiccup.
-        let Some(desired) = self.compute_desired().await else {
-            return;
+        let mut outcome = self.compute_desired().await;
+        // A `None` desired set is inconclusive this tick (transient CLI error / task join failure):
+        // keep the current activations unchanged rather than tearing everything down on a hiccup.
+        // The diagnostics snapshot is published either way — an inconclusive tick is precisely the
+        // state an operator needs reported, and it publishes the *actual* activations below rather
+        // than a desired set that was never applied.
+        if let Some(desired) = outcome.desired.take() {
+            self.apply_desired(desired).await;
+        }
+        self.publish_diagnostics(&outcome);
+    }
+
+    /// Write the polled half of the shared diagnostics snapshot. Activation is read back off this
+    /// reconciler's own task maps rather than off the `Desired` that produced them, so an
+    /// inconclusive tick reports what is really running instead of what was wanted.
+    fn publish_diagnostics(&self, outcome: &TickOutcome) {
+        let activation = Activation {
+            receivers: self
+                .active
+                .keys()
+                .map(|k| ReceiverState {
+                    venue: k.0,
+                    category: k.1,
+                    kind: k.2,
+                    base_port: k.3,
+                    liveness: self.health.liveness(k),
+                })
+                .collect(),
+            ws_on: self.ws_task.is_some(),
+            api_on: self.api_task.is_some(),
+            shred_sources: self
+                .shred_task
+                .as_ref()
+                .map(|(srcs, _)| srcs.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
         };
-        self.apply_desired(desired).await;
+        let mut diag = crate::model::lock(&self.cfg.diagnostics);
+        diag.refresh_secs = self.cfg.refresh.as_secs();
+        diag.publish_tick(outcome.polled.clone(), activation);
     }
 
     /// Apply one computed [`Desired`] state. Split out of `tick` so a test can drive this
@@ -393,15 +451,49 @@ impl Reconciler {
         self.apply_shred(desired.shred_sources);
     }
 
-    async fn compute_desired(&mut self) -> Option<Desired> {
+    async fn compute_desired(&mut self) -> TickOutcome {
         if self.cfg.gating_disabled {
-            return Some(self.static_desired());
+            return TickOutcome {
+                polled: Polled {
+                    detection: Detection::GatingDisabled,
+                    ..Polled::default()
+                },
+                desired: Some(self.static_desired()),
+            };
         }
         // The group list is only needed to resolve shred-group IPs; skip it when shreds are
         // disabled or explicitly sourced.
         let need_group_ips = !self.cfg.shred.disabled && self.cfg.shred.explicit_sources.is_empty();
-        match tokio::task::spawn_blocking(move || subscriptions::detect(need_group_ips)).await {
-            Ok(Detected::Ok(subs)) => Some(self.desired_from_subs(&subs)),
+        // Latency is paced separately from the subscription poll: it is active measurement against
+        // every device, and what it reports (a nearer device than the one this host chose) moves
+        // with network topology, not with a 30s tick. First tick always probes, so `diagnose` has
+        // an answer promptly after start.
+        let probe_latency = self
+            .last_latency_probe
+            .is_none_or(|at| at.elapsed() >= LATENCY_PROBE_INTERVAL);
+        if probe_latency {
+            self.last_latency_probe = Some(Instant::now());
+        }
+        match tokio::task::spawn_blocking(move || {
+            subscriptions::detect(need_group_ips, probe_latency)
+        })
+        .await
+        {
+            Ok(Detected::Ok(subs)) => {
+                let (market_data_codes, shred_codes, other_codes) = self.classify_codes(&subs);
+                TickOutcome {
+                    polled: Polled {
+                        detection: Detection::Ok,
+                        detail: None,
+                        sessions: subs.sessions.clone(),
+                        market_data_codes,
+                        shred_codes,
+                        other_codes,
+                        latency: subs.latency.clone(),
+                    },
+                    desired: Some(self.desired_from_subs(&subs)),
+                }
+            }
             Ok(Detected::CliMissing) => {
                 if !self.cli_missing_logged {
                     warn!(
@@ -410,14 +502,56 @@ impl Reconciler {
                     );
                     self.cli_missing_logged = true;
                 }
-                Some(self.static_desired())
+                TickOutcome {
+                    polled: Polled {
+                        detection: Detection::CliMissing,
+                        ..Polled::default()
+                    },
+                    desired: Some(self.static_desired()),
+                }
             }
-            Ok(Detected::Unavailable) => None,
+            Ok(Detected::Unavailable { detail }) => TickOutcome {
+                polled: Polled {
+                    detection: Detection::Unavailable,
+                    detail,
+                    ..Polled::default()
+                },
+                desired: None,
+            },
             Err(e) => {
                 warn!(%e, "subscription detect task failed; keeping current activations");
-                None
+                TickOutcome {
+                    polled: Polled {
+                        detection: Detection::Unavailable,
+                        detail: Some(format!("subscription detect task failed: {e}")),
+                        ..Polled::default()
+                    },
+                    desired: None,
+                }
             }
         }
+    }
+
+    /// Split the subscribed codes three ways for reporting: the ones matching a feed row this
+    /// process may run, the shred groups, and everything else (a group this host holds that this
+    /// build has no row for — the shape a stale registry produces). Sorted so a diff of two
+    /// diagnostics responses is stable. Reporting only: activation still keys on
+    /// [`HostSubs::market_data_feeds`], which this deliberately mirrors rather than replaces.
+    fn classify_codes(&self, subs: &HostSubs) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let (mut market, mut shred, mut other) = (Vec::new(), Vec::new(), Vec::new());
+        for code in &subs.subscribed_codes {
+            if self.cfg.enabled.iter().any(|f| f.code == *code) {
+                market.push(code.clone());
+            } else if code.starts_with(&self.cfg.shred.code_prefix) {
+                shred.push(code.clone());
+            } else {
+                other.push(code.clone());
+            }
+        }
+        for v in [&mut market, &mut shred, &mut other] {
+            v.sort();
+        }
+        (market, shred, other)
     }
 
     /// A per-tick snapshot of the runtime-mutable channel filter. Cloned rather than held locked
@@ -2233,6 +2367,7 @@ mod tests {
                 rpc_url: None,
                 dedup_window_slots: 1,
             },
+            diagnostics: Default::default(),
         })
     }
 

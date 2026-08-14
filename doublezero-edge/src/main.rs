@@ -5,10 +5,9 @@
 //!
 //! Every `products`/`status` command is READ-ONLY (a `GET` against `/v1`, which has no
 //! order-placement or mutation path anywhere in `edge-connect` for it to reach) and never needs a
-//! confirmation prompt. `channels` is the one exception: it is a distinct command group over a
-//! distinct, off-by-default admin surface (`--admin-url` / `DZ_ADMIN_BIND`), and `channels set` is
-//! this tool's only mutating command — it changes what the shared process ingests, so it prints
-//! what it would drop and requires confirmation unless `--force`.
+//! confirmation prompt. The commands over the **admin** surface (`--admin-url`) are where that
+//! stops holding: `diagnose` is read-only too, but `channels set` mutates what this process
+//! ingests, so it states exactly what it will do and requires confirmation unless `--force`.
 
 use std::time::Duration;
 
@@ -18,7 +17,7 @@ use doublezero_edge::{channels, client, endpoint::Endpoint, jq, params, render};
 use serde_json::{json, Value};
 
 /// doublezero-edge: an agent-facing CLI over a running edge-connect container's /v1 market-data
-/// API (plus its off-by-default admin surface, for `channels`).
+/// API (plus its admin surface, for `diagnose` and `channels`).
 #[derive(Parser)]
 #[command(
     name = "doublezero-edge",
@@ -31,10 +30,12 @@ order-placement or mutation path anywhere in edge-connect for it to reach, so ne
 confirmation prompt — a real difference from the Coinbase Advanced Trade CLI this tool's surface \
 is modelled on, where blast-radius containment (accidentally placing a real order) drives much of \
 the design.\n\n\
-`channels` is separate: it talks to edge-connect's off-by-default admin surface (--admin-url / \
-DZ_ADMIN_BIND) rather than /v1, and `channels set` is this tool's one mutating command — it \
-replaces which channels this process ingests, which drops books/history/catalog state for \
-anything it excludes. It prints what would be dropped and requires confirmation unless --force.\n\n\
+`diagnose` and `channels` are separate: they talk to edge-connect's admin surface (--admin-url, on \
+by default at 127.0.0.1:9098) rather than /v1, which matters because /v1 activates only once a \
+market-data feed is subscribed — on a host whose tunnel never came up it is not listening at all, \
+and `diagnose` is then the command that answers why. `diagnose` only reports; the one mutating \
+command, `channels set`, replaces which channels this process ingests and requires confirmation \
+unless --force.\n\n\
 Trailing arguments to a products subcommand are either the product id (a bare positional, e.g. \
 HYPERLIQUID:BTC) or a key==value query parameter (e.g. granularity==ONE_MINUTE); the two are told \
 apart by the presence of '==', matched before anything is treated as positional, so a query value \
@@ -49,6 +50,12 @@ struct Cli {
         default_value = "http://127.0.0.1:9099"
     )]
     url: String,
+
+    /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
+    /// container). Unlike `/v1` it is not subscription-gated, so it answers on a host whose tunnel
+    /// never came up — which is what `diagnose` is for.
+    #[arg(long, global = true, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
+    admin_url: String,
 
     /// jq-subset filter applied to the JSON response, e.g. '.trades[0].price' or
     /// '.products[].product_id'. Applies to a successful response only; ignores --output.
@@ -87,12 +94,18 @@ enum Command {
         args: Vec<String>,
     },
     /// Inspect or change which channels of an enabled feed this process ingests. Talks to
-    /// edge-connect's off-by-default admin surface (`--admin-url` / `DZ_ADMIN_BIND`), not `/v1` —
-    /// see the top-level `--help` for why this command group is separate.
+    /// edge-connect's admin surface (`--admin-url` / `DZ_ADMIN_BIND`), not `/v1` — see the
+    /// top-level `--help` for why this command group is separate.
     Channels {
         #[command(subcommand)]
         action: ChannelsCommand,
     },
+    /// Why this container is (or is not) serving data: the tunnel, what this host is subscribed
+    /// to, and which feeds are activated, ending in one verdict. Reads the admin surface, which
+    /// answers even when `/v1` is not activated — so this is the command to run when everything
+    /// else reports `api_unreachable`. Exits 0 whatever the verdict; 3 only if the admin surface
+    /// itself does not answer.
+    Diagnose,
     /// Print a shell-completion script for `<shell>` to stdout. Local-only — no config file, no
     /// server, no network — so packaging can run it at build time.
     Completion {
@@ -101,10 +114,7 @@ enum Command {
     },
 }
 
-/// The admin surface's base URL. `9098` is edge-connect's own documented example bind
-/// (`docs/superpowers/specs/2026-08-09-channel-floor-and-history-accounting-design.md`); the
-/// surface itself is off unless the container sets `DZ_ADMIN_BIND`, so this default is only ever a
-/// starting point, never a promise the surface is listening.
+/// The admin surface's base URL — `--admin-bind`'s own default, which is loopback-only by design.
 const DEFAULT_ADMIN_URL: &str = "http://127.0.0.1:9098";
 
 /// Page size `products list --paginate` supplies on the caller's behalf when no `limit==N` was
@@ -115,24 +125,13 @@ const DEFAULT_PAGINATE_LIMIT: u32 = 500;
 #[derive(Subcommand)]
 enum ChannelsCommand {
     /// List each enabled row's channels: channel-filter admission, real bound state, product count.
-    List {
-        /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
-        /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
-        /// since that is otherwise indistinguishable from a wrong port.
-        #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
-        admin_url: String,
-    },
+    List,
     /// Replace the channel filter (same spec syntax as `--channels`/`DZ_CHANNELS`:
     /// `<code>=<id>[,<id>...][;<code>=...]`). Prints what would be dropped and requires
     /// confirmation unless `--force` — the drop is irreversible within the history window.
     Set {
         /// The new channel filter spec. An empty string clears every restriction.
         spec: String,
-        /// Base URL of the edge-connect admin surface (`--admin-bind` / `DZ_ADMIN_BIND` in the
-        /// container). Off by default — a connection failure here names `DZ_ADMIN_BIND`,
-        /// since that is otherwise indistinguishable from a wrong port.
-        #[arg(long, env = "DOUBLEZERO_EDGE_ADMIN_URL", default_value = DEFAULT_ADMIN_URL)]
-        admin_url: String,
         /// Skip the drop preview's confirmation prompt.
         #[arg(long)]
         force: bool,
@@ -195,15 +194,8 @@ fn resolve(command: &Command) -> (Endpoint, Vec<String>) {
             ProductsCommand::Book { args } => (Endpoint::Book, args.clone()),
             ProductsCommand::BestBidAsk { args } => (Endpoint::BestBidAsk, args.clone()),
         },
-        Command::Channels { .. } => {
-            unreachable!(
-                "Command::Channels is dispatched directly by run(), never through resolve()"
-            )
-        }
-        Command::Completion { .. } => {
-            unreachable!(
-                "Command::Completion is dispatched directly by run(), never through resolve()"
-            )
+        Command::Channels { .. } | Command::Diagnose | Command::Completion { .. } => {
+            unreachable!("this command is dispatched directly by run(), never through resolve()")
         }
     }
 }
@@ -226,9 +218,9 @@ fn build_path(endpoint: Endpoint, positionals: &[String]) -> Result<String, Stri
         Endpoint::Ticker => format!("/v1/products/{}/ticker", require_id()?),
         Endpoint::Candles => format!("/v1/products/{}/candles", require_id()?),
         Endpoint::Book => format!("/v1/products/{}/book", require_id()?),
-        Endpoint::ChannelsList | Endpoint::ChannelsSet => {
+        Endpoint::ChannelsList | Endpoint::ChannelsSet | Endpoint::Diagnose => {
             unreachable!(
-                "channels commands are dispatched directly by run(), never through build_path"
+                "admin-surface commands are dispatched directly by run(), never through build_path"
             )
         }
     })
@@ -328,10 +320,12 @@ fn run() -> i32 {
         return run_completion(*shell);
     }
 
-    if let Command::Channels { action } = &cli.command {
-        // A distinct command group over a distinct surface (`--admin-url`, never `cli.url`) with
-        // its own confirmation flow — handled entirely separately from the /v1 GET pipeline below.
-        return run_channels(&cli, action);
+    // The admin-surface commands: a distinct surface (`--admin-url`) with their own confirmation
+    // flows, handled separately from the /v1 GET pipeline below.
+    match &cli.command {
+        Command::Channels { action } => return run_channels(&cli, action),
+        Command::Diagnose => return run_diagnose(&cli),
+        _ => {}
     }
 
     if let Command::Products {
@@ -381,11 +375,38 @@ fn run() -> i32 {
             print_error(&body);
             exit_code_for_status(status)
         }
-        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+        client::Outcome::Unreachable { body } => print_v1_unreachable(&cli, &client, &body),
+        client::Outcome::Invalid { body, .. } => {
             print_error(&body);
             3
         }
     }
+}
+
+/// Report a `/v1` transport failure, telling the two causes apart: a container that is not running,
+/// and one that is running with `/v1` not activated (it is subscription-gated, so on a host whose
+/// tunnel never came up it is not listening at all — the failure that sends an operator to
+/// `docker ps`, which shows a healthy container and no further clue).
+///
+/// The [`client::same_host`] guard is load-bearing: against a remote bridge with the default
+/// loopback `--admin-url`, an unguarded probe would answer for the *local* container and report its
+/// state as the remote one's — confidently wrong, which is worse than the vague message it replaces.
+fn print_v1_unreachable(cli: &Cli, client: &reqwest::blocking::Client, body: &Value) -> i32 {
+    let probed = client::same_host(&cli.url, &cli.admin_url)
+        .then(|| client::probe_diagnostics(client, &cli.admin_url))
+        .flatten();
+    match probed {
+        Some(diag) => {
+            let summary = diag["diagnosis"]["summary"].as_str().unwrap_or_default();
+            print_error(&client::api_inactive_envelope(
+                &cli.url,
+                &cli.admin_url,
+                summary,
+            ));
+        }
+        None => print_error(body),
+    }
+    3
 }
 
 /// Build the one HTTP client every command (`/v1` and admin alike) shares.
@@ -458,7 +479,10 @@ fn run_products_list_paginated(cli: &Cli, args: &[String]) -> i32 {
                 print_error(&body);
                 return exit_code_for_status(status);
             }
-            client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+            client::Outcome::Unreachable { body } => {
+                return print_v1_unreachable(cli, &client, &body)
+            }
+            client::Outcome::Invalid { body, .. } => {
                 print_error(&body);
                 return 3;
             }
@@ -486,24 +510,20 @@ fn run_channels(cli: &Cli, action: &ChannelsCommand) -> i32 {
     };
 
     match action {
-        ChannelsCommand::List { admin_url } => run_channels_list(cli, &client, admin_url),
-        ChannelsCommand::Set {
-            spec,
-            admin_url,
-            force,
-        } => run_channels_set(cli, &client, admin_url, spec, *force),
+        ChannelsCommand::List => run_channels_list(cli, &client),
+        ChannelsCommand::Set { spec, force } => run_channels_set(cli, &client, spec, *force),
     }
 }
 
 /// `channels list`: confirm the admin surface answers (naming `DZ_ADMIN_BIND` if it doesn't), then
 /// merge its channel-filter summary with `/v1/status`'s real per-channel liveness into one JSON value so
 /// `--jq`/`--output`/`--template` behave exactly as they do for every other command.
-fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &str) -> i32 {
+fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client) -> i32 {
     if cli.template {
         return emit_template(cli, &Endpoint::ChannelsList.template());
     }
 
-    let admin_body = match client::admin_get(client, admin_url, "/admin/channels") {
+    let admin_body = match client::admin_get(client, &cli.admin_url, "/admin/channels") {
         client::Outcome::Ok { body } => body,
         client::Outcome::Failed { status, body } => {
             print_error(&body);
@@ -521,7 +541,8 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
             print_error(&body);
             return exit_code_for_status(status);
         }
-        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+        client::Outcome::Unreachable { body } => return print_v1_unreachable(cli, client, &body),
+        client::Outcome::Invalid { body, .. } => {
             print_error(&body);
             return 3;
         }
@@ -533,13 +554,7 @@ fn run_channels_list(cli: &Cli, client: &reqwest::blocking::Client, admin_url: &
 
 /// `channels set`: preview what the new channel filter would drop (best-effort, from `/v1/status`), require
 /// confirmation unless `--force`, then `POST` the spec to the admin surface.
-fn run_channels_set(
-    cli: &Cli,
-    client: &reqwest::blocking::Client,
-    admin_url: &str,
-    spec: &str,
-    force: bool,
-) -> i32 {
+fn run_channels_set(cli: &Cli, client: &reqwest::blocking::Client, spec: &str, force: bool) -> i32 {
     if cli.template {
         return emit_template(cli, &Endpoint::ChannelsSet.template());
     }
@@ -589,7 +604,7 @@ fn run_channels_set(
         }
     }
 
-    match client::admin_post_channels(client, admin_url, spec) {
+    match client::admin_post_channels(client, &cli.admin_url, spec) {
         client::Outcome::Ok { body } => emit(cli, Endpoint::ChannelsSet, &body),
         client::Outcome::Failed { status, body } => {
             print_error(&body);
@@ -600,6 +615,50 @@ fn run_channels_set(
             3
         }
     }
+}
+
+/// `diagnose`: the admin surface's verdict plus, best-effort, `/v1/status`'s venue health, merged
+/// into one value exactly as `channels list` merges the same two surfaces.
+///
+/// **Exit 0 for any verdict a healthy admin surface produced**, including `tunnel_down`: the report
+/// succeeded, and an agent reads `.diagnostics.diagnosis.code` for the answer. Only the admin
+/// surface itself failing is an error (3) — there is then nothing to report.
+fn run_diagnose(cli: &Cli) -> i32 {
+    if cli.template {
+        return emit_template(cli, &Endpoint::Diagnose.template());
+    }
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return 1;
+        }
+    };
+
+    let diagnostics = match client::admin_get(&client, &cli.admin_url, "/admin/diagnostics") {
+        client::Outcome::Ok { body } => body,
+        client::Outcome::Failed { status, body } => {
+            print_error(&body);
+            return exit_code_for_status(status);
+        }
+        client::Outcome::Invalid { body, .. } | client::Outcome::Unreachable { body } => {
+            print_error(&body);
+            return 3;
+        }
+    };
+
+    // `/v1` being down is the very condition this command explains, so its failure is silent —
+    // a warning here would read as a second fault on top of the one being reported.
+    let status = match client::get(&client, &cli.url, "/v1/status", &[]) {
+        client::Outcome::Ok { body } => body,
+        _ => Value::Null,
+    };
+
+    emit(
+        cli,
+        Endpoint::Diagnose,
+        &json!({ "diagnostics": diagnostics, "status": status }),
+    )
 }
 
 /// clap's own `--help`/`--version`/usage errors: the two "not actually an error" kinds print to

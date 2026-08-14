@@ -66,27 +66,86 @@ pub fn get(
 /// one case the server's own `{"error","message","remediation"}` shape can't produce for us,
 /// because there is no server in the loop to produce it. Matches that shape exactly so downstream
 /// code (rendering, exit-code mapping) never needs to know which side produced an error body.
+///
+/// This is the message for "nothing answered on either surface". When the admin surface *does*
+/// answer, the container is up and this is the wrong story — see [`api_inactive_envelope`].
 pub fn unreachable_envelope(base_url: &str) -> Value {
     json!({
         "error": "api_unreachable",
         "message": format!("No response at {base_url}."),
-        "remediation": "Is edge-connect running? Check `docker ps`, or pass --url.",
+        "remediation": "Is edge-connect running? Check `docker ps`, or pass --url. A running \
+            container can also answer nothing here: /v1 activates only once a market-data feed is \
+            subscribed, re-checked every --subscription-refresh-secs (30s by default). Run \
+            `doublezero-edge diagnose`, which reads the admin surface and is not gated that way.",
+    })
+}
+
+/// `/v1` did not answer but the admin surface did: the container is running and its query API is
+/// simply not activated. Distinct from [`unreachable_envelope`] because the remediations have
+/// nothing in common — one is "start the container", the other is "fix the tunnel".
+///
+/// Names `admin_url` explicitly. [`same_host`] can only compare host strings, so a `--url` that
+/// reaches a *remote* bridge through a local port forward looks local and the probe fires against
+/// the local container. Saying which process answered is what lets an operator spot that.
+pub fn api_inactive_envelope(base_url: &str, admin_url: &str, summary: &str) -> Value {
+    json!({
+        "error": "api_inactive",
+        "message": format!(
+            "No response at {base_url}, but edge-connect is running — the admin surface at \
+             {admin_url} answered. The /v1 API activates only when a market-data feed is \
+             subscribed. {summary}"
+        ),
+        "remediation": "Run `doublezero-edge diagnose` for the full verdict, and \
+            `doublezero-edge connect` if it reports the tunnel down.",
     })
 }
 
 /// The admin-surface twin of [`unreachable_envelope`]. It exists as a separate message because a
-/// connection-refused against the admin surface has a genuinely different likely cause: the admin
-/// surface is **off by default** (unlike `/v1`), so a wrong `--admin-url` and a container that
-/// simply never set `DZ_ADMIN_BIND` are otherwise indistinguishable failures with different fixes.
-/// Naming the env var here is what lets a caller tell them apart without guessing.
+/// connection-refused against the admin surface has a genuinely different likely cause: it is a
+/// different bind from `/v1`, on by default at loopback, and the one way to turn it off is to set
+/// `DZ_ADMIN_BIND` empty. Naming the env var here is what lets a caller tell that apart from a
+/// wrong `--admin-url` without guessing.
 pub fn admin_unreachable_envelope(admin_url: &str) -> Value {
     json!({
         "error": "admin_api_unreachable",
         "message": format!("No response at {admin_url}."),
-        "remediation": "The admin surface is off unless DZ_ADMIN_BIND is set in the edge-connect \
-            container (it is not the same bind as the read-only /v1 API). Confirm DZ_ADMIN_BIND \
-            is set there, or pass the correct --admin-url.",
+        "remediation": "The admin surface is on by default at 127.0.0.1:9098 — a different bind \
+            from the read-only /v1 API. It is off only if the container set DZ_ADMIN_BIND empty; \
+            otherwise check --admin-url, and that this command runs somewhere the container's \
+            loopback is reachable (the default bind never reaches past it).",
     })
+}
+
+/// Ask the admin surface for its diagnostics, returning the body only if it answered — the probe
+/// behind the [`api_inactive_envelope`] distinction. A failure of any kind is `None`: this runs
+/// only to improve another error's wording and must never produce an error of its own.
+pub fn probe_diagnostics(client: &reqwest::blocking::Client, admin_url: &str) -> Option<Value> {
+    match admin_get(client, admin_url, "/admin/diagnostics") {
+        Outcome::Ok { body } => Some(body),
+        _ => None,
+    }
+}
+
+/// Do two URLs name the same host, ignoring scheme and port? The guard on that probe: against a
+/// remote bridge with the default loopback `--admin-url`, probing would report the *local*
+/// container's state as the remote one's. Two spellings of one host (`localhost` vs `127.0.0.1`)
+/// compare unequal, which suppresses the probe — the safe direction.
+pub fn same_host(a: &str, b: &str) -> bool {
+    match (host_of(a), host_of(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// `GET {admin_url}{path}` — the admin-surface counterpart of [`get`], differing only in which
@@ -130,11 +189,21 @@ pub fn admin_post_channels(
     admin_url: &str,
     spec: &str,
 ) -> Outcome {
-    let full = format!("{}/admin/channels", admin_url.trim_end_matches('/'));
+    admin_post_with(client, admin_url, "/admin/channels", &[("channels", spec)])
+}
+
+/// The one POST this CLI's admin mutation runs through.
+fn admin_post_with(
+    client: &reqwest::blocking::Client,
+    admin_url: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Outcome {
+    let full = format!("{}{}", admin_url.trim_end_matches('/'), path);
     let resp = match client
         .post(&full)
         .header("X-DZ-Admin-Request", "1")
-        .query(&[("channels", spec)])
+        .query(query)
         .send()
     {
         Ok(r) => r,
@@ -222,6 +291,9 @@ mod tests {
         assert_eq!(encode_path_segment("100%"), "100%25");
     }
 
+    /// The env var still has to be named — it is the one way to turn the surface off — but the
+    /// default flipped to `127.0.0.1:9098`, so the remediation must not send a caller looking for
+    /// a `DZ_ADMIN_BIND` they were never meant to set.
     #[test]
     fn the_admin_unreachable_envelope_names_dz_admin_bind() {
         let body = admin_unreachable_envelope("http://127.0.0.1:9098");
@@ -231,6 +303,60 @@ mod tests {
             "a connection-refused against the admin surface must name DZ_ADMIN_BIND, since it is \
              otherwise indistinguishable from a wrong --admin-url: {msg}"
         );
+        assert!(
+            msg.contains("on by default"),
+            "the surface is on by default at loopback; saying otherwise is the stale message this \
+             replaced: {msg}"
+        );
+    }
+
+    /// The `api_inactive` story is only useful if it points at the command that explains why.
+    #[test]
+    fn the_api_inactive_envelope_names_diagnose_and_quotes_the_verdict() {
+        let body = api_inactive_envelope(
+            "http://127.0.0.1:9099",
+            "http://127.0.0.1:9098",
+            "The tunnel is not up.",
+        );
+        assert_eq!(body["error"], "api_inactive");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("The tunnel is not up."));
+        assert!(body["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("doublezero-edge diagnose"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // same_host — the guard on the diagnostics probe. Getting this wrong reports the local
+    // container's state as a remote bridge's, which is worse than the vague answer it replaces.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_same_host_on_different_ports_and_schemes_matches() {
+        assert!(same_host("http://127.0.0.1:9099", "http://127.0.0.1:9098"));
+        assert!(same_host("https://Edge.Example:443", "http://edge.example"));
+        assert!(same_host("http://[::1]:9099/", "http://[::1]:9098"));
+    }
+
+    #[test]
+    fn a_remote_url_never_matches_a_loopback_admin_url() {
+        assert!(!same_host(
+            "http://edge-1.example:9099",
+            "http://127.0.0.1:9098"
+        ));
+        assert!(!same_host("http://10.0.0.4:9099", "http://127.0.0.1:9098"));
+    }
+
+    /// Two spellings of the same host still compare unequal, and a string with no host at all
+    /// never matches — both suppress the probe, which is the safe direction.
+    #[test]
+    fn an_unresolvable_comparison_suppresses_the_probe() {
+        assert!(!same_host("http://localhost:9099", "http://127.0.0.1:9098"));
+        assert!(!same_host("", "http://127.0.0.1:9098"));
+        assert!(!same_host("http:///v1", "http://127.0.0.1:9098"));
     }
 
     // -----------------------------------------------------------------------------------------
