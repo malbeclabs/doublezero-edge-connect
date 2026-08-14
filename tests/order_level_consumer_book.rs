@@ -401,9 +401,8 @@ fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
     let (mut venue_a, mut venue_b) = (Book::new(), Book::new());
     let mut markets: BTreeMap<u32, Book> = BTreeMap::new();
 
-    // Both markets install a book, each holding its own order 1.
+    // Market A installs a book holding order 1; market B installs an empty one.
     venue_a.insert(1, (BookSide::Bid, 100.0, 5.0));
-    venue_b.insert(1, (BookSide::Ask, 50.0, 2.0));
     a.emit(
         snapshot_for(INSTRUMENT, &venue_a, 1_000, 1_000),
         fast,
@@ -415,7 +414,7 @@ fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
         CATEGORY,
     );
 
-    // Market A's order 1 is cancelled. Market B's identically-numbered order is not.
+    // Market A's order 1 is cancelled.
     venue_a.remove(&1);
     a.emit(
         batch_for(
@@ -428,24 +427,28 @@ fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
         CATEGORY,
     );
 
-    // The lagging arm's first and only copy of A's add for that order — dead there — and its copy
-    // of B's order, which is alive and must survive whatever A's refusal does.
-    a.emit(
-        batch_for(
-            INSTRUMENT,
-            vec![change(1, BookSide::Bid, 100.0, 5.0)],
-            1_200,
-            1_200,
-        ),
-        slow,
-        CATEGORY,
-    );
+    // Market B opens an order under the **same id**. It is live and has nothing to do with A's dead
+    // one, so it has to reach the consumer.
+    venue_b.insert(1, (BookSide::Ask, 50.0, 2.0));
     a.emit(
         batch_for(
             INSTRUMENT_B,
             vec![change(1, BookSide::Ask, 50.0, 2.0)],
             1_200,
             1_200,
+        ),
+        fast,
+        CATEGORY,
+    );
+
+    // And the lagging arm's first and only copy of A's add for that id, which is dead there and
+    // must not come back on either market.
+    a.emit(
+        batch_for(
+            INSTRUMENT,
+            vec![change(1, BookSide::Bid, 100.0, 5.0)],
+            1_300,
+            1_300,
         ),
         slow,
         CATEGORY,
@@ -844,4 +847,340 @@ fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
     );
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The consumer-visible contract, at behavioural altitude. Nothing below reaches into the arbiter's
+// internals: each scenario drives batches from N arms through the real `Arbiter`, reads what
+// reaches the broadcast, rebuilds a book exactly as PROTOCOL.md tells a consumer to, and compares
+// it to the venue's. That is what makes them survive a replacement of the mechanism underneath.
+// ---------------------------------------------------------------------------------------------
+
+/// One venue event: an order's id, side, resting price and **absolute resulting** quantity, with
+/// zero meaning it left the book.
+type Event = (u64, BookSide, f64, f64);
+
+/// One market's life as the wire delivers it — orders arrive, are partially filled, and leave.
+const LIFECYCLE: [Event; 8] = [
+    (1, BookSide::Bid, 100.0, 5.0),
+    (2, BookSide::Ask, 101.0, 7.0),
+    (1, BookSide::Bid, 100.0, 2.0),
+    (3, BookSide::Bid, 99.0, 4.0),
+    (2, BookSide::Ask, 101.0, 0.0),
+    (3, BookSide::Bid, 99.0, 1.0),
+    (1, BookSide::Bid, 100.0, 0.0),
+    (4, BookSide::Ask, 102.0, 6.0),
+];
+
+/// `rounds` copies of [`LIFECYCLE`], each on its own order ids and prices, so a scenario can run
+/// long enough for a lagging arm to stay behind for the whole of it.
+fn lifecycle_stream(rounds: u64) -> Vec<Event> {
+    (0..rounds)
+        .flat_map(|r| {
+            LIFECYCLE
+                .iter()
+                .map(move |&(id, side, px, sz)| (id + r * 10, side, px + r as f64, sz))
+        })
+        .collect()
+}
+
+fn venue_apply(venue: &mut Book, (id, side, px, sz): Event) {
+    if sz == 0.0 {
+        venue.remove(&id);
+    } else {
+        venue.insert(id, (side, px, sz));
+    }
+}
+
+fn ev_change((id, side, px, sz): Event) -> BookChange {
+    change(id, side, px, sz)
+}
+
+/// Drain into the consumer's book **and** keep what was published, so a scenario can assert what
+/// reached the wire rather than only where the consumer ended up.
+fn drain_published(
+    rx: &mut broadcast::Receiver<Arc<FeedMessage>>,
+    consumer: &mut Book,
+) -> Vec<NormalizedBook> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if let FeedMessage::Book(b) = &*m {
+            apply(consumer, b);
+            out.push(b.clone());
+        }
+    }
+    out
+}
+
+/// A single publisher streaming a market's whole life. Nothing races, so the consumer's book has to
+/// equal the venue's after **every** event, not merely at the end.
+#[test]
+fn a_single_arms_stream_reaches_the_consumer_exactly() {
+    let (mut a, mut rx, only, peer) = harness();
+    a.forget_publisher_books(VENUE, peer);
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    for (i, &e) in lifecycle_stream(1).iter().enumerate() {
+        let t = 1_000 + i as u64 * 100;
+        venue_apply(&mut venue, e);
+        a.emit(batch(vec![ev_change(e)], t, t), only, CATEGORY);
+        drain_into(&mut rx, &mut consumer);
+        assert_eq!(consumer, venue, "diverged at event {i}");
+    }
+}
+
+/// Both arms deliver every event, a nanosecond apart. The consumer sees each event **once**: a
+/// second copy carries the order's absolute quantity again, so republishing it after the wire has
+/// moved on walks the consumer back to a size the venue already reduced.
+#[test]
+fn two_arms_in_lockstep_publish_each_event_once() {
+    let (mut a, mut rx, one, two) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+    let (mut published, mut expected) = (Vec::new(), Vec::new());
+
+    for (i, &e) in lifecycle_stream(1).iter().enumerate() {
+        let t = 1_000 + i as u64 * 100;
+        venue_apply(&mut venue, e);
+        expected.push(ev_change(e));
+        a.emit(batch(vec![ev_change(e)], t, t), one, CATEGORY);
+        a.emit(batch(vec![ev_change(e)], t, t + 1), two, CATEGORY);
+        published.extend(drain_published(&mut rx, &mut consumer));
+    }
+
+    let changes: Vec<BookChange> = published.iter().flat_map(|b| b.changes.clone()).collect();
+    assert_eq!(changes, expected, "each venue event reaches the wire once");
+    assert_eq!(consumer, venue);
+}
+
+/// Drive `events` through two arms, the trailing one `lag_ns` late **in arrival only** — its
+/// `source_ts_ns` is the leader's, which is what the wire shows on 271,455 paired events. One venue
+/// event every `spacing_ns`, so a lag wider than the spacing leaves the trailer permanently behind.
+fn arrival_lagged_stream(
+    events: &[Event],
+    spacing_ns: u64,
+    lag_ns: u64,
+    leader_is_first_arm: bool,
+) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>, Book, Book) {
+    let (mut a, mut rx, one, two) = harness();
+    a.set_book_dedup_window(1_000_000_000); // the shipped --arb-book-dedup-window-ms
+    let (leader, trailer) = if leader_is_first_arm {
+        (one, two)
+    } else {
+        (two, one)
+    };
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    // (arrival, the venue's own stamp — identical on both arms' copies, arm, change).
+    let mut arrivals: Vec<(u64, u64, Publisher, BookChange)> = Vec::new();
+    for (i, &e) in events.iter().enumerate() {
+        let t = 1_000 + i as u64 * spacing_ns;
+        venue_apply(&mut venue, e);
+        arrivals.push((t, t, leader, ev_change(e)));
+        arrivals.push((t + lag_ns, t, trailer, ev_change(e)));
+    }
+    arrivals.sort_by_key(|&(at, ..)| at); // stable, so the leader's copy stays first on a tie
+    for (at, venue_ts, p, c) in arrivals {
+        a.emit(batch(vec![c], venue_ts, at), p, CATEGORY);
+        drain_into(&mut rx, &mut consumer);
+    }
+    (a, rx, consumer, venue)
+}
+
+/// The trailing arm is late in arrival and stamps the leader's venue times. Whichever arm leads,
+/// the consumer ends holding the venue's book.
+#[test]
+fn an_arm_behind_in_arrival_only_does_not_drift_the_consumer() {
+    for leader_is_first_arm in [true, false] {
+        let (_a, _rx, consumer, venue) =
+            arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, 5_000_000, leader_is_first_arm);
+        assert_eq!(consumer, venue, "leader_is_first_arm={leader_is_first_arm}");
+    }
+}
+
+/// Two arms recovered from **different snapshot anchors**: the first holds an order the venue
+/// killed before the second's newer snapshot was taken. The arm that holds it is the only one
+/// that can remove it, and the market must go on being served either way.
+#[test]
+fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
+    let (mut a, mut rx, early, late) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    // The early arm's anchor, taken while order 2 still rested.
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    venue.insert(2, (BookSide::Ask, 101.0, 7.0));
+    a.emit(snapshot(&venue, 1_000, 1_000), early, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // The venue removes order 2; the late arm's anchor is taken after that, so it never held it and
+    // can never report its removal. Its re-baseline is dropped — the early arm is serving.
+    venue.remove(&2);
+    a.emit(snapshot(&venue, 2_000, 2_000), late, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer.len(),
+        2,
+        "a peer's re-baseline must not displace a served book"
+    );
+
+    // Only the arm that held order 2 reports its removal, and it has to reach the consumer.
+    a.emit(
+        batch(vec![change(2, BookSide::Ask, 101.0, 0.0)], 3_000, 3_000),
+        early,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue, "the holder's removal must reach the wire");
+
+    // And the market keeps being served, from either arm.
+    venue.insert(3, (BookSide::Bid, 98.0, 4.0));
+    a.emit(
+        batch(vec![change(3, BookSide::Bid, 98.0, 4.0)], 4_000, 4_000),
+        late,
+        CATEGORY,
+    );
+    venue.insert(4, (BookSide::Ask, 103.0, 2.0));
+    a.emit(
+        batch(vec![change(4, BookSide::Ask, 103.0, 2.0)], 5_000, 5_000),
+        early,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+}
+
+/// An arm leaves and comes back, missing everything in between and replaying a stale backlog on its
+/// return. The consumer holds the venue's book throughout.
+///
+/// Departure is driven by [`Arbiter::forget_publisher_books`], the signal a receiver's registration
+/// sends as it exits, because that is the one an integration test can produce: the wall-clock
+/// `PEER_SERVING_NS` backstop is measured on a monotonic clock this side of the API, so "silent for
+/// 30 s" is unreachable without a clock seam in `src/`. Same consumer-visible property either way.
+#[test]
+fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
+    let (mut a, mut rx, staying, leaving) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    a.emit(snapshot(&venue, 1_000, 1_000), staying, CATEGORY);
+
+    // The arm's receiver exits, which ends its claim to be serving this market.
+    a.forget_publisher_books(VENUE, leaving);
+
+    // The venue moves on while it is away: order 1 is filled down, a second order rests and is
+    // filled down in turn. None of it reaches the departed arm.
+    for (i, &e) in [
+        (1u64, BookSide::Bid, 100.0, 2.0),
+        (2, BookSide::Ask, 101.0, 3.0),
+        (2, BookSide::Ask, 101.0, 1.0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let t = 2_000 + i as u64 * 100;
+        venue_apply(&mut venue, e);
+        a.emit(batch(vec![ev_change(e)], t, t), staying, CATEGORY);
+    }
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // It comes back the only way a restarted receiver can: synced first, then the re-baseline its
+    // snapshot install produced. That anchor is one the venue has already moved past, and it is
+    // dropped rather than published — the arm that stayed is serving this market correctly.
+    a.set_book_synced(&market(INSTRUMENT), leaving, true);
+    let anchor = Book::from([
+        (1, (BookSide::Bid, 100.0, 2.0)),
+        (2, (BookSide::Ask, 101.0, 3.0)),
+    ]);
+    a.emit(snapshot(&anchor, 3_000, 3_000), leaving, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue, "a returning arm must not displace the book");
+
+    // Its first deltas off that anchor are copies of events the serving arm has already published,
+    // and they claim a size the venue has since reduced. Neither may walk the consumer back.
+    a.emit(
+        batch(vec![change(2, BookSide::Ask, 101.0, 3.0)], 3_100, 3_100),
+        leaving,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue, "a stale copy must not walk an order back");
+
+    // And the market goes on being served, from both arms.
+    venue.insert(3, (BookSide::Bid, 97.0, 8.0));
+    a.emit(
+        batch(vec![change(3, BookSide::Bid, 97.0, 8.0)], 4_000, 4_000),
+        staying,
+        CATEGORY,
+    );
+    venue.insert(4, (BookSide::Ask, 102.0, 6.0));
+    a.emit(
+        batch(vec![change(4, BookSide::Ask, 102.0, 6.0)], 4_100, 4_100),
+        leaving,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+}
+
+/// One arm trails the other for the **whole run** — 25 events behind, never catching up. It must
+/// not drift the consumer, and it must not stop the market being served: both arms still reach
+/// the wire afterwards.
+#[test]
+fn a_permanently_slower_arm_never_stops_the_market_being_served() {
+    let events = lifecycle_stream(5);
+    let (mut a, mut rx, mut consumer, mut venue) =
+        arrival_lagged_stream(&events, 10_000_000, 250_000_000, true);
+    assert_eq!(consumer, venue, "a permanent lag must not drift the book");
+
+    // Each arm in turn, on a fresh order: the market is still being served from both.
+    let after = 1_000 + events.len() as u64 * 10_000_000 + 250_000_000;
+    for (i, p) in [arm(1), arm(2)].into_iter().enumerate() {
+        let (id, t) = (900 + i as u64, after + i as u64 * 10_000_000);
+        venue.insert(id, (BookSide::Bid, 10.0, 1.0));
+        a.emit(
+            batch(vec![change(id, BookSide::Bid, 10.0, 1.0)], t, t),
+            p,
+            CATEGORY,
+        );
+        drain_into(&mut rx, &mut consumer);
+        assert_eq!(consumer, venue, "market not served after the lagging run");
+    }
+}
+
+/// While one arm is serving a market, a peer's `Clear`-led re-baseline is **dropped**, not
+/// published: it would tell the consumer to discard a book that is correct and replace it with the
+/// peer's, which on a recovering arm is older. Exactly one `Clear` reaches the wire.
+#[test]
+fn a_peers_rebaseline_does_not_displace_a_served_book() {
+    let (mut a, mut rx, serving, peer) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+    let mut published = Vec::new();
+
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    a.emit(snapshot(&venue, 1_000, 1_000), serving, CATEGORY);
+    venue.insert(2, (BookSide::Ask, 101.0, 7.0));
+    a.emit(
+        batch(vec![change(2, BookSide::Ask, 101.0, 7.0)], 1_100, 1_100),
+        serving,
+        CATEGORY,
+    );
+    published.extend(drain_published(&mut rx, &mut consumer));
+    assert_eq!(consumer, venue);
+
+    // The peer recovers and offers its own whole book, which is a state the venue has left.
+    let stale_book: Book = BTreeMap::from([(9, (BookSide::Bid, 50.0, 1.0))]);
+    a.emit(snapshot(&stale_book, 1_200, 1_200), peer, CATEGORY);
+    published.extend(drain_published(&mut rx, &mut consumer));
+    assert_eq!(consumer, venue, "the served book must survive the peer");
+
+    let clears = published
+        .iter()
+        .filter(|b| {
+            b.changes
+                .first()
+                .is_some_and(|c| c.action == BookAction::Clear)
+        })
+        .count();
+    assert_eq!(clears, 1, "only the serving arm's re-baseline reaches the wire");
 }
