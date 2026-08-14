@@ -905,6 +905,10 @@ Modules are grouped by role under `src/`:
   state**, not the wire's add/cancel/execute event, and a recovery still surfaces only as a
   `Clear`-led re-baseline — do not expose the raw order events. `depth` is additive and unchanged:
   there are testers on it, and deleting it is its own change (PROTOCOL.md v2).
+  **`docs/order-level-test-inventory.md` says which of this product's tests pin the consumer contract
+  and which pin the cross-publisher guard's internals** — read it before changing that guard, because
+  the reassuring test count is mostly the second kind, and the overlap between them (market disowning,
+  the forced re-baseline) is where a "no behaviour change" claim goes wrong.
 - **Four latency timestamps** ride every quote: `source_ts_ns` (venue), `kernel_rx_ts_ns`
   (`SO_TIMESTAMPNS`, captured in the driver softirq — best-effort, falls back to 0), `recv_ts_ns`
   (user-space post-decode), `ws_send_ts_ns` (stamped in `sinks/ws.rs` just before send). `0` is
