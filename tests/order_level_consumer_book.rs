@@ -69,10 +69,10 @@ fn market(instrument_id: u32) -> BookKey {
 /// A market's wire symbol. Not part of [`BookKey`], but two markets sharing one must not be how a
 /// scenario distinguishes them, so each carries its own.
 fn symbol_of(instrument_id: u32) -> &'static str {
-    if instrument_id == INSTRUMENT {
-        "BTC"
-    } else {
-        "ETH"
+    match instrument_id {
+        INSTRUMENT => "BTC",
+        INSTRUMENT_B => "ETH",
+        other => panic!("no symbol for instrument {other}"),
     }
 }
 
@@ -912,6 +912,38 @@ fn drain_published(
     out
 }
 
+/// The two clocks reach the wire as the harness set them. Nothing on the order-level path reads
+/// `source_ts_ns` today, so without this the whole split is unfalsifiable: the arguments could be
+/// swapped at every call site and every scenario below would still pass, which is exactly how a
+/// venue-time-keyed test comes to measure nothing.
+#[test]
+fn a_published_batch_carries_the_stamps_it_was_given() {
+    let (mut a, mut rx, only, _peer) = harness();
+    let mut consumer = Book::new();
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 4_000, 7_000),
+        only,
+        CATEGORY,
+    );
+    let published = drain_published(&mut rx, &mut consumer);
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].source_ts_ns, 4_000, "venue time");
+    assert_eq!(published[0].recv_ts_ns, 7_000, "arrival time");
+}
+
+/// Venue-time skew on its own, with both arms arriving in lockstep. The order-level path reads only
+/// arrival today, so this changes nothing — which is the before-picture a design keying on venue time
+/// is measured against, and the one caller that drives [`Lag::venue_ns`].
+#[test]
+fn a_venue_time_skew_alone_does_not_drift_the_consumer() {
+    let lag = Lag {
+        arrival_ns: 0,
+        venue_ns: 5_000_000,
+    };
+    let (consumer, venue) = replay_with_lag(64, lag, true);
+    assert_eq!(consumer, venue);
+}
+
 /// A single publisher streaming a market's whole life. Nothing races, so the consumer's book has to
 /// equal the venue's after **every** event, not merely at the end.
 #[test]
@@ -955,6 +987,12 @@ fn two_arms_in_lockstep_publish_each_event_once() {
 /// Drive `events` through two arms, the trailing one `lag_ns` late **in arrival only** — its
 /// `source_ts_ns` is the leader's, which is what the wire shows on 271,455 paired events. One venue
 /// event every `spacing_ns`, so a lag wider than the spacing leaves the trailer permanently behind.
+///
+/// The invariant is asserted **after every arrival**, not at the end. A trailer replaying the venue's
+/// whole life in order converges on its own: a resurrection or a stale size it publishes is corrected
+/// by its own next copy, so a terminal comparison alone passes even with the racing guard removed
+/// outright. Step by step it does not — under correct behaviour every trailer copy is collapsed and
+/// publishes nothing, so the consumer never leaves the venue's state as of the last leader arrival.
 fn arrival_lagged_stream(
     events: &[Event],
     spacing_ns: u64,
@@ -970,18 +1008,22 @@ fn arrival_lagged_stream(
     };
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    // (arrival, the venue's own stamp — identical on both arms' copies, arm, change).
-    let mut arrivals: Vec<(u64, u64, Publisher, BookChange)> = Vec::new();
+    // (arrival, the venue's own stamp — identical on both arms' copies, arm, change, and the venue
+    // event the leader's copy advances; `None` on the trailer's, which advances nothing).
+    let mut arrivals: Vec<(u64, u64, Publisher, BookChange, Option<Event>)> = Vec::new();
     for (i, &e) in events.iter().enumerate() {
         let t = 1_000 + i as u64 * spacing_ns;
-        venue_apply(&mut venue, e);
-        arrivals.push((t, t, leader, ev_change(e)));
-        arrivals.push((t + lag_ns, t, trailer, ev_change(e)));
+        arrivals.push((t, t, leader, ev_change(e), Some(e)));
+        arrivals.push((t + lag_ns, t, trailer, ev_change(e), None));
     }
-    arrivals.sort_by_key(|&(at, ..)| at); // stable, so the leader's copy stays first on a tie
-    for (at, venue_ts, p, c) in arrivals {
+    arrivals.sort_by_key(|&(at, _, p, ..)| (at, p != leader)); // the leader's copy wins a tie
+    for (at, venue_ts, p, c, applied) in arrivals {
+        if let Some(e) = applied {
+            venue_apply(&mut venue, e);
+        }
         a.emit(batch(vec![c], venue_ts, at), p, CATEGORY);
         drain_into(&mut rx, &mut consumer);
+        assert_eq!(consumer, venue, "diverged at arrival {at}");
     }
     (a, rx, consumer, venue)
 }
@@ -1014,12 +1056,12 @@ fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
 
     // The venue removes order 2; the late arm's anchor is taken after that, so it never held it and
     // can never report its removal. Its re-baseline is dropped — the early arm is serving.
+    let served = venue.clone();
     venue.remove(&2);
     a.emit(snapshot(&venue, 2_000, 2_000), late, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(
-        consumer.len(),
-        2,
+        consumer, served,
         "a peer's re-baseline must not displace a served book"
     );
 
@@ -1049,44 +1091,59 @@ fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
     assert_eq!(consumer, venue);
 }
 
-/// An arm leaves and comes back, missing everything in between and replaying a stale backlog on its
-/// return. The consumer holds the venue's book throughout.
+/// The arm that is **serving** a market leaves, and the peer recovering behind it has to be able to
+/// re-baseline the consumer. Then it comes back, and neither its stale anchor nor its first deltas
+/// may walk that consumer back.
 ///
 /// Departure is driven by [`Arbiter::forget_publisher_books`], the signal a receiver's registration
 /// sends as it exits, because that is the one an integration test can produce: the wall-clock
 /// `PEER_SERVING_NS` backstop is measured on a monotonic clock this side of the API, so "silent for
-/// 30 s" is unreachable without a clock seam in `src/`. Same consumer-visible property either way.
+/// 30 s" is unreachable without a clock seam in `src/`. Same consumer-visible property either way,
+/// and the departure is load-bearing here — without it the peer's re-baseline stays suppressed and
+/// the consumer holds a book the venue has left, for the life of the process.
 #[test]
 fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
     let (mut a, mut rx, staying, leaving) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
+    // The arm about to leave is the one serving the market.
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
-    a.emit(snapshot(&venue, 1_000, 1_000), staying, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), leaving, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
 
-    // The arm's receiver exits, which ends its claim to be serving this market.
+    // The venue moves on. The peer gapped and recovered, and its re-baseline is dropped: the serving
+    // arm is healthy, so a recovering peer must not wipe a book that is correct.
+    venue.insert(1, (BookSide::Bid, 100.0, 2.0));
+    venue.insert(2, (BookSide::Ask, 101.0, 3.0));
+    a.emit(snapshot(&venue, 2_000, 2_000), staying, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer,
+        Book::from([(1, (BookSide::Bid, 100.0, 5.0))]),
+        "a recovering peer must not displace a served book"
+    );
+
+    // The serving arm's receiver exits, ending its claim. Nobody is serving now, so the peer's next
+    // re-baseline is the consumer's only route back to the venue's book.
     a.forget_publisher_books(VENUE, leaving);
+    a.emit(snapshot(&venue, 2_100, 2_100), staying, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue, "a departure must release the suppression");
 
-    // The venue moves on while it is away: order 1 is filled down, a second order rests and is
-    // filled down in turn. None of it reaches the departed arm.
-    for (i, &e) in [
-        (1u64, BookSide::Bid, 100.0, 2.0),
-        (2, BookSide::Ask, 101.0, 3.0),
-        (2, BookSide::Ask, 101.0, 1.0),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let t = 2_000 + i as u64 * 100;
-        venue_apply(&mut venue, e);
-        a.emit(batch(vec![ev_change(e)], t, t), staying, CATEGORY);
-    }
+    // The venue moves on again while the departed arm is still away.
+    venue.insert(2, (BookSide::Ask, 101.0, 1.0));
+    a.emit(
+        batch(vec![change(2, BookSide::Ask, 101.0, 1.0)], 2_200, 2_200),
+        staying,
+        CATEGORY,
+    );
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
 
     // It comes back the only way a restarted receiver can: synced first, then the re-baseline its
     // snapshot install produced. That anchor is one the venue has already moved past, and it is
-    // dropped rather than published — the arm that stayed is serving this market correctly.
+    // dropped rather than published — the arm that stayed is serving this market correctly now.
     a.set_book_synced(&market(INSTRUMENT), leaving, true);
     let anchor = Book::from([
         (1, (BookSide::Bid, 100.0, 2.0)),
