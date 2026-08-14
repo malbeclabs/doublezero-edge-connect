@@ -25,6 +25,9 @@ use tokio::sync::broadcast;
 const VENUE: &str = "HYPERLIQUID";
 const CHANNEL: u32 = 1;
 const INSTRUMENT: u32 = 7;
+/// A second market on the **same channel**, for a scenario that has to show one market's traffic
+/// leaving another's alone.
+const INSTRUMENT_B: u32 = 9;
 const CATEGORY: &str = "perp";
 const DEDUP_WINDOW_NS: u64 = 1_000;
 
@@ -59,17 +62,40 @@ fn clear_both() -> BookChange {
     }
 }
 
+fn market(instrument_id: u32) -> BookKey {
+    (VENUE.into(), CATEGORY.into(), CHANNEL, instrument_id)
+}
+
+/// A market's wire symbol. Not part of [`BookKey`], but two markets sharing one must not be how a
+/// scenario distinguishes them, so each carries its own.
+fn symbol_of(instrument_id: u32) -> &'static str {
+    if instrument_id == INSTRUMENT {
+        "BTC"
+    } else {
+        "ETH"
+    }
+}
+
 /// The venue's own stamp and our arrival stamp are **different quantities** and every helper here
 /// takes them apart: the real publishers stamp identical `source_ts_ns` on an event they both saw,
 /// and a lagging arm is late in `recv_ts_ns` alone.
 fn batch(changes: Vec<BookChange>, source_ts_ns: u64, recv_ts_ns: u64) -> FeedMessage {
+    batch_for(INSTRUMENT, changes, source_ts_ns, recv_ts_ns)
+}
+
+fn batch_for(
+    instrument_id: u32,
+    changes: Vec<BookChange>,
+    source_ts_ns: u64,
+    recv_ts_ns: u64,
+) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: VENUE.into(),
         source: VENUE.into(),
         source_id: 1,
-        symbol: "BTC".into(),
+        symbol: symbol_of(instrument_id).into(),
         channel: CHANNEL,
-        instrument_id: INSTRUMENT,
+        instrument_id,
         category: CATEGORY.into(),
         changes,
         snapshot: false,
@@ -83,12 +109,21 @@ fn batch(changes: Vec<BookChange>, source_ts_ns: u64, recv_ts_ns: u64) -> FeedMe
 
 /// A publisher's whole book as the `Clear`-led re-baseline it emits after a snapshot install.
 fn snapshot(book: &Book, source_ts_ns: u64, recv_ts_ns: u64) -> FeedMessage {
+    snapshot_for(INSTRUMENT, book, source_ts_ns, recv_ts_ns)
+}
+
+fn snapshot_for(
+    instrument_id: u32,
+    book: &Book,
+    source_ts_ns: u64,
+    recv_ts_ns: u64,
+) -> FeedMessage {
     let mut changes = vec![clear_both()];
     changes.extend(
         book.iter()
             .map(|(&id, &(side, px, sz))| change(id, side, px, sz)),
     );
-    batch(changes, source_ts_ns, recv_ts_ns)
+    batch_for(instrument_id, changes, source_ts_ns, recv_ts_ns)
 }
 
 /// Exactly what PROTOCOL.md tells a `book` consumer to do: a `Clear` re-baselines the side(s) it
@@ -116,7 +151,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
     a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
-    let market = (VENUE.into(), CATEGORY.into(), CHANNEL, INSTRUMENT);
+    let market = market(INSTRUMENT);
     let (fast, slow) = (arm(1), arm(2));
     a.set_book_synced(&market, fast, true);
     a.set_book_synced(&market, slow, true);
@@ -247,7 +282,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
     a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
-    let market: BookKey = (VENUE.into(), CATEGORY.into(), CHANNEL, INSTRUMENT);
+    let market = market(INSTRUMENT);
     let (fast, drifted) = (arm(1), arm(2));
     a.set_book_synced(&market, fast, true);
     a.set_book_synced(&market, drifted, true);
@@ -308,15 +343,30 @@ fn harness() -> (
     Publisher,
     Publisher,
 ) {
+    harness_over(&[INSTRUMENT])
+}
+
+/// The same wiring over several markets of one channel, for a scenario that has to show one
+/// market's traffic reaching another's state.
+fn harness_over(
+    instruments: &[u32],
+) -> (
+    Arbiter,
+    broadcast::Receiver<Arc<FeedMessage>>,
+    Publisher,
+    Publisher,
+) {
     let (tx, rx) = broadcast::channel(4096);
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
     a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
-    let market: BookKey = (VENUE.into(), CATEGORY.into(), CHANNEL, INSTRUMENT);
     let (fast, slow) = (arm(1), arm(2));
-    a.set_book_synced(&market, fast, true);
-    a.set_book_synced(&market, slow, true);
+    for &instrument_id in instruments {
+        let key = market(instrument_id);
+        a.set_book_synced(&key, fast, true);
+        a.set_book_synced(&key, slow, true);
+    }
     (a, rx, fast, slow)
 }
 
@@ -326,6 +376,84 @@ fn drain_into(rx: &mut broadcast::Receiver<Arc<FeedMessage>>, consumer: &mut Boo
             apply(consumer, b);
         }
     }
+}
+
+/// One consumer book per market, so a scenario over several markets of a channel reads each one's
+/// state apart. Keyed by `instrument_id` — a market-by-price `symbol` collides, which is why
+/// [`BookKey`] does not carry one.
+fn drain_markets(
+    rx: &mut broadcast::Receiver<Arc<FeedMessage>>,
+    markets: &mut BTreeMap<u32, Book>,
+) {
+    while let Ok(m) = rx.try_recv() {
+        if let FeedMessage::Book(b) = &*m {
+            apply(markets.entry(b.instrument_id).or_default(), b);
+        }
+    }
+}
+
+/// Two markets on one channel, carrying **colliding order ids**: what one market's stream does to
+/// an order must not reach the other's. Every state the merge point keeps is per market, and one
+/// kept per channel would cross them.
+#[test]
+fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
+    let (mut a, mut rx, fast, slow) = harness_over(&[INSTRUMENT, INSTRUMENT_B]);
+    let (mut venue_a, mut venue_b) = (Book::new(), Book::new());
+    let mut markets: BTreeMap<u32, Book> = BTreeMap::new();
+
+    // Both markets install a book, each holding its own order 1.
+    venue_a.insert(1, (BookSide::Bid, 100.0, 5.0));
+    venue_b.insert(1, (BookSide::Ask, 50.0, 2.0));
+    a.emit(
+        snapshot_for(INSTRUMENT, &venue_a, 1_000, 1_000),
+        fast,
+        CATEGORY,
+    );
+    a.emit(
+        snapshot_for(INSTRUMENT_B, &venue_b, 1_000, 1_000),
+        fast,
+        CATEGORY,
+    );
+
+    // Market A's order 1 is cancelled. Market B's identically-numbered order is not.
+    venue_a.remove(&1);
+    a.emit(
+        batch_for(
+            INSTRUMENT,
+            vec![change(1, BookSide::Bid, 100.0, 0.0)],
+            1_100,
+            1_100,
+        ),
+        fast,
+        CATEGORY,
+    );
+
+    // The lagging arm's first and only copy of A's add for that order — dead there — and its copy
+    // of B's order, which is alive and must survive whatever A's refusal does.
+    a.emit(
+        batch_for(
+            INSTRUMENT,
+            vec![change(1, BookSide::Bid, 100.0, 5.0)],
+            1_200,
+            1_200,
+        ),
+        slow,
+        CATEGORY,
+    );
+    a.emit(
+        batch_for(
+            INSTRUMENT_B,
+            vec![change(1, BookSide::Ask, 50.0, 2.0)],
+            1_200,
+            1_200,
+        ),
+        slow,
+        CATEGORY,
+    );
+
+    drain_markets(&mut rx, &mut markets);
+    assert_eq!(markets.remove(&INSTRUMENT).unwrap_or_default(), venue_a);
+    assert_eq!(markets.remove(&INSTRUMENT_B).unwrap_or_default(), venue_b);
 }
 
 /// A forced re-baseline republishes the view no single arm owns. If the arm whose batch discharged
