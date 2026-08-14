@@ -931,16 +931,18 @@ fn a_published_batch_carries_the_stamps_it_was_given() {
     assert_eq!(published[0].recv_ts_ns, 7_000, "arrival time");
 }
 
-/// Venue-time skew on its own, with both arms arriving in lockstep. The order-level path reads only
-/// arrival today, so this changes nothing — which is the before-picture a design keying on venue time
-/// is measured against, and the one caller that drives [`Lag::venue_ns`].
+/// Venue-time skew on its own: the trailing arm stamps `source_ts_ns` 5 ms older than the leader's
+/// for the same event and arrives in lockstep with it. The order-level path reads only arrival
+/// today, so this changes nothing — which is the before-picture a design keying on venue time is
+/// measured against, and the one caller that drives [`Lag::venue_ns`].
 #[test]
 fn a_venue_time_skew_alone_does_not_drift_the_consumer() {
-    let lag = Lag {
+    let skew = Lag {
         arrival_ns: 0,
         venue_ns: 5_000_000,
     };
-    let (consumer, venue) = replay_with_lag(64, lag, true);
+    let (_a, _rx, consumer, venue) =
+        arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, skew, true);
     assert_eq!(consumer, venue);
 }
 
@@ -996,7 +998,7 @@ fn two_arms_in_lockstep_publish_each_event_once() {
 fn arrival_lagged_stream(
     events: &[Event],
     spacing_ns: u64,
-    lag_ns: u64,
+    lag: Lag,
     leader_is_first_arm: bool,
 ) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>, Book, Book) {
     let (mut a, mut rx, one, two) = harness();
@@ -1014,7 +1016,13 @@ fn arrival_lagged_stream(
     for (i, &e) in events.iter().enumerate() {
         let t = 1_000 + i as u64 * spacing_ns;
         arrivals.push((t, t, leader, ev_change(e), Some(e)));
-        arrivals.push((t + lag_ns, t, trailer, ev_change(e), None));
+        arrivals.push((
+            t + lag.arrival_ns,
+            t.saturating_sub(lag.venue_ns),
+            trailer,
+            ev_change(e),
+            None,
+        ));
     }
     arrivals.sort_by_key(|&(at, _, p, ..)| (at, p != leader)); // the leader's copy wins a tie
     for (at, venue_ts, p, c, applied) in arrivals {
@@ -1032,9 +1040,10 @@ fn arrival_lagged_stream(
 /// the consumer ends holding the venue's book.
 #[test]
 fn an_arm_behind_in_arrival_only_does_not_drift_the_consumer() {
+    let lag = Lag::arrival(5_000_000);
     for leader_is_first_arm in [true, false] {
         let (_a, _rx, consumer, venue) =
-            arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, 5_000_000, leader_is_first_arm);
+            arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, lag, leader_is_first_arm);
         assert_eq!(consumer, venue, "leader_is_first_arm={leader_is_first_arm}");
     }
 }
@@ -1187,7 +1196,7 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
 fn a_permanently_slower_arm_never_stops_the_market_being_served() {
     let events = lifecycle_stream(5);
     let (mut a, mut rx, mut consumer, mut venue) =
-        arrival_lagged_stream(&events, 10_000_000, 250_000_000, true);
+        arrival_lagged_stream(&events, 10_000_000, Lag::arrival(250_000_000), true);
     assert_eq!(consumer, venue, "a permanent lag must not drift the book");
 
     // Each arm in turn, on a fresh order: the market is still being served from both.
