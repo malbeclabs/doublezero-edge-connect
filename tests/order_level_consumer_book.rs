@@ -59,7 +59,10 @@ fn clear_both() -> BookChange {
     }
 }
 
-fn batch(changes: Vec<BookChange>, recv_ns: u64) -> FeedMessage {
+/// The venue's own stamp and our arrival stamp are **different quantities** and every helper here
+/// takes them apart: the real publishers stamp identical `source_ts_ns` on an event they both saw,
+/// and a lagging arm is late in `recv_ts_ns` alone.
+fn batch(changes: Vec<BookChange>, source_ts_ns: u64, recv_ts_ns: u64) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: VENUE.into(),
         source: VENUE.into(),
@@ -71,21 +74,21 @@ fn batch(changes: Vec<BookChange>, recv_ns: u64) -> FeedMessage {
         changes,
         snapshot: false,
         last: true,
-        source_ts_ns: recv_ns,
-        recv_ts_ns: recv_ns,
+        source_ts_ns,
+        recv_ts_ns,
         kernel_rx_ts_ns: 0,
         ws_send_ts_ns: 0,
     })
 }
 
 /// A publisher's whole book as the `Clear`-led re-baseline it emits after a snapshot install.
-fn snapshot(book: &Book, recv_ns: u64) -> FeedMessage {
+fn snapshot(book: &Book, source_ts_ns: u64, recv_ts_ns: u64) -> FeedMessage {
     let mut changes = vec![clear_both()];
     changes.extend(
         book.iter()
             .map(|(&id, &(side, px, sz))| change(id, side, px, sz)),
     );
-    batch(changes, recv_ns)
+    batch(changes, source_ts_ns, recv_ts_ns)
 }
 
 /// Exactly what PROTOCOL.md tells a `book` consumer to do: a `Clear` re-baselines the side(s) it
@@ -130,8 +133,8 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
 
     // Both publishers install their books. The first through is published; the peer's copy is a
     // re-baseline for a market someone is already serving, so it is dropped.
-    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
-    a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001, 1_001), slow, CATEGORY);
 
     // Ordinary flow, every event mirrored by both publishers.
     let events = [
@@ -143,8 +146,12 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     for (i, &(id, side, px, sz)) in events.iter().enumerate() {
         let t = 2_000 + i as u64 * 10;
         venue.insert(id, (side, px, sz));
-        a.emit(batch(vec![change(id, side, px, sz)], t), fast, CATEGORY);
-        a.emit(batch(vec![change(id, side, px, sz)], t + 1), slow, CATEGORY);
+        a.emit(batch(vec![change(id, side, px, sz)], t, t), fast, CATEGORY);
+        a.emit(
+            batch(vec![change(id, side, px, sz)], t + 1, t + 1),
+            slow,
+            CATEGORY,
+        );
     }
 
     // A partial fill both publishers see: order 1 goes from 5 to 2. Same id, same action, same
@@ -152,12 +159,12 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // consumer holding a quantity the venue has already reduced.
     venue.insert(1, (BookSide::Bid, 100.0, 2.0));
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 2_100),
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 2_100, 2_100),
         fast,
         CATEGORY,
     );
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 2_101),
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 2_101, 2_101),
         slow,
         CATEGORY,
     );
@@ -165,7 +172,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // The slow publisher re-sends its copy of an earlier event long past the dedup window. It is a
     // redundant emission at worst: the order's absolute state has not moved since.
     a.emit(
-        batch(vec![change(3, BookSide::Ask, 101.0, 7.0)], 9_000_000),
+        batch(vec![change(3, BookSide::Ask, 101.0, 7.0)], 9_000_000, 9_000_000),
         slow,
         CATEGORY,
     );
@@ -173,7 +180,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // Order 2 is cancelled. Only the fast publisher's copy lands.
     venue.remove(&2);
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 99.0, 0.0)], 9_000_100),
+        batch(vec![change(2, BookSide::Bid, 99.0, 0.0)], 9_000_100, 9_000_100),
         fast,
         CATEGORY,
     );
@@ -185,7 +192,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
 
     // The fast publisher gaps and recovers too. With no peer serving, its re-baseline goes out — and
     // its snapshot does not contain the cancelled order 2.
-    a.emit(snapshot(&venue, 9_000_200), fast, CATEGORY);
+    a.emit(snapshot(&venue, 9_000_200, 9_000_200), fast, CATEGORY);
     drain(&mut consumer);
     assert_eq!(
         consumer, venue,
@@ -197,7 +204,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // holds it, so nothing upstream of the merge point can refuse this, and the re-baseline above must
     // not have wiped the record that says it is dead.
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 99.0, 3.0)], 9_100_000),
+        batch(vec![change(2, BookSide::Bid, 99.0, 3.0)], 9_100_000, 9_100_000),
         slow,
         CATEGORY,
     );
@@ -212,7 +219,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // book is stale by the time that publisher resyncs.
     venue.insert(3, (BookSide::Ask, 101.0, 4.0));
     venue.remove(&4);
-    a.emit(snapshot(&venue, 9_200_000), slow, CATEGORY);
+    a.emit(snapshot(&venue, 9_200_000, 9_200_000), slow, CATEGORY);
     drain(&mut consumer);
     assert_eq!(
         consumer, venue,
@@ -222,7 +229,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // And the survivor streams on from there.
     venue.insert(5, (BookSide::Bid, 98.0, 9.0));
     a.emit(
-        batch(vec![change(5, BookSide::Bid, 98.0, 9.0)], 9_300_000),
+        batch(vec![change(5, BookSide::Bid, 98.0, 9.0)], 9_300_000, 9_300_000),
         slow,
         CATEGORY,
     );
@@ -249,18 +256,18 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     let mut consumer = Book::new();
 
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
-    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
 
     // The venue fills order 1 down to 2. The drifted publisher missed that fill and reports the
     // order still resting at 5.
     venue.insert(1, (BookSide::Bid, 100.0, 2.0));
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100),
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100, 1_100),
         fast,
         CATEGORY,
     );
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200),
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200, 1_200),
         drifted,
         CATEGORY,
     );
@@ -268,7 +275,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     // Whatever comes next re-baselines the market rather than resuming either arm's deltas.
     venue.insert(2, (BookSide::Ask, 101.0, 4.0));
     a.emit(
-        batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300),
+        batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300, 1_300),
         fast,
         CATEGORY,
     );
@@ -330,29 +337,29 @@ fn a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim() {
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
-    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
 
     venue.insert(1, (BookSide::Bid, 100.0, 2.0));
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100),
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100, 1_100),
         fast,
         CATEGORY,
     );
     // The drifted arm missed the fill, claims 5, and is withheld — then discharges the flag with an
     // unrelated event and repeats the claim.
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200),
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200, 1_200),
         drifted,
         CATEGORY,
     );
     venue.insert(2, (BookSide::Ask, 101.0, 4.0));
     a.emit(
-        batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300),
+        batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300, 1_300),
         drifted,
         CATEGORY,
     );
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_400),
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_400, 1_400),
         drifted,
         CATEGORY,
     );
@@ -370,9 +377,9 @@ fn a_book_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
     let dead = change(7, BookSide::Bid, 100.0, 6.0);
-    a.emit(batch(vec![dead], 1_000), fast, CATEGORY);
+    a.emit(batch(vec![dead], 1_000, 1_000), fast, CATEGORY);
     a.emit(
-        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 1_100),
+        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 1_100, 1_100),
         fast,
         CATEGORY,
     );
@@ -386,6 +393,7 @@ fn a_book_larger_than_the_guard_does_not_resurrect_a_removed_order() {
             batch(
                 vec![change(id, BookSide::Ask, 200.0 + i as f64, 1.0)],
                 2_000 + i * 10_000,
+                2_000 + i * 10_000,
             ),
             fast,
             CATEGORY,
@@ -394,7 +402,7 @@ fn a_book_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     }
 
     // The lagging arm's first and only copy of the add for the order that is already gone.
-    a.emit(batch(vec![dead], 90_000_000), slow, CATEGORY);
+    a.emit(batch(vec![dead], 90_000_000, 90_000_000), slow, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
 }
@@ -407,9 +415,9 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
     let dead = change(7, BookSide::Bid, 100.0, 6.0);
-    a.emit(batch(vec![dead], 1_000), fast, CATEGORY);
+    a.emit(batch(vec![dead], 1_000, 1_000), fast, CATEGORY);
     a.emit(
-        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 1_100),
+        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 1_100, 1_100),
         fast,
         CATEGORY,
     );
@@ -419,19 +427,19 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
         let id = 100 + i;
         venue.insert(id, (BookSide::Ask, 200.0 + i as f64, 1.0));
     }
-    a.emit(snapshot(&venue, 1_200), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_200, 1_200), fast, CATEGORY);
     drain_into(&mut rx, &mut consumer);
 
     // Twice, either side of a fast-arm event: a guard the seeding spent would withhold the first
     // copy behind a forced re-baseline and then publish the second onto the market it just healed.
-    a.emit(batch(vec![dead], 90_000_000), slow, CATEGORY);
+    a.emit(batch(vec![dead], 90_000_000, 90_000_000), slow, CATEGORY);
     venue.insert(9, (BookSide::Bid, 50.0, 2.0));
     a.emit(
-        batch(vec![change(9, BookSide::Bid, 50.0, 2.0)], 91_000_000),
+        batch(vec![change(9, BookSide::Bid, 50.0, 2.0)], 91_000_000, 91_000_000),
         fast,
         CATEGORY,
     );
-    a.emit(batch(vec![dead], 92_000_000), slow, CATEGORY);
+    a.emit(batch(vec![dead], 92_000_000, 92_000_000), slow, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
 }
@@ -450,14 +458,14 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
     // is already serving, which is still the moment it starts counting as serving — and from here it
     // reports none of the removals below, so every tombstone stays open for a copy it has yet to send.
     venue.insert(1, (BookSide::Bid, 90.0, 1.0));
-    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
-    a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001, 1_001), slow, CATEGORY);
 
     // The order the lagging arm is still holding an add for, killed by the fast arm before it starts.
     let stale_add = change(7, BookSide::Bid, 100.0, 6.0);
-    a.emit(batch(vec![stale_add], 2_000), fast, CATEGORY);
+    a.emit(batch(vec![stale_add], 2_000, 2_000), fast, CATEGORY);
     a.emit(
-        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 2_100),
+        batch(vec![change(7, BookSide::Bid, 100.0, 0.0)], 2_100, 2_100),
         fast,
         CATEGORY,
     );
@@ -501,8 +509,8 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
         let deletes = ids
             .map(|id| change(id, BookSide::Ask, 200.0, 0.0))
             .collect();
-        a.emit(batch(adds, at), fast, CATEGORY);
-        a.emit(batch(deletes, at + 1_000), fast, CATEGORY);
+        a.emit(batch(adds, at, at), fast, CATEGORY);
+        a.emit(batch(deletes, at + 1_000, at + 1_000), fast, CATEGORY);
         // Up to the disowning the consumer tracks the venue exactly: every removal that crossed the
         // guard while it could still answer reached the wire, including the one that broke it.
         let before = clears.is_empty();
@@ -523,9 +531,9 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
 
     // The lagging arm's first and only copy of the add for the order that is already gone, and the
     // fast arm streaming on. The market is disowned, so neither reaches the consumer.
-    a.emit(batch(vec![stale_add], 90_000_000), slow, CATEGORY);
+    a.emit(batch(vec![stale_add], 90_000_000, 90_000_000), slow, CATEGORY);
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_100_000),
+        batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_100_000, 90_100_000),
         fast,
         CATEGORY,
     );
@@ -534,7 +542,7 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
 
     // A producer's own snapshot is what ends the outage, and it is the venue's book, not ours.
     venue.insert(3, (BookSide::Ask, 105.0, 2.0));
-    a.emit(snapshot(&venue, 91_000_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 91_000_000, 91_000_000), fast, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(
         consumer, venue,
@@ -547,9 +555,31 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
 /// `0.875 * L / (SPACING_NS * events_per_order)` removals inside its tombstone population.
 const SPACING_NS: u64 = 1_120_000; // ~890 events/s, the flagship market's measured change rate
 
-/// Drive `pairs` orders through both arms with the slow one `lag_ns` behind **in arrival order**, not
-/// merely in its timestamps, and return the consumer's book beside the venue's. Every eighth order is
-/// never removed, so the end state is a book rather than an empty map.
+/// How far the slow arm trails the leader, in the two clocks that move independently.
+#[derive(Clone, Copy)]
+struct Lag {
+    /// The datagram reaches us late. This is the lag the wire actually shows: on 271,455 paired
+    /// events the two publishers stamp **identical** venue times, so a real lagging arm is late
+    /// here and nowhere else.
+    arrival_ns: u64,
+    /// The arm's own `source_ts_ns` reads older than the leader's for the same event. A separate
+    /// quantity from arrival, and none of the scenarios below use it — it exists so a phase
+    /// keying on venue time can drive the two apart.
+    venue_ns: u64,
+}
+
+impl Lag {
+    fn arrival(ns: u64) -> Self {
+        Self {
+            arrival_ns: ns,
+            venue_ns: 0,
+        }
+    }
+}
+
+/// Drive `pairs` orders through both arms with the slow one behind by `lag` in **arrival order**,
+/// not merely in its timestamps, and return the consumer's book beside the venue's. Every eighth
+/// order is never removed, so the end state is a book rather than an empty map.
 ///
 /// `partial_fills` inserts a size-decreasing step in each order's life (add 1.0 → fill 0.5 → remove).
 /// Without it every order is only ever seen at `1.0` and then `0.0`, so a stale copy arriving past the
@@ -558,15 +588,16 @@ const SPACING_NS: u64 = 1_120_000; // ~890 events/s, the flagship market's measu
 /// capture's divergence, and a regression at any lag would pass. With it, an order's lifecycle costs
 /// three events rather than two, which is what a caller measuring the tombstone population has to
 /// divide by.
-fn replay_with_lag(pairs: u64, lag_ns: u64, partial_fills: bool) -> (Book, Book) {
+fn replay_with_lag(pairs: u64, lag: Lag, partial_fills: bool) -> (Book, Book) {
     let (mut a, mut rx, fast, slow) = harness();
     a.set_book_dedup_window(1_000_000_000); // the shipped --arb-book-dedup-window-ms
     let (mut venue, mut consumer) = (Book::new(), Book::new());
-    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
-    a.emit(snapshot(&venue, 1_001), slow, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001, 1_001), slow, CATEGORY);
 
     let per_order = if partial_fills { 3 } else { 2 };
-    let mut arrivals: Vec<(u64, bool, BookChange)> = Vec::new();
+    // (arrival time, the arm's own venue stamp, is the fast arm, the change).
+    let mut arrivals: Vec<(u64, u64, bool, BookChange)> = Vec::new();
     for i in 0..pairs {
         let (id, at) = (100 + i, 10_000 + i * per_order * SPACING_NS);
         let px = 200.0 + (i % 50) as f64;
@@ -584,14 +615,14 @@ fn replay_with_lag(pairs: u64, lag_ns: u64, partial_fills: bool) -> (Book, Book)
             ));
         }
         for (t, c) in events {
-            arrivals.push((t, true, c));
-            arrivals.push((t + lag_ns, false, c));
+            arrivals.push((t, t, true, c));
+            arrivals.push((t + lag.arrival_ns, t.saturating_sub(lag.venue_ns), false, c));
         }
     }
-    arrivals.sort_by_key(|&(t, is_fast, _)| (t, !is_fast));
-    for (t, is_fast, c) in arrivals {
+    arrivals.sort_by_key(|&(at, _, is_fast, _)| (at, !is_fast));
+    for (at, venue_ts, is_fast, c) in arrivals {
         let arm = if is_fast { fast } else { slow };
-        a.emit(batch(vec![c], t), arm, CATEGORY);
+        a.emit(batch(vec![c], venue_ts, at), arm, CATEGORY);
         drain_into(&mut rx, &mut consumer);
     }
     (consumer, venue)
@@ -608,7 +639,8 @@ fn replay_with_lag(pairs: u64, lag_ns: u64, partial_fills: bool) -> (Book, Book)
 #[test]
 fn a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing() {
     // 300ms of lag at two events per order: ~1,300 removals in flight, against an old cap of 512.
-    let (consumer, venue) = replay_with_lag(GUARDED_ORDERS * 8, 300 * SPACING_NS * 10, false);
+    let lag = Lag::arrival(300 * SPACING_NS * 10);
+    let (consumer, venue) = replay_with_lag(GUARDED_ORDERS * 8, lag, false);
     assert_eq!(consumer, venue);
 }
 
@@ -633,7 +665,7 @@ fn a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing() {
 fn the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag() {
     for lag_ms in [10u64, 50, 100, 200, 300, 500, 800, 1_000] {
         let pairs = (lag_ms * 1_000_000 / SPACING_NS).max(GUARDED_ORDERS) * 2;
-        let (consumer, venue) = replay_with_lag(pairs, lag_ms * 1_000_000, true);
+        let (consumer, venue) = replay_with_lag(pairs, Lag::arrival(lag_ms * 1_000_000), true);
         assert_eq!(consumer, venue, "diverged at {lag_ms}ms of inter-arm lag");
     }
 }
@@ -648,13 +680,13 @@ fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
 
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
     venue.insert(2, (BookSide::Bid, 99.0, 3.0));
-    a.emit(snapshot(&venue, 1_000), fast, CATEGORY);
-    a.emit(snapshot(&venue, 1_001), drifted, CATEGORY);
+    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
+    a.emit(snapshot(&venue, 1_001, 1_001), drifted, CATEGORY);
 
     // Order 1 is filled down to 2. The drifted arm misses that fill.
     venue.insert(1, (BookSide::Bid, 100.0, 2.0));
     a.emit(
-        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100),
+        batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100, 1_100),
         fast,
         CATEGORY,
     );
@@ -669,6 +701,7 @@ fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
                 change(1, BookSide::Bid, 100.0, 5.0),
             ],
             1_200,
+            1_200,
         ),
         drifted,
         CATEGORY,
@@ -677,7 +710,7 @@ fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
     // An unrelated event discharges the re-baseline the disagreement forced.
     venue.insert(3, (BookSide::Ask, 101.0, 4.0));
     a.emit(
-        batch(vec![change(3, BookSide::Ask, 101.0, 4.0)], 1_300),
+        batch(vec![change(3, BookSide::Ask, 101.0, 4.0)], 1_300, 1_300),
         fast,
         CATEGORY,
     );
