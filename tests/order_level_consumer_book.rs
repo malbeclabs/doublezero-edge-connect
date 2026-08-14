@@ -207,7 +207,11 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // The slow publisher re-sends its copy of an earlier event long past the dedup window. It is a
     // redundant emission at worst: the order's absolute state has not moved since.
     a.emit(
-        batch(vec![change(3, BookSide::Ask, 101.0, 7.0)], 9_000_000, 9_000_000),
+        batch(
+            vec![change(3, BookSide::Ask, 101.0, 7.0)],
+            9_000_000,
+            9_000_000,
+        ),
         slow,
         CATEGORY,
     );
@@ -215,7 +219,11 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // Order 2 is cancelled. Only the fast publisher's copy lands.
     venue.remove(&2);
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 99.0, 0.0)], 9_000_100, 9_000_100),
+        batch(
+            vec![change(2, BookSide::Bid, 99.0, 0.0)],
+            9_000_100,
+            9_000_100,
+        ),
         fast,
         CATEGORY,
     );
@@ -239,7 +247,11 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // holds it, so nothing upstream of the merge point can refuse this, and the re-baseline above must
     // not have wiped the record that says it is dead.
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 99.0, 3.0)], 9_100_000, 9_100_000),
+        batch(
+            vec![change(2, BookSide::Bid, 99.0, 3.0)],
+            9_100_000,
+            9_100_000,
+        ),
         slow,
         CATEGORY,
     );
@@ -264,7 +276,11 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     // And the survivor streams on from there.
     venue.insert(5, (BookSide::Bid, 98.0, 9.0));
     a.emit(
-        batch(vec![change(5, BookSide::Bid, 98.0, 9.0)], 9_300_000, 9_300_000),
+        batch(
+            vec![change(5, BookSide::Bid, 98.0, 9.0)],
+            9_300_000,
+            9_300_000,
+        ),
         slow,
         CATEGORY,
     );
@@ -566,7 +582,11 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     a.emit(batch(vec![dead], 90_000_000, 90_000_000), slow, CATEGORY);
     venue.insert(9, (BookSide::Bid, 50.0, 2.0));
     a.emit(
-        batch(vec![change(9, BookSide::Bid, 50.0, 2.0)], 91_000_000, 91_000_000),
+        batch(
+            vec![change(9, BookSide::Bid, 50.0, 2.0)],
+            91_000_000,
+            91_000_000,
+        ),
         fast,
         CATEGORY,
     );
@@ -662,9 +682,17 @@ fn an_unanswerable_guard_does_not_republish_our_own_view() {
 
     // The lagging arm's first and only copy of the add for the order that is already gone, and the
     // fast arm streaming on. The market is disowned, so neither reaches the consumer.
-    a.emit(batch(vec![stale_add], 90_000_000, 90_000_000), slow, CATEGORY);
     a.emit(
-        batch(vec![change(2, BookSide::Bid, 91.0, 1.0)], 90_100_000, 90_100_000),
+        batch(vec![stale_add], 90_000_000, 90_000_000),
+        slow,
+        CATEGORY,
+    );
+    a.emit(
+        batch(
+            vec![change(2, BookSide::Bid, 91.0, 1.0)],
+            90_100_000,
+            90_100_000,
+        ),
         fast,
         CATEGORY,
     );
@@ -1160,7 +1188,10 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
     ]);
     a.emit(snapshot(&anchor, 3_000, 3_000), leaving, CATEGORY);
     drain_into(&mut rx, &mut consumer);
-    assert_eq!(consumer, venue, "a returning arm must not displace the book");
+    assert_eq!(
+        consumer, venue,
+        "a returning arm must not displace the book"
+    );
 
     // Its first deltas off that anchor are copies of events the serving arm has already published,
     // and they claim a size the venue has since reduced. Neither may walk the consumer back.
@@ -1248,5 +1279,8 @@ fn a_peers_rebaseline_does_not_displace_a_served_book() {
                 .is_some_and(|c| c.action == BookAction::Clear)
         })
         .count();
-    assert_eq!(clears, 1, "only the serving arm's re-baseline reaches the wire");
+    assert_eq!(
+        clears, 1,
+        "only the serving arm's re-baseline reaches the wire"
+    );
 }
