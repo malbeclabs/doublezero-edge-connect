@@ -339,16 +339,13 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     assert_eq!(consumer, venue);
 }
 
-/// Mirrors the arbiter's private `MAX_SEEN_ORDER_EVENTS`. A scenario that has to cross the guard's
-/// cap has to name it; a wrong value here makes the test weaker, never wrong.
+/// Mirrors the arbiter's private `MAX_SEEN_ORDER_EVENTS`, the dedup window's count half. A scenario
+/// that has to cross it has to name it; a wrong value here makes the test weaker, never wrong.
 const GUARD_CAP: u64 = 1024;
 
-/// Mirrors the arbiter's private `MAX_GUARDED_ORDERS`: the live resting-quantity floors, bounded
-/// apart from the tombstones and to half of [`GUARD_CAP`].
-const GUARDED_ORDERS: u64 = GUARD_CAP / 2;
-
-/// Mirrors the arbiter's private `MAX_MARKET_TOMBSTONES`: how many removed orders one market's
-/// resurrection guard holds before it can no longer answer.
+/// The per-market cap on removed orders this design **deleted** (65,536). A scenario showing the
+/// population is no longer bounded by a count, and that crossing what used to bound it costs the
+/// market nothing, has to name the figure it crosses.
 const MARKET_TOMBSTONES: u64 = 65_536;
 
 /// Mirrors the default `--arb-book-retention-secs`: how far behind a channel's newest venue stamp an
@@ -600,11 +597,6 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     assert_eq!(consumer, venue);
 }
 
-/// One venue event every [`SPACING_NS`], whatever an order's lifecycle costs. A lag of L therefore
-/// leaves `L / SPACING_NS` events inside the guard's own [`GUARD_CAP`] count bound, and
-/// `0.875 * L / (SPACING_NS * events_per_order)` removals inside its tombstone population.
-const SPACING_NS: u64 = 1_120_000; // ~890 events/s, the flagship market's measured change rate
-
 /// How far the slow arm trails the leader, in the two clocks that move independently.
 #[derive(Clone, Copy)]
 struct Lag {
@@ -613,8 +605,7 @@ struct Lag {
     /// here and nowhere else.
     arrival_ns: u64,
     /// The arm's own `source_ts_ns` reads older than the leader's for the same event. A separate
-    /// quantity from arrival, and none of the scenarios below use it — it exists so a phase
-    /// keying on venue time can drive the two apart.
+    /// quantity from arrival, and only the skew scenarios drive it.
     venue_ns: u64,
 }
 
@@ -624,99 +615,6 @@ impl Lag {
             arrival_ns: ns,
             venue_ns: 0,
         }
-    }
-}
-
-/// Drive `pairs` orders through both arms with the slow one behind by `lag` in **arrival order**,
-/// not merely in its timestamps, and return the consumer's book beside the venue's. Every eighth
-/// order is never removed, so the end state is a book rather than an empty map.
-///
-/// `partial_fills` inserts a size-decreasing step in each order's life (add 1.0 → fill 0.5 → remove).
-/// Without it every order is only ever seen at `1.0` and then `0.0`, so a stale copy arriving past the
-/// dedup window either hits a tombstone (refused) or matches the floor exactly (idempotent) — the
-/// replay **structurally cannot produce a `Disagreement`**, which is the mechanism behind the real
-/// capture's divergence, and a regression at any lag would pass. With it, an order's lifecycle costs
-/// three events rather than two, which is what a caller measuring the tombstone population has to
-/// divide by.
-fn replay_with_lag(pairs: u64, lag: Lag, partial_fills: bool) -> (Book, Book) {
-    let (mut a, mut rx, fast, slow) = harness();
-    a.set_book_dedup_window(1_000_000_000); // the shipped --arb-book-dedup-window-ms
-    let (mut venue, mut consumer) = (Book::new(), Book::new());
-    a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
-    a.emit(snapshot(&venue, 1_001, 1_001), slow, CATEGORY);
-
-    let per_order = if partial_fills { 3 } else { 2 };
-    // (arrival time, the arm's own venue stamp, is the fast arm, the change).
-    let mut arrivals: Vec<(u64, u64, bool, BookChange)> = Vec::new();
-    for i in 0..pairs {
-        let (id, at) = (100 + i, 10_000 + i * per_order * SPACING_NS);
-        let px = 200.0 + (i % 50) as f64;
-        let resting = if partial_fills { 0.5 } else { 1.0 };
-        let mut events = vec![(at, change(id, BookSide::Ask, px, 1.0))];
-        if partial_fills {
-            events.push((at + SPACING_NS, change(id, BookSide::Ask, px, 0.5)));
-        }
-        if i % 8 == 0 {
-            venue.insert(id, (BookSide::Ask, px, resting));
-        } else {
-            events.push((
-                at + (per_order - 1) * SPACING_NS,
-                change(id, BookSide::Ask, px, 0.0),
-            ));
-        }
-        for (t, c) in events {
-            arrivals.push((t, t, true, c));
-            arrivals.push((t + lag.arrival_ns, t.saturating_sub(lag.venue_ns), false, c));
-        }
-    }
-    arrivals.sort_by_key(|&(at, _, is_fast, _)| (at, !is_fast));
-    for (at, venue_ts, is_fast, c) in arrivals {
-        let arm = if is_fast { fast } else { slow };
-        a.emit(batch(vec![c], venue_ts, at), arm, CATEGORY);
-        drain_into(&mut rx, &mut consumer);
-    }
-    (consumer, venue)
-}
-
-/// A lagging arm holds every tombstone the leader makes open until it catches up, so the population the
-/// guard has to hold is the removals inside that lag — thousands on a busy market, where the per-market
-/// count it used to be bounded by was 512. Crossing that count must no longer cost the market anything.
-///
-/// Orders that are added and cancelled without ever trading, deliberately: a lag wide enough to hold
-/// more than 512 removals is necessarily wider than [`GUARD_CAP`] events, and past that a *filled*
-/// order's stale add reads as a size disagreement rather than as a duplicate — which is the count cap
-/// binding, a different limit measured by the sweep below. This one is about the tombstones.
-#[test]
-fn a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing() {
-    // 300ms of lag at two events per order: ~1,300 removals in flight, against an old cap of 512.
-    let lag = Lag::arrival(300 * SPACING_NS * 10);
-    let (consumer, venue) = replay_with_lag(GUARDED_ORDERS * 8, lag, false);
-    assert_eq!(consumer, venue);
-}
-
-/// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
-/// to keep a consumer's book identical to the venue's.
-///
-/// **Before this guard was sized by the arms' lag rather than by a per-market count of 512, that
-/// figure was 150 ms**, reproducing the same cliff a real two-publisher capture showed at 153 ms,
-/// where the consumer ended 994 orders wrong and never self-healed. It now holds to **1 s**, the last
-/// step below — twice the 500 ms at which that capture first diverges, and five times the widest
-/// separation those publishers ever showed.
-///
-/// What sets the ceiling is the guard's [`GUARD_CAP`] **count** bound, not the 1 s dedup window: past
-/// 1,024 events in flight (1.15 s at this rate) an arm's copy of an add for an order the leader has
-/// already partially filled is no longer recognized as a duplicate — it reads as a second publisher
-/// claiming a larger resting size, a false `dz_mbo_arm_disagreement_total`, and the batches withheld
-/// behind the re-baseline it forces are lost rather than delayed. Measured: exact at 1 s, 223 orders
-/// wrong at 1.2 s. `docs/metrics.md` states that ceiling as `min(flag, 1024 / event_rate)`; this is it.
-/// It is also why raising the window alone buys nothing here, and why [`SPACING_NS`] has to be the
-/// real market's rate for the figure to mean anything.
-#[test]
-fn the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag() {
-    for lag_ms in [10u64, 50, 100, 200, 300, 500, 800, 1_000] {
-        let pairs = (lag_ms * 1_000_000 / SPACING_NS).max(GUARDED_ORDERS) * 2;
-        let (consumer, venue) = replay_with_lag(pairs, Lag::arrival(lag_ms * 1_000_000), true);
-        assert_eq!(consumer, venue, "diverged at {lag_ms}ms of inter-arm lag");
     }
 }
 
@@ -953,6 +851,40 @@ fn arrival_lagged_stream(
         assert_eq!(consumer, venue, "diverged at arrival {at}");
     }
     (a, rx, consumer, venue)
+}
+
+/// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
+/// to keep a consumer's book identical to the venue's.
+///
+/// It replaces a sweep that stopped at 1 s, and the two tests it replaces both compared only at the
+/// **end** of the run — where a trailer replaying the venue's whole life in order has converged on
+/// its own, so they passed with the racing guard removed outright. This one goes through
+/// `arrival_lagged_stream`, which asserts after every arrival.
+///
+/// What set the old 1 s ceiling was the per-market **event count** (1,024): past it a trailing arm's
+/// copy of an add for an order the leader had since partially filled stopped reading as a duplicate
+/// and read as a second publisher claiming a larger resting size — a false
+/// `dz_mbo_arm_disagreement_total`, and the batches withheld behind the re-baseline it forced were
+/// lost rather than delayed. The venue-time rules subsume it: that copy is refused for being older
+/// than the last change published for its order, before any size comparison. The ceiling is now the
+/// retention window, and the widest step below is twice it.
+///
+/// Synthetic, at 2.5 events/s per market. The acceptance check against two captured publishers is the
+/// operator's and does not run here.
+#[test]
+fn the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling() {
+    // 320 events at 400 ms spans 128 s of venue time, so the widest lag below is still inside the
+    // run rather than arriving after it has ended.
+    let events = lifecycle_stream(40);
+    for lag_s in [0u64, 1, 10, 30, 60] {
+        let (_a, _rx, consumer, venue) = arrival_lagged_stream(
+            &events,
+            400_000_000,
+            Lag::arrival(lag_s * 1_000_000_000),
+            true,
+        );
+        assert_eq!(consumer, venue, "diverged at {lag_s}s of inter-arm lag");
+    }
 }
 
 /// The trailing arm is late in arrival and stamps the leader's venue times. Whichever arm leads,

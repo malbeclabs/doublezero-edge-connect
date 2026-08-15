@@ -1,25 +1,30 @@
 # Order-level `book` test inventory
 
-The Market-by-Order cross-publisher **resurrection guard** — tombstones, per-arm reporter masks, retirement quorums, sweeps, caps and the market-disowning path in `src/ingest/arbiter.rs` — is being replaced. This file says which of today's tests pin the *contract* (they must survive that replacement unchanged) and which pin the *mechanism* (a later phase deletes them with the code they describe).
+The Market-by-Order cross-publisher **resurrection guard** in `src/ingest/arbiter.rs` decides whether a removed order may be forgotten on **venue time**: per channel, the newest `source_ts_ns` accepted defines a frontier at `newest - retention`, an event older than the frontier is refused, a removed entry older than it is forgotten, an event older than its own order's last published change is refused before any size comparison, and any non-zero size for an order already published as gone is refused. This file says which of the tests around it pin the *contract* — the ones a change to this guard must leave alone — and which pin the *mechanism*, which is deleted with the code it describes.
 
-The rule the replacement is held to: **the implementation diff touches none of the names under [Behaviour](#behaviour).** That check needs a list, which is what this is. The [Both](#both) section is the part that breaks the rule if it is not read first.
+The rule the guard is held to: **a change to it touches none of the names under [Behaviour](#behaviour).** That check needs a list, which is what this is.
 
 ## Criterion
 
 A test is **behaviour** if its assertions are things a WebSocket consumer can observe: what reaches the broadcast, whether a message is published at all, and whether a book rebuilt the way PROTOCOL.md tells a consumer to rebuild it matches the venue's. A test that reads a private field of the arbiter, a guard counter or a metric to decide whether it passed is **mechanism**, whatever its name says — it cannot survive the removal of the thing it reads.
 
-Everything about quotes, depth, trades, midpoints, market-by-price levels, codecs, the registry, the reconciler, shreds and the CLI is out of scope and not listed. So is the **single-arm authority gate** (`src/ingest/authority.rs` and the `book_publishes_one_arm_*` / arm-transfer / arm-eligibility tests in `arbiter.rs`) — a neighbouring gate that decides which arm serves a *price-aggregated* market, not the resurrection guard. It is out of scope for the classification, not for the diff: it shares `MarketKey` and the accumulator/replay/`last_admitted` eviction pairing, so a replacement that re-keys per-market state lands on it. If your diff touches those, they need their own read.
+Everything about quotes, depth, trades, midpoints, market-by-price levels, codecs, the registry, the reconciler, shreds and the CLI is out of scope and not listed. So is the **single-arm authority gate** (`src/ingest/authority.rs` and the `book_publishes_one_arm_*` / arm-transfer / arm-eligibility tests in `arbiter.rs`) — a neighbouring gate that decides which arm serves a *price-aggregated* market, not the resurrection guard. It is out of scope for the classification, not for a diff: it shares `MarketKey` and the accumulator/replay/`last_admitted` eviction pairing, so anything that re-keys per-market state lands on it. If your diff touches those, they need their own read.
 
 ## Behaviour
-
-These must pass unchanged.
 
 ### `tests/order_level_consumer_book.rs`
 
 The whole file qualifies: every test drives batches through the real `Arbiter`, reads the broadcast, and compares a naively-rebuilt book to the venue's.
 
-Written for this net, before the replacement's shape was known:
+The consumer-equality net:
 
+- `a_naive_consumers_book_matches_the_venue_across_gaps_and_races`
+- `a_drifted_publisher_cannot_walk_a_consumers_order_backwards`
+- `a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim`
+- `a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`
+- `a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order`
+- `a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal`
+- `one_markets_stream_leaves_another_on_the_same_channel_alone`
 - `a_single_arms_stream_reaches_the_consumer_exactly`
 - `two_arms_in_lockstep_publish_each_event_once`
 - `an_arm_behind_in_arrival_only_does_not_drift_the_consumer`
@@ -27,32 +32,38 @@ Written for this net, before the replacement's shape was known:
 - `an_arm_that_departs_and_returns_keeps_the_consumer_exact`
 - `a_permanently_slower_arm_never_stops_the_market_being_served`
 - `a_peers_rebaseline_does_not_displace_a_served_book`
-- `one_markets_stream_leaves_another_on_the_same_channel_alone`
+- `the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling`
 
-Already there:
+The two clocks, and the frontier's own scenarios:
 
-- `a_naive_consumers_book_matches_the_venue_across_gaps_and_races`
-- `a_drifted_publisher_cannot_walk_a_consumers_order_backwards`
-- `a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim`
-- `a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`
-- `a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order`
-- `a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing`
-- `the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag`
-- `a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal`
+- `a_published_batch_carries_the_stamps_it_was_given` — the harness's venue and arrival stamps reach the wire as they were set, without which the whole split is unfalsifiable.
+- `a_venue_time_skew_alone_does_not_drift_the_consumer`
+- `a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy`
+- `an_arm_that_never_held_the_removed_orders_does_not_darken_the_market`
+- `a_returning_links_contiguous_backlog_reaches_no_consumer`
+- `a_whole_channel_gap_past_the_forward_bound_resumes`
+- `a_cold_start_market_stamped_zero_still_bootstraps`
+- `a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market`
+- `a_session_whose_clock_restarts_lower_keeps_publishing`
 
-⚠️ Two caveats on this list.
+⚠️ Three caveats on this list.
 
-The **scenario sizes** of five of them are derived from private constants mirrored at the top of the file (`GUARD_CAP`, `GUARDED_ORDERS`, `MARKET_TOMBSTONES`). A replacement that changes what bounds the guard has to re-derive those numbers even where the assertion itself stands, and `a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`, `a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order` and `a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing` are named for a cap that may no longer exist. Renaming those three is not a contract change; weakening what they assert is.
+The **scenario sizes** of several of them are derived from private constants mirrored at the top of the file: `GUARD_CAP` (the arbiter's `MAX_SEEN_ORDER_EVENTS`), `MARKET_TOMBSTONES` (the per-market cap this design deleted, kept because a scenario showing that crossing it costs the market nothing has to name the figure it crosses) and `RETENTION_NS` (the default `--arb-book-retention-secs`). A change to what bounds the guard has to re-derive those numbers even where the assertion itself stands. Re-deriving them is not a contract change; weakening what a scenario asserts is.
 
-`a_lagging_arm_past_the_old_per_market_cap_costs_the_market_nothing` and `the_consumer_book_matches_the_venue_up_to_a_one_second_inter_arm_lag` compare the consumer's book to the venue's **only at the end of the run**, and their trailing arm replays the venue's whole life in order — so a stale copy it publishes is corrected by its own next copy, and both pass with the racing guard removed outright. They measure the *lag ceiling* honestly and detect over-suppression; they are not evidence that under-suppression is caught. The scenarios added for this net assert after every arrival instead (`arrival_lagged_stream`), which is the form to copy. Strengthening the two older ones is a change to an existing test and was deliberately left out of this phase.
+`a_venue_time_skew_alone_does_not_drift_the_consumer` is **still unfalsifiable**, and its own doc comment says so: the trailing arm's copies collapse as duplicates before any rule reads a stamp, so swapping the venue stamp for the arrival stamp leaves it green. `a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy` is the scenario that actually measures venue time — verified by mutation, since swapping the two stamps and deleting the stale-copy rule each kill it while leaving the older test green. Keep the older one for the contrast it draws; do not read it as coverage.
+
+`the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling` asserts through `arrival_lagged_stream`, which compares after **every** arrival. It replaces a sweep that compared only at the end of the run, where a trailer replaying the venue's whole life in order has converged on its own — that form passed with the racing guard removed outright and was evidence of nothing. Assert per arrival; do not add another terminal comparison.
 
 ### `src/ingest/arbiter.rs`
+
+Collapse, refusal and re-baseline suppression, all decided on the broadcast:
 
 - `order_events_collapse_across_publishers_keeping_first_arrival`
 - `successive_partial_fills_of_one_order_all_reach_the_wire`
 - `a_partly_duplicate_batch_publishes_only_its_new_events`
-- `a_late_copy_cannot_resurrect_a_deleted_order`
+- `a_late_copy_cannot_resurrect_a_deleted_order` (also asserts `dz_book_resurrections_dropped_total`)
 - `a_repeated_removal_is_not_treated_as_a_resurrection`
+- `a_copy_past_the_window_re_emits_rather_than_corrupting`
 - `a_rebaseline_keeps_the_resurrection_guard`
 - `a_rebaseline_seeds_an_order_it_had_tombstoned`
 - `a_rebaseline_is_suppressed_while_a_peer_is_serving`
@@ -61,11 +72,18 @@ The **scenario sizes** of five of them are derived from private constants mirror
 - `an_interleaved_race_is_not_a_disagreement`
 - `a_single_publisher_streams_unimpeded`
 - `simultaneous_recoveries_produce_exactly_one_rebaseline`
-- `an_evicted_market_still_routes_as_order_level` — decides on the broadcast (one message, not two), and it is the only check that an evicted market re-derives its routing from batch content. Reverting it to the single-arm authority emits `clear_only` plus the batch, which tells every consumer to drop a live book. It also asserts a private `seen`/`resting` bound, so it cannot pass *unchanged* if those fields go — but the consumer-visible half has to survive in some form.
+- `an_evicted_market_still_routes_as_order_level` — decides purely on the broadcast (one message, not two), and it is the only check that an evicted market re-derives its routing from batch content. Reverting it to the single-arm authority emits `clear_only` plus the batch, which tells every consumer to drop a live book.
+
+The forced re-baseline a size disagreement raises, and what the republished view may claim:
+
+- `a_size_disagreement_forces_a_rebaseline_rather_than_a_guess` (also asserts `dz_mbo_arm_disagreement_total` and the forced-re-baseline counter)
+- `a_forced_rebaseline_republishes_the_wire_not_an_arms_own_book`
+- `the_arm_that_discharges_a_rebaseline_does_not_own_the_floor_it_seeds`
+- `a_rebaseline_seeds_the_guard_with_its_own_orders` (the drop is the assertion; the counter confirms *why* it was dropped)
 
 ### Elsewhere
 
-Downstream of the merge point, so a replacement should not reach them — but they are the ones that notice if it changes the `book` product's shape rather than its arbitration.
+Downstream of the merge point, so a change to the guard should not reach them — but they are the ones that notice if it changes the `book` product's shape rather than its arbitration.
 
 - `tests/dedup.rs` — `interleaved_book_arms_publish_one_coherent_stream`
 - `src/ingest/book.rs` (L3 reconstruction, single publisher) — `deltas_report_the_order_they_touched`, `a_rejected_delta_reports_nothing`, `a_removed_order_is_never_resurrected`, `a_fully_executed_order_is_never_resurrected`, `a_session_reset_reopens_the_id_space`, `order_set_is_complete_and_deterministically_ordered`, `order_set_tolerates_extreme_prices`, `end_of_session_drops_book_sequences_and_event_clock`, `instrument_reset_drops_the_event_clock`, `snapshot_then_contiguous_deltas_update_top_of_book`, `execute_reduces_then_removes_order`, `duplicate_and_old_deltas_are_ignored`, `gap_triggers_recovery_then_snapshot_replays_buffered_deltas`, `instrument_reset_drops_book_until_resnapshot`, `periodic_snapshot_while_ready_is_ignored`, `stale_snapshot_ahead_rebootstraps`, `incomplete_snapshot_is_discarded`, `instrument_reset_keeps_post_anchor_buffered_deltas`, `pending_buffer_is_bounded_while_recovering`, `resting_orders_are_bounded_under_add_flood`
@@ -78,47 +96,36 @@ Downstream of the merge point, so a replacement should not reach them — but th
 
 ## Mechanism
 
-All in `src/ingest/arbiter.rs`, all reading guard internals, a guard metric or a private field. A later phase deletes them with the code they describe; none of them is evidence the product still works.
+All in `src/ingest/arbiter.rs`, all reading guard internals, a guard metric or a private field. None of them is evidence the product still works, and a change that removes what they read deletes them rather than rewriting them — a rewritten mechanism test asserts whatever the replacement turns out to be.
 
-- Retirement and the arm masks — `a_tombstone_every_arm_reported_is_retired_on_the_spot`, `an_unreported_removal_does_not_hold_the_tombstones_behind_it`, `arms_snapshotting_from_different_anchors_do_not_walk_a_market_to_a_blackout`, `a_market_the_arms_cannot_settle_does_not_rescan_on_every_batch`, `a_sweep_schedules_the_next_one_above_the_population_it_left`, `a_synced_arm_with_nothing_on_the_wire_yet_holds_the_retirement_quorum`, `an_arm_that_stopped_arriving_leaves_the_retirement_quorum`, `a_peer_that_is_not_serving_does_not_hold_tombstones_open`, `the_batch_that_creates_a_markets_race_state_still_knows_who_is_serving`
-- Caps, budgets and their accounting — `one_market_may_hold_more_tombstones_than_the_old_per_market_cap`, `the_cap_sweeps_before_it_evicts_rather_than_disowning_a_settled_tombstone`, `the_high_water_re_seats_when_the_market_holding_it_retires_rather_than_reading_zero`, `the_process_wide_ceiling_disowns_the_market_holding_the_tombstones`, `an_overcounted_budget_costs_a_recount_rather_than_every_market`, `guarded_tombstones_are_counted_exactly`, `drift_is_still_caught_after_a_caps_worth_of_removals`, `evicting_a_live_floor_does_not_force_a_rebaseline`
-- Disowning bookkeeping — `a_flapping_market_does_not_discharge_its_own_disowning`
+- The venue-time frontier — `the_removed_population_tracks_the_window_not_the_anchor_difference`, `a_repeated_removal_does_not_hold_its_entry_above_the_frontier`, `the_removed_population_tracks_the_window_not_the_lag`, `the_work_one_batch_does_is_bounded_in_every_state`. These are in-crate rather than in the consumer net because the frontier's whole point is what it *forgets*, which nothing on the wire shows: they read the removed population (`book_events[..].n_dead`, an entry's `last_ts`) and the per-batch work counter (`examined`). The last one is the only assertion about the scan that maintains the population rather than the population itself, and it matters because that scan runs under the one mutex every receiver on every feed takes to emit. Their scenario sizes mirror the implementation's per-batch work bound and the default retention window; a wrong mirror makes them weaker, never wrong.
+- Guard accounting and eviction — `guarded_tombstones_are_counted_exactly` (the process-wide running total against a recount from the maps), `evicting_a_live_floor_does_not_force_a_rebaseline`, `a_book_larger_than_the_guard_stays_proportional_to_its_input` (its proportionality half is consumer-visible; its `book_markets[..].rebaseline` half is not)
 - Counters and rate limits — `a_content_disagreement_is_counted`, `the_rebaseline_rate_limit_does_not_follow_the_dedup_window`
-**Two of these are bounds, not mechanism. Re-point them; do not delete them.** The wire is unauthenticated, so `order_id`, `channel` and `instrument_id` are all attacker-supplied, and these are the only assertions that the two per-market maps they key cannot grow without limit:
 
-- `the_racing_window_is_bounded_by_event_count` — the sole check that `seen`/`resting` stay within `MAX_SEEN_ORDER_EVENTS`, the per-market bound against an `order_id` flood.
-- `eviction_drops_the_racing_state_too` — the sole check that `book_sync` and `book_events` are evicted with `MAX_BOOK_MARKETS`. `book_markets_are_bounded` covers `book_markets`, `book_order`, the replay map and the authority map, and none of those two. `book_sync` is also what the re-baseline suppression reads, which is behaviour.
+**Four of these are bounds, not mechanism. Re-point them; do not delete them.** The wire is unauthenticated, so `order_id`, `channel_id` and `instrument_id` are all attacker-supplied, and these are the only assertions that the state keyed on them cannot grow without limit:
 
-Whatever bounds the replacement puts on the state that replaces these needs an equivalent test landing in the same change.
+- `the_racing_window_is_bounded_by_event_count` — the sole check that `seen`/`resting` stay within `MAX_SEEN_ORDER_EVENTS`, the live half's bound against an `order_id` flood. The removed half is no longer bounded by a count at all: the retention window sizes it and the next entry backstops it.
+- `the_process_wide_ceiling_forgets_rather_than_growing` — `MAX_TOMBSTONES_TOTAL` costs entries rather than memory. It is charged to the market being admitted and so is advisory; it asserts the shed happened, not that the total came under.
+- `the_channel_clocks_are_bounded` — the per-channel frontier map, keyed on the wire's `channel_id`. Losing a clock degrades that channel to "frontier unset", which its next batch re-seeds.
+- `a_batch_past_the_frontier_mints_no_market_state` — the one that keeps the two above honest. `book_events` is evicted alongside `book_markets`, which is only tracked once something is published, so a refused batch must create nothing: a flood of forged `(channel, instrument_id)` keys carrying ancient stamps is one datagram per key, none of them ever published.
+- `eviction_drops_the_racing_state_too` — the sole check that `book_sync` and `book_events` are evicted with `MAX_BOOK_MARKETS`. `book_markets_are_bounded` covers `book_markets`, `book_order`, the replay map and the authority map, and neither of those two. `book_sync` is also what the re-baseline suppression reads, which is behaviour.
 
-- Neighbouring, and only listed so nobody mistakes them for the guard: `src/ingest/book.rs::the_removed_set_is_bounded` (the per-book removed-id set, defence in depth behind the merge point) and `src/ingest/processor.rs::a_gapped_book_reports_itself_unsynced` (the sync report the arm masks consume — if the replacement stops consuming it, this one goes with it).
+Whatever bounds a later change puts on the state that replaces these needs an equivalent test landing in the same change.
 
-## Both
+- Neighbouring, and only listed so nobody mistakes them for the guard: `src/ingest/book.rs::the_removed_set_is_bounded` (the per-book removed-id set, defence in depth behind the merge point) and `src/ingest/processor.rs::a_gapped_book_reports_itself_unsynced` (the sync report the re-baseline suppression consumes — if that stops being consumed, this one goes with it).
 
-Consumer-visible properties that the guard's *current* mechanism produces. Each is something a client can see, so it reads like a contract; each exists only because of a mechanism that may not survive. **These are the tests that break the "must pass unchanged" rule**, and the replacement has to state, for each, whether it keeps the property or deliberately drops it.
+## What the venue-time frontier dropped
 
-Market disowning — the market goes dark, told exactly once as a bare `Clear`, and nothing but a producer's own re-baseline ends the outage:
+The consensus mechanism produced one consumer-visible property that no longer exists, and its tests went with it: a market the arms could not settle was **disowned** — it went dark, was told so exactly once as a bare `Clear`, and nothing but a producer's own re-baseline ended the outage (`an_unanswerable_guard_does_not_republish_our_own_view`, `evicting_an_unpassed_tombstone_invalidates_the_market`, `a_market_disowned_by_the_ceiling_is_announced_without_waiting_for_a_batch`, `evicting_a_disowned_market_does_not_let_it_resume_serving_deltas`, `a_bare_clear_ends_a_disowned_markets_outage_even_after_eviction`). Deliberate: one publisher synced from an older snapshot anchor can never report removals for orders it never held, so under consensus the ordinary case walked a market to a blackout every consumer paid for. `dz_mbo_market_invalidations_total` is gone with it, and `an_arm_that_never_held_the_removed_orders_does_not_darken_the_market` now asserts the opposite property.
 
-- `tests/order_level_consumer_book.rs::an_unanswerable_guard_does_not_republish_our_own_view`
-- `arbiter.rs::evicting_an_unpassed_tombstone_invalidates_the_market`
-- `arbiter.rs::a_market_disowned_by_the_ceiling_is_announced_without_waiting_for_a_batch`
-- `arbiter.rs::evicting_a_disowned_market_does_not_let_it_resume_serving_deltas`
-- `arbiter.rs::a_bare_clear_ends_a_disowned_markets_outage_even_after_eviction`
+Two more went for the same reason — refusal held open by a *count* of removals rather than by how far behind the event is (`an_unreported_removal_keeps_refusing_the_resurrection_it_is_held_for`, `a_rebaseline_larger_than_the_cap_keeps_the_resurrection_guard`) — and one because it pinned re-seating the high-water gauge on *retirement*, which no longer happens (`the_high_water_re_seats_when_the_market_holding_it_retires_rather_than_reading_zero`; the gauge and its re-seat survive against the frontier's forgetting).
 
-The forced re-baseline a size disagreement raises, and what the republished view may claim:
+Nothing else was dropped: the forced re-baseline and the guard's other consumer-visible properties are listed under [Behaviour](#behaviour) above.
 
-- `arbiter.rs::a_size_disagreement_forces_a_rebaseline_rather_than_a_guess`
-- `arbiter.rs::a_forced_rebaseline_republishes_the_wire_not_an_arms_own_book`
-- `arbiter.rs::the_arm_that_discharges_a_rebaseline_does_not_own_the_floor_it_seeds`
-- `arbiter.rs::a_book_larger_than_the_guard_stays_proportional_to_its_input` (also reads `book_markets[..].rebaseline`)
+## What the net cannot reach
 
-Tombstones surviving a cap, and the arrival-keyed window's choice to re-emit a late copy rather than refuse it:
+Two waits are measured on a monotonic clock inside the arbiter, with no seam an integration test can drive.
 
-- `arbiter.rs::a_rebaseline_larger_than_the_cap_keeps_the_resurrection_guard`
-- `arbiter.rs::a_rebaseline_seeds_the_guard_with_its_own_orders`
-- `arbiter.rs::an_unreported_removal_keeps_refusing_the_resurrection_it_is_held_for` (also asserts `n_dead`)
-- `arbiter.rs::a_copy_past_the_window_re_emits_rather_than_corrupting`
+`PEER_SERVING_NS` silence — an arm going quiet for 30 s — is why `an_arm_that_departs_and_returns_keeps_the_consumer_exact` uses `Arbiter::forget_publisher_books`, the signal a receiver's registration sends as it exits and the authoritative one, with the timer as its backstop. Same consumer-visible property; the timer itself is not covered.
 
-## One thing the net cannot reach
-
-`PEER_SERVING_NS` silence. An arm going quiet for 30 s is measured on a monotonic clock inside the arbiter, with no seam an integration test can drive, so `an_arm_that_departs_and_returns_keeps_the_consumer_exact` uses `Arbiter::forget_publisher_books` — the signal a receiver's registration sends as it exits, and the authoritative one, with the timer as its backstop. Same consumer-visible property; the timer itself is covered only by `arbiter.rs::an_arm_that_stopped_arriving_leaves_the_retirement_quorum`, which pokes the private field and is listed as mechanism above.
+The frontier's **re-seat wait** has the same limitation, and the scenarios that need it (`a_whole_channel_gap_past_the_forward_bound_resumes`, `a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market`) reach it by configuring a `BookGuardConfig` with a `reseat_after_ns` of a millisecond and then sleeping 5 ms of real time. That is a real sleep in the test suite, and the only alternative is injecting a clock into the emit path; it buys coverage of the one hatch that keeps a survivor behind a dead leader's frontier from being dark for the life of the process.

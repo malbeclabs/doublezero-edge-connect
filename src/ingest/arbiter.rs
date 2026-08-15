@@ -1087,6 +1087,9 @@ impl MarketEvents {
         for slot in self.resting.values() {
             if slot.removed() {
                 dead += 1;
+                // A removal clears the owner. Left set, the arm that made it would be exempt from the
+                // size gate if the order came back through a re-baseline's seeding.
+                debug_assert!(slot.owner.is_none(), "a removed order still names an owner");
             } else {
                 live += 1;
             }
@@ -2035,14 +2038,20 @@ impl Arbiter {
         }
         let window = self.book_dedup_window_ns;
         let budget = &mut self.guard;
-        let events = self.book_events.entry(key.clone()).or_default();
         // Rules 1 and 2 on **one** frontier value, which is the whole safety argument: an event is
         // admitted only while its entry is still present, so a stale change can never slip past an
         // entry this batch's own forgetting just dropped.
-        events.forget_expired(frontier, budget);
         if frontier.is_some_and(|f| b.source_ts_ns < f) {
+            // A refused batch **creates no state**. `book_events` is evicted alongside `book_markets`,
+            // which is only tracked once something is published, so minting an entry here would let a
+            // flood of forged `(channel, instrument_id)` keys carrying ancient stamps grow this map
+            // past the cap `book_markets` enforces.
+            let mut n_dead = 0;
+            if let Some(events) = self.book_events.get_mut(&key) {
+                events.forget_expired(frontier, budget);
+                n_dead = events.n_dead;
+            }
             let stale = b.changes.iter().filter(|c| c.order_id != 0).count() as u64;
-            let n_dead = events.n_dead;
             if stale > 0 {
                 metrics()
                     .mbo_events_past_frontier
@@ -2055,6 +2064,8 @@ impl Arbiter {
             self.assert_budget_consistent();
             return;
         }
+        let events = self.book_events.entry(key.clone()).or_default();
+        events.forget_expired(frontier, budget);
         let mut kept: Vec<BookChange> = Vec::new();
         let (mut deduped, mut disagreed, mut resurrected, mut stale) = (0u64, 0u64, 0u64, 0u64);
         for c in &b.changes {
@@ -2177,6 +2188,20 @@ impl Arbiter {
         }
         let held: usize = self.book_events.values().map(|e| e.n_dead).sum();
         debug_assert_eq!(self.guard.held, held, "the guard budget slipped");
+        debug_assert!(
+            self.channel_clocks.len() <= MAX_CHANNEL_CLOCKS
+                && self.channel_clock_order.len() <= MAX_CHANNEL_CLOCKS,
+            "the channel clocks outgrew their cap"
+        );
+        if self.channel_clocks.len() > AUDIT_MARKETS {
+            return;
+        }
+        debug_assert!(
+            self.channel_clocks
+                .keys()
+                .all(|k| self.channel_clock_order.contains(k)),
+            "a channel clock outlived its eviction queue entry"
+        );
     }
 
     /// Hold the removed entries across every market to [`MAX_TOMBSTONES_TOTAL`] by forgetting the
@@ -6671,6 +6696,48 @@ mod tests {
         let _ = drain_books(&mut rx);
         assert!(a.channel_clocks.len() <= MAX_CHANNEL_CLOCKS);
         assert!(a.channel_clock_order.len() <= MAX_CHANNEL_CLOCKS);
+    }
+
+    /// A batch refused for being past the frontier creates **no** per-market state. `book_events` is
+    /// evicted alongside `book_markets`, which is only tracked once something is published, so a flood
+    /// of forged `(channel, instrument_id)` keys carrying ancient stamps would otherwise grow that map
+    /// past the cap `book_markets` enforces — one datagram per key, none of them ever published.
+    #[test]
+    fn a_batch_past_the_frontier_mints_no_market_state() {
+        const VENUE: &str = "BookFrontierNoMint";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        a.set_book_guard(BookGuardConfig::DEFAULT);
+        // One real market carries the channel's clock past the retention window.
+        let newest = BookGuardConfig::DEFAULT.retention_ns * 2;
+        a.emit(
+            l3_batch_at(
+                VENUE,
+                vec![order(BookAction::Update, 1, 100.0, 1.0)],
+                newest,
+                newest,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let tracked = a.book_events.len();
+        for instrument_id in 1_000..1_128u32 {
+            let FeedMessage::Book(mut b) = l3_batch_at(
+                VENUE,
+                vec![order(BookAction::Update, 7, 100.0, 1.0)],
+                1_000,
+                newest + u64::from(instrument_id),
+            ) else {
+                unreachable!()
+            };
+            b.instrument_id = instrument_id;
+            a.emit(FeedMessage::Book(b), arm(1), TEST_CATEGORY);
+        }
+        let _ = drain_books(&mut rx);
+        assert_eq!(
+            a.book_events.len(),
+            tracked,
+            "a refused batch must not mint race state for its key"
+        );
     }
 
     /// A market evicted from the tracked set takes its racing state with it, or the two maps keyed by

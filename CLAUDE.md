@@ -448,82 +448,81 @@ Modules are grouped by role under `src/`:
   republished **filtered** to its surviving changes, because a change carries an order's absolute quantity
   and re-delivering a stale one walks the consumer back.
   **`MarketEvents::resting` is the resurrection guard, and this is the only scope that can hold it**
-  (`dz_book_resurrections_dropped_total`): a `size == 0` event tombstones the order and any later change
-  for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order another
-  publisher already killed passes every check `book.rs` makes — that book legitimately still holds the
-  order. Tombstones are deliberately **not** expired by the time window, which is what keeps
-  `--arb-book-dedup-window-ms` a cost knob; **what retires one is the arms, not a clock or a count** —
-  every arm the market still counts (`known`) has reported the removal. `known` is **every arm arriving
-  within `PEER_SERVING_NS`, plus a synced arm that has never reached this market at all** — that one
-  arm because its first copy is the likeliest stale `Add` there is, and ageing it out lets that copy
-  resurrect a removed order (`a_book_larger_than_the_guard_does_not_resurrect_a_removed_order`). Every
-  other arm ages out on arrival, and must: a source that spoke once and vanished is minted by one
-  forged datagram, and nothing clears `synced` short of the receiver exiting, so a publisher whose
-  upstream dies behind a bound socket would otherwise hold every market it was synced on to
-  `MAX_MARKET_TOMBSTONES` — and sixteen of those reach the process-wide ceiling, where
-  `shed_over_budget` disowns the largest holder without asking whether its tombstones were settled.
-  One quiet publisher, a rolling venue-wide blackout. Retirement runs **head-of-queue per batch plus a
-  full sweep out of queue order** on a threshold that doubles after each sweep (O(1) amortized per
-  tombstone, nothing at all while the arms keep up). The sweep is not an optimization: `dead` is in
-  removal order, so head-only retirement lets one removal an arm never reports block every tombstone
-  behind it, and nothing re-supplies a report for an order that arm never held — two arms synced from
-  different snapshot anchors is the ordinary way there, and the population then grows with the market's
-  whole history rather than the arms' lag spread. **It changes only where retirement looks, never what
-  counts as evidence.** Reporting is
-  the **only** evidence accepted: anything weaker infers an
-  arm's position in the venue stream from something else it sent, and on this wire that is spoofable —
-  one datagram echoing a just-published event from a lagging arm's address would retire that arm's
-  whole backlog and let its genuine stale `Add` through as live. That makes the population "the
-  removals inside the arms' current lag spread",
-  which is what the guard actually needs; a per-market **count** — what it used to be, 512 — is a count
-  standing in for a *time* tolerance and is simultaneously far too much for a quiet market and far too
-  little for a busy one. Measured: at 150 ms of inter-arm lag on a busy market it gave way, against
-  186 ms between the real publishers. The two populations are queued and bounded **apart** — a **live
-  floor** re-seeds itself on that order's next update, so its eviction is silent (which is what lets a
-  recovery snapshot larger than the cap, the flagship market being 44,598 orders, seed itself without
-  discarding the guard), while a **tombstone** is re-seeded by nothing — and the tombstones are bounded
-  **process-wide** (`MAX_TOMBSTONES_TOTAL`, 1 Mi, an eighth of what the old per-market cap permitted
-  across `MAX_BOOK_MARKETS`) with `MAX_MARKET_TOMBSTONES` (65,536) as the per-market backstop, since a
-  per-market cap large enough for a busy market is no bound at all once multiplied out. Reaching either
-  cap **invalidates** the market rather than forcing a re-baseline
-  (`dz_mbo_market_invalidations_total`; headroom is on `dz_mbo_guarded_tombstones_max`, the
-  per-market high-water — the aggregate `dz_mbo_guarded_tombstones` is a sum against a ceiling sixteen
-  times the cap that fires first, so one market walking to a blackout reads as flat headroom there):
-  republishing our
-  own view is not an answer to "the guard could not answer", since that view is exactly what the guard
-  failed to protect — it would hand the consumer the resurrections stamped `snapshot`/`last` and
-  re-seed them as live floors, so nothing removes them again. So `Arbiter::invalidate_market` drops the
-  market's race state, replay entry and accumulators, tells consumers to drop the book with a bare
-  `Clear` (`announce_disowned`, once — the flag lives with the record, not on the evictable per-market
-  state) and publishes **nothing** further until a producer sends a `Clear`-led re-baseline of its own.
-  A market carrying that record also **routes as order-level** whatever its next batch contains, since
-  a producer's re-baseline for an *empty* book is a bare `Clear` with no order id and would otherwise
-  reach the single-arm authority, which cannot discharge the record. The `Clear` needs a message's header fields, which the key alone does not
-  carry, so it is built from an accumulator (`BookAccumulator::to_clear`, header-only — materializing
-  the 44k-order book a disowning just stopped vouching for would be the wrong price) **before** the
-  state holding it is dropped, never deferred to the market's next batch: `shed_over_budget` disowns a
-  market other than the one being admitted, and a market whose arms drifted apart and then both went
-  quiet is precisely how one comes to hold the most tombstones. Leaving consumers holding a book that
-  silently stops updating while a client connecting a second later gets none at all is two consumers of
-  one feed in contradictory states, neither told anything. The record of the disowning lives in a
-  bounded set of its own rather than on the per-market state, because `MAX_BOOK_MARKETS` eviction drops
-  that state and the `order_level` memo is re-derived from batch content — an evicted market would come
-  back reading as ordinary and resume serving deltas onto a book nothing vouches for.
-  ⚠️ That is a real availability cost: for a *healthy* publisher the next such batch is its next
-  **recovery**, not its next snapshot rotation (`book.rs` drops a snapshot whose anchor it has already
-  applied), so the market can be dark for tens of seconds or longer. The **process-wide** ceiling is
-  `Arbiter`'s (`shed_over_budget`), never `MarketEvents`', because it is the only scope that can charge
-  it to the market actually holding the tombstones: charging the market being *admitted* — the obvious
-  O(1) choice — would let one market's arms drifting apart disown every other order-level market in
-  turn, each on its next removal and each returning only its own handful, while the hoarder kept
-  everything it held. Eviction — as opposed to retirement — asks only about the *serving* arms, which is
-  `book_sync`'s `synced` plus arrival within `PEER_SERVING_NS`; arrival, not a *published* batch,
-  because a mirror whose copies all lose the race publishes nothing and is exactly the arm the guard is
-  held open for. The two masks are the whole distinction: a gapped or departed arm must not be retired
-  around (it is the likeliest source of a stale `Add` there is) but must not hold the population open
-  forever either, or one desync report would put a busy market into permanent invalidation. And a
-  forged copy of a real removal spends an arm's bit, so this bounds the guard's cost rather than proving
-  nothing is in flight — the unauthenticated wire's price, as elsewhere here.
+  (`dz_book_resurrections_dropped_total`): a `size == 0` event records the order as removed and any later
+  non-zero change for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order
+  another publisher already killed passes every check `book.rs` makes — that book legitimately still holds
+  the order. **What retires an entry is venue time, not the arms and not a count.** Per channel
+  (`ChannelClock`, keyed `(venue, category, channel)` — a market's own stamps say nothing about how far the
+  venue has moved, so a per-market clock would forget nothing on a quiet market and everything at once when
+  it woke) the arbiter tracks the newest `source_ts_ns` accepted, and the **frontier** is
+  `newest - --arb-book-retention-secs`. Four rules: an event older than the frontier is refused, a removed
+  entry older than the frontier is forgotten, an event older than that order's own `last_ts` is refused, and
+  a non-zero size for an order already published as gone is refused whatever its stamp. Rules 1 and 2 read
+  **one** frontier value per batch, and that sharing is the whole safety argument: an event is admitted only
+  while its entry is still present, so a stale change can never slip past an entry already dropped — which
+  is what closes the case the design is for, a link returning with a *contiguous* buffered backlog that
+  carries no sequence gap, so `book.rs` never demands a snapshot and minutes-old events arrive looking
+  legitimate. Rule 3 runs **before** the size comparison: a stale copy of an add for an order the venue has
+  since partially filled claims more than the peer reported, and testing size first reads that as drift and
+  forces a re-baseline — the false disagreement rule 3 exists to subsume, and what used to cap the tolerable
+  inter-arm lag at the dedup window's 1,024-event count (~1.15 s on the flagship market). Rule 4's carve-out
+  is scoped to rule 3 alone: a **removal** is never refused for being older than the order it removes, which
+  would strand that order live in every consumer's book. ⚠️ A removed entry's `last_ts` is **frozen at the
+  removal** — later copies are published, idempotently, but do not refresh it, or one laggard repeating
+  itself holds that entry and everything queued behind it above the frontier indefinitely. Freezing is safe
+  **only** because the batch stamp is that instrument's own `book.last_event_ts()` under a contiguous
+  per-instrument sequence; a change to where the stamp comes from breaks it silently, which is why the
+  comment sits on the field.
+  The frontier is wire-supplied, so three mechanisms keep it honest, and all four writes of `newest_ts` go
+  through one `ChannelClock::set` (they diverged in an earlier revision *because* they were four). A
+  **forward bound** (`--arb-book-ts-jump-secs`) refuses an advance more than that far ahead — but the batch
+  is **still processed**, because `newest_ts` only advances from what it accepts, so refusing it means that
+  after one legitimate jump every later batch is further ahead than the last and the channel wedges
+  permanently; the bound cannot tell "the publisher jumped" from "we were away", and a whole-channel gap is
+  ordinary. A **re-seat hatch** (`--arb-book-reseat-secs`) re-seats `newest_ts` from the highest stamp among
+  the batches actually arriving once it has failed to **move** for that long — keyed on movement, never on
+  "a batch was accepted", since the forward bound leaves past-the-bound batches accepted and an
+  acceptance-keyed timer would never fire in the one state the hatch exists for. Its sample is taken
+  *before* rule 1 can refuse a batch (a session restarting lower is exactly the batch rule 1 refuses) and is
+  scoped to the stuck period rather than to the process (a lifetime maximum re-seats to a dead leader's last
+  stamp, which is the failure it exists to undo). It may move the frontier in either direction and is by
+  construction a bypass of the forward bound. `EndOfSession` **unsets** `newest_ts`
+  (`reset_book_session_for_market`, the session-scoped sibling of `reset_book_events_for_market`) rather
+  than zeroing it — zero plus the forward bound is itself a wedge — and the first batch after seeds it
+  unconditionally; `InstrumentReset` must not touch it, since that restarts one instrument's sequence space
+  and not the venue's clock.
+  A **`Clear`-led re-baseline is exempt from rule 1 and feeds neither the sample nor the forward bound**:
+  its `source_ts_ns` is the book's *age*, not a delivery time — `on_snapshot_end` never writes
+  `last_event_ts` and the resets zero it, so a snapshot install with no pending delta past its anchor is
+  stamped `0`, which is every cold start and the idle majority of a 318-instrument channel — and it is a
+  market's only bootstrap. Its seeded entries take `last_ts = newest_ts`, never the batch's own stamp, at
+  all three `rebaselined` call sites. What bounds the exemption's blast radius is the existing
+  **`peer_serving` suppression**, which is therefore load-bearing for the frontier's integrity as well as
+  for the consumer's book.
+  The two populations are queued and bounded **apart** — a **live floor** re-seeds itself on that order's
+  next update, so its eviction is silent (which is what lets a recovery snapshot larger than the cap, the
+  flagship market being 44,598 orders, seed itself without discarding the guard) and it keeps its per-market
+  count cap (`MAX_GUARDED_ORDERS`), while a **removed entry** is re-seeded by nothing and has **no count cap
+  at all**: what sizes it is the retention window, and a count standing in for a time tolerance is
+  simultaneously far too much for a quiet market and far too little for a busy one. At the shipped 30 s
+  against a measured p99.99 inter-arm separation of 2.77 s and 3,958 removals/s per publisher per channel,
+  that is ~119k entries on the flagship channel, 11% of the process-wide `MAX_TOMBSTONES_TOTAL` (1 Mi).
+  Forgetting is **head-of-queue, bounded per batch** (`MAX_FORGOTTEN_PER_BATCH`): `dead` is in removal order,
+  which is only *approximately* ordered by `last_ts` since two arms' stamps interleave, so the head-only
+  walk leaves bounded slack (under 10%) — do not add a `debug_assert` that the queue is sorted, it fires on
+  production-shaped input — and the per-batch bound is for the other end, an upward re-seat after a long gap
+  making the whole population eligible at once, where taking 119k entries inline would stall every receiver
+  on every feed on the one arbiter mutex. The process-wide ceiling is a backstop that should be unreachable;
+  crossing it forgets the oldest entries **in the market being admitted** (`dz_mbo_guard_ceiling_evictions_total`),
+  which makes it deliberately **advisory** — that market may hold nothing to forget, so the process can sit
+  over the ceiling, bounded by `reseat_after_ns x removal rate`. That is intended: charging the largest
+  holder is an O(markets) scan on the ingest hot path. ⚠️ **There is no market-disowning path any more.** A
+  market is never taken dark by the guard, because the failure that produced it — one publisher whose
+  snapshot anchor never held the removed orders, holding a consensus quorum open until a cap gave way — is
+  exactly what this design removes. `dz_mbo_market_invalidations_total` is gone with it; the headroom to
+  alert on is `dz_mbo_guarded_tombstones_max`, and the refusals are
+  `dz_mbo_events_past_frontier_total`/`dz_mbo_events_stale_total` against
+  `dz_mbo_frontier_bounded_total`/`dz_mbo_frontier_reseats_total`.
   A forced re-baseline's seeded floors are owned by **no arm**:
   what is republished is the pointwise-minimum view of every arm, so stamping the arm whose batch
   discharged the flag would exempt it from the gate and let it re-assert the stale size the
@@ -536,8 +535,8 @@ Modules are grouped by role under `src/`:
   synced and recently on the wire (`PEER_SERVING_NS`). The flag alone would let a departed publisher
   suppress this product's only self-heal forever; requiring a delivery also settles the both-recovering
   race, since whichever arm publishes first records one. A session boundary restarts the venue's id space,
-  so `reset_book_events_for_market` clears the tombstones — narrower than `reset_book_for_market` on
-  purpose, since a peer that missed the session end is still serving that market.
+  so `reset_book_session_for_market` clears the removed entries **and** the channel's clock — narrower than
+  `reset_book_for_market` on purpose, since a peer that missed the session end is still serving that market.
 - **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**
   for a price-aggregated market, in *both* arbitration modes with no `mode_for` branch (#105): one
   `source_ts` tick can hold several

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The Market-by-Order resurrection guard forgets a removed order on **venue time** rather than by
+  agreement between the publishers. It used to hold a per-arm reporter mask per removed order and retire
+  it only once every arm still reaching the market had independently reported that removal; an arm whose
+  own snapshot anchor never held the order could never report it, so the population grew with the market's
+  whole history until a cap gave way and the market was **disowned** — dark for every consumer until some
+  producer re-baselined it, which for a healthy publisher is its next recovery rather than its next
+  snapshot rotation. One publisher's anchor could black out a market every consumer was watching. Per
+  channel the arbiter now tracks the newest venue stamp accepted and refuses anything older than
+  `newest - --arb-book-retention-secs`, forgetting removed entries on the same frontier; an event older
+  than its own order's last published change is refused before any size comparison, which also removes the
+  false size disagreements that capped the tolerable inter-arm lag at about a second.
+- ⚠️ **`dz_mbo_market_invalidations_total` is removed.** Nothing disowns a market any more, so any alert
+  or dashboard on it must be retired. Replace it with `dz_mbo_events_past_frontier_total` (a link
+  returning with a backlog), `dz_mbo_guard_ceiling_evictions_total` (the process-wide ceiling forgetting
+  entries the retention window would still have held) and `dz_mbo_guarded_tombstones_max` for headroom.
+  `dz_mbo_guarded_tombstones{,_max}` keep their names and their 1,048,576-entry ceiling but are now sized
+  by the retention window and the venue's removal rate rather than by how far the publishers lag.
+
+### Added
+- `--arb-book-retention-secs` (30), `--arb-book-ts-jump-secs` (5) and `--arb-book-reseat-secs` (10) tune
+  the guard above. The retention default is sized against a measured p99.99 inter-arm separation of 2.77 s
+  and 3,958 removals/s per publisher per channel: ~119k entries, 11% of the process-wide ceiling.
+- `dz_mbo_events_stale_total`, `dz_mbo_frontier_bounded_total` and `dz_mbo_frontier_reseats_total` report
+  the guard's three venue-time refusals and its self-corrections. A sustained `dz_mbo_frontier_bounded_total`
+  means the forward bound is catching ordinary jitter rather than a bad stamp.
+
 ### Security
 - `--admin-bind`/`DZ_ADMIN_BIND` now defaults to `127.0.0.1:9098` instead of empty, so
   `doublezero-edge channels list`/`channels set` work out of the box. The exposure is accepted on
