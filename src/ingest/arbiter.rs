@@ -2046,10 +2046,10 @@ impl Arbiter {
             // which is only tracked once something is published, so minting an entry here would let a
             // flood of forged `(channel, instrument_id)` keys carrying ancient stamps grow this map
             // past the cap `book_markets` enforces.
-            let mut n_dead = 0;
+            let mut held = None;
             if let Some(events) = self.book_events.get_mut(&key) {
                 events.forget_expired(frontier, budget);
-                n_dead = events.n_dead;
+                held = Some(events.n_dead);
             }
             let stale = b.changes.iter().filter(|c| c.order_id != 0).count() as u64;
             if stale > 0 {
@@ -2058,7 +2058,12 @@ impl Arbiter {
                     .with_label_values(&[venue])
                     .inc_by(stale);
             }
-            self.observe_market_peak(&key, n_dead);
+            // Only for a market that holds a population. Reporting zero for one that holds nothing
+            // would ask the high-water to re-seat — one pass over every tracked market — on a batch
+            // that made no state, which is a forged stream's cheapest scan.
+            if let Some(n_dead) = held {
+                self.observe_market_peak(&key, n_dead);
+            }
             self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
             self.shed_over_budget(&key);
             self.assert_budget_consistent();
