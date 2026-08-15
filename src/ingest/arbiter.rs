@@ -202,6 +202,30 @@ pub struct BookGuardConfig {
 }
 
 impl BookGuardConfig {
+    /// Reject a configuration whose bounds contradict each other, at startup rather than as a silent
+    /// channel-wide outage. Both failures look identical in production — every honest publisher on a
+    /// channel refused, no metric saying why — and one is a typo away.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_ts_jump_ns >= self.retention_ns {
+            return Err(format!(
+                "--arb-book-ts-jump-secs ({}) must be below --arb-book-retention-secs ({}): one \
+                 accepted jump would otherwise put the whole channel outside the retention window",
+                self.max_ts_jump_ns / 1_000_000_000,
+                self.retention_ns / 1_000_000_000
+            ));
+        }
+        if self.retention_ns <= MAX_FUTURE_SKEW_NS {
+            return Err(format!(
+                "--arb-book-retention-secs ({}) must exceed the {}s host-clock skew the frontier \
+                 tolerates: below it a source stamping just inside that skew holds the frontier \
+                 above every honest publisher on the channel",
+                self.retention_ns / 1_000_000_000,
+                MAX_FUTURE_SKEW_NS / 1_000_000_000
+            ));
+        }
+        Ok(())
+    }
+
     /// `retention_ns` is sized against a measured p99.99 inter-arm separation of 2.77 s and a
     /// removal rate of 3,958/s per publisher per channel: ~119k removed entries on the flagship
     /// channel, 11% of [`MAX_TOMBSTONES_TOTAL`]. `max_ts_jump_ns` sits comfortably below it, so one
@@ -687,13 +711,14 @@ struct ChannelClock {
     /// is forgotten either, so the population grows to the process ceiling and the guard's reach
     /// silently reverts to a count.
     ahead_since: Option<u64>,
-    /// The highest stamp seen since `newest_ts` last moved past it, whether or not it advanced it.
-    /// Taken **before** rule 1 can refuse a batch — sampled after the refusal, a session restarting
-    /// *lower* leaves the hatch nothing to re-seat from.
+    /// The highest stamp seen since a write **consumed** the last one, whether or not it advanced
+    /// `newest_ts`. Taken **before** rule 1 can refuse a batch — sampled after the refusal, a session
+    /// restarting *lower* leaves the hatch nothing to re-seat from.
     ///
-    /// Scoped to the stuck period, not to the process: a lifetime maximum re-seats to a stale value,
-    /// which is the whole failure the hatch exists to undo. A dead leader's last stamp would otherwise
-    /// keep winning the maximum and re-seat the frontier back onto the arm that is gone.
+    /// Not a lifetime maximum, which would re-seat to a stale value and is the whole failure the
+    /// hatch exists to undo. It does survive any number of accepted advances that land *below* it,
+    /// which is deliberate — that is exactly the crawl `ahead_since` is about — so a departed arm's
+    /// last refused stamp can still win it one interval later. The anchor bounds what that costs.
     sample: Option<u64>,
 }
 
@@ -724,10 +749,20 @@ impl ChannelClock {
     /// [`MAX_FUTURE_SKEW_NS`] is the same absolute check the quote and depth floors already apply to
     /// this field.
     fn observe(&mut self, ts: u64, now: u64, wall: u64, cfg: &BookGuardConfig) -> bool {
-        if ts > wall.saturating_add(MAX_FUTURE_SKEW_NS) {
+        let cap = wall.saturating_add(MAX_FUTURE_SKEW_NS);
+        let ts = if ts > cap {
+            // Sampled **at the cap**, not skipped. A host clock that runs behind venue time by more
+            // than the skew anchors every batch on the channel, and a path that samples nothing
+            // leaves the hatch with no evidence at all: `newest_ts` freezes, nothing is forgotten,
+            // and the population grows to the process ceiling because of an NTP step. Capping
+            // instead re-seats the frontier onto the host clock, so retention degrades to being
+            // measured in host time rather than stopping.
             self.ahead_since.get_or_insert(now);
+            self.sample = Some(self.sample.map_or(cap, |s| s.max(cap)));
             return true;
-        }
+        } else {
+            ts
+        };
         self.sample = Some(self.sample.map_or(ts, |s| s.max(ts)));
         match self.newest_ts {
             // The first batch of a session seeds unconditionally: the bound has nothing to measure
@@ -787,15 +822,23 @@ impl ChannelClock {
     }
 
     /// The stamp a batch is **judged and recorded** by: its own, held down to the newest stamp this
-    /// channel has accepted.
+    /// channel has accepted, or to the host-clock cap on a channel that has accepted none.
     ///
     /// Every batch the forward bound refused is still served, so its raw stamp can be unboundedly
     /// above the frontier. Recorded unclamped it pins the head of the forgetting queue — nothing
     /// behind it ages out either — and, on a live order, refuses every genuine later change to that
-    /// order as stale for as long as the entry survives. Clamping is a no-op on any batch that
-    /// advanced the clock, which is every batch in steady state.
-    fn stamp(&self, ts: u64) -> u64 {
-        self.newest_ts.map_or(ts, |newest| ts.min(newest))
+    /// order as stale. Clamping is a no-op on any batch that advanced the clock, which is every batch
+    /// in steady state.
+    ///
+    /// ⚠️ The `None` arm is not a formality. A batch the *anchor* refused leaves `newest_ts` unset,
+    /// so on a channel's first batch — every cold start, and every batch after an `EndOfSession` —
+    /// falling back to the raw stamp hands the far-future value straight to the rules it was
+    /// filtered out of.
+    fn stamp(&self, ts: u64, wall: u64) -> u64 {
+        ts.min(
+            self.newest_ts
+                .unwrap_or_else(|| wall.saturating_add(MAX_FUTURE_SKEW_NS)),
+        )
     }
 }
 
@@ -2073,13 +2116,14 @@ impl Arbiter {
         // has to see a session that restarted lower, which is precisely the batch rule 1 refuses.
         let cfg = self.book_guard;
         let ck = Self::channel_key(&key);
+        let wall = now_ns();
         let clock = self.clock_for(&ck);
-        let bounded = clock.observe(b.source_ts_ns, now, now_ns(), &cfg);
+        let bounded = clock.observe(b.source_ts_ns, now, wall, &cfg);
         let reseated = clock.reseat(now, &cfg);
         let frontier = clock.frontier(&cfg);
         // Every rule below judges and records this batch by the clamped stamp, never the raw one:
         // see [`ChannelClock::stamp`].
-        let stamp = clock.stamp(b.source_ts_ns);
+        let stamp = clock.stamp(b.source_ts_ns, wall);
         let venue = b.venue.as_ref();
         if bounded {
             metrics()
@@ -6760,6 +6804,157 @@ mod tests {
         assert!(a.channel_clock_order.len() <= MAX_CHANNEL_CLOCKS);
     }
 
+    /// A batch the **anchor** refused leaves the clock unset, so there is no newest stamp to hold it
+    /// down to. Falling back to the raw value there hands the far-future stamp straight to the rules
+    /// it was filtered out of, and every genuine later change to the order it names is then refused
+    /// as stale for as long as the entry survives.
+    ///
+    /// Driven through a session boundary rather than a cold start: a *fresh* clock has never been
+    /// written, so the re-seat hatch fires on its first batch and seeds it from the anchor's own cap.
+    /// A session unset stamps both waits, which is what leaves the window this is about open.
+    #[test]
+    fn a_far_future_batch_on_an_unset_clock_does_not_freeze_the_orders_it_touches() {
+        const VENUE: &str = "BookFrontierUnsetClock";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_guard(BookGuardConfig::DEFAULT);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let base = now_ns();
+        a.emit(
+            l3_batch_at(
+                VENUE,
+                vec![order(BookAction::Update, 1, 100.0, 1.0)],
+                base,
+                base,
+            ),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        a.reset_book_session_for_market(&key);
+        let _ = drain_books(&mut rx);
+        // The new session's first batch, stamped ten years ahead.
+        a.emit(
+            l3_batch_at(
+                VENUE,
+                vec![order(BookAction::Update, 5, 100.0, 10.0)],
+                base + 315_360_000_000_000_000,
+                base,
+            ),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        // The venue then fills that order down, past the skew the anchor tolerates.
+        for (i, size) in [9.0, 8.0, 7.0].into_iter().enumerate() {
+            let t = base + 6_000_000_000 + i as u64 * 1_000_000_000;
+            a.emit(
+                l3_batch_at(VENUE, vec![order(BookAction::Update, 5, 100.0, size)], t, t),
+                arm(1),
+                TEST_CATEGORY,
+            );
+        }
+        assert_eq!(
+            consumer_book(&mut rx).get(&5),
+            Some(&7.0),
+            "the venue's own fills must reach the consumer"
+        );
+    }
+
+    /// A host clock running behind venue time by more than the skew anchors **every** batch on a
+    /// channel. The anchor path must still feed the hatch, or `newest_ts` freezes, the frontier
+    /// forgets nothing, and the population grows to the process ceiling because of an NTP step.
+    #[test]
+    fn a_host_clock_behind_the_venue_still_re_seats_the_frontier() {
+        let cfg = BookGuardConfig {
+            reseat_after_ns: 20_000_000,
+            ..BookGuardConfig::DEFAULT
+        };
+        let wall = 1_000_000_000_000_000;
+        let venue = wall + 3_600_000_000_000;
+        let mut clock = ChannelClock::default();
+        let mut now = 0u64;
+        for i in 0..40u64 {
+            assert!(
+                clock.observe(venue + i * 1_000_000_000, now, wall, &cfg),
+                "every stamp here is past the anchor"
+            );
+            now += 1_000_000;
+            if clock.reseat(now, &cfg) {
+                assert_eq!(
+                    clock.newest_ts,
+                    Some(wall + MAX_FUTURE_SKEW_NS),
+                    "re-seated onto the host clock, which is the only honest reference left"
+                );
+                assert!(
+                    clock.frontier(&cfg).is_some(),
+                    "without a frontier nothing is ever forgotten"
+                );
+                return;
+            }
+        }
+        panic!("a channel whose host clock runs behind never re-seats, so it never forgets");
+    }
+
+    /// The crawl trigger, driven directly. `observe` and `reseat` take `now`, so the interleaving
+    /// that starves the movement-keyed wait is exact here rather than a race against the host — which
+    /// is what the emit-altitude scenario above cannot be.
+    #[test]
+    fn a_crawling_advance_keeps_only_the_movement_wait_fresh() {
+        let cfg = BookGuardConfig {
+            reseat_after_ns: 20_000_000,
+            ..BookGuardConfig::DEFAULT
+        };
+        // Far above every stamp below, so the host-clock anchor never fires and only the two waits
+        // decide anything.
+        let wall = 1_000_000_000_000_000;
+        let mut clock = ChannelClock::default();
+        let mut now = 0u64;
+        clock.observe(1_000, now, wall, &cfg);
+        for i in 1..=40u64 {
+            now += 1_000_000;
+            // The honest arm, far ahead of the crawl and inside the anchor: refused as an advance.
+            assert!(clock.observe(500_000_000_000 + i, now, wall, &cfg));
+            // The crawler's own microsecond step, accepted — which is what keeps the movement wait
+            // fresh for as long as it keeps sending.
+            assert!(!clock.observe(1_000 + i * 1_000, now, wall, &cfg));
+            assert!(
+                now.saturating_sub(clock.moved_at) < cfg.reseat_after_ns,
+                "the movement wait must stay fresh, or this measures the wrong trigger"
+            );
+            if clock.reseat(now, &cfg) {
+                assert!(
+                    now >= cfg.reseat_after_ns,
+                    "re-seated before the wait elapsed"
+                );
+                assert!(
+                    clock.newest_ts.is_some_and(|t| t >= 500_000_000_000),
+                    "re-seated onto the crawl rather than onto the channel"
+                );
+                return;
+            }
+        }
+        panic!("the frontier never re-seated past a crawling clock");
+    }
+
+    /// The guard's two bounds are not independent, and both ways of getting them wrong read as a
+    /// channel-wide outage with no metric saying why.
+    #[test]
+    fn a_guard_config_whose_bounds_contradict_is_refused() {
+        let ok = BookGuardConfig::DEFAULT;
+        assert!(ok.validate().is_ok());
+        assert!(BookGuardConfig {
+            max_ts_jump_ns: ok.retention_ns,
+            ..ok
+        }
+        .validate()
+        .is_err());
+        assert!(BookGuardConfig {
+            retention_ns: MAX_FUTURE_SKEW_NS,
+            max_ts_jump_ns: 1_000_000_000,
+            ..ok
+        }
+        .validate()
+        .is_err());
+    }
+
     /// A batch refused for being past the frontier creates **no** per-market state. `book_events` is
     /// evicted alongside `book_markets`, which is only tracked once something is published, so a flood
     /// of forged `(channel, instrument_id)` keys carrying ancient stamps would otherwise grow that map
@@ -7074,9 +7269,11 @@ mod tests {
     /// forgotten either, and the population grows until the process ceiling turns the guard back into
     /// the count this design replaced.
     ///
-    /// The crawler emits every 2 ms against a 20 ms wait, so the movement-keyed trigger cannot fire
-    /// and only the ahead-of-its-channel one can. That pacing is the test: without it the loop runs
-    /// faster than the wait, the movement trigger fires by accident, and this measures nothing.
+    /// This is the **population** check; `a_crawling_advance_keeps_only_the_movement_wait_fresh`
+    /// below is what isolates the trigger. ⚠️ It can false-pass on a slow host: the crawler's pacing
+    /// keeps the movement-keyed wait fresh only while a round costs less than that wait, and past
+    /// that the movement trigger fires by itself and this passes with the mechanism deleted. Do not
+    /// read a pass here as evidence the ahead-of-its-channel trigger works.
     #[test]
     fn a_crawling_clock_does_not_starve_the_reseat() {
         const VENUE: &str = "BookFrontierCrawl";

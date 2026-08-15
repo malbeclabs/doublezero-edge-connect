@@ -479,7 +479,7 @@ Modules are grouped by role under `src/`:
   sample or advance anything — the same check the quote and depth floors already apply to this field, and
   the one the per-step bound below cannot stand in for: the bound caps one advance while a **stream** of
   in-bound ones ratchets the frontier arbitrarily far ahead, refusing every honest publisher on the channel
-  and leaving the forger's own stamps the only ones inside the window. A **forward bound**
+  and leaving the forger's own stamps the only ones inside the window. The anchor is also the frontier's fallback where it has no venue reference of its own — a batch it refused while `newest_ts` is unset, and a host clock running *behind* venue time by more than the skew, which anchors every batch on the channel. In the second case the hatch re-seats onto the host clock and retention degrades to being measured in host time, which is the point: the alternative is a frozen frontier that forgets nothing until the process ceiling. A **forward bound**
   (`--arb-book-ts-jump-secs`) refuses an advance more than that far ahead of `newest_ts` — but the batch is
   **still processed**, because `newest_ts` only advances from what it accepts, so refusing it means that
   after one legitimate jump every later batch is further ahead than the last and the channel wedges

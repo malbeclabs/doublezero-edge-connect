@@ -642,22 +642,16 @@ async fn main() -> Result<()> {
         transfer_win_rate: args.arb_transfer_win_rate,
         min_window_samples: args.arb_min_window_samples as usize,
     };
-    // The resurrection guard's venue-time tunables, validated here for the same reason: the two
-    // bounds are not independent. A jump bound at or above the retention window means one accepted
-    // jump puts the whole channel outside that window at once, which reads as a channel-wide book
-    // outage and takes a re-seat interval to clear — a typo with the same signature as an attack.
+    // The resurrection guard's venue-time tunables. Validated by the type that owns the bounds, not
+    // here: both ways of getting them wrong read as a channel-wide book outage with no metric saying
+    // why, which is a typo with the same signature as an attack.
     let book_guard = ingest::arbiter::BookGuardConfig {
         retention_ns: args.arb_book_retention_secs * 1_000_000_000,
         max_ts_jump_ns: args.arb_book_ts_jump_secs * 1_000_000_000,
         reseat_after_ns: args.arb_book_reseat_secs * 1_000_000_000,
     };
-    if book_guard.max_ts_jump_ns >= book_guard.retention_ns {
-        bail!(
-            "--arb-book-ts-jump-secs ({}) must be below --arb-book-retention-secs ({}): one \
-             accepted jump would otherwise put the whole channel outside the retention window",
-            args.arb_book_ts_jump_secs,
-            args.arb_book_retention_secs
-        );
+    if let Err(why) = book_guard.validate() {
+        bail!(why);
     }
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
