@@ -473,20 +473,31 @@ Modules are grouped by role under `src/`:
   **only** because the batch stamp is that instrument's own `book.last_event_ts()` under a contiguous
   per-instrument sequence; a change to where the stamp comes from breaks it silently, which is why the
   comment sits on the field.
-  The frontier is wire-supplied, so three mechanisms keep it honest, and all four writes of `newest_ts` go
-  through one `ChannelClock::set` (they diverged in an earlier revision *because* they were four). A
-  **forward bound** (`--arb-book-ts-jump-secs`) refuses an advance more than that far ahead — but the batch
-  is **still processed**, because `newest_ts` only advances from what it accepts, so refusing it means that
+  The frontier is wire-supplied, so four mechanisms keep it honest, and every write of `newest_ts` goes
+  through one `ChannelClock::set` (they diverged in an earlier revision *because* they were separate). An
+  **absolute anchor** refuses a stamp more than `MAX_FUTURE_SKEW_NS` past the *host* clock before it can
+  sample or advance anything — the same check the quote and depth floors already apply to this field, and
+  the one the per-step bound below cannot stand in for: the bound caps one advance while a **stream** of
+  in-bound ones ratchets the frontier arbitrarily far ahead, refusing every honest publisher on the channel
+  and leaving the forger's own stamps the only ones inside the window. A **forward bound**
+  (`--arb-book-ts-jump-secs`) refuses an advance more than that far ahead of `newest_ts` — but the batch is
+  **still processed**, because `newest_ts` only advances from what it accepts, so refusing it means that
   after one legitimate jump every later batch is further ahead than the last and the channel wedges
   permanently; the bound cannot tell "the publisher jumped" from "we were away", and a whole-channel gap is
-  ordinary. A **re-seat hatch** (`--arb-book-reseat-secs`) re-seats `newest_ts` from the highest stamp among
-  the batches actually arriving once it has failed to **move** for that long — keyed on movement, never on
-  "a batch was accepted", since the forward bound leaves past-the-bound batches accepted and an
-  acceptance-keyed timer would never fire in the one state the hatch exists for. Its sample is taken
-  *before* rule 1 can refuse a batch (a session restarting lower is exactly the batch rule 1 refuses) and is
-  scoped to the stuck period rather than to the process (a lifetime maximum re-seats to a dead leader's last
-  stamp, which is the failure it exists to undo). It may move the frontier in either direction and is by
-  construction a bypass of the forward bound. `EndOfSession` **unsets** `newest_ts`
+  ordinary. Every batch is then judged and recorded by `ChannelClock::stamp` — its own stamp held down to
+  `newest_ts` — never the raw one: a bounded batch's stamp is unbounded above the frontier, and recorded
+  unclamped it pins the head of the forgetting queue (nothing behind it ages out either) and refuses every
+  genuine later change to a live order it touched. A **re-seat hatch** (`--arb-book-reseat-secs`) re-seats
+  `newest_ts` from the highest stamp among the batches actually arriving, once it has failed to **move**
+  for that long **or** the forward bound has been refusing continuously for that long. The second trigger
+  is not redundant: a publisher whose clock *crawls* — a unit mismatch, an old-session replay — has every
+  one of its tiny advances accepted, which keeps the movement timer fresh forever while every honest arm is
+  refused, and the frontier then pins below the whole channel for the life of the process. The sample is
+  taken *before* rule 1 can refuse a batch (a session restarting lower is exactly the batch rule 1 refuses)
+  and, with that timer, is cleared only by a write that **consumed** it — a write landing below the highest
+  stamp on the channel is that crawl, and clearing either there starves the hatch of its own evidence. It
+  may move the frontier in either direction and is by construction a bypass of the forward bound, though
+  not of the anchor, which filtered the sample on the way in. `EndOfSession` **unsets** `newest_ts`
   (`reset_book_session_for_market`, the session-scoped sibling of `reset_book_events_for_market`) rather
   than zeroing it — zero plus the forward bound is itself a wedge — and the first batch after seeds it
   unconditionally; `InstrumentReset` must not touch it, since that restarts one instrument's sequence space

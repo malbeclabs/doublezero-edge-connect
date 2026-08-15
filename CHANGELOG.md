@@ -28,9 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removal rate rather than by how far the publishers lag.
 
 ### Added
+- The frontier is anchored against the **host** clock as well as against its own newest stamp: a venue
+  stamp implausibly ahead of the host neither samples nor advances anything, the same check the quote and
+  depth floors already apply to this field. The per-step jump bound caps one advance; a stream of in-bound
+  ones would otherwise ratchet the frontier arbitrarily far ahead and refuse every honest publisher on the
+  channel. Every batch is judged and recorded at the channel's newest stamp rather than its own, so a
+  refused advance cannot pin the forgetting queue behind it either, and the re-seat hatch now also fires
+  when the forward bound has been refusing continuously — a publisher whose clock crawls has all of its
+  tiny advances accepted, which would keep the movement-keyed hatch from ever firing.
 - `--arb-book-retention-secs` (30), `--arb-book-ts-jump-secs` (5) and `--arb-book-reseat-secs` (10) tune
   the guard above. The retention default is sized against a measured p99.99 inter-arm separation of 2.77 s
-  and 3,958 removals/s per publisher per channel: ~119k entries, 11% of the process-wide ceiling.
+  and 3,958 removals/s per publisher per channel: ~119k entries, 11% of the process-wide ceiling. A jump
+  bound at or above the retention window is refused at startup: one accepted jump would put a whole channel
+  outside that window.
 - `dz_mbo_events_stale_total`, `dz_mbo_frontier_bounded_total` and `dz_mbo_frontier_reseats_total` report
   the guard's three venue-time refusals and its self-corrections. A sustained `dz_mbo_frontier_bounded_total`
   means the forward bound is catching ordinary jitter rather than a bad stamp.

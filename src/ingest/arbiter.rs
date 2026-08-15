@@ -108,8 +108,10 @@ const MAX_WITHHELD_BATCHES: u32 = 8192;
 /// suppressing is the wedge.
 const PEER_SERVING_NS: u64 = 30_000_000_000; // 30s
 
-/// Cap on order events and tracked orders remembered per order-level market. Two jobs: the count half
-/// of the dedup window, and the reach of the resurrection guard (see [`MarketEvents::resting`]).
+/// Cap on order events remembered per order-level market: the count half of the dedup window, and
+/// nothing else. **It does not bound the resurrection guard's reach** — that is the channel's
+/// venue-time frontier ([`ChannelClock`]) — so a maintainer sizing the guard wants
+/// [`BookGuardConfig::retention_ns`], not this.
 ///
 /// Sized against the **product** with [`MAX_BOOK_MARKETS`], not against one market: a per-market cap
 /// the size of [`TRADE_DEDUP_WINDOW`] would put the aggregate ceiling in the tens of gigabytes on a
@@ -119,6 +121,8 @@ const PEER_SERVING_NS: u64 = 30_000_000_000; // 30s
 /// It is the other half of the dedup window, and the binding half above a second: the effective reach
 /// is `min(window, 1024 / event_rate)`, and the right-hand term is about 1.15 s on the flagship market.
 /// That is what [`DEFAULT_BOOK_DEDUP_WINDOW_NS`] is sized to, and why raising it further is inert.
+/// Crossing it no longer manufactures a false size disagreement: the copy is refused for being older
+/// than the last change published for its order, before its size is compared.
 const MAX_SEEN_ORDER_EVENTS: usize = 1024;
 
 /// Cap on the live resting-quantity floors one market tracks. A floor's eviction is silent — the
@@ -674,9 +678,18 @@ struct ChannelClock {
     /// accepted": the forward bound below leaves a past-the-bound batch accepted, so an
     /// acceptance-keyed timer would never fire in the one state the re-seat exists for.
     moved_at: u64,
-    /// The highest stamp seen since `newest_ts` last moved, whether or not it advanced it. Taken
-    /// **before** rule 1 can refuse a batch — sampled after the refusal, a session restarting *lower*
-    /// leaves the hatch nothing to re-seat from.
+    /// The monotonic time the forward bound started refusing advances **continuously**, cleared by
+    /// any accepted one. The movement-keyed wait above is not enough on its own: a publisher whose
+    /// stamps crawl — a unit mismatch, an old-session replay, a forged source stepping by a
+    /// microsecond — has every one of its tiny advances accepted, which keeps `moved_at` fresh
+    /// forever while every honest arm on the channel is refused. The frontier then pins below the
+    /// whole channel for the life of the process: nothing is refused (the safe direction) but nothing
+    /// is forgotten either, so the population grows to the process ceiling and the guard's reach
+    /// silently reverts to a count.
+    ahead_since: Option<u64>,
+    /// The highest stamp seen since `newest_ts` last moved past it, whether or not it advanced it.
+    /// Taken **before** rule 1 can refuse a batch — sampled after the refusal, a session restarting
+    /// *lower* leaves the hatch nothing to re-seat from.
     ///
     /// Scoped to the stuck period, not to the process: a lifetime maximum re-seats to a stale value,
     /// which is the whole failure the hatch exists to undo. A dead leader's last stamp would otherwise
@@ -685,25 +698,41 @@ struct ChannelClock {
 }
 
 impl ChannelClock {
-    /// The **one** place `newest_ts` is written, so the four writers that would otherwise diverge —
+    /// The **one** place `newest_ts` is written, so the writers that would otherwise diverge —
     /// advance, session unset, first-batch seed, re-seat — cannot disagree about stamping `moved_at`
-    /// or about scoping the sample to the period since the last movement.
+    /// or about what the sample and the ahead timer then mean.
     fn set(&mut self, ts: Option<u64>, now: u64) {
+        // The sample and the ahead timer are cleared only by a write that **consumed** the sample —
+        // the one thing that means "caught up with the traffic arriving". A write landing below the
+        // highest stamp on the channel is a clock crawling behind it, and clearing either there is
+        // what would starve the hatch of the evidence that re-seats past that crawl.
+        if ts.is_none_or(|t| self.sample.is_none_or(|s| t >= s)) {
+            self.sample = None;
+            self.ahead_since = None;
+        }
         self.newest_ts = ts;
         self.moved_at = now;
-        self.sample = None;
     }
 
     /// Take one batch's stamp: the hatch's sample first, then the advance the forward bound may
     /// refuse. Returns whether it refused one.
-    fn observe(&mut self, ts: u64, now: u64, cfg: &BookGuardConfig) -> bool {
-        // Sampled first and cleared by the write below, so a batch that moved the clock leaves no
-        // sample behind: the sample is evidence about a *stuck* frontier, and a stamp that advanced
-        // one is not.
+    ///
+    /// `wall` is the host clock, and a stamp implausibly ahead of it is refused **before** it can
+    /// sample or advance anything. Without that anchor the per-step bound caps one advance while a
+    /// *stream* of in-bound ones ratchets the frontier arbitrarily far ahead, refusing every honest
+    /// publisher on the channel and leaving the forger's own stamps the only ones inside the window.
+    /// [`MAX_FUTURE_SKEW_NS`] is the same absolute check the quote and depth floors already apply to
+    /// this field.
+    fn observe(&mut self, ts: u64, now: u64, wall: u64, cfg: &BookGuardConfig) -> bool {
+        if ts > wall.saturating_add(MAX_FUTURE_SKEW_NS) {
+            self.ahead_since.get_or_insert(now);
+            return true;
+        }
         self.sample = Some(self.sample.map_or(ts, |s| s.max(ts)));
         match self.newest_ts {
             // The first batch of a session seeds unconditionally: the bound has nothing to measure
-            // against, and a zero plus a forward bound is itself a wedge.
+            // against, and a zero plus a forward bound is itself a wedge. The host-clock anchor above
+            // is what keeps that seed honest.
             None => {
                 self.set(Some(ts), now);
                 false
@@ -717,6 +746,7 @@ impl ChannelClock {
                     // `newest_ts` only advances from what it accepts, so after one legitimate jump
                     // every later batch is further ahead than the last. The bound cannot tell "the
                     // publisher jumped" from "we were away", and a whole-channel gap is ordinary.
+                    self.ahead_since.get_or_insert(now);
                     true
                 }
             }
@@ -725,12 +755,19 @@ impl ChannelClock {
     }
 
     /// Re-seat `newest_ts` from the batches actually arriving, once it has failed to move for
-    /// `reseat_after_ns`. May move it in either direction, and is by construction a bypass of the
-    /// forward bound. It covers three states: the bound holding the frontier too low after a gap, a
-    /// session clock restarting lower, and a peer still in the old session re-raising it after a
-    /// reset.
+    /// `reseat_after_ns` **or** the forward bound has been refusing for that long. May move it in
+    /// either direction, and is by construction a bypass of the forward bound — but not of the
+    /// host-clock anchor, which filtered the sample on the way in.
+    ///
+    /// It covers four states: the bound holding the frontier too low after a gap, a session clock
+    /// restarting lower, a peer still in the old session re-raising it after a reset, and a crawling
+    /// clock holding the channel below every honest arm on it.
     fn reseat(&mut self, now: u64, cfg: &BookGuardConfig) -> bool {
-        if now.saturating_sub(self.moved_at) < cfg.reseat_after_ns {
+        let stuck = now.saturating_sub(self.moved_at) >= cfg.reseat_after_ns;
+        let ahead = self
+            .ahead_since
+            .is_some_and(|t| now.saturating_sub(t) >= cfg.reseat_after_ns);
+        if !stuck && !ahead {
             return false;
         }
         // An empty sample is a no-op that does **not** restamp the timer, or a channel whose clock
@@ -747,6 +784,18 @@ impl ChannelClock {
     /// everything and rule 2 forgets nothing.
     fn frontier(&self, cfg: &BookGuardConfig) -> Option<u64> {
         self.newest_ts.map(|t| t.saturating_sub(cfg.retention_ns))
+    }
+
+    /// The stamp a batch is **judged and recorded** by: its own, held down to the newest stamp this
+    /// channel has accepted.
+    ///
+    /// Every batch the forward bound refused is still served, so its raw stamp can be unboundedly
+    /// above the frontier. Recorded unclamped it pins the head of the forgetting queue — nothing
+    /// behind it ages out either — and, on a live order, refuses every genuine later change to that
+    /// order as stale for as long as the entry survives. Clamping is a no-op on any batch that
+    /// advanced the clock, which is every batch in steady state.
+    fn stamp(&self, ts: u64) -> u64 {
+        self.newest_ts.map_or(ts, |newest| ts.min(newest))
     }
 }
 
@@ -853,6 +902,8 @@ impl MarketEvents {
                     self.force(FORCED_DISAGREEMENT);
                     return EventVerdict::Disagreement;
                 } else if let Some(slot) = self.resting.get_mut(&ev.order_id) {
+                    // Infallible — the match arm above holds the same key — and written as an `if
+                    // let` rather than an `expect` because a panic here kills every feed's ingest.
                     if size < floor {
                         slot.size = size;
                         slot.owner = Some(publisher);
@@ -1332,7 +1383,6 @@ pub struct Arbiter {
     /// How long a delivered order event is remembered (`--arb-book-dedup-window-ms`).
     book_dedup_window_ns: u64,
     /// The resurrection guard's venue-time tunables (`--arb-book-*`).
-    #[allow(dead_code)] // read by the frontier, which lands in the next commit
     book_guard: BookGuardConfig,
 }
 
@@ -1886,7 +1936,11 @@ impl Arbiter {
     /// One pass over the tracked markets, taken on the largest holder's own batches and only when it
     /// actually fell; every other batch stays O(1).
     fn observe_market_peak(&mut self, key: &MarketKey, n_dead: usize) {
-        if self.guard.peaks(key) && n_dead < self.guard.peak {
+        // A **material** fall only. Under the frontier the largest holder forgets on most of its
+        // batches, so re-seating on every downward step would put a pass over every tracked market on
+        // the ingest hot path at that market's batch rate — the same scan `shed_over_budget` refuses
+        // to make there. The gauge is a lagging high-water either way, and this only widens the lag.
+        if self.guard.peaks(key) && n_dead * 2 < self.guard.peak {
             let largest = self.largest_tombstone_holder();
             self.guard.reseat_peak(largest);
             return;
@@ -2020,9 +2074,12 @@ impl Arbiter {
         let cfg = self.book_guard;
         let ck = Self::channel_key(&key);
         let clock = self.clock_for(&ck);
-        let bounded = clock.observe(b.source_ts_ns, now, &cfg);
+        let bounded = clock.observe(b.source_ts_ns, now, now_ns(), &cfg);
         let reseated = clock.reseat(now, &cfg);
         let frontier = clock.frontier(&cfg);
+        // Every rule below judges and records this batch by the clamped stamp, never the raw one:
+        // see [`ChannelClock::stamp`].
+        let stamp = clock.stamp(b.source_ts_ns);
         let venue = b.venue.as_ref();
         if bounded {
             metrics()
@@ -2041,7 +2098,7 @@ impl Arbiter {
         // Rules 1 and 2 on **one** frontier value, which is the whole safety argument: an event is
         // admitted only while its entry is still present, so a stale change can never slip past an
         // entry this batch's own forgetting just dropped.
-        if frontier.is_some_and(|f| b.source_ts_ns < f) {
+        if frontier.is_some_and(|f| stamp < f) {
             // A refused batch **creates no state**. `book_events` is evicted alongside `book_markets`,
             // which is only tracked once something is published, so minting an entry here would let a
             // flood of forged `(channel, instrument_id)` keys carrying ancient stamps grow this map
@@ -2084,7 +2141,7 @@ impl Arbiter {
                 price_bits: c.price.to_bits(),
                 size_bits: c.size.to_bits(),
             };
-            match events.admit(ev, publisher, b.recv_ts_ns, b.source_ts_ns, window, budget) {
+            match events.admit(ev, publisher, b.recv_ts_ns, stamp, window, budget) {
                 EventVerdict::Deliver => kept.push(*c),
                 EventVerdict::Disagreement => disagreed += 1,
                 EventVerdict::Duplicate => deduped += 1,
@@ -6924,15 +6981,21 @@ mod tests {
     /// The work one batch does is bounded whatever state the market is in. Every other assertion here
     /// measures the *population*, which says nothing about the scan that maintains it — and a full
     /// rescan per datagram runs under the one mutex every receiver on every feed takes to emit.
+    ///
+    /// The state that matters is the one where a whole population becomes eligible at once, so the
+    /// stamps below step **inside** the forward bound: a jump past it is refused, the frontier never
+    /// advances, and the run then measures a market with nothing to forget — which is how this test
+    /// first passed while asserting nothing.
     #[test]
     fn the_work_one_batch_does_is_bounded_in_every_state() {
         const VENUE: &str = "BookFrontierWork";
         const POPULATION: u64 = 20_000;
+        const STEP: u64 = 4_000_000_000;
         let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
         a.set_book_guard(BookGuardConfig::DEFAULT);
         let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
-        // A population built inside one retention window, so none of it is forgettable yet: the state
-        // in which a scheduled full scan is at its most expensive.
+        // A population built at one venue stamp, so none of it is forgettable until the frontier
+        // clears that stamp — and then all of it is, at once.
         a.emit(
             removals(VENUE, 1..=POPULATION, 1_000),
             arm(1),
@@ -6940,12 +7003,10 @@ mod tests {
         );
         let mut worst = 0u64;
         let mut before = a.book_events[&key].examined;
-        for i in 0..40u64 {
-            // Past the window, so the whole population becomes forgettable at once — the one state in
-            // which an unbounded forget stalls the ingest path for milliseconds.
-            let t = 1_000 + BookGuardConfig::DEFAULT.retention_ns * 2 + i * SPACING_NS;
+        for i in 1..=40u64 {
+            let t = 1_000 + i * STEP;
             a.emit(
-                born_and_killed(VENUE, POPULATION + 1 + i, t, t),
+                born_and_killed(VENUE, POPULATION + i, t, t),
                 arm(1),
                 TEST_CATEGORY,
             );
@@ -6955,8 +7016,102 @@ mod tests {
         }
         let _ = drain_books(&mut rx);
         assert!(
+            worst >= WORK_BOUND,
+            "{worst} entries examined at most: the population never became forgettable, so this \
+             measured nothing"
+        );
+        assert!(
             worst <= WORK_BOUND + 64,
             "{worst} entries examined in one batch at a population of {POPULATION}"
+        );
+        assert!(
+            a.book_events[&key].n_dead < POPULATION as usize,
+            "the population never drained"
+        );
+    }
+
+    /// A stamp the forward bound refused is still served, so it can be unboundedly above the
+    /// channel's newest — and recorded unclamped it pins the head of the forgetting queue, which
+    /// holds every entry behind it too. The old design's out-of-queue sweep was what covered this
+    /// case; the clamp is what replaces it.
+    #[test]
+    fn a_bounded_far_future_removal_does_not_pin_the_forgetting_queue() {
+        const VENUE: &str = "BookFrontierPin";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1)]);
+        a.set_book_guard(BookGuardConfig::DEFAULT);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        // An hour behind the host clock, so every stamp below is inside the absolute anchor and the
+        // forward bound is the only thing that can refuse one.
+        let base = now_ns() - 3_600_000_000_000;
+        a.emit(born_and_killed(VENUE, 1, base, base), arm(1), TEST_CATEGORY);
+        // Fifty minutes ahead of the channel's newest against a five-second bound: refused as an
+        // advance, still served, and it must age from the channel's newest rather than from that.
+        a.emit(
+            born_and_killed(VENUE, 2, base + 3_000_000_000_000, base + 1),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        for i in 1..=60u64 {
+            let t = base + i * 1_000_000_000;
+            a.emit(born_and_killed(VENUE, 100 + i, t, t), arm(1), TEST_CATEGORY);
+        }
+        let _ = drain_books(&mut rx);
+        assert!(
+            !a.book_events[&key].resting.contains_key(&2),
+            "a stamp the forward bound refused must not outlive the window"
+        );
+        assert!(
+            a.book_events[&key].n_dead <= 64,
+            "{} entries held: one far-future stamp pinned the queue behind it",
+            a.book_events[&key].n_dead
+        );
+    }
+
+    /// A publisher whose clock **crawls** — a unit mismatch, an old-session replay, a forged source
+    /// stepping by a microsecond — has every one of its tiny advances accepted, so the
+    /// movement-keyed re-seat never elapses while every honest arm on the channel is refused as too
+    /// far ahead. The frontier then pins below the whole channel: nothing is refused, but nothing is
+    /// forgotten either, and the population grows until the process ceiling turns the guard back into
+    /// the count this design replaced.
+    ///
+    /// The crawler emits every 2 ms against a 20 ms wait, so the movement-keyed trigger cannot fire
+    /// and only the ahead-of-its-channel one can. That pacing is the test: without it the loop runs
+    /// faster than the wait, the movement trigger fires by accident, and this measures nothing.
+    #[test]
+    fn a_crawling_clock_does_not_starve_the_reseat() {
+        const VENUE: &str = "BookFrontierCrawl";
+        const ROUNDS: u64 = 40;
+        const STEP: u64 = 4_000_000_000;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_guard(BookGuardConfig {
+            reseat_after_ns: 20_000_000,
+            ..BookGuardConfig::DEFAULT
+        });
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        let base = now_ns() - 3_600_000_000_000;
+        // The crawler owns the clock: it seeds it, and every microsecond step it takes is accepted.
+        a.emit(
+            born_and_killed(VENUE, 1, 1_000, base),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        for i in 1..=ROUNDS {
+            let t = base + i * STEP;
+            a.emit(born_and_killed(VENUE, 100 + i, t, t), arm(1), TEST_CATEGORY);
+            a.emit(
+                born_and_killed(VENUE, 1_000_000 + i, 1_000 + i * 1_000, t + 1),
+                arm(2),
+                TEST_CATEGORY,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let _ = drain_books(&mut rx);
+        let held = a.book_events[&key].n_dead;
+        let span = ROUNDS * STEP / 1_000_000_000;
+        assert!(
+            held <= 32,
+            "{held} entries held over {span}s of venue time: the crawler held the frontier below \
+             the channel and nothing aged out"
         );
     }
 }

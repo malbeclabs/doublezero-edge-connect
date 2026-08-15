@@ -13,7 +13,9 @@ use doublezero_edge_connect::{
         arbiter::{Arbiter, BookGuardConfig, Publisher, TRADE_DEDUP_WINDOW},
         feeds::ArbitrationMode,
     },
-    model::{BookAction, BookChange, BookKey, BookReplay, BookSide, FeedMessage, NormalizedBook},
+    model::{
+        now_ns, BookAction, BookChange, BookKey, BookReplay, BookSide, FeedMessage, NormalizedBook,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -1206,9 +1208,10 @@ fn quick_reseat() -> BookGuardConfig {
     }
 }
 
-/// Long enough for the re-seat wait above to have elapsed on any host.
+/// Long enough for the re-seat wait above to have elapsed on any host. Generous on purpose: the
+/// assertion behind it is a correctness one, and a flake here reads as a guard regression.
 fn wait_for_reseat() {
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::thread::sleep(std::time::Duration::from_millis(50));
 }
 
 /// A peer synced from a different snapshot anchor never held the orders the serving arm is
@@ -1503,6 +1506,89 @@ fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
         consumer, venue,
         "a survivor behind the frontier must not be left dark"
     );
+}
+
+/// The forward bound caps one *step*, so a **stream** of stamps each just inside it ratchets the
+/// frontier arbitrarily far ahead of real venue time. Past that point every honest publisher on the
+/// channel is refused, the whole removed population ages out at once, and the forger's own stamps are
+/// the only ones left inside the window — a channel-wide blackout and a blind guard from one spoofed
+/// source. The absolute anchor against the host clock is what stops it, and it is the same check the
+/// quote and depth floors already apply to this field.
+#[test]
+fn a_stream_of_in_bound_stamps_cannot_ratchet_the_frontier_past_the_host_clock() {
+    let (mut a, mut rx, honest, forger) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+    let base = now_ns();
+
+    // The honest publisher opens the channel, and kills an order the guard must go on refusing.
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], base, base),
+        honest,
+        CATEGORY,
+    );
+    let dead = change(7, BookSide::Bid, 90.0, 6.0);
+    a.emit(
+        batch(vec![dead], base + 1_000, base + 1_000),
+        honest,
+        CATEGORY,
+    );
+    a.emit(
+        batch(
+            vec![change(7, BookSide::Bid, 90.0, 0.0)],
+            base + 2_000,
+            base + 2_000,
+        ),
+        honest,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // Two hundred batches, each one step inside the per-step forward bound. Nothing but an absolute
+    // anchor refuses these. They carry the forger's own order, which legitimately reaches the wire —
+    // this is an unauthenticated wire and nothing here stops a source publishing.
+    for i in 1..=200u64 {
+        let t = base + i * 4_900_000_000;
+        a.emit(
+            batch(
+                vec![change(9_000, BookSide::Ask, 500.0, 1.0 + i as f64)],
+                t,
+                base + i,
+            ),
+            forger,
+            CATEGORY,
+        );
+    }
+    venue.insert(9_000, (BookSide::Ask, 500.0, 201.0));
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // The honest publisher, stamping real venue time, must still be served.
+    venue.insert(2, (BookSide::Bid, 99.0, 3.0));
+    a.emit(
+        batch(
+            vec![change(2, BookSide::Bid, 99.0, 3.0)],
+            base + 3_000,
+            base + 3_000,
+        ),
+        honest,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer, venue,
+        "a stream of in-bound stamps must not strand the channel"
+    );
+
+    // And the guard must not have been emptied on the way: the order the venue removed stays removed.
+    a.emit(
+        batch(vec![dead], base + 4_000, base + 4_000),
+        forger,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue, "the ratchet must not empty the guard");
 }
 
 /// `EndOfSession` restarts the venue's clock as well as its id space. A new session that resumes

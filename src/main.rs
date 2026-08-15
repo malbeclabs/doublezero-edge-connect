@@ -365,7 +365,7 @@ struct Args {
         long = "arb-book-retention-secs",
         env = "DZ_ARB_BOOK_RETENTION_SECS",
         default_value_t = BOOK_GUARD.retention_ns / 1_000_000_000,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
     arb_book_retention_secs: u64,
 
@@ -377,7 +377,7 @@ struct Args {
         long = "arb-book-ts-jump-secs",
         env = "DZ_ARB_BOOK_TS_JUMP_SECS",
         default_value_t = BOOK_GUARD.max_ts_jump_ns / 1_000_000_000,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
     arb_book_ts_jump_secs: u64,
 
@@ -390,7 +390,7 @@ struct Args {
         long = "arb-book-reseat-secs",
         env = "DZ_ARB_BOOK_RESEAT_SECS",
         default_value_t = BOOK_GUARD.reseat_after_ns / 1_000_000_000,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
     arb_book_reseat_secs: u64,
 }
@@ -642,6 +642,23 @@ async fn main() -> Result<()> {
         transfer_win_rate: args.arb_transfer_win_rate,
         min_window_samples: args.arb_min_window_samples as usize,
     };
+    // The resurrection guard's venue-time tunables, validated here for the same reason: the two
+    // bounds are not independent. A jump bound at or above the retention window means one accepted
+    // jump puts the whole channel outside that window at once, which reads as a channel-wide book
+    // outage and takes a re-seat interval to clear — a typo with the same signature as an attack.
+    let book_guard = ingest::arbiter::BookGuardConfig {
+        retention_ns: args.arb_book_retention_secs * 1_000_000_000,
+        max_ts_jump_ns: args.arb_book_ts_jump_secs * 1_000_000_000,
+        reseat_after_ns: args.arb_book_reseat_secs * 1_000_000_000,
+    };
+    if book_guard.max_ts_jump_ns >= book_guard.retention_ns {
+        bail!(
+            "--arb-book-ts-jump-secs ({}) must be below --arb-book-retention-secs ({}): one \
+             accepted jump would otherwise put the whole channel outside the retention window",
+            args.arb_book_ts_jump_secs,
+            args.arb_book_retention_secs
+        );
+    }
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
         // Every registry venue, not just the selected ones: a message's venue comes from the wire
@@ -658,11 +675,7 @@ async fn main() -> Result<()> {
             args.arb_match_window_secs.saturating_mul(1_000_000_000),
         );
         a.set_book_dedup_window(args.arb_book_dedup_window_ms.saturating_mul(1_000_000));
-        a.set_book_guard(ingest::arbiter::BookGuardConfig {
-            retention_ns: args.arb_book_retention_secs.saturating_mul(1_000_000_000),
-            max_ts_jump_ns: args.arb_book_ts_jump_secs.saturating_mul(1_000_000_000),
-            reseat_after_ns: args.arb_book_reseat_secs.saturating_mul(1_000_000_000),
-        });
+        a.set_book_guard(book_guard);
         Arc::new(Mutex::new(a))
     };
 
