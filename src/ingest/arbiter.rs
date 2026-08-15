@@ -195,6 +195,34 @@ const DEFAULT_BOOK_DEDUP_WINDOW_NS: u64 = 1_000_000_000; // 1s
 /// same value, so the cost of a real disagreement is what it was measured at.
 const FORCED_REBASELINE_MIN_INTERVAL_NS: u64 = 250_000_000; // 250ms
 
+/// The cross-publisher resurrection guard's venue-time tunables (`--arb-book-*`), so the values a
+/// test-built arbiter guards on and the ones `--help` advertises cannot drift apart.
+#[derive(Clone, Copy, Debug)]
+pub struct BookGuardConfig {
+    /// How far behind a channel's newest venue stamp an order-level event may be and still be
+    /// admitted — and, by the same value, how long a removed order is remembered.
+    pub retention_ns: u64,
+    /// How far ahead of the channel's newest stamp a batch may be and still advance it.
+    pub max_ts_jump_ns: u64,
+    /// How long the channel's newest stamp may fail to *move* before it is re-seated from the
+    /// batches actually arriving.
+    pub reseat_after_ns: u64,
+}
+
+impl BookGuardConfig {
+    /// `retention_ns` is sized against a measured p99.99 inter-arm separation of 2.77 s and a
+    /// removal rate of 3,958/s per publisher per channel: ~119k removed entries on the flagship
+    /// channel, 11% of [`MAX_TOMBSTONES_TOTAL`]. `max_ts_jump_ns` sits comfortably below it, so one
+    /// legitimate jump cannot put a later batch outside the window. `reseat_after_ns` is ~3.6x that
+    /// separation — below it the hatch fires on ordinary jitter, above it a stuck frontier grows the
+    /// population unforgotten for that much longer.
+    pub const DEFAULT: Self = Self {
+        retention_ns: 30_000_000_000,
+        max_ts_jump_ns: 5_000_000_000,
+        reseat_after_ns: 10_000_000_000,
+    };
+}
+
 /// Which ingest source produced an update — the floor's per-tick leader identity. The edge
 /// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
 /// a single logical source with no multicast IP. Two distinct edge publishers therefore race as
@@ -674,6 +702,10 @@ struct MarketEvents {
     /// about the work per batch, which is where this guard's scheduling defect lived.
     #[cfg(test)]
     sweeps: u32,
+    /// Removed-order entries this market's forgetting has *looked at*, cumulative. The population
+    /// says nothing about the work one batch does, which is the quantity a per-batch bound is about.
+    #[cfg(test)]
+    examined: u64,
     /// Arms this market has seen, **append-only**: an arm's index here is its bit in a tombstone's
     /// reporter mask, so the list may never be reordered or compacted. Capped at eight, the width of
     /// that mask and of the authority's own per-scope arm cap.
@@ -884,6 +916,10 @@ impl MarketEvents {
     /// synced from different snapshot anchors is the ordinary way to get there.
     fn retire_settled(&mut self, budget: &mut GuardBudget) {
         while let Some(&id) = self.dead.front() {
+            #[cfg(test)]
+            {
+                self.examined += 1;
+            }
             // A queue entry whose slot is no longer a tombstone is the slack the order's re-add left
             // behind: drop it and go on.
             if let Some(&Slot::Tomb(by)) = self.resting.get(&id) {
@@ -919,6 +955,7 @@ impl MarketEvents {
         #[cfg(test)]
         {
             self.sweeps += 1;
+            self.examined += self.resting.len() as u64;
         }
         let known = self.known;
         let mut retired = 0usize;
@@ -1388,6 +1425,9 @@ pub struct Arbiter {
     guard: GuardBudget,
     /// How long a delivered order event is remembered (`--arb-book-dedup-window-ms`).
     book_dedup_window_ns: u64,
+    /// The resurrection guard's venue-time tunables (`--arb-book-*`).
+    #[allow(dead_code)] // read by the frontier, which lands in the next commit
+    book_guard: BookGuardConfig,
 }
 
 /// Who serves one `Sticky` venue's trade tape, per [`Arbiter::tape_arm_admits`].
@@ -1616,12 +1656,20 @@ impl Arbiter {
             invalidated_order: VecDeque::new(),
             guard: GuardBudget::default(),
             book_dedup_window_ns: DEFAULT_BOOK_DEDUP_WINDOW_NS,
+            book_guard: BookGuardConfig::DEFAULT,
         }
     }
 
     /// How long a delivered order event stays in the racing window (`--arb-book-dedup-window-ms`).
     pub fn set_book_dedup_window(&mut self, window_ns: u64) {
         self.book_dedup_window_ns = window_ns;
+    }
+
+    /// Install the resurrection guard's venue-time tunables (`--arb-book-*`). Called once at
+    /// startup; without it the guard takes [`BookGuardConfig::DEFAULT`], the same values `main.rs`'s
+    /// clap defaults are derived from.
+    pub fn set_book_guard(&mut self, cfg: BookGuardConfig) {
+        self.book_guard = cfg;
     }
 
     /// Report one publisher's order-level book sync state for a market — the seam the Market-by-Order
@@ -1877,6 +1925,17 @@ impl Arbiter {
     /// the authority entry alone, because a peer arm that did not see the session end is still serving
     /// this market and tearing its published book down is the failure that variant exists to avoid.
     pub fn reset_book_events_for_market(&mut self, key: &MarketKey) {
+        self.drop_book_events(key);
+    }
+
+    /// The **session** boundary's variant of [`Self::reset_book_events_for_market`]: the same drop,
+    /// plus whatever the channel's own venue clock holds. `EndOfSession` restarts the venue's clock as
+    /// well as its id space, and a new session that resumes *below* the old one's newest stamp would
+    /// otherwise have every batch refused as ancient.
+    ///
+    /// Separate from the per-instrument seam on purpose: `InstrumentReset` restarts one instrument's
+    /// sequence space, not the venue's clock, and must not touch the channel.
+    pub fn reset_book_session_for_market(&mut self, key: &MarketKey) {
         self.drop_book_events(key);
     }
 
@@ -7736,5 +7795,195 @@ mod tests {
         assert_eq!(a.book_markets.len(), MAX_BOOK_MARKETS);
         assert!(a.book_sync.len() <= MAX_BOOK_MARKETS);
         assert!(a.book_events.len() <= MAX_BOOK_MARKETS);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The venue-time frontier. Everything below reads private state — the removed population and
+    // the work one batch does — which is why it is here rather than in
+    // `tests/order_level_consumer_book.rs` with the rest of this design's net.
+    // -----------------------------------------------------------------------------------------
+
+    /// One order-level batch stamped with the venue's own time as well as with the arrival clock. The
+    /// two are different quantities: the real publishers stamp an event they both saw identically in
+    /// `source_ts_ns`, and a lagging arm is late in `recv_ts_ns` alone.
+    fn l3_batch_at(
+        venue: &str,
+        changes: Vec<BookChange>,
+        source_ts: u64,
+        recv_ns: u64,
+    ) -> FeedMessage {
+        let FeedMessage::Book(mut b) = l3_batch(venue, changes, recv_ns) else {
+            unreachable!()
+        };
+        b.source_ts_ns = source_ts;
+        FeedMessage::Book(b)
+    }
+
+    /// One order's whole life in a single batch: added and removed at the same venue stamp, which is
+    /// how a scenario drives a removal rate without also driving the live-floor population.
+    fn born_and_killed(venue: &str, order_id: u64, source_ts: u64, recv_ns: u64) -> FeedMessage {
+        l3_batch_at(
+            venue,
+            vec![
+                order(BookAction::Update, order_id, 100.0, 1.0),
+                order(BookAction::Delete, order_id, 100.0, 0.0),
+            ],
+            source_ts,
+            recv_ns,
+        )
+    }
+
+    /// Mirrors the implementation's per-batch bound on how many removed entries one batch may forget.
+    /// A wrong value here makes the assertion weaker, never wrong.
+    const WORK_BOUND: u64 = 4_096;
+
+    /// One venue event every 100 ms of venue time, so a retention window of 30 s holds 300 removals
+    /// whatever the arms are doing.
+    const SPACING_NS: u64 = 100_000_000;
+    const REMOVALS: u64 = 900;
+    const IN_WINDOW: usize = (BookGuardConfig::DEFAULT.retention_ns / SPACING_NS) as usize;
+
+    /// Two arms recovered from different snapshot anchors: the peer is synced and never reports any of
+    /// these removals, because its own anchor never held the orders. The population the guard holds
+    /// must still be the removals inside the retention window rather than the market's whole history —
+    /// under a consensus rule it is the history, and the market is eventually disowned for it.
+    #[test]
+    fn the_removed_population_tracks_the_window_not_the_anchor_difference() {
+        const VENUE: &str = "BookFrontierAnchors";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_guard(BookGuardConfig::DEFAULT);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        for i in 0..REMOVALS {
+            let t = 1_000 + i * SPACING_NS;
+            a.emit(born_and_killed(VENUE, 100 + i, t, t), arm(1), TEST_CATEGORY);
+        }
+        let _ = drain_books(&mut rx);
+        let held = a.book_events[&key].n_dead;
+        assert!(
+            held <= IN_WINDOW + 64,
+            "{held} removed entries held for {REMOVALS} removals spanning \
+             {}s of venue time, against a {}s window",
+            REMOVALS * SPACING_NS / 1_000_000_000,
+            BookGuardConfig::DEFAULT.retention_ns / 1_000_000_000
+        );
+        assert_eq!(a.guard.held, held);
+    }
+
+    /// A laggard redelivering one removal over and over must not hold that entry open. Its copies are
+    /// published — idempotent against an entry that already records the order as gone — but the entry
+    /// ages from the removal, not from the last copy of it, or one quiet arm pins the head of the queue
+    /// and every entry behind it for as long as it keeps repeating itself.
+    #[test]
+    fn a_repeated_removal_does_not_hold_its_entry_above_the_frontier() {
+        const VENUE: &str = "BookFrontierRepeat";
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_guard(BookGuardConfig::DEFAULT);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        a.emit(
+            born_and_killed(VENUE, 7, 1_000, 1_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+
+        // The leader carries the channel's clock two retention windows past that removal while the
+        // laggard keeps redelivering its own copy of it, each copy stamped later than the last.
+        let span = 2 * BookGuardConfig::DEFAULT.retention_ns;
+        for i in 1..=60u64 {
+            let t = 1_000 + i * span / 60;
+            a.emit(born_and_killed(VENUE, 100 + i, t, t), arm(1), TEST_CATEGORY);
+            a.emit(
+                l3_batch_at(
+                    VENUE,
+                    vec![order(BookAction::Delete, 7, 100.0, 0.0)],
+                    t,
+                    t + 1,
+                ),
+                arm(2),
+                TEST_CATEGORY,
+            );
+        }
+        let _ = drain_books(&mut rx);
+        assert!(
+            !a.book_events[&key].resting.contains_key(&7),
+            "a redelivered removal must not keep its own entry alive"
+        );
+    }
+
+    /// The population is the removals inside the retention window, whatever the arms' arrival lag is.
+    /// A consensus rule makes it the removals in flight instead, so it grows with the lag without
+    /// bound; the venue-time frontier is what makes the figure a constant the host can be sized for.
+    #[test]
+    fn the_removed_population_tracks_the_window_not_the_lag() {
+        for lag_ns in [1_000_000_000u64, 10_000_000_000, 60_000_000_000] {
+            let venue: &'static str =
+                Box::leak(format!("BookFrontierLag{lag_ns}").into_boxed_str());
+            let (mut a, mut rx) = racing(venue, &[arm(1), arm(2)]);
+            a.set_book_guard(BookGuardConfig::DEFAULT);
+            a.set_book_dedup_window(1_000_000_000);
+            let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
+            // (arrival, the venue's own stamp — identical on both arms' copies, arm).
+            let mut arrivals: Vec<(u64, u64, Publisher)> = Vec::new();
+            for i in 0..REMOVALS {
+                let t = 1_000 + i * SPACING_NS;
+                arrivals.push((t, t, arm(1)));
+                arrivals.push((t + lag_ns, t, arm(2)));
+            }
+            arrivals.sort_by_key(|&(at, _, p)| (at, p != arm(1)));
+            // The **peak**, not the figure the run ends on: by the last arrival the trailing arm has
+            // caught up entirely, so a terminal reading is near zero at every lag and measures
+            // nothing.
+            let mut peak = 0usize;
+            for (at, ts, p) in arrivals {
+                let id = 100 + (ts - 1_000) / SPACING_NS;
+                a.emit(born_and_killed(venue, id, ts, at), p, TEST_CATEGORY);
+                peak = peak.max(a.book_events[&key].n_dead);
+            }
+            let _ = drain_books(&mut rx);
+            assert!(
+                peak <= IN_WINDOW + 64,
+                "{peak} removed entries held at {}s of inter-arm lag, against a window that \
+                 holds {IN_WINDOW}",
+                lag_ns / 1_000_000_000
+            );
+        }
+    }
+
+    /// The work one batch does is bounded whatever state the market is in. Every other assertion here
+    /// measures the *population*, which says nothing about the scan that maintains it — and a full
+    /// rescan per datagram runs under the one mutex every receiver on every feed takes to emit.
+    #[test]
+    fn the_work_one_batch_does_is_bounded_in_every_state() {
+        const VENUE: &str = "BookFrontierWork";
+        const POPULATION: u64 = 20_000;
+        let (mut a, mut rx) = racing(VENUE, &[arm(1), arm(2)]);
+        a.set_book_guard(BookGuardConfig::DEFAULT);
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        // A population built inside one retention window, so none of it is forgettable yet: the state
+        // in which a scheduled full scan is at its most expensive.
+        a.emit(
+            removals(VENUE, 1..=POPULATION, 1_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let mut worst = 0u64;
+        let mut before = a.book_events[&key].examined;
+        for i in 0..40u64 {
+            // Past the window, so the whole population becomes forgettable at once — the one state in
+            // which an unbounded forget stalls the ingest path for milliseconds.
+            let t = 1_000 + BookGuardConfig::DEFAULT.retention_ns * 2 + i * SPACING_NS;
+            a.emit(
+                born_and_killed(VENUE, POPULATION + 1 + i, t, t),
+                arm(1),
+                TEST_CATEGORY,
+            );
+            let now = a.book_events[&key].examined;
+            worst = worst.max(now - before);
+            before = now;
+        }
+        let _ = drain_books(&mut rx);
+        assert!(
+            worst <= WORK_BOUND + 64,
+            "{worst} entries examined in one batch at a population of {POPULATION}"
+        );
     }
 }

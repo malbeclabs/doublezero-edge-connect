@@ -10,7 +10,7 @@
 
 use doublezero_edge_connect::{
     ingest::{
-        arbiter::{Arbiter, Publisher, TRADE_DEDUP_WINDOW},
+        arbiter::{Arbiter, BookGuardConfig, Publisher, TRADE_DEDUP_WINDOW},
         feeds::ArbitrationMode,
     },
     model::{BookAction, BookChange, BookKey, BookReplay, BookSide, FeedMessage, NormalizedBook},
@@ -350,6 +350,11 @@ const GUARDED_ORDERS: u64 = GUARD_CAP / 2;
 /// Mirrors the arbiter's private `MAX_MARKET_TOMBSTONES`: how many removed orders one market's
 /// resurrection guard holds before it can no longer answer.
 const MARKET_TOMBSTONES: u64 = 65_536;
+
+/// Mirrors the default `--arb-book-retention-secs`: how far behind a channel's newest venue stamp an
+/// order-level event may be and still be admitted. A wrong value here makes a scenario weaker, never
+/// wrong.
+const RETENTION_NS: u64 = 30_000_000_000;
 
 /// The wiring every scenario shares: one order-level market on a two-publisher venue, both arms
 /// synced, racing exactly as the Market-by-Order processor drives it.
@@ -1282,5 +1287,374 @@ fn a_peers_rebaseline_does_not_displace_a_served_book() {
     assert_eq!(
         clears, 1,
         "only the serving arm's re-baseline reaches the wire"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The venue-time frontier, at consumer altitude. What the merge point forgets is decided by how
+// far behind the channel's newest venue stamp an event is — not by agreement between the arms —
+// so every scenario below drives `source_ts_ns` and reads the broadcast.
+// ---------------------------------------------------------------------------------------------
+
+/// How many `Clear`-led batches reached the wire. A forced re-baseline is one, and it is how a
+/// scenario sees the merge point give up on serving a market from deltas.
+fn clears(published: &[NormalizedBook]) -> usize {
+    published
+        .iter()
+        .filter(|b| {
+            b.changes
+                .first()
+                .is_some_and(|c| c.action == BookAction::Clear)
+        })
+        .count()
+}
+
+/// The guard's tunables as a scenario needs them: the shipped retention window, and a re-seat wait
+/// short enough that a test can cross it with a millisecond of real time. The wait is measured on a
+/// monotonic clock inside the arbiter, so it has no other seam — the same limitation
+/// `PEER_SERVING_NS` has.
+fn quick_reseat() -> BookGuardConfig {
+    BookGuardConfig {
+        reseat_after_ns: 1_000_000,
+        ..BookGuardConfig::DEFAULT
+    }
+}
+
+/// Long enough for the re-seat wait above to have elapsed on any host.
+fn wait_for_reseat() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+/// A peer synced from a different snapshot anchor never held the orders the serving arm is
+/// removing, so it can never report those removals. It must not cost the market anything: under a
+/// consensus rule the population grows with the market's whole history until a cap gives way and the
+/// market goes dark — one publisher's anchor blacking out a market every consumer is watching.
+#[test]
+fn an_arm_that_never_held_the_removed_orders_does_not_darken_the_market() {
+    let (mut a, mut rx, leader, quiet) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    // Both arms install. The quiet arm's copy is dropped — the leader is serving — but that dropped
+    // batch is still the moment it starts counting as an arm of this market, and it reports nothing
+    // from here on.
+    venue.insert(1, (BookSide::Bid, 90.0, 1.0));
+    a.emit(snapshot(&venue, 1_000, 1_000), leader, CATEGORY);
+    a.emit(snapshot(&venue, 1_001, 1_001), quiet, CATEGORY);
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // Far more removals than the count cap this design deletes, chunked only so the scenario is a
+    // few dozen batches rather than 131,072 of them.
+    const CHUNK: u64 = 2_048;
+    for c in 0..=(MARKET_TOMBSTONES / CHUNK) {
+        let (base, at) = (100 + c * CHUNK, 10_000 + c * 1_000_000);
+        let ids = base..base + CHUNK;
+        let adds = ids
+            .clone()
+            .map(|id| change(id, BookSide::Ask, 200.0, 1.0))
+            .collect();
+        let deletes = ids
+            .map(|id| change(id, BookSide::Ask, 200.0, 0.0))
+            .collect();
+        a.emit(batch(adds, at, at), leader, CATEGORY);
+        a.emit(batch(deletes, at + 1_000, at + 1_000), leader, CATEGORY);
+        drain_into(&mut rx, &mut consumer);
+        assert_eq!(
+            consumer, venue,
+            "the consumer must track the venue throughout"
+        );
+    }
+
+    // And the market is still being served.
+    venue.insert(2, (BookSide::Bid, 100.0, 5.0));
+    a.emit(
+        batch(
+            vec![change(2, BookSide::Bid, 100.0, 5.0)],
+            90_000_000,
+            90_000_000,
+        ),
+        leader,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer, venue,
+        "a market a peer never reached must not go dark"
+    );
+}
+
+/// A link that returns after minutes away delivers a **contiguous** backlog: sequence-valid, so
+/// `ingest::book` sees no gap and demands no snapshot, and every event carrying the venue stamp it
+/// was born with. Nothing upstream of the merge point can refuse it, and none of it describes the
+/// book a consumer holds now.
+///
+/// Nothing it sends while beyond the frontier may reach the wire — not as a change, and not as the
+/// forced re-baseline a stale claim about a partially-filled order would otherwise raise.
+#[test]
+fn a_returning_links_contiguous_backlog_reaches_no_consumer() {
+    let (mut a, mut rx, leader, returning) = harness();
+    a.set_book_dedup_window(1_000_000_000);
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    // The leader streams a market's life across two retention windows of venue time while the
+    // returning arm's link is down.
+    let events = lifecycle_stream(60);
+    let spacing = 2 * RETENTION_NS / events.len() as u64;
+    let stamps: Vec<u64> = (0..events.len() as u64)
+        .map(|i| 1_000 + i * spacing)
+        .collect();
+    for (i, &e) in events.iter().enumerate() {
+        venue_apply(&mut venue, e);
+        a.emit(
+            batch(vec![ev_change(e)], stamps[i], stamps[i]),
+            leader,
+            CATEGORY,
+        );
+        drain_into(&mut rx, &mut consumer);
+    }
+    assert_eq!(consumer, venue);
+
+    // The link returns and replays everything it buffered, in order and at its original stamps.
+    let arrival_base = 1_000 + events.len() as u64 * spacing;
+    let mut published = Vec::new();
+    for (i, &e) in events.iter().enumerate() {
+        a.emit(
+            batch(vec![ev_change(e)], stamps[i], arrival_base + i as u64),
+            returning,
+            CATEGORY,
+        );
+        published.extend(drain_published(&mut rx, &mut consumer));
+        assert_eq!(consumer, venue, "diverged replaying backlog event {i}");
+    }
+    assert_eq!(
+        clears(&published),
+        0,
+        "a backlog older than the frontier must not force a re-baseline"
+    );
+    // Only the tail of the backlog is inside the window at all, and every event in it is one the
+    // leader has already published, so what crosses is bounded by the window rather than by the
+    // backlog's length.
+    assert!(
+        published.len() <= events.len() / 2 + 1,
+        "{} of {} backlog events reached the wire",
+        published.len(),
+        events.len()
+    );
+}
+
+/// A gap that takes the **whole channel** away: every arm returns with stamps far past anything the
+/// frontier has seen. The forward bound refuses the advance — it cannot tell "the publisher jumped"
+/// from "we were away" — but the batches themselves must still be processed, or the channel wedges
+/// permanently: the frontier only advances from what it accepts, so after one legitimate jump every
+/// later batch is further ahead than the last.
+#[test]
+fn a_whole_channel_gap_past_the_forward_bound_resumes() {
+    let (mut a, mut rx, leader, trailer) = harness();
+    a.set_book_guard(quick_reseat());
+    a.set_book_dedup_window(1_000);
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    let before_gap = 1_000u64;
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    a.emit(
+        batch(
+            vec![change(1, BookSide::Bid, 100.0, 5.0)],
+            before_gap,
+            before_gap,
+        ),
+        leader,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // Ten minutes of venue time later — orders of magnitude past the forward bound — the channel
+    // comes back.
+    wait_for_reseat();
+    let after_gap = before_gap + 600_000_000_000;
+    for (i, (id, px, sz)) in [(2u64, 101.0, 3.0), (3, 102.0, 4.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let t = after_gap + i as u64 * 1_000_000;
+        venue.insert(id, (BookSide::Ask, px, sz));
+        a.emit(
+            batch(vec![change(id, BookSide::Ask, px, sz)], t, t),
+            leader,
+            CATEGORY,
+        );
+        drain_into(&mut rx, &mut consumer);
+        assert_eq!(consumer, venue, "the channel must resume after the gap");
+    }
+
+    // And once it has resumed, a copy from before the gap is ancient and must not walk the consumer
+    // back to it.
+    venue.insert(1, (BookSide::Bid, 100.0, 2.0));
+    a.emit(
+        batch(
+            vec![change(1, BookSide::Bid, 100.0, 2.0)],
+            after_gap + 2_000_000,
+            after_gap + 2_000_000,
+        ),
+        leader,
+        CATEGORY,
+    );
+    a.emit(
+        batch(
+            vec![change(1, BookSide::Bid, 100.0, 5.0)],
+            before_gap,
+            after_gap + 3_000_000,
+        ),
+        trailer,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer, venue,
+        "a pre-gap copy must not reach the consumer once the frontier has caught up"
+    );
+}
+
+/// A market whose snapshot installs with no pending delta past its anchor emits its re-baseline
+/// stamped **`0`** — the book's age, not a delivery time. That is every cold start and the idle
+/// majority of a busy channel, and the frontier a busy market on the same channel holds must not
+/// refuse it: it is the market's only bootstrap.
+#[test]
+fn a_cold_start_market_stamped_zero_still_bootstraps() {
+    let (mut a, mut rx, leader, _peer) = harness_over(&[INSTRUMENT, INSTRUMENT_B]);
+    let (mut busy, mut idle) = (Book::new(), Book::new());
+    let mut markets: BTreeMap<u32, Book> = BTreeMap::new();
+
+    // The busy market carries the channel's clock a minute forward.
+    for i in 0..60u64 {
+        let t = 1_000 + i * 1_000_000_000;
+        busy.insert(i, (BookSide::Bid, 100.0 + i as f64, 1.0));
+        a.emit(
+            batch_for(
+                INSTRUMENT,
+                vec![change(i, BookSide::Bid, 100.0 + i as f64, 1.0)],
+                t,
+                t,
+            ),
+            leader,
+            CATEGORY,
+        );
+    }
+    let newest = 1_000 + 59 * 1_000_000_000;
+
+    // The idle market installs its book, stamped with the age of a book nothing has moved.
+    idle.insert(500, (BookSide::Ask, 50.0, 2.0));
+    idle.insert(501, (BookSide::Ask, 51.0, 3.0));
+    a.emit(
+        snapshot_for(INSTRUMENT_B, &idle, 0, newest + 1),
+        leader,
+        CATEGORY,
+    );
+    drain_markets(&mut rx, &mut markets);
+    assert_eq!(
+        markets.get(&INSTRUMENT_B).cloned().unwrap_or_default(),
+        idle,
+        "a market stamped 0 must still bootstrap"
+    );
+
+    // And the orders it seeded go on being served.
+    idle.insert(500, (BookSide::Ask, 50.0, 1.0));
+    a.emit(
+        batch_for(
+            INSTRUMENT_B,
+            vec![change(500, BookSide::Ask, 50.0, 1.0)],
+            newest + 1_000_000,
+            newest + 1_000_000,
+        ),
+        leader,
+        CATEGORY,
+    );
+    drain_markets(&mut rx, &mut markets);
+    assert_eq!(
+        markets.get(&INSTRUMENT_B).cloned().unwrap_or_default(),
+        idle
+    );
+    assert_eq!(markets.get(&INSTRUMENT).cloned().unwrap_or_default(), busy);
+}
+
+/// The arm carrying a channel's clock dies while the survivor is minutes behind it. Everything the
+/// survivor has to send is older than the frontier the dead arm left, so without a way to re-seat
+/// that frontier the market is dark for the life of the process.
+#[test]
+fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
+    let (mut a, mut rx, leader, survivor) = harness();
+    a.set_book_guard(quick_reseat());
+    a.set_book_dedup_window(1_000);
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    let ahead = 300_000_000_000u64;
+    venue.insert(1, (BookSide::Bid, 100.0, 5.0));
+    a.emit(
+        batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], ahead, ahead),
+        leader,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // The leader's host is drained. The survivor is 100 s of venue time behind it — far past the
+    // retention window — and is now the only arm there is.
+    a.forget_publisher_books(VENUE, leader);
+    wait_for_reseat();
+    let behind = ahead - 100_000_000_000;
+    venue.insert(2, (BookSide::Ask, 101.0, 3.0));
+    a.emit(
+        batch(
+            vec![change(2, BookSide::Ask, 101.0, 3.0)],
+            behind,
+            ahead + 1_000_000,
+        ),
+        survivor,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer, venue,
+        "a survivor behind the frontier must not be left dark"
+    );
+}
+
+/// `EndOfSession` restarts the venue's clock as well as its id space. A new session that resumes
+/// *below* the old one's newest stamp is not stale data — it is the only data there is.
+#[test]
+fn a_session_whose_clock_restarts_lower_keeps_publishing() {
+    let (mut a, mut rx, only, _peer) = harness();
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    for i in 0..60u64 {
+        let t = 1_000 + i * 1_000_000_000;
+        venue.insert(i, (BookSide::Bid, 100.0 + i as f64, 1.0));
+        a.emit(
+            batch(vec![change(i, BookSide::Bid, 100.0 + i as f64, 1.0)], t, t),
+            only,
+            CATEGORY,
+        );
+    }
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // The session ends, exactly as the Market-by-Order processor reports it, and the next one starts
+    // its clock over.
+    a.reset_book_session_for_market(&market(INSTRUMENT));
+    let after = 5_000u64;
+    venue.insert(900, (BookSide::Ask, 200.0, 7.0));
+    a.emit(
+        batch(
+            vec![change(900, BookSide::Ask, 200.0, 7.0)],
+            after,
+            60_000_000_000,
+        ),
+        only,
+        CATEGORY,
+    );
+    drain_into(&mut rx, &mut consumer);
+    assert_eq!(
+        consumer, venue,
+        "a session that restarts its clock must keep publishing"
     );
 }
