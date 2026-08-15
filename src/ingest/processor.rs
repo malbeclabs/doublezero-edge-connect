@@ -1076,7 +1076,10 @@ impl MboProcessor {
         let mut arb = lock(ctx.arbiter);
         for key in self.books.keys().filter(|(p, _)| *p == ctx.publisher) {
             if let Some(market) = self.market_key(key, ctx) {
-                arb.reset_book_events_for_market(&market);
+                // The session variant: a boundary restarts the venue's *clock* as well as its id
+                // space, so the channel's venue-time frontier goes with the racing state. The
+                // per-instrument seam (`InstrumentReset`) must not, which is why they are two calls.
+                arb.reset_book_session_for_market(&market);
             }
         }
     }

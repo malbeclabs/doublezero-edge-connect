@@ -967,6 +967,74 @@ fn an_arm_behind_in_arrival_only_does_not_drift_the_consumer() {
     }
 }
 
+/// A venue-time skew wide enough, and a dedup window narrow enough, that the trailing arm's copies
+/// reach the frontier's rules instead of collapsing as duplicates first.
+///
+/// ⚠️ `a_venue_time_skew_alone_does_not_drift_the_consumer` above cannot do this and is **still**
+/// unfalsifiable by a mutation that swaps venue time for arrival time: its copies are duplicates,
+/// short-circuited before any rule reads a stamp. This is the scenario that actually measures it —
+/// a copy older than the last change published for that order is refused rather than republished, so
+/// swapping the two stamps changes what reaches the wire.
+#[test]
+fn a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy() {
+    let (mut a, mut rx, leader, trailer) = harness();
+    a.set_book_dedup_window(1_000); // 1 µs: nothing collapses as a duplicate
+    let (mut venue, mut consumer) = (Book::new(), Book::new());
+
+    // The order is added, then filled down. Both changes are the leader's.
+    for (i, sz) in [5.0f64, 2.0].into_iter().enumerate() {
+        let t = 1_000_000 + i as u64 * 1_000_000;
+        venue.insert(1, (BookSide::Bid, 100.0, sz));
+        a.emit(
+            batch(vec![change(1, BookSide::Bid, 100.0, sz)], t, t),
+            leader,
+            CATEGORY,
+        );
+    }
+    let mut published = drain_published(&mut rx, &mut consumer);
+    assert_eq!(consumer, venue);
+
+    // The trailer's copy of the *add*, arriving now and stamped with the venue time it happened at.
+    // Nothing about its arrival says it is old; only its venue stamp does.
+    a.emit(
+        batch(
+            vec![change(1, BookSide::Bid, 100.0, 5.0)],
+            1_000_000,
+            9_000_000,
+        ),
+        trailer,
+        CATEGORY,
+    );
+    published.extend(drain_published(&mut rx, &mut consumer));
+    assert_eq!(
+        published.len(),
+        2,
+        "a copy older than the order's last published change must not reach the wire"
+    );
+
+    // And it is refused as *stale*, not as a size disagreement. The two are indistinguishable from
+    // what was published — both suppress the copy — but a disagreement forces a re-baseline, which the
+    // next batch discharges as a `Clear`. That `Clear` is the difference, and it is what the venue
+    // stamp buys: read the arrival clock here instead and this arm's copy reads as drift.
+    venue.insert(2, (BookSide::Ask, 101.0, 4.0));
+    a.emit(
+        batch(
+            vec![change(2, BookSide::Ask, 101.0, 4.0)],
+            10_000_000,
+            10_000_000,
+        ),
+        leader,
+        CATEGORY,
+    );
+    published.extend(drain_published(&mut rx, &mut consumer));
+    assert_eq!(
+        clears(&published),
+        0,
+        "a stale copy must not read as drift and force a re-baseline"
+    );
+    assert_eq!(consumer, venue);
+}
+
 /// Two arms recovered from **different snapshot anchors**: the first holds an order the venue
 /// killed before the second's newer snapshot was taken. The arm that holds it is the only one
 /// that can remove it, and the market must go on being served either way.

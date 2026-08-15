@@ -210,16 +210,31 @@ pub struct Metrics {
     /// Order-level markets forced to re-baseline because two arms claimed different resting state for
     /// one order (`reason="disagreement"`).
     pub mbo_forced_rebaselines: IntCounterVec,
-    /// Order-level markets disowned because the resurrection guard lost a tombstone no serving arm had
-    /// passed. The market publishes nothing until a producer re-baselines it, so this is an
-    /// availability alarm, not a throughput figure.
-    pub mbo_market_invalidations: IntCounterVec,
-    /// Tombstones the resurrection guard holds across every tracked market, against the process-wide
-    /// ceiling. The headroom to watch: it is readable long before the guard runs out of it.
+    /// Order-level changes refused because the batch carrying them is older than its channel's
+    /// retention window — a link returning with a backlog, or a forged replay. Expected to spike once
+    /// per recovery and sit at zero otherwise.
+    pub mbo_events_past_frontier: IntCounterVec,
+    /// Order-level changes refused because they are older than the last change the market published
+    /// for that same order. The lagging-copy case the retention window is too coarse to catch, and
+    /// what keeps a stale copy of a partially-filled order from reading as a size disagreement.
+    pub mbo_events_stale: IntCounterVec,
+    /// Batches whose venue stamp was too far ahead of their channel's newest to advance it. The batch
+    /// is still processed; a sustained rate means the forward bound is being hit by ordinary jitter
+    /// and `--arb-book-ts-jump-secs` is too tight.
+    pub mbo_frontier_bounded: IntCounterVec,
+    /// Channel frontiers re-seated from the batches actually arriving, because the newest stamp had
+    /// stopped moving. One per genuine gap, session restart or clock jump.
+    pub mbo_frontier_reseats: IntCounterVec,
+    /// Removed-order entries forgotten by the process-wide ceiling rather than by age. Non-zero means
+    /// the retention window is holding more than the host was sized for; the guard's reach is shorter
+    /// than the window claims for as long as it lasts.
+    pub mbo_guard_ceiling_evictions: IntCounter,
+    /// Removed orders the resurrection guard holds across every tracked market, against the
+    /// process-wide ceiling. The headroom to watch: it is readable long before the guard runs out of it.
     pub mbo_guarded_tombstones: IntGauge,
-    /// The largest tombstone population any single market holds, against the per-market cap — which is
-    /// a sixteenth of the process-wide one, and so the cap that fires first. Unlabelled: the market is
-    /// wire-supplied and there are up to 16,384 of them.
+    /// The largest removed population any single market holds, against the same process-wide ceiling.
+    /// Alert on this rather than on the aggregate: one market walking away from the rest is flat
+    /// headroom on the sum. Unlabelled: the market is wire-supplied and there are up to 16,384 of them.
     pub mbo_guarded_tombstones_max: IntGauge,
 
     // --- Market-by-price processor (per `venue`) ---
@@ -736,29 +751,59 @@ impl Metrics {
                  reconsider the per-publisher book model.",
                 &["venue", "reason"],
             ),
-            mbo_market_invalidations: counter_vec(
+            mbo_events_past_frontier: counter_vec(
                 &registry,
-                "dz_mbo_market_invalidations_total",
-                "Order-level markets disowned because the resurrection guard lost a tombstone no \
-                 serving arm had passed, so a lagging publisher's stale add for that order could no \
-                 longer be refused. The market's state is dropped and nothing is published for it \
-                 until a publisher re-baselines it, which is an outage for that market.",
+                "dz_mbo_events_past_frontier_total",
+                "Order-level changes refused because their batch is older than the channel's \
+                 retention window (--arb-book-retention-secs). A returning link's backlog, or a \
+                 replay of one: expected to spike once per recovery and to sit at zero otherwise.",
                 &["venue"],
+            ),
+            mbo_events_stale: counter_vec(
+                &registry,
+                "dz_mbo_events_stale_total",
+                "Order-level changes refused because they are older than the last change published \
+                 for that same order. The lagging-copy case the retention window is too coarse to \
+                 catch; in steady state this is the trailing publisher's stale copies of orders the \
+                 leader has since filled.",
+                &["venue"],
+            ),
+            mbo_frontier_bounded: counter_vec(
+                &registry,
+                "dz_mbo_frontier_bounded_total",
+                "Batches whose venue stamp was too far ahead of their channel's newest to advance it \
+                 (--arb-book-ts-jump-secs). The batch is still processed. A sustained rate means the \
+                 bound is catching ordinary jitter rather than a bad stamp.",
+                &["venue"],
+            ),
+            mbo_frontier_reseats: counter_vec(
+                &registry,
+                "dz_mbo_frontier_reseats_total",
+                "Channel frontiers re-seated from the batches actually arriving, after the newest \
+                 venue stamp stopped moving for --arb-book-reseat-secs. One per genuine gap, session \
+                 restart or publisher clock jump.",
+                &["venue"],
+            ),
+            mbo_guard_ceiling_evictions: counter(
+                &registry,
+                "dz_mbo_guard_ceiling_evictions_total",
+                "Removed-order entries forgotten by the process-wide ceiling rather than by age. \
+                 Non-zero means the retention window is holding more than the host was sized for, and \
+                 the resurrection guard's reach is shorter than the window claims until it clears.",
             ),
             mbo_guarded_tombstones: gauge(
                 &registry,
                 "dz_mbo_guarded_tombstones",
                 "Removed orders the cross-publisher resurrection guard is holding across every \
-                 tracked market, against a process-wide ceiling of 1048576. Sized by how far the \
-                 publishers lag each other; reaching the ceiling is what invalidates markets.",
+                 tracked market, against a process-wide ceiling of 1048576. Sized by the retention \
+                 window and the venue's removal rate, not by how far the publishers lag each other.",
             ),
             mbo_guarded_tombstones_max: gauge(
                 &registry,
                 "dz_mbo_guarded_tombstones_max",
-                "The largest tombstone population any single order-level market holds, against a \
-                 per-market cap of 65536 — a sixteenth of the process-wide ceiling, and so the cap \
-                 that fires first. Alert on this rather than on the aggregate: one market walking to \
-                 its own cap, and to a blackout, is flat headroom on the sum.",
+                "The largest removed population any single order-level market holds, against the same \
+                 process-wide ceiling of 1048576. Alert on this rather than on the aggregate: one \
+                 market whose frontier is stuck is flat headroom on the sum.",
             ),
             trades_no_id: counter_vec(
                 &registry,
@@ -1074,9 +1119,17 @@ mod tests {
         m.mbo_forced_rebaselines
             .with_label_values(&["HYPERLIQUID", "disagreement"])
             .inc();
-        m.mbo_market_invalidations
+        m.mbo_events_past_frontier
             .with_label_values(&["HYPERLIQUID"])
             .inc();
+        m.mbo_events_stale.with_label_values(&["HYPERLIQUID"]).inc();
+        m.mbo_frontier_bounded
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_frontier_reseats
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_guard_ceiling_evictions.inc();
         m.mbo_guarded_tombstones.set(7);
         m.mbo_guarded_tombstones_max.set(3);
         m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
@@ -1132,7 +1185,11 @@ mod tests {
             "dz_mbo_arm_disagreement_total",
             "dz_book_resurrections_dropped_total",
             "dz_mbo_forced_rebaselines_total",
-            "dz_mbo_market_invalidations_total",
+            "dz_mbo_events_past_frontier_total",
+            "dz_mbo_events_stale_total",
+            "dz_mbo_frontier_bounded_total",
+            "dz_mbo_frontier_reseats_total",
+            "dz_mbo_guard_ceiling_evictions_total",
             "dz_mbo_guarded_tombstones",
             "dz_mbo_guarded_tombstones_max",
             "dz_hl_sink_clients",

@@ -354,11 +354,53 @@ struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     arb_book_dedup_window_ms: u64,
+
+    /// Seconds of venue time behind a channel's newest stamp an order-level book event may be and
+    /// still be admitted — and, by the same value, how long a removed order is remembered so a
+    /// lagging publisher's stale add for it can be refused. Set below the arms' worst separation and
+    /// a returning link's backlog is published as live; set far above it and every removal inside the
+    /// window is held (~4,000/s per publisher on the flagship channel, against a process-wide ceiling
+    /// of 1,048,576 entries).
+    #[arg(
+        long = "arb-book-retention-secs",
+        env = "DZ_ARB_BOOK_RETENTION_SECS",
+        default_value_t = BOOK_GUARD.retention_ns / 1_000_000_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_book_retention_secs: u64,
+
+    /// Seconds a batch's venue stamp may be ahead of its channel's newest and still advance it. Past
+    /// it the advance is refused but the batch is still served, so a single bad stamp cannot carry the
+    /// frontier years forward and refuse every real event behind it. Must stay comfortably below
+    /// `--arb-book-retention-secs`, or one accepted jump puts the whole channel outside the window.
+    #[arg(
+        long = "arb-book-ts-jump-secs",
+        env = "DZ_ARB_BOOK_TS_JUMP_SECS",
+        default_value_t = BOOK_GUARD.max_ts_jump_ns / 1_000_000_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_book_ts_jump_secs: u64,
+
+    /// Seconds a channel's newest venue stamp may fail to **move** before it is re-seated from the
+    /// batches actually arriving. A real tradeoff: below the arms' worst separation (2.77 s measured
+    /// at p99.99) it fires on ordinary jitter, and above it, it bounds both how long a stuck frontier
+    /// grows the removed population unforgotten and how long a market whose only surviving arm is
+    /// behind that frontier can be dark.
+    #[arg(
+        long = "arb-book-reseat-secs",
+        env = "DZ_ARB_BOOK_RESEAT_SECS",
+        default_value_t = BOOK_GUARD.reseat_after_ns / 1_000_000_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_book_reseat_secs: u64,
 }
 
 /// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
 /// the ones `--help` advertises cannot drift apart.
 const ARB: ingest::authority::AuthorityConfig = ingest::authority::AuthorityConfig::DEFAULT;
+
+/// The same, for the resurrection guard's venue-time tunables.
+const BOOK_GUARD: ingest::arbiter::BookGuardConfig = ingest::arbiter::BookGuardConfig::DEFAULT;
 
 /// A win rate outside `0.0..=1.0` silently disables one of the two transfer conditions (above 1.0
 /// no challenger ever clears it, below 0.0 every one does), and `NaN` compares false against both.
@@ -616,6 +658,11 @@ async fn main() -> Result<()> {
             args.arb_match_window_secs.saturating_mul(1_000_000_000),
         );
         a.set_book_dedup_window(args.arb_book_dedup_window_ms.saturating_mul(1_000_000));
+        a.set_book_guard(ingest::arbiter::BookGuardConfig {
+            retention_ns: args.arb_book_retention_secs.saturating_mul(1_000_000_000),
+            max_ts_jump_ns: args.arb_book_ts_jump_secs.saturating_mul(1_000_000_000),
+            reseat_after_ns: args.arb_book_reseat_secs.saturating_mul(1_000_000_000),
+        });
         Arc::new(Mutex::new(a))
     };
 
