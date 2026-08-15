@@ -771,10 +771,16 @@ impl Metrics {
             mbo_frontier_bounded: counter_vec(
                 &registry,
                 "dz_mbo_frontier_bounded_total",
-                "Batches whose venue stamp was too far ahead of their channel's newest to advance it \
-                 (--arb-book-ts-jump-secs). The batch is still processed. A sustained rate means the \
-                 bound is catching ordinary jitter rather than a bad stamp.",
-                &["venue"],
+                "Batches whose venue stamp did not advance their channel's frontier. The batch is \
+                 still processed either way. reason=\"jump\" is too far ahead of the channel's own \
+                 newest stamp and is answered by --arb-book-ts-jump-secs; a sustained rate there \
+                 means the bound is catching ordinary jitter. reason=\"anchor\" is too far ahead of \
+                 THIS HOST'S clock, which no flag widens — a sustained rate means either a publisher \
+                 stamping the wrong units, or this host's clock is behind the venue's, and the \
+                 second of those also makes dz_mbo_arm_disagreement_total rise for a reason that has \
+                 nothing to do with the publishers disagreeing. Check the host clock before reading \
+                 that alarm.",
+                &["venue", "reason"],
             ),
             mbo_frontier_reseats: counter_vec(
                 &registry,
@@ -1124,7 +1130,10 @@ mod tests {
             .inc();
         m.mbo_events_stale.with_label_values(&["HYPERLIQUID"]).inc();
         m.mbo_frontier_bounded
-            .with_label_values(&["HYPERLIQUID"])
+            .with_label_values(&["HYPERLIQUID", "jump"])
+            .inc();
+        m.mbo_frontier_bounded
+            .with_label_values(&["HYPERLIQUID", "anchor"])
             .inc();
         m.mbo_frontier_reseats
             .with_label_values(&["HYPERLIQUID"])

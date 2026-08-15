@@ -88,6 +88,13 @@ pub const DEPTH_TICK_CAP: usize = 1024;
 /// and self-heals; it is generous enough to absorb ordinary clock skew between the venue and host.
 const MAX_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 
+/// Why a batch's stamp did not advance a channel's frontier. Kept apart because only one of the two
+/// is reachable by a flag: widening `--arb-book-ts-jump-secs` answers `jump` and does nothing for
+/// `anchor`, whose bound is [`MAX_FUTURE_SKEW_NS`] — a constant this guard shares with the quote and
+/// depth floors, so moving it would silently change their staleness too.
+const BOUND_JUMP: &str = "jump";
+const BOUND_ANCHOR: &str = "anchor";
+
 /// Cap on markets whose `book` state the authority gate tracks, evicting oldest-first. The key is
 /// wire-supplied `(channel_id, instrument_id)`, so a forged stream must cost evictions rather than
 /// memory; the cap sits an order of magnitude above the largest real venue (~1,200 instruments).
@@ -579,12 +586,22 @@ struct Slot {
     /// The venue time of the last change this market **published** for the order, and the quantity
     /// [`MarketEvents::forget_expired`] ages the entry by.
     ///
-    /// ⚠️ **Frozen at the removal**, and safe to freeze only because the batch stamp it comes from
-    /// is that instrument's own `book.last_event_ts()` under a contiguous per-instrument sequence:
-    /// a later copy of the removal describes the same venue event, so the entry's age is the event's
-    /// age. Refreshing it instead lets one laggard's repeated copies hold the entry — and everything
-    /// queued behind it — above the frontier indefinitely. A change to where the batch stamp comes
-    /// from breaks this silently.
+    /// ⚠️ **Frozen at the removal.** Refreshing it instead lets one laggard's repeated copies hold
+    /// the entry — and everything queued behind it — above the frontier indefinitely.
+    ///
+    /// Freezing is sound because the stamp derives from that instrument's own
+    /// `book.last_event_ts()` under a contiguous per-instrument sequence, so a later copy of the
+    /// removal describes the same venue event and the entry's age is the event's age. It is written
+    /// through [`ChannelClock::stamp`], which **clamps down** to the channel's newest — the one
+    /// deviation from "that instrument's own stamp", and it only ever lowers. A clamped removal
+    /// therefore ages out early, so a peer's stale add can land between the clamped value and the
+    /// true removal time. Reaching that needs a host clock more than [`MAX_FUTURE_SKEW_NS`] off the
+    /// venue's **and** a peer tens of seconds behind at the same moment, against a measured p99.99
+    /// inter-arm separation of 2.77 s, and it self-heals on that order's next event.
+    ///
+    /// Any *other* change to where the stamp comes from — a channel-grain stamp that can raise it, a
+    /// coalesced multi-instrument batch — breaks the freeze silently and is not covered by that
+    /// reasoning.
     last_ts: u64,
     /// The smallest resting quantity any arm has claimed for the order; `0.0` means removed.
     size: f64,
@@ -623,6 +640,11 @@ struct GuardBudget {
     /// ([`Arbiter::drop_book_events`]) rather than zeroing it.
     peak: usize,
     peak_market: Option<MarketKey>,
+    /// Whether the recount has already been paid for the current excursion above the ceiling. The
+    /// shed is advisory — it frees only what the admitting market holds — so `over()` can stay true
+    /// for a long window, and the recount is an O(markets) scan that only needs to happen once per
+    /// crossing. Cleared the moment the process is back under.
+    resynced_while_over: bool,
 }
 
 impl GuardBudget {
@@ -703,14 +725,18 @@ struct ChannelClock {
     /// acceptance-keyed timer would never fire in the one state the re-seat exists for.
     moved_at: u64,
     /// The monotonic time the forward bound started refusing advances **continuously**, cleared by
-    /// any accepted one. The movement-keyed wait above is not enough on its own: a publisher whose
-    /// stamps crawl — a unit mismatch, an old-session replay, a forged source stepping by a
-    /// microsecond — has every one of its tiny advances accepted, which keeps `moved_at` fresh
-    /// forever while every honest arm on the channel is refused. The frontier then pins below the
-    /// whole channel for the life of the process: nothing is refused (the safe direction) but nothing
-    /// is forgotten either, so the population grows to the process ceiling and the guard's reach
-    /// silently reverts to a count.
+    /// any accepted one. The movement-keyed wait above is not enough on its own, and the case that
+    /// needs this is an ordinary publisher bug rather than a forged source: **a unit mismatch where
+    /// the mis-stamping arm owns the clock.** Arm A stamps milliseconds and seeds the channel; arm B
+    /// stamps nanoseconds and is a million times ahead of it — but B is *not* past the host-clock
+    /// anchor, because B is emitting the correct time, so the anchor cannot recover this. Meanwhile
+    /// A's tiny advances are all accepted, keeping `moved_at` fresh forever while every honest arm is
+    /// refused. The frontier then pins below the whole channel for the life of the process: nothing
+    /// is refused (the safe direction) but nothing is forgotten either, so the population grows to
+    /// the process ceiling and the guard's reach silently reverts to a count. An old-session replay
+    /// reaches the same state by the same route.
     ahead_since: Option<u64>,
+
     /// The highest stamp seen since a write **consumed** the last one, whether or not it advanced
     /// `newest_ts`. Taken **before** rule 1 can refuse a batch — sampled after the refusal, a session
     /// restarting *lower* leaves the hatch nothing to re-seat from.
@@ -748,7 +774,13 @@ impl ChannelClock {
     /// publisher on the channel and leaving the forger's own stamps the only ones inside the window.
     /// [`MAX_FUTURE_SKEW_NS`] is the same absolute check the quote and depth floors already apply to
     /// this field.
-    fn observe(&mut self, ts: u64, now: u64, wall: u64, cfg: &BookGuardConfig) -> bool {
+    fn observe(
+        &mut self,
+        ts: u64,
+        now: u64,
+        wall: u64,
+        cfg: &BookGuardConfig,
+    ) -> Option<&'static str> {
         let cap = wall.saturating_add(MAX_FUTURE_SKEW_NS);
         let ts = if ts > cap {
             // Sampled **at the cap**, not skipped. A host clock that runs behind venue time by more
@@ -759,7 +791,7 @@ impl ChannelClock {
             // measured in host time rather than stopping.
             self.ahead_since.get_or_insert(now);
             self.sample = Some(self.sample.map_or(cap, |s| s.max(cap)));
-            return true;
+            return Some(BOUND_ANCHOR);
         } else {
             ts
         };
@@ -770,22 +802,22 @@ impl ChannelClock {
             // is what keeps that seed honest.
             None => {
                 self.set(Some(ts), now);
-                false
+                None
             }
             Some(newest) if ts > newest => {
                 if ts - newest <= cfg.max_ts_jump_ns {
                     self.set(Some(ts), now);
-                    false
+                    None
                 } else {
                     // **The batch is still processed.** Refusing it wedges the channel permanently:
                     // `newest_ts` only advances from what it accepts, so after one legitimate jump
                     // every later batch is further ahead than the last. The bound cannot tell "the
                     // publisher jumped" from "we were away", and a whole-channel gap is ordinary.
                     self.ahead_since.get_or_insert(now);
-                    true
+                    Some(BOUND_JUMP)
                 }
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -1664,6 +1696,15 @@ impl Arbiter {
     /// startup; without it the guard takes [`BookGuardConfig::DEFAULT`], the same values `main.rs`'s
     /// clap defaults are derived from.
     pub fn set_book_guard(&mut self, cfg: BookGuardConfig) {
+        // `main` validates before calling, but this is `pub` in a crate that ships a mutation
+        // surface, and the failure `validate` prevents — a retention window at or below the skew, or
+        // a jump bound at or above the window — is a silent channel-wide outage rather than a loud
+        // one. Cheap to assert where the value actually lands.
+        debug_assert!(
+            cfg.validate().is_ok(),
+            "book guard config installed without validation: {:?}",
+            cfg.validate()
+        );
         self.book_guard = cfg;
     }
 
@@ -2118,17 +2159,17 @@ impl Arbiter {
         let ck = Self::channel_key(&key);
         let wall = now_ns();
         let clock = self.clock_for(&ck);
-        let bounded = clock.observe(b.source_ts_ns, now, wall, &cfg);
+        let bound_reason = clock.observe(b.source_ts_ns, now, wall, &cfg);
         let reseated = clock.reseat(now, &cfg);
         let frontier = clock.frontier(&cfg);
         // Every rule below judges and records this batch by the clamped stamp, never the raw one:
         // see [`ChannelClock::stamp`].
         let stamp = clock.stamp(b.source_ts_ns, wall);
         let venue = b.venue.as_ref();
-        if bounded {
+        if let Some(reason) = bound_reason {
             metrics()
                 .mbo_frontier_bounded
-                .with_label_values(&[venue])
+                .with_label_values(&[venue, reason])
                 .inc();
         }
         if reseated {
@@ -2320,12 +2361,23 @@ impl Arbiter {
     /// unreachable in the first place.
     fn shed_over_budget(&mut self, key: &MarketKey) {
         if !self.guard.over() {
+            self.guard.resynced_while_over = false;
             return;
         }
-        // The running total is an optimization; without this recount an over-count no market can pay
+        // The running total is an optimization; without a recount an over-count no market can pay
         // off sheds from every market in the process, on every batch, forever.
-        let held = self.book_events.values().map(|e| e.n_dead).sum();
-        self.guard.resync(held);
+        //
+        // Gated on `resynced_at`, because the shed is deliberately advisory: it frees only what the
+        // *admitting* market holds, so `over()` can stay true for `reseat_after × removal_rate` and
+        // an ungated recount would pay an O(markets) scan on **every batch** for that whole window —
+        // 318 markets in production and 16,384 under a forged flood, which is when it is least
+        // affordable. Once per crossing is what the invariant needs; the running total carries it
+        // between.
+        if !self.guard.resynced_while_over {
+            let held = self.book_events.values().map(|e| e.n_dead).sum();
+            self.guard.resync(held);
+            self.guard.resynced_while_over = true;
+        }
         let budget = &mut self.guard;
         let Some(events) = self.book_events.get_mut(key) else {
             return;
@@ -6872,9 +6924,11 @@ mod tests {
         let mut clock = ChannelClock::default();
         let mut now = 0u64;
         for i in 0..40u64 {
-            assert!(
+            assert_eq!(
                 clock.observe(venue + i * 1_000_000_000, now, wall, &cfg),
-                "every stamp here is past the anchor"
+                Some(BOUND_ANCHOR),
+                "every stamp here is past the anchor, and must be attributed to it — \
+                 widening --arb-book-ts-jump-secs cannot answer this case"
             );
             now += 1_000_000;
             if clock.reseat(now, &cfg) {
@@ -6910,11 +6964,16 @@ mod tests {
         clock.observe(1_000, now, wall, &cfg);
         for i in 1..=40u64 {
             now += 1_000_000;
-            // The honest arm, far ahead of the crawl and inside the anchor: refused as an advance.
-            assert!(clock.observe(500_000_000_000 + i, now, wall, &cfg));
+            // The honest arm, far ahead of the crawl and inside the anchor: refused as an advance,
+            // and attributed to the jump bound rather than the anchor — this is the unit-mismatch
+            // shape, where the arm that is *right* is the one being refused.
+            assert_eq!(
+                clock.observe(500_000_000_000 + i, now, wall, &cfg),
+                Some(BOUND_JUMP)
+            );
             // The crawler's own microsecond step, accepted — which is what keeps the movement wait
             // fresh for as long as it keeps sending.
-            assert!(!clock.observe(1_000 + i * 1_000, now, wall, &cfg));
+            assert_eq!(clock.observe(1_000 + i * 1_000, now, wall, &cfg), None);
             assert!(
                 now.saturating_sub(clock.moved_at) < cfg.reseat_after_ns,
                 "the movement wait must stay fresh, or this measures the wrong trigger"
