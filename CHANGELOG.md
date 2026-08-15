@@ -19,12 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `newest - --arb-book-retention-secs`, forgetting removed entries on the same frontier; an event older
   than its own order's last published change is refused before any size comparison, which also removes the
   false size disagreements that capped the tolerable inter-arm lag at about a second.
-- ⚠️ **`dz_mbo_market_invalidations_total` is removed.** Nothing disowns a market any more, so any alert
-  or dashboard on it must be retired. Replace it with `dz_mbo_events_past_frontier_total` (a link
-  returning with a backlog), `dz_mbo_guard_ceiling_evictions_total` (the process-wide ceiling forgetting
-  entries the retention window would still have held) and `dz_mbo_guarded_tombstones_max` for headroom.
-  `dz_mbo_guarded_tombstones{,_max}` keep their names and their 1,048,576-entry ceiling but are now sized
-  by the retention window and the venue's removal rate rather than by how far the publishers lag.
+- ⚠️ **`dz_mbo_market_invalidations_total` is removed.** It never shipped in a release, but a host
+  running a build from this cycle exports it, so retire any alert or dashboard on it. The refusals to
+  watch instead are `dz_mbo_events_past_frontier_total` (a link returning with a backlog) and
+  `dz_mbo_guard_ceiling_evictions_total` (the process-wide ceiling forgetting entries the retention
+  window would still have held); headroom stays on `dz_mbo_guarded_tombstones_max`, which keeps its
+  name and its 1,048,576-entry ceiling but is now sized by the retention window and the venue's
+  removal rate rather than by how far the publishers lag.
 
 ### Added
 - `--arb-book-retention-secs` (30), `--arb-book-ts-jump-secs` (5) and `--arb-book-reseat-secs` (10) tune
@@ -114,12 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   market's stream instead of 250 ms.
 
 ### Added
-- `dz_mbo_market_invalidations_total{venue}` counts markets disowned by the guard above,
-  `dz_mbo_guarded_tombstones` reports the tombstones held against the process-wide ceiling, and
-  `dz_mbo_guarded_tombstones_max` reports the largest single market's population against the
-  per-market cap — **the one to alert on**, since that cap fires at a sixteenth of the aggregate and a
-  market walking to a blackout is flat headroom on the sum. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"`
-  label, which no longer has a behaviour behind it.
+- `dz_mbo_guarded_tombstones` reports the removed orders the guard holds against the process-wide
+  ceiling, and `dz_mbo_guarded_tombstones_max` the largest single market's population against that
+  same ceiling — **the one to alert on**, since one market walking away from the rest is flat headroom
+  on the sum. `dz_mbo_forced_rebaselines_total` loses its `reason="guard_evicted"` label, which no
+  longer has a behaviour behind it.
 - `doublezero-edge diagnose` reports why the container is (or is not) serving data — tunnel,
   subscriptions, activations — ending in one verdict an agent reads as `.diagnostics.diagnosis.code`.
   It reads the admin surface, which is not subscription-gated, so it answers on exactly the host
