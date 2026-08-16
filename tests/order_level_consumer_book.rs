@@ -262,7 +262,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
 
     // The fast publisher's host is drained: its receiver exits, which is the moment its claim to be
     // serving this market ends.
-    a.forget_publisher_books(VENUE, fast);
+    a.forget_publisher_books(CATEGORY, fast);
 
     // The venue moves on while the only remaining publisher is still recovering, so the consumer's
     // book is stale by the time that publisher resyncs.
@@ -770,7 +770,7 @@ fn a_venue_time_skew_alone_does_not_drift_the_consumer() {
 #[test]
 fn a_single_arms_stream_reaches_the_consumer_exactly() {
     let (mut a, mut rx, only, peer) = harness();
-    a.forget_publisher_books(VENUE, peer);
+    a.forget_publisher_books(CATEGORY, peer);
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
     for (i, &e) in lifecycle_stream(1).iter().enumerate() {
@@ -1056,7 +1056,7 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
 
     // The serving arm's receiver exits, ending its claim. Nobody is serving now, so the peer's next
     // re-baseline is the consumer's only route back to the venue's book.
-    a.forget_publisher_books(VENUE, leaving);
+    a.forget_publisher_books(CATEGORY, leaving);
     a.emit(snapshot(&venue, 2_100, 2_100), staying, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue, "a departure must release the suppression");
@@ -1488,7 +1488,7 @@ fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
 
     // The leader's host is drained. The survivor is 100 s of venue time behind it — far past the
     // retention window — and is now the only arm there is.
-    a.forget_publisher_books(VENUE, leader);
+    a.forget_publisher_books(CATEGORY, leader);
     wait_for_reseat();
     let behind = ahead - 100_000_000_000;
     venue.insert(2, (BookSide::Ask, 101.0, 3.0));

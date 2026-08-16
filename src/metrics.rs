@@ -288,6 +288,14 @@ pub struct Metrics {
     pub hl_sink_clients: IntGauge,
     /// Frames sent by the Hyperliquid-compatible sink, by `channel` (l2Book/l4Book/trades).
     pub hl_sink_messages: IntCounterVec,
+    /// What the Hyperliquid-compatible sink did not send, by `reason`: `prepare_lagged` (the shared
+    /// stage fell behind the backbone — every client missed those batches), `client_lagged` (one slow
+    /// consumer), `ambiguous_market` (two markets share a `coin`, so one of them is not served).
+    pub hl_sink_dropped: IntCounterVec,
+    /// Market price-folds the Hyperliquid-compatible sink performed. The fold is O(resting orders)
+    /// and is the sink's dominant cost, so this is what says whether it is being paid once per batch
+    /// (correct) or once per client per batch.
+    pub hl_sink_folds: IntCounter,
 
     // --- Public WS input feeders (per-venue backstops; off by default) ---
     /// Feeder health per `venue`: 1 while the public WebSocket session is connected, 0 while
@@ -883,6 +891,17 @@ impl Metrics {
                 "dz_hl_sink_messages_total",
                 "Frames sent by the Hyperliquid-compatible sink, by channel",
                 &["channel"],
+            ),
+            hl_sink_dropped: counter_vec(
+                &registry,
+                "dz_hl_sink_dropped_total",
+                "Frames the Hyperliquid-compatible sink did not send, by reason",
+                &["reason"],
+            ),
+            hl_sink_folds: counter(
+                &registry,
+                "dz_hl_sink_folds_total",
+                "Market price-folds performed by the Hyperliquid-compatible sink",
             ),
             ws_feeder_up: gauge_vec(
                 &registry,

@@ -31,7 +31,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
 };
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::{Message as WsMessage, Utf8Bytes};
 use tracing::{info, warn};
 
 use crate::{
@@ -64,6 +64,11 @@ const MAX_INBOUND_PER_MIN: u32 = 600;
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Capacity of the prepared-frame fan-out, sized to match the backbone so a client that keeps up
+/// with the backbone keeps up here too.
+const PREPARED_CAPACITY: usize = 4096;
+/// Shortest interval between one client's `l4Book` re-bootstraps — see `rebootstrap`.
+const REBOOTSTRAP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Cap on an inbound frame. Control frames here are tens of bytes; tungstenite's 64 MiB default would
 /// let `MAX_CLIENTS` peers buffer gigabytes before a single byte is parsed. Read-path only, so the
@@ -297,14 +302,29 @@ struct OrderDiffEntry<'a> {
     raw_book_diff: RawDiff,
 }
 
-/// The publisher's `OrderDiff`, minus its `update{origSz,newSz}` variant: our changes carry an
-/// order's **absolute** resulting quantity and no prior one, so `origSz` could only be fabricated.
-/// `new` already means "this order now rests at this price for this size", which is exactly what a
-/// change asserts.
-#[derive(Serialize)]
+/// The publisher's `OrderDiff`, verbatim (`app/publisher/server/src/types/mod.rs`).
+///
+/// The three variants are not interchangeable, and the reference apply
+/// (`listeners/order_book/state.rs`) is what makes the distinction load-bearing: `New` is inserted
+/// only against a **matching opening order status**, while `Update` goes straight to
+/// `modify_sz(oid, coin, newSz)`. Rendering a partial fill as `new` therefore does not reduce the
+/// order — the consumer logs "New order did not rest" and skips it, and the fill is silently lost.
+///
+/// `origSz` is what **this channel last published** for the order, which is the only prior size the
+/// sink can honestly claim (the arbiter can refuse a change that never reached the wire, so a
+/// producer-side prior would describe a state no consumer here holds). The reference apply ignores
+/// the field; it is carried because the schema has it.
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 enum RawDiff {
-    New { sz: String },
+    New {
+        sz: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Update {
+        orig_sz: String,
+        new_sz: String,
+    },
     Remove,
 }
 
@@ -484,9 +504,28 @@ fn render_l4book_snapshot(b: &NormalizedBook, coin: &str) -> String {
     })
 }
 
-/// Render one incremental batch as `l4Book` order diffs. `None` when the batch is for another venue
-/// or coin, or when it carries no order-level change at all.
-fn render_l4book_diff(b: &NormalizedBook, coin: &str) -> Option<String> {
+/// Which `raw_book_diff` one change is, given what this channel last published for the order.
+fn raw_diff(c: &crate::model::BookChange, published: Option<f64>) -> RawDiff {
+    // A zero size is how an order-level producer says the order is gone; a consumer that rested it
+    // would hold a phantom forever.
+    if c.action == BookAction::Delete || c.size == 0.0 {
+        return RawDiff::Remove;
+    }
+    match published {
+        // The consumer already holds this order: `new` would be skipped for want of an opening
+        // status, so a partial fill has to say `update`. See [`RawDiff`].
+        Some(prev) => RawDiff::Update {
+            orig_sz: num(prev),
+            new_sz: num(c.size),
+        },
+        None => RawDiff::New { sz: num(c.size) },
+    }
+}
+
+/// Render one incremental batch as `l4Book` order diffs, against `published` — the sizes this
+/// channel last sent for the market, read **before** the batch is folded into it. `None` when the
+/// batch carries no order-level change at all.
+fn render_l4book_diff(b: &NormalizedBook, coin: &str, published: &MarketOrders) -> Option<String> {
     if b.venue.as_ref() != VENUE || b.symbol.as_ref() != coin {
         return None;
     }
@@ -499,13 +538,7 @@ fn render_l4book_diff(b: &NormalizedBook, coin: &str) -> Option<String> {
             oid: c.order_id,
             px: num(c.price),
             coin,
-            // A zero size is how an order-level producer says the order is gone; a consumer that
-            // rested it would hold a phantom forever.
-            raw_book_diff: if c.action == BookAction::Delete || c.size == 0.0 {
-                RawDiff::Remove
-            } else {
-                RawDiff::New { sz: num(c.size) }
-            },
+            raw_book_diff: raw_diff(c, published.size_of(c.order_id)),
         })
         .collect();
     if book_diffs.is_empty() {
@@ -579,6 +612,272 @@ fn error_frame(message: &str) -> WsMessage {
     )
 }
 
+// --- the shared per-batch stage ---
+
+/// Markets whose published order sizes are tracked, and resting orders per market. Both are wire-keyed
+/// (`channel`/`instrument_id` and the venue's order ids), so both are bounded; overflow degrades one
+/// market's diffs to `new` rather than growing without limit. `MAX_TRACKED_ORDERS` matches
+/// `model::MAX_ACCUMULATED_ORDERS`, the ceiling the shared accumulator already holds itself to.
+const MAX_TRACKED_MARKETS: usize = 4096;
+const MAX_TRACKED_ORDERS: usize = 1 << 18;
+
+/// What this sink has last published for one market's resting orders — the state `origSz` is a claim
+/// about, and the memo that says whether the market is order-level at all.
+///
+/// Deliberately *this channel's* view rather than a copy of the producer's: the arbiter can refuse a
+/// change that never reaches the wire, so a producer-side prior size would describe a book no consumer
+/// here holds.
+#[derive(Default)]
+struct MarketOrders {
+    sizes: std::collections::HashMap<u64, f64>,
+    /// Whether this market streams order-level changes. Sticky, like the accumulator's own flag: an
+    /// order-level book that empties is still order-level, and reading it off the population would
+    /// stop a bare `clear` reaching the `l4Book` subscriber it is meant for.
+    order_level: bool,
+}
+
+impl MarketOrders {
+    fn size_of(&self, oid: u64) -> Option<f64> {
+        self.sizes.get(&oid).copied()
+    }
+
+    /// Fold one published batch in. A `Clear` replaces the population rather than merging into it —
+    /// the consumer was just told to discard, so anything left behind would make the next `origSz` a
+    /// claim about a book nobody holds.
+    fn apply(&mut self, b: &NormalizedBook) {
+        for c in &b.changes {
+            if c.action == BookAction::Clear {
+                self.sizes.clear();
+                continue;
+            }
+            if c.order_id == 0 {
+                continue;
+            }
+            self.order_level = true;
+            if c.action == BookAction::Delete || c.size == 0.0 || !c.size.is_finite() {
+                self.sizes.remove(&c.order_id);
+            } else if self.sizes.len() < MAX_TRACKED_ORDERS || self.sizes.contains_key(&c.order_id)
+            {
+                self.sizes.insert(c.order_id, c.size);
+            }
+        }
+    }
+}
+
+/// One broadcast message with everything shared across clients already computed.
+///
+/// The stage exists because the per-client alternative takes the **arbiter's** mutex once per client
+/// per batch — the same mutex every receiver on every feed takes to emit — and then folds the same
+/// 44,598-order market once per client. Both are now paid once per batch, off that lock.
+enum Prepared {
+    Message(Box<PreparedMessage>),
+    /// The stage fell behind the backbone, so every client's `l4Book` book is now wrong. Clients see
+    /// their own `Lagged` but not this one, and an incremental channel cannot self-heal without being
+    /// told.
+    Resync,
+}
+
+struct PreparedMessage {
+    msg: Arc<FeedMessage>,
+    /// The market this batch is for, when it is a `book`.
+    key: Option<BookKey>,
+    /// Folded price levels and their time, when a client wants `l2Book` for this coin. Shared, not
+    /// re-folded per subscription: the fold is independent of the `nSigFigs`/`nLevels` view.
+    l2: Option<Arc<L2Fold>>,
+    /// The rendered `l4Book` frame, when a client wants `l4Book` for this coin. Identical for every
+    /// such client (the channel has no view parameters), so it is rendered once.
+    l4: Option<Utf8Bytes>,
+}
+
+/// `(bids, asks, time_ms)` — one market's price fold, shared by every `l2Book` subscription of it.
+type L2Fold = (Vec<CountedLevel>, Vec<CountedLevel>, u64);
+
+/// How many connected clients want each channel for a coin, so the stage above folds and renders only
+/// what someone will read. Refcounted rather than a flag: subscriptions come and go per client.
+#[derive(Default, Clone, Copy)]
+struct Wants {
+    l2: usize,
+    l4: usize,
+}
+
+type Wanted = Arc<std::sync::Mutex<std::collections::HashMap<String, Wants>>>;
+
+/// One client's claims on [`Wanted`], released on drop so an early return or a panic cannot leave the
+/// stage folding a market nobody reads.
+struct WantGuard {
+    wanted: Wanted,
+    held: Vec<(String, bool)>,
+}
+
+impl WantGuard {
+    fn new(wanted: Wanted) -> Self {
+        Self {
+            wanted,
+            held: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, coin: &str, l4: bool) {
+        let mut w = crate::model::lock(&self.wanted);
+        let e = w.entry(coin.to_string()).or_default();
+        if l4 {
+            e.l4 += 1;
+        } else {
+            e.l2 += 1;
+        }
+        drop(w);
+        self.held.push((coin.to_string(), l4));
+    }
+
+    fn remove(&mut self, coin: &str, l4: bool) {
+        let Some(i) = self.held.iter().position(|(c, k)| c == coin && *k == l4) else {
+            return;
+        };
+        self.held.swap_remove(i);
+        release(&self.wanted, coin, l4);
+    }
+}
+
+fn release(wanted: &Wanted, coin: &str, l4: bool) {
+    let mut w = crate::model::lock(wanted);
+    let Some(e) = w.get_mut(coin) else { return };
+    let n = if l4 { &mut e.l4 } else { &mut e.l2 };
+    *n = n.saturating_sub(1);
+    if e.l2 == 0 && e.l4 == 0 {
+        w.remove(coin);
+    }
+}
+
+impl Drop for WantGuard {
+    fn drop(&mut self) {
+        for (coin, l4) in std::mem::take(&mut self.held) {
+            release(&self.wanted, &coin, l4);
+        }
+    }
+}
+
+fn dropped(reason: &'static str) {
+    metrics().hl_sink_dropped.with_label_values(&[reason]).inc();
+}
+
+/// The shared stage: one task reads the backbone, does the per-batch work once, and re-broadcasts it.
+async fn prepare_loop(
+    mut backbone: broadcast::Receiver<Arc<FeedMessage>>,
+    out: broadcast::Sender<Arc<Prepared>>,
+    books: BookSnapshot,
+    wanted: Wanted,
+) {
+    let mut published: std::collections::HashMap<BookKey, MarketOrders> = Default::default();
+    let mut order: std::collections::VecDeque<BookKey> = Default::default();
+    loop {
+        match backbone.recv().await {
+            Ok(m) => {
+                // No connected clients → nothing to prepare. The published-size map still has to
+                // track, or the first client to connect would be diffed against a book this sink
+                // never saw.
+                let idle = out.receiver_count() == 0;
+                let p = prepare_one(&m, &books, &wanted, &mut published, &mut order, idle);
+                if !idle {
+                    let _ = out.send(Arc::new(Prepared::Message(Box::new(p))));
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("hl sink prepare stage lagged, dropped {n}");
+                dropped("prepare_lagged");
+                let _ = out.send(Arc::new(Prepared::Resync));
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+fn prepare_one(
+    m: &Arc<FeedMessage>,
+    books: &BookSnapshot,
+    wanted: &Wanted,
+    published: &mut std::collections::HashMap<BookKey, MarketOrders>,
+    order: &mut std::collections::VecDeque<BookKey>,
+    idle: bool,
+) -> PreparedMessage {
+    let bare = |key| PreparedMessage {
+        msg: m.clone(),
+        key,
+        l2: None,
+        l4: None,
+    };
+    let FeedMessage::Book(b) = &**m else {
+        return bare(None);
+    };
+    if b.venue.as_ref() != VENUE {
+        return bare(None);
+    }
+    let coin = b.symbol.as_ref();
+    let key: BookKey = (
+        b.venue.clone(),
+        b.category.clone(),
+        b.channel,
+        b.instrument_id,
+    );
+    let wants = crate::model::lock(wanted)
+        .get(coin)
+        .copied()
+        .unwrap_or_default();
+    let rebaseline = b
+        .changes
+        .first()
+        .is_some_and(|c| c.action == BookAction::Clear);
+
+    if !published.contains_key(&key) {
+        while published.len() >= MAX_TRACKED_MARKETS {
+            match order.pop_front() {
+                Some(old) => {
+                    published.remove(&old);
+                }
+                None => break,
+            }
+        }
+        order.push_back(key.clone());
+    }
+    let market = published.entry(key.clone()).or_default();
+    // Rendered against the pre-batch sizes, then the batch is folded in — `origSz` is what the
+    // consumer holds, which is what this channel published *before* this batch.
+    let l4_diff = (!idle && wants.l4 > 0 && !rebaseline)
+        .then(|| render_l4book_diff(b, coin, market))
+        .flatten();
+    market.apply(b);
+    let order_level = market.order_level;
+
+    // **Rendered from the batch, never from the shared accumulator.** The accumulator is advanced by
+    // `Arbiter::publish_book` *before* the message is broadcast, so it already holds batches still
+    // queued for a lagging client: that client would get a snapshot containing them and then apply
+    // the older diffs on top, resurrecting orders permanently. A `Clear`-led batch is the complete
+    // book by construction, and a bare one is the arbiter's degraded "discard this market" — which an
+    // `l4Book` subscriber must still hear, since the channel has no clear of its own.
+    let l4 = if idle || wants.l4 == 0 {
+        None
+    } else if rebaseline {
+        order_level.then(|| Utf8Bytes::from(render_l4book_snapshot(b, coin)))
+    } else {
+        l4_diff.map(Utf8Bytes::from)
+    };
+    // `l2Book` is snapshot-per-update and needs the whole folded market, so it still reads the shared
+    // accumulator — once per batch, under one brief lock, shared by every subscription of it.
+    let l2 = (!idle && wants.l2 > 0)
+        .then(|| take_market(books, &key, coin, BookAccumulator::clone))
+        .flatten()
+        .map(|acc| {
+            metrics().hl_sink_folds.inc();
+            let (bids, asks) = acc.price_fold();
+            Arc::new((bids, asks, ms_or_now(acc.source_ts_ns())))
+        });
+    PreparedMessage {
+        msg: m.clone(),
+        key: Some(key),
+        l2,
+        l4,
+    }
+}
+
 // --- the server ---
 
 /// Bind the listener up front so the caller decides what a bind failure means: a taken port must
@@ -601,15 +900,25 @@ impl Drop for ClientGuard {
     }
 }
 
-/// The accept loop. Each client gets its own broadcast receiver: unlike the normalized sink there is
-/// no serialize-once stage, because two clients can ask for different `nSigFigs`/`nLevels` views of
-/// the same book and so share no rendered bytes.
+/// The accept loop, fed by the shared [`prepare_loop`] stage rather than by the backbone directly:
+/// the `l4Book` frame and the `l2Book` price fold are identical for every client that wants them, and
+/// paying for either per client puts the arbiter's mutex — the one every receiver on every feed takes
+/// to emit — on the sink's fan-out path. Only the `l2Book` *rendering* stays per client, since two
+/// subscriptions can ask for different `nSigFigs`/`nLevels` views of one fold.
 pub async fn serve(
     listener: TcpListener,
     tx: broadcast::Sender<Arc<FeedMessage>>,
     books: BookSnapshot,
 ) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
+    let wanted: Wanted = Default::default();
+    let (prepared_tx, _rx) = broadcast::channel::<Arc<Prepared>>(PREPARED_CAPACITY);
+    tokio::spawn(prepare_loop(
+        tx.subscribe(),
+        prepared_tx.clone(),
+        books.clone(),
+        wanted.clone(),
+    ));
     loop {
         // Never propagate an accept error: this task's `Err` reaches `main`'s `select!` and would
         // exit the process — tunnel, receivers and every other sink with it — over a transient
@@ -632,11 +941,12 @@ pub async fn serve(
         let guard = ClientGuard {
             clients: clients.clone(),
         };
-        let rx = tx.subscribe();
+        let rx = prepared_tx.subscribe();
         let books = books.clone();
+        let wanted = wanted.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            if let Err(e) = serve_client(stream, rx, books).await {
+            if let Err(e) = serve_client(stream, rx, books, wanted).await {
                 warn!(%peer, "hl sink client ended: {e}");
             }
         });
@@ -709,8 +1019,32 @@ fn l2_view(n_sig_figs: Option<u32>, mantissa: Option<u32>, n_levels: usize) -> L
     }
 }
 
-/// Bootstrap `sub` from current state.
-fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
+/// Every market of this venue whose display symbol is `coin`.
+///
+/// **A `coin` is not an identity.** The wire `symbol` is a truncated 16-byte label, and two distinct
+/// `instrument_id`s sharing one is confirmed on captured data (`tests/fixtures/PROVENANCE.md`) — which
+/// is why `BookSnapshot` is keyed on the identity and not on the symbol. Hyperliquid's schema carries
+/// no channel or instrument field to disambiguate with, so a subscription that resolves to more than
+/// one market is refused rather than served two markets' competing snapshots and interleaved updates
+/// under one name.
+fn markets_for(books: &BookSnapshot, coin: &str) -> Vec<BookKey> {
+    take_markets(books, coin, |key, _| key.clone())
+}
+
+/// Bootstrap `sub` from current state, scoped to `key` when the client is pinned to one market.
+fn bootstrap(
+    books: &BookSnapshot,
+    sub: &Sub,
+    key: Option<&BookKey>,
+) -> Vec<(&'static str, String)> {
+    let markets = |coin: &str| -> Vec<(BookKey, BookAccumulator)> {
+        match key {
+            Some(k) => take_market(books, k, coin, BookAccumulator::clone)
+                .map(|acc| vec![(k.clone(), acc)])
+                .unwrap_or_default(),
+            None => take_markets(books, coin, |k, acc| (k.clone(), acc.clone())),
+        }
+    };
     match sub {
         // Prints are point-in-time: there is nothing to bootstrap, and no reason to take the lock.
         Sub::Trades { .. } => Vec::new(),
@@ -721,16 +1055,16 @@ fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
             n_levels,
         } => {
             let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
-            take_markets(books, coin, |_, acc| acc.clone())
+            markets(coin)
                 .into_iter()
-                .map(|acc| {
+                .map(|(_, acc)| {
                     let (bids, asks) = acc.price_fold();
                     let time = ms_or_now(acc.source_ts_ns());
                     ("l2Book", render_l2book(&bids, &asks, coin, view, time))
                 })
                 .collect()
         }
-        Sub::L4Book { coin } => take_markets(books, coin, |key, acc| (key.clone(), acc.clone()))
+        Sub::L4Book { coin } => markets(coin)
             .into_iter()
             .map(|(key, acc)| {
                 let b = acc.to_book(&key, ReplayScope::Orders);
@@ -740,55 +1074,44 @@ fn bootstrap(books: &BookSnapshot, sub: &Sub) -> Vec<(&'static str, String)> {
     }
 }
 
-/// Every frame one broadcast message produces across a client's subscriptions.
+/// One outbound frame: the channel it counts against, and its bytes.
+type Frame = (&'static str, Utf8Bytes);
+
+/// Every frame one prepared message produces across a client's subscriptions.
 ///
-/// Filtering on venue and coin happens before any rendering, and the book state is resolved **once**
-/// per message: one lock acquisition, one `price_fold` shared by every `l2Book` subscription of that
-/// market (the fold is O(resting orders) and independent of the view, so folding per subscription
-/// would let one client multiply a 44k-order book by `MAX_SUBS`).
-fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static str, String)> {
+/// Takes no lock and folds nothing — [`prepare_one`] has already done both, once for every client.
+/// `pinned` binds each subscribed coin to the one market it was bootstrapped from, so a second market
+/// that later takes the same truncated symbol cannot interleave its updates into the first's book
+/// (see [`markets_for`]).
+fn frames(
+    p: &PreparedMessage,
+    subs: &[Sub],
+    pinned: &mut std::collections::HashMap<String, BookKey>,
+) -> Vec<Frame> {
     let mut out = Vec::new();
-    match m {
+    match &*p.msg {
         FeedMessage::Trade(t) => {
             for sub in subs {
                 if let Sub::Trades { coin } = sub {
-                    out.extend(render_trade(t, coin).map(|f| ("trades", f)));
+                    out.extend(render_trade(t, coin).map(|f| ("trades", Utf8Bytes::from(f))));
                 }
             }
         }
         FeedMessage::Book(b) if b.venue.as_ref() == VENUE => {
             let coin = b.symbol.as_ref();
-            let l2 = subs
-                .iter()
-                .any(|s| matches!(s, Sub::L2Book { coin: c, .. } if c == coin));
-            let l4 = subs
-                .iter()
-                .any(|s| matches!(s, Sub::L4Book { coin: c } if c == coin));
-            // A `Clear`-led batch is a producer re-baseline. `l4Book` has no clear, so it becomes
-            // another snapshot; `l2Book` is snapshot-per-update and needs no special case.
-            let rebaseline = b
-                .changes
-                .first()
-                .is_some_and(|c| c.action == BookAction::Clear);
-            let key = (
-                b.venue.clone(),
-                b.category.clone(),
-                b.channel,
-                b.instrument_id,
-            );
-            // Only these two cases need book state; an ordinary `l4Book` diff is rendered from the
-            // batch alone and takes no lock.
-            let market = (l2 || (l4 && rebaseline))
-                .then(|| take_market(books, &key, coin, BookAccumulator::clone))
-                .flatten();
-            let fold = market
-                .as_ref()
-                .filter(|_| l2)
-                .map(|acc| (acc.price_fold(), ms_or_now(acc.source_ts_ns())));
-            let snapshot = market
-                .as_ref()
-                .filter(|_| l4 && rebaseline)
-                .map(|acc| acc.to_book(&key, ReplayScope::Orders));
+            let Some(key) = p.key.as_ref() else {
+                return out;
+            };
+            match pinned.get(coin) {
+                Some(held) if held != key => {
+                    dropped("ambiguous_market");
+                    return out;
+                }
+                Some(_) => {}
+                None => {
+                    pinned.insert(coin.to_string(), key.clone());
+                }
+            }
             for sub in subs {
                 match sub {
                     Sub::L2Book {
@@ -797,21 +1120,14 @@ fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static 
                         mantissa,
                         n_levels,
                     } if c == coin => {
-                        if let Some(((bids, asks), time)) = &fold {
+                        if let Some(fold) = &p.l2 {
                             let view = l2_view(*n_sig_figs, *mantissa, *n_levels);
-                            out.push(("l2Book", render_l2book(bids, asks, c, view, *time)));
+                            let text = render_l2book(&fold.0, &fold.1, c, view, fold.2);
+                            out.push(("l2Book", Utf8Bytes::from(text)));
                         }
                     }
                     Sub::L4Book { coin: c } if c == coin => {
-                        if rebaseline {
-                            out.extend(
-                                snapshot
-                                    .as_ref()
-                                    .map(|b| ("l4Book", render_l4book_snapshot(b, c))),
-                            );
-                        } else {
-                            out.extend(render_l4book_diff(b, c).map(|f| ("l4Book", f)));
-                        }
+                        out.extend(p.l4.clone().map(|f| ("l4Book", f)));
                     }
                     _ => {}
                 }
@@ -824,8 +1140,9 @@ fn frames(m: &FeedMessage, subs: &[Sub], books: &BookSnapshot) -> Vec<(&'static 
 
 async fn serve_client(
     stream: TcpStream,
-    mut rx: broadcast::Receiver<Arc<FeedMessage>>,
+    mut rx: broadcast::Receiver<Arc<Prepared>>,
     books: BookSnapshot,
+    wanted: Wanted,
 ) -> Result<()> {
     // The client slot is taken before this point, and the idle reaper only starts after it, so a peer
     // that connects and never handshakes would hold one of `MAX_CLIENTS` indefinitely.
@@ -837,10 +1154,14 @@ async fn serve_client(
     .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     let (mut write, mut read) = ws.split();
     let mut subs: Vec<Sub> = Vec::new();
+    let mut wants = WantGuard::new(wanted);
+    // The one market each subscribed coin was resolved to — see `markets_for`.
+    let mut pinned: std::collections::HashMap<String, BookKey> = Default::default();
     let mut last_seen = Instant::now();
     let mut hb = tokio::time::interval(HEARTBEAT);
     let mut win_start = Instant::now();
     let mut win_count: u32 = 0;
+    let mut last_rebootstrap: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -851,14 +1172,8 @@ async fn serve_client(
                     // control frame: a subscribe renders a market's whole book, so without a cap an
                     // `unsubscribe`/`subscribe` loop is an output amplifier — the `added` guard below
                     // only suppresses an identical *repeat*.
-                    if win_start.elapsed() >= Duration::from_secs(60) {
-                        win_start = Instant::now();
-                        win_count = 0;
-                    }
-                    win_count += 1;
-                    if win_count > MAX_INBOUND_PER_MIN {
-                        write.send(error_frame("inbound rate limit exceeded")).await?;
-                        break;
+                    if !inbound_allowed(&mut win_start, &mut win_count) {
+                        return end_rate_limited(&mut write).await;
                     }
                     match parse_control(&txt) {
                         Ok(Control::Ping) => write.send(WsMessage::Text(
@@ -874,23 +1189,56 @@ async fn serve_client(
                             // without ever reaching `MAX_SUBS`. The rate limit above is what bounds
                             // the unsubscribe-then-resubscribe variant this cannot see.
                             let added = !subs.contains(&sub);
+                            if added {
+                                if let Some(coin) = book_coin(&sub) {
+                                    let markets = markets_for(&books, coin);
+                                    if markets.len() > 1 {
+                                        dropped("ambiguous_market");
+                                        write.send(error_frame(
+                                            "Invalid subscription: coin is ambiguous, several markets share this symbol",
+                                        )).await?;
+                                        continue;
+                                    }
+                                    if let Some(key) = markets.into_iter().next() {
+                                        pinned.entry(coin.to_string()).or_insert(key);
+                                    }
+                                }
+                            }
                             write.send(subscription_response("subscribe", &sub)).await?;
                             if added {
-                                for (channel, frame) in bootstrap(&books, &sub) {
+                                let key = book_coin(&sub).and_then(|c| pinned.get(c)).cloned();
+                                for (channel, frame) in bootstrap(&books, &sub, key.as_ref()) {
                                     sent(channel);
                                     write.send(WsMessage::Text(frame.into())).await?;
+                                }
+                                if let Some(coin) = book_coin(&sub) {
+                                    wants.add(coin, matches!(sub, Sub::L4Book { .. }));
                                 }
                                 subs.push(sub);
                             }
                         }
                         Ok(Control::Unsubscribe(sub)) => {
+                            if subs.contains(&sub) {
+                                if let Some(coin) = book_coin(&sub) {
+                                    wants.remove(coin, matches!(sub, Sub::L4Book { .. }));
+                                }
+                            }
                             subs.retain(|s| s != &sub);
                             write.send(subscription_response("unsubscribe", &sub)).await?;
                         }
                         Err(message) => write.send(error_frame(&message)).await?,
                     }
                 }
-                Some(Ok(WsMessage::Ping(p))) => { last_seen = Instant::now(); write.send(WsMessage::Pong(p)).await?; }
+                // Rate-limited exactly as `Text` is. Applied to `Text` alone, a peer holds the
+                // connection open indefinitely and drives an unbounded outbound `Pong` stream without
+                // ever tripping the cap this sink relies on as its load-bearing client limit.
+                Some(Ok(WsMessage::Ping(p))) => {
+                    last_seen = Instant::now();
+                    if !inbound_allowed(&mut win_start, &mut win_count) {
+                        return end_rate_limited(&mut write).await;
+                    }
+                    write.send(WsMessage::Pong(p)).await?;
+                }
                 Some(Ok(WsMessage::Pong(_))) => last_seen = Instant::now(),
                 Some(Ok(WsMessage::Close(_))) | None => break,
                 Some(Ok(_)) => {}
@@ -906,23 +1254,26 @@ async fn serve_client(
             },
 
             msg = rx.recv() => match msg {
-                Ok(m) => {
-                    for (channel, frame) in frames(&m, &subs, &books) {
-                        sent(channel);
-                        write.send(WsMessage::Text(frame.into())).await?;
+                Ok(p) => match &*p {
+                    Prepared::Message(p) => {
+                        for (channel, frame) in frames(p, &subs, &mut pinned) {
+                            sent(channel);
+                            write.send(WsMessage::Text(frame)).await?;
+                        }
                     }
-                }
+                    // The shared stage lost messages, so this client's `l4Book` book is wrong even
+                    // though its own receiver never lagged.
+                    Prepared::Resync => {
+                        if !rebootstrap(&mut write, &books, &subs, &pinned, &mut last_rebootstrap).await? {
+                            return end_lagging(&mut write).await;
+                        }
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("hl sink client lagged, dropped {n}");
-                    // `l4Book` only: it is incremental, so a dropped batch leaves this client's book
-                    // permanently wrong. `l2Book` self-heals on its next frame, and re-rendering it
-                    // here would spend the most work on the one path where the client is already
-                    // behind — which is what makes it lag again.
-                    for sub in subs.iter().filter(|s| matches!(s, Sub::L4Book { .. })) {
-                        for (channel, frame) in bootstrap(&books, sub) {
-                            sent(channel);
-                            write.send(WsMessage::Text(frame.into())).await?;
-                        }
+                    dropped("client_lagged");
+                    if !rebootstrap(&mut write, &books, &subs, &pinned, &mut last_rebootstrap).await? {
+                        return end_lagging(&mut write).await;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -930,6 +1281,88 @@ async fn serve_client(
         }
     }
     Ok(())
+}
+
+/// The coin a subscription names, when it is one of the two book channels.
+fn book_coin(sub: &Sub) -> Option<&str> {
+    match sub {
+        Sub::L2Book { coin, .. } | Sub::L4Book { coin } => Some(coin),
+        Sub::Trades { .. } => None,
+    }
+}
+
+/// Charge one inbound frame against the rolling-minute cap, returning whether it is allowed.
+fn inbound_allowed(win_start: &mut Instant, win_count: &mut u32) -> bool {
+    if win_start.elapsed() >= Duration::from_secs(60) {
+        *win_start = Instant::now();
+        *win_count = 0;
+    }
+    *win_count += 1;
+    *win_count <= MAX_INBOUND_PER_MIN
+}
+
+/// End a connection that crossed the inbound cap. The `Close` is not decoration: dropping the socket
+/// straight after the error frame races whatever the peer has not drained, so a real client is
+/// disconnected with the one frame that says why still in flight.
+async fn end_rate_limited<S>(write: &mut S) -> Result<()>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    write
+        .send(error_frame("inbound rate limit exceeded"))
+        .await?;
+    write.send(WsMessage::Close(None)).await?;
+    Ok(())
+}
+
+/// End a connection that keeps falling behind. See [`rebootstrap`].
+async fn end_lagging<S>(write: &mut S) -> Result<()>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    write
+        .send(error_frame("lagging: reconnect for a fresh book"))
+        .await?;
+    write.send(WsMessage::Close(None)).await?;
+    Ok(())
+}
+
+/// Re-bootstrap this client's `l4Book` subscriptions after a gap, returning whether it should stay
+/// connected.
+///
+/// `l4Book` only: it is incremental, so a dropped batch leaves this client's book permanently wrong.
+/// `l2Book` self-heals on its next frame.
+///
+/// **Guarded, because the remedy is also the cause.** A client lags when it cannot keep up, and this
+/// hands it the most expensive frame the sink produces — a lock-held clone plus a full order-set
+/// materialization, ~5.6 ms per market. Ungated, a client that lags once lags again on the work sent
+/// to fix it, forever. A second gap inside the guard window says the client cannot be served at this
+/// rate, so it is told to reconnect rather than kept on a book known to be wrong.
+async fn rebootstrap<S>(
+    write: &mut S,
+    books: &BookSnapshot,
+    subs: &[Sub],
+    pinned: &std::collections::HashMap<String, BookKey>,
+    last: &mut Option<Instant>,
+) -> Result<bool>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    if last.is_some_and(|t| t.elapsed() < REBOOTSTRAP_MIN_INTERVAL) {
+        return Ok(false);
+    }
+    *last = Some(Instant::now());
+    for sub in subs.iter().filter(|s| matches!(s, Sub::L4Book { .. })) {
+        let key = book_coin(sub).and_then(|c| pinned.get(c));
+        for (channel, frame) in bootstrap(books, sub, key) {
+            sent(channel);
+            write.send(WsMessage::Text(frame.into())).await?;
+        }
+    }
+    Ok(true)
 }
 
 /// The publisher acknowledges a sub/unsub by echoing the client's own frame back. The echo carries
@@ -1375,7 +1808,8 @@ mod tests {
             order_id: 11,
         }]);
         let v: serde_json::Value =
-            serde_json::from_str(&render_l4book_diff(&b, "BTC").unwrap()).unwrap();
+            serde_json::from_str(&render_l4book_diff(&b, "BTC", &MarketOrders::default()).unwrap())
+                .unwrap();
         let up = &v["data"]["Updates"];
         assert_eq!(up["book_diffs"][0]["oid"], 11);
         assert_eq!(up["book_diffs"][0]["px"], "100");
@@ -1404,8 +1838,10 @@ mod tests {
             },
         ] {
             let b = book_with(vec![change]);
-            let v: serde_json::Value =
-                serde_json::from_str(&render_l4book_diff(&b, "BTC").unwrap()).unwrap();
+            let v: serde_json::Value = serde_json::from_str(
+                &render_l4book_diff(&b, "BTC", &MarketOrders::default()).unwrap(),
+            )
+            .unwrap();
             assert_eq!(
                 v["data"]["Updates"]["book_diffs"][0]["raw_book_diff"],
                 "remove"
@@ -1423,9 +1859,9 @@ mod tests {
             size: 3.0,
             order_id: 11,
         }]);
-        assert!(render_l4book_diff(&b, "ETH").is_none());
+        assert!(render_l4book_diff(&b, "ETH", &MarketOrders::default()).is_none());
         b.venue = "PHOENIX".into();
-        assert!(render_l4book_diff(&b, "BTC").is_none());
+        assert!(render_l4book_diff(&b, "BTC", &MarketOrders::default()).is_none());
     }
 
     /// A price-aggregated change carries no order identity, and `oid: 0` reads to an L3 consumer as
@@ -1439,7 +1875,7 @@ mod tests {
             size: 3.0,
             order_id: 0,
         }]);
-        assert!(render_l4book_diff(&b, "BTC").is_none());
+        assert!(render_l4book_diff(&b, "BTC", &MarketOrders::default()).is_none());
     }
 
     // --- Task 5: trades ---
@@ -1507,10 +1943,11 @@ mod tests {
                 n_sig_figs: None,
                 mantissa: None,
                 n_levels: 20
-            }
+            },
+            None,
         )
         .is_empty());
-        assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).is_empty());
+        assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }, None).is_empty());
     }
 
     /// This sink reads only the accumulator's *order* population, so a price-aggregated market would
@@ -1537,7 +1974,7 @@ mod tests {
         ]));
         assert!(acc.baselined() && !acc.is_order_level());
         let books = replay(vec![(key(), acc)]);
-        assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).is_empty());
+        assert!(bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }, None).is_empty());
         assert!(bootstrap(
             &books,
             &Sub::L2Book {
@@ -1545,7 +1982,8 @@ mod tests {
                 n_sig_figs: None,
                 mantissa: None,
                 n_levels: 20
-            }
+            },
+            None,
         )
         .is_empty());
     }
@@ -1575,7 +2013,7 @@ mod tests {
         }]));
         let books = replay(vec![(key(), acc)]);
         assert_eq!(
-            bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }).len(),
+            bootstrap(&books, &Sub::L4Book { coin: "BTC".into() }, None).len(),
             1
         );
         assert_eq!(
@@ -1586,7 +2024,8 @@ mod tests {
                     n_sig_figs: None,
                     mantissa: None,
                     n_levels: 20
-                }
+                },
+                None,
             )
             .len(),
             1
@@ -1618,14 +2057,27 @@ mod tests {
                 n_levels: 20,
             },
         ];
-        let m = FeedMessage::Book(book_with(vec![BookChange {
+        let m = Arc::new(FeedMessage::Book(book_with(vec![BookChange {
             action: BookAction::Update,
             side: BookSide::Bid,
             price: 100.0,
             size: 3.0,
             order_id: 11,
-        }]));
-        let out = frames(&m, &subs, &books);
+        }])));
+        let wanted: Wanted = Default::default();
+        for (coin, l4) in [("BTC", false), ("BTC", true)] {
+            let mut w = crate::model::lock(&wanted);
+            let e = w.entry(coin.to_string()).or_default();
+            if l4 {
+                e.l4 += 1;
+            } else {
+                e.l2 += 1;
+            }
+        }
+        let mut published = Default::default();
+        let mut order = Default::default();
+        let p = prepare_one(&m, &books, &wanted, &mut published, &mut order, false);
+        let out = frames(&p, &subs, &mut Default::default());
         assert_eq!(
             out.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
             vec!["l2Book", "l4Book"]
@@ -1861,43 +2313,460 @@ mod tests {
         srv.abort();
     }
 
-    /// A control frame is cheap to send and can cost a whole book to answer, so the per-minute cap is
-    /// what bounds the amplification. Crossing it ends the connection rather than throttling, which is
-    /// what the normalized sink does.
-    #[tokio::test]
-    async fn crossing_the_inbound_rate_limit_ends_the_connection() {
+    /// Flood the connection past the inbound cap with `flood`, then report whether the rate-limit
+    /// error arrived and whether a WebSocket `Close` followed it.
+    async fn flood_past_the_cap(frame: impl Fn() -> WsMessage) -> (bool, bool) {
         let (_tx, addr, srv) = spawn(vec![]).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
         for _ in 0..=MAX_INBOUND_PER_MIN {
-            if ws
-                .send(WsMessage::Text(r#"{"method":"ping"}"#.into()))
-                .await
-                .is_err()
-            {
+            if ws.send(frame()).await.is_err() {
                 break;
             }
         }
-        // Drain until the rate-limit error arrives (every frame before it is a pong).
-        let limited = timeout(Duration::from_secs(5), async {
+        // Drain until the rate-limit error arrives (every frame before it is a pong), then look for
+        // the close that must follow it.
+        let out = timeout(Duration::from_secs(5), async {
+            let mut errored = false;
             loop {
                 match ws.next().await {
                     Some(Ok(WsMessage::Text(t))) => {
                         let v: serde_json::Value = serde_json::from_str(&t).unwrap();
                         if v["channel"] == "error" {
-                            return true;
+                            errored = true;
                         }
                     }
+                    Some(Ok(WsMessage::Close(_))) => return (errored, true),
                     Some(Ok(_)) => continue,
-                    _ => return false,
+                    _ => return (errored, false),
                 }
             }
         })
         .await
         .expect("must answer within the timeout");
-        assert!(limited, "the connection must end with the rate-limit error");
         srv.abort();
+        out
+    }
+
+    /// A control frame is cheap to send and can cost a whole book to answer, so the per-minute cap is
+    /// what bounds the amplification. Crossing it ends the connection rather than throttling, which is
+    /// what the normalized sink does.
+    ///
+    /// **Item K.** The `Close` is part of ending it: dropping the socket straight after the error
+    /// races the frames the peer has not drained, so the one frame that says *why* can be lost
+    /// entirely and a real client is disconnected with no reason.
+    #[tokio::test]
+    async fn crossing_the_inbound_rate_limit_ends_the_connection() {
+        let (errored, closed) =
+            flood_past_the_cap(|| WsMessage::Text(r#"{"method":"ping"}"#.into())).await;
+        assert!(errored, "the connection must end with the rate-limit error");
+        assert!(closed, "and with a WebSocket close, not an abrupt drop");
+    }
+
+    /// **Item L.** A WebSocket `Ping` is an inbound frame that costs an outbound `Pong`, so it is
+    /// charged against the same cap. Applied to `Text` alone, a peer holds the connection open
+    /// indefinitely and drives an unbounded `Pong` stream without ever tripping the limit this sink
+    /// relies on as its load-bearing client bound.
+    #[tokio::test]
+    async fn websocket_pings_count_against_the_inbound_rate_limit() {
+        let (errored, closed) = flood_past_the_cap(|| WsMessage::Ping(Vec::new().into())).await;
+        assert!(errored, "a ping flood must trip the inbound cap");
+        assert!(closed);
+    }
+
+    /// **Item J.** A coin that resolves to more than one market cannot be served: the schema carries
+    /// no channel or instrument field, so both markets' snapshots and updates would arrive under one
+    /// name. Refused, rather than silently served one of them.
+    #[tokio::test]
+    async fn an_ambiguous_coin_subscription_is_refused() {
+        let mut second = key();
+        second.3 = 8;
+        let books = vec![
+            (key(), accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)])),
+            (second, accumulated(vec![(BookSide::Ask, 200.0, 1.0, 12)])),
+        ];
+        let (_tx, addr, srv) = spawn(books).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let f = next_text(&mut ws, Duration::from_secs(2)).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&f).unwrap();
+        assert_eq!(v["channel"], "error", "got {f}");
+        assert!(v["data"].as_str().unwrap().contains("ambiguous"));
+        assert!(
+            next_text(&mut ws, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "an ambiguous coin must not be bootstrapped from either market"
+        );
+        srv.abort();
+    }
+
+    // --- the review's findings ---
+
+    /// One market's published order sizes, as the prepare stage would hold them.
+    fn published_sizes(orders: &[(u64, f64)]) -> MarketOrders {
+        let mut m = MarketOrders {
+            order_level: true,
+            ..Default::default()
+        };
+        for &(oid, sz) in orders {
+            m.sizes.insert(oid, sz);
+        }
+        m
+    }
+
+    fn diff_json(b: &NormalizedBook, published: &MarketOrders) -> serde_json::Value {
+        serde_json::from_str(&render_l4book_diff(b, "BTC", published).unwrap()).unwrap()
+    }
+
+    /// **Item I.** A partial fill of an order the consumer already holds is `update{origSz,newSz}`.
+    /// Rendered as `new`, the reference apply skips it for want of a matching opening order status
+    /// (`listeners/order_book/state.rs`) and the fill is silently lost. An order the channel has never
+    /// published stays `new` — there is no prior size to claim.
+    #[test]
+    fn a_partial_fill_of_a_published_order_is_an_update() {
+        let b = book_with(vec![BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price: 100.0,
+            size: 3.0,
+            order_id: 11,
+        }]);
+        let filled = diff_json(&b, &published_sizes(&[(11, 5.0)]));
+        assert_eq!(
+            filled["data"]["Updates"]["book_diffs"][0]["raw_book_diff"]["update"],
+            serde_json::json!({ "origSz": "5", "newSz": "3" })
+        );
+        let fresh = diff_json(&b, &published_sizes(&[]));
+        assert_eq!(
+            fresh["data"]["Updates"]["book_diffs"][0]["raw_book_diff"]["new"]["sz"],
+            "3"
+        );
+    }
+
+    /// A removal stays `remove` whatever the channel last published for the order.
+    #[test]
+    fn a_removal_is_remove_even_for_a_published_order() {
+        let b = book_with(vec![BookChange {
+            action: BookAction::Delete,
+            side: BookSide::Bid,
+            price: 100.0,
+            size: 0.0,
+            order_id: 11,
+        }]);
+        assert_eq!(
+            diff_json(&b, &published_sizes(&[(11, 5.0)]))["data"]["Updates"]["book_diffs"][0]
+                ["raw_book_diff"],
+            "remove"
+        );
+    }
+
+    /// A `Clear` drops the published population: the consumer was told to discard, so the next change
+    /// to a formerly-resting order is `new`, not an `update` against a size nobody holds.
+    #[test]
+    fn a_clear_drops_the_published_sizes() {
+        let mut m = published_sizes(&[(11, 5.0)]);
+        m.apply(&book_with(vec![BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+            order_id: 0,
+        }]));
+        assert_eq!(m.size_of(11), None);
+        assert!(m.order_level, "an emptied order book is still order-level");
+    }
+
+    /// Everything one broadcast message needs, prepared as the shared stage prepares it.
+    fn prepared(
+        m: &Arc<FeedMessage>,
+        books: &BookSnapshot,
+        published: &mut std::collections::HashMap<BookKey, MarketOrders>,
+        coins: &[(&str, bool)],
+    ) -> PreparedMessage {
+        let wanted: Wanted = Default::default();
+        {
+            let mut w = crate::model::lock(&wanted);
+            for (coin, l4) in coins {
+                let e = w.entry((*coin).to_string()).or_default();
+                if *l4 {
+                    e.l4 += 1;
+                } else {
+                    e.l2 += 1;
+                }
+            }
+        }
+        let mut order = Default::default();
+        prepare_one(m, books, &wanted, published, &mut order, false)
+    }
+
+    /// **Item C.** The `l4Book` re-baseline is rendered from the batch, not from the shared
+    /// accumulator. `Arbiter::publish_book` advances that accumulator *before* the message is
+    /// broadcast, so it already holds batches still queued for a lagging client: rendered from it, the
+    /// client gets a snapshot containing them and then applies the older diffs on top, resurrecting
+    /// removed orders permanently.
+    #[test]
+    fn an_l4book_snapshot_renders_the_batch_not_the_accumulator() {
+        // The shared accumulator is ahead of the batch — order 12 has already been folded in.
+        let mut acc = accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]);
+        acc.apply(&book_with(vec![BookChange {
+            action: BookAction::Update,
+            side: BookSide::Ask,
+            price: 101.0,
+            size: 1.0,
+            order_id: 12,
+        }]));
+        let books = replay(vec![(key(), acc)]);
+        let m = Arc::new(FeedMessage::Book(order_book(vec![(
+            BookSide::Bid,
+            100.0,
+            5.0,
+            11,
+        )])));
+        let p = prepared(&m, &books, &mut Default::default(), &[("BTC", true)]);
+        let v: serde_json::Value =
+            serde_json::from_str(p.l4.as_ref().expect("a re-baseline must snapshot")).unwrap();
+        let oids: Vec<u64> = v["data"]["Snapshot"]["levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|side| side.as_array().unwrap())
+            .map(|o| o["oid"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            oids,
+            vec![11],
+            "the snapshot must be the batch, not the accumulator's later state"
+        );
+    }
+
+    /// **Item B.** The arbiter's degraded forced re-baseline is a bare `Clear` — no replacement
+    /// content. `l4Book` has no clear of its own, so the consumer must still get a snapshot (an empty
+    /// one) or it holds every stale order forever and then receives `Updates` for a market it was
+    /// never given a `Snapshot` for.
+    #[test]
+    fn a_bare_clear_still_snapshots_an_l4book_subscriber() {
+        let books = replay(vec![(
+            key(),
+            accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]),
+        )]);
+        let mut published = Default::default();
+        // The market must first be known order-level, exactly as it is on the wire.
+        let seed = Arc::new(FeedMessage::Book(order_book(vec![(
+            BookSide::Bid,
+            100.0,
+            5.0,
+            11,
+        )])));
+        let _ = prepared(&seed, &books, &mut published, &[("BTC", true)]);
+
+        let bare = Arc::new(FeedMessage::Book(book_with(vec![BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+            order_id: 0,
+        }])));
+        let p = prepared(&bare, &books, &mut published, &[("BTC", true)]);
+        let v: serde_json::Value = serde_json::from_str(
+            p.l4.as_ref()
+                .expect("a bare clear must still tell the consumer to discard"),
+        )
+        .unwrap();
+        assert!(v["data"]["Snapshot"].is_object());
+        assert!(v["data"]["Snapshot"]["levels"][0]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(v["data"]["Snapshot"]["levels"][1]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A market that has never carried an order id is price-aggregated: this sink reads only the order
+    /// population, so an empty `l4Book` snapshot for it would tell the consumer to discard levels the
+    /// bridge holds.
+    #[test]
+    fn a_price_aggregated_clear_is_not_snapshotted() {
+        let books = replay(vec![]);
+        let bare = Arc::new(FeedMessage::Book(book_with(vec![BookChange {
+            action: BookAction::Clear,
+            side: BookSide::Both,
+            price: 0.0,
+            size: 0.0,
+            order_id: 0,
+        }])));
+        let p = prepared(&bare, &books, &mut Default::default(), &[("BTC", true)]);
+        assert!(p.l4.is_none());
+    }
+
+    /// **Item M.** The fold is O(resting orders) and is the sink's dominant cost. Paid per client it
+    /// also takes the *arbiter's* mutex once per client per batch — the one every receiver on every
+    /// feed takes to emit — so 64 clients stall all ingest for tens of milliseconds a batch. One fold
+    /// per batch, fanned out.
+    #[test]
+    fn the_l2_fold_is_paid_once_per_batch_not_once_per_client() {
+        let books = replay(vec![(
+            key(),
+            accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]),
+        )]);
+        let m = Arc::new(FeedMessage::Book(book_with(vec![BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price: 100.0,
+            size: 3.0,
+            order_id: 11,
+        }])));
+        let before = metrics().hl_sink_folds.get();
+        let p = prepared(&m, &books, &mut Default::default(), &[("BTC", false)]);
+        let subs = vec![Sub::L2Book {
+            coin: "BTC".into(),
+            n_sig_figs: None,
+            mantissa: None,
+            n_levels: 20,
+        }];
+        for _ in 0..64 {
+            let out = frames(&p, &subs, &mut Default::default());
+            assert_eq!(out.len(), 1, "every client still gets its own view");
+        }
+        assert_eq!(
+            metrics().hl_sink_folds.get() - before,
+            1,
+            "64 clients must cost one fold, not 64"
+        );
+    }
+
+    /// **Item J.** A `coin` is a truncated display label, and two markets sharing one is confirmed on
+    /// captured data (`tests/fixtures/PROVENANCE.md`). The schema carries no channel or instrument
+    /// field, so once a subscription is bound to a market, a second market taking the same symbol must
+    /// not interleave its updates into the first's book.
+    #[test]
+    fn a_second_market_sharing_the_coin_does_not_interleave() {
+        let books = replay(vec![]);
+        let subs = vec![Sub::L4Book { coin: "BTC".into() }];
+        let mut pinned = Default::default();
+        let first = Arc::new(FeedMessage::Book(order_book(vec![(
+            BookSide::Bid,
+            100.0,
+            5.0,
+            11,
+        )])));
+        let mut published = Default::default();
+        let p = prepared(&first, &books, &mut published, &[("BTC", true)]);
+        assert_eq!(frames(&p, &subs, &mut pinned).len(), 1);
+
+        // Same coin, different market.
+        let FeedMessage::Book(mut other) = (*first).clone() else {
+            unreachable!()
+        };
+        other.instrument_id = 8;
+        let other = Arc::new(FeedMessage::Book(other));
+        let p = prepared(&other, &books, &mut published, &[("BTC", true)]);
+        assert!(
+            frames(&p, &subs, &mut pinned).is_empty(),
+            "the second market must not be served under the first's coin"
+        );
+    }
+
+    /// A `Sink` that just records what was written, so the re-bootstrap guard can be driven without a
+    /// socket.
+    #[derive(Default)]
+    struct Recorder(Vec<WsMessage>);
+
+    impl futures_util::Sink<WsMessage> for Recorder {
+        type Error = std::convert::Infallible;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(
+            mut self: std::pin::Pin<&mut Self>,
+            item: WsMessage,
+        ) -> std::result::Result<(), Self::Error> {
+            self.0.push(item);
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive
+    /// frame the sink produces — so re-sending it unguarded is what makes the client lag again. A
+    /// second gap inside the guard window means it cannot be served at this rate.
+    #[tokio::test]
+    async fn a_second_lag_inside_the_guard_window_is_refused() {
+        let books = replay(vec![(
+            key(),
+            accumulated(vec![(BookSide::Bid, 100.0, 5.0, 11)]),
+        )]);
+        let subs = vec![Sub::L4Book { coin: "BTC".into() }];
+        let pinned = Default::default();
+        let mut out = Recorder::default();
+        let mut last = None;
+        assert!(
+            rebootstrap(&mut out, &books, &subs, &pinned, &mut last)
+                .await
+                .unwrap(),
+            "the first gap re-bootstraps"
+        );
+        assert_eq!(out.0.len(), 1);
+        assert!(
+            !rebootstrap(&mut out, &books, &subs, &pinned, &mut last)
+                .await
+                .unwrap(),
+            "a second gap inside the window must not re-send the whole book"
+        );
+        assert_eq!(out.0.len(), 1);
+    }
+
+    /// Not a regression guard — it asserts nothing — but the figures behind the fan-out above, so a
+    /// future reader can re-measure instead of trusting the commit message. Run with
+    /// `cargo test --release -- --ignored measure_the_per_client_cost --nocapture`.
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    fn measure_the_per_client_cost() {
+        let n = 44_598u64;
+        let acc = accumulated(
+            (0..n)
+                .map(|i| (BookSide::Bid, 100.0 - (i as f64) / 1000.0, 1.0, i + 1))
+                .collect(),
+        );
+        let books = replay(vec![(key(), acc.clone())]);
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = take_market(&books, &key(), "BTC", BookAccumulator::clone);
+        }
+        println!("clone (lock-held):   {:?}", t.elapsed() / 10);
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = acc.price_fold();
+        }
+        println!("price_fold:          {:?}", t.elapsed() / 10);
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = acc.to_book(&key(), ReplayScope::Orders);
+        }
+        println!("to_book(Orders):     {:?}", t.elapsed() / 10);
     }
 
     /// The golden fixture `tests/hyperliquid_sink_shapes.rs` pins is generated from this renderer,
@@ -1959,7 +2828,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            render_l4book_diff(&b, "BTC").unwrap(),
+            render_l4book_diff(&b, "BTC", &MarketOrders::default()).unwrap(),
             include_str!("../../tests/fixtures/hl_l4book_updates_golden.json").trim_end(),
             "regenerate tests/fixtures/hl_l4book_updates_golden.json from this renderer"
         );
