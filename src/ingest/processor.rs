@@ -1091,12 +1091,17 @@ impl MboProcessor {
     /// Clear the raced order-event state for every market this processor has emitted a book under — the
     /// `EndOfSession` counterpart of [`Self::reset_all_known_depth_floors`]. A session boundary restarts
     /// the venue's order-id space, so the ended session's tombstones would refuse the new session's
-    /// legitimately-reused ids. Scoped to the racing state only: a peer arm that missed the session end
-    /// is still serving these markets, and dropping its published book is the failure the arbiter's
-    /// narrower seam exists to avoid.
+    /// legitimately-reused ids. Scoped to the racing state only: it leaves the replay accumulator and
+    /// the authority entry alone, which is what stops it tearing down a published book.
+    ///
+    /// **Every publisher's markets, matching the book reset that precedes it.** The handler drops all of
+    /// them to `Recovering` and reports all of them unsynced, so leaving a peer's tombstones behind
+    /// refuses the new session's re-used ids for exactly the markets nothing is serving any more — the
+    /// `InstrumentReset` failure, one handler over. It also means an `EndOfSession` from a source
+    /// holding no books of its own still clears the state of the ones that were just reset.
     fn reset_all_known_book_events(&self, ctx: &FrameCtx) {
         let mut arb = lock(ctx.arbiter);
-        for key in self.books.keys().filter(|(p, _)| *p == ctx.publisher) {
+        for key in self.books.keys() {
             if let Some(market) = self.market_key(key, ctx) {
                 // The session variant: a boundary restarts the venue's *clock* as well as its id
                 // space, so the channel's venue-time frontier goes with the racing state. The
@@ -7428,7 +7433,110 @@ mod tests {
         );
     }
 
-    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
+    /// `EndOfSession` drops every publisher's book, so the raced state of every one of them has to go
+    /// with it. Scoped to the sending publisher, an `EndOfSession` from a source holding no books of
+    /// its own — a refdata-only mirror, an evicted publisher, one forged datagram — resets every real
+    /// book to `Recovering` and clears no tombstones, and the new session's re-used order ids are then
+    /// refused for exactly the markets nothing is serving any more.
+    #[test]
+    fn an_end_of_session_from_a_bookless_source_still_clears_the_raced_state() {
+        use std::net::Ipv4Addr;
+        fn ctx_for<'a>(
+            publisher: IpAddr,
+            arbiter: &'a SharedArbiter,
+            instruments: &'a crate::model::InstrumentSnapshot,
+            role: PortRole,
+        ) -> FrameCtx<'a> {
+            let mut c = make_ctx(arbiter, instruments, role);
+            c.publisher = publisher;
+            c
+        }
+        let holder = IpAddr::V4(Ipv4Addr::new(10, 3, 0, 1));
+        let bookless = IpAddr::V4(Ipv4Addr::new(10, 3, 0, 2));
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        lock(&arbiter).set_book_replay(Arc::new(Mutex::new(Default::default())));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, tape(false));
+        let anchor = |sid: u32, ts: u64| {
+            frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: sid,
+                    last_instrument_seq: 0,
+                    ts,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: sid,
+                }),
+            ])
+        };
+        for publisher in [holder, bookless] {
+            proc.on_datagram(
+                &frame(&[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(0, "INST-0", 1),
+                ]),
+                &ctx_for(publisher, &arbiter, &instruments, PortRole::Combined),
+            );
+        }
+        // Only `holder` builds a book: order 7 rests, then dies, leaving a tombstone.
+        proc.on_datagram(
+            &anchor(1, 1),
+            &ctx_for(holder, &arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &frame(&[add(1, 7, 1_000)]),
+            &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        proc.on_datagram(
+            &frame(&[enc_order_cancel(&OrderCancel {
+                instrument_id: 0,
+                source_id: 0,
+                reason: 0,
+                per_instrument_seq: 2,
+                order_id: 7,
+                ts: 1_100,
+            })]),
+            &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+
+        proc.on_datagram(
+            &frame(&[enc_end_of_session(1_200)]),
+            &ctx_for(bookless, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        // The new session re-syncs and re-uses order id 7, arriving as an ordinary delta (a
+        // `Clear`-led batch bypasses the guard, so the reveal is spent on an unrelated order first).
+        proc.on_datagram(
+            &anchor(2, 1_300),
+            &ctx_for(holder, &arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &frame(&[add(1, 9, 1_400)]),
+            &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+        proc.on_datagram(
+            &frame(&[add(2, 7, 1_500)]),
+            &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        let ids: Vec<u64> = drain_books(&mut rx)
+            .iter()
+            .flat_map(|b| b.changes.iter().map(|c| c.order_id))
+            .collect();
+        assert!(
+            ids.contains(&7),
+            "the ended session's tombstone must not refuse the new session's re-used id: {ids:?}"
+        );
+    }
+
+    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering`    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
     /// `mbo_end_of_session_resets_peer_publisher_books` for why), so every one of them must report it.
     /// A peer left claiming `synced` is a phantom healthy arm, and the arbiter suppresses the
     /// surviving arm's only re-baseline against it.

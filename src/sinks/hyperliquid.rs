@@ -64,8 +64,9 @@ const MAX_INBOUND_PER_MIN: u32 = 600;
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Capacity of the prepared-frame fan-out, sized to match the backbone so a client that keeps up
-/// with the backbone keeps up here too.
+/// Capacity of the prepared-frame fan-out. A constant like every other limit here — this sink has no
+/// operator-tunable behaviour — and set well above the backbone's own shipped default, so this hop is
+/// never the one that drops a batch a client would otherwise have kept.
 const PREPARED_CAPACITY: usize = 4096;
 /// Shortest interval between one client's `l4Book` re-bootstraps — see `rebootstrap`.
 const REBOOTSTRAP_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -302,17 +303,26 @@ struct OrderDiffEntry<'a> {
     raw_book_diff: RawDiff,
 }
 
-/// The publisher's `OrderDiff`, verbatim (`app/publisher/server/src/types/mod.rs`).
+/// The publisher's `OrderDiff`, verbatim (`app/publisher/server/src/types/mod.rs`) — the container's
+/// `rename_all` spells the variants `new`/`update`/`remove`, and the `Update` variant carries its own,
+/// which is what spells its fields `origSz`/`newSz`.
 ///
-/// The three variants are not interchangeable, and the reference apply
-/// (`listeners/order_book/state.rs`) is what makes the distinction load-bearing: `New` is inserted
-/// only against a **matching opening order status**, while `Update` goes straight to
-/// `modify_sz(oid, coin, newSz)`. Rendering a partial fill as `new` therefore does not reduce the
-/// order — the consumer logs "New order did not rest" and skips it, and the fill is silently lost.
+/// **The three are not interchangeable.** `new` asserts that an order the recipient does not have is
+/// now resting; `update` asserts that one it does have changed size. A partial fill is the second, and
+/// rendering it as the first tells a consumer to insert an order it already holds. The publisher's own
+/// book builder refuses that outright — `listeners/order_book/state.rs` inserts a `New` only against a
+/// matching opening order status and logs "New order did not rest" otherwise, while `Update` goes
+/// straight to `modify_sz(oid, coin, newSz)`.
+///
+/// ⚠️ That builder consumes the Hyperliquid node's raw book diffs, **not** this WebSocket channel, and
+/// there is no reference `l4Book` *consumer* in either source this sink is written against. It is the
+/// closest statement of the variants' meaning that exists, and it is cited as that rather than as the
+/// behaviour of any particular client. What follows from it either way: emit the variant the venue
+/// event actually is.
 ///
 /// `origSz` is what **this channel last published** for the order, which is the only prior size the
 /// sink can honestly claim (the arbiter can refuse a change that never reached the wire, so a
-/// producer-side prior would describe a state no consumer here holds). The reference apply ignores
+/// producer-side prior would describe a state no consumer here holds). The publisher's builder ignores
 /// the field; it is carried because the schema has it.
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -512,8 +522,8 @@ fn raw_diff(c: &crate::model::BookChange, published: Option<f64>) -> RawDiff {
         return RawDiff::Remove;
     }
     match published {
-        // The consumer already holds this order: `new` would be skipped for want of an opening
-        // status, so a partial fill has to say `update`. See [`RawDiff`].
+        // The consumer already holds this order, so the change is a size change and not a new
+        // resting order. See [`RawDiff`].
         Some(prev) => RawDiff::Update {
             orig_sz: num(prev),
             new_sz: num(c.size),
@@ -784,6 +794,11 @@ async fn prepare_loop(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("hl sink prepare stage lagged, dropped {n}");
                 dropped("prepare_lagged");
+                // The published sizes no longer describe what any client holds — the gap's changes
+                // never went out, and every client re-bootstraps from the accumulator below. Kept,
+                // they would claim an `origSz` for orders whose history this stage missed.
+                published.clear();
+                order.clear();
                 let _ = out.send(Arc::new(Prepared::Resync));
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -837,6 +852,19 @@ fn prepare_one(
             }
         }
         order.push_back(key.clone());
+        // Seeded from the shared accumulator, not rebuilt from the stream: a market re-created after
+        // an eviction would otherwise read as price-aggregated until its next order-carrying batch,
+        // and a bare `clear` in that window would reach no `l4Book` subscriber at all.
+        let seed = crate::model::lock(books)
+            .get(&key)
+            .is_some_and(BookAccumulator::is_order_level);
+        published.insert(
+            key.clone(),
+            MarketOrders {
+                order_level: seed,
+                ..Default::default()
+            },
+        );
     }
     let market = published.entry(key.clone()).or_default();
     // Rendered against the pre-batch sizes, then the batch is folded in — `origSz` is what the
@@ -1102,6 +1130,14 @@ fn frames(
             let Some(key) = p.key.as_ref() else {
                 return out;
             };
+            // **Only a coin this client is subscribed to may be pinned.** Pinning from the stream
+            // regardless would let a market that happened to publish between accept and the
+            // subscribe frame claim the coin, and the subscribe path — which resolves it properly
+            // against the book map — would then find the pin already taken: an empty bootstrap
+            // followed by every real frame silently dropped, for the life of the connection.
+            if !subs.iter().any(|s| book_coin(s) == Some(coin)) {
+                return out;
+            }
             match pinned.get(coin) {
                 Some(held) if held != key => {
                     dropped("ambiguous_market");
@@ -1199,8 +1235,11 @@ async fn serve_client(
                                         )).await?;
                                         continue;
                                     }
+                                    // Overwrites: this is the authoritative resolution, against
+                                    // the book map, and it must win over anything the stream put
+                                    // there for an earlier subscription of the same coin.
                                     if let Some(key) = markets.into_iter().next() {
-                                        pinned.entry(coin.to_string()).or_insert(key);
+                                        pinned.insert(coin.to_string(), key);
                                     }
                                 }
                             }
@@ -1224,6 +1263,13 @@ async fn serve_client(
                                 }
                             }
                             subs.retain(|s| s != &sub);
+                            // The pin goes with the last subscription that held it, so a later
+                            // subscribe re-resolves the coin instead of inheriting a stale market.
+                            if let Some(coin) = book_coin(&sub) {
+                                if !subs.iter().any(|s| book_coin(s) == Some(coin)) {
+                                    pinned.remove(coin);
+                                }
+                            }
                             write.send(subscription_response("unsubscribe", &sub)).await?;
                         }
                         Err(message) => write.send(error_frame(&message)).await?,
@@ -2713,7 +2759,30 @@ mod tests {
         }
     }
 
-    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive
+    /// A market must not claim a coin before the client asks for it. Pinned from the stream regardless
+    /// of subscriptions, a market that published between accept and the subscribe frame took the coin,
+    /// the subscribe path's own resolution could not displace it, and the client then received an empty
+    /// bootstrap followed by every real frame dropped — with a `subscriptionResponse` and no error.
+    #[test]
+    fn an_unsubscribed_coin_is_not_pinned_from_the_stream() {
+        let books = replay(vec![]);
+        let mut pinned = Default::default();
+        let stray = Arc::new(FeedMessage::Book(order_book(vec![(
+            BookSide::Bid,
+            100.0,
+            5.0,
+            11,
+        )])));
+        let p = prepared(&stray, &books, &mut Default::default(), &[("BTC", true)]);
+        // No subscriptions yet: the batch is not rendered, and must leave no pin behind.
+        assert!(frames(&p, &[], &mut pinned).is_empty());
+        assert!(
+            pinned.is_empty(),
+            "a coin nobody subscribed to must not be bound to a market"
+        );
+    }
+
+    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive
     /// frame the sink produces — so re-sending it unguarded is what makes the client lag again. A
     /// second gap inside the guard window means it cannot be served at this rate.
     #[tokio::test]
@@ -2829,9 +2898,17 @@ mod tests {
                 size: 0.0,
                 order_id: 4,
             },
+            // A partial fill of an order this channel has already published — the `update` variant.
+            BookChange {
+                action: BookAction::Update,
+                side: BookSide::Bid,
+                price: 100.5,
+                size: 1.5,
+                order_id: 2,
+            },
         ]);
         assert_eq!(
-            render_l4book_diff(&b, "BTC", &MarketOrders::default()).unwrap(),
+            render_l4book_diff(&b, "BTC", &published_sizes(&[(2, 3.0)])).unwrap(),
             include_str!("../../tests/fixtures/hl_l4book_updates_golden.json").trim_end(),
             "regenerate tests/fixtures/hl_l4book_updates_golden.json from this renderer"
         );

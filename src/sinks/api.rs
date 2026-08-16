@@ -583,15 +583,26 @@ type Level = Option<(f64, f64)>;
 /// inside market, and materializing the market's entire level set (plus a `to_book` timestamp
 /// syscall) to then discard everything past the first entry per side would be wasted work on every
 /// `ticker`/`best_bid_ask` call.
+///
+/// An **order-level** accumulator is skipped rather than read: its levels exist only as resting
+/// orders, so any answer from it is O(resting orders) — and this runs under the mutex the arbiter's
+/// emit path takes on every published batch, once per instrument in the catalog on an unfiltered
+/// `best_bid_ask`. The Market-by-Order `depth` snapshot below is the same book's inside market,
+/// already derived, already top-N, and O(1) to read; that is what such a market answers from. (An
+/// order-level market with no `depth` entry yet reports "not available", the same as any other
+/// identity neither store holds.)
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) {
     {
         let books = crate::model::lock(&state.books);
-        if let Some(acc) = books.get(&(
-            inst.venue.clone(),
-            inst.category.clone(),
-            inst.channel,
-            inst.instrument_id,
-        )) {
+        if let Some(acc) = books
+            .get(&(
+                inst.venue.clone(),
+                inst.category.clone(),
+                inst.channel,
+                inst.instrument_id,
+            ))
+            .filter(|acc| !acc.is_order_level())
+        {
             return (acc.best_bid(), acc.best_ask());
         }
     }
@@ -640,12 +651,33 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         inst.channel,
         inst.instrument_id,
     );
-    let order_level_copy = {
+    // One acquisition for both paths: an order-level market is copied out and folded after the guard
+    // drops, a price-keyed one is read in place (its trees are already ordered, so there is nothing to
+    // copy out for).
+    enum Held {
+        Fold(Box<crate::model::BookAccumulator>),
+        Top(bool, u64, Vec<(f64, f64)>, Vec<(f64, f64)>, usize, usize),
+    }
+    let held = {
         let books = crate::model::lock(&state.books);
-        books.get(&key).filter(|acc| acc.is_order_level()).cloned()
+        books.get(&key).map(|acc| {
+            if acc.is_order_level() {
+                Held::Fold(Box::new(acc.clone()))
+            } else {
+                let (bids, asks, bids_total, asks_total) = acc.top_levels(MAX_LEVELS_PER_SIDE);
+                Held::Top(
+                    acc.baselined(),
+                    acc.source_ts_ns(),
+                    bids,
+                    asks,
+                    bids_total,
+                    asks_total,
+                )
+            }
+        })
     };
-    let mbp = match &order_level_copy {
-        Some(acc) => {
+    let mbp = match held {
+        Some(Held::Fold(acc)) => {
             let (bids, asks) = acc.price_fold();
             let (bids_total, asks_total) = (bids.len(), asks.len());
             let level = |v: Vec<crate::model::CountedLevel>| -> Vec<(f64, f64)> {
@@ -663,20 +695,10 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
                 asks_total,
             ))
         }
-        None => {
-            let books = crate::model::lock(&state.books);
-            books.get(&key).map(|acc| {
-                let (bids, asks, bids_total, asks_total) = acc.top_levels(MAX_LEVELS_PER_SIDE);
-                (
-                    acc.baselined(),
-                    acc.source_ts_ns(),
-                    bids,
-                    asks,
-                    bids_total,
-                    asks_total,
-                )
-            })
+        Some(Held::Top(baselined, ts, bids, asks, bids_total, asks_total)) => {
+            Some((baselined, ts, bids, asks, bids_total, asks_total))
         }
+        None => None,
     };
     if let Some((baselined, source_ts_ns, bids, asks, bids_total, asks_total)) = mbp {
         // Our own serving cap, independent of `baselined()`: even a fully re-baselined book is
@@ -2320,6 +2342,91 @@ mod tests {
         );
     }
 
+    /// `best_levels` runs under the same `books` guard `book()` does — and `best_bid_ask` fans it out
+    /// over **every** instrument in the catalog, so one unauthenticated GET must not become an
+    /// O(resting orders) pass per order-level market. It reads the `depth` snapshot for those instead,
+    /// which is the same book's inside market, already derived and already top-N.
+    #[test]
+    fn the_inside_market_of_a_huge_order_book_is_read_in_bounded_time() {
+        const TOTAL_ORDERS: usize = 200_000;
+        const BATCH: usize = 4_000;
+
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        instruments.lock().unwrap().insert(
+            ("HUGE".into(), "perps".into(), 9u32, 1u32),
+            inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2),
+        );
+        depth.lock().unwrap().insert(
+            ("HUGE".into(), "HUGEL3".into()),
+            NormalizedDepth {
+                venue: "HUGE".into(),
+                source: "HUGE".into(),
+                source_id: 3,
+                symbol: "HUGEL3".into(),
+                bids: vec![[1.0, 1.0]],
+                asks: vec![[2.0, 1.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        {
+            let mut acc = BookAccumulator::new("HUGEL3".into());
+            acc.apply(&book_batch(
+                "HUGE",
+                "HUGEL3",
+                9,
+                1,
+                vec![BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                }],
+                true,
+            ));
+            let mut o = 0usize;
+            while o < TOTAL_ORDERS {
+                let end = (o + BATCH).min(TOTAL_ORDERS);
+                let changes: Vec<BookChange> = (o..end)
+                    .map(|i| {
+                        order_update(BookSide::Bid, 1.0 - (i as f64) * 1e-6, 1.0, i as u64 + 1)
+                    })
+                    .collect();
+                acc.apply(&book_batch("HUGE", "HUGEL3", 9, 1, changes, true));
+                o = end;
+            }
+            assert!(acc.baselined() && acc.is_order_level(), "fixture sanity");
+            books
+                .lock()
+                .unwrap()
+                .insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+        }
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+        };
+        let inst = inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2);
+
+        let started = std::time::Instant::now();
+        let (bid, ask) = best_levels(&state, &inst);
+        let elapsed = started.elapsed();
+        assert_eq!(bid, Some((1.0, 1.0)));
+        assert_eq!(ask, Some((2.0, 1.0)));
+        assert!(
+            elapsed < std::time::Duration::from_millis(20),
+            "best_levels took {elapsed:?} for a {TOTAL_ORDERS}-order book: it must not scan the \
+             order population while holding `state.books`"
+        );
+    }
+
     /// The headline regression: two disjoint universes ("perps" and "sports") under one Source ID
     /// (KALSHI) both use `channel=9, instrument_id=1` — never assume `channel_id` ranges stay
     /// disjoint across universes, see this module's docs. Each market has its own catalog entry and
@@ -2446,6 +2553,25 @@ mod tests {
         instruments.lock().unwrap().insert(
             ("KALSHI".into(), "perps".into(), 2u32, 41u32),
             inst_in("perps", 3, "KALSHI", "L3MKT", 2, 41, -4, -2),
+        );
+        // A Market-by-Order feed publishes `depth` alongside its `book`, and that top-N slice is what
+        // the inside market is read from: folding the order population for it would be O(book) under
+        // the mutex the arbiter's emit path takes, once per instrument on an unfiltered
+        // `best_bid_ask`.
+        depth.lock().unwrap().insert(
+            ("KALSHI".into(), "L3MKT".into()),
+            NormalizedDepth {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "L3MKT".into(),
+                bids: vec![[0.61, 140.0], [0.60, 10.0]],
+                asks: vec![[0.63, 50.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
         );
         {
             let mut acc = BookAccumulator::new("L3MKT".into());

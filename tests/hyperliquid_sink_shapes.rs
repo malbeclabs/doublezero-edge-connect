@@ -141,11 +141,20 @@ struct L4Order {
 }
 
 /// `OrderDiff`'s container `rename_all` renames the *variants*, so the tags are lowercase and the
-/// unit variant is a bare string, not an object.
+/// unit variant is a bare string, not an object. `Update` carries a `rename_all` of its **own**,
+/// which is what spells its fields `origSz`/`newSz` while the variant tag stays `update` — the two
+/// attributes do different jobs, and mirroring only the container's would put `orig_sz` on the wire.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum OrderDiff {
-    New { sz: String },
+    New {
+        sz: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Update {
+        orig_sz: String,
+        new_sz: String,
+    },
     Remove,
 }
 
@@ -211,7 +220,8 @@ fn a_golden_l4book_snapshot_parses_as_the_publisher_emits_it() {
     assert_eq!(asks[0].side, HyperliquidSide::Sell);
 }
 
-/// The golden `l4Book` updates frame: snake_case throughout, and `remove` as a bare string.
+/// The golden `l4Book` updates frame: snake_case throughout, `remove` as a bare string, and
+/// `update`'s own camelCase fields.
 #[test]
 fn a_golden_l4book_updates_frame_parses_as_the_publisher_emits_it() {
     let frame = include_str!("fixtures/hl_l4book_updates_golden.json");
@@ -228,4 +238,13 @@ fn a_golden_l4book_updates_frame_parses_as_the_publisher_emits_it() {
         OrderDiff::New { sz: "4".into() }
     );
     assert_eq!(u.book_diffs[1].raw_book_diff, OrderDiff::Remove);
+    // A change to an order the channel has already published: `update`, with the prior size. `new`
+    // asserts an order the recipient does not have is now resting, which a partial fill is not.
+    assert_eq!(
+        u.book_diffs[2].raw_book_diff,
+        OrderDiff::Update {
+            orig_sz: "3".into(),
+            new_sz: "1.5".into()
+        }
+    );
 }

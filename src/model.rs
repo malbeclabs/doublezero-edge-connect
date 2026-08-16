@@ -702,40 +702,18 @@ impl BookAccumulator {
     /// level as "the best currently known" does not claim completeness the way replaying the whole
     /// book as a re-baseline would.
     ///
-    /// An **order-level** market keeps nothing in that tree, so it is one pass over the resting
-    /// orders instead. That is the cheapest honest answer available — the order map is unordered, so
-    /// there is no top to read — and it is what keeps a caller from reading an L3 market's silent
-    /// `None` as "this venue has no bid".
+    /// ⚠️ **`None` for an order-level market**, which keeps nothing in that tree: its levels exist
+    /// only as resting orders, and the order map is unordered, so there is no top to read and any
+    /// answer here would be a pass over the whole book taken under a caller's lock. A caller wanting
+    /// the inside market of such a market reads its `depth` snapshot instead — see
+    /// `sinks/api.rs::best_levels`.
     pub fn best_bid(&self) -> Option<(f64, f64)> {
-        if self.order_level {
-            return self.best_resting(true);
-        }
         self.bids.values().next_back().copied()
     }
 
     /// The current best ask (lowest price), as `(price, size)`. See [`Self::best_bid`].
     pub fn best_ask(&self) -> Option<(f64, f64)> {
-        if self.order_level {
-            return self.best_resting(false);
-        }
         self.asks.values().next().copied()
-    }
-
-    /// The best resting price on one side and the total size at it — one pass, no allocation, so a
-    /// `ticker` query never pays [`Self::price_fold`]'s whole-book cost for two levels.
-    fn best_resting(&self, bid: bool) -> Option<(f64, f64)> {
-        let mut best: Option<(i128, f64, f64)> = None;
-        for &(is_bid, key, price, size) in self.orders.values() {
-            if is_bid != bid {
-                continue;
-            }
-            match best {
-                Some((k, _, ref mut total)) if k == key => *total += size,
-                Some((k, ..)) if (bid && key < k) || (!bid && key > k) => {}
-                _ => best = Some((key, price, size)),
-            }
-        }
-        best.map(|(_, price, size)| (price, size))
     }
 
     /// The accumulator's last-applied event time. A caller that only needs a level slice (see
