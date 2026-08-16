@@ -795,14 +795,39 @@ async fn prepare_loop(
                 warn!("hl sink prepare stage lagged, dropped {n}");
                 dropped("prepare_lagged");
                 // The published sizes no longer describe what any client holds — the gap's changes
-                // never went out, and every client re-bootstraps from the accumulator below. Kept,
-                // they would claim an `origSz` for orders whose history this stage missed.
-                published.clear();
-                order.clear();
+                // never went out. Re-seeded from the accumulator every client is about to
+                // re-bootstrap from, rather than dropped: dropped, the first change to *every*
+                // order after the gap claims to be a new one, for orders the re-bootstrapped
+                // client demonstrably holds.
+                reseed_published(&books, &mut published, &mut order);
                 let _ = out.send(Arc::new(Prepared::Resync));
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+/// Rebuild the published-size map from the shared accumulators — the state every client is about to
+/// re-bootstrap from. Only ever on a stage gap, so its O(tracked books) cost is not on any hot path.
+fn reseed_published(
+    books: &BookSnapshot,
+    published: &mut std::collections::HashMap<BookKey, MarketOrders>,
+    order: &mut std::collections::VecDeque<BookKey>,
+) {
+    published.clear();
+    order.clear();
+    let guard = crate::model::lock(books);
+    for (key, acc) in guard.iter().filter(|(_, acc)| acc.is_order_level()) {
+        if published.len() >= MAX_TRACKED_MARKETS {
+            break;
+        }
+        let mut m = MarketOrders {
+            order_level: true,
+            ..Default::default()
+        };
+        m.apply(&acc.to_book(key, ReplayScope::Orders));
+        published.insert(key.clone(), m);
+        order.push_back(key.clone());
     }
 }
 
@@ -1245,15 +1270,24 @@ async fn serve_client(
                             }
                             write.send(subscription_response("subscribe", &sub)).await?;
                             if added {
-                                let key = book_coin(&sub).and_then(|c| pinned.get(c)).cloned();
-                                for (channel, frame) in bootstrap(&books, &sub, key.as_ref()) {
-                                    sent(channel);
-                                    write.send(WsMessage::Text(frame.into())).await?;
-                                }
+                                // **Claim before reading the bootstrap**, not after writing it.
+                                // The stage renders `l4` only for coins something wants, so a want
+                                // claimed after the write leaves the whole write of a 44,598-order
+                                // snapshot as a window in which every batch reaches this client
+                                // with nothing to render — and an incremental channel does not
+                                // recover from a gap. Claiming first can instead duplicate a batch
+                                // the bootstrap already contains, and those converge: an `update`
+                                // carries the order's absolute size and a `remove` is idempotent.
                                 if let Some(coin) = book_coin(&sub) {
                                     wants.add(coin, matches!(sub, Sub::L4Book { .. }));
                                 }
+                                let key = book_coin(&sub).and_then(|c| pinned.get(c)).cloned();
+                                let frames = bootstrap(&books, &sub, key.as_ref());
                                 subs.push(sub);
+                                for (channel, frame) in frames {
+                                    sent(channel);
+                                    write.send(WsMessage::Text(frame.into())).await?;
+                                }
                             }
                         }
                         Ok(Control::Unsubscribe(sub)) => {
@@ -2782,7 +2816,7 @@ mod tests {
         );
     }
 
-    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive
+    /// **Item N.** A client lags because it cannot keep up, and the re-bootstrap is the most expensive
     /// frame the sink produces — so re-sending it unguarded is what makes the client lag again. A
     /// second gap inside the guard window means it cannot be served at this rate.
     #[tokio::test]

@@ -7536,7 +7536,7 @@ mod tests {
         );
     }
 
-    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering`    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
+    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
     /// `mbo_end_of_session_resets_peer_publisher_books` for why), so every one of them must report it.
     /// A peer left claiming `synced` is a phantom healthy arm, and the arbiter suppresses the
     /// surviving arm's only re-baseline against it.

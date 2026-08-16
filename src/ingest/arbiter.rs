@@ -1757,13 +1757,12 @@ impl Arbiter {
     /// `reset_all_known_depth_floors` stop sweeping by `ctx.venue`. Filtered by the row's venue this
     /// matched nothing for exactly those markets, which is the wedge it exists to close.
     ///
-    /// ⚠️ **A category is not unique across venues** (`perps` already names rows on two of them), so
-    /// the scope is exact only while one `MarketByOrder` row carries it. A second such row on a
-    /// different venue, served by the same publisher host, would have this release that host's live
-    /// arms there too: `peer_serving` then reads false and a recovering arm can wipe a book a healthy
-    /// peer is serving. Nothing enforces it — `note_publisher` records publishers for
-    /// `MarketByOrder` alone and there is one such row — so adding a second is the point at which the
-    /// exiting receiver has to name the markets it actually fed rather than a scope it shares.
+    /// A category is not unique across venues in general (`perps` already names rows on two of them),
+    /// which would make this scope inexact the moment two venues carried `MarketByOrder` rows under
+    /// one: each exit would release the other venue's live arms, `peer_serving` would read false, and
+    /// a recovering arm could wipe a book a healthy peer is serving. That is refused at startup —
+    /// `registry::check_cross_row_invariants`, `SharedOrderBookCategory` — rather than left to be
+    /// re-derived here, since whoever adds the second row will be reading `registry.json`.
     pub fn forget_publisher_books(&mut self, category: &str, publisher: Publisher) {
         for (key, arms) in self.book_sync.iter_mut() {
             if key.1.as_ref() == category {

@@ -153,11 +153,15 @@ Modules are grouped by role under `src/`:
   `sources::source_id_of` resolves, base ports unique within a row, a non-empty roster, no port
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
   planes, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key from a
-  silently two-port block whose book never syncs into a startup error) **and the four cross-row
+  silently two-port block whose book never syncs into a startup error) **and the five cross-row
   invariants** — `(venue, category, kind)` uniqueness,
   one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
   cannot resolve last-write-wins by document order), `emit_trades` agreeing with
-  `reconcile::tape_rank_is_some`, and global `(group, port)` uniqueness. Those four used to be
+  `reconcile::tape_rank_is_some`, global `(group, port)` uniqueness, and **one venue per
+  `MarketByOrder` category** (a departing receiver releases its publishers' book standing by
+  category — the one scope it and the `MarketKey` provably share, see
+  `Arbiter::forget_publisher_books` — so two venues carrying that kind under one category would have
+  each exit release the other's live arms). The first four used to be
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
   `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a channel
@@ -769,8 +773,8 @@ Modules are grouped by role under `src/`:
   the `nLevels` extension. ⚠️ **No rendering happens under the shared `BookSnapshot` lock** — that is
   the mutex the arbiter's `apply_book_replay` takes on every published batch, so a book render held
   across it stalls every receiver on every feed; `take_market`/`take_markets` clone the accumulator out
-  (itself O(book), and the cheapest snapshot on offer — measured ~617 µs against ~8.9 ms to fold
-  under the guard) and every rendering step runs after the guard drops. **Everything shared across
+  (itself O(book), and the cheapest snapshot on offer — measured ~617 µs against ~8.9 ms to fold and
+  ~5.2 ms to materialize the order set under the guard) and every rendering step runs after the guard drops. **Everything shared across
   clients is paid once per batch, in `prepare_loop`/`prepare_one`**, a second broadcast hop modelled on
   `ws`'s serialize-once stage: it takes that mutex once, clones once, folds once (`price_fold` is
   view-independent) and renders the `l4Book` frame once, then fans out `Arc<Prepared>`; only the
@@ -793,12 +797,16 @@ Modules are grouped by role under `src/`:
   `height`, `order_statuses`) have no counterpart on the MBO wire and are null/zero/empty — parseable,
   never meaningful. `timestamp` is deliberately `0` rather than the book's event time: that stamp is one
   instant shared by every order in a snapshot, which a consumer ageing orders reads as real. Order diffs use all three
-  of the publisher's variants, and the choice is load-bearing: its own apply path inserts a `New` only
-  against a matching opening order status, so a partial fill rendered as `new` is skipped and lost. A
-  change to an order this channel has already published is `update{origSz,newSz}`, where `origSz` is
-  what **this channel last published** (`MarketOrders`, bounded per market and per order) — the arbiter
-  can refuse a change that never reached the wire, so a producer-side prior would describe a book no
-  consumer here holds.
+  of the publisher's variants, and the choice is load-bearing: `new` asserts that an order the recipient
+  does not have is now resting and `update` that one it does have changed size, so a partial fill is the
+  second. A change to an order this channel has already published is `update{origSz,newSz}`, where
+  `origSz` is what **this channel last published** (`MarketOrders`, bounded per market and per order) —
+  the arbiter can refuse a change that never reached the wire, so a producer-side prior would describe a
+  book no consumer here holds. ⚠️ The publisher's own book builder (`listeners/order_book/state.rs`,
+  which inserts a `New` only against a matching opening order status) is the closest statement of the
+  variants' meaning that exists, but it consumes the node's raw book diffs rather than this channel:
+  **there is no reference `l4Book` consumer in either source**, so nothing here should be written as
+  though a particular client's behaviour were known.
   The accept loop never propagates an error (this task's `Err` reaches `main`'s `select!` and would exit
   the process; unlike `ws`'s, no reconciler respawns it), and the client limits are constants, of which
   the inbound rate cap is the load-bearing one — a subscribe frame is tens of bytes and costs a whole

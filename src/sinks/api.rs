@@ -592,9 +592,9 @@ type Level = Option<(f64, f64)>;
 /// order-level market with no `depth` entry yet reports "not available", the same as any other
 /// identity neither store holds.)
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) {
-    {
+    let from_book = {
         let books = crate::model::lock(&state.books);
-        if let Some(acc) = books
+        books
             .get(&(
                 inst.venue.clone(),
                 inst.category.clone(),
@@ -602,9 +602,20 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) 
                 inst.instrument_id,
             ))
             .filter(|acc| !acc.is_order_level())
-        {
-            return (acc.best_bid(), acc.best_ask());
-        }
+            .map(|acc| (acc.best_bid(), acc.best_ask()))
+    };
+    // Falls through on an accumulator that *answered nothing*, not merely on an absent one: a market
+    // holding only a bare `clear` is present and empty, and returning its `None` would shadow the
+    // `depth` entry the same frame wrote.
+    if let Some(levels @ (Some(_), _) | levels @ (_, Some(_))) = from_book {
+        return levels;
+    }
+    // ⚠️ Keyed by `(venue, symbol)`, and the wire symbol is a truncated label that two instruments
+    // can share — the exact reason `BookSnapshot` is keyed on the identity instead. Where it is
+    // ambiguous this cannot say whose inside market it holds, and reporting one identity's ticker
+    // from another's book is worse than reporting nothing.
+    if is_ambiguous(state, inst.source_id, &inst.symbol) {
+        return (None, None);
     }
     let depth = crate::model::lock(&state.depth);
     if let Some(d) = depth.get(&(inst.venue.clone(), inst.symbol.clone())) {
@@ -763,7 +774,12 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     )
 }
 
-/// Assemble the `pricebook`/`coverage` envelope. `levels_capped_at` and `complete` are the caller's
+/// Assemble the `pricebook`/`coverage` envelope. `complete` is a claim about what this bridge has
+/// **delivered**, not about what the venue holds: it follows `BookAccumulator::baselined`, which means
+/// "these levels are the whole book as published", and a market re-baselined by a bare `clear` is
+/// therefore complete-and-empty until the producer's next snapshot rotation refills it.
+///
+/// `levels_capped_at` and `complete` are the caller's
 /// own honest completeness verdict for whichever path served this book (see [`book`] — the
 /// market-by-price and market-by-order paths derive them differently, since one is a serving cap we
 /// impose ourselves and the other is a producer-imposed slice we can only partially see past). This
@@ -2342,7 +2358,127 @@ mod tests {
         );
     }
 
-    /// `best_levels` runs under the same `books` guard `book()` does — and `best_bid_ask` fans it out
+    /// A `BookSnapshot` entry that answers *nothing* must not shadow the `depth` entry the same frame
+    /// wrote. Returning on the accumulator's mere presence, a market re-baselined by a bare `clear` —
+    /// present, baselined and empty — reports a null inside market while the top-N slice beside it
+    /// holds one.
+    #[test]
+    fn an_empty_accumulator_does_not_shadow_the_depth_snapshot() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        instruments.lock().unwrap().insert(
+            ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+            inst_in("perps", 3, "KALSHI", "EMPTYACC", 2, 41, -4, -2),
+        );
+        {
+            let mut acc = BookAccumulator::new("EMPTYACC".into());
+            acc.apply(&book_batch(
+                "KALSHI",
+                "EMPTYACC",
+                2,
+                41,
+                vec![BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                }],
+                true,
+            ));
+            assert!(
+                acc.baselined() && acc.best_bid().is_none(),
+                "fixture sanity"
+            );
+            books
+                .lock()
+                .unwrap()
+                .insert(("KALSHI".into(), "perps".into(), 2, 41), acc);
+        }
+        depth.lock().unwrap().insert(
+            ("KALSHI".into(), "EMPTYACC".into()),
+            NormalizedDepth {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "EMPTYACC".into(),
+                bids: vec![[0.61, 100.0]],
+                asks: vec![[0.63, 50.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+        };
+        let inst = inst_in("perps", 3, "KALSHI", "EMPTYACC", 2, 41, -4, -2);
+        assert_eq!(
+            best_levels(&state, &inst),
+            (Some((0.61, 100.0)), Some((0.63, 50.0)))
+        );
+    }
+
+    /// The `depth` fallback is keyed `(venue, symbol)`, and the wire symbol is a truncated label two
+    /// instruments can share — the exact reason `BookSnapshot` is keyed on the identity instead. Where
+    /// it is ambiguous the entry cannot say whose inside market it holds, and reporting one identity's
+    /// ticker out of another's book is worse than reporting nothing.
+    #[test]
+    fn an_ambiguous_symbol_reports_no_inside_market_rather_than_a_neighbours() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 41, -4, -2),
+            );
+            // A second instrument the publisher's 16-byte symbol field truncated to the same label.
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 2u32, 42u32),
+                inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 42, -4, -2),
+            );
+        }
+        depth.lock().unwrap().insert(
+            ("KALSHI".into(), "COLLIDE".into()),
+            NormalizedDepth {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "COLLIDE".into(),
+                bids: vec![[0.61, 100.0]],
+                asks: vec![[0.63, 50.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+        };
+        for id in [41u32, 42u32] {
+            let inst = inst_in("perps", 3, "KALSHI", "COLLIDE", 2, id, -4, -2);
+            assert_eq!(
+                best_levels(&state, &inst),
+                (None, None),
+                "instrument {id} must not be handed a depth entry that may be its neighbour's"
+            );
+        }
+    }
+
+    /// `best_levels` runs under the same `books` guard `book()` does    /// `best_levels` runs under the same `books` guard `book()` does — and `best_bid_ask` fans it out
     /// over **every** instrument in the catalog, so one unauthenticated GET must not become an
     /// O(resting orders) pass per order-level market. It reads the `depth` snapshot for those instead,
     /// which is the same book's inside market, already derived and already top-N.
@@ -2363,7 +2499,10 @@ mod tests {
                 source: "HUGE".into(),
                 source_id: 3,
                 symbol: "HUGEL3".into(),
-                bids: vec![[1.0, 1.0]],
+                // Deliberately unequal to the accumulator's own best bid (1.0) and best ask (it has
+                // none), so the assertion below says *which* source answered rather than only that
+                // some answer came back.
+                bids: vec![[0.5, 7.0]],
                 asks: vec![[2.0, 1.0]],
                 source_ts_ns: 7,
                 recv_ts_ns: 0,
@@ -2418,7 +2557,11 @@ mod tests {
         let started = std::time::Instant::now();
         let (bid, ask) = best_levels(&state, &inst);
         let elapsed = started.elapsed();
-        assert_eq!(bid, Some((1.0, 1.0)));
+        assert_eq!(
+            bid,
+            Some((0.5, 7.0)),
+            "from the depth snapshot, not the order population"
+        );
         assert_eq!(ask, Some((2.0, 1.0)));
         assert!(
             elapsed < std::time::Duration::from_millis(20),

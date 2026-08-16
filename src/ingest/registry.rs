@@ -136,6 +136,11 @@ pub enum RegistryError {
         category: String,
         kind: &'static str,
     },
+    /// Two venues' Market-by-Order rows share a `category`.
+    SharedOrderBookCategory {
+        category: String,
+        venues: [String; 2],
+    },
     /// Two receivers would bind the same `(group, port)`.
     DuplicateGroupPort {
         venue: String,
@@ -224,6 +229,13 @@ impl std::fmt::Display for RegistryError {
             } => write!(
                 f,
                 "{venue}/{category}: `emit_trades` disagrees with whether `{kind}` can own a tape"
+            ),
+            RegistryError::SharedOrderBookCategory { category, venues } => write!(
+                f,
+                "market-by-order rows on `{}` and `{}` share category `{category}`; a departing \
+                 receiver releases its publishers' book standing by category, so each exit would \
+                 release the other venue's live arms",
+                venues[0], venues[1]
             ),
             RegistryError::DuplicateGroupPort { venue, group, port } => write!(
                 f,
@@ -710,6 +722,8 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     let mut modes: std::collections::HashMap<&str, ArbitrationMode> =
         std::collections::HashMap::new();
     let mut group_ports = std::collections::HashSet::new();
+    let mut mbo_categories: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
 
     for f in rows {
         // `(venue, category, kind)` is the identity of a row. A duplicate is silently dropped by
@@ -748,6 +762,27 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
                 category: f.category.to_string(),
                 kind: f.kind.label(),
             });
+        }
+
+        // A Market-by-Order receiver releases its publishers' book standing by **category** as it
+        // exits (`Arbiter::forget_publisher_books`) — the one scope it and the `MarketKey` provably
+        // agree on, since the key is filed under the *wire* venue and the row's venue can differ.
+        // That is exact only while one venue's rows own the category: two Market-by-Order rows on
+        // different venues, served by one publisher host, would have each exit release the other's
+        // live arms, and a recovering arm can then wipe a book a healthy peer is serving.
+        if f.kind == FeedKind::MarketByOrder {
+            match mbo_categories.entry(f.category) {
+                std::collections::hash_map::Entry::Occupied(e) if *e.get() != f.venue => {
+                    return Err(RegistryError::SharedOrderBookCategory {
+                        category: f.category.to_string(),
+                        venues: [(*e.get()).to_string(), f.venue.to_string()],
+                    })
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(f.venue);
+                }
+            }
         }
 
         let expected_planes = planes_for(f.kind);
@@ -1561,6 +1596,40 @@ mod tests {
         assert!(matches!(
             build(&doc_with(&format!("{SPORTS_ROW},{other}")), "test"),
             Err(RegistryError::ArbitrationDisagreement { .. })
+        ));
+    }
+
+    /// Two venues' Market-by-Order rows must not share a `category`. A departing receiver releases
+    /// its publishers' book standing by category — the one scope it and the `MarketKey` provably
+    /// agree on — so each venue's exit would release the other's live arms, and a recovering arm can
+    /// then wipe a book a healthy peer is serving. Nothing downstream notices; the invariant is the
+    /// only thing that says so, and it is written where whoever adds the second row will read it.
+    #[test]
+    fn two_venues_sharing_an_order_book_category_is_fatal() {
+        let mbo = |venue: &str, code: &str, group: &str, port: u16| {
+            format!(
+                r#"{{"venue":"{venue}","category":"perps","code":"{code}","kind":"MarketByOrder",
+                "group":"{group}","emit_trades":false,"arbitration":"Sticky",
+                "publishers":{{"explicit":[{{"mktdata":{port},"refdata":{},"snapshot":{}}}]}}}}"#,
+                port + 1,
+                port + 2
+            )
+        };
+        // One venue owning the category is the legitimate case and must still load.
+        assert!(build(
+            &doc_with(&mbo("KALSHI", "a", "233.84.178.30", 7600)),
+            "test"
+        )
+        .is_ok());
+
+        let two_venues = format!(
+            "{},{}",
+            mbo("KALSHI", "a", "233.84.178.30", 7600),
+            mbo("HYPERLIQUID", "b", "233.84.178.31", 7610)
+        );
+        assert!(matches!(
+            build(&doc_with(&two_venues), "test"),
+            Err(RegistryError::SharedOrderBookCategory { .. })
         ));
     }
 

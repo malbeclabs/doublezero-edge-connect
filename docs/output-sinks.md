@@ -63,13 +63,15 @@ zero so a client written against the publisher still parses the frames — a con
 meaning into them. In particular `timestamp` is **0, not the book's event time**: stamping the event
 time would give every order in a snapshot the same plausible placement time, which a consumer ranking
 queue priority or ageing orders would read as real. `l4Book`'s `order_statuses` is always empty for
-the same reason. Its order diffs use all three of the publisher's variants: a change to an order this
-channel has already published is `update{origSz,newSz}` and only a genuinely new one is `new`, because
-the publisher's own apply path inserts a `New` solely against a matching opening order status — a
-partial fill rendered as `new` is skipped and lost. `origSz` is what **this channel last published**
-for the order, which is the only prior size the sink can honestly claim: the arbiter can refuse a
-change that never reached the wire, so a producer-side prior would describe a book no consumer here
-holds. On `trades`, a print whose aggressor side the venue did not report is **dropped** rather
+the same reason. Its order diffs use all three of the publisher's variants: `new` asserts that an
+order the recipient does not have is now resting and `update` that one it does have changed size, so a
+partial fill is the second and only a genuinely new order is the first. `origSz` is what **this channel
+last published** for the order, which is the only prior size the sink can honestly claim: the arbiter
+can refuse a change that never reached the wire, so a producer-side prior would describe a book no
+consumer here holds. The publisher's own book builder — which inserts a `New` only against a matching
+opening order status — is the closest statement of the variants' meaning that exists, but it consumes
+the node's raw book diffs rather than this channel, and **there is no reference `l4Book` consumer** in
+either source this sink is written against. On `trades`, a print whose aggressor side the venue did not report is **dropped** rather
 than guessed: `side` is the one field on that channel a consumer acts on directionally and
 Hyperliquid's schema has no "unknown", so the compat tape can be shorter than the normalized one.
 
@@ -83,9 +85,10 @@ on top. The one case with no content is the arbiter's degraded re-baseline, a ba
 becomes a `Snapshot`, an empty one, because this channel has no clear of its own and the consumer
 must be told to discard.
 
-**A `coin` is not an identity.** The wire symbol is a truncated label and two markets can share one,
-so a subscription that resolves to more than one is refused, and each one that is served is pinned to
-the market it was bootstrapped from.
+**A `coin` is not an identity.** The wire symbol is a truncated label and two markets can share one, so
+a **book** subscription that resolves to more than one is refused, and each one that is served is
+pinned to the market it was bootstrapped from. `trades` is not covered: a print carries no book to pin
+against, so two markets sharing a coin still merge their tapes under one name.
 
 Client limits are fixed rather than configurable (64 clients, 256 subscriptions each, 600 inbound
 control frames per minute, a 20s heartbeat with a 60s idle reap). Both a text control frame and a

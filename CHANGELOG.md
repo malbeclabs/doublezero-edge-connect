@@ -66,8 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `products` reported `market_by_price`, `ticker` returned null bid/ask and `book` returned no
   levels for a market the bridge holds in full.
 - The Hyperliquid-compatible sink's `l4Book` order diffs regain the publisher's
-  `update{origSz,newSz}` variant. The reference apply inserts a `New` only against a matching
-  opening order status, so a partial fill rendered as `new` was skipped and the fill lost. Its
+  `update{origSz,newSz}` variant. `new` asserts that an order the recipient does not have is now
+  resting, which a partial fill is not — and the publisher's own book builder refuses one outright
+  unless a matching opening order status came with it. Its
   re-baseline snapshot is rendered from the batch rather than from the shared accumulator, which the
   arbiter advances *before* broadcasting — a client with a queue was handed a snapshot containing
   batches it had not applied and then applied the older diffs on top. A bare `clear` now becomes an
