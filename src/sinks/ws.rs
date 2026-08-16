@@ -116,7 +116,7 @@ pub struct WsConfig {
 }
 
 /// A subscription filter: a `None` field matches any value (so `{}` = everything).
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 struct SubFilter {
     #[serde(default)]
     venue: Option<String>,
@@ -135,25 +135,6 @@ struct SubFilter {
     /// keyword; the wire name is `type`.
     #[serde(rename = "type", default)]
     msg_type: Option<String>,
-    /// How much detail this subscription's `book` bootstrap carries; unset follows the market's own
-    /// granularity. Not a filter dimension — it selects no messages, so neither `matches` nor filter
-    /// equality reads it: a client that subscribed and then unsubscribes the same scope must have its
-    /// subscription cancelled, and silently leaking the slot because the scopes differ would be worse
-    /// than making a scope change an unsubscribe-then-subscribe.
-    #[serde(default)]
-    book_scope: Option<ReplayScope>,
-}
-
-/// Filter equality is over the **filter** dimensions only, so `book_scope` — a rendering choice, not a
-/// selector — cannot make two subscriptions for the same markets distinct.
-impl PartialEq for SubFilter {
-    fn eq(&self, other: &Self) -> bool {
-        self.venue == other.venue
-            && self.source == other.source
-            && self.symbol == other.symbol
-            && self.channel == other.channel
-            && self.msg_type == other.msg_type
-    }
 }
 
 impl SubFilter {
@@ -324,19 +305,20 @@ fn text(value: serde_json::Value) -> WsMessage {
 /// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
 /// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
 /// state, so the overlap a connect-then-subscribe client sees is harmless.
-/// The scope to bootstrap one market at: whatever a subscription selecting it asked for, and otherwise
-/// the market's own granularity — so the connect-time replay, where there are no subscriptions yet to
-/// ask, still matches the stream the client is about to receive.
-fn book_scope(subs: &[SubFilter], acc: &BookAccumulator, venue: &str, channel: u32) -> ReplayScope {
-    let asked = subs
-        .iter()
-        .filter(|f| f.matches(venue, Some(acc.symbol()), Some(channel), "book"))
-        .find_map(|f| f.book_scope);
-    asked.unwrap_or(if acc.is_order_level() {
+/// The scope to bootstrap one market at: **the market's own granularity, always**.
+///
+/// It is not a client choice. A bootstrap and a stream of different granularity cannot be reconciled
+/// — an order-level change carries one *order's* absolute size, and a client handed price levels has
+/// no order state to apply it to — so the only consumer a fold could serve is one folding the live
+/// stream itself, which needs every resting order's size and is exactly what the fold discards. The
+/// `book_scope` subscription field offered that choice and is withdrawn; it never shipped in a
+/// release.
+fn book_scope(acc: &BookAccumulator) -> ReplayScope {
+    if acc.is_order_level() {
         ReplayScope::Orders
     } else {
         ReplayScope::Levels
-    })
+    }
 }
 
 async fn replay_scoped<W>(
@@ -392,7 +374,7 @@ where
                 pass(venue, acc.symbol(), Some(*channel), "book")
             })
             .map(|(key, acc)| {
-                let scope = book_scope(subs, acc, &key.0, key.2);
+                let scope = book_scope(acc);
                 FeedMessage::Book(acc.to_book(key, scope))
             })
             .collect()
@@ -1292,12 +1274,12 @@ mod tests {
         srv.abort();
     }
 
-    /// An order-level market bootstraps as **orders** by default, matching the stream the client is
-    /// about to receive: a level bootstrap followed by order-level changes cannot be reconciled. A client
-    /// that folds the stream itself asks for `book_scope: "levels"` and gets the fold.
+    /// An order-level market bootstraps as **orders**, matching the stream the client is about to
+    /// receive: a level bootstrap followed by order-level changes cannot be reconciled, and no
+    /// subscription can ask for one.
     #[tokio::test]
     #[serial]
-    async fn the_book_replay_scope_follows_the_market_unless_asked() {
+    async fn the_book_replay_scope_always_follows_the_market() {
         let mut acc = BookAccumulator::new("BTC".into());
         acc.apply(&book_batch(
             "BTC",
@@ -1356,6 +1338,11 @@ mod tests {
             "the default bootstrap must carry the order ids the stream carries"
         );
 
+        // A subscription cannot ask for anything else. `book_scope: "levels"` used to fold the
+        // bootstrap while the live stream stayed order-level, which is unusable: an order-level
+        // change carries one *order's* absolute size, and a client handed price levels holds no
+        // order state to apply it to. The field is gone, and an unknown key is ignored, so a client
+        // still sending it is bootstrapped at the market's own granularity.
         use futures_util::SinkExt;
         ws.send(WsMessage::Text(
             r#"{"method":"subscribe","subscription":{"symbol":"BTC","book_scope":"levels"}}"#
@@ -1370,35 +1357,19 @@ mod tests {
         let b = parse_book(
             &next_frame(&mut ws, Duration::from_secs(2))
                 .await
-                .expect("level-scoped book replay"),
+                .expect("book replay"),
         );
-        let updates: Vec<_> = b
-            .changes
-            .iter()
-            .filter(|c| c.action != BookAction::Clear)
-            .collect();
         assert_eq!(
-            updates.len(),
-            1,
-            "two orders at one price fold to one level"
+            b.changes
+                .iter()
+                .filter(|c| c.action != BookAction::Clear)
+                .map(|c| c.order_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8],
+            "an order-level market is always bootstrapped as orders"
         );
-        assert_eq!(updates[0].size, 8.0);
-        assert_eq!(updates[0].order_id, 0, "a level carries no order identity");
 
         srv.abort();
-    }
-
-    /// `book_scope` is a rendering choice, not a filter dimension, so it must not make two subscriptions
-    /// for the same markets distinct — an `unsubscribe` that omits it has to cancel the subscription
-    /// rather than silently leaking the slot.
-    #[test]
-    fn book_scope_does_not_change_a_subscriptions_identity() {
-        let bare: SubFilter = serde_json::from_str(r#"{"symbol":"BTC"}"#).unwrap();
-        let scoped: SubFilter =
-            serde_json::from_str(r#"{"symbol":"BTC","book_scope":"orders"}"#).unwrap();
-        assert_eq!(bare, scoped);
-        let other: SubFilter = serde_json::from_str(r#"{"symbol":"ETH"}"#).unwrap();
-        assert_ne!(bare, other);
     }
 
     /// A `{"channel":N}` subscribe replays only that channel's markets — the reason `replay_scoped`

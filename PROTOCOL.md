@@ -34,9 +34,8 @@ On each new connection the producer:
    not (see [*A symbol appears only once its source is
    known*](#a-symbol-appears-only-once-its-source-is-known)).
 2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and a
-   `book` re-baseline (a `clear` plus the complete book) for every market that has one. See
-   `book_scope` under [*Subscriptions & filtering*](#subscriptions--filtering) for the granularity of
-   that re-baseline on an order-level market.
+   `book` re-baseline (a `clear` plus the complete book) for every market that has one, at the
+   market's own granularity.
 3. **Streams** `quote`/`trade`/`midpoint`/`depth`/`book` messages as they arrive, fanned out to all
    connected consumers.
 
@@ -252,8 +251,8 @@ client that connects mid-stream is replayed the latest `depth` per symbol on con
 
 ```json
 {"type":"book","venue":"BookVenue","source":"BookVenue","source_id":0,"symbol":"SOL","channel":2,"instrument_id":41,
- "changes":[{"action":"update","side":"bid","price":0.6200,"size":150},
-            {"action":"delete","side":"ask","price":0.6300,"size":0}],
+ "changes":[{"action":"update","side":"bid","price":0.6200,"size":150,"order_id":0},
+            {"action":"delete","side":"ask","price":0.6300,"size":0,"order_id":0}],
  "snapshot":false,"last":true,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -300,7 +299,7 @@ A change is either **price-aggregated** (`order_id: 0`, from the Market-by-Price
 
 Either way a consumer that honors `clear` needs nothing else.
 
-**The bootstrap matches the market.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a stream of different granularity. `book_scope` under *Subscriptions & filtering* overrides that for a consumer that folds the stream itself.
+**The bootstrap matches the market, always.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a stream of different granularity. There is no way to ask for anything else: an order-level change carries one *order's* absolute size, so a client bootstrapped with price levels holds no order state to apply the live stream to.
 
 ### `status`
 
@@ -410,7 +409,7 @@ A consumer may send control messages (JSON text frames) to filter the stream. **
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string, "book_scope"?: "levels" | "orders" }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
 
 `source` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them, so a
 disagreeing pair matches nothing; supply one.
@@ -444,7 +443,7 @@ are otherwise ignored.
 
 Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
 
-**`book_scope` selects the granularity of that `book` replay, not which messages arrive.** Omitted — the default, and the only possibility on the connect-time replay — it **follows the market**: an order-level market is bootstrapped as every resting order with its `order_id`, a price-aggregated one as price levels carrying `order_id: 0`. That is what a consumer needs, because a bootstrap and a stream of different granularity cannot be reconciled: an order-level change carries one *order's* absolute size, and applying it as a level's size corrupts the book. `"levels"` asks for the price fold of an order-level market anyway, which is useful only to a consumer that folds the live stream itself; `"orders"` asks for orders explicitly. It is a rendering choice rather than a filter dimension, so it neither excludes messages nor forms part of a subscription's identity — changing scope is an `unsubscribe` followed by a `subscribe`.
+**The granularity of that replay is the market's, not the subscription's.** An order-level market is bootstrapped as every resting order with its `order_id`, a price-aggregated one as price levels carrying `order_id: 0` — see [*The bootstrap matches the market*](#book).
 
 ## Heartbeat & liveness
 
@@ -522,7 +521,7 @@ on connect:
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
 - **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally and — on that feed — at order level. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement `book`.
-- **Additive in this revision, so still v1:** `order_id` on a `book` change, and `book_scope` on a subscription. Nothing is withdrawn, and a consumer that ignores both reads the same price-aggregated books it read before.
+- **Additive in this revision, so still v1:** `order_id` on a `book` change. A consumer that ignores it reads the same price-aggregated books it read before.
 - **Breaking within v1: what `venue` contains changed**, and emission is now gated on a Source ID
   having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
   no removed ones) but change *values* an existing consumer may depend on — see [`source`,

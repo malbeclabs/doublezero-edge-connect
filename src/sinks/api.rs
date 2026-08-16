@@ -408,16 +408,23 @@ fn decimal_string(value: f64, exponent: i8) -> String {
 fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     {
         let books = crate::model::lock(&state.books);
-        if books
+        if let Some(order_level) = books
             .get(&(
                 i.venue.clone(),
                 i.category.clone(),
                 i.channel,
                 i.instrument_id,
             ))
-            .is_some()
+            .map(crate::model::BookAccumulator::is_order_level)
         {
-            return "market_by_price";
+            // The same accumulator serves both products. Which one it holds is the market's own
+            // property, not the map's — reported as `market_by_price` regardless, every
+            // Market-by-Order instrument misdescribes itself the moment it starts publishing.
+            return if order_level {
+                "market_by_order"
+            } else {
+                "market_by_price"
+            };
         }
     }
     {
@@ -621,16 +628,44 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // materializes the market's entire level set (up to 2^18 of them) to then serve 50 per side,
     // and it would do so while still holding `state.books`. `Arbiter::apply_book_replay` takes that
     // same guard from inside `emit`, so a slow request here would stall ingest for every venue.
-    let mbp = {
+    //
+    // An **order-level** market keeps nothing in those trees — its levels exist only as resting
+    // orders — so `top_levels` would serve an empty book for an instrument the bridge holds in full.
+    // Folding is O(resting orders) and cannot be avoided (the order map is unordered), so it is done
+    // on a copy taken out from under the guard, the same discipline `sinks/hyperliquid.rs` follows:
+    // ~617 µs held to clone the 44,598-order market against ~8.9 ms to fold it.
+    let key = (
+        inst.venue.clone(),
+        inst.category.clone(),
+        inst.channel,
+        inst.instrument_id,
+    );
+    let order_level_copy = {
         let books = crate::model::lock(&state.books);
-        books
-            .get(&(
-                inst.venue.clone(),
-                inst.category.clone(),
-                inst.channel,
-                inst.instrument_id,
+        books.get(&key).filter(|acc| acc.is_order_level()).cloned()
+    };
+    let mbp = match &order_level_copy {
+        Some(acc) => {
+            let (bids, asks) = acc.price_fold();
+            let (bids_total, asks_total) = (bids.len(), asks.len());
+            let level = |v: Vec<crate::model::CountedLevel>| -> Vec<(f64, f64)> {
+                v.into_iter()
+                    .take(MAX_LEVELS_PER_SIDE)
+                    .map(|(price, size, _)| (price, size))
+                    .collect()
+            };
+            Some((
+                acc.baselined(),
+                acc.source_ts_ns(),
+                level(bids),
+                level(asks),
+                bids_total,
+                asks_total,
             ))
-            .map(|acc| {
+        }
+        None => {
+            let books = crate::model::lock(&state.books);
+            books.get(&key).map(|acc| {
                 let (bids, asks, bids_total, asks_total) = acc.top_levels(MAX_LEVELS_PER_SIDE);
                 (
                     acc.baselined(),
@@ -641,6 +676,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
                     asks_total,
                 )
             })
+        }
     };
     if let Some((baselined, source_ts_ns, bids, asks, bids_total, asks_total)) = mbp {
         // Our own serving cap, independent of `baselined()`: even a fully re-baselined book is
@@ -2025,6 +2061,16 @@ mod tests {
         }
     }
 
+    fn order_update(side: BookSide, price: f64, size: f64, order_id: u64) -> BookChange {
+        BookChange {
+            action: BookAction::Update,
+            side,
+            price,
+            size,
+            order_id,
+        }
+    }
+
     fn level_update(side: BookSide, price: f64, size: f64) -> BookChange {
         BookChange {
             action: BookAction::Update,
@@ -2387,6 +2433,88 @@ mod tests {
             .unwrap();
         assert_eq!(sports_ticker["best_bid"], "0.1100");
         assert_eq!(sports_ticker["best_ask"], "0.1300");
+    }
+
+    /// **Item O.** An order-level market populates `BookSnapshot` like any other, but its levels exist
+    /// only as resting orders — nothing is in the price trees the read paths used to read. Every `/v1`
+    /// answer for such an instrument was therefore wrong in the same way: `products` reported
+    /// `market_by_price`, `ticker` returned null BBOs, and `book` returned no levels, for a market the
+    /// bridge holds in full.
+    #[tokio::test]
+    async fn an_order_level_market_is_served_as_orders_not_as_an_empty_price_book() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        instruments.lock().unwrap().insert(
+            ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+            inst_in("perps", 3, "KALSHI", "L3MKT", 2, 41, -4, -2),
+        );
+        {
+            let mut acc = BookAccumulator::new("L3MKT".into());
+            acc.apply(&book_batch(
+                "KALSHI",
+                "L3MKT",
+                2,
+                41,
+                vec![
+                    BookChange {
+                        action: BookAction::Clear,
+                        side: BookSide::Both,
+                        price: 0.0,
+                        size: 0.0,
+                        order_id: 0,
+                    },
+                    order_update(BookSide::Bid, 0.61, 100.0, 11),
+                    // A second order at the best bid: the fold has to sum them, which is what an
+                    // order-keyed book can report and a price-keyed one cannot.
+                    order_update(BookSide::Bid, 0.61, 40.0, 12),
+                    order_update(BookSide::Bid, 0.60, 10.0, 13),
+                    order_update(BookSide::Ask, 0.63, 50.0, 14),
+                ],
+                true,
+            ));
+            assert!(acc.baselined() && acc.is_order_level());
+            books
+                .lock()
+                .unwrap()
+                .insert(("KALSHI".into(), "perps".into(), 2, 41), acc);
+        }
+
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let products: Value = reqwest::get(format!("{base}/v1/products"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            products["products"][0]["feed_kind"], "market_by_order",
+            "an order-level accumulator is not a market-by-price feed: {products}"
+        );
+
+        let ticker: Value = reqwest::get(format!("{base}/v1/products/KALSHI:L3MKT/ticker"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ticker["best_bid"], "0.6100", "{ticker}");
+        assert_eq!(ticker["best_ask"], "0.6300", "{ticker}");
+
+        let book: Value = reqwest::get(format!("{base}/v1/products/KALSHI:L3MKT/book"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(book["coverage"]["complete"], true, "{book}");
+        assert_eq!(
+            book["pricebook"]["bids"],
+            serde_json::json!([["0.6100", "140.00"], ["0.6000", "10.00"]]),
+            "two orders at the best bid fold to one level: {book}"
+        );
+        assert_eq!(
+            book["pricebook"]["asks"],
+            serde_json::json!([["0.6300", "50.00"]])
+        );
     }
 
     /// Not one of the seven named cases, but exercises the market-by-order fallback path (no

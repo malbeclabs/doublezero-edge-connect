@@ -871,8 +871,8 @@ Modules are grouped by role under `src/`:
   `order_id` (`0` = price-aggregated), and `BookAccumulator` keys order-level changes by it while keeping
   the price maps for the aggregated kind; `price_fold` folds the orders into levels **with a count per
   level**, which a price-keyed accumulator structurally cannot produce, and `to_book(ReplayScope)`
-  materializes either rendering, and `is_order_level` is what an unset `book_scope` follows so a client's
-  bootstrap matches the granularity the market streams. A `Clear` names a *side*, so it always carries
+  materializes either rendering, and `is_order_level` is what the `book` bootstrap follows so a client's
+  bootstrap always matches the granularity the market streams (a subscription cannot ask for the other). A `Clear` names a *side*, so it always carries
   `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
   of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
   `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
