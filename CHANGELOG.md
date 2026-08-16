@@ -51,6 +51,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the condition that the default binds loopback only — a wildcard bind still requires an explicit,
   documented override, and the non-loopback warning in `scripts/connect.sh` is unchanged.
 ### Fixed
+- Six order-level paths silently dropped or corrupted consumer state. An `InstrumentReset` resolved
+  its market through the `revealed` entry it had already removed, so the raced-state drop was dead
+  code and every re-used order id was refused as a resurrection. A departing Market-by-Order
+  receiver released its arm's serving claim filtered by the registry row's venue while every market
+  is filed under the *wire* venue, so for a superset row nothing matched and a departed arm's
+  phantom `synced` kept suppressing the survivor's only re-baseline. The arbiter's degraded forced
+  re-baseline hand-deleted the replay entry while its paired state survived, leaving a market
+  invisible to every newly-connecting client. `EndOfSession` dropped every publisher's book but
+  reported only the sending one. A reveal the rate limit refused to republish still streamed
+  incrementals under the new market key; it sends a bare `clear` now. And a publisher evicted from
+  the reference-data map left an uncorrectable `synced = true` behind.
+- **`/v1` now understands an order-level book.** Its levels exist only as resting orders, so
+  `products` reported `market_by_price`, `ticker` returned null bid/ask and `book` returned no
+  levels for a market the bridge holds in full.
+- The Hyperliquid-compatible sink's `l4Book` order diffs regain the publisher's
+  `update{origSz,newSz}` variant. The reference apply inserts a `New` only against a matching
+  opening order status, so a partial fill rendered as `new` was skipped and the fill lost. Its
+  re-baseline snapshot is rendered from the batch rather than from the shared accumulator, which the
+  arbiter advances *before* broadcasting — a client with a queue was handed a snapshot containing
+  batches it had not applied and then applied the older diffs on top. A bare `clear` now becomes an
+  empty `Snapshot` rather than no frame at all. A `coin` that resolves to two markets is refused
+  rather than served both under one name. A `Ping` is charged against the inbound rate limit it used
+  to bypass, crossing that limit sends a `Close` before the socket goes, and a lagging client's
+  `l4Book` re-bootstrap — the most expensive frame the sink produces — is rate-limited instead of
+  feeding the loop that caused the lag.
+- The Hyperliquid sink pays its per-batch work **once**, not once per client. The accumulator clone
+  (617 µs held on the 44,598-order market) and the price fold (8.9 ms) ran per client on the mutex
+  the ingest emit path takes on every published batch: 64 clients meant roughly 39 ms of stall per
+  batch, for every feed. `dz_hl_sink_folds_total`, `dz_hl_sink_dropped_total{reason}`.
 - The resurrection guard's out-of-queue sweep is scheduled rather than triggered on every batch. The
   threshold was clamped to half the per-market tombstone cap, so above that population it sat *below*
   the population itself and the comparison was true forever: a full scan of the market's tombstone map

@@ -760,7 +760,7 @@ Modules are grouped by role under `src/`:
   (`coin` is our `symbol`), with `bind()` split from `serve()` like `ws`'s. Three channels off the
   order-keyed `BookAccumulator` in the shared `BookSnapshot`: `l2Book` (snapshot-per-update from
   `price_fold()` — whose per-level order count is the whole reason the accumulator is order-keyed;
-  honours `nSigFigs`/`mantissa`/`nLevels`), `l4Book` (`to_book(ReplayScope::Orders)` as the publisher's
+  honours `nSigFigs`/`mantissa`/`nLevels`), `l4Book` (the publisher's
   externally-tagged `{"Snapshot":…}`, then `{"Updates":…}` order diffs) and `trades`. Two references
   define the wire and one rule settles them: **NautilusTrader v1.227.0 wins for anything it parses**
   (`l2Book`/`trades` field names and types, the `B`/`A` side spelling, `{"channel":"pong"}` for its
@@ -769,25 +769,45 @@ Modules are grouped by role under `src/`:
   the `nLevels` extension. ⚠️ **No rendering happens under the shared `BookSnapshot` lock** — that is
   the mutex the arbiter's `apply_book_replay` takes on every published batch, so a book render held
   across it stalls every receiver on every feed; `take_market`/`take_markets` clone the accumulator out
-  (itself O(book), and the cheapest snapshot on offer — measured ~0.45 ms against ~9.1 ms to fold
-  under the guard) and every rendering step runs after the guard drops, and the `price_fold` behind a client's `l2Book`
-  subscriptions is computed **once per market per message** (it is view-independent, so folding per
-  subscription would let one client multiply a 44k-order book by `MAX_SUBS`). Both book channels are
-  gated on `baselined() && is_order_level()`: an
-  `l2Book` frame *replaces* a Nautilus consumer's book wholesale and an `l4Book` snapshot claims
-  completeness, so a market accumulated mid-stream must be withheld, not published as if whole — and a
-  price-aggregated market, whose orders this sink cannot read, would render as an empty book. An
+  (itself O(book), and the cheapest snapshot on offer — measured ~617 µs against ~8.9 ms to fold
+  under the guard) and every rendering step runs after the guard drops. **Everything shared across
+  clients is paid once per batch, in `prepare_loop`/`prepare_one`**, a second broadcast hop modelled on
+  `ws`'s serialize-once stage: it takes that mutex once, clones once, folds once (`price_fold` is
+  view-independent) and renders the `l4Book` frame once, then fans out `Arc<Prepared>`; only the
+  per-view `l2Book` rendering stays per client. Paid per client instead, 64 clients meant ~39 ms of
+  arbiter stall a batch. `Wants` refcounts what any client actually reads, so a market nobody is
+  subscribed to is never folded; `dz_hl_sink_folds_total` is the check. The stage's own `Lagged` becomes
+  a `Prepared::Resync` — clients see their own lag but not the stage's, and `l4Book` cannot self-heal
+  without being told. `l2Book` is gated on `baselined() && is_order_level()`: it *replaces* a Nautilus
+  consumer's book wholesale, so a market accumulated mid-stream must be withheld, not published as if
+  whole — and a price-aggregated market, whose orders this sink cannot read, would render as an empty
+  book. An `l4Book` **re-baseline renders from the batch**, which is complete by construction, never
+  from the accumulator (advanced *before* the broadcast, so a queued client would get a snapshot
+  containing batches it has not applied and then apply the older diffs on top); a *bare* clear — the
+  arbiter's degraded re-baseline — still becomes an empty `Snapshot`, since this channel has no clear.
+  ⚠️ **A `coin` is a truncated display label, not an identity**: a subscription resolving to more than
+  one market is refused, and one that is served is pinned to the market it bootstrapped from. An
   out-of-range `nSigFigs`/`mantissa` is **rejected** rather than coerced (a substituted bucket yields
   prices that look like the venue's and are not); `nLevels` only truncates, so it clamps. The schema's
   account-model fields (`users`/`hash`, an order's `user`/`timestamp`/`orderType`/`tif`/`cloid`,
   `height`, `order_statuses`) have no counterpart on the MBO wire and are null/zero/empty — parseable,
   never meaningful. `timestamp` is deliberately `0` rather than the book's event time: that stamp is one
-  instant shared by every order in a snapshot, which a consumer ageing orders reads as real. Order diffs
-  are `new`/`remove` only, since `update{origSz,newSz}` would need a prior quantity we do not carry.
+  instant shared by every order in a snapshot, which a consumer ageing orders reads as real. Order diffs use all three
+  of the publisher's variants, and the choice is load-bearing: its own apply path inserts a `New` only
+  against a matching opening order status, so a partial fill rendered as `new` is skipped and lost. A
+  change to an order this channel has already published is `update{origSz,newSz}`, where `origSz` is
+  what **this channel last published** (`MarketOrders`, bounded per market and per order) — the arbiter
+  can refuse a change that never reached the wire, so a producer-side prior would describe a book no
+  consumer here holds.
   The accept loop never propagates an error (this task's `Err` reaches `main`'s `select!` and would exit
   the process; unlike `ws`'s, no reconciler respawns it), and the client limits are constants, of which
   the inbound rate cap is the load-bearing one — a subscribe frame is tens of bytes and costs a whole
-  book to answer, and the `subs.contains` guard cannot see an unsubscribe-then-resubscribe loop.
+  book to answer, and the `subs.contains` guard cannot see an unsubscribe-then-resubscribe loop. A
+  WebSocket `Ping` is charged against that cap too (it costs an outbound `Pong`), and crossing it sends
+  a `Close` before the socket goes, or the error frame that says why races the peer's undrained queue.
+  A lagging client is re-bootstrapped on `l4Book` at most once per `REBOOTSTRAP_MIN_INTERVAL`, since
+  that frame is the most expensive the sink produces and is what makes a struggling client lag again;
+  a second gap inside the window ends the connection.
 - **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
   `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
   bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical

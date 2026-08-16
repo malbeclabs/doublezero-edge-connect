@@ -63,29 +63,52 @@ zero so a client written against the publisher still parses the frames — a con
 meaning into them. In particular `timestamp` is **0, not the book's event time**: stamping the event
 time would give every order in a snapshot the same plausible placement time, which a consumer ranking
 queue priority or ageing orders would read as real. `l4Book`'s `order_statuses` is always empty for
-the same reason, and its order diffs use `new`/`remove` only: our changes carry an order's absolute
-resulting quantity and no prior one, so the publisher's `update{origSz,newSz}` could only be
-fabricated. On `trades`, a print whose aggressor side the venue did not report is **dropped** rather
+the same reason. Its order diffs use all three of the publisher's variants: a change to an order this
+channel has already published is `update{origSz,newSz}` and only a genuinely new one is `new`, because
+the publisher's own apply path inserts a `New` solely against a matching opening order status — a
+partial fill rendered as `new` is skipped and lost. `origSz` is what **this channel last published**
+for the order, which is the only prior size the sink can honestly claim: the arbiter can refuse a
+change that never reached the wire, so a producer-side prior would describe a book no consumer here
+holds. On `trades`, a print whose aggressor side the venue did not report is **dropped** rather
 than guessed: `side` is the one field on that channel a consumer acts on directionally and
 Hyperliquid's schema has no "unknown", so the compat tape can be shorter than the normalized one.
 
-Both book channels publish a market only once the bridge holds its **complete** book. `l2Book`
-replaces a consumer's book wholesale on every frame and an `l4Book` snapshot claims completeness, so
-a market accumulated mid-stream — before a producer re-baseline — is withheld rather than published
-as if it were whole.
+`l2Book` publishes a market only once the bridge holds its **complete** book: it replaces a
+consumer's book wholesale on every frame, so a market accumulated mid-stream — before a producer
+re-baseline — is withheld rather than published as if it were whole. An `l4Book` **re-baseline is
+rendered from the batch itself**, which is the complete book by construction, and never from the
+shared accumulator: the arbiter advances that accumulator *before* broadcasting, so a client with a
+queue would get a snapshot containing batches it had not applied yet and then apply the older diffs
+on top. The one case with no content is the arbiter's degraded re-baseline, a bare `clear`; it still
+becomes a `Snapshot`, an empty one, because this channel has no clear of its own and the consumer
+must be told to discard.
+
+**A `coin` is not an identity.** The wire symbol is a truncated label and two markets can share one,
+so a subscription that resolves to more than one is refused, and each one that is served is pinned to
+the market it was bootstrapped from.
 
 Client limits are fixed rather than configurable (64 clients, 256 subscriptions each, 600 inbound
-control frames per minute, a 20s heartbeat with a 60s idle reap). The rate limit is the one that
-matters: a subscribe frame is tens of bytes and can cost a whole book to answer. The shared book
-map's mutex is the one the ingest emit path takes on every published batch, so the sink does exactly
-one thing under it: clone the market's accumulator. Every rendering step — the price fold, the order
-set, the decimal formatting, the JSON — runs after the guard drops. The clone is the cheapest
-snapshot on offer and not a fallback: on the 44,598-order fixture it costs ~0.45 ms against ~9.1 ms
-to fold under the guard and ~5.6 ms to materialize the order set there. It is still O(book) inside a
-process-wide mutex, so enabling this sink on a very large book is a measurable cost to *every* feed's
-ingest; a copy-on-write accumulator would remove it and has not been built.
-Observability is `dz_hl_sink_clients` and `dz_hl_sink_messages_total{channel}`. There is **no TLS**,
-as with the rest of the service surface.
+control frames per minute, a 20s heartbeat with a 60s idle reap). Both a text control frame and a
+WebSocket `Ping` are charged against the rate limit — it is the sink's load-bearing client bound, and
+a channel that bypassed it would let a peer drive an unbounded `Pong` stream. The limit is the one
+that matters: a subscribe frame is tens of bytes and can cost a whole book to answer.
+
+**Everything shared across clients is paid once per batch, not once per client.** A single prepare
+stage reads the backbone, takes the shared book map's mutex — the one the ingest emit path takes on
+every published batch — clones the market's accumulator, folds it, renders the `l4Book` frame, and
+fans all of that out; only the per-view `l2Book` rendering stays per client. On the 44,598-order
+fixture the clone is ~617 µs held against ~8.9 ms to fold and ~5.2 ms to materialize the order set,
+both of which run after the guard drops, so 64 clients cost one clone rather than 64 (~39 ms of
+arbiter stall per batch before). It is still O(book) inside a process-wide mutex once per batch, so
+enabling this sink on a very large book is a measurable cost to *every* feed's ingest; a
+copy-on-write accumulator would remove it and has not been built. A client that lags is
+re-bootstrapped on `l4Book` only, at most once every 5s — the re-bootstrap is the most expensive
+frame the sink produces, so ungated it is what makes a struggling client lag again — and a second gap
+inside that window ends the connection instead.
+
+Observability is `dz_hl_sink_clients`, `dz_hl_sink_messages_total{channel}`,
+`dz_hl_sink_dropped_total{reason}` and `dz_hl_sink_folds_total`. There is **no TLS**, as with the
+rest of the service surface.
 
 ## Metrics (Prometheus)
 
