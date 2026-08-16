@@ -1262,12 +1262,15 @@ async fn serve_client(
                         }
                     }
                     // The shared stage lost messages, so this client's `l4Book` book is wrong even
-                    // though its own receiver never lagged.
-                    Prepared::Resync => {
+                    // though its own receiver never lagged. Only an `l4Book` subscriber has anything
+                    // to lose, and only one may be disconnected for it: the stage's lag is not this
+                    // client's fault, and a `trades`/`l2Book` client is unaffected by it.
+                    Prepared::Resync if subs.iter().any(|s| matches!(s, Sub::L4Book { .. })) => {
                         if !rebootstrap(&mut write, &books, &subs, &pinned, &mut last_rebootstrap).await? {
                             return end_lagging(&mut write).await;
                         }
                     }
+                    Prepared::Resync => {}
                 },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("hl sink client lagged, dropped {n}");
