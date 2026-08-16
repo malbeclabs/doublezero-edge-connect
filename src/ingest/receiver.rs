@@ -358,7 +358,7 @@ impl Drop for ReceiverRegistration {
         if !self.publishers.is_empty() {
             let mut a = lock(arbiter);
             for &ip in &self.publishers {
-                a.forget_publisher_books(venue, Publisher::Edge(ip));
+                a.forget_publisher_books(self.key.1, Publisher::Edge(ip));
             }
         }
         self.health.deregister(self.key, |venue_up| {
@@ -1240,6 +1240,46 @@ mod tests {
         assert!(
             lock(&tob).book_arm_synced(&market, Publisher::Edge(ip)),
             "a quote receiver's exit says nothing about its publisher's books"
+        );
+    }
+
+    /// The release above must find the market whatever the wire called its venue. Every `MarketKey`
+    /// is filed under the **wire** venue the instrument resolved to, and one registry row can carry
+    /// instruments whose Source IDs resolve elsewhere (the superset case `reset_all_known_depth_floors`
+    /// exists for), so a release filtered by the row's own `venue` matches nothing for exactly those
+    /// markets and leaves a departed arm's phantom `synced` standing forever. The category is what the
+    /// exiting receiver and the key provably share.
+    #[test]
+    fn an_mbo_receivers_exit_releases_a_market_filed_under_a_different_wire_venue() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Publisher},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // The row's static venue; the market below is filed under a different one, as a superset
+        // row's instruments are.
+        let row_venue = "MBOWIREVENUE";
+        let market = ("HYPERLIQUID".into(), "wiretest".into(), 2u32, 41u32);
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let arbiter: SharedArbiter =
+            std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+        lock(&arbiter).set_book_synced(&market, Publisher::Edge(ip), true);
+        let up_gauge = metrics()
+            .receiver_up
+            .with_label_values(&[row_venue, "wiretest", "9103"]);
+        let mut reg = ReceiverRegistration::new(
+            FeedHealth::new().into(),
+            arbiter.clone(),
+            (row_venue, "wiretest", FeedKind::MarketByOrder, 9103),
+            up_gauge,
+        );
+        reg.note_publisher(ip);
+        drop(reg);
+        assert!(
+            !lock(&arbiter).book_arm_synced(&market, Publisher::Edge(ip)),
+            "the departed arm's claim must go even when the wire named the venue differently"
         );
     }
 

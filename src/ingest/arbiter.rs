@@ -1739,7 +1739,7 @@ impl Arbiter {
         peer.synced = synced;
     }
 
-    /// Drop a departed publisher's claim to be serving `venue`'s order-level markets — the seam a
+    /// Drop a departed publisher's claim to be serving a universe's order-level markets — the seam a
     /// Market-by-Order receiver's registration calls as it exits.
     ///
     /// Departure is the authoritative signal and [`PEER_SERVING_NS`] is only its backstop, for a
@@ -1747,12 +1747,18 @@ impl Arbiter {
     /// timer never binds on it, and a suppressed re-baseline is never retried — the surviving arm's
     /// market wedges for the life of the process.
     ///
-    /// Scoped to the venue, and to the sync claims only. One publisher host serves several protocols
-    /// from one source IP (the tape-arm gate rests on that), so a venue-blind sweep would let an
-    /// exiting Market-by-Order receiver tear down the same host's live Market-by-Price state.
-    pub fn forget_publisher_books(&mut self, venue: &str, publisher: Publisher) {
+    /// Scoped to the **category**, and to the sync claims only. One publisher host serves several
+    /// protocols from one source IP (the tape-arm gate rests on that), so an unscoped sweep would let
+    /// an exiting Market-by-Order receiver tear down the same host's live Market-by-Price state. The
+    /// category is what the exiting receiver and the `MarketKey` provably agree on — both take it
+    /// verbatim from the registry row (`FrameCtx::category`). Its **venue** does not: every key here
+    /// is filed under the *wire* venue (`MboProcessor::wire_venue`), and one registry row can carry
+    /// instruments whose Source IDs resolve elsewhere — the same superset case that made
+    /// `reset_all_known_depth_floors` stop sweeping by `ctx.venue`. Filtered by the row's venue this
+    /// matched nothing for exactly those markets, which is the wedge it exists to close.
+    pub fn forget_publisher_books(&mut self, category: &str, publisher: Publisher) {
         for (key, arms) in self.book_sync.iter_mut() {
-            if key.0.as_ref() == venue {
+            if key.1.as_ref() == category {
                 arms.remove(&publisher);
             }
         }
@@ -2468,18 +2474,25 @@ impl Arbiter {
         let seed_ts = self.channel_newest(key);
         let Some(full) = self.rebaseline_from_replay(key) else {
             // Nothing complete to republish: empty the consumer's book and let this batch rebuild onto
-            // it, exactly as the single-arm gate degrades. The replay entry goes with it — left in
-            // place it would keep claiming completeness and bootstrap a new client with the orders
-            // live consumers were just told to discard.
-            if let Some(replay) = &self.book_replay {
-                model::lock(replay).remove(key);
-            }
+            // it, exactly as the single-arm gate degrades.
+            //
+            // The clear goes through the replay accumulator rather than around it. **Never delete the
+            // entry here**: `book_markets` and `StickyAuthority::last_admitted` would survive it, and
+            // that pairing is the only thing that forces a re-baseline (see
+            // `reset_books_for_markets`) — the order-level path never re-baselines of its own accord,
+            // so the next batch would recreate the entry with `baselined() == false` and the market
+            // would stay invisible to every newly-connecting client until some producer sent a
+            // `Clear`. Applying the clear instead is both honest and complete: every live consumer was
+            // just told to discard, so an accumulator that starts empty here and folds in what follows
+            // *is* the whole book.
+            let cleared = clear_only(b);
+            self.apply_book_replay(key, &cleared);
             self.book_events
                 .entry(key.clone())
                 .or_default()
                 .rebaselined(&[], seed_ts, &mut self.guard);
             self.vm(&b.venue).emit[EMIT_BOOK].inc();
-            let _ = self.tx.send(Arc::new(FeedMessage::Book(clear_only(b))));
+            let _ = self.tx.send(Arc::new(FeedMessage::Book(cleared)));
             return true;
         };
         self.book_events
@@ -6144,6 +6157,68 @@ mod tests {
         assert_eq!(out[1].changes[0].order_id, 9);
     }
 
+    /// **Item E.** The degraded forced re-baseline — nothing complete to republish, so the consumer's
+    /// book is emptied and rebuilt from the following batches — must leave the shared replay entry
+    /// *present and complete*, not deleted. Deleting it strands `book_markets` and
+    /// `StickyAuthority::last_admitted`, which is the pairing that forces a re-baseline; the order-level
+    /// path never re-baselines of its own accord, so the recreated entry stays un-baselined and the
+    /// market is invisible to every newly-connecting client. Applying the broadcast clear is both
+    /// honest and complete: every live consumer was just told to discard.
+    #[test]
+    fn a_degraded_forced_rebaseline_leaves_the_replay_entry_bootstrappable() {
+        const VENUE: &str = "BookDegradedReplay";
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_mode(VENUE, ArbitrationMode::Coordinated);
+        let replay: BookSnapshot = Arc::new(std::sync::Mutex::new(BookReplay::default()));
+        a.set_book_replay(replay.clone());
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        for p in [arm(1), arm(2)] {
+            a.set_book_synced(&key, p, true);
+        }
+
+        // Seeded mid-stream: no producer `Clear` has ever been folded in, so the accumulator holds
+        // only what has moved since and cannot honestly be republished as full state.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 6.0)], 1_000),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        assert!(
+            !crate::model::lock(&replay)
+                .get(&key)
+                .expect("the market is tracked")
+                .baselined(),
+            "the setup must reach the degraded path, not the complete one"
+        );
+        // Arm 2 disagrees about order 7's resting size, forcing the re-baseline.
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 8.0)], 1_100),
+            arm(2),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        a.emit(
+            l3_batch(VENUE, vec![order(BookAction::Update, 9, 99.0, 1.0)], 1_200),
+            arm(1),
+            TEST_CATEGORY,
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(
+            out.first().map(|b| b.changes[0].action),
+            Some(BookAction::Clear),
+            "the consumer must be told to discard"
+        );
+        let guard = crate::model::lock(&replay);
+        let acc = guard
+            .get(&key)
+            .expect("the replay entry must survive the degraded clear");
+        assert!(
+            acc.baselined(),
+            "after a broadcast clear the accumulator IS the whole book, so it must say so"
+        );
+    }
+
     /// A forged source can raise a disagreement against any real order for the price of one datagram,
     /// so the re-baseline that follows must republish what the wire agreed on and never the raising
     /// arm's own book — otherwise the cheapest input on the wire buys wholesale replacement of a
@@ -6552,7 +6627,7 @@ mod tests {
         );
         let _ = drain_books(&mut rx);
 
-        a.forget_publisher_books(VENUE, arm(1));
+        a.forget_publisher_books(TEST_CATEGORY, arm(1));
         a.emit(
             l3_batch(
                 VENUE,

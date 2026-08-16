@@ -1030,11 +1030,33 @@ impl MboProcessor {
         true
     }
 
-    /// Drop every `revealed`/`pending_channel` entry for `publisher` — see
-    /// [`TobProcessor::forget_publisher`]. MBO has no `ChannelReset` message of its own (per-
-    /// instrument `InstrumentReset` already drops its own key's entry), so this is called only from
-    /// [`PerPublisher::take_evicted`].
-    fn forget_publisher(&mut self, publisher: IpAddr) {
+    /// Drop everything keyed on `publisher` — see [`TobProcessor::forget_publisher`]. MBO has no
+    /// `ChannelReset` message of its own (per-instrument `InstrumentReset` already drops its own
+    /// key's entry), so this is called only from [`PerPublisher::take_evicted`].
+    ///
+    /// Drops the **same set** [`Self::book_for`]'s eviction does, and for the same reason: a sibling
+    /// map left behind outlives the state that gave it meaning. `synced_reported` is the one that
+    /// corrupts rather than leaks — the arbiter reads a departed arm's `synced = true` as a healthy
+    /// peer and suppresses the surviving arm's only re-baseline — and it cannot be corrected later,
+    /// because `market_key` resolves through `revealed`. So the arm is released here, while
+    /// `revealed` still resolves it.
+    fn forget_publisher(&mut self, publisher: IpAddr, ctx: &FrameCtx) {
+        let stale: Vec<(IpAddr, u32)> = self
+            .synced_reported
+            .iter()
+            .filter(|((p, _), synced)| *p == publisher && **synced)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale {
+            self.set_synced(key, false, ctx);
+        }
+        self.books.retain(|(p, _), _| *p != publisher);
+        self.books_order.retain(|(p, _)| *p != publisher);
+        self.last_top.retain(|(p, _), _| *p != publisher);
+        self.emitted_symbol.retain(|(p, _), _| *p != publisher);
+        self.synced_reported.retain(|(p, _), _| *p != publisher);
+        self.reveal_rebaselined_ns
+            .retain(|(p, _), _| *p != publisher);
         self.revealed.retain(|(p, _), _| *p != publisher);
         self.pending_channel.retain(|(p, _), _| *p != publisher);
     }
@@ -1279,6 +1301,37 @@ impl MboProcessor {
         Some((venue_arc(venue), category_arc(ctx.category), channel, key.1))
     }
 
+    /// Handle a delta-carrying message's Source ID: reveal the instrument if it moved, and decide what
+    /// the frame owes the `book` consumer as a result. Identical at all four delta-carrying call sites,
+    /// so it lives here rather than four times over.
+    ///
+    /// A reveal moves the instrument to a **new** `MarketKey`, under which the consumer has seen
+    /// nothing. Publishing the frame's incremental changes there is the one outcome that must not
+    /// happen: the consumer applies order updates onto a book it was never given, and the replay
+    /// accumulator for that key never reaches `baselined()`, so new clients never see it either. So a
+    /// reveal always says *something* — the whole book when [`Self::reveal_rebaseline_due`] allows it,
+    /// and otherwise a bare `Clear`, which is honest, costs one change, and cannot be amplified by the
+    /// forged-Source-ID flood the rate limit exists to bound.
+    fn on_reveal(
+        &mut self,
+        ctx: &FrameCtx,
+        instrument_id: u32,
+        source_id: u16,
+        changed: &mut BTreeSet<u32>,
+        rebaselined: &mut BTreeSet<u32>,
+        cleared: &mut BTreeSet<u32>,
+    ) {
+        if !self.reveal_if_needed(ctx, instrument_id, source_id) {
+            return;
+        }
+        changed.insert(instrument_id);
+        if self.reveal_rebaseline_due((ctx.publisher, instrument_id)) {
+            rebaselined.insert(instrument_id);
+        } else {
+            cleared.insert(instrument_id);
+        }
+    }
+
     /// Report this instrument's book sync state to the arbiter when it has changed. The arbiter's
     /// re-baseline suppression reads these, so a book that gaps must say so — otherwise a peer that is
     /// itself recovering would see a phantom healthy arm and suppress the only re-baseline on offer.
@@ -1291,6 +1344,11 @@ impl MboProcessor {
     /// [`Self::report_synced`] for a caller that already knows the state, and reports it *before* the
     /// book reaches it — an `InstrumentReset` clears the `revealed` entry that resolves the market, so
     /// waiting until the book has actually dropped leaves nothing to key the report by.
+    ///
+    /// Reported under **`key`'s own publisher**, not `ctx.publisher`: a feed-wide `EndOfSession` and a
+    /// publisher eviction both report for arms other than the one whose datagram is being handled, and
+    /// naming the wrong arm there would leave the departed one's `synced = true` standing while
+    /// clearing an innocent peer's.
     fn set_synced(&mut self, key: (IpAddr, u32), synced: bool, ctx: &FrameCtx) {
         if self.synced_reported.get(&key) == Some(&synced) {
             return;
@@ -1299,7 +1357,7 @@ impl MboProcessor {
             return;
         };
         self.synced_reported.insert(key, synced);
-        lock(ctx.arbiter).set_book_synced(&market, Publisher::Edge(ctx.publisher), synced);
+        lock(ctx.arbiter).set_book_synced(&market, Publisher::Edge(key.0), synced);
     }
 
     /// Emit the order-level `book` for one instrument — the real L3 product, carrying the venue's own
@@ -1307,11 +1365,13 @@ impl MboProcessor {
     /// for an instrument whose book is unsynced, whose precision is unknown, or whose Source ID has not
     /// been revealed.
     ///
-    /// `rebaseline` materializes the whole book behind a `Clear` (`changes[0].action == Clear` is what
-    /// re-baselines a consumer; the `snapshot` flag is advisory) — for a snapshot install, and for a
-    /// reveal, after which the consumer has never seen this identity's book at all. Otherwise the
-    /// frame's applied changes are published as they came.
-    fn emit_book(&mut self, instrument_id: u32, rebaseline: bool, ctx: &FrameCtx) {
+    /// [`BookEmit::Rebaseline`] materializes the whole book behind a `Clear` (`changes[0].action ==
+    /// Clear` is what re-baselines a consumer; the `snapshot` flag is advisory) — for a snapshot
+    /// install, and for a reveal, after which the consumer has never seen this identity's book at
+    /// all. [`BookEmit::Clear`] is the same statement without the content, for a reveal the rate
+    /// limit refused to materialize. Otherwise the frame's applied changes are published as they
+    /// came.
+    fn emit_book(&mut self, instrument_id: u32, mode: BookEmit, ctx: &FrameCtx) {
         let key = (ctx.publisher, instrument_id);
         let Some(&source_id) = self.revealed.get(&key) else {
             return;
@@ -1346,9 +1406,7 @@ impl MboProcessor {
             order_id: c.order_id,
         };
         let mut changes = Vec::new();
-        if rebaseline {
-            let mut scratch = std::mem::take(&mut self.order_scratch);
-            book.order_set(&mut scratch);
+        if mode != BookEmit::Delta {
             changes.push(BookChange {
                 action: BookAction::Clear,
                 side: BookSide::Both,
@@ -1356,9 +1414,13 @@ impl MboProcessor {
                 size: 0.0,
                 order_id: 0,
             });
+        }
+        if mode == BookEmit::Rebaseline {
+            let mut scratch = std::mem::take(&mut self.order_scratch);
+            book.order_set(&mut scratch);
             changes.extend(scratch.iter().map(scale));
             self.order_scratch = scratch;
-        } else {
+        } else if mode == BookEmit::Delta {
             changes.extend(
                 self.frame_changes
                     .iter()
@@ -1382,7 +1444,7 @@ impl MboProcessor {
             instrument_id,
             category: category_arc(ctx.category),
             changes,
-            snapshot: rebaseline,
+            snapshot: mode != BookEmit::Delta,
             last: true,
             source_ts_ns,
             recv_ts_ns: ctx.recv_ts_ns,
@@ -1390,6 +1452,17 @@ impl MboProcessor {
             ws_send_ts_ns: 0, // stamped by the WS server just before send
         }));
     }
+}
+
+/// What one instrument's `book` emission says this frame — see [`MboProcessor::emit_book`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BookEmit {
+    /// The frame's applied changes, as they came.
+    Delta,
+    /// A bare `Clear`: discard this market, with no replacement content.
+    Clear,
+    /// A `Clear` followed by the book's whole current order set.
+    Rebaseline,
 }
 
 impl FrameProcessor for MboProcessor {
@@ -1417,7 +1490,7 @@ impl FrameProcessor for MboProcessor {
             // on — evicting a publisher this drain never saw, unboundedly growing `pending_channel`
             // for a publisher that never sent a single byte of real reference data.
             if let Some(evicted) = self.state.take_evicted() {
-                self.forget_publisher(evicted);
+                self.forget_publisher(evicted, ctx);
             }
         }
 
@@ -1431,6 +1504,10 @@ impl FrameProcessor for MboProcessor {
         // Instruments whose whole book must be republished: a snapshot install, or a reveal, after which
         // the consumer has never seen this identity's book.
         let mut rebaselined: BTreeSet<u32> = BTreeSet::new();
+        // Instruments a reveal moved to a new `MarketKey` that the rate limit refused to republish
+        // whole: they owe the consumer a bare `Clear` rather than this frame's incrementals — see
+        // [`MboProcessor::on_reveal`].
+        let mut cleared: BTreeSet<u32> = BTreeSet::new();
         self.frame_changes.clear();
 
         for msg in messages {
@@ -1509,17 +1586,31 @@ impl FrameProcessor for MboProcessor {
                     // the other ports are harmless no-ops (deliberately not role-gated: an extra
                     // clear also backs up a lost copy).
                     //
-                    // SCOPE TRAP: `books` holds only THIS publisher's books (one processor per
-                    // receiver task) while the floor cleared below is venue-wide and shared. A
-                    // mirror that loses its own EndOfSession datagram keeps a `Synced` book and
-                    // can re-latch the cleared floor at the old high-water, wedging the venue's
-                    // depth until that mirror resets on its own. Closing it needs a per-venue
-                    // session epoch shared across the receiver tasks.
+                    // SCOPE TRAP: `books` can hold several publishers' books (they share a port
+                    // block, and so one processor), while the floor cleared below is venue-wide and
+                    // shared. A mirror that loses its own EndOfSession datagram keeps a `Synced`
+                    // book and can re-latch the cleared floor at the old high-water, wedging the
+                    // venue's depth until that mirror resets on its own. Resetting every
+                    // publisher's book here is what closes that; a per-venue session epoch shared
+                    // across the receiver tasks is what would close it properly.
                     for book in self.books.values_mut() {
                         book.on_end_of_session();
                     }
-                    // Every book this publisher holds just dropped to `Recovering`, and the arbiter's
-                    // re-baseline suppression must not keep reading them as healthy arms.
+                    // EVERY book just dropped to `Recovering`, so every one of them must say so —
+                    // the reset above is feed-wide, and reporting only this publisher's would leave
+                    // the arbiter reading a peer's stale `synced = true` as a healthy arm and
+                    // suppressing the surviving arm's only re-baseline. `touched` can carry only
+                    // this publisher's (it is keyed by instrument id alone), so the peers are
+                    // reported here.
+                    let peers: Vec<(IpAddr, u32)> = self
+                        .books
+                        .keys()
+                        .filter(|(p, _)| *p != ctx.publisher)
+                        .copied()
+                        .collect();
+                    for key in peers {
+                        self.set_synced(key, false, ctx);
+                    }
                     touched.extend(
                         self.books
                             .keys()
@@ -1552,12 +1643,14 @@ impl FrameProcessor for MboProcessor {
                     // are never re-served), so a reveal here forces a `depth` re-baseline —
                     // otherwise a delta that didn't move the visible top-N would reveal the
                     // instrument's definition but never follow it with any book content.
-                    if self.reveal_if_needed(ctx, o.instrument_id, o.source_id) {
-                        changed.insert(o.instrument_id);
-                        if self.reveal_rebaseline_due((ctx.publisher, o.instrument_id)) {
-                            rebaselined.insert(o.instrument_id);
-                        }
-                    }
+                    self.on_reveal(
+                        ctx,
+                        o.instrument_id,
+                        o.source_id,
+                        &mut changed,
+                        &mut rebaselined,
+                        &mut cleared,
+                    );
                 }
                 codec_mbo::Message::OrderCancel(o) => {
                     let op = DeltaOp {
@@ -1569,12 +1662,14 @@ impl FrameProcessor for MboProcessor {
                         },
                     };
                     self.apply_delta(o.instrument_id, op, ctx, &mut changed, &mut touched);
-                    if self.reveal_if_needed(ctx, o.instrument_id, o.source_id) {
-                        changed.insert(o.instrument_id);
-                        if self.reveal_rebaseline_due((ctx.publisher, o.instrument_id)) {
-                            rebaselined.insert(o.instrument_id);
-                        }
-                    }
+                    self.on_reveal(
+                        ctx,
+                        o.instrument_id,
+                        o.source_id,
+                        &mut changed,
+                        &mut rebaselined,
+                        &mut cleared,
+                    );
                 }
                 codec_mbo::Message::OrderExecute(o) => {
                     let op = DeltaOp {
@@ -1588,12 +1683,14 @@ impl FrameProcessor for MboProcessor {
                         },
                     };
                     self.apply_delta(o.instrument_id, op, ctx, &mut changed, &mut touched);
-                    if self.reveal_if_needed(ctx, o.instrument_id, o.source_id) {
-                        changed.insert(o.instrument_id);
-                        if self.reveal_rebaseline_due((ctx.publisher, o.instrument_id)) {
-                            rebaselined.insert(o.instrument_id);
-                        }
-                    }
+                    self.on_reveal(
+                        ctx,
+                        o.instrument_id,
+                        o.source_id,
+                        &mut changed,
+                        &mut rebaselined,
+                        &mut cleared,
+                    );
                     // An execution is also a public trade print; emit it like a Top-of-Book trade.
                     // `reveal_if_needed` above guarantees this instrument is revealed whenever a
                     // definition exists (the only way it could still return `false`), so no
@@ -1640,12 +1737,14 @@ impl FrameProcessor for MboProcessor {
                     // A Trade doesn't touch the book, but the book may already hold real content
                     // from an earlier (silently applied) snapshot — if this is the reveal, force a
                     // `depth` re-baseline so that content isn't left permanently unshown.
-                    if self.reveal_if_needed(ctx, t.instrument_id, t.source_id) {
-                        changed.insert(t.instrument_id);
-                        if self.reveal_rebaseline_due((ctx.publisher, t.instrument_id)) {
-                            rebaselined.insert(t.instrument_id);
-                        }
-                    }
+                    self.on_reveal(
+                        ctx,
+                        t.instrument_id,
+                        t.source_id,
+                        &mut changed,
+                        &mut rebaselined,
+                        &mut cleared,
+                    );
                     // Same identity `reveal_if_needed` above just announced (or already holds) this
                     // instrument's `instrument` under — see `pending_channel`'s doc.
                     let channel = self
@@ -1689,12 +1788,23 @@ impl FrameProcessor for MboProcessor {
                     // always published (and its timestamps are fresh), never suppressed against the
                     // pre-reset top-N. Per-publisher: only this publisher's book is resetting.
                     self.last_top.remove(&key);
+                    // The `book` product's equivalent, and for the same reason: the reset drops
+                    // `revealed` below, so the post-reset stream re-reveals — and a rate limit left
+                    // standing from the pre-reset reveal would downgrade that republish to a bare
+                    // clear, leaving the re-synced book unshown until the next snapshot rotation.
+                    self.reveal_rebaselined_ns.remove(&key);
                     // Resolve the wire venue the pre-reset depth actually latched under BEFORE
                     // dropping the cache entry that supplies it. Same remap risk as `last_top`/
                     // `emitted_symbol`: a manifest epoch bump can reassign this instrument_id to a
                     // different market, and the old Source ID would then misdescribe the new one —
                     // it must not survive past this reset either.
                     let latched_venue = self.wire_venue(&key);
+                    // Resolved BEFORE the removal for the same reason `set_synced` runs before it:
+                    // `market_key` reaches through `revealed`, so afterwards it is `None` and the
+                    // raced-state drop below would be dead code — leaving the ended session's
+                    // tombstones to refuse the new session's re-used order ids, which drops those
+                    // orders from every consumer's book until retention expires.
+                    let market = self.market_key(&key, ctx);
                     self.revealed.remove(&key);
                     // The re-snapshot may anchor at a `source_ts` below the latched floor (e.g. the
                     // venue reset this instrument's clock); clear the `(venue, symbol)` floor entry
@@ -1733,7 +1843,7 @@ impl FrameProcessor for MboProcessor {
                     }
                     // The new session may reuse this instrument's order ids, so the raced state's
                     // tombstones must go with the book or they would refuse the reused ids.
-                    if let Some(market) = self.market_key(&key, ctx) {
+                    if let Some(market) = market {
                         lock(ctx.arbiter).reset_book_events_for_market(&market);
                     }
                     // Reset the existing book directly — NOT via `book_for`, whose definition gate
@@ -1803,7 +1913,17 @@ impl FrameProcessor for MboProcessor {
         }
         for instrument_id in changed {
             self.emit_depth(instrument_id, ctx);
-            self.emit_book(instrument_id, rebaselined.contains(&instrument_id), ctx);
+            // `depth` is full state, so a reveal never has to withhold it; only the incremental
+            // product does. A snapshot install in the same frame outranks the rate limit's bare
+            // clear — it already has the content the clear would have withheld.
+            let mode = if rebaselined.contains(&instrument_id) {
+                BookEmit::Rebaseline
+            } else if cleared.contains(&instrument_id) {
+                BookEmit::Clear
+            } else {
+                BookEmit::Delta
+            };
+            self.emit_book(instrument_id, mode, ctx);
         }
     }
 }
@@ -2897,6 +3017,8 @@ mod tests {
         collections::HashMap,
         sync::{Arc, Mutex},
     };
+
+    use super::{MarketKey, MAX_PUBLISHERS};
 
     use tokio::sync::broadcast;
 
@@ -7229,6 +7351,284 @@ mod tests {
         assert_eq!(
             proc.synced_reported.values().copied().collect::<Vec<_>>(),
             vec![false]
+        );
+    }
+    /// **Item A.** An `InstrumentReset` restarts the venue's order-id space for that instrument, so
+    /// the arbiter's raced order state must go with the book. The market is resolved *before* the
+    /// `revealed` entry that resolves it is dropped; resolved after, the drop is dead code and every
+    /// re-used order id is refused as a resurrection — silently missing from every consumer's book
+    /// until the retention window expires.
+    #[test]
+    fn an_instrument_reset_lets_the_venue_reuse_an_order_id() {
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        lock(&arbiter).set_book_replay(Arc::new(Mutex::new(Default::default())));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let snap = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
+
+        // Order 7 rests, then dies: the arbiter now holds a tombstone for it.
+        proc.on_datagram(&frame(&[add(1, 7, 1_000)]), &mkt);
+        proc.on_datagram(
+            &frame(&[enc_order_cancel(&OrderCancel {
+                instrument_id: 0,
+                source_id: 0,
+                reason: 0,
+                per_instrument_seq: 2,
+                order_id: 7,
+                ts: 1_100,
+            })]),
+            &mkt,
+        );
+        let _ = drain_books(&mut rx);
+
+        proc.on_datagram(
+            &frame(&[enc_instrument_reset(&InstrumentReset {
+                instrument_id: 0,
+                reason: 0,
+                new_anchor_seq: 0,
+                ts: 1_150,
+            })]),
+            &mkt,
+        );
+        // Re-sync on an empty anchor, then re-reveal on an unrelated order so the re-used id below
+        // arrives as an ordinary delta rather than inside a `Clear`-led batch (which bypasses the
+        // guard entirely).
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 2,
+                    last_instrument_seq: 0,
+                    ts: 1_200,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 2,
+                }),
+            ]),
+            &snap,
+        );
+        proc.on_datagram(&frame(&[add(1, 9, 1_300)]), &mkt);
+        let _ = drain_books(&mut rx);
+
+        // The venue re-uses order id 7 in the new session.
+        proc.on_datagram(&frame(&[add(2, 7, 1_400)]), &mkt);
+        let ids: Vec<u64> = drain_books(&mut rx)
+            .iter()
+            .flat_map(|b| b.changes.iter().map(|c| c.order_id))
+            .collect();
+        assert!(
+            ids.contains(&7),
+            "the re-used order id must reach the wire, not be refused as a resurrection: {ids:?}"
+        );
+    }
+
+    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
+    /// `mbo_end_of_session_resets_peer_publisher_books` for why), so every one of them must report it.
+    /// A peer left claiming `synced` is a phantom healthy arm, and the arbiter suppresses the
+    /// surviving arm's only re-baseline against it.
+    #[test]
+    fn end_of_session_reports_every_publishers_book_unsynced() {
+        use crate::ingest::sources::source_label;
+        use std::net::Ipv4Addr;
+        fn ctx_for<'a>(
+            publisher: IpAddr,
+            arbiter: &'a SharedArbiter,
+            instruments: &'a crate::model::InstrumentSnapshot,
+            role: PortRole,
+        ) -> FrameCtx<'a> {
+            let mut c = make_ctx(arbiter, instruments, role);
+            c.publisher = publisher;
+            c
+        }
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, tape(false));
+        let anchor = frame(&[
+            enc_snapshot_begin(&SnapshotBegin {
+                instrument_id: 0,
+                anchor_seq: 0,
+                total_orders: 0,
+                snapshot_id: 1,
+                last_instrument_seq: 0,
+                ts: 1,
+            }),
+            enc_snapshot_end(&SnapshotEnd {
+                instrument_id: 0,
+                anchor_seq: 0,
+                snapshot_id: 1,
+            }),
+        ]);
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(
+                &frame(&[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(0, "INST-0", 1),
+                ]),
+                &ctx_for(publisher, &arbiter, &instruments, PortRole::Combined),
+            );
+            proc.on_datagram(
+                &anchor,
+                &ctx_for(publisher, &arbiter, &instruments, PortRole::Snapshot),
+            );
+            proc.on_datagram(
+                &frame(&[add(1, 100, 5_000)]),
+                &ctx_for(publisher, &arbiter, &instruments, PortRole::Mktdata),
+            );
+        }
+        let market: MarketKey = (
+            venue_arc(source_label(0)),
+            category_arc("testcategory"),
+            0,
+            0,
+        );
+        assert!(
+            lock(&arbiter).book_arm_synced(&market, Publisher::Edge(pub_b)),
+            "B's arm must be synced before the session ends"
+        );
+
+        proc.on_datagram(
+            &frame(&[enc_end_of_session(6_000)]),
+            &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
+        );
+        let a = lock(&arbiter).book_arm_synced(&market, Publisher::Edge(pub_a));
+        let b = lock(&arbiter).book_arm_synced(&market, Publisher::Edge(pub_b));
+        assert!(
+            !a && !b,
+            "both books dropped to Recovering, so both arms must say so (a={a}, b={b})"
+        );
+    }
+
+    /// **Item G.** A reveal moves the instrument to a new `MarketKey`. When the rate limit refuses to
+    /// materialize the whole book there, the frame owes the consumer a bare `Clear` — never its
+    /// incremental changes, which would land under a key the consumer was never baselined for and
+    /// leave the replay accumulator un-baselined so new clients never see the market either.
+    #[test]
+    fn a_rate_limited_reveal_clears_rather_than_streaming_under_a_new_key() {
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(256);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        // First reveal (Source ID 0): the whole book, behind a `Clear`.
+        proc.on_datagram(&frame(&[add(1, 7, 1_000)]), &mkt);
+        let _ = drain_books(&mut rx);
+
+        // A second Source ID inside the rate-limit interval: the reveal still fires, but the
+        // republish does not.
+        proc.on_datagram(
+            &frame(&[enc_order_add(&OrderAdd {
+                instrument_id: 0,
+                source_id: 1,
+                side: SIDE_BID,
+                order_flags: 0,
+                per_instrument_seq: 2,
+                order_id: 8,
+                enter_ts: 1_100,
+                price_raw: 100,
+                qty_raw: 5,
+            })]),
+            &mkt,
+        );
+        let books = drain_books(&mut rx);
+        let shapes: Vec<Vec<(BookAction, u64)>> = books
+            .iter()
+            .filter(|b| b.venue.as_ref() == crate::ingest::sources::source_label(1))
+            .map(|b| b.changes.iter().map(|c| (c.action, c.order_id)).collect())
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![vec![(BookAction::Clear, 0u64)]],
+            "the new identity gets a bare clear, never incremental order changes"
+        );
+    }
+
+    /// **Item H.** A publisher evicted from the reference-data map takes its `revealed` entry with it,
+    /// and `revealed` is what resolves the market — so a `synced = true` left behind in the arbiter can
+    /// never be corrected afterwards. The arm is released while the key still resolves, and the
+    /// eviction drops the same sibling maps a book eviction does.
+    #[test]
+    fn an_evicted_publisher_releases_its_arm_and_its_sibling_state() {
+        use crate::ingest::sources::source_label;
+        use std::net::Ipv4Addr;
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(1024);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, tape(false));
+        let ctx_for = |publisher: IpAddr, role: PortRole| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        let victim = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1));
+        proc.on_datagram(
+            &frame(&[
+                enc_manifest_summary(1, 1),
+                enc_instrument_def(0, "INST-0", 1),
+            ]),
+            &ctx_for(victim, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &frame(&[
+                enc_snapshot_begin(&SnapshotBegin {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    total_orders: 0,
+                    snapshot_id: 1,
+                    last_instrument_seq: 0,
+                    ts: 1,
+                }),
+                enc_snapshot_end(&SnapshotEnd {
+                    instrument_id: 0,
+                    anchor_seq: 0,
+                    snapshot_id: 1,
+                }),
+            ]),
+            &ctx_for(victim, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &frame(&[add(1, 7, 1_000)]),
+            &ctx_for(victim, PortRole::Mktdata),
+        );
+        let market: MarketKey = (
+            venue_arc(source_label(0)),
+            category_arc("testcategory"),
+            0,
+            0,
+        );
+        assert!(lock(&arbiter).book_arm_synced(&market, Publisher::Edge(victim)));
+
+        // Fill the per-publisher reference-data map past its cap; the victim was inserted first, so
+        // it is the one evicted.
+        for i in 0..=MAX_PUBLISHERS {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 2, (i / 256) as u8, (i % 256) as u8));
+            proc.on_datagram(
+                &frame(&[enc_manifest_summary(1, 1)]),
+                &ctx_for(ip, PortRole::Combined),
+            );
+        }
+        assert!(
+            !lock(&arbiter).book_arm_synced(&market, Publisher::Edge(victim)),
+            "an evicted publisher's serving claim must go with its reference data"
+        );
+        assert!(
+            !proc.books.keys().any(|(p, _)| *p == victim)
+                && !proc.synced_reported.keys().any(|(p, _)| *p == victim)
+                && !proc.last_top.keys().any(|(p, _)| *p == victim)
+                && !proc.emitted_symbol.keys().any(|(p, _)| *p == victim)
+                && !proc.reveal_rebaselined_ns.keys().any(|(p, _)| *p == victim),
+            "the eviction must drop the same sibling maps a book eviction does"
         );
     }
 }
