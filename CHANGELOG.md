@@ -511,7 +511,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Market-by-Order now serves the order-level `book` alongside its existing `depth`.** The bridge no
   longer throws the order identity away: every change carries the venue's own `order_id`, a snapshot
   install re-baselines as a `clear` plus the full order set, and `depth` keeps working unchanged for
-  the consumers on it. PROTOCOL.md stays **v1** — both additions are fields a consumer may ignore.
+  the consumers on it. PROTOCOL.md stays **v1**, but this is filed there as breaking *within* v1:
+  `book` previously came only from Market-by-Price feeds, so an existing consumer that ignores
+  `order_id` and keys these changes by price corrupts its book, and must exclude Market-by-Order
+  markets from its `book` subscription.
 - `order_id` on a `book` change: the venue's order id for an order-level change, `0` when the change
   is price-aggregated (Market-by-Price) and carries no order identity.
 - The `book` bootstrap **follows the market**: an order-level market is bootstrapped as orders and a

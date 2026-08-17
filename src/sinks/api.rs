@@ -560,7 +560,12 @@ fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         })
         .collect();
 
-    let (bid, ask) = best_levels(state, inst);
+    // One instrument, so one catalog scan — the same cost `book()` already pays per request.
+    let (bid, ask) = best_levels(
+        state,
+        inst,
+        is_ambiguous(state, inst.source_id, &inst.symbol),
+    );
     ok_json(json!({
         "trades": trades_json,
         "best_bid": bid.map(|(p, _)| decimal_string(p, inst.price_exponent)),
@@ -591,7 +596,13 @@ type Level = Option<(f64, f64)>;
 /// already derived, already top-N, and O(1) to read; that is what such a market answers from. (An
 /// order-level market with no `depth` entry yet reports "not available", the same as any other
 /// identity neither store holds.)
-fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) {
+///
+/// `ambiguous` is supplied by the caller rather than derived here: `is_ambiguous` scans the whole
+/// catalog under the lock the ingest hot path's `upsert_instrument` writes on every refdata burst,
+/// and the fall-through below is reached for *every* order-level and depth-only market — so deriving
+/// it here would make one unfiltered `best_bid_ask` O(catalog²) with an acquisition per instrument.
+/// That endpoint already counts `(source_id, symbol)` once for its `product_id` rendering.
+fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -> (Level, Level) {
     let from_book = {
         let books = crate::model::lock(&state.books);
         books
@@ -614,7 +625,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument) -> (Level, Level) 
     // can share — the exact reason `BookSnapshot` is keyed on the identity instead. Where it is
     // ambiguous this cannot say whose inside market it holds, and reporting one identity's ticker
     // from another's book is worse than reporting nothing.
-    if is_ambiguous(state, inst.source_id, &inst.symbol) {
+    if ambiguous {
         return (None, None);
     }
     let depth = crate::model::lock(&state.depth);
@@ -903,17 +914,20 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
                 continue;
             }
         }
-        let (bid, ask) = best_levels(state, i);
-        if bid.is_none() && ask.is_none() {
-            // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
-            // docs); omitting it is honest, a zeroed/fabricated level would not be.
-            continue;
-        }
+        // The same count that renders `product_id` below also decides whether the `depth` fallback
+        // can name whose inside market it holds, so both read one map built once — rather than
+        // `best_levels` re-scanning the catalog per instrument, which is what made this O(catalog²).
         let ambiguous = counts
             .get(&(i.source_id, i.symbol.to_string()))
             .copied()
             .unwrap_or(1)
             > 1;
+        let (bid, ask) = best_levels(state, i, ambiguous);
+        if bid.is_none() && ask.is_none() {
+            // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
+            // docs); omitting it is honest, a zeroed/fabricated level would not be.
+            continue;
+        }
         let product_id = products::ProductId {
             source_id: i.source_id,
             symbol: i.symbol.clone(),
@@ -2420,7 +2434,7 @@ mod tests {
         };
         let inst = inst_in("perps", 3, "KALSHI", "EMPTYACC", 2, 41, -4, -2);
         assert_eq!(
-            best_levels(&state, &inst),
+            best_levels(&state, &inst, false),
             (Some((0.61, 100.0)), Some((0.63, 50.0)))
         );
     }
@@ -2470,15 +2484,19 @@ mod tests {
         };
         for id in [41u32, 42u32] {
             let inst = inst_in("perps", 3, "KALSHI", "COLLIDE", 2, id, -4, -2);
+            // Derived from the catalog, not passed as a literal, so the two colliding entries above
+            // stay load-bearing: a test handing `true` down would pass with `is_ambiguous` broken.
+            let ambiguous = is_ambiguous(&state, inst.source_id, &inst.symbol);
+            assert!(ambiguous, "fixture sanity: the two entries collide");
             assert_eq!(
-                best_levels(&state, &inst),
+                best_levels(&state, &inst, ambiguous),
                 (None, None),
                 "instrument {id} must not be handed a depth entry that may be its neighbour's"
             );
         }
     }
 
-    /// `best_levels` runs under the same `books` guard `book()` does    /// `best_levels` runs under the same `books` guard `book()` does — and `best_bid_ask` fans it out
+    /// `best_levels` runs under the same `books` guard `book()` does — and `best_bid_ask` fans it out
     /// over **every** instrument in the catalog, so one unauthenticated GET must not become an
     /// O(resting orders) pass per order-level market. It reads the `depth` snapshot for those instead,
     /// which is the same book's inside market, already derived and already top-N.
@@ -2555,7 +2573,7 @@ mod tests {
         let inst = inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2);
 
         let started = std::time::Instant::now();
-        let (bid, ask) = best_levels(&state, &inst);
+        let (bid, ask) = best_levels(&state, &inst, false);
         let elapsed = started.elapsed();
         assert_eq!(
             bid,
@@ -2968,6 +2986,73 @@ mod tests {
         assert_eq!(body["best_ask"], "100.50");
     }
 
+    /// The `ticker` half of the same guarantee `best_bid_ask` carries below: ambiguity is now the
+    /// caller's to supply, so each caller needs its own coverage — derived inside `best_levels` it
+    /// came free, and a caller that forgets it hands out a `depth` entry keyed `(venue, symbol)` that
+    /// may be a colliding instrument's. The trades still come back: only the inside market is unsafe
+    /// to answer, and `history` is keyed on the full identity.
+    #[tokio::test]
+    async fn ticker_reports_no_inside_market_for_a_symbol_two_instruments_share() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 41, -4, -2),
+            );
+            // A second instrument the publisher's 16-byte symbol field truncated to the same label.
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 2u32, 42u32),
+                inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 42, -4, -2),
+            );
+        }
+        let now = crate::model::now_ns() / 1_000_000_000;
+        history.lock().unwrap().ingest(
+            crate::history::Key {
+                source_id: 3,
+                category: "perps".into(),
+                channel: 2,
+                instrument_id: 41,
+            },
+            Print {
+                ts_ns: (now - 5) * 1_000_000_000,
+                price: 0.62,
+                size: 3.0,
+            },
+        );
+        depth.lock().unwrap().insert(
+            ("KALSHI".into(), "COLLIDE".into()),
+            NormalizedDepth {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "COLLIDE".into(),
+                bids: vec![[0.61, 100.0]],
+                asks: vec![[0.63, 50.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:COLLIDE%232.41/ticker"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["trades"].as_array().unwrap().len(),
+            1,
+            "the print is keyed on the full identity, so it is still answerable: {body}"
+        );
+        assert!(
+            body["best_bid"].is_null() && body["best_ask"].is_null(),
+            "the depth entry may be instrument 42's: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn best_bid_ask_reports_only_derivable_products() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
@@ -3066,6 +3151,83 @@ mod tests {
         assert_eq!(
             lashay["asks"][0][0], "0.6300",
             "from BookAccumulator::best_ask, not depth"
+        );
+    }
+
+    /// `best_bid_ask` derives ambiguity from the `(source_id, symbol)` counts it already builds for
+    /// `product_id` rendering, rather than letting `best_levels` re-scan the catalog per instrument
+    /// (which made one unfiltered GET O(catalog²)). The guarantee has to survive that move: the
+    /// `depth` fallback is keyed `(venue, symbol)`, so where two instruments share a truncated label
+    /// neither may be handed an entry that might be the other's. Passing a hardcoded `false` from
+    /// here would report both, each with a possibly-foreign inside market, and every unit test on
+    /// `best_levels` would still pass — this is the only test that fails.
+    #[tokio::test]
+    async fn best_bid_ask_reports_no_inside_market_for_a_symbol_two_instruments_share() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 41, -4, -2),
+            );
+            // A second instrument the publisher's 16-byte symbol field truncated to the same label.
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 2u32, 42u32),
+                inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 42, -4, -2),
+            );
+            // An unambiguous third product, so an empty `pricebooks` cannot pass this by accident.
+            map.insert(
+                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+                inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
+            );
+        }
+        depth.lock().unwrap().insert(
+            ("KALSHI".into(), "COLLIDE".into()),
+            NormalizedDepth {
+                venue: "KALSHI".into(),
+                source: "KALSHI".into(),
+                source_id: 3,
+                symbol: "COLLIDE".into(),
+                bids: vec![[0.61, 100.0]],
+                asks: vec![[0.63, 50.0]],
+                source_ts_ns: 7,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+        depth.lock().unwrap().insert(
+            ("HYPERLIQUID".into(), "BTC".into()),
+            NormalizedDepth {
+                venue: "HYPERLIQUID".into(),
+                source: "HYPERLIQUID".into(),
+                source_id: 1,
+                symbol: "BTC".into(),
+                bids: vec![[100.0, 1.0]],
+                asks: vec![[101.0, 2.0]],
+                source_ts_ns: 1,
+                recv_ts_ns: 0,
+                kernel_rx_ts_ns: 0,
+                ws_send_ts_ns: 0,
+            },
+        );
+
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let resp = reqwest::get(format!("{base}/v1/best_bid_ask"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        let ids: Vec<&str> = body["pricebooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["product_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["HYPERLIQUID:BTC"],
+            "neither COLLIDE identity may be handed a depth entry that might be the other's: {body}"
         );
     }
 

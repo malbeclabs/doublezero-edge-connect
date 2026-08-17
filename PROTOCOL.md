@@ -521,7 +521,7 @@ on connect:
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
 - **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally and — on that feed — at order level. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement `book`.
-- **Additive in this revision, so still v1:** `order_id` on a `book` change. A consumer that ignores it reads the same price-aggregated books it read before.
+- **Breaking within v1: `book` now carries order-level changes.** Previously `book` came only from Market-by-Price feeds and Market-by-Order served `depth` alone; both serve `book` now, and a Market-by-Order market's changes carry the venue's own `order_id`. The field is additive; the markets it arrives for are not. A consumer that ignores `order_id` keys those changes by price, collapsing two orders resting at one price to the last one's size and removing the whole level when either is deleted — so **it must exclude Market-by-Order markets from its `book` subscription**, identified from `feed_kind` on `/v1/products` or from the first change it sees on a market, since [the two granularities never mix within one](#book).
 - **Breaking within v1: what `venue` contains changed**, and emission is now gated on a Source ID
   having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
   no removed ones) but change *values* an existing consumer may depend on — see [`source`,
