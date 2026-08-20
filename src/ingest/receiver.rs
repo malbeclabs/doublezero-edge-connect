@@ -56,7 +56,7 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
+        arbiter::{lock, SharedArbiter, Transport},
         feeds::{feeds, Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
         processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor, MAX_PUBLISHERS},
@@ -168,7 +168,7 @@ impl FrameCtx<'_> {
     pub fn emit(&self, msg: FeedMessage) {
         let (wire_venue, _) = msg.venue_symbol();
         record_revealed(self.venue, wire_venue);
-        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher), self.category);
+        lock(self.arbiter).emit(msg, Transport::Edge(self.publisher), self.category);
     }
 }
 
@@ -358,7 +358,7 @@ impl Drop for ReceiverRegistration {
         if !self.publishers.is_empty() {
             let mut a = lock(arbiter);
             for &ip in &self.publishers {
-                a.forget_publisher_books(self.key.1, Publisher::Edge(ip));
+                a.forget_publisher_books(self.key.1, Transport::Edge(ip));
             }
         }
         self.health.deregister(self.key, |venue_up| {
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn an_mbo_receivers_exit_releases_its_publishers_book_standing() {
         use crate::ingest::{
-            arbiter::{lock, Arbiter, Publisher},
+            arbiter::{lock, Arbiter, Transport},
             feeds::FeedKind,
             health::FeedHealth,
         };
@@ -1216,7 +1216,7 @@ mod tests {
             let (tx, _rx) = tokio::sync::broadcast::channel(8);
             let arbiter: SharedArbiter =
                 std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
-            lock(&arbiter).set_book_synced(&market, Publisher::Edge(ip), true);
+            lock(&arbiter).set_book_synced(&market, Transport::Edge(ip), true);
             let up_gauge = metrics()
                 .receiver_up
                 .with_label_values(&["MBODEPART", "test", port]);
@@ -1233,12 +1233,12 @@ mod tests {
 
         let mbo = registration(FeedKind::MarketByOrder, "9101");
         assert!(
-            !lock(&mbo).book_path_synced(&market, Publisher::Edge(ip)),
+            !lock(&mbo).book_path_synced(&market, Transport::Edge(ip)),
             "the departed publisher's claim must go with its receiver"
         );
         let tob = registration(FeedKind::TopOfBook, "9102");
         assert!(
-            lock(&tob).book_path_synced(&market, Publisher::Edge(ip)),
+            lock(&tob).book_path_synced(&market, Transport::Edge(ip)),
             "a quote receiver's exit says nothing about its publisher's books"
         );
     }
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn an_mbo_receivers_exit_releases_a_market_filed_under_a_different_wire_venue() {
         use crate::ingest::{
-            arbiter::{lock, Arbiter, Publisher},
+            arbiter::{lock, Arbiter, Transport},
             feeds::FeedKind,
             health::FeedHealth,
         };
@@ -1265,7 +1265,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
         let arbiter: SharedArbiter =
             std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
-        lock(&arbiter).set_book_synced(&market, Publisher::Edge(ip), true);
+        lock(&arbiter).set_book_synced(&market, Transport::Edge(ip), true);
         let up_gauge = metrics()
             .receiver_up
             .with_label_values(&[row_venue, "wiretest", "9103"]);
@@ -1278,7 +1278,7 @@ mod tests {
         reg.note_publisher(ip);
         drop(reg);
         assert!(
-            !lock(&arbiter).book_path_synced(&market, Publisher::Edge(ip)),
+            !lock(&arbiter).book_path_synced(&market, Transport::Edge(ip)),
             "the departed path's claim must go even when the wire named the venue differently"
         );
     }
@@ -1372,7 +1372,7 @@ mod tests {
     fn reset_count_change_is_a_reset() {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 100), SeqCheck::First);
-        // Publisher reset the channel: reset_count bumped, sequence legitimately restarts at 0.
+        // Transport reset the channel: reset_count bumped, sequence legitimately restarts at 0.
         // Without the reset_count check this 0 would be misread as a stale frame.
         assert_eq!(s.check(0, 1, 0), SeqCheck::Reset);
         assert_eq!(s.check(0, 1, 1), SeqCheck::Ok);

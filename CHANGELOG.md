@@ -827,7 +827,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     times are clamped non-negative.
 - Phoenix public-API trade feeder (`ingest::phoenix_feeder`), an off-by-default backstop for the edge
   Phoenix multicast TRADE stream (#53). It subscribes Phoenix's public `trades` channel per market,
-  emits `NormalizedTrade`s through the shared arbiter as `Publisher::PublicWs` (deduped on
+  emits `NormalizedTrade`s through the shared arbiter as `Transport::PublicWs` (deduped on
   `trade_id` = the public `tradeSequenceNumber`), and is enabled with `--phoenix-ws-input-markets`
   (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) / `--phoenix-ws-input-url`. Trades only —
   no quote backstop (the edge BBO is spline-blended; Phoenix's public book is resting-only). Validated
@@ -972,7 +972,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that backstops the DZ Edge multicast feed (#8). It connects to `wss://api.hyperliquid.xyz/ws` over
   TLS, subscribes `bbo` + `trades` per configured coin on one connection, decodes the HL JSON into the
   same `FeedMessage`s the multicast pipeline produces, and emits them through the shared arbiter as a
-  distinct `Publisher::PublicWs`. Because it shares the per-`(venue, symbol)` latch-to-leader floor with
+  distinct `Transport::PublicWs`. Because it shares the per-`(venue, symbol)` latch-to-leader floor with
   the edge feed, the backstop falls out with **no health check**: the edge wins every tick in steady
   state (the public copy loses the race and is dropped as a no-op), and when the edge gaps the public
   copy is the first to cross the floor and fills in. The public block time (ms) is scaled to ns so both
@@ -1146,7 +1146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared pre-broadcast `Arbiter` (`src/ingest/arbiter.rs`) that owns the broadcast `Sender` and
   exposes one `emit(msg, publisher)` entry point (#8). Every ingest source — each multicast receiver
   and the new public WS feeder — funnels through one `Arc<Mutex<Arbiter>>`, so they all race on the
-  same per-`(venue, symbol)` floor instead of each owning a private one. A `Publisher { Edge(IpAddr),
+  same per-`(venue, symbol)` floor instead of each owning a private one. A `Transport { Edge(IpAddr),
   PublicWs }` enum is the floor's leader identity. Behavior-preserving for the edge path (the
   two-publisher and single-publisher counts are unchanged); the refactor itself adds no output fields.
 - Feed registry is keyed by `(venue, kind)` instead of `venue`, so one venue can carry

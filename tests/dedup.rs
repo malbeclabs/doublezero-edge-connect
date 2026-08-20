@@ -14,7 +14,7 @@ mod common;
 use common::{assertions, replay as replay_helper};
 use doublezero_edge_connect::{
     ingest::{
-        arbiter::{Arbiter, Publisher, SharedArbiter, TRADE_DEDUP_WINDOW},
+        arbiter::{Arbiter, SharedArbiter, Transport, TRADE_DEDUP_WINDOW},
         codec, codec_mbo,
         feeds::{feeds, init_built_in, FeedKind},
         processor::{MboProcessor, TobProcessor},
@@ -645,8 +645,8 @@ const BOOK_CATEGORY: &str = "perps";
 const BOOK_CHANNEL: u32 = 2;
 const BOOK_INSTRUMENT: u32 = 41;
 
-fn path(n: u8) -> Publisher {
-    Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+fn path(n: u8) -> Transport {
+    Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
 }
 
 fn level(side: BookSide, price: f64, size: f64) -> BookChange {

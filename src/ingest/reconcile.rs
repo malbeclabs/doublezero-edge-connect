@@ -1597,7 +1597,7 @@ mod tests {
         instrument_id: u32,
     ) {
         let mut a = crate::ingest::arbiter::lock(&r.cfg.arbiter);
-        let publisher = crate::ingest::arbiter::Publisher::Edge(std::net::IpAddr::V4(
+        let publisher = crate::ingest::arbiter::Transport::Edge(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(10, 0, 0, 1),
         ));
         a.emit(

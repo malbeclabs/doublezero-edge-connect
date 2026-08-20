@@ -8,7 +8,7 @@
 //! source delivered a given update first. Because every source races through the **same** per-`(venue,
 //! symbol)` floor, a public-feed copy of an update the edge already emitted collapses into a no-op —
 //! and when the edge gaps, the public copy is the first to cross the floor and fills in (the backstop,
-//! with no health check; see [`Publisher`]).
+//! with no health check; see [`Transport`]).
 //!
 //! Two dedup primitives, by message semantics:
 //! - quotes ([`StalenessFloor`]): a full-state BBO is a *snapshot*, but two distinct BBOs can share
@@ -246,10 +246,10 @@ impl BookGuardConfig {
     };
 }
 
-/// Which ingest source produced an update — the floor's per-tick leader identity. The edge
-/// multicast publishers are distinguished by their datagram source IP; the public WebSocket feed is
-/// a single logical source with no multicast IP. Two distinct edge publishers therefore race as
-/// distinct leaders, while the public feed always races as one [`Publisher::PublicWs`].
+/// Which ingest input produced an update — the floor's per-tick leader identity. The edge
+/// multicast publishers are distinguished by their datagram source IP address; the public WebSocket
+/// feed is a single logical input with no multicast IP. Two distinct edge publishers therefore race
+/// as distinct leaders, while the public feed always races as one [`Transport::PublicWs`].
 ///
 /// The backstop falls out of this: the edge publishers deliver each `source_ts` tick sub-millisecond
 /// while the public copy arrives tens of milliseconds later over the internet, so an edge publisher
@@ -257,21 +257,26 @@ impl BookGuardConfig {
 /// non-leader no-op. When the edge feed gaps, no edge publisher opens the next tick, so the public
 /// feed's sample is the first to cross the floor — it leads and fills in.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Publisher {
-    /// A DZ Edge multicast publisher, identified by its datagram source IP.
+pub enum Transport {
+    /// A DZ Edge multicast publisher, carrying its datagram source IP address.
+    ///
+    /// ⚠️ The address is **not** decoration and this variant cannot collapse to a unit: it is the
+    /// per-publisher identity every `path_ordinal`, both staleness floors and the single-path
+    /// authority gate key on. Without it every edge publisher would race as one leader and the
+    /// mirrored publishers could never be told apart.
     Edge(IpAddr),
-    /// The Hyperliquid public WebSocket feeder (a single logical source).
+    /// The Hyperliquid public WebSocket input (a single logical input).
     PublicWs,
 }
 
-impl Publisher {
+impl Transport {
     /// A stable, low-cardinality metric label for the source class. Deliberately collapses the
     /// edge publisher's source IP to `"edge"` — the per-IP identity matters to the floor but would
     /// blow up metric cardinality (and is spoofable), so it is never used as a label.
     pub fn label(self) -> &'static str {
         match self {
-            Publisher::Edge(_) => "edge",
-            Publisher::PublicWs => "public",
+            Transport::Edge(_) => "edge",
+            Transport::PublicWs => "public",
         }
     }
 }
@@ -610,7 +615,7 @@ struct Slot {
     /// publisher can match is what keeps the next larger claim challenged whichever path makes it —
     /// including the one whose batch discharged the re-baseline, which would otherwise re-assert its
     /// own stale size unopposed.
-    owner: Option<Publisher>,
+    owner: Option<Transport>,
 }
 
 impl Slot {
@@ -883,7 +888,7 @@ impl ChannelClock {
 #[derive(Default)]
 struct MarketEvents {
     /// Delivered events mapped to the publisher that delivered each first and when it arrived.
-    seen: HashMap<OrderEvent, (Publisher, u64)>,
+    seen: HashMap<OrderEvent, (Transport, u64)>,
     /// `seen` in delivery order, oldest first, for both bounds.
     order: VecDeque<OrderEvent>,
     /// Per order this market has published anything for, its [`Slot`].
@@ -939,7 +944,7 @@ impl MarketEvents {
     fn admit(
         &mut self,
         ev: OrderEvent,
-        publisher: Publisher,
+        publisher: Transport,
         arrival_ns: u64,
         source_ts: u64,
         window_ns: u64,
@@ -1009,7 +1014,7 @@ impl MarketEvents {
         &mut self,
         order_id: u64,
         size: f64,
-        by: Option<Publisher>,
+        by: Option<Transport>,
         last_ts: u64,
         budget: &mut GuardBudget,
     ) {
@@ -1340,7 +1345,7 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 
 /// The shared emit stage: owns the broadcast `Sender` plus the dedup state, and exposes one
 /// `emit(msg, publisher)` entry point every ingest source funnels through. Quotes pass through the
-/// per-`(venue, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Publisher`),
+/// per-`(venue, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Transport`),
 /// MBO `depth` through its own latch-to-leader floor (keyed on [`DepthId`] — but with no
 /// `source_ts == 0` bypass, see the `Depth` branch), trades through the [`WindowedDedup`] on `trade_id`,
 /// and everything else (`Instrument`/`Midpoint`/`Status`) is broadcast unchanged. Wrapped in
@@ -1356,8 +1361,8 @@ pub struct Arbiter {
     /// high-water — and 0, the "not available" sentinel, bypasses this floor entirely. Revisit if
     /// a venue with a session-scoped quote clock is ever added. The key `(venue, symbol)` is
     /// `Arc<str>` (venues interned via `model::venue_arc`), so building it allocates nothing.
-    quotes: StalenessFloor<(Arc<str>, Arc<str>), QuoteId, Publisher>,
-    trades: WindowedDedup<(Arc<str>, Arc<str>), u64, Publisher>,
+    quotes: StalenessFloor<(Arc<str>, Arc<str>), QuoteId, Transport>,
+    trades: WindowedDedup<(Arc<str>, Arc<str>), u64, Transport>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
@@ -1369,7 +1374,7 @@ pub struct Arbiter {
     /// self-heal (the floor stays latched) — so the MBO processor clears the affected entries on
     /// `EndOfSession` / `InstrumentReset` via [`Arbiter::reset_depth_floor_for_venue`] /
     /// [`Arbiter::reset_depth_floor_for_symbol`], the session-reset escape hatch.
-    depths: StalenessFloor<(Arc<str>, Arc<str>), DepthId, Publisher>,
+    depths: StalenessFloor<(Arc<str>, Arc<str>), DepthId, Transport>,
     /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
     /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
     /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
@@ -1412,7 +1417,7 @@ pub struct Arbiter {
     ///
     /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
-    no_id_owner: HashMap<(Arc<str>, Arc<str>), (Publisher, u64)>,
+    no_id_owner: HashMap<(Arc<str>, Arc<str>), (Transport, u64)>,
     /// Which **path** serves each `Sticky` universe's tape, keyed on `(venue, category)`. See
     /// [`Arbiter::tape_path_admits`]. One entry per `Sticky` universe that has ever printed.
     ///
@@ -1444,7 +1449,7 @@ pub struct Arbiter {
     /// Per order-level market, each publisher's standing (see [`PeerState`]). Bounded twice: evicted
     /// alongside `book_markets`, and the inner map only admits paths the authority already counts, so a
     /// spoofed-source flood cannot grow it.
-    book_sync: HashMap<MarketKey, HashMap<Publisher, PeerState>>,
+    book_sync: HashMap<MarketKey, HashMap<Transport, PeerState>>,
     /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
     book_events: HashMap<MarketKey, MarketEvents>,
     /// Per `(venue, category, channel)` venue clock — the frontier the resurrection guard admits and
@@ -1463,12 +1468,12 @@ pub struct Arbiter {
 
 /// Who serves one `Sticky` venue's trade tape, per [`Arbiter::tape_path_admits`].
 struct TapeLead {
-    path: Publisher,
+    path: Transport,
     /// That path's last admitted print, for the silence handover.
     last_ns: u64,
     /// The book election this tape has already deferred to, so the deferral fires once per election
     /// rather than on every print by the elected path.
-    honored_election: Option<Publisher>,
+    honored_election: Option<Transport>,
 }
 
 /// One publisher's standing for an order-level market: whether its book is in sync, and when it last
@@ -1492,7 +1497,7 @@ struct BookMarket {
     /// **Every** eligible path's accumulated book, not just the serving one. A transfer re-baselines
     /// the consumer against the new path's *current* levels, which exist only if its stream was folded
     /// in all along. Bounded by the caller's eligibility check (`StickyAuthority::tracks_path`).
-    paths: HashMap<Publisher, BookAccumulator>,
+    paths: HashMap<Transport, BookAccumulator>,
     /// Set when the serving path changed. The re-baseline then waits for that path to close a logical
     /// event, because a `to_book` of a half-applied one goes out stamped `last` as a torn book.
     rebaseline: bool,
@@ -1510,10 +1515,10 @@ struct BookMarket {
 /// market back from a health override follows either that or a recovery, so it is not attributable
 /// here and is deliberately left uncounted rather than mislabelled.
 fn transfer_reason(
-    prev: Option<Publisher>,
-    leader_before: Option<Publisher>,
-    leader_after: Option<Publisher>,
-    publisher: Publisher,
+    prev: Option<Transport>,
+    leader_before: Option<Transport>,
+    leader_after: Option<Transport>,
+    publisher: Transport,
 ) -> Option<&'static str> {
     if leader_before.is_none() {
         return Some("initial"); // the venue's first eligible path
@@ -1548,11 +1553,11 @@ fn clear_only(b: &NormalizedBook) -> NormalizedBook {
     }
 }
 
-/// Index of a [`Publisher`] class into the 2-wide `[edge, public]` metric arrays.
-fn pub_idx(p: Publisher) -> usize {
+/// Index of a [`Transport`] class into the 2-wide `[edge, public]` metric arrays.
+fn pub_idx(p: Transport) -> usize {
     match p {
-        Publisher::Edge(_) => 0,
-        Publisher::PublicWs => 1,
+        Transport::Edge(_) => 0,
+        Transport::PublicWs => 1,
     }
 }
 
@@ -1719,7 +1724,7 @@ impl Arbiter {
     /// Ineligible paths are ignored, exactly as [`StickyAuthority::admit`] ignores them: the report keys
     /// on a spoofable source IP, so without this a forged flood would both grow the map and mint an
     /// unbounded supply of peers whose claim suppresses a real publisher's re-baseline.
-    pub fn set_book_synced(&mut self, key: &MarketKey, publisher: Publisher, synced: bool) {
+    pub fn set_book_synced(&mut self, key: &MarketKey, publisher: Transport, synced: bool) {
         if self
             .books
             .path_ordinal(&(key.0.clone(), key.1.clone()), publisher)
@@ -1763,7 +1768,7 @@ impl Arbiter {
     /// a recovering path could wipe a book a healthy peer is serving. That is refused at startup —
     /// `registry::check_cross_row_invariants`, `SharedOrderBookCategory` — rather than left to be
     /// re-derived here, since whoever adds the second row will be reading `registry.json`.
-    pub fn forget_publisher_books(&mut self, category: &str, publisher: Publisher) {
+    pub fn forget_publisher_books(&mut self, category: &str, publisher: Transport) {
         for (key, paths) in self.book_sync.iter_mut() {
             if key.1.as_ref() == category {
                 paths.remove(&publisher);
@@ -1795,7 +1800,7 @@ impl Arbiter {
     /// Whether one path still claims a synced book for a market, so a test can assert a departure
     /// released it.
     #[cfg(test)]
-    pub(crate) fn book_path_synced(&self, key: &MarketKey, publisher: Publisher) -> bool {
+    pub(crate) fn book_path_synced(&self, key: &MarketKey, publisher: Transport) -> bool {
         self.book_sync
             .get(key)
             .and_then(|paths| paths.get(&publisher))
@@ -1808,7 +1813,7 @@ impl Arbiter {
     /// Health is a **per-market override** on the universe's authority: a path gapped on one market yields
     /// that market only, and takes it back on its own once the book recovers. Under incremental output
     /// a lost level does not self-heal until the next snapshot, so an unhealthy path must not serve.
-    pub fn set_book_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
+    pub fn set_book_health(&mut self, key: &MarketKey, publisher: Transport, healthy: bool) {
         self.books.set_health(key, publisher, healthy);
     }
 
@@ -1906,7 +1911,7 @@ impl Arbiter {
 
     /// Fold one path's batch into that path's own accumulator for `key`, admitting the market to the
     /// tracked set (evicting the oldest when it is full).
-    fn accumulate_book(&mut self, key: &MarketKey, publisher: Publisher, b: &NormalizedBook) {
+    fn accumulate_book(&mut self, key: &MarketKey, publisher: Transport, b: &NormalizedBook) {
         if !self.book_markets.contains_key(key) {
             self.track_book_market(key);
         }
@@ -1950,7 +1955,7 @@ impl Arbiter {
     /// only the levels that have moved since, so publishing it as `snapshot` would tell the consumer to
     /// discard every level it is missing. The caller degrades to a bare `clear`, which is incomplete
     /// but says so — and the replay entry carries the same flag, so the WS replay skips it too.
-    fn rebaseline_book(&mut self, key: &MarketKey, publisher: Publisher) -> Option<NormalizedBook> {
+    fn rebaseline_book(&mut self, key: &MarketKey, publisher: Transport) -> Option<NormalizedBook> {
         let acc = self
             .book_markets
             .get(key)
@@ -2122,7 +2127,7 @@ impl Arbiter {
     /// walk a consumer's order back to a size the venue has already reduced.
     ///
     /// A change with no order identity (`order_id == 0`) is un-collapsable and always published.
-    fn emit_order_level_book(&mut self, key: MarketKey, b: &NormalizedBook, publisher: Publisher) {
+    fn emit_order_level_book(&mut self, key: MarketKey, b: &NormalizedBook, publisher: Transport) {
         let now = now_mono_ns();
         if b.changes
             .first()
@@ -2410,7 +2415,7 @@ impl Arbiter {
         &mut self,
         key: &MarketKey,
         b: &NormalizedBook,
-        publisher: Publisher,
+        publisher: Transport,
         now: u64,
     ) {
         let seed_ts = self.channel_newest(key);
@@ -2464,7 +2469,7 @@ impl Arbiter {
         &mut self,
         key: &MarketKey,
         b: &NormalizedBook,
-        publisher: Publisher,
+        publisher: Transport,
         now: u64,
     ) -> bool {
         if let Some(m) = self.book_markets.get_mut(key) {
@@ -2533,7 +2538,7 @@ impl Arbiter {
         &mut self,
         key: &MarketKey,
         b: &NormalizedBook,
-        publisher: Publisher,
+        publisher: Transport,
         now: u64,
     ) {
         if !self.book_markets.contains_key(key) {
@@ -2621,8 +2626,8 @@ impl Arbiter {
     /// authority**: `observe_matched_lead` creates a path entry for whatever it is handed, so an
     /// untracked publisher (a peer feed row of the same universe, a forged source IP) would otherwise
     /// spend one of the universe's eight admission slots and could displace a real mirror path.
-    fn race_eligible(&self, scope: &ScopeKey, publisher: Publisher) -> bool {
-        matches!(publisher, Publisher::Edge(_)) && self.books.tracks_path(scope, publisher)
+    fn race_eligible(&self, scope: &ScopeKey, publisher: Transport) -> bool {
+        matches!(publisher, Transport::Edge(_)) && self.books.tracks_path(scope, publisher)
     }
 
     /// Whether this path currently serves a `Sticky` **universe**'s tape — one gate per
@@ -2680,12 +2685,12 @@ impl Arbiter {
     /// [`StickyAuthority`] was venue-wide they could name a path elected on a disjoint universe — a
     /// stranger to this tape — and hand it prints it never makes.
     ///
-    /// Applies to every publisher class uniformly, [`Publisher::PublicWs`] included; no `Sticky` venue
+    /// Applies to every publisher class uniformly, [`Transport::PublicWs`] included; no `Sticky` venue
     /// has a public backstop today, and adding one needs this revisited.
     fn tape_path_admits(
         &mut self,
         t: &NormalizedTrade,
-        publisher: Publisher,
+        publisher: Transport,
         category: &'static str,
     ) -> bool {
         // Interned, so the per-print key is two refcount bumps rather than an allocation. One key for
@@ -2728,7 +2733,7 @@ impl Arbiter {
 
     /// Claim the `(venue, symbol)` zero-id tape for `publisher`, returning whether a *concurrent*
     /// second emitter was detected. `Coordinated` venues only — see the `Trade` branch.
-    fn claim_no_id_tape(&mut self, t: &NormalizedTrade, publisher: Publisher) -> bool {
+    fn claim_no_id_tape(&mut self, t: &NormalizedTrade, publisher: Transport) -> bool {
         let key = (t.venue.clone(), t.symbol.clone());
         match self.no_id_owner.get_mut(&key) {
             // The owner printing again, or a challenger inheriting a tape that has gone quiet past
@@ -2754,7 +2759,7 @@ impl Arbiter {
     ///
     /// `scope` is the emitting row's `(venue, category)`: the election it feeds is per universe, so a
     /// lead measured between two of one universe's mirrors must not be filed against another's paths.
-    fn observe_trade_race(&mut self, scope: &ScopeKey, t: &NormalizedTrade, publisher: Publisher) {
+    fn observe_trade_race(&mut self, scope: &ScopeKey, t: &NormalizedTrade, publisher: Transport) {
         let Some(m) = self.race.on_trade(
             scope,
             &t.symbol,
@@ -2829,7 +2834,7 @@ impl Arbiter {
     ///
     /// Metric children are pre-resolved per venue (see [`VenueMetrics`]) so this per-message path
     /// increments a cached handle rather than doing a label-map lookup for each counter.
-    pub fn emit(&mut self, msg: FeedMessage, publisher: Publisher, category: &'static str) {
+    pub fn emit(&mut self, msg: FeedMessage, publisher: Transport, category: &'static str) {
         match &msg {
             FeedMessage::Quote(q) => {
                 // `source_ts == 0` is the "not available" sentinel (per CLAUDE.md, never a real
@@ -3354,7 +3359,7 @@ mod tests {
     /// source's own exact `(source_ts, content)` republish through the arbiter's emit path.
     #[test]
     fn arbiter_emit_drops_same_source_exact_repeat() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3381,7 +3386,7 @@ mod tests {
     /// the first to cross the floor and is emitted.
     #[test]
     fn arbiter_public_loses_to_edge_then_fills_gap() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         // Steady state: edge opens tick 1000, public's copy at the same tick is dropped.
@@ -3392,13 +3397,13 @@ mod tests {
         );
         a.emit(
             FeedMessage::Quote(quote(1000, 100.0, 101.0)),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         );
         // Edge gaps: the public feed opens the next tick and fills in.
         a.emit(
             FeedMessage::Quote(quote(1001, 100.2, 101.2)),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         );
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1001, 100.2)]);
@@ -3409,7 +3414,7 @@ mod tests {
     #[test]
     fn arbiter_trade_dedup_across_sources() {
         use crate::model::NormalizedTrade;
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |id: u64| {
             FeedMessage::Trade(NormalizedTrade {
                 venue: "HYPERLIQUID".into(),
@@ -3433,8 +3438,8 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(trade(7), edge, TEST_CATEGORY);
-        a.emit(trade(7), Publisher::PublicWs, TEST_CATEGORY); // same id from public -> dropped
-        a.emit(trade(8), Publisher::PublicWs, TEST_CATEGORY);
+        a.emit(trade(7), Transport::PublicWs, TEST_CATEGORY); // same id from public -> dropped
+        a.emit(trade(8), Transport::PublicWs, TEST_CATEGORY);
         let mut ids = Vec::new();
         while let Ok(m) = rx.try_recv() {
             if let FeedMessage::Trade(t) = &*m {
@@ -3472,7 +3477,7 @@ mod tests {
     fn zero_trade_id_bypasses_the_window() {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
-        let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let p = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         for _ in 0..5 {
             a.emit(FeedMessage::Trade(trade(0)), p, TEST_CATEGORY);
         }
@@ -3495,8 +3500,8 @@ mod tests {
             tr.venue = venue.into();
             (FeedMessage::Trade(tr), p)
         };
-        let a1 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let a2 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let a1 = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let a2 = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let conflicts = metrics().trades_no_id_conflict.with_label_values(&[venue]);
 
         let (tx, mut rx) = broadcast::channel(64);
@@ -3539,8 +3544,8 @@ mod tests {
             tr.recv_ts_ns = recv_ts_ns;
             (FeedMessage::Trade(tr), p)
         };
-        let a1 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let a2 = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let a1 = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let a2 = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let conflicts = metrics().trades_no_id_conflict.with_label_values(&[venue]);
 
         let (tx, _rx) = broadcast::channel(64);
@@ -3579,7 +3584,7 @@ mod tests {
     fn nonzero_trade_id_still_dedupes() {
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
-        let p = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let p = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         for _ in 0..5 {
             a.emit(FeedMessage::Trade(trade(77)), p, TEST_CATEGORY);
         }
@@ -3595,7 +3600,7 @@ mod tests {
     /// isolates the pure duplicate-packet case (no third distinct quote).
     #[test]
     fn duplicate_quote_packet_from_same_source_emitted_once() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3616,8 +3621,8 @@ mod tests {
     /// copy is a non-leader no-op. This is the cross-source duplicate-packet case.
     #[test]
     fn duplicate_quote_from_two_multicast_publishers_emitted_once() {
-        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3638,7 +3643,7 @@ mod tests {
     #[test]
     fn duplicate_trade_packet_from_same_source_emitted_once() {
         use crate::model::NormalizedTrade;
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = || {
             FeedMessage::Trade(NormalizedTrade {
                 venue: "HYPERLIQUID".into(),
@@ -3678,14 +3683,14 @@ mod tests {
     /// drop every real edge quote as stale until restart.)
     #[test]
     fn arbiter_future_timestamp_does_not_wedge_the_floor() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         let now = crate::model::now_ns();
         let bogus_future = now + 3_600_000_000_000; // 1h ahead -> rejected before touching the floor
         a.emit(
             FeedMessage::Quote(quote(bogus_future, 1.0, 2.0)),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         );
         // The real edge quote (at ~now) is not stale relative to the floor and still emits.
@@ -3701,7 +3706,7 @@ mod tests {
     /// latched, so it can't pin `high_water` at 0 and drop later quotes / non-leaders forever.
     #[test]
     fn arbiter_zero_source_ts_bypasses_floor() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3711,7 +3716,7 @@ mod tests {
         ); // bypass -> emitted, floor untouched
         a.emit(
             FeedMessage::Quote(quote(0, 100.5, 101.0)),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         ); // also bypass -> emitted
         a.emit(
@@ -3749,7 +3754,7 @@ mod tests {
     #[test]
     fn arbiter_emit_records_quote_contest_into_lead_histogram() {
         let venue = "ArbiterQuoteContestMetricTest";
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |source_ts: u64, recv: u64, bid: f64| {
             let mut q = quote(source_ts, bid, 101.0);
             q.venue = venue.into();
@@ -3761,7 +3766,7 @@ mod tests {
         // Edge opens tick 1000 arriving at t=100; the public copy at the same tick arrives at t=150
         // -> contest, edge led the public copy by 50ns.
         a.emit(mk(1000, 100, 100.0), edge, TEST_CATEGORY);
-        a.emit(mk(1000, 150, 100.5), Publisher::PublicWs, TEST_CATEGORY);
+        a.emit(mk(1000, 150, 100.5), Transport::PublicWs, TEST_CATEGORY);
 
         let m = metrics();
         let edge_beats_public = m
@@ -3796,8 +3801,8 @@ mod tests {
     #[test]
     fn arbiter_emit_separates_edge_mirror_race_from_public_margin() {
         let venue = "ArbiterMirrorRaceMetricTest";
-        let mirror_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let mirror_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let mirror_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let mirror_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let mk = |recv: u64, bid: f64| {
             let mut q = quote(1000, bid, 101.0);
             q.venue = venue.into();
@@ -3828,7 +3833,7 @@ mod tests {
     fn arbiter_emit_records_trade_contest_into_lead_histogram() {
         use crate::model::NormalizedTrade;
         let venue = "ArbiterTradeContestMetricTest";
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let trade = |recv: u64| {
             FeedMessage::Trade(NormalizedTrade {
                 venue: venue.into(),
@@ -3852,7 +3857,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(trade(100), edge, TEST_CATEGORY); // edge delivers id 7 first at t=100
-        a.emit(trade(175), Publisher::PublicWs, TEST_CATEGORY); // public's copy loses by 75ns
+        a.emit(trade(175), Transport::PublicWs, TEST_CATEGORY); // public's copy loses by 75ns
 
         let m = metrics();
         let edge_beats_public = m
@@ -3897,8 +3902,8 @@ mod tests {
     /// content-inclusive depth oracle never sees the duplicate `(0, [], [])`.
     #[test]
     fn arbiter_depth_empty_anchor_at_zero_collapses() {
-        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3926,8 +3931,8 @@ mod tests {
     /// divergent copy is never both-emitted). A new tick re-latches.
     #[test]
     fn arbiter_depth_latches_to_leader_within_tick() {
-        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3965,8 +3970,8 @@ mod tests {
     /// never goes backwards on the wire).
     #[test]
     fn arbiter_depth_stale_tick_dropped() {
-        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -3986,7 +3991,7 @@ mod tests {
     /// and wedge the symbol: it is rejected, and a later real depth still emits.
     #[test]
     fn arbiter_depth_future_timestamp_does_not_wedge_the_floor() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         let now = crate::model::now_ns();
@@ -4009,8 +4014,8 @@ mod tests {
     #[test]
     fn arbiter_emit_records_depth_contest_into_lead_histogram() {
         let venue = "ArbiterDepthContestMetricTest";
-        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let mk = |recv: u64, bid: f64| {
             let mut d = depth(1000, vec![[bid, 1.0]], vec![]);
             d.venue = venue.into();
@@ -4037,8 +4042,8 @@ mod tests {
     /// connecting mid-stream never bootstraps from a book that never crossed the floor.
     #[test]
     fn arbiter_depth_replay_records_leader_not_dropped_nonleader() {
-        let pub_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let pub_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);
@@ -4070,7 +4075,7 @@ mod tests {
     /// symbol reset purges exactly its key; the venue reset purges only that venue's entries.
     #[test]
     fn arbiter_depth_floor_reset_purges_replay_entries() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |venue: &str, symbol: &str| {
             let mut d = depth(1000, vec![[100.0, 1.0]], vec![]);
             d.venue = venue.into();
@@ -4118,7 +4123,7 @@ mod tests {
     #[test]
     fn arbiter_depth_session_reset_readmits_lower_tick() {
         let venue = "ArbiterDepthSessionResetTest";
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |ts: u64, bid: f64| {
             let mut d = depth(ts, vec![[bid, 1.0]], vec![]);
             d.venue = venue.into();
@@ -4154,7 +4159,7 @@ mod tests {
     /// still drops its stale ticks.
     #[test]
     fn arbiter_depth_session_reset_is_venue_scoped() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |venue: &str, ts: u64| {
             let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
             d.venue = venue.into();
@@ -4191,7 +4196,7 @@ mod tests {
     /// sibling symbol's floor stays latched.
     #[test]
     fn arbiter_depth_symbol_reset_clears_only_that_symbol() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |symbol: &str, ts: u64| {
             let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
             d.symbol = symbol.into();
@@ -4305,8 +4310,8 @@ mod tests {
     #[test]
     fn quote_tick_wins_count_once_per_tick_by_class() {
         let venue = "TickWonQuotes";
-        let edge_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -4326,12 +4331,12 @@ mod tests {
         ); // mirror copy: no count
         a.emit(
             FeedMessage::Quote(quote_at(venue, 1000, 100.0)),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         ); // late public copy: no count
         a.emit(
             FeedMessage::Quote(quote_at(venue, 2000, 101.0)),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         ); // public opens tick 2000
         a.emit(
@@ -4367,8 +4372,8 @@ mod tests {
             venue: venue.into(),
             ..depth(source_ts_ns, bids, vec![])
         };
-        let edge_a = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let edge_b = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let edge_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, _rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(
@@ -4388,7 +4393,7 @@ mod tests {
         ); // B opens tick 1000
         a.emit(
             FeedMessage::Depth(depth_at(2000, vec![[100.0, 2.0]])),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             TEST_CATEGORY,
         ); // public opens tick 2000
         let m = crate::metrics::metrics();
@@ -4417,11 +4422,11 @@ mod tests {
             ("public", "edge"),
             ("public", "public"),
         ];
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let public = Publisher::PublicWs;
-        let label = |p: Publisher| match p {
-            Publisher::Edge(_) => "edge",
-            Publisher::PublicWs => "public",
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let public = Transport::PublicWs;
+        let label = |p: Transport| match p {
+            Transport::Edge(_) => "edge",
+            Transport::PublicWs => "public",
         };
         for winner in [edge, public] {
             for loser in [edge, public] {
@@ -4475,8 +4480,8 @@ mod tests {
     /// re-emits at once.
     #[test]
     fn arbiter_collapses_duplicate_instrument_definitions() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        let peer = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let peer = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
@@ -4501,7 +4506,7 @@ mod tests {
     /// `InstrumentSnapshot` replay only covers clients at connect time.
     #[test]
     fn arbiter_reannounces_unchanged_instrument_after_the_interval() {
-        let edge = Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, 8);
         a.emit(instrument(1, "BTC", -2, -4), edge, TEST_CATEGORY);
@@ -4547,8 +4552,8 @@ mod tests {
         )
     }
 
-    fn path(n: u8) -> Publisher {
-        Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    fn path(n: u8) -> Transport {
+        Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
     fn bid(price: f64, size: f64) -> BookChange {
@@ -4605,7 +4610,7 @@ mod tests {
         a: &mut Arbiter,
         venue: &str,
         instrument_id: u32,
-        publisher: Publisher,
+        publisher: Transport,
         recv_ns: u64,
     ) {
         a.emit(
@@ -4639,7 +4644,7 @@ mod tests {
 
     /// Feed `n` matched trade pairs in which `fast` beats `slow` by 50us, through `emit` so the
     /// production call site is what supplies the election's evidence.
-    fn race_trades(a: &mut Arbiter, venue: &str, fast: Publisher, slow: Publisher, n: u64) {
+    fn race_trades(a: &mut Arbiter, venue: &str, fast: Transport, slow: Transport, n: u64) {
         for i in 0..n {
             let mut t = trade(i + 1);
             t.venue = venue.into();
@@ -5033,9 +5038,9 @@ mod tests {
     fn the_public_backstop_is_not_an_election_path() {
         let venue = "BookPublicNotAnPath";
         let (mut a, _rx) = gated(venue, sticky_cfg());
-        race_trades(&mut a, venue, Publisher::PublicWs, path(1), 20);
+        race_trades(&mut a, venue, Transport::PublicWs, path(1), 20);
         a.close_authority_windows();
-        assert!(!a.books.tracks_path(&bscope(venue), Publisher::PublicWs));
+        assert!(!a.books.tracks_path(&bscope(venue), Transport::PublicWs));
         assert_eq!(a.books.scope_leader(&bscope(venue)), Some(path(1)));
     }
 
@@ -5097,7 +5102,7 @@ mod tests {
     }
 
     /// One print from `path` for `venue`, at `recv_ts_ns`.
-    fn tape_print(a: &mut Arbiter, venue: &str, p: Publisher, id: u64, recv_ts_ns: u64) {
+    fn tape_print(a: &mut Arbiter, venue: &str, p: Transport, id: u64, recv_ts_ns: u64) {
         let mut t = trade(id);
         t.venue = venue.into();
         t.recv_ts_ns = recv_ts_ns;
@@ -5275,7 +5280,7 @@ mod tests {
         a: &mut Arbiter,
         venue: &str,
         category: &'static str,
-        p: Publisher,
+        p: Transport,
         id: u64,
         recv_ts_ns: u64,
     ) -> bool {
@@ -5716,7 +5721,7 @@ mod tests {
         /// change which market a later eviction drops.
         order: Vec<MarketKey>,
         /// `StickyAuthority::last_admitted` per seeded key.
-        admitted: Vec<(MarketKey, Option<Publisher>)>,
+        admitted: Vec<(MarketKey, Option<Transport>)>,
         /// The replay entry per seeded key: present-and-`baselined`, present-and-not, or absent.
         replay: Vec<(MarketKey, Option<bool>)>,
         /// Total entries in the replay map (a leaked entry from a market that should have been
@@ -5943,7 +5948,7 @@ mod tests {
     /// registered as synced exactly as the Market-by-Order processor reports them.
     fn racing(
         venue: &'static str,
-        paths: &[Publisher],
+        paths: &[Transport],
     ) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>) {
         let (tx, rx) = broadcast::channel(1024);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
@@ -7325,7 +7330,7 @@ mod tests {
             a.set_book_dedup_window(1_000_000_000);
             let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
             // (arrival, the venue's own stamp — identical on both paths' copies, path).
-            let mut arrivals: Vec<(u64, u64, Publisher)> = Vec::new();
+            let mut arrivals: Vec<(u64, u64, Transport)> = Vec::new();
             for i in 0..REMOVALS {
                 let t = 1_000 + i * SPACING_NS;
                 arrivals.push((t, t, path(1)));

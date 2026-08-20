@@ -351,7 +351,7 @@ Modules are grouped by role under `src/`:
   never-binding receiver would otherwise flap `status` on every reconciler respawn) and deregisters
   on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
   ticking when market data is wedged). `FrameCtx` carries the shared `arbiter` (not a raw `tx`);
-  `ctx.emit(msg)` routes through it tagged `Publisher::Edge(src_ip)`.
+  `ctx.emit(msg)` routes through it tagged `Transport::Edge(src_ip)`.
 - **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
   universes),
@@ -365,7 +365,7 @@ Modules are grouped by role under `src/`:
 - **`ingest/arbiter.rs`** — the shared **pre-broadcast emit stage** every ingest source funnels
   through. `Arbiter` owns the broadcast `Sender` plus the dedup state — the per-`(venue, symbol)`
   latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the canonical BBO fixed-point, with
-  the `Publisher` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
+  the `Transport` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
   (keyed on `DepthId`, the top-N book content at canonical `10^-8` fixed-point; both ids use `i128`
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher, category)` (quotes → quote
@@ -376,7 +376,7 @@ Modules are grouped by role under `src/`:
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
   broadcast as `Arc<FeedMessage>` (a per-subscriber delivery is a refcount bump, not a deep clone).
   Every path returns an
-  `Admit<Publisher>`: `Emitted{opened_tick}` broadcasts and bumps the admitted/winner counter —
+  `Admit<Transport>`: `Emitted{opened_tick}` broadcasts and bumps the admitted/winner counter —
   plus, when the sample *opened* its `source_ts` tick, the once-per-tick
   `dz_quote_ticks_won_total`/`dz_depth_ticks_won_total` (the published win-rate primitive:
   `edge/sum`; every tick scores exactly once, walkovers included — see docs/metrics.md) —
@@ -616,7 +616,7 @@ Modules are grouped by role under `src/`:
   Connects `wss://api.hyperliquid.xyz/ws` over TLS, subscribes `bbo` + `trades` per coin on one
   connection, decodes the HL JSON → `FeedMessage`, scales the public block time (ms) to ns so it
   shares the **same canonical `source_ts`** as the edge copy, and emits through the shared arbiter as
-  `Publisher::PublicWs`. Gates each emission on the `(venue, symbol)` instrument being known in the
+  `Transport::PublicWs`. Gates each emission on the `(venue, symbol)` instrument being known in the
   shared snapshot (precision before price, supplied by edge refdata). Backstop behavior falls out of
   the floor: edge leads each tick in steady state (public copy dropped as a no-op), public fills in on
   an edge gap — no health check.
@@ -625,7 +625,7 @@ Modules are grouped by role under `src/`:
   quote backstop). Subscribes Phoenix's public `trades` channel per market; Phoenix names each market
   with the **same bare ticker on the edge and public feeds** (edge `instrument_id == public assetId`),
   so the wire symbol is used verbatim — no mapping. Derives the trade price as `quoteAmount /
-  baseAmount` and emits `NormalizedTrade`s as `Publisher::PublicWs` keyed on `trade_id` = the public
+  baseAmount` and emits `NormalizedTrade`s as `Transport::PublicWs` keyed on `trade_id` = the public
   `tradeSequenceNumber` (the arbiter's windowed trade dedup races them). Validated against a live
   edge+public capture (2026-06-30): `trade_id == tradeSequenceNumber` on 257/257 shared fills and
   `side` maps `bid->buy`/`ask->sell`. No `FEEDS` row depends on it (off until enabled).

@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher},
+        arbiter::{lock, Transport},
         authority::MarketKey,
         book::{BookState, DeltaKind, DeltaOp, Level, OrderChange},
         codec::{apply_exponent, decode_frame, InstrumentDefinition, Message},
@@ -1362,7 +1362,7 @@ impl MboProcessor {
             return;
         };
         self.synced_reported.insert(key, synced);
-        lock(ctx.arbiter).set_book_synced(&market, Publisher::Edge(key.0), synced);
+        lock(ctx.arbiter).set_book_synced(&market, Transport::Edge(key.0), synced);
     }
 
     /// Emit the order-level `book` for one instrument — the real L3 product, carrying the venue's own
@@ -2300,7 +2300,7 @@ impl MbpProcessor {
             ctx.canonical_channel(key.1),
             key.2,
         );
-        lock(ctx.arbiter).set_book_health(&market, Publisher::Edge(key.0), healthy);
+        lock(ctx.arbiter).set_book_health(&market, Transport::Edge(key.0), healthy);
     }
 
     /// §4.9: discard everything a `Reset Count` change invalidated for one `(publisher, channel)` —
@@ -3037,7 +3037,7 @@ mod tests {
     };
     use crate::{
         ingest::{
-            arbiter::{lock, Arbiter, Publisher, SharedArbiter},
+            arbiter::{lock, Arbiter, SharedArbiter, Transport},
             codec_mbo::{
                 tests::{
                     enc_end_of_session, enc_instrument_reset, enc_order_add, enc_order_cancel,
@@ -6912,7 +6912,7 @@ mod tests {
             3u32,
             41u32,
         );
-        let path = Publisher::Edge(TEST_PUB);
+        let path = Transport::Edge(TEST_PUB);
         let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, path);
 
         proc.on_datagram(
@@ -7184,7 +7184,7 @@ mod tests {
                     0u32,
                     0u32,
                 ),
-                Publisher::Edge(TEST_PUB)
+                Transport::Edge(TEST_PUB)
             ),
             "an evicted book leaves its market unhealthy for this path"
         );
@@ -7629,7 +7629,7 @@ mod tests {
             0,
         );
         assert!(
-            lock(&arbiter).book_path_synced(&market, Publisher::Edge(pub_b)),
+            lock(&arbiter).book_path_synced(&market, Transport::Edge(pub_b)),
             "B's path must be synced before the session ends"
         );
 
@@ -7637,8 +7637,8 @@ mod tests {
             &frame(&[enc_end_of_session(6_000)]),
             &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
         );
-        let a = lock(&arbiter).book_path_synced(&market, Publisher::Edge(pub_a));
-        let b = lock(&arbiter).book_path_synced(&market, Publisher::Edge(pub_b));
+        let a = lock(&arbiter).book_path_synced(&market, Transport::Edge(pub_a));
+        let b = lock(&arbiter).book_path_synced(&market, Transport::Edge(pub_b));
         assert!(
             !a && !b,
             "both books dropped to Recovering, so both paths must say so (a={a}, b={b})"
@@ -7744,7 +7744,7 @@ mod tests {
             0,
             0,
         );
-        assert!(lock(&arbiter).book_path_synced(&market, Publisher::Edge(victim)));
+        assert!(lock(&arbiter).book_path_synced(&market, Transport::Edge(victim)));
 
         // Fill the per-publisher reference-data map past its cap; the victim was inserted first, so
         // it is the one evicted.
@@ -7756,7 +7756,7 @@ mod tests {
             );
         }
         assert!(
-            !lock(&arbiter).book_path_synced(&market, Publisher::Edge(victim)),
+            !lock(&arbiter).book_path_synced(&market, Transport::Edge(victim)),
             "an evicted publisher's serving claim must go with its reference data"
         );
         assert!(

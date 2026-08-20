@@ -21,7 +21,7 @@
 //! leader silence and a leader streaming its own universe is never silent. The symptom is a universe
 //! whose books simply never appear, behind a `dz_book_dropped_total` that looks exactly like a
 //! healthy mirror losing a race it was supposed to lose. It is latent only while both universes
-//! publish from the same hosts, which resolves them to one [`Publisher`] and lets nothing contest.
+//! publish from the same hosts, which resolves them to one [`Transport`] and lets nothing contest.
 //!
 //! The category rides in on [`MarketKey`] rather than on the wire: it is a property of the feed
 //! *row*, and the wire types are the WebSocket contract PROTOCOL.md fixes for consumers, which have
@@ -54,7 +54,7 @@
 //!
 //! # Bounding
 //!
-//! The multicast source is unauthenticated and a [`Publisher`] is a spoofable source IP, so **only
+//! The multicast source is unauthenticated and a [`Transport`] is a spoofable source IP, so **only
 //! paths holding a metric ordinal are eligible**: past [`MAX_LABELLED_PATHS`] a publisher is neither
 //! recorded nor ever authoritative. The cap that existed to bound the metric label set bounds
 //! admission too, which keeps the per-path state from growing under a forged flood. Real deployments
@@ -75,7 +75,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::ingest::arbiter::{Admit, Publisher};
+use crate::ingest::arbiter::{Admit, Transport};
 
 /// The arbitration scope: a venue's Source ID plus the instrument **universe** within it
 /// (`ingest::feeds::Feed::category`). One election, one path numbering and one silence clock per
@@ -161,8 +161,8 @@ struct Path {
 
 /// Per-scope authority: one leader, one path set, one sampling window per `(venue, category)`.
 struct ScopeState {
-    leader: Publisher,
-    paths: HashMap<Publisher, Path>,
+    leader: Transport,
+    paths: HashMap<Transport, Path>,
     window_opened_ns: u64,
 }
 
@@ -170,7 +170,7 @@ impl ScopeState {
     /// Hand the scope to `leader`. Every sample in the open window was measured against the outgoing
     /// leader, so a handover always starts a new window — judging a new leader on its predecessor's
     /// evidence is how a transfer gets undone at the next close.
-    fn take_authority(&mut self, leader: Publisher, arrival_ns: u64) {
+    fn take_authority(&mut self, leader: Transport, arrival_ns: u64) {
         self.leader = leader;
         self.window_opened_ns = arrival_ns;
         for path in self.paths.values_mut() {
@@ -184,10 +184,10 @@ impl ScopeState {
 struct MarketState {
     /// Paths known unhealthy here (`gap`/`awaiting-snapshot`). Absent means healthy, so a market whose
     /// processor does not report health still gets served.
-    unhealthy: HashSet<Publisher>,
+    unhealthy: HashSet<Transport>,
     /// Who was last admitted here, so `opened_tick` marks a real change of served path rather than
     /// every leader message.
-    last_admitted: Option<Publisher>,
+    last_admitted: Option<Transport>,
 }
 
 pub struct StickyAuthority {
@@ -202,9 +202,9 @@ pub struct StickyAuthority {
     market_order: VecDeque<MarketKey>,
     /// Path ordinals per scope, for the same reason `scopes` is: an ordinal names one of a universe's
     /// mirrors, and two universes' publishers are not each other's mirrors. Nested rather than keyed
-    /// on `(ScopeKey, Publisher)` so the per-message lookup borrows the scope instead of building a
+    /// on `(ScopeKey, Transport)` so the per-message lookup borrows the scope instead of building a
     /// composite key.
-    ordinals: HashMap<ScopeKey, HashMap<Publisher, &'static str>>,
+    ordinals: HashMap<ScopeKey, HashMap<Transport, &'static str>>,
     cfg: AuthorityConfig,
 }
 
@@ -244,7 +244,7 @@ impl StickyAuthority {
 
     /// Record a path's book health for one market. `false` means `gap`/`awaiting-snapshot`; the
     /// processor calls this on every state transition.
-    pub fn set_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
+    pub fn set_health(&mut self, key: &MarketKey, publisher: Transport, healthy: bool) {
         // Same eligibility bound as `admit`: an ineligible path (past the labelled cap — the source IP
         // is spoofable) is never authoritative, so it must not enter per-market state either.
         if self.path_ordinal(&scope_of(key), publisher) == OTHER_PATH {
@@ -258,7 +258,7 @@ impl StickyAuthority {
         }
     }
 
-    pub(crate) fn healthy(&self, key: &MarketKey, publisher: Publisher) -> bool {
+    pub(crate) fn healthy(&self, key: &MarketKey, publisher: Transport) -> bool {
         self.markets
             .get(key)
             .is_none_or(|m| !m.unhealthy.contains(&publisher))
@@ -272,9 +272,9 @@ impl StickyAuthority {
     pub fn admit(
         &mut self,
         key: MarketKey,
-        publisher: Publisher,
+        publisher: Transport,
         arrival_ns: u64,
-    ) -> Admit<Publisher> {
+    ) -> Admit<Transport> {
         let scope = scope_of(&key);
         // Ineligible paths enter no map and are never authoritative (see the module doc).
         if self.path_ordinal(&scope, publisher) == OTHER_PATH {
@@ -324,7 +324,7 @@ impl StickyAuthority {
 
     /// Force a scope's authority, returning whether it moved. The margin path; silence goes through
     /// [`Self::admit`] and health is an override rather than a transfer.
-    pub fn transfer_scope_to(&mut self, scope: &ScopeKey, to: Publisher, at_ns: u64) -> bool {
+    pub fn transfer_scope_to(&mut self, scope: &ScopeKey, to: Transport, at_ns: u64) -> bool {
         match self.scopes.get_mut(scope) {
             Some(v) if v.leader != to => {
                 v.take_authority(to, at_ns);
@@ -342,7 +342,7 @@ impl StickyAuthority {
     /// of one venue. That is the point: an ordinal identifies one of a universe's *mirrors*, and a
     /// numbering shared across universes would have labelled two unrelated publishers as one path in
     /// the very metrics that diagnose a path going dark.
-    pub fn path_ordinal(&mut self, scope: &ScopeKey, publisher: Publisher) -> &'static str {
+    pub fn path_ordinal(&mut self, scope: &ScopeKey, publisher: Transport) -> &'static str {
         if let Some(&label) = self.ordinals.get(scope).and_then(|m| m.get(&publisher)) {
             return label;
         }
@@ -365,7 +365,7 @@ impl StickyAuthority {
     /// must only be reached from a path that has applied the eligibility rule. A metric label is not
     /// one: a publisher can reach the counters without ever having been admitted, and registering it
     /// there would spend the scope's admission budget on a source that never serves a book.
-    pub fn path_label(&self, scope: &ScopeKey, publisher: Publisher) -> &'static str {
+    pub fn path_label(&self, scope: &ScopeKey, publisher: Transport) -> &'static str {
         self.ordinals
             .get(scope)
             .and_then(|m| m.get(&publisher))
@@ -379,7 +379,7 @@ impl StickyAuthority {
     /// rather than `HashMap`-order dependent, so a host publishing two universes reports one stable
     /// label instead of alternating between them. Every other metrics path is scope-keyed and uses
     /// [`Self::path_label`].
-    pub fn path_label_in_venue(&self, venue: &str, publisher: Publisher) -> &'static str {
+    pub fn path_label_in_venue(&self, venue: &str, publisher: Transport) -> &'static str {
         self.ordinals
             .iter()
             .filter(|((v, _), _)| v.as_ref() == venue)
@@ -391,7 +391,7 @@ impl StickyAuthority {
     }
 
     /// The scope-wide leader, before any per-market health override.
-    pub fn scope_leader(&self, scope: &ScopeKey) -> Option<Publisher> {
+    pub fn scope_leader(&self, scope: &ScopeKey) -> Option<Transport> {
         self.scopes.get(scope).map(|v| v.leader)
     }
 
@@ -400,7 +400,7 @@ impl StickyAuthority {
     ///
     /// The alternative is chosen by most-recently-live rather than by map order, so two paths cannot
     /// be picked differently on two calls with the same state.
-    fn serving(&self, key: &MarketKey) -> Option<Publisher> {
+    fn serving(&self, key: &MarketKey) -> Option<Transport> {
         let scope = scope_of(key);
         let leader = self.scope_leader(&scope)?;
         if self.healthy(key, leader) {
@@ -419,14 +419,14 @@ impl StickyAuthority {
     }
 
     /// The path actually serving one market — its scope's leader, or a healthy path overriding it.
-    pub fn leader_of(&self, key: &MarketKey) -> Option<Publisher> {
+    pub fn leader_of(&self, key: &MarketKey) -> Option<Transport> {
         self.serving(key)
     }
 
     /// Whether `scope` has recorded `path` at all — true exactly for the paths [`Self::admit`] found
     /// eligible, so a caller can bound its own per-path state on the same rule without paying for (or
     /// re-deriving) the ordinal.
-    pub fn tracks_path(&self, scope: &ScopeKey, path: Publisher) -> bool {
+    pub fn tracks_path(&self, scope: &ScopeKey, path: Transport) -> bool {
         self.scopes
             .get(scope)
             .is_some_and(|v| v.paths.contains_key(&path))
@@ -434,7 +434,7 @@ impl StickyAuthority {
 
     /// The path last admitted for one market — who the consumer's book state came from. A change of
     /// this across an [`Self::admit`] is what obliges the caller to re-baseline that market.
-    pub fn last_admitted(&self, key: &MarketKey) -> Option<Publisher> {
+    pub fn last_admitted(&self, key: &MarketKey) -> Option<Transport> {
         self.markets.get(key)?.last_admitted
     }
 
@@ -448,8 +448,8 @@ impl StickyAuthority {
     ///
     /// **O(markets + paths)**, resolving each market's serving path exactly once: the metrics tick runs
     /// this under the shared arbiter lock, so a per-path rescan of every market would stall ingest.
-    pub fn markets_held_all(&self) -> Vec<(Arc<str>, Publisher, usize)> {
-        let mut held: HashMap<(Arc<str>, Publisher), usize> = self
+    pub fn markets_held_all(&self) -> Vec<(Arc<str>, Transport, usize)> {
+        let mut held: HashMap<(Arc<str>, Transport), usize> = self
             .scopes
             .iter()
             .flat_map(|((venue, _), v)| v.paths.keys().map(|&a| ((venue.clone(), a), 0)))
@@ -478,7 +478,7 @@ impl StickyAuthority {
     /// Never derive this from `Admit::Contest`'s `lead_ns`: that is inter-path *phase* — the interval
     /// to the leader's previous, unrelated message — and is structurally non-negative, so a
     /// challenger could never win.
-    pub fn observe_matched_lead(&mut self, scope: &ScopeKey, path: Publisher, lead_ns: i64) {
+    pub fn observe_matched_lead(&mut self, scope: &ScopeKey, path: Transport, lead_ns: i64) {
         // Eligibility first, so an entry created here is bounded exactly as `admit`'s is.
         if self.path_ordinal(scope, path) == OTHER_PATH {
             return;
@@ -501,7 +501,7 @@ impl StickyAuthority {
     /// Close every elapsed sampling window, transferring a scope's authority where a challenger
     /// cleared every condition. Returns the scopes that moved, so the caller counts
     /// `dz_path_authority_transfers_total{reason="margin"}`. `now_ns` is on [`Self::admit`]'s clock.
-    pub fn close_window(&mut self, now_ns: u64) -> Vec<(ScopeKey, Publisher)> {
+    pub fn close_window(&mut self, now_ns: u64) -> Vec<(ScopeKey, Transport)> {
         // Saturate rather than cast: a `transfer_margin_ns` past `i64::MAX` would wrap negative and
         // invert both conditions, making every window transfer.
         let margin = i64::try_from(self.cfg.transfer_margin_ns).unwrap_or(i64::MAX);
@@ -531,12 +531,12 @@ impl StickyAuthority {
 /// `transfer_win_rate` of its own samples AND supplied at least `min_window_samples` of them.
 /// `None` when none cleared all three — the ordinary case, and why authority is sticky.
 fn best_challenger(
-    paths: &HashMap<Publisher, Path>,
-    leader: Publisher,
+    paths: &HashMap<Transport, Path>,
+    leader: Transport,
     margin: i64,
     cfg: &AuthorityConfig,
-) -> Option<Publisher> {
-    let mut best: Option<(Publisher, i64)> = None;
+) -> Option<Transport> {
+    let mut best: Option<(Transport, i64)> = None;
     for (&p, path) in paths {
         if p == leader || path.samples.len() < cfg.min_window_samples.max(1) {
             continue;
@@ -563,8 +563,8 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn path(n: u8) -> Publisher {
-        Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    fn path(n: u8) -> Transport {
+        Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
     const VENUE: &str = "KALSHI";
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(held(&a, path(2)), 1);
     }
 
-    fn held(a: &StickyAuthority, publisher: Publisher) -> usize {
+    fn held(a: &StickyAuthority, publisher: Transport) -> usize {
         a.markets_held_all()
             .into_iter()
             .find(|(v, p, _)| v.as_ref() == VENUE && *p == publisher)

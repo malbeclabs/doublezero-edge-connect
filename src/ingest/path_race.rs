@@ -55,7 +55,7 @@ use std::{
 };
 
 use crate::{
-    ingest::{arbiter::Publisher, authority::ScopeKey},
+    ingest::{arbiter::Transport, authority::ScopeKey},
     model::Side,
 };
 
@@ -81,7 +81,7 @@ struct Signature {
 /// One path's unmatched arrival.
 #[derive(Debug, Clone, Copy)]
 struct Arrival {
-    path: Publisher,
+    path: Transport,
     recv_ns: u64,
 }
 
@@ -90,9 +90,9 @@ struct Arrival {
 pub struct Match {
     pub scope: ScopeKey,
     /// The path that delivered it first.
-    pub first: Publisher,
+    pub first: Transport,
     /// The path that delivered the same trade second.
-    pub second: Publisher,
+    pub second: Transport,
     /// How far ahead `first` was, on our receive clock. Always non-negative.
     pub delta_ns: u64,
 }
@@ -105,7 +105,7 @@ impl Match {
     /// The sign lives here, in one tested place, deliberately: getting it backwards is exactly what
     /// made the first version of this election silently inert. `None` when the leader was not one of
     /// the two paths in the pair, which is not evidence about it either way.
-    pub fn lead_for(&self, leader: Publisher) -> Option<(Publisher, i64)> {
+    pub fn lead_for(&self, leader: Transport) -> Option<(Transport, i64)> {
         let delta = i64::try_from(self.delta_ns).unwrap_or(i64::MAX);
         if leader == self.second {
             Some((self.first, -delta)) // the challenger arrived first: it led
@@ -131,7 +131,7 @@ const MAX_PENDING: usize = 1 << 16;
 /// arbiter lock, so one path repeating one signature must not be able to lengthen it.
 const MAX_PER_SIGNATURE: usize = 8;
 
-/// Cap on distinct `(scope, path)` counter keys. A [`Publisher`] is a spoofable source IP, so past the
+/// Cap on distinct `(scope, path)` counter keys. A [`Transport`] is a spoofable source IP, so past the
 /// cap a new key is refused rather than grown into.
 const MAX_UNMATCHED_KEYS: usize = 1024;
 
@@ -146,7 +146,7 @@ pub struct PathRace {
     live: usize,
     /// Window evictions since the last drain. Only those: the cap paths are overload, not a one-sided
     /// print, and merging them would blur what the counter means.
-    unmatched: HashMap<(ScopeKey, Publisher), u64>,
+    unmatched: HashMap<(ScopeKey, Transport), u64>,
 }
 
 impl Default for PathRace {
@@ -182,7 +182,7 @@ impl PathRace {
         price: f64,
         size: f64,
         aggressor: Side,
-        path: Publisher,
+        path: Transport,
         recv_ns: u64,
     ) -> Option<Match> {
         self.evict_stale(recv_ns);
@@ -222,14 +222,14 @@ impl PathRace {
     /// Take the per-`(scope, path)` window-eviction counts accumulated since the last drain — the
     /// "seen only on this path" signal, which is a drop or a genuine one-sided print. Accumulated
     /// rather than returned by [`Self::evict_stale`], which [`Self::on_trade`] calls mid-burst.
-    pub fn drain_unmatched(&mut self) -> Vec<((ScopeKey, Publisher), u64)> {
+    pub fn drain_unmatched(&mut self) -> Vec<((ScopeKey, Transport), u64)> {
         std::mem::take(&mut self.unmatched).into_iter().collect()
     }
 
     /// Drop arrivals older than the window, returning how many were dropped per path and adding them
     /// to the [`Self::drain_unmatched`] accumulator.
-    pub fn evict_stale(&mut self, now_ns: u64) -> Vec<(Publisher, usize)> {
-        let mut dropped: HashMap<Publisher, usize> = HashMap::new();
+    pub fn evict_stale(&mut self, now_ns: u64) -> Vec<(Transport, usize)> {
+        let mut dropped: HashMap<Transport, usize> = HashMap::new();
         while let Some((sig, at)) = self.order.front() {
             if now_ns.saturating_sub(*at) <= self.window_ns {
                 break;
@@ -244,7 +244,7 @@ impl PathRace {
         dropped.into_iter().collect()
     }
 
-    fn record_unmatched(&mut self, scope: &ScopeKey, path: Publisher) {
+    fn record_unmatched(&mut self, scope: &ScopeKey, path: Transport) {
         let key = (scope.clone(), path);
         if let Some(n) = self.unmatched.get_mut(&key) {
             *n += 1;
@@ -273,7 +273,7 @@ impl PathRace {
     }
 
     /// Remove the queued arrival matching `(sig, at)`, returning its path if it was still there.
-    fn drop_arrival(&mut self, sig: &Signature, at: u64) -> Option<Publisher> {
+    fn drop_arrival(&mut self, sig: &Signature, at: u64) -> Option<Transport> {
         let q = self.pending.get_mut(sig)?;
         let i = q.iter().position(|a| a.recv_ns == at)?;
         let path = q.remove(i)?.path;
@@ -290,13 +290,13 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn path(n: u8) -> Publisher {
-        Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+    fn path(n: u8) -> Transport {
+        Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
     /// Distinct paths past a single octet, for the counter-map cap.
-    fn path_n(n: usize) -> Publisher {
-        Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, (n >> 8) as u8, n as u8)))
+    fn path_n(n: usize) -> Transport {
+        Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, (n >> 8) as u8, n as u8)))
     }
 
     fn sym() -> Arc<str> {
@@ -321,7 +321,7 @@ mod tests {
         (PathRace::new(1_000_000_000), scope())
     }
 
-    fn trade(r: &mut PathRace, v: &ScopeKey, a: Publisher, recv_ns: u64) -> Option<Match> {
+    fn trade(r: &mut PathRace, v: &ScopeKey, a: Transport, recv_ns: u64) -> Option<Match> {
         r.on_trade(v, &sym(), 6_200.0, 150.0, Side::Buy, a, recv_ns)
     }
 

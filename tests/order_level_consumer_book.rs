@@ -10,7 +10,7 @@
 
 use doublezero_edge_connect::{
     ingest::{
-        arbiter::{Arbiter, BookGuardConfig, Publisher, TRADE_DEDUP_WINDOW},
+        arbiter::{Arbiter, BookGuardConfig, Transport, TRADE_DEDUP_WINDOW},
         feeds::ArbitrationMode,
     },
     model::{
@@ -36,8 +36,8 @@ const DEDUP_WINDOW_NS: u64 = 1_000;
 /// One order's resting state: which side, at what price, in what quantity.
 type Book = BTreeMap<u64, (BookSide, f64, f64)>;
 
-fn path(n: u8) -> Publisher {
-    Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+fn path(n: u8) -> Transport {
+    Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
 }
 
 fn change(order_id: u64, side: BookSide, price: f64, size: f64) -> BookChange {
@@ -364,8 +364,8 @@ const RETENTION_NS: u64 = 30_000_000_000;
 fn harness() -> (
     Arbiter,
     broadcast::Receiver<Arc<FeedMessage>>,
-    Publisher,
-    Publisher,
+    Transport,
+    Transport,
 ) {
     harness_over(&[INSTRUMENT])
 }
@@ -377,8 +377,8 @@ fn harness_over(
 ) -> (
     Arbiter,
     broadcast::Receiver<Arc<FeedMessage>>,
-    Publisher,
-    Publisher,
+    Transport,
+    Transport,
 ) {
     let (tx, rx) = broadcast::channel(4096);
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
@@ -835,7 +835,7 @@ fn arrival_lagged_stream(
 
     // (arrival, the venue's own stamp — identical on both paths' copies, path, change, and the venue
     // event the leader's copy advances; `None` on the trailer's, which advances nothing).
-    let mut arrivals: Vec<(u64, u64, Publisher, BookChange, Option<Event>)> = Vec::new();
+    let mut arrivals: Vec<(u64, u64, Transport, BookChange, Option<Event>)> = Vec::new();
     for (i, &e) in events.iter().enumerate() {
         let t = 1_000 + i as u64 * spacing_ns;
         arrivals.push((t, t, leader, ev_change(e), Some(e)));

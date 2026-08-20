@@ -3,7 +3,7 @@
 //!
 //! It connects to Hyperliquid's own `wss://api.hyperliquid.xyz/ws`, subscribes `bbo` + `trades` per
 //! configured coin, decodes the JSON into the same `FeedMessage`s the multicast pipeline produces,
-//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. The
+//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. The
 //! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_feeder`];
 //! this module owns only the Hyperliquid wire decode.
 //!
@@ -21,7 +21,7 @@ use tracing::warn;
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
+        arbiter::{lock, SharedArbiter, Transport},
         public_feeder::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
@@ -251,7 +251,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         .ws_feeder_messages
         .with_label_values(&[hl_venue(), "quote"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs, HL_CATEGORY);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Transport::PublicWs, HL_CATEGORY);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
@@ -295,7 +295,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         .ws_feeder_messages
         .with_label_values(&[hl_venue(), "trade"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs, HL_CATEGORY);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Transport::PublicWs, HL_CATEGORY);
 }
 
 #[cfg(test)]

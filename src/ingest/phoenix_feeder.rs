@@ -3,7 +3,7 @@
 //!
 //! It connects to Phoenix's public `wss://perp-api.phoenix.trade/v1/ws`, subscribes the `trades`
 //! channel per configured market, decodes each fill into a `NormalizedTrade`, and emits it through
-//! the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. The arbiter dedups trades
+//! the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. The arbiter dedups trades
 //! per `(venue, symbol)` on `trade_id` (= the public `tradeSequenceNumber`), so a public trade races
 //! the edge copy and only fills in when the edge gaps — no arbiter change needed.
 //!
@@ -27,7 +27,7 @@ use serde::Deserialize;
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
+        arbiter::{lock, SharedArbiter, Transport},
         public_feeder::{self, finite_non_negative, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
@@ -229,7 +229,7 @@ impl PhoenixVenue {
             .inc();
         lock(arbiter).emit(
             FeedMessage::Trade(trade),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             PHOENIX_CATEGORY,
         );
     }

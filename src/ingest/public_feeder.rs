@@ -3,7 +3,7 @@
 //!
 //! A public feeder is a second ingest source, off by default, that connects to a venue's own public
 //! `wss://`, decodes its JSON into the same [`FeedMessage`]s the multicast pipeline produces, and
-//! emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. It is a
+//! emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. It is a
 //! different transport from the multicast receiver — it never touches the `FrameProcessor` /
 //! `recv_any` machinery — but it converges on the *same* per-`(venue, symbol)` arbiter dedup state,
 //! so a public copy of an update the edge already emitted collapses into a no-op, and when the edge
