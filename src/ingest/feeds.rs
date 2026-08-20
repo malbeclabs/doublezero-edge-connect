@@ -14,20 +14,20 @@ use tracing::warn;
 
 use crate::ingest::registry;
 
-/// Which edge-feed-spec protocol a feed speaks. Selects the frame magic + decoder + receiver
+/// Which edge-feed-spec protocol a feed speaks. Selects the datagram magic + decoder + receiver
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
 // `Midpoint`/`MarketByOrder`/`MarketByPrice` are matched on by the receiver but only *constructed*
 // by FEEDS rows, added once their live multicast endpoints are known - hence the dead_code allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FeedKind {
-    /// Top-of-Book & Trades (frame magic `0x445A`): best bid/ask quotes + trade prints.
+    /// Top-of-Book & Trades (datagram magic `0x445A`): best bid/ask quotes + trade prints.
     TopOfBook,
-    /// Midpoint (frame magic `0x4D44`): a single derived mid price per instrument.
+    /// Midpoint (datagram magic `0x4D44`): a single derived mid price per instrument.
     Midpoint,
-    /// Market-by-Order (frame magic `0x4444`): full L3 order book with snapshot+delta recovery.
+    /// Market-by-Order (datagram magic `0x4444`): full L3 order book with snapshot+delta recovery.
     MarketByOrder,
-    /// Market-by-Price (frame magic `0x4442`): the price-aggregated book with snapshot+delta
+    /// Market-by-Price (datagram magic `0x4442`): the price-aggregated book with snapshot+delta
     /// recovery, re-served as the incremental `book` product.
     MarketByPrice,
 }
@@ -216,11 +216,11 @@ pub struct Feed {
     /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount (`publisher_offset` in the document, a row-level
     /// field — an `explicit` row can declare it exactly like a `derived` one) — so the socket
-    /// bound for channel `N` also receives frames stamped `N + offset`. `None` for every row with
+    /// bound for channel `N` also receives datagrams stamped `N + offset`. `None` for every row with
     /// no such mirror.
     ///
     /// **Consumer-facing identity only.** Ingest subtracts this from a wire channel id at the
-    /// point a message becomes catalog/history/book identity (`FrameCtx::canonical_channel`), so
+    /// point a message becomes catalog/history/book identity (`DatagramCtx::canonical_channel`), so
     /// the mirror's `N + offset` and the base publisher's `N` are one market — one catalog entry,
     /// one book, one history series — to everything downstream of that point. It must **never**
     /// be applied to producer-side state (books, sequence tracking, reset counts, snapshot

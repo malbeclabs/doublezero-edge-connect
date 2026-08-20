@@ -1,10 +1,10 @@
-//! DoubleZero Edge multicast receiver: bind the group's port(s), decode frames, and broadcast
+//! DoubleZero Edge multicast receiver: bind the group's port(s), decode datagrams, and broadcast
 //! normalized `FeedMessage`s.
 //!
 //! The socket plumbing here is **protocol-agnostic** and shared by every edge-feed-spec feed:
 //! interface resolution, the multicast join, kernel RX timestamps, the idle-rejoin watchdog and
-//! the venue feed-health status. The per-protocol work (which frame magic, which messages, what
-//! to emit) lives behind the [`FrameProcessor`] trait, so [`drive`] runs the same receive loop
+//! the venue feed-health status. The per-protocol work (which datagram magic, which messages, what
+//! to emit) lives behind the [`DatagramProcessor`] trait, so [`drive`] runs the same receive loop
 //! over 1, 2 or 3 ports for Top-of-Book, Midpoint or Market-by-Order alike.
 //!
 //! Socket setup follows the DoubleZero edge-multicast-ref `kernel-receiver` reference:
@@ -106,10 +106,10 @@ impl PortRole {
     }
 }
 
-/// Per-datagram context handed to a [`FrameProcessor`]: the shared sinks plus the receive
+/// Per-datagram context handed to a [`DatagramProcessor`]: the shared sinks plus the receive
 /// timestamps and which port role the datagram arrived on. Borrowed for the duration of one
 /// `on_datagram` call so the processor only needs to hold its own protocol state.
-pub struct FrameCtx<'a> {
+pub struct DatagramCtx<'a> {
     /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
     /// venue ultimately comes from the `&'static` `FEEDS` registry.
     pub venue: &'static str,
@@ -138,10 +138,10 @@ pub struct FrameCtx<'a> {
     pub mirror_offset: Option<u8>,
 }
 
-impl FrameCtx<'_> {
+impl DatagramCtx<'_> {
     /// Canonicalize a wire channel id for **consumer-facing identity** — the catalog, history, the
     /// book authority's `MarketKey`, and the emitted `channel` field itself. A mirror publisher
-    /// (`mirror_offset` set) stamps the same market's frames at `N + offset`; subtracting it here
+    /// (`mirror_offset` set) stamps the same market's datagrams at `N + offset`; subtracting it here
     /// is what makes that one market rather than two.
     ///
     /// **Never call this for producer-side state** (book keys, sequence trackers, reset counts,
@@ -173,22 +173,22 @@ impl FrameCtx<'_> {
 }
 
 /// Wire venues actually emitted under each feed row's static `venue`, tracked from every
-/// [`FrameCtx::emit`]. `FeedStatus` (built in [`emit_status`]) must report under what consumers'
+/// [`DatagramCtx::emit`]. `FeedStatus` (built in [`emit_status`]) must report under what consumers'
 /// quotes/trades actually carry — a publisher's wire `Source ID` can resolve
 /// (`ingest::sources::source_label`) to a different registry name than `venue`, the static identity
 /// of the row this receiver was configured from (see the module doc and `ingest::sources`).
 ///
 /// Scoped to the row `venue` — the same granularity `FeedHealth`'s own up/down aggregate already
-/// uses — rather than the finer per-receiver `ReceiverKey`, because `FrameCtx` carries no `kind`/port
-/// and is a fixed contract with `processor.rs`'s `FrameProcessor` implementations (not this fix's to
+/// uses — rather than the finer per-receiver `ReceiverKey`, because `DatagramCtx` carries no `kind`/port
+/// and is a fixed contract with `processor.rs`'s `DatagramProcessor` implementations (not this fix's to
 /// change). This is not a loss of precision where it matters: `emit_status` only ever fires from
 /// `FeedHealth::with_edge` on a genuine aggregate flip (the whole point of that gate — see
 /// `health.rs`), so whichever receiver(s) of this row caused the flip are exactly the ones whose
 /// revealed venues belong in that flip's message. `emit_status` additionally never speaks for a
 /// revealed venue that owns its own `FEEDS` row (see there) — this map only records candidates.
 ///
-/// A process-wide static rather than a `FrameCtx`/`ReceiverRegistration` field for the same reason:
-/// `FrameCtx`'s field set is fixed. The outer key space (row venues) is the small, fixed `FEEDS`
+/// A process-wide static rather than a `DatagramCtx`/`ReceiverRegistration` field for the same reason:
+/// `DatagramCtx`'s field set is fixed. The outer key space (row venues) is the small, fixed `FEEDS`
 /// registry, never wire-controlled; the inner sets hold only registry-resolved labels (see
 /// `record_revealed`), so the whole map is bounded by the registry, never by wire input.
 ///
@@ -263,13 +263,13 @@ fn revealed_venues_for(venue: &str) -> BTreeSet<Arc<str>> {
         .unwrap_or_default()
 }
 
-/// Protocol-specific frame handling. Implementors own their decode (they know their frame magic
+/// Protocol-specific datagram handling. Implementors own their decode (they know their datagram magic
 /// and message set) and their persistent state (reference-data state machine, sequence trackers,
 /// book state, warn-once flags), and emit normalized `FeedMessage`s via `ctx.emit`.
-pub trait FrameProcessor {
+pub trait DatagramProcessor {
     /// Decode and handle one received datagram. Errors are the processor's own concern (it logs
     /// and drops); the driver only deals with socket/transport errors.
-    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx);
+    fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx);
 }
 
 /// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
@@ -563,9 +563,9 @@ pub fn bind_multicast(
     Ok(AsyncFd::new(std_sock)?)
 }
 
-/// Outcome of checking a frame's header against the per-channel sequence tracker.
+/// Outcome of checking a datagram's header against the per-channel sequence tracker.
 ///
-/// Mirrors the edge-feed-spec frame-header semantics: the Sequence Number is "monotonically
+/// Mirrors the edge-feed-spec datagram-header semantics: the Sequence Number is "monotonically
 /// increasing per channel ... Resets to 0 when `Reset Count` changes", and "Subscribers detect a
 /// reset by comparing [`Reset Count`] against their last-seen value". Everything but
 /// [`Stale`](SeqCheck::Stale) is processed.
@@ -576,7 +576,7 @@ pub fn bind_multicast(
 /// *lower* sequence on the same group (a reorder/replay) is actionable.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeqCheck {
-    /// First frame seen on this channel.
+    /// First datagram seen on this channel.
     First,
     /// Sequence at or above the last seen within the epoch (forward progress or a duplicate of
     /// the last). Accepted.
@@ -589,7 +589,7 @@ pub enum SeqCheck {
     Stale,
 }
 
-/// Per-`channel_id` frame-sequence state for gap detection and stale-frame rejection on the
+/// Per-`channel_id` datagram-sequence state for gap detection and stale-datagram rejection on the
 /// market-data feed, implementing the edge-feed-spec sequence/reset contract (see [`SeqCheck`]).
 #[derive(Default)]
 pub struct SeqTracker {
@@ -598,10 +598,10 @@ pub struct SeqTracker {
 }
 
 impl SeqTracker {
-    /// Classify a frame and advance the tracker. A reset (`reset_count` differs from the
-    /// last-seen value, per spec) re-anchors to this frame's sequence; otherwise the sequence
-    /// is compared within the epoch. The tracker is only advanced for accepted frames, so a
-    /// dropped stale frame leaves the anchor on the freshest sequence.
+    /// Classify a datagram and advance the tracker. A reset (`reset_count` differs from the
+    /// last-seen value, per spec) re-anchors to this datagram's sequence; otherwise the sequence
+    /// is compared within the epoch. The tracker is only advanced for accepted datagrams, so a
+    /// dropped stale datagram leaves the anchor on the freshest sequence.
     pub fn check(&mut self, channel_id: u8, reset_count: u8, sequence: u64) -> SeqCheck {
         match self.last.get_mut(&channel_id) {
             None => {
@@ -666,13 +666,13 @@ async fn recv_any(channels: &mut [Channel]) -> Result<(PortRole, usize, usize, u
     }
 }
 
-/// The shared receive loop for one feed, generic over its [`FrameProcessor`]. Binds every port in
+/// The shared receive loop for one feed, generic over its [`DatagramProcessor`]. Binds every port in
 /// `ports` on `group`, then loops receiving datagrams and handing each to `processor`. The
 /// [`IDLE_REJOIN`] watchdog tracks the **market-data** port only (reference/snapshot ports keep
 /// ticking even when market data is wedged), and breaks back out to re-resolve the interface and
 /// rebind - self-healing a join that landed on the wrong interface or a wedged socket.
 #[allow(clippy::too_many_arguments)]
-async fn drive<P: FrameProcessor>(
+async fn drive<P: DatagramProcessor>(
     group: Ipv4Addr,
     ports: Vec<(PortRole, u16)>,
     iface: String,
@@ -812,7 +812,7 @@ async fn drive<P: FrameProcessor>(
             }
 
             reg.note_publisher(publisher);
-            let ctx = FrameCtx {
+            let ctx = DatagramCtx {
                 venue,
                 category,
                 arbiter: &arbiter,
@@ -840,7 +840,7 @@ fn two_port_roles(ports: FeedPorts) -> Vec<(PortRole, u16)> {
     }
 }
 
-/// Run the receiver for **one publisher** of one feed: pick the protocol's [`FrameProcessor`] and
+/// Run the receiver for **one publisher** of one feed: pick the protocol's [`DatagramProcessor`] and
 /// port roles from the feed's [`FeedKind`], then drive the shared receive loop over that
 /// publisher's port block. Returns only on a fatal bind error (it otherwise runs forever).
 #[allow(clippy::too_many_arguments)]
@@ -974,8 +974,8 @@ mod tests {
 
     use super::{
         datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_venues_for,
-        FeedMessage, FrameCtx, PortRole, ReceiverRegistration, SeqCheck, SeqTracker, SharedArbiter,
-        SockaddrStorage,
+        DatagramCtx, FeedMessage, PortRole, ReceiverRegistration, SeqCheck, SeqTracker,
+        SharedArbiter, SockaddrStorage,
     };
     use crate::metrics::metrics;
 
@@ -1097,11 +1097,11 @@ mod tests {
         );
     }
 
-    /// `FrameCtx::emit` is the hook: it must record the message's OWN venue (as `processor.rs`
+    /// `DatagramCtx::emit` is the hook: it must record the message's OWN venue (as `processor.rs`
     /// resolves it from the wire Source ID), not `ctx.venue` (the feed row's static identity) —
     /// those are exactly the two that can differ.
     #[test]
-    fn frame_ctx_emit_records_the_messages_own_venue() {
+    fn datagram_ctx_emit_records_the_messages_own_venue() {
         use std::collections::HashMap;
 
         use crate::model::{InstrumentSnapshot, NormalizedQuote};
@@ -1113,7 +1113,7 @@ mod tests {
         let (arbiter, _rx) = test_arbiter();
         let instruments: InstrumentSnapshot =
             std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let ctx = FrameCtx {
+        let ctx = DatagramCtx {
             venue: row_venue,
             category: "testcategory",
             arbiter: &arbiter,
@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_on_a_channel() {
+    fn first_datagram_on_a_channel() {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 0), SeqCheck::First); // sequence starts at 0 per spec
     }
@@ -1356,7 +1356,7 @@ mod tests {
         assert_eq!(s.check(0, 0, 10), SeqCheck::First);
         assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // reordered/duplicated old datagram
         assert_eq!(s.check(0, 0, 3), SeqCheck::Stale);
-        // The anchor stayed at 10 (stale frames don't advance it), so 11 is the next contiguous one.
+        // The anchor stayed at 10 (stale datagrams don't advance it), so 11 is the next contiguous one.
         assert_eq!(s.check(0, 0, 11), SeqCheck::Ok);
     }
 
@@ -1373,7 +1373,7 @@ mod tests {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 100), SeqCheck::First);
         // Transport reset the channel: reset_count bumped, sequence legitimately restarts at 0.
-        // Without the reset_count check this 0 would be misread as a stale frame.
+        // Without the reset_count check this 0 would be misread as a stale datagram.
         assert_eq!(s.check(0, 1, 0), SeqCheck::Reset);
         assert_eq!(s.check(0, 1, 1), SeqCheck::Ok);
         // Within the new epoch, lower sequences are stale again.
@@ -1385,7 +1385,7 @@ mod tests {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 10), SeqCheck::First);
         assert_eq!(s.check(1, 0, 2), SeqCheck::First); // a different channel has its own counter
-        assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // channel 0 still drops its own stale frame
+        assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // channel 0 still drops its own stale datagram
         assert_eq!(s.check(1, 0, 3), SeqCheck::Ok);
     }
 }

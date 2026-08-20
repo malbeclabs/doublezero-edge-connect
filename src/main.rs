@@ -1,7 +1,7 @@
 //! doublezero-edge-connect - DoubleZero Edge multicast -> normalized WebSocket bridge.
 //!
 //! Binds each configured DZ Edge feed's multicast group, decodes the binary Top-of-Book
-//! frames, and re-serves normalized quotes over a WebSocket that any trading engine can
+//! datagrams, and re-serves normalized quotes over a WebSocket that any trading engine can
 //! subscribe to. One feed maps to one venue (see `ingest/feeds.rs`); the bridge ingests every
 //! selected feed at once and consumers filter by venue over the WebSocket (PROTOCOL.md).
 //! Run it on a host connected to DZ Edge (the `doublezero1` interface) so consumers never

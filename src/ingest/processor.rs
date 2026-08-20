@@ -1,6 +1,6 @@
-//! Per-protocol frame processors: the [`FrameProcessor`] implementations the receiver's shared
+//! Per-protocol datagram processors: the [`DatagramProcessor`] implementations the receiver's shared
 //! driver dispatches to. Each owns its protocol state (reference-data state machine, sequence
-//! tracker, warn-once flags, book state) and turns decoded frames into normalized `FeedMessage`s.
+//! tracker, warn-once flags, book state) and turns decoded datagrams into normalized `FeedMessage`s.
 //!
 //! - [`TobProcessor`] - Top-of-Book & Trades (`codec`, magic `0x445A`).
 //! - [`MidpointProcessor`] - Midpoint (`codec_midpoint`, magic `0x4D44`).
@@ -24,13 +24,13 @@ use crate::{
         arbiter::{lock, Transport},
         authority::MarketKey,
         book::{BookState, DeltaKind, DeltaOp, Level, OrderChange},
-        codec::{apply_exponent, decode_frame, InstrumentDefinition, Message},
+        codec::{apply_exponent, decode_datagram, InstrumentDefinition, Message},
         codec_mbo, codec_mbp, codec_midpoint,
         pricebook::{
             BookDelta, DeltaOp as PriceDeltaOp, DeltaOutcome, Divergence, PriceBook,
             Status as BookStatus,
         },
-        receiver::{FrameCtx, FrameProcessor, SeqCheck, SeqTracker},
+        receiver::{DatagramCtx, DatagramProcessor, SeqCheck, SeqTracker},
         reconcile::TapeOwner,
         sources::source_label,
         subscriber::{InstrumentDef, RefDataState},
@@ -51,7 +51,7 @@ pub(crate) const DEPTH_LEVELS: usize = 10;
 /// Minimum gap between two decode-error log lines from one processor.
 const DECODE_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Rate limit for a warning that can fire **per datagram**. A decode error is per-frame, so a
+/// Rate limit for a warning that can fire **per datagram**. A decode error is per-datagram, so a
 /// `(group, port)` block that turns out to carry another protocol's traffic (several of the MBO/TOB
 /// port blocks are inferred, not confirmed on-wire) would otherwise warn at full market-data rate.
 #[derive(Default)]
@@ -77,8 +77,8 @@ impl WarnRateLimit {
 }
 
 /// Pre-resolved `dz_seq_events_total{venue, kind}` children (one per [`SeqCheck`] outcome) for a
-/// single feed, so the per-frame hot path increments a cached counter instead of doing a label-map
-/// lookup. The processor doesn't know its venue until the first frame (`ctx.venue`, fixed for the
+/// single feed, so the per-datagram hot path increments a cached counter instead of doing a label-map
+/// lookup. The processor doesn't know its venue until the first datagram (`ctx.venue`, fixed for the
 /// feed's lifetime), so the children are bound lazily on first use.
 #[derive(Default)]
 struct SeqEvents {
@@ -115,7 +115,7 @@ impl SeqEvents {
 /// bound an attacker who can inject into the multicast group could mint a fresh `SeqTracker` per
 /// forged source IP and grow the map without limit (memory-exhaustion DoS). Real deployments have a
 /// handful of mirrored publishers, so this is set far above that; once full, the least-recently-
-/// inserted publisher is evicted (it simply re-anchors its sequence on its next frame).
+/// inserted publisher is evicted (it simply re-anchors its sequence on its next datagram).
 pub(crate) const MAX_PUBLISHERS: usize = 256;
 
 /// Per-publisher reference-data state, bounded exactly like the per-publisher sequence map.
@@ -256,13 +256,13 @@ fn remove_instrument(
 
 /// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata stream
 /// and emits normalized quotes (gated per-instrument on a known definition) on the market-data
-/// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote frames.
+/// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote datagrams.
 pub struct TobProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
     state: PerPublisher<InstrumentDefinition>,
-    /// Per-publisher, per-channel frame sequence tracker. Independent publishers mirror this feed
+    /// Per-publisher, per-channel datagram sequence tracker. Independent publishers mirror this feed
     /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
-    /// frames stale and drop them before dedup; keying by source IP keeps each publisher's sequence
+    /// datagrams stale and drop them before dedup; keying by source IP keeps each publisher's sequence
     /// state separate. Bounded to [`MAX_PUBLISHERS`] entries (the source IP is spoofable, so the map
     /// must not grow without limit); `seq_order` records insertion order for the eviction.
     seq: HashMap<IpAddr, SeqTracker>,
@@ -276,7 +276,7 @@ pub struct TobProcessor {
     /// venue's rows are separately subscription-gated, so which of them serves the tape is the
     /// reconciler's decision and moves without respawning this task (see [`TapeOwner`]).
     tape: TapeOwner,
-    /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
+    /// Pre-resolved datagram-sequence metric children (bound lazily on the first datagram).
     seq_events: SeqEvents,
     /// The wire Source ID revealed for `(publisher, instrument)` — absent until the first `Quote`/
     /// `Trade` for the key (both carry one). See the module-level deferral note on
@@ -284,7 +284,7 @@ pub struct TobProcessor {
     revealed: HashMap<(IpAddr, u32), u16>,
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
     /// remembered because the deferred `NormalizedInstrument`, emitted once a price message
-    /// reveals the instrument, is built outside that definition's own frame and so no longer has
+    /// reveals the instrument, is built outside that definition's own datagram and so no longer has
     /// its `header.channel_id` in scope. Refreshed on every definition burst (last-definition-wins,
     /// matching how `RefDataState.defs` itself already treats a same-`instrument_id` redefinition).
     /// Also what a Source ID change purges the stale `InstrumentSnapshot` entry by: the identity
@@ -329,7 +329,7 @@ impl TobProcessor {
     /// change, so the current `pending_channel` value and this call's own `instrument_id` are
     /// exactly what the old entry was filed under — unlike the display `symbol`, the identity
     /// needs no separate "what was it last announced under" memo.
-    fn reveal_if_needed(&mut self, ctx: &FrameCtx, instrument_id: u32, source_id: u16) {
+    fn reveal_if_needed(&mut self, ctx: &DatagramCtx, instrument_id: u32, source_id: u16) {
         let key = (ctx.publisher, instrument_id);
         let previous = self.revealed.get(&key).copied();
         if previous == Some(source_id) {
@@ -387,7 +387,7 @@ impl TobProcessor {
     /// [`MAX_PUBLISHERS`]: when a *new* publisher would overflow it, the least-recently-inserted one
     /// is evicted first. Source IPs are spoofable, so this bound is what stops a forged-source flood
     /// from growing the map without limit; a legitimate publisher evicted under such a flood simply
-    /// re-anchors (`SeqCheck::First`) on its next frame, with no data loss beyond a stale-check reset.
+    /// re-anchors (`SeqCheck::First`) on its next datagram, with no data loss beyond a stale-check reset.
     fn seq_for(&mut self, publisher: IpAddr) -> &mut SeqTracker {
         if !self.seq.contains_key(&publisher) {
             while self.seq.len() >= MAX_PUBLISHERS {
@@ -405,9 +405,9 @@ impl TobProcessor {
     }
 }
 
-impl FrameProcessor for TobProcessor {
-    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx) {
-        let (header, messages) = match decode_frame(buf) {
+impl DatagramProcessor for TobProcessor {
+    fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx) {
+        let (header, messages) = match decode_datagram(buf) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(suppressed) = self.decode_warn.allow() {
@@ -421,7 +421,9 @@ impl FrameProcessor for TobProcessor {
         let handle_quotes = ctx.role.handles_mktdata();
 
         if handle_refdata {
-            self.state.get(ctx.publisher).on_frame(header.reset_count);
+            self.state
+                .get(ctx.publisher)
+                .on_datagram(header.reset_count);
             // `get()` above is the only place a new publisher can evict an old one this datagram
             // (every other `get()` call this function makes lands on an already-tracked publisher,
             // gated by the same `handle_refdata`); drop the evicted publisher's `revealed`/
@@ -431,9 +433,9 @@ impl FrameProcessor for TobProcessor {
             }
         }
 
-        // Per edge-feed-spec, the frame Sequence Number is monotonically increasing per channel and
+        // Per edge-feed-spec, the datagram Sequence Number is monotonically increasing per channel and
         // a `Reset Count` change signals a publisher reset. On the quote feed we drop only the stale
-        // (out-of-order/replayed) frames - those whose sequence is below the last seen within the
+        // (out-of-order/replayed) datagrams - those whose sequence is below the last seen within the
         // same reset epoch - so an old datagram can never overwrite a fresher top-of-book. Forward
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
@@ -450,7 +452,7 @@ impl FrameProcessor for TobProcessor {
                         venue = ctx.venue,
                         channel = header.channel_id,
                         sequence = header.sequence,
-                        "dropping stale/out-of-order quote frame (sequence below last seen)"
+                        "dropping stale/out-of-order quote datagram (sequence below last seen)"
                     );
                     false
                 }
@@ -663,7 +665,7 @@ pub struct MidpointProcessor {
     seq: SeqTracker,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
-    /// Pre-resolved frame-sequence metric children (bound lazily on the first frame).
+    /// Pre-resolved datagram-sequence metric children (bound lazily on the first datagram).
     seq_events: SeqEvents,
     /// The wire Source ID revealed for `(publisher, instrument)` — absent until the first
     /// `Midpoint` for the key. See [`MboProcessor::revealed`] for the full deferral design.
@@ -696,7 +698,7 @@ impl MidpointProcessor {
     /// wire Source ID (the first `Midpoint` for it), and re-announce if a later `Midpoint` names a
     /// DIFFERENT id for a key already revealed. See [`TobProcessor::reveal_if_needed`], including
     /// the `InstrumentSnapshot` purge on a Source ID change.
-    fn reveal_if_needed(&mut self, ctx: &FrameCtx, instrument_id: u32, source_id: u16) {
+    fn reveal_if_needed(&mut self, ctx: &DatagramCtx, instrument_id: u32, source_id: u16) {
         let key = (ctx.publisher, instrument_id);
         let previous = self.revealed.get(&key).copied();
         if previous == Some(source_id) {
@@ -748,9 +750,9 @@ impl MidpointProcessor {
     }
 }
 
-impl FrameProcessor for MidpointProcessor {
-    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx) {
-        let (header, messages) = match codec_midpoint::decode_frame(buf) {
+impl DatagramProcessor for MidpointProcessor {
+    fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx) {
+        let (header, messages) = match codec_midpoint::decode_datagram(buf) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(suppressed) = self.decode_warn.allow() {
@@ -764,7 +766,9 @@ impl FrameProcessor for MidpointProcessor {
         let handle_mids = ctx.role.handles_mktdata();
 
         if handle_refdata {
-            self.state.get(ctx.publisher).on_frame(header.reset_count);
+            self.state
+                .get(ctx.publisher)
+                .on_datagram(header.reset_count);
             // See `TobProcessor::on_datagram`: this is the only `get()` call this function makes
             // that can evict a publisher.
             if let Some(evicted) = self.state.take_evicted() {
@@ -924,10 +928,10 @@ pub struct MboProcessor {
     /// Same bound reasoning as `revealed` above. Also what a Source ID change's `InstrumentSnapshot`
     /// purge reads its current value from directly — see [`TobProcessor::pending_channel`].
     pending_channel: HashMap<(IpAddr, u32), u8>,
-    /// Order-level changes the current frame's applied deltas produced, tagged with the instrument they
-    /// touched. Reused across frames (cleared at the top of each) so the hot path allocates nothing per
+    /// Order-level changes the current datagram's applied deltas produced, tagged with the instrument they
+    /// touched. Reused across datagrams (cleared at the top of each) so the hot path allocates nothing per
     /// event, and bounded by one datagram's message count.
-    frame_changes: Vec<(u32, OrderChange)>,
+    datagram_changes: Vec<(u32, OrderChange)>,
     /// Scratch for the order changes one delta or one whole-book materialization produces, swapped
     /// out of `self` while `books` is borrowed. Transient within a call, never state.
     order_scratch: Vec<OrderChange>,
@@ -956,7 +960,7 @@ impl MboProcessor {
             emitted_symbol: HashMap::new(),
             revealed: HashMap::new(),
             pending_channel: HashMap::new(),
-            frame_changes: Vec::new(),
+            datagram_changes: Vec::new(),
             order_scratch: Vec::new(),
             synced_reported: HashMap::new(),
             reveal_rebaselined_ns: HashMap::new(),
@@ -979,7 +983,7 @@ impl MboProcessor {
     /// Counted in `dz_source_id_changed_total{venue}` (the new venue), and purges the stale
     /// `(old_venue, channel, instrument_id)` `InstrumentSnapshot` entry (see
     /// [`TobProcessor::reveal_if_needed`]'s doc comment).
-    fn reveal_if_needed(&mut self, ctx: &FrameCtx, instrument_id: u32, source_id: u16) -> bool {
+    fn reveal_if_needed(&mut self, ctx: &DatagramCtx, instrument_id: u32, source_id: u16) -> bool {
         let key = (ctx.publisher, instrument_id);
         let previous = self.revealed.get(&key).copied();
         if previous == Some(source_id) {
@@ -1040,7 +1044,7 @@ impl MboProcessor {
     /// peer and suppresses the surviving path's only re-baseline — and it cannot be corrected later,
     /// because `market_key` resolves through `revealed`. So the path is released here, while
     /// `revealed` still resolves it.
-    fn forget_publisher(&mut self, publisher: IpAddr, ctx: &FrameCtx) {
+    fn forget_publisher(&mut self, publisher: IpAddr, ctx: &DatagramCtx) {
         let stale: Vec<(IpAddr, u32)> = self
             .synced_reported
             .iter()
@@ -1079,7 +1083,7 @@ impl MboProcessor {
     /// whose depth actually latched the floor, each resolved to its own last-known wire venue.
     /// This is a superset of `ctx.venue`'s old reach, not a subset: still a safe over-approximation
     /// (a spurious clear self-heals via full-state depth), same as the call sites it replaces.
-    fn reset_all_known_depth_floors(&self, ctx: &FrameCtx, reason: &'static str) {
+    fn reset_all_known_depth_floors(&self, ctx: &DatagramCtx, reason: &'static str) {
         let mut arb = lock(ctx.arbiter);
         for (key, symbol) in &self.emitted_symbol {
             if let Some(venue) = self.wire_venue(key) {
@@ -1099,7 +1103,7 @@ impl MboProcessor {
     /// refuses the new session's re-used ids for exactly the markets nothing is serving any more — the
     /// `InstrumentReset` failure, one handler over. It also means an `EndOfSession` from a source
     /// holding no books of its own still clears the state of the ones that were just reset.
-    fn reset_all_known_book_events(&self, ctx: &FrameCtx) {
+    fn reset_all_known_book_events(&self, ctx: &DatagramCtx) {
         let mut arb = lock(ctx.arbiter);
         for key in self.books.keys() {
             if let Some(market) = self.market_key(key, ctx) {
@@ -1125,7 +1129,7 @@ impl MboProcessor {
     ///    also drops the evicted pair's `last_top` and (when no other publisher still serves that
     ///    symbol) the shared `depth` (WS replay) entry in lockstep, so neither sibling map outgrows
     ///    `books`. An evicted legitimate book simply re-syncs from the next snapshot.
-    fn book_for(&mut self, instrument_id: u32, ctx: &FrameCtx) -> Option<&mut BookState> {
+    fn book_for(&mut self, instrument_id: u32, ctx: &DatagramCtx) -> Option<&mut BookState> {
         // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
         self.state.def(ctx.publisher, instrument_id)?;
         let key = (ctx.publisher, instrument_id);
@@ -1186,7 +1190,7 @@ impl MboProcessor {
     /// instrument has been revealed (see [`Self::revealed`]) — deferral applies to `depth` exactly
     /// as it does to the definition: nothing is emitted for an instrument until its Source ID is
     /// known, so a book built purely from a snapshot must not reach the wire ahead of it either.
-    fn emit_depth(&mut self, instrument_id: u32, ctx: &FrameCtx) {
+    fn emit_depth(&mut self, instrument_id: u32, ctx: &DatagramCtx) {
         let key = (ctx.publisher, instrument_id);
         let Some(&source_id) = self.revealed.get(&key) else {
             return;
@@ -1220,8 +1224,8 @@ impl MboProcessor {
                 })
                 .collect()
         };
-        // No message triggers a `depth` re-baseline directly (it is coalesced per frame from
-        // whichever deltas/snapshot messages touched the book this frame); `source_id` is the one
+        // No message triggers a `depth` re-baseline directly (it is coalesced per datagram from
+        // whichever deltas/snapshot messages touched the book this datagram); `source_id` is the one
         // this key was revealed under (the gate above guarantees it is `Some`).
         let venue: &'static str = source_label(source_id);
         let source = venue_arc(venue);
@@ -1274,12 +1278,12 @@ impl MboProcessor {
     }
 
     /// Apply one order delta, recording the instrument as touched, as changed if the book took it, and
-    /// collecting the order-level change it produced for this frame's `book`.
+    /// collecting the order-level change it produced for this datagram's `book`.
     fn apply_delta(
         &mut self,
         instrument_id: u32,
         op: DeltaOp,
-        ctx: &FrameCtx,
+        ctx: &DatagramCtx,
         changed: &mut BTreeSet<u32>,
         touched: &mut BTreeSet<u32>,
     ) {
@@ -1291,7 +1295,7 @@ impl MboProcessor {
                 changed.insert(instrument_id);
             }
         }
-        self.frame_changes
+        self.datagram_changes
             .extend(produced.iter().map(|c| (instrument_id, *c)));
         self.order_scratch = produced;
     }
@@ -1300,18 +1304,18 @@ impl MboProcessor {
     /// instrument is revealed (nothing has been emitted for it, so there is no market yet). Resolved
     /// exactly as `emit_depth` resolves its venue, so a health report and an emission cannot land on
     /// different keys.
-    fn market_key(&self, key: &(IpAddr, u32), ctx: &FrameCtx) -> Option<MarketKey> {
+    fn market_key(&self, key: &(IpAddr, u32), ctx: &DatagramCtx) -> Option<MarketKey> {
         let venue = self.wire_venue(key)?;
         let channel = self.pending_channel.get(key).copied().unwrap_or(0);
         Some((venue_arc(venue), category_arc(ctx.category), channel, key.1))
     }
 
     /// Handle a delta-carrying message's Source ID: reveal the instrument if it moved, and decide what
-    /// the frame owes the `book` consumer as a result. Identical at all four delta-carrying call sites,
+    /// the datagram owes the `book` consumer as a result. Identical at all four delta-carrying call sites,
     /// so it lives here rather than four times over.
     ///
     /// A reveal moves the instrument to a **new** `MarketKey`, under which the consumer has seen
-    /// nothing. Publishing the frame's incremental changes there is the one outcome that must not
+    /// nothing. Publishing the datagram's incremental changes there is the one outcome that must not
     /// happen: the consumer applies order updates onto a book it was never given, and the replay
     /// accumulator for that key never reaches `baselined()`, so new clients never see it either. So a
     /// reveal always says *something* — the whole book when [`Self::reveal_rebaseline_due`] allows it,
@@ -1319,7 +1323,7 @@ impl MboProcessor {
     /// forged-Source-ID flood the rate limit exists to bound.
     fn on_reveal(
         &mut self,
-        ctx: &FrameCtx,
+        ctx: &DatagramCtx,
         instrument_id: u32,
         source_id: u16,
         changed: &mut BTreeSet<u32>,
@@ -1340,7 +1344,7 @@ impl MboProcessor {
     /// Report this instrument's book sync state to the arbiter when it has changed. The arbiter's
     /// re-baseline suppression reads these, so a book that gaps must say so — otherwise a peer that is
     /// itself recovering would see a phantom healthy path and suppress the only re-baseline on offer.
-    fn report_synced(&mut self, instrument_id: u32, ctx: &FrameCtx) {
+    fn report_synced(&mut self, instrument_id: u32, ctx: &DatagramCtx) {
         let key = (ctx.publisher, instrument_id);
         let synced = self.books.get(&key).is_some_and(|b| b.is_synced());
         self.set_synced(key, synced, ctx);
@@ -1354,7 +1358,7 @@ impl MboProcessor {
     /// publisher eviction both report for paths other than the one whose datagram is being handled, and
     /// naming the wrong path there would leave the departed one's `synced = true` standing while
     /// clearing an innocent peer's.
-    fn set_synced(&mut self, key: (IpAddr, u32), synced: bool, ctx: &FrameCtx) {
+    fn set_synced(&mut self, key: (IpAddr, u32), synced: bool, ctx: &DatagramCtx) {
         if self.synced_reported.get(&key) == Some(&synced) {
             return;
         }
@@ -1374,9 +1378,9 @@ impl MboProcessor {
     /// Clear` is what re-baselines a consumer; the `snapshot` flag is advisory) — for a snapshot
     /// install, and for a reveal, after which the consumer has never seen this identity's book at
     /// all. [`BookEmit::Clear`] is the same statement without the content, for a reveal the rate
-    /// limit refused to materialize. Otherwise the frame's applied changes are published as they
+    /// limit refused to materialize. Otherwise the datagram's applied changes are published as they
     /// came.
-    fn emit_book(&mut self, instrument_id: u32, mode: BookEmit, ctx: &FrameCtx) {
+    fn emit_book(&mut self, instrument_id: u32, mode: BookEmit, ctx: &DatagramCtx) {
         let key = (ctx.publisher, instrument_id);
         let Some(&source_id) = self.revealed.get(&key) else {
             return;
@@ -1427,7 +1431,7 @@ impl MboProcessor {
             self.order_scratch = scratch;
         } else if mode == BookEmit::Delta {
             changes.extend(
-                self.frame_changes
+                self.datagram_changes
                     .iter()
                     .filter(|(id, _)| *id == instrument_id)
                     .map(|(_, c)| scale(c)),
@@ -1460,10 +1464,10 @@ impl MboProcessor {
     }
 }
 
-/// What one instrument's `book` emission says this frame — see [`MboProcessor::emit_book`].
+/// What one instrument's `book` emission says this datagram — see [`MboProcessor::emit_book`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BookEmit {
-    /// The frame's applied changes, as they came.
+    /// The datagram's applied changes, as they came.
     Delta,
     /// A bare `Clear`: discard this market, with no replacement content.
     Clear,
@@ -1471,9 +1475,9 @@ enum BookEmit {
     Rebaseline,
 }
 
-impl FrameProcessor for MboProcessor {
-    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx) {
-        let (header, messages) = match codec_mbo::decode_frame(buf) {
+impl DatagramProcessor for MboProcessor {
+    fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx) {
+        let (header, messages) = match codec_mbo::decode_datagram(buf) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(suppressed) = self.decode_warn.allow() {
@@ -1486,7 +1490,9 @@ impl FrameProcessor for MboProcessor {
         let handle_refdata = ctx.role.handles_refdata();
 
         if handle_refdata {
-            self.state.get(ctx.publisher).on_frame(header.reset_count);
+            self.state
+                .get(ctx.publisher)
+                .on_datagram(header.reset_count);
             // This is the only `get()` call this function makes that can evict a publisher: every
             // other `get()` call below (`ManifestSummary`/`InstrumentDefinition`) is now gated on
             // this same `handle_refdata`, so it lands on a publisher already inserted by the line
@@ -1500,21 +1506,21 @@ impl FrameProcessor for MboProcessor {
             }
         }
 
-        // Instruments whose book changed this frame; depth is emitted once per frame per instrument
+        // Instruments whose book changed this datagram; depth is emitted once per datagram per instrument
         // (coalescing many order events into a single full-state snapshot). BTreeSet gives
-        // deterministic ascending instrument_id order across frames touching multiple instruments.
+        // deterministic ascending instrument_id order across datagrams touching multiple instruments.
         let mut changed: BTreeSet<u32> = BTreeSet::new();
-        // Instruments whose book the frame *reached*, changed or not: a delta that opened a gap drops
+        // Instruments whose book the datagram *reached*, changed or not: a delta that opened a gap drops
         // the book to `Recovering` without changing it, and the arbiter must hear about that.
         let mut touched: BTreeSet<u32> = BTreeSet::new();
         // Instruments whose whole book must be republished: a snapshot install, or a reveal, after which
         // the consumer has never seen this identity's book.
         let mut rebaselined: BTreeSet<u32> = BTreeSet::new();
         // Instruments a reveal moved to a new `MarketKey` that the rate limit refused to republish
-        // whole: they owe the consumer a bare `Clear` rather than this frame's incrementals — see
+        // whole: they owe the consumer a bare `Clear` rather than this datagram's incrementals — see
         // [`MboProcessor::on_reveal`].
         let mut cleared: BTreeSet<u32> = BTreeSet::new();
-        self.frame_changes.clear();
+        self.datagram_changes.clear();
 
         for msg in messages {
             match msg {
@@ -1902,7 +1908,7 @@ impl FrameProcessor for MboProcessor {
                     }
                     touched.insert(s.instrument_id);
                 }
-                // BatchBoundary is an emission-coalescing hint; we already emit once per frame.
+                // BatchBoundary is an emission-coalescing hint; we already emit once per datagram.
                 codec_mbo::Message::BatchBoundary(_, _) | codec_mbo::Message::Heartbeat => {}
                 // Catches `Other`, and — since match guards don't count toward exhaustiveness —
                 // also `ManifestSummary`/`InstrumentDefinition` on a role that doesn't handle
@@ -1920,7 +1926,7 @@ impl FrameProcessor for MboProcessor {
         for instrument_id in changed {
             self.emit_depth(instrument_id, ctx);
             // `depth` is full state, so a reveal never has to withhold it; only the incremental
-            // product does. A snapshot install in the same frame outranks the rate limit's bare
+            // product does. A snapshot install in the same datagram outranks the rate limit's bare
             // clear — it already has the content the clear would have withheld.
             let mode = if rebaselined.contains(&instrument_id) {
                 BookEmit::Rebaseline
@@ -2065,7 +2071,7 @@ impl MbpProcessor {
     /// Counted in `dz_source_id_changed_total{venue}` (the new venue), and purges the stale
     /// `(old_venue, channel, instrument_id)` `InstrumentSnapshot` entry the same way (see there) —
     /// `key.1`/`key.2` are unaffected by the Source ID change, so no separate memo is needed.
-    fn reveal_if_needed(&mut self, ctx: &FrameCtx, key: PriceBookKey, source_id: u16) -> bool {
+    fn reveal_if_needed(&mut self, ctx: &DatagramCtx, key: PriceBookKey, source_id: u16) -> bool {
         let previous = self.revealed.get(&key).copied();
         if previous == Some(source_id) {
             return false;
@@ -2122,9 +2128,9 @@ impl MbpProcessor {
             .map(|d| (d.price_exponent, d.qty_exponent))
     }
 
-    /// Record this frame's `Reset Count` for `(publisher, channel)`, returning the previous one.
+    /// Record this datagram's `Reset Count` for `(publisher, channel)`, returning the previous one.
     /// Bounded to [`MAX_CHANNEL_KEYS`] with least-recently-inserted eviction; an evicted live
-    /// publisher simply re-anchors its baseline on its next frame (reporting no reset for it).
+    /// publisher simply re-anchors its baseline on its next datagram (reporting no reset for it).
     fn note_reset_count(&mut self, publisher: IpAddr, channel: u8, reset_count: u8) -> Option<u8> {
         let key = (publisher, channel);
         if !self.last_reset.contains_key(&key) {
@@ -2149,7 +2155,7 @@ impl MbpProcessor {
     /// [`Self::with_book`], which is what keeps [`Self::buffered_total`] honest.
     fn ensure_book(
         &mut self,
-        ctx: &FrameCtx,
+        ctx: &DatagramCtx,
         channel: u8,
         instrument_id: u32,
     ) -> Option<PriceBookKey> {
@@ -2255,7 +2261,7 @@ impl MbpProcessor {
     /// under budget. Finding the largest is O(books), which is fine because overflow is rare and the
     /// check that gates it is O(1). Never takes the channel down: every other instrument keeps
     /// streaming and the dropped one recovers on its next snapshot.
-    fn enforce_buffer_budget(&mut self, ctx: &FrameCtx) {
+    fn enforce_buffer_budget(&mut self, ctx: &DatagramCtx) {
         while self.buffered_total > MAX_BUFFERED_DELTAS_ACROSS_BOOKS {
             // The path that filled the budget is the one sending, so take its own largest buffer
             // first: a global maximum would let one flooding path cost a peer path its recovering book.
@@ -2274,8 +2280,8 @@ impl MbpProcessor {
     }
 
     /// Report one book's `Ready`-ness for its market, but only when it changed: an unhealthy path
-    /// loses the market to its peer, so this is a transition signal rather than a per-frame one.
-    fn report_health(&mut self, ctx: &FrameCtx, key: &PriceBookKey, healthy: bool) {
+    /// loses the market to its peer, so this is a transition signal rather than a per-datagram one.
+    fn report_health(&mut self, ctx: &DatagramCtx, key: &PriceBookKey, healthy: bool) {
         if self.health_reported.get(key) == Some(&healthy) {
             return;
         }
@@ -2293,7 +2299,7 @@ impl MbpProcessor {
         // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
         // instrument universe, so a report filed without it targets nothing the gate ever admitted.
         // `ctx.canonical_channel`, not the raw `key.1`, so a mirror path's health report lands on
-        // the SAME `MarketKey` `send_book` admits its `book` under — see `FrameCtx::canonical_channel`.
+        // the SAME `MarketKey` `send_book` admits its `book` under — see `DatagramCtx::canonical_channel`.
         let market: MarketKey = (
             venue_arc(venue),
             category_arc(ctx.category),
@@ -2309,7 +2315,7 @@ impl MbpProcessor {
     /// data first. `RefDataState` is per publisher rather than per channel, so a sharded publisher's
     /// reset clears every channel's definitions — an over-approximation that self-heals on the next
     /// reference-data burst.
-    fn on_channel_reset(&mut self, ctx: &FrameCtx, channel: u8, reset_count: u8) {
+    fn on_channel_reset(&mut self, ctx: &DatagramCtx, channel: u8, reset_count: u8) {
         let keys: Vec<PriceBookKey> = self
             .books
             .keys()
@@ -2325,7 +2331,7 @@ impl MbpProcessor {
             .retain(|(p, c, _)| !(*p == ctx.publisher && *c == channel));
         self.open.remove(&(ctx.publisher, channel));
         if let Some(state) = self.state.state_mut(ctx.publisher) {
-            state.on_frame(reset_count);
+            state.on_datagram(reset_count);
         }
         metrics()
             .mbp_channel_resets
@@ -2354,7 +2360,7 @@ impl MbpProcessor {
     /// Emit a full re-baseline for one instrument: `Clear{Both}` then every level it now holds.
     /// `changes[0].action == Clear` is what re-baselines a consumer (the `snapshot` flag is
     /// advisory), so this is a batch rather than a distinct message type.
-    fn emit_rebaseline(&self, ctx: &FrameCtx, channel: u8, instrument_id: u32) {
+    fn emit_rebaseline(&self, ctx: &DatagramCtx, channel: u8, instrument_id: u32) {
         let Some(book) = self.books.get(&(ctx.publisher, channel, instrument_id)) else {
             return;
         };
@@ -2387,7 +2393,7 @@ impl MbpProcessor {
     /// so a snapshot-only re-baseline from `emit_rebaseline` can never slip out ahead of a reveal).
     fn send_book(
         &self,
-        ctx: &FrameCtx,
+        ctx: &DatagramCtx,
         channel: u8,
         instrument_id: u32,
         changes: Vec<BookChange>,
@@ -2465,9 +2471,9 @@ fn divergence_label(d: Divergence) -> &'static str {
     }
 }
 
-impl FrameProcessor for MbpProcessor {
-    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx) {
-        let (header, messages) = match codec_mbp::decode_frame(buf) {
+impl DatagramProcessor for MbpProcessor {
+    fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx) {
+        let (header, messages) = match codec_mbp::decode_datagram(buf) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(suppressed) = self.decode_warn.allow() {
@@ -2476,14 +2482,16 @@ impl FrameProcessor for MbpProcessor {
                 return;
             }
         };
-        // The channel comes from this codec's own frame header rather than `FrameCtx`: `drive` is
+        // The channel comes from this codec's own datagram header rather than `DatagramCtx`: `drive` is
         // protocol-agnostic and would have to decode a header it has no magic for.
         let channel = header.channel_id;
 
         let handle_refdata = ctx.role.handles_refdata();
 
         if handle_refdata {
-            self.state.get(ctx.publisher).on_frame(header.reset_count);
+            self.state
+                .get(ctx.publisher)
+                .on_datagram(header.reset_count);
             // The only `get()` this function makes that can evict a publisher: the
             // `ManifestSummary`/`InstrumentDefinition` branches below are gated on this same
             // `handle_refdata`, so they land on a publisher already inserted here and never
@@ -2515,20 +2523,20 @@ impl FrameProcessor for MbpProcessor {
             self.on_channel_reset(ctx, channel, header.reset_count);
         }
 
-        // Wire changes per instrument, emitted once per frame; a `BTreeMap` gives deterministic
-        // ascending-id order across a multi-instrument frame, matching `MboProcessor`'s `BTreeSet`.
+        // Wire changes per instrument, emitted once per datagram; a `BTreeMap` gives deterministic
+        // ascending-id order across a multi-instrument datagram, matching `MboProcessor`'s `BTreeSet`.
         let mut accum: BTreeMap<u32, Vec<BookChange>> = BTreeMap::new();
-        // Instruments touched since the previous `BatchBoundary`, and since the frame started (for
-        // the health sweep). Both are frame-scoped: the publisher and channel are fixed per datagram.
+        // Instruments touched since the previous `BatchBoundary`, and since the datagram started (for
+        // the health sweep). Both are datagram-scoped: the publisher and channel are fixed per datagram.
         let mut since_boundary: BTreeSet<u32> = BTreeSet::new();
         let mut touched: BTreeSet<u32> = BTreeSet::new();
-        // Instruments that revealed their Source ID for the FIRST time this frame. Decided once,
-        // at frame's end (not inline per message): a reveal can be followed by more deltas for the
-        // SAME instrument later in the SAME frame, and those must still coalesce into ONE batch
+        // Instruments that revealed their Source ID for the FIRST time this datagram. Decided once,
+        // at datagram's end (not inline per message): a reveal can be followed by more deltas for the
+        // SAME instrument later in the SAME datagram, and those must still coalesce into ONE batch
         // with the reveal, not a second separate message — so the choice between "full
-        // re-baseline" and "this frame's incremental batch" is made per instrument after every
+        // re-baseline" and "this datagram's incremental batch" is made per instrument after every
         // message has been applied, exactly where `accum` is already drained per instrument.
-        let mut revealed_this_frame: BTreeSet<u32> = BTreeSet::new();
+        let mut revealed_this_datagram: BTreeSet<u32> = BTreeSet::new();
         // Moved out so the `&mut self` book calls below can borrow it; put back before returning.
         let mut cleared = std::mem::take(&mut self.cleared);
 
@@ -2622,7 +2630,7 @@ impl FrameProcessor for MbpProcessor {
                     };
                     self.record_outcome(ctx.venue, &outcome);
                     if self.reveal_if_needed(ctx, key, l.source_id) {
-                        revealed_this_frame.insert(l.instrument_id);
+                        revealed_this_datagram.insert(l.instrument_id);
                     }
                     if matches!(outcome, DeltaOutcome::Applied { .. }) {
                         // Quantity alone decides the action, exactly as the apply does: `0` removes
@@ -2670,7 +2678,7 @@ impl FrameProcessor for MbpProcessor {
                     };
                     self.record_outcome(ctx.venue, &outcome);
                     if self.reveal_if_needed(ctx, key, c.source_id) {
-                        revealed_this_frame.insert(c.instrument_id);
+                        revealed_this_datagram.insert(c.instrument_id);
                     }
                     if !matches!(outcome, DeltaOutcome::Applied { .. }) {
                         continue;
@@ -2836,17 +2844,17 @@ impl FrameProcessor for MbpProcessor {
                         .unwrap_or(false);
                     if installed {
                         // The re-baseline replaces everything accumulated for this instrument so
-                        // far, and goes out here (not deferred to the frame-end sweep below) so a
-                        // delta later in the same frame follows it as an incremental batch. Also
-                        // clears `revealed_this_frame` for it: an earlier message this same frame
+                        // far, and goes out here (not deferred to the end-of-datagram sweep below) so a
+                        // delta later in the same datagram follows it as an incremental batch. Also
+                        // clears `revealed_this_datagram` for it: an earlier message this same datagram
                         // may have already revealed this instrument, but the "needs a full
                         // re-baseline because it was just revealed" need is satisfied by the
                         // unconditional full re-baseline right here — leaving the entry would make
-                        // the frame-end sweep either double-emit an identical re-baseline (nothing
-                        // else touches this instrument again this frame) or turn a later delta's
+                        // the end-of-datagram sweep either double-emit an identical re-baseline (nothing
+                        // else touches this instrument again this datagram) or turn a later delta's
                         // legitimate incremental batch into a second, redundant full one.
                         accum.remove(&e.instrument_id);
-                        revealed_this_frame.remove(&e.instrument_id);
+                        revealed_this_datagram.remove(&e.instrument_id);
                         self.emit_rebaseline(ctx, channel, e.instrument_id);
                     }
                 }
@@ -2918,7 +2926,7 @@ impl FrameProcessor for MbpProcessor {
                     let (price_exponent, qty_exponent) = (def.price_exponent, def.qty_exponent);
                     // A Trade doesn't touch the book, but the book may already hold real content
                     // from an earlier (silently applied) snapshot — if this is the reveal, the
-                    // end-of-frame sweep below forces a full re-baseline so that content isn't
+                    // end-of-datagram sweep below forces a full re-baseline so that content isn't
                     // left permanently unshown, even though this message never touches `accum`.
                     // Routed through `ensure_book` (not a bare key tuple) so `revealed` never holds
                     // an entry `books` doesn't also hold — the same lockstep every other revealing
@@ -2927,7 +2935,7 @@ impl FrameProcessor for MbpProcessor {
                     // `send_book` for it; this only fixes the bookkeeping invariant, not emission.
                     if let Some(key) = self.ensure_book(ctx, channel, t.instrument_id) {
                         if self.reveal_if_needed(ctx, key, t.source_id) {
-                            revealed_this_frame.insert(t.instrument_id);
+                            revealed_this_datagram.insert(t.instrument_id);
                         }
                     }
                     let venue: &'static str = source_label(t.source_id);
@@ -2937,8 +2945,8 @@ impl FrameProcessor for MbpProcessor {
                         source: source.clone(),
                         source_id: t.source_id,
                         symbol,
-                        // `channel` is this frame's header channel id, canonicalized for
-                        // consumer-facing identity (see `FrameCtx::canonical_channel`) — a mirror
+                        // `channel` is this datagram's header channel id, canonicalized for
+                        // consumer-facing identity (see `DatagramCtx::canonical_channel`) — a mirror
                         // publisher's `N + offset` becomes the same `N` its peer path carries, so
                         // the history/catalog see one market rather than two. This is still the
                         // field that disambiguates a price-aggregated venue's mirrored paths
@@ -2979,27 +2987,27 @@ impl FrameProcessor for MbpProcessor {
         cleared.clear();
         self.cleared = cleared;
         self.enforce_buffer_budget(ctx);
-        // One batch per instrument, `last: true`: a frame is one logical event per instrument, since
+        // One batch per instrument, `last: true`: a datagram is one logical event per instrument, since
         // cross-instrument atomicity is not promised. A clear that removed nothing has no changes to
         // publish.
         //
-        // An instrument revealed THIS frame always gets the full current book (`emit_rebaseline`),
-        // never this frame's own incremental `accum` batch alone — a consumer that has never seen
+        // An instrument revealed THIS datagram always gets the full current book (`emit_rebaseline`),
+        // never this datagram's own incremental `accum` batch alone — a consumer that has never seen
         // the market has no prior state an incremental update could apply against, and a reveal can
-        // be followed by more deltas for the SAME instrument later in the SAME frame, which must
+        // be followed by more deltas for the SAME instrument later in the SAME datagram, which must
         // still coalesce into that one re-baseline rather than a second, separate message.
         let accum_keys: BTreeSet<u32> = accum.keys().copied().collect();
         for (instrument_id, changes) in accum {
-            if revealed_this_frame.contains(&instrument_id) {
+            if revealed_this_datagram.contains(&instrument_id) {
                 self.emit_rebaseline(ctx, channel, instrument_id);
             } else if !changes.is_empty() {
                 self.send_book(ctx, channel, instrument_id, changes, false);
             }
         }
-        // Revealed this frame via a message with no book-content representation of its own
-        // (`Trade`) and no accompanying delta this frame, so it never entered `accum` above — still
+        // Revealed this datagram via a message with no book-content representation of its own
+        // (`Trade`) and no accompanying delta this datagram, so it never entered `accum` above — still
         // show whatever the book already holds (e.g. from an earlier silently-applied snapshot).
-        for instrument_id in &revealed_this_frame {
+        for instrument_id in &revealed_this_datagram {
             if !accum_keys.contains(instrument_id) {
                 self.emit_rebaseline(ctx, channel, *instrument_id);
             }
@@ -3040,15 +3048,15 @@ mod tests {
             arbiter::{lock, Arbiter, SharedArbiter, Transport},
             codec_mbo::{
                 tests::{
-                    enc_end_of_session, enc_instrument_reset, enc_order_add, enc_order_cancel,
-                    enc_snapshot_begin, enc_snapshot_end, enc_snapshot_order, frame,
+                    datagram, enc_end_of_session, enc_instrument_reset, enc_order_add,
+                    enc_order_cancel, enc_snapshot_begin, enc_snapshot_end, enc_snapshot_order,
                 },
                 InstrumentReset, OrderAdd, OrderCancel, SnapshotBegin, SnapshotEnd, SnapshotOrder,
                 MSG_INSTRUMENT_DEFINITION, MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
             },
             codec_mbp::{self, tests as mbp_wire, SIDE_ASK as MBP_ASK, SIDE_BID as MBP_BID},
             pricebook::{BookDelta, DeltaOp as PriceDeltaOp, Status as BookStatus},
-            receiver::{FrameCtx, FrameProcessor, PortRole},
+            receiver::{DatagramCtx, DatagramProcessor, PortRole},
         },
         metrics::metrics,
         model::{
@@ -3150,7 +3158,7 @@ mod tests {
     fn refdata_reset_is_scoped_to_the_publisher_that_reset() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        /// Rewrite a frame's `reset_count` (frame-header byte 21) to simulate a publisher restart.
+        /// Rewrite a datagram's `reset_count` (datagram-header byte 21) to simulate a publisher restart.
         fn with_reset_count(mut f: Vec<u8>, n: u8) -> Vec<u8> {
             f[21] = n;
             f
@@ -3168,12 +3176,12 @@ mod tests {
             c.publisher = publisher;
             c
         };
-        let burst = frame(&[
+        let burst = datagram(&[
             enc_manifest_summary(1, 1),
             enc_instrument_def(0, "INST-0", 1),
         ]);
         let anchor = |sid: u32| {
-            frame(&[
+            datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -3195,16 +3203,16 @@ mod tests {
         }
         let _ = drain_depth_ts(&mut rx);
 
-        // A restarts: its `reset_count` bumps on A's frames only, clearing A's definitions. An
-        // empty frame, so the clear isn't immediately undone by the burst that would follow it.
+        // A restarts: its `reset_count` bumps on A's datagrams only, clearing A's definitions. An
+        // empty datagram, so the clear isn't immediately undone by the burst that would follow it.
         proc.on_datagram(
-            &with_reset_count(frame(&[]), 1),
+            &with_reset_count(datagram(&[]), 1),
             &ctx_for(pub_a, PortRole::Refdata),
         );
 
         // A is dark until its next burst (no definition -> no book -> no depth) ...
         proc.on_datagram(
-            &frame(&[add(1, 100, 7000)]),
+            &datagram(&[add(1, 100, 7000)]),
             &ctx_for(pub_a, PortRole::Mktdata),
         );
         assert!(
@@ -3214,7 +3222,7 @@ mod tests {
 
         // ... but B, which never reset, keeps streaming.
         proc.on_datagram(
-            &frame(&[add(1, 101, 8000)]),
+            &datagram(&[add(1, 101, 8000)]),
             &ctx_for(pub_b, PortRole::Mktdata),
         );
         assert_eq!(
@@ -3304,7 +3312,7 @@ mod tests {
         out
     }
 
-    /// The single-publisher source IP `make_ctx` stamps on every frame, so book-map keys in these
+    /// The single-publisher source IP `make_ctx` stamps on every datagram, so book-map keys in these
     /// tests are `(TEST_PUB, instrument_id)` (the MBO books re-key by publisher).
     const TEST_PUB: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
 
@@ -3312,8 +3320,8 @@ mod tests {
         arbiter: &'a SharedArbiter,
         instruments: &'a crate::model::InstrumentSnapshot,
         role: PortRole,
-    ) -> FrameCtx<'a> {
-        FrameCtx {
+    ) -> DatagramCtx<'a> {
+        DatagramCtx {
             venue: "TV",
             category: "testcategory",
             arbiter,
@@ -3338,13 +3346,13 @@ mod tests {
         ids
     }
 
-    /// TOB-magic (0x445A) frame wrapper — same header shape as `codec_mbo::tests::frame`, but with
+    /// TOB-magic (0x445A) datagram wrapper — same header shape as `codec_mbo::tests::datagram`, but with
     /// `codec::MAGIC` so these decode under `TobProcessor` rather than `MboProcessor`. `sequence` is
-    /// explicit (unlike the MBO/MBP helpers' fixed `0`) so a caller can send several frames on one
+    /// explicit (unlike the MBO/MBP helpers' fixed `0`) so a caller can send several datagrams on one
     /// channel without a later one reading as stale against an earlier one.
-    fn tob_frame(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
+    fn tob_datagram(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
         let body: Vec<u8> = messages.concat();
-        let frame_len = (crate::ingest::codec_common::FRAME_HEADER_SIZE + body.len()) as u16;
+        let datagram_len = (crate::ingest::codec_common::DATAGRAM_HEADER_SIZE + body.len()) as u16;
         let mut f = Vec::new();
         f.extend_from_slice(&crate::ingest::codec::MAGIC.to_le_bytes());
         f.push(1); // schema version
@@ -3353,20 +3361,20 @@ mod tests {
         f.extend_from_slice(&0u64.to_le_bytes()); // send ts
         f.push(messages.len() as u8);
         f.push(0); // reset count
-        f.extend_from_slice(&frame_len.to_le_bytes());
+        f.extend_from_slice(&datagram_len.to_le_bytes());
         f.extend_from_slice(&body);
         f
     }
 
-    /// [`tob_frame`], but stamped with Schema Version 3 — for the tests exercising a v3
+    /// [`tob_datagram`], but stamped with Schema Version 3 — for the tests exercising a v3
     /// `InstrumentDefinition`'s own Source ID.
-    fn tob_frame_v3(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
-        let mut f = tob_frame(sequence, messages);
+    fn tob_datagram_v3(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = tob_datagram(sequence, messages);
         f[2] = 3;
         f
     }
 
-    /// Minimal TOB `Quote` body encoder (60-byte body — matches `codec::tests::encode_quote_frame`'s
+    /// Minimal TOB `Quote` body encoder (60-byte body — matches `codec::tests::encode_quote_datagram`'s
     /// layout byte-for-byte) — enough to reveal `(publisher, instrument_id)` under a given Source ID.
     /// Content (prices/qtys) is arbitrary; these tests assert on the `Instrument` announcement, not
     /// the quote itself.
@@ -3402,7 +3410,7 @@ mod tests {
         instruments: &'a crate::model::InstrumentSnapshot,
         role: PortRole,
         publisher: IpAddr,
-    ) -> FrameCtx<'a> {
+    ) -> DatagramCtx<'a> {
         let mut c = make_ctx(arbiter, instruments, role);
         c.publisher = publisher;
         c
@@ -3419,7 +3427,7 @@ mod tests {
         let ctx = |role| tob_ctx(&arbiter, &instruments, role, TEST_PUB);
 
         proc.on_datagram(
-            &tob_frame(
+            &tob_datagram(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3429,7 +3437,7 @@ mod tests {
             &ctx(PortRole::Combined),
         );
         proc.on_datagram(
-            &tob_frame(1, &[enc_tob_quote(41, 1, 1_000)]),
+            &tob_datagram(1, &[enc_tob_quote(41, 1, 1_000)]),
             &ctx(PortRole::Mktdata),
         );
         let mut seen = Vec::new();
@@ -3445,7 +3453,7 @@ mod tests {
             .with_label_values(&["PHOENIX"])
             .get();
         proc.on_datagram(
-            &tob_frame(2, &[enc_tob_quote(41, 2, 2_000)]),
+            &tob_datagram(2, &[enc_tob_quote(41, 2, 2_000)]),
             &ctx(PortRole::Mktdata),
         );
         let mut seen = Vec::new();
@@ -3484,7 +3492,7 @@ mod tests {
         let ctx = |role| tob_ctx(&arbiter, &instruments, role, TEST_PUB);
 
         proc.on_datagram(
-            &tob_frame(
+            &tob_datagram(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3494,11 +3502,11 @@ mod tests {
             &ctx(PortRole::Combined),
         );
         proc.on_datagram(
-            &tob_frame(1, &[enc_tob_quote(41, 1, 1_000)]),
+            &tob_datagram(1, &[enc_tob_quote(41, 1, 1_000)]),
             &ctx(PortRole::Mktdata),
         );
         proc.on_datagram(
-            &tob_frame(2, &[enc_tob_quote(41, 2, 2_000)]),
+            &tob_datagram(2, &[enc_tob_quote(41, 2, 2_000)]),
             &ctx(PortRole::Mktdata),
         );
         while rx.try_recv().is_ok() {}
@@ -3547,7 +3555,7 @@ mod tests {
         let ctx = tob_ctx(&arbiter, &instruments, PortRole::Combined, TEST_PUB);
 
         proc.on_datagram(
-            &tob_frame_v3(
+            &tob_datagram_v3(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3559,7 +3567,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         proc.on_datagram(
-            &tob_frame_v3(
+            &tob_datagram_v3(
                 1,
                 &[enc_instrument_def_v3_with_exponents(
                     41, 2, "INST-41", 1, -2, 0,
@@ -3591,7 +3599,7 @@ mod tests {
         let ctx = tob_ctx(&arbiter, &instruments, PortRole::Combined, TEST_PUB);
 
         proc.on_datagram(
-            &tob_frame_v3(
+            &tob_datagram_v3(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3626,7 +3634,7 @@ mod tests {
         let ctx = tob_ctx(&arbiter, &instruments, PortRole::Combined, TEST_PUB);
 
         proc.on_datagram(
-            &tob_frame(
+            &tob_datagram(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3641,7 +3649,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &tob_frame(1, &[enc_tob_quote(41, 1, 1_000)]),
+            &tob_datagram(1, &[enc_tob_quote(41, 1, 1_000)]),
             &tob_ctx(&arbiter, &instruments, PortRole::Mktdata, TEST_PUB),
         );
         let mut seen = Vec::new();
@@ -3670,7 +3678,7 @@ mod tests {
         // The first publisher gets a full reveal (both maps populated for it); every later one only
         // sends refdata, so `pending_channel` is the map that would otherwise leak unboundedly.
         proc.on_datagram(
-            &tob_frame(
+            &tob_datagram(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3680,7 +3688,7 @@ mod tests {
             &tob_ctx(&arbiter, &instruments, PortRole::Combined, ip(0)),
         );
         proc.on_datagram(
-            &tob_frame(1, &[enc_tob_quote(41, 1, 1_000)]),
+            &tob_datagram(1, &[enc_tob_quote(41, 1, 1_000)]),
             &tob_ctx(&arbiter, &instruments, PortRole::Mktdata, ip(0)),
         );
         let _ = rx.try_recv();
@@ -3690,7 +3698,7 @@ mod tests {
         let flood = (MAX_PUBLISHERS as u32) + 50;
         for i in 1..flood {
             proc.on_datagram(
-                &tob_frame(
+                &tob_datagram(
                     0,
                     &[
                         enc_manifest_summary(1, 1),
@@ -3733,7 +3741,7 @@ mod tests {
         let ctx = |role| tob_ctx(&arbiter, &instruments, role, TEST_PUB);
 
         proc.on_datagram(
-            &tob_frame(
+            &tob_datagram(
                 0,
                 &[
                     enc_manifest_summary(1, 1),
@@ -3743,7 +3751,7 @@ mod tests {
             &ctx(PortRole::Combined),
         );
         proc.on_datagram(
-            &tob_frame(1, &[enc_tob_quote(41, 1, 1_000)]),
+            &tob_datagram(1, &[enc_tob_quote(41, 1, 1_000)]),
             &ctx(PortRole::Mktdata),
         );
         let _ = rx.try_recv();
@@ -3751,7 +3759,7 @@ mod tests {
         assert!(proc.pending_channel.contains_key(&(TEST_PUB, 41)));
 
         proc.on_datagram(
-            &tob_frame(2, &[enc_tob_channel_reset(9_999)]),
+            &tob_datagram(2, &[enc_tob_channel_reset(9_999)]),
             &ctx(PortRole::Combined),
         );
 
@@ -3766,7 +3774,7 @@ mod tests {
     }
 
     /// Minimal MBO `Trade` body encoder (52-byte message, same layout as TOB's `Trade` — see
-    /// `codec::tests::encode_trade_frame`) — a print with no book effect at all, for the tests
+    /// `codec::tests::encode_trade_datagram`) — a print with no book effect at all, for the tests
     /// below that need a reveal/id-change with zero chance of moving the book's own top-N.
     fn enc_mbo_trade(instrument_id: u32, source_id: u16) -> Vec<u8> {
         let mut b = vec![
@@ -3806,7 +3814,7 @@ mod tests {
         let mut proc = MboProcessor::new(depth, tape(false));
         let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
 
-        let burst = frame(&[
+        let burst = datagram(&[
             enc_manifest_summary(1, 1),
             enc_instrument_def(0, "INST-0", 1),
         ]);
@@ -3836,10 +3844,10 @@ mod tests {
         );
     }
 
-    /// [`frame`], but stamped with Schema Version 3 — for the tests exercising a v3
+    /// [`datagram`], but stamped with Schema Version 3 — for the tests exercising a v3
     /// `InstrumentDefinition`'s own Source ID.
-    fn mbo_frame_v3(messages: &[Vec<u8>]) -> Vec<u8> {
-        let mut f = frame(messages);
+    fn mbo_datagram_v3(messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = datagram(messages);
         f[2] = 3;
         f
     }
@@ -3858,7 +3866,7 @@ mod tests {
         let combined = make_ctx(&arbiter, &instruments, PortRole::Combined);
 
         proc.on_datagram(
-            &mbo_frame_v3(&[
+            &mbo_datagram_v3(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def_v3(0, 1, "INST-0", 1),
             ]),
@@ -3899,7 +3907,7 @@ mod tests {
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def(0, "INST-0", 1),
             ]),
@@ -3910,7 +3918,7 @@ mod tests {
             "a v1 definition carries no Source ID; nothing is emitted at definition time"
         );
 
-        proc.on_datagram(&frame(&[add(1, 100, 5_000)]), &mkt);
+        proc.on_datagram(&datagram(&[add(1, 100, 5_000)]), &mkt);
         let seen = drain_all(&mut rx);
         assert!(
             seen.iter().any(|m| matches!(m, FeedMessage::Instrument(_))),
@@ -3936,14 +3944,14 @@ mod tests {
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def(0, "INST-0", 1),
             ]),
             &combined,
         );
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -3962,7 +3970,7 @@ mod tests {
         );
         // Reveal + establish the top-N under Source ID 0 (`add`'s fixed id — synthesizes
         // "SOURCE_0", since 0 has no registry row): one resting bid.
-        proc.on_datagram(&frame(&[add(1, 100, 5_000)]), &mkt);
+        proc.on_datagram(&datagram(&[add(1, 100, 5_000)]), &mkt);
         let first = drain_all(&mut rx);
         let venues: Vec<String> = first
             .iter()
@@ -3989,7 +3997,7 @@ mod tests {
         // It never touches the book — the published top-N is byte-for-byte identical to what
         // `emit_depth` last recorded — which is exactly the case `last_top` would otherwise
         // suppress, leaving the new venue with an `instrument` and no `depth` at all.
-        proc.on_datagram(&frame(&[enc_mbo_trade(0, 2)]), &mkt);
+        proc.on_datagram(&datagram(&[enc_mbo_trade(0, 2)]), &mkt);
         let second = drain_all(&mut rx);
         let venues: Vec<String> = second
             .iter()
@@ -4037,13 +4045,13 @@ mod tests {
         let mut manifest = enc_manifest_summary(5, 1);
         manifest[5] = 0; // body+1 is the `valid` byte; force the live-feed Valid=0 case
         proc.on_datagram(
-            &frame(&[manifest, enc_instrument_def(0, "INST-0", 5)]),
+            &datagram(&[manifest, enc_instrument_def(0, "INST-0", 5)]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
 
         // Empty-book anchor (anchor_seq=0, last_instrument_seq=0), then a contiguous delta (seq 1).
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4061,7 +4069,7 @@ mod tests {
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &frame(&[enc_order_add(&OrderAdd {
+            &datagram(&[enc_order_add(&OrderAdd {
                 instrument_id: 0,
                 source_id: 0,
                 side: SIDE_BID,
@@ -4102,14 +4110,14 @@ mod tests {
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, tape(false));
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def(0, "INST-0", 1),
             ]),
             &make_ctx(arbiter, instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4158,13 +4166,13 @@ mod tests {
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
-        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
-        proc.on_datagram(&frame(&[add(2, 101, 100)]), &mkt); // stale-clock tick -> dropped (the wedge)
-        proc.on_datagram(&frame(&[enc_end_of_session(6000)]), &mkt); // floor cleared, book -> Recovering
-                                                                     // New session: re-snapshot (empty anchor; the fresh book's depth(0) re-opens the cleared
-                                                                     // floor), then a restarted-seq, restarted-clock delta.
+        proc.on_datagram(&datagram(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+        proc.on_datagram(&datagram(&[add(2, 101, 100)]), &mkt); // stale-clock tick -> dropped (the wedge)
+        proc.on_datagram(&datagram(&[enc_end_of_session(6000)]), &mkt); // floor cleared, book -> Recovering
+                                                                        // New session: re-snapshot (empty anchor; the fresh book's depth(0) re-opens the cleared
+                                                                        // floor), then a restarted-seq, restarted-clock delta.
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4181,7 +4189,7 @@ mod tests {
             ]),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
-        proc.on_datagram(&frame(&[add(1, 102, 50)]), &mkt); // new-session tick below the old high-water
+        proc.on_datagram(&datagram(&[add(1, 102, 50)]), &mkt); // new-session tick below the old high-water
 
         // No leading `0`: `synced_mbo_proc`'s own empty-anchor setup carries no Source ID (the
         // snapshot machinery never does), so it stays deferred and emits nothing — the first
@@ -4211,7 +4219,7 @@ mod tests {
             arbiter: &'a SharedArbiter,
             instruments: &'a crate::model::InstrumentSnapshot,
             role: PortRole,
-        ) -> FrameCtx<'a> {
+        ) -> DatagramCtx<'a> {
             let mut c = make_ctx(arbiter, instruments, role);
             c.publisher = publisher;
             c
@@ -4225,7 +4233,7 @@ mod tests {
         // which is what they do on the wire, sharing one refdata port.
         for publisher in [pub_a, pub_b] {
             proc.on_datagram(
-                &frame(&[
+                &datagram(&[
                     enc_manifest_summary(1, 1),
                     enc_instrument_def(0, "INST-0", 1),
                 ]),
@@ -4233,7 +4241,7 @@ mod tests {
             );
         }
         let anchor = |sid: u32| {
-            frame(&[
+            datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4259,22 +4267,22 @@ mod tests {
             &ctx_for(pub_b, &arbiter, &instruments, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &frame(&[add(1, 100, 5000)]),
+            &datagram(&[add(1, 100, 5000)]),
             &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
         );
         proc.on_datagram(
-            &frame(&[add(1, 100, 5000)]),
+            &datagram(&[add(1, 100, 5000)]),
             &ctx_for(pub_b, &arbiter, &instruments, PortRole::Mktdata),
         );
         // A's EndOfSession resets BOTH books and clears the floor.
         proc.on_datagram(
-            &frame(&[enc_end_of_session(6000)]),
+            &datagram(&[enc_end_of_session(6000)]),
             &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
         );
         // B's old-session tail (would be depth(5001), re-latching the old high-water) is buffered
         // by B's now-Recovering book instead: nothing emits, the floor stays open.
         proc.on_datagram(
-            &frame(&[add(2, 101, 5001)]),
+            &datagram(&[add(2, 101, 5001)]),
             &ctx_for(pub_b, &arbiter, &instruments, PortRole::Mktdata),
         );
         // B re-syncs in the new session and its restarted-clock depth is admitted.
@@ -4283,7 +4291,7 @@ mod tests {
             &ctx_for(pub_b, &arbiter, &instruments, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &frame(&[add(1, 102, 50)]),
+            &datagram(&[add(1, 102, 50)]),
             &ctx_for(pub_b, &arbiter, &instruments, PortRole::Mktdata),
         );
 
@@ -4310,10 +4318,10 @@ mod tests {
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
-        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
-                                                              // Reset for an id with no definition, no emitted depth, no book -> venue-wide clear.
+        proc.on_datagram(&datagram(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+                                                                 // Reset for an id with no definition, no emitted depth, no book -> venue-wide clear.
         proc.on_datagram(
-            &frame(&[enc_instrument_reset(&InstrumentReset {
+            &datagram(&[enc_instrument_reset(&InstrumentReset {
                 instrument_id: 99,
                 reason: 1,
                 new_anchor_seq: 0,
@@ -4323,7 +4331,7 @@ mod tests {
         );
         // Instrument 0's still-synced book emits at the restarted (lower) clock: admitted only if
         // the venue-wide fallback cleared the floor.
-        proc.on_datagram(&frame(&[add(2, 101, 100)]), &mkt);
+        proc.on_datagram(&datagram(&[add(2, 101, 100)]), &mkt);
 
         // No leading `0`: the setup's empty-anchor sync carries no Source ID, so it stays
         // deferred and emits nothing until `add(1,100,5000)` both reveals instrument 0 and shows
@@ -4347,18 +4355,18 @@ mod tests {
         let mut proc = synced_mbo_proc(&arbiter, &instruments); // id 0 -> "INST-0" (manifest 1)
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
-        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // floor latched under INST-0
-                                                              // Manifest bump remaps id 0 to another symbol; the reset must clear the LATCHED
-                                                              // symbol (INST-0), not the current definition's (INST-9).
+        proc.on_datagram(&datagram(&[add(1, 100, 5000)]), &mkt); // floor latched under INST-0
+                                                                 // Manifest bump remaps id 0 to another symbol; the reset must clear the LATCHED
+                                                                 // symbol (INST-0), not the current definition's (INST-9).
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(2, 1),
                 enc_instrument_def(0, "INST-9", 2),
             ]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &frame(&[enc_instrument_reset(&InstrumentReset {
+            &datagram(&[enc_instrument_reset(&InstrumentReset {
                 instrument_id: 0,
                 reason: 1,
                 new_anchor_seq: 0,
@@ -4369,14 +4377,14 @@ mod tests {
         // The venue maps the id back to INST-0 and re-syncs; the restarted-clock depths under
         // INST-0 flow only if the memo-scoped clear hit (venue, "INST-0").
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(3, 1),
                 enc_instrument_def(0, "INST-0", 3),
             ]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4393,7 +4401,7 @@ mod tests {
             ]),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
-        proc.on_datagram(&frame(&[add(1, 101, 100)]), &mkt);
+        proc.on_datagram(&datagram(&[add(1, 101, 100)]), &mkt);
 
         // No leading/middle `0`s: the setup's empty-anchor sync stays deferred until
         // `add(1,100,5000)` reveals it (showing 5000 directly), and `InstrumentReset` clears the
@@ -4422,9 +4430,9 @@ mod tests {
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
-        proc.on_datagram(&frame(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
+        proc.on_datagram(&datagram(&[add(1, 100, 5000)]), &mkt); // depth(5000) latches the floor
         proc.on_datagram(
-            &frame(&[enc_instrument_reset(&InstrumentReset {
+            &datagram(&[enc_instrument_reset(&InstrumentReset {
                 instrument_id: 0,
                 reason: 1,
                 new_anchor_seq: 0,
@@ -4435,7 +4443,7 @@ mod tests {
         // Re-sync via a fresh empty anchor: the post-resync depth is stamped source_ts=0 (the
         // event clock was dropped with the book) and re-opens the cleared floor.
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4452,7 +4460,7 @@ mod tests {
             ]),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
-        proc.on_datagram(&frame(&[add(1, 101, 100)]), &mkt); // new (restarted) clock -> admitted
+        proc.on_datagram(&datagram(&[add(1, 101, 100)]), &mkt); // new (restarted) clock -> admitted
 
         // No leading/middle `0`s — same deferral reasoning as
         // `mbo_instrument_reset_after_id_remap_clears_the_latched_symbol`: the setup anchor and
@@ -4465,7 +4473,7 @@ mod tests {
         );
     }
 
-    /// `depth` messages for a frame touching multiple instruments must arrive in ascending
+    /// `depth` messages for a datagram touching multiple instruments must arrive in ascending
     /// instrument_id order regardless of the wire order of their `OrderAdd`s. The invariant is
     /// guaranteed by draining a `BTreeSet<u32>` rather than a `HashSet`.
     #[test]
@@ -4478,7 +4486,7 @@ mod tests {
 
         // Refdata: manifest declares 2 instruments; then their definitions.
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 2),
                 enc_instrument_def(0, "INST-0", 1),
                 enc_instrument_def(1, "INST-1", 1),
@@ -4488,7 +4496,7 @@ mod tests {
 
         // Sync each instrument via an empty-book anchor snapshot (0 orders, anchor_seq=0).
         let snap = |iid: u32, sid: u32| {
-            frame(&[
+            datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: iid,
                     anchor_seq: 0,
@@ -4509,9 +4517,9 @@ mod tests {
         proc.on_datagram(&snap(1, 2), &snap_ctx);
         drain_depth_ids(&mut rx); // discard snapshot-triggered emits
 
-        // Mktdata frame: instrument 1 appears before instrument 0 in the wire order. BTreeSet must
+        // Mktdata datagram: instrument 1 appears before instrument 0 in the wire order. BTreeSet must
         // still drain 0 → 1.
-        let mktdata_frame = frame(&[
+        let mktdata_datagram = datagram(&[
             enc_order_add(&OrderAdd {
                 instrument_id: 1,
                 source_id: 0,
@@ -4536,7 +4544,7 @@ mod tests {
             }),
         ]);
         proc.on_datagram(
-            &mktdata_frame,
+            &mktdata_datagram,
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
@@ -4552,9 +4560,9 @@ mod tests {
             "depth must arrive in ascending instrument_id order"
         );
 
-        // Replay with incremented per_instrument_seqs to confirm the order is stable across frames,
+        // Replay with incremented per_instrument_seqs to confirm the order is stable across datagrams,
         // not a lucky hash ordering on the first run.
-        let mktdata_frame2 = frame(&[
+        let mktdata_datagram2 = datagram(&[
             enc_order_add(&OrderAdd {
                 instrument_id: 1,
                 source_id: 0,
@@ -4579,13 +4587,13 @@ mod tests {
             }),
         ]);
         proc.on_datagram(
-            &mktdata_frame2,
+            &mktdata_datagram2,
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert_eq!(
             drain_depth_ids(&mut rx),
             vec![0, 1],
-            "order must be stable across frames"
+            "order must be stable across datagrams"
         );
     }
 
@@ -4656,7 +4664,7 @@ mod tests {
         let mut proc = MboProcessor::new(depth, tape(false));
 
         // No manifest/definition: an OrderAdd for an unknown instrument must be dropped, not booked.
-        let f = frame(&[enc_order_add(&OrderAdd {
+        let f = datagram(&[enc_order_add(&OrderAdd {
             instrument_id: 42,
             source_id: 0,
             side: SIDE_BID,
@@ -4696,12 +4704,12 @@ mod tests {
         let flood = (MAX_BOOKS as u32) + 50;
         // Declare and define every instrument so the definition gate admits each one.
         proc.on_datagram(
-            &frame(&[enc_manifest_summary(1, flood)]),
+            &datagram(&[enc_manifest_summary(1, flood)]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         for i in 0..flood {
             proc.on_datagram(
-                &frame(&[enc_instrument_def(i, &format!("INST-{i}"), 1)]),
+                &datagram(&[enc_instrument_def(i, &format!("INST-{i}"), 1)]),
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
         }
@@ -4710,7 +4718,7 @@ mod tests {
         // oldest from BOTH maps as the flood grows past MAX_BOOKS.
         for i in 0..flood {
             proc.on_datagram(
-                &frame(&[
+                &datagram(&[
                     enc_snapshot_begin(&SnapshotBegin {
                         instrument_id: i,
                         anchor_seq: 0,
@@ -4791,7 +4799,7 @@ mod tests {
     fn mbo_book_eviction_preserves_pending_channel_for_a_later_reveal() {
         use super::MAX_BOOKS;
 
-        /// Rewrite a frame's channel byte (frame-header byte 3) — `codec_mbo::tests::frame` always
+        /// Rewrite a datagram's channel byte (datagram-header byte 3) — `codec_mbo::tests::datagram` always
         /// writes `0`, so this is the only way to get a non-zero channel onto the wire from here.
         fn with_channel(mut f: Vec<u8>, ch: u8) -> Vec<u8> {
             f[3] = ch;
@@ -4808,7 +4816,7 @@ mod tests {
         // `pending_channel` entry is observable).
         proc.on_datagram(
             &with_channel(
-                frame(&[
+                datagram(&[
                     enc_manifest_summary(1, 1),
                     enc_instrument_def(0, "INST-0", 1),
                 ]),
@@ -4819,7 +4827,7 @@ mod tests {
         // Sync and reveal instrument 0's book (channel doesn't matter here; only the definition's
         // channel, above, feeds `pending_channel`).
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4845,16 +4853,16 @@ mod tests {
         // (oldest-first) while leaving its `pending_channel` entry alone (finding 4's fix).
         let flood = (MAX_BOOKS as u32) + 5;
         proc.on_datagram(
-            &frame(&[enc_manifest_summary(1, flood + 1)]),
+            &datagram(&[enc_manifest_summary(1, flood + 1)]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         for i in 1..=flood {
             proc.on_datagram(
-                &frame(&[enc_instrument_def(i, &format!("INST-{i}"), 1)]),
+                &datagram(&[enc_instrument_def(i, &format!("INST-{i}"), 1)]),
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
             proc.on_datagram(
-                &frame(&[
+                &datagram(&[
                     enc_snapshot_begin(&SnapshotBegin {
                         instrument_id: i,
                         anchor_seq: 0,
@@ -4907,7 +4915,7 @@ mod tests {
         // broadcast channel: its channel must be the ORIGINAL 7, not the `unwrap_or(0)` fallback a
         // wrongly-evicted `pending_channel` would produce.
         proc.on_datagram(
-            &frame(&[add(1, 999, 1)]),
+            &datagram(&[add(1, 999, 1)]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         let snapshot = crate::model::lock(&instruments);
@@ -4941,14 +4949,14 @@ mod tests {
 
         // Define instrument 0 and sync it with an empty-anchor snapshot.
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def(0, "INST-0", 1),
             ]),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -4967,8 +4975,8 @@ mod tests {
         );
         drain_depth_ids(&mut rx); // discard the snapshot-triggered (empty) depth
 
-        // Frame 1: add DEPTH_LEVELS+1 bids at distinct ascending prices. The lowest price is the
-        // (N+1)th level — outside the published top-N. One coalesced depth for the frame.
+        // Datagram 1: add DEPTH_LEVELS+1 bids at distinct ascending prices. The lowest price is the
+        // (N+1)th level — outside the published top-N. One coalesced depth for the datagram.
         let bid = |seq: u32, price: i64| {
             enc_order_add(&OrderAdd {
                 instrument_id: 0,
@@ -4985,19 +4993,19 @@ mod tests {
         let levels = DEPTH_LEVELS as u32 + 1;
         let establish: Vec<_> = (0..levels).map(|k| bid(k + 1, 100 + k as i64)).collect();
         proc.on_datagram(
-            &frame(&establish),
+            &datagram(&establish),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert_eq!(
             drain_depth_ids(&mut rx).len(),
             1,
-            "frame 1 establishes the book: exactly one depth"
+            "datagram 1 establishes the book: exactly one depth"
         );
 
-        // Frame 2: churn the worst (lowest) bid price 100 — outside the top-N. Book changes, but the
+        // Datagram 2: churn the worst (lowest) bid price 100 — outside the top-N. Book changes, but the
         // top-N is byte-identical, so depth must be suppressed.
         proc.on_datagram(
-            &frame(&[bid(levels + 1, 100)]),
+            &datagram(&[bid(levels + 1, 100)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert_eq!(
@@ -5006,9 +5014,9 @@ mod tests {
             "deep-book churn outside the top-N must be suppressed"
         );
 
-        // Frame 3: add a new best bid above every existing level — moves the top-N, must emit.
+        // Datagram 3: add a new best bid above every existing level — moves the top-N, must emit.
         proc.on_datagram(
-            &frame(&[bid(levels + 2, 100 + levels as i64)]),
+            &datagram(&[bid(levels + 2, 100 + levels as i64)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert_eq!(
@@ -5045,15 +5053,15 @@ mod tests {
         out
     }
 
-    /// [`mbp_wire::frame`], but stamped with Schema Version 3 — for the tests exercising a v3
+    /// [`mbp_wire::datagram`], but stamped with Schema Version 3 — for the tests exercising a v3
     /// `InstrumentDefinition`'s own Source ID.
-    fn mbp_frame_v3(
+    fn mbp_datagram_v3(
         channel_id: u8,
         reset_count: u8,
         sequence: u64,
         messages: &[Vec<u8>],
     ) -> Vec<u8> {
-        let mut f = mbp_wire::frame(channel_id, reset_count, sequence, messages);
+        let mut f = mbp_wire::datagram(channel_id, reset_count, sequence, messages);
         f[2] = 3;
         f
     }
@@ -5069,7 +5077,7 @@ mod tests {
         let mut proc = MbpProcessor::new(tape(false));
 
         proc.on_datagram(
-            &mbp_frame_v3(
+            &mbp_datagram_v3(
                 0,
                 0,
                 0,
@@ -5115,7 +5123,7 @@ mod tests {
         let mut proc = MbpProcessor::new(tape(false));
 
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 0, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 0, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         assert!(
@@ -5124,7 +5132,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &[mbp_reveal(41, 1)]),
+            &mbp_wire::datagram(0, 0, 1, &[mbp_reveal(41, 1)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let seen = drain_all(&mut rx);
@@ -5246,7 +5254,7 @@ mod tests {
         p.books.get(&(publisher, channel, id)).map(|b| b.status())
     }
 
-    /// A `FrameCtx` on a venue unique to one test. The Prometheus registry is process-global, so a
+    /// A `DatagramCtx` on a venue unique to one test. The Prometheus registry is process-global, so a
     /// metric assertion driven through `make_ctx`'s shared `"TV"` venue would count every other
     /// test's increments too.
     fn mbp_ctx<'a>(
@@ -5254,7 +5262,7 @@ mod tests {
         arbiter: &'a SharedArbiter,
         instruments: &'a crate::model::InstrumentSnapshot,
         role: PortRole,
-    ) -> FrameCtx<'a> {
+    ) -> DatagramCtx<'a> {
         let mut c = make_ctx(arbiter, instruments, role);
         c.venue = venue;
         c
@@ -5269,7 +5277,7 @@ mod tests {
         instruments: &'a crate::model::InstrumentSnapshot,
         role: PortRole,
         offset: u8,
-    ) -> FrameCtx<'a> {
+    ) -> DatagramCtx<'a> {
         let mut c = mbp_ctx(venue, arbiter, instruments, role);
         c.mirror_offset = Some(offset);
         c
@@ -5277,8 +5285,8 @@ mod tests {
 
     /// **The mirror finding.** A second publisher mirrors this channel's whole roster on the SAME
     /// socket, stamping every wire `channel_id` raised by `publisher_offset` — so one receiver
-    /// decodes frames stamped both channel 10 and channel 110 for the identical market. The
-    /// datagram source IP is deliberately the SAME for both frames here (the registry's own
+    /// decodes datagrams stamped both channel 10 and channel 110 for the identical market. The
+    /// datagram source IP is deliberately the SAME for both datagrams here (the registry's own
     /// `DEPLOYMENT` note keys the two paths apart by `channel_id`, never by host), which is what
     /// makes this a real regression guard: if `ensure_book`/`note_reset_count`/`revealed` ever
     /// canonicalized their channel instead of using the raw wire one, the two paths below would
@@ -5294,8 +5302,8 @@ mod tests {
         let base = mbp_ctx_mirrored("TV", &arbiter, &instruments, PortRole::Combined, 100);
         let mirror = mbp_ctx_mirrored("TV", &arbiter, &instruments, PortRole::Combined, 100);
 
-        let def_frame = |channel_id: u8| {
-            mbp_frame_v3(
+        let def_datagram = |channel_id: u8| {
+            mbp_datagram_v3(
                 channel_id,
                 0,
                 0,
@@ -5312,10 +5320,10 @@ mod tests {
             )
         };
         // The base path, wire channel 10.
-        proc.on_datagram(&def_frame(10), &base);
+        proc.on_datagram(&def_datagram(10), &base);
         // The mirror path, wire channel 110 (10 + the 100 offset) — same source IP, same
         // instrument, same Source ID: the same market as far as a consumer is concerned.
-        proc.on_datagram(&def_frame(110), &mirror);
+        proc.on_datagram(&def_datagram(110), &mirror);
 
         // Catalog: ONE market at the canonical channel, not two.
         {
@@ -5363,11 +5371,11 @@ mod tests {
         // shape `synced_mbp_proc` below drives) so a following delta actually applies rather than
         // merely buffering — the only way to observe divergent book *content*, not just presence.
         proc.on_datagram(
-            &mbp_wire::frame(10, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &mbp_wire::datagram(10, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[])),
             &base,
         );
         proc.on_datagram(
-            &mbp_wire::frame(110, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &mbp_wire::datagram(110, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[])),
             &mirror,
         );
         assert_eq!(mbp_status(&proc, TEST_PUB, 10, 41), Some(BookStatus::Ready));
@@ -5394,8 +5402,8 @@ mod tests {
                 level_flags: 0,
             })
         };
-        proc.on_datagram(&mbp_wire::frame(10, 0, 2, &[level(100)]), &base);
-        proc.on_datagram(&mbp_wire::frame(110, 0, 2, &[level(200)]), &mirror);
+        proc.on_datagram(&mbp_wire::datagram(10, 0, 2, &[level(100)]), &base);
+        proc.on_datagram(&mbp_wire::datagram(110, 0, 2, &[level(200)]), &mirror);
 
         assert_eq!(
             proc.books.len(),
@@ -5421,7 +5429,7 @@ mod tests {
             "the two paths' books must evolve independently"
         );
 
-        // Every `book` this frame pair emitted still carries the canonical channel, proving the
+        // Every `book` this datagram pair emitted still carries the canonical channel, proving the
         // collapse is consumer-facing only and not a side effect of the books above having stayed
         // apart.
         let book_channels: Vec<u8> = drain_all(&mut rx)
@@ -5438,7 +5446,7 @@ mod tests {
     }
 
     /// **The live regression, end to end.** The mirror offset here does not come from a
-    /// hand-built `FrameCtx` — it comes from parsing an `explicit` registry row (the shape the
+    /// hand-built `DatagramCtx` — it comes from parsing an `explicit` registry row (the shape the
     /// live mirrored feeds actually use: one shared port block, two paths separated only by
     /// `channel_id`), exactly the document shape that used to be hard-wired to `mirror_offset:
     /// None`. Two paths stamp the same market at channel 1 and channel 101 (the offsets seen on
@@ -5462,8 +5470,8 @@ mod tests {
         let base = mbp_ctx_mirrored("KALSHI", &arbiter, &instruments, PortRole::Combined, offset);
         let mirror = mbp_ctx_mirrored("KALSHI", &arbiter, &instruments, PortRole::Combined, offset);
 
-        let def_frame = |channel_id: u8| {
-            mbp_frame_v3(
+        let def_datagram = |channel_id: u8| {
+            mbp_datagram_v3(
                 channel_id,
                 0,
                 0,
@@ -5479,8 +5487,8 @@ mod tests {
                 ],
             )
         };
-        proc.on_datagram(&def_frame(1), &base);
-        proc.on_datagram(&def_frame(101), &mirror);
+        proc.on_datagram(&def_datagram(1), &base);
+        proc.on_datagram(&def_datagram(101), &mirror);
 
         let cat = instruments.lock().unwrap();
         assert_eq!(
@@ -5501,12 +5509,12 @@ mod tests {
     ) -> MbpProcessor {
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(channel, reset_count, 1, &mbp_refdata(ids)),
+            &mbp_wire::datagram(channel, reset_count, 1, &mbp_refdata(ids)),
             &make_ctx(arbiter, instruments, PortRole::Combined),
         );
         for (n, id) in ids.iter().enumerate() {
             proc.on_datagram(
-                &mbp_wire::frame(
+                &mbp_wire::datagram(
                     channel,
                     reset_count,
                     2 + n as u64,
@@ -5539,13 +5547,13 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41, 42])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41, 42])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         // Both rotations use snapshot_id 5 — the collision the route must not key on.
         for (id, price) in [(41u32, 6200i64), (42, 6300)] {
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 2, &mbp_snapshot(id, 5, 0, 0, &[(MBP_BID, price, 10)])),
+                &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(id, 5, 0, 0, &[(MBP_BID, price, 10)])),
                 &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
             );
         }
@@ -5553,7 +5561,7 @@ mod tests {
         // no-op Trade so the already-installed book's rebaseline reaches the wire, unmodified.
         for id in [41u32, 42] {
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 3, &[mbp_reveal(id, 1)]),
+                &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(id, 1)]),
                 &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
             );
         }
@@ -5580,11 +5588,11 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 2,
@@ -5605,7 +5613,7 @@ mod tests {
         // A snapshot alone carries no Source ID and stays deferred; reveal via a no-op Trade so
         // the already-installed book's rebaseline reaches the wire, unmodified.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 3, &[mbp_reveal(41, 1)]),
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 1)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
@@ -5626,20 +5634,20 @@ mod tests {
     }
 
     /// Round-3 review, finding 5: `SnapshotEnd`'s inline re-baseline (fired immediately so a later
-    /// delta in the same frame follows it incrementally) must also clear `revealed_this_frame` for
-    /// the instrument it just re-baselined — an earlier message in the SAME frame may have already
-    /// revealed it, and leaving the entry behind makes the frame-end sweep double-emit an identical,
+    /// delta in the same datagram follows it incrementally) must also clear `revealed_this_datagram` for
+    /// the instrument it just re-baselined — an earlier message in the SAME datagram may have already
+    /// revealed it, and leaving the entry behind makes the end-of-datagram sweep double-emit an identical,
     /// redundant second `book` for it. Reproduced with a `Trade` that reveals instrument 41 (routed
     /// through `ensure_book` per finding 1, so the book exists but stays `AwaitingSnapshot`) followed,
-    /// in the SAME frame, by a complete snapshot rotation for the same instrument — only reachable via
+    /// in the SAME datagram, by a complete snapshot rotation for the same instrument — only reachable via
     /// `PortRole::Combined` (the live three-port row never carries a Trade and a snapshot rotation on
     /// one socket).
     #[test]
-    fn mbp_reveal_and_snapshot_install_in_one_frame_emits_exactly_one_rebaseline() {
+    fn mbp_reveal_and_snapshot_install_in_one_datagram_emits_exactly_one_rebaseline() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
 
@@ -5652,7 +5660,7 @@ mod tests {
             &[(MBP_BID, 6200, 10), (MBP_ASK, 6300, 20)],
         ));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &msgs),
+            &mbp_wire::datagram(0, 0, 2, &msgs),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
 
@@ -5661,7 +5669,7 @@ mod tests {
             books.len(),
             1,
             "exactly one book message for an instrument revealed and snapshot-installed in the \
-             same frame, got {books:?}"
+             same datagram, got {books:?}"
         );
         assert!(books[0].snapshot, "advisory rebuild flag");
         assert!(books[0].last, "a buffering consumer wedges without it");
@@ -5690,11 +5698,11 @@ mod tests {
         let (arbiter, _rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &[mbp_reveal(41, 1)]),
+            &mbp_wire::datagram(0, 0, 2, &[mbp_reveal(41, 1)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let key41: PriceBookKey = (TEST_PUB, 0u8, 41u32);
@@ -5714,11 +5722,11 @@ mod tests {
         let flood = (MAX_PRICE_BOOKS as u32) + 5;
         for i in 100..100 + flood {
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[i])),
+                &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[i])),
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 2, &[mbp_reveal(i, 1)]),
+                &mbp_wire::datagram(0, 0, 2, &[mbp_reveal(i, 1)]),
                 &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
             );
         }
@@ -5771,7 +5779,7 @@ mod tests {
         let mut proc = MbpProcessor::new(tape(false));
         // Row venue is deliberately a lie; the wire id must win.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(
                 "NotTheWireSource",
                 &arbiter,
@@ -5780,7 +5788,7 @@ mod tests {
             ),
         );
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6100, 20)])),
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6100, 20)])),
             &mbp_ctx(
                 "NotTheWireSource",
                 &arbiter,
@@ -5794,7 +5802,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 3,
@@ -5829,7 +5837,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 4,
@@ -5865,7 +5873,7 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(
                 "NotTheWireSource",
                 &arbiter,
@@ -5874,7 +5882,7 @@ mod tests {
             ),
         );
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6100, 20)])),
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6100, 20)])),
             &mbp_ctx(
                 "NotTheWireSource",
                 &arbiter,
@@ -5890,26 +5898,26 @@ mod tests {
         );
     }
 
-    /// A batch of level updates in one frame coalesces into ONE `book` message per instrument, with
-    /// `last: true`. Cross-instrument atomicity is not promised, so per-frame batching is correct.
+    /// A batch of level updates in one datagram coalesces into ONE `book` message per instrument, with
+    /// `last: true`. Cross-instrument atomicity is not promised, so per-datagram batching is correct.
     #[test]
-    fn mbp_one_book_message_per_instrument_per_frame() {
+    fn mbp_one_book_message_per_instrument_per_datagram() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41, 42]);
         // `synced_mbp_proc`'s empty-anchor snapshots carry no Source ID and stay deferred; reveal
-        // both instruments first (via a no-op Trade) so the frame below tests ordinary incremental
+        // both instruments first (via a no-op Trade) so the datagram below tests ordinary incremental
         // coalescing, not the first-reveal re-baseline case covered separately. Source ID 0, matching
         // the `mbp_level` deltas below: a mismatched id here would itself be a (real, and now
         // detected) Source ID change, forcing a re-baseline instead of the incremental batch this
         // test means to exercise.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 3, &[mbp_reveal(41, 0), mbp_reveal(42, 0)]),
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0), mbp_reveal(42, 0)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
 
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 100,
@@ -5952,12 +5960,12 @@ mod tests {
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mbp_wire::datagram(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
             &mkt,
         );
         let _ = drain_books(&mut rx);
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 101, &[mbp_level(41, 2, MBP_BID, 6200, 0, 7_001)]),
+            &mbp_wire::datagram(0, 0, 101, &[mbp_level(41, 2, MBP_BID, 6200, 0, 7_001)]),
             &mkt,
         );
 
@@ -5976,11 +5984,11 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 2,
@@ -6004,9 +6012,9 @@ mod tests {
         // no-op Trade) rather than letting the from-price clear below be that first admission —
         // otherwise its exact-deletes shape would be replaced by a full re-baseline before this
         // test ever sees it. Source ID 0, matching the `clear` deltas below (see
-        // `mbp_one_book_message_per_instrument_per_frame` for why a mismatch here matters).
+        // `mbp_one_book_message_per_instrument_per_datagram` for why a mismatch here matters).
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
@@ -6025,7 +6033,7 @@ mod tests {
             })
         };
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 100,
@@ -6049,7 +6057,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 101,
@@ -6082,9 +6090,9 @@ mod tests {
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
         let _ = drain_books(&mut rx);
 
-        // The attacker's frame: same publisher IP, same channel, a manifest one seq ahead of the
+        // The attacker's datagram: same publisher IP, same channel, a manifest one seq ahead of the
         // real one, delivered to the market-data port.
-        let forged = mbp_wire::frame(
+        let forged = mbp_wire::datagram(
             0,
             0,
             50,
@@ -6104,7 +6112,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mbp_wire::datagram(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert!(
@@ -6126,7 +6134,7 @@ mod tests {
         let mut proc = MbpProcessor::new(tape(false));
         let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
 
-        let burst = mbp_wire::frame(0, 0, 1, &mbp_refdata(&[0]));
+        let burst = mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[0]));
         for i in 0..(MAX_PUBLISHERS as u32) + 50 {
             let mut ctx = mbp_ctx("MBPFORGE", &arbiter, &instruments, PortRole::Mktdata);
             ctx.publisher = ip(i);
@@ -6157,18 +6165,23 @@ mod tests {
         for i in 0..(MAX_PUBLISHERS as u32) + 1 {
             let mut refdata = mbp_ctx("MBPEVICT", &arbiter, &instruments, PortRole::Combined);
             refdata.publisher = ip(i);
-            proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
             if i == 0 {
                 let mut snap = mbp_ctx("MBPEVICT", &arbiter, &instruments, PortRole::Snapshot);
                 snap.publisher = first;
                 proc.on_datagram(
-                    &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+                    &mbp_wire::datagram(
+                        0,
+                        0,
+                        2,
+                        &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)]),
+                    ),
                     &snap,
                 );
                 let mut mkt = mbp_ctx("MBPEVICT", &arbiter, &instruments, PortRole::Mktdata);
                 mkt.publisher = first;
                 proc.on_datagram(
-                    &mbp_wire::frame(0, 0, 3, &[mbp_level(41, 2, MBP_BID, 6300, 5, 7_000)]),
+                    &mbp_wire::datagram(0, 0, 3, &[mbp_level(41, 2, MBP_BID, 6300, 5, 7_000)]),
                     &mkt,
                 );
                 assert!(
@@ -6208,7 +6221,7 @@ mod tests {
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
         // Give the live book a level, so there is something to lose.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 10, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mbp_wire::datagram(0, 0, 10, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
@@ -6223,11 +6236,11 @@ mod tests {
         let (begin, rest) = rotation.split_first().unwrap();
         let snap = || make_ctx(&arbiter, &instruments, PortRole::Snapshot);
         let begins = std::slice::from_ref(begin);
-        proc.on_datagram(&mbp_wire::frame(0, 0, 11, begins), &snap());
-        proc.on_datagram(&mbp_wire::frame(0, 0, 12, &rest[..1]), &snap());
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 11, begins), &snap());
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 12, &rest[..1]), &snap());
         // The duplicate: the very same begin datagram, redelivered.
-        proc.on_datagram(&mbp_wire::frame(0, 0, 11, begins), &snap());
-        proc.on_datagram(&mbp_wire::frame(0, 0, 13, &rest[1..]), &snap());
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 11, begins), &snap());
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 13, &rest[1..]), &snap());
 
         assert_eq!(
             mbp_status(&proc, TEST_PUB, 0, 41),
@@ -6254,11 +6267,11 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mbp_wire::datagram(0, 0, 2, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
@@ -6276,17 +6289,17 @@ mod tests {
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 7, 0, &[41]);
         let _ = drain_books(&mut rx);
         proc.on_datagram(
-            &mbp_wire::frame(7, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mbp_wire::datagram(7, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
         let books = drain_books(&mut rx);
-        assert_eq!(books[0].channel, 7, "the frame header's channel_id");
+        assert_eq!(books[0].channel, 7, "the datagram header's channel_id");
         assert_eq!(books[0].instrument_id, 41, "the wire instrument id");
         assert_eq!(&*books[0].symbol, "INST-41", "a display label only");
         // The mirror of the Market-by-Order assertion: marked order-level, this market would be
         // served as `order_book` and disappear from every `{"type":"book"}` subscriber it has today.
-        // Asserted on a *second* frame as well: the first batch of a market is the re-baseline the
+        // Asserted on a *second* datagram as well: the first batch of a market is the re-baseline the
         // arbiter materializes from its own accumulator, so only the later, forwarded batch carries
         // the flag this processor stamped.
         assert!(
@@ -6294,7 +6307,7 @@ mod tests {
             "the re-baseline must be price-aggregated"
         );
         proc.on_datagram(
-            &mbp_wire::frame(7, 0, 101, &[mbp_level(41, 2, MBP_BID, 6300, 20, 8_000)]),
+            &mbp_wire::datagram(7, 0, 101, &[mbp_level(41, 2, MBP_BID, 6300, 20, 8_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let later = drain_books(&mut rx);
@@ -6311,7 +6324,7 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(7, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(7, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         // Checked before any reveal: revealing (below) now runs even a `Trade` through
@@ -6322,7 +6335,7 @@ mod tests {
         // Refdata alone carries no Source ID and stays deferred; reveal via a no-op Trade (same
         // channel as the refdata burst above) so the deferred Instrument reaches the wire.
         proc.on_datagram(
-            &mbp_wire::frame(7, 0, 2, &[mbp_reveal(41, 1)]),
+            &mbp_wire::datagram(7, 0, 2, &[mbp_reveal(41, 1)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
@@ -6353,11 +6366,11 @@ mod tests {
             let (arbiter, mut rx, instruments) = mbp_harness();
             let mut proc = MbpProcessor::new(tape(emit_trades));
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+                &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 2, std::slice::from_ref(&trade)),
+                &mbp_wire::datagram(0, 0, 2, std::slice::from_ref(&trade)),
                 &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
             );
             let trades = std::iter::from_fn(|| rx.try_recv().ok())
@@ -6381,11 +6394,11 @@ mod tests {
         for publisher in [pub_a, pub_b] {
             let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
             refdata.publisher = publisher;
-            proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
             let mut snap = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
             snap.publisher = publisher;
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+                &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
                 &snap,
             );
         }
@@ -6394,7 +6407,7 @@ mod tests {
         let mut a_mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
         a_mkt.publisher = pub_a;
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
+            &mbp_wire::datagram(0, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
             &a_mkt,
         );
 
@@ -6420,7 +6433,7 @@ mod tests {
         assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
 
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mbp_wire::datagram(0, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
 
@@ -6441,18 +6454,18 @@ mod tests {
         for publisher in [pub_a, pub_b] {
             let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
             refdata.publisher = publisher;
-            proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
             let mut snap = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
             snap.publisher = publisher;
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+                &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
                 &snap,
             );
         }
 
         let mut a_mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
         a_mkt.publisher = pub_a;
-        proc.on_datagram(&mbp_wire::frame(0, 1, 100, &[]), &a_mkt);
+        proc.on_datagram(&mbp_wire::datagram(0, 1, 100, &[]), &a_mkt);
 
         assert_eq!(mbp_status(&proc, pub_a, 0, 41), None, "A's state discarded");
         assert_eq!(
@@ -6476,7 +6489,7 @@ mod tests {
         let mut ids = heavy.clone();
         ids.push(99);
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&ids)),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&ids)),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
         );
         // Deltas for a never-snapshotted instrument buffer. Filled through `with_book` rather than
@@ -6521,7 +6534,7 @@ mod tests {
             .mbp_buffer_overflows
             .with_label_values(&[venue])
             .get();
-        proc.on_datagram(&mbp_wire::frame(0, 0, 2, &[]), &mkt);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 2, &[]), &mkt);
 
         assert!(
             proc.buffered_total <= MAX_BUFFERED_DELTAS_ACROSS_BOOKS,
@@ -6565,7 +6578,7 @@ mod tests {
 
         // Gap both instruments (a forward jump buffers), then exercise each mutation in turn.
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 100,
@@ -6582,13 +6595,13 @@ mod tests {
 
         // A snapshot install replays past the anchor and drains what it consumed.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 101, &mbp_snapshot(41, 2, 100, 8, &[])),
+            &mbp_wire::datagram(0, 0, 101, &mbp_snapshot(41, 2, 100, 8, &[])),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
         assert_eq!(proc.buffered_total, recomputed(&proc), "after a replay");
 
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 102,
@@ -6606,11 +6619,11 @@ mod tests {
         assert_eq!(proc.buffered_total, recomputed(&proc), "after a reset");
 
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 103, &[mbp_level(42, 20, MBP_BID, 6300, 10, 7_004)]),
+            &mbp_wire::datagram(0, 0, 103, &[mbp_level(42, 20, MBP_BID, 6300, 10, 7_004)]),
             &mkt,
         );
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 104, &[mbp_wire::enc_end_of_session(9_000)]),
+            &mbp_wire::datagram(0, 0, 104, &[mbp_wire::enc_end_of_session(9_000)]),
             &mkt,
         );
         assert_eq!(
@@ -6625,7 +6638,7 @@ mod tests {
 
         // ...and a forgotten book takes its buffer out of the total.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 105, &[mbp_level(41, 30, MBP_BID, 6200, 10, 7_005)]),
+            &mbp_wire::datagram(0, 0, 105, &[mbp_level(41, 30, MBP_BID, 6200, 10, 7_005)]),
             &mkt,
         );
         proc.forget_book(&(TEST_PUB, 0, 41));
@@ -6641,11 +6654,11 @@ mod tests {
         let (arbiter, _rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 2,
@@ -6657,7 +6670,7 @@ mod tests {
         let before = metrics().mbp_crossed.with_label_values(&[venue]).get();
         // The boundary is the consistency point: mid-batch a crossed inside market is legitimate.
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 100,
@@ -6693,12 +6706,12 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
         );
         // A snapshot claiming a baseline of 100 while the publisher is really at 1.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 100, &[])),
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 100, &[])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot),
         );
         // Reveal now (a no-op Trade) so the duplicate deltas below are not ALSO this instrument's
@@ -6708,7 +6721,7 @@ mod tests {
         // matching the `mbp_level` deltas below: a mismatched id here would itself be a Source ID
         // change, forcing an unwanted re-baseline instead of exercising the duplicate-delta path.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
@@ -6718,7 +6731,7 @@ mod tests {
             .with_label_values(&[venue])
             .get();
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 100,
@@ -6753,7 +6766,7 @@ mod tests {
         let (arbiter, _rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined),
         );
 
@@ -6762,7 +6775,7 @@ mod tests {
             .with_label_values(&[venue])
             .get();
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 2,
@@ -6806,15 +6819,15 @@ mod tests {
         let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
         let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
 
-        proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
             &snap,
         );
         // The snapshot alone carries no Source ID and stays deferred; reveal via a no-op Trade so
         // the installed book's re-baseline reaches the wire.
         let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
-        proc.on_datagram(&mbp_wire::frame(0, 0, 3, &[mbp_reveal(41, 1)]), &mkt);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 1)]), &mkt);
         assert_eq!(drain_books(&mut rx).len(), 1, "the first rotation installs");
         assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
 
@@ -6835,7 +6848,7 @@ mod tests {
         // The next rotation for the same instrument: `Ready` and already at this
         // `last_instrument_seq`, so `on_snapshot_begin` declines it — the correct call.
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 3,
@@ -6876,7 +6889,7 @@ mod tests {
     }
 
     /// The authority gate decides which path reaches the wire from per-market health, so a book
-    /// leaving `Ready` has to be reported. Only transitions are reported, not every frame.
+    /// leaving `Ready` has to be reported. Only transitions are reported, not every datagram.
     #[test]
     fn mbp_book_health_reaches_the_authority() {
         let (arbiter, _rx, instruments) = mbp_harness();
@@ -6895,10 +6908,10 @@ mod tests {
         // defers the health report too (`report_health` skips a not-yet-revealed key, since there
         // is no `MarketKey` yet for the authority to know about). Reveal via a `LevelUpdate` (not
         // the no-op `mbp_reveal` Trade): it also marks the instrument `touched`, which is what
-        // triggers this frame's own end-of-frame health-report sweep, so the book's `Ready` status
+        // triggers this datagram's own end-of-datagram health-report sweep, so the book's `Ready` status
         // actually reaches the authority in this same call.
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 3,
                 0,
                 50,
@@ -6916,7 +6929,7 @@ mod tests {
         let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, path);
 
         proc.on_datagram(
-            &mbp_wire::frame(3, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
+            &mbp_wire::datagram(3, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         assert!(
@@ -6927,7 +6940,7 @@ mod tests {
         // The recovery direction is what pins a real report: `healthy` answers true for a market the
         // authority has never heard of, so only the unhealthy -> healthy transition proves the call.
         proc.on_datagram(
-            &mbp_wire::frame(3, 0, 101, &mbp_snapshot(41, 2, 0, 0, &[])),
+            &mbp_wire::datagram(3, 0, 101, &mbp_snapshot(41, 2, 0, 0, &[])),
             &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
         );
         assert!(healthy(&arbiter), "a re-synced book takes its market back");
@@ -6948,7 +6961,7 @@ mod tests {
             for reset_count in [0, 1] {
                 let mut ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
                 ctx.publisher = ip(i);
-                proc.on_datagram(&mbp_wire::frame(0, reset_count, 1, &[]), &ctx);
+                proc.on_datagram(&mbp_wire::datagram(0, reset_count, 1, &[]), &ctx);
             }
         }
         assert_eq!(
@@ -6970,12 +6983,12 @@ mod tests {
         let peer = ip(1_000);
         let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
         refdata.publisher = peer;
-        proc.on_datagram(&mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
         for publisher in [TEST_PUB, peer] {
             for channel in 0..=u8::MAX {
                 let mut ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
                 ctx.publisher = publisher;
-                proc.on_datagram(&mbp_wire::frame(channel, 0, 1, &[]), &ctx);
+                proc.on_datagram(&mbp_wire::datagram(channel, 0, 1, &[]), &ctx);
             }
         }
         assert!(
@@ -7002,11 +7015,11 @@ mod tests {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 1, &mbp_refdata(&[41])),
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
             &make_ctx(&arbiter, &instruments, PortRole::Combined),
         );
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 2,
@@ -7021,13 +7034,13 @@ mod tests {
         // `BookClear` below: a mismatched id here would itself be a Source ID change, forcing an
         // unwanted re-baseline instead of exercising the unrecognized-clear-side path.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
 
         proc.on_datagram(
-            &mbp_wire::frame(
+            &mbp_wire::datagram(
                 0,
                 0,
                 100,
@@ -7067,15 +7080,15 @@ mod tests {
         let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
         let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
         // Epoch 1: definitions, then a snapshot that installs and publishes its re-baseline.
-        proc.on_datagram(&mbp_wire::frame(0, 1, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(&mbp_wire::datagram(0, 1, 1, &mbp_refdata(&[41])), &refdata);
         proc.on_datagram(
-            &mbp_wire::frame(0, 1, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &mbp_wire::datagram(0, 1, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
             &snap,
         );
         // The snapshot alone carries no Source ID and stays deferred; reveal via a no-op Trade so
         // the installed book's re-baseline reaches the wire.
         let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
-        proc.on_datagram(&mbp_wire::frame(0, 1, 3, &[mbp_reveal(41, 1)]), &mkt);
+        proc.on_datagram(&mbp_wire::datagram(0, 1, 3, &[mbp_reveal(41, 1)]), &mkt);
         assert_eq!(drain_books(&mut rx).len(), 1, "the current epoch installs");
 
         let resets = || {
@@ -7093,7 +7106,7 @@ mod tests {
         );
         // The previous run's rotation, still draining off the snapshot socket.
         proc.on_datagram(
-            &mbp_wire::frame(0, 0, 3, &mbp_snapshot(41, 9, 0, 0, &[(MBP_BID, 1, 1)])),
+            &mbp_wire::datagram(0, 0, 3, &mbp_snapshot(41, 9, 0, 0, &[(MBP_BID, 1, 1)])),
             &snap,
         );
 
@@ -7104,7 +7117,7 @@ mod tests {
         assert_eq!(
             resets(),
             before.0,
-            "and a snapshot-port frame resets nothing"
+            "and a snapshot-port datagram resets nothing"
         );
         assert_eq!(
             metrics()
@@ -7139,10 +7152,10 @@ mod tests {
         );
         let mut proc = MbpProcessor::new(tape(false));
         let ids: Vec<u32> = (0..(MAX_PRICE_BOOKS as u32 + 50)).collect();
-        // One burst per 200 definitions keeps each frame's message count inside the header's u8.
+        // One burst per 200 definitions keeps each datagram's message count inside the header's u8.
         for chunk in ids.chunks(200) {
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 1, &mbp_refdata(chunk)),
+                &mbp_wire::datagram(0, 0, 1, &mbp_refdata(chunk)),
                 &make_ctx(&arbiter, &instruments, PortRole::Combined),
             );
         }
@@ -7152,7 +7165,7 @@ mod tests {
                 .map(|id| mbp_level(*id, 1, MBP_BID, 6200, 10, 7_000))
                 .collect();
             proc.on_datagram(
-                &mbp_wire::frame(0, 0, 100, &deltas),
+                &mbp_wire::datagram(0, 0, 100, &deltas),
                 &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
             );
         }
@@ -7206,7 +7219,7 @@ mod tests {
         let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
         // The first delta reveals the instrument, so its book goes out as a re-baseline: the consumer
         // has never seen this identity, and the book may already hold snapshot content.
-        proc.on_datagram(&frame(&[add(1, 4242, 5_000)]), &ctx);
+        proc.on_datagram(&datagram(&[add(1, 4242, 5_000)]), &ctx);
         let revealed = drain_books(&mut rx);
         let first = revealed.last().expect("a book message must be emitted");
         assert!(first.snapshot);
@@ -7228,7 +7241,7 @@ mod tests {
         );
 
         // From there each event is published as it came, carrying the venue's own order id.
-        proc.on_datagram(&frame(&[add(2, 4343, 6_000)]), &ctx);
+        proc.on_datagram(&datagram(&[add(2, 4343, 6_000)]), &ctx);
         let books = drain_books(&mut rx);
         let last = books.last().expect("a book message must be emitted");
         assert_eq!(
@@ -7251,7 +7264,7 @@ mod tests {
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
         proc.on_datagram(
-            &frame(&[add(1, 4242, 5_000)]),
+            &datagram(&[add(1, 4242, 5_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let msgs = drain_all(&mut rx);
@@ -7268,10 +7281,10 @@ mod tests {
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
         let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
-        proc.on_datagram(&frame(&[add(1, 4242, 5_000)]), &ctx);
+        proc.on_datagram(&datagram(&[add(1, 4242, 5_000)]), &ctx);
         let _ = drain_books(&mut rx);
         proc.on_datagram(
-            &frame(&[enc_order_cancel(&OrderCancel {
+            &datagram(&[enc_order_cancel(&OrderCancel {
                 instrument_id: 0,
                 source_id: 0,
                 reason: 0,
@@ -7302,7 +7315,7 @@ mod tests {
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, tape(false));
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def(0, "INST-0", 1),
             ]),
@@ -7311,7 +7324,7 @@ mod tests {
         // A delta first, so the instrument is revealed and the snapshot install is the re-baseline
         // under test rather than the reveal's.
         proc.on_datagram(
-            &frame(&[add(1, 1, 1_000)]),
+            &datagram(&[add(1, 1, 1_000)]),
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
@@ -7328,7 +7341,7 @@ mod tests {
             })
         };
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 9,
@@ -7374,14 +7387,14 @@ mod tests {
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = synced_mbo_proc(&arbiter, &instruments);
         let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
-        proc.on_datagram(&frame(&[add(1, 1, 1_000)]), &ctx);
+        proc.on_datagram(&datagram(&[add(1, 1, 1_000)]), &ctx);
         assert_eq!(
             proc.synced_reported.values().copied().collect::<Vec<_>>(),
             vec![true]
         );
 
         // A sequence jump opens a gap: the book drops to `Recovering` and must say so.
-        proc.on_datagram(&frame(&[add(9, 2, 2_000)]), &ctx);
+        proc.on_datagram(&datagram(&[add(9, 2, 2_000)]), &ctx);
         assert_eq!(
             proc.synced_reported.values().copied().collect::<Vec<_>>(),
             vec![false]
@@ -7403,9 +7416,9 @@ mod tests {
         let snap = make_ctx(&arbiter, &instruments, PortRole::Snapshot);
 
         // Order 7 rests, then dies: the arbiter now holds a tombstone for it.
-        proc.on_datagram(&frame(&[add(1, 7, 1_000)]), &mkt);
+        proc.on_datagram(&datagram(&[add(1, 7, 1_000)]), &mkt);
         proc.on_datagram(
-            &frame(&[enc_order_cancel(&OrderCancel {
+            &datagram(&[enc_order_cancel(&OrderCancel {
                 instrument_id: 0,
                 source_id: 0,
                 reason: 0,
@@ -7418,7 +7431,7 @@ mod tests {
         let _ = drain_books(&mut rx);
 
         proc.on_datagram(
-            &frame(&[enc_instrument_reset(&InstrumentReset {
+            &datagram(&[enc_instrument_reset(&InstrumentReset {
                 instrument_id: 0,
                 reason: 0,
                 new_anchor_seq: 0,
@@ -7430,7 +7443,7 @@ mod tests {
         // arrives as an ordinary delta rather than inside a `Clear`-led batch (which bypasses the
         // guard entirely).
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -7447,11 +7460,11 @@ mod tests {
             ]),
             &snap,
         );
-        proc.on_datagram(&frame(&[add(1, 9, 1_300)]), &mkt);
+        proc.on_datagram(&datagram(&[add(1, 9, 1_300)]), &mkt);
         let _ = drain_books(&mut rx);
 
         // The venue re-uses order id 7 in the new session.
-        proc.on_datagram(&frame(&[add(2, 7, 1_400)]), &mkt);
+        proc.on_datagram(&datagram(&[add(2, 7, 1_400)]), &mkt);
         let ids: Vec<u64> = drain_books(&mut rx)
             .iter()
             .flat_map(|b| b.changes.iter().map(|c| c.order_id))
@@ -7475,7 +7488,7 @@ mod tests {
             arbiter: &'a SharedArbiter,
             instruments: &'a crate::model::InstrumentSnapshot,
             role: PortRole,
-        ) -> FrameCtx<'a> {
+        ) -> DatagramCtx<'a> {
             let mut c = make_ctx(arbiter, instruments, role);
             c.publisher = publisher;
             c
@@ -7489,7 +7502,7 @@ mod tests {
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, tape(false));
         let anchor = |sid: u32, ts: u64| {
-            frame(&[
+            datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -7507,7 +7520,7 @@ mod tests {
         };
         for publisher in [holder, bookless] {
             proc.on_datagram(
-                &frame(&[
+                &datagram(&[
                     enc_manifest_summary(1, 1),
                     enc_instrument_def(0, "INST-0", 1),
                 ]),
@@ -7520,11 +7533,11 @@ mod tests {
             &ctx_for(holder, &arbiter, &instruments, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &frame(&[add(1, 7, 1_000)]),
+            &datagram(&[add(1, 7, 1_000)]),
             &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
         );
         proc.on_datagram(
-            &frame(&[enc_order_cancel(&OrderCancel {
+            &datagram(&[enc_order_cancel(&OrderCancel {
                 instrument_id: 0,
                 source_id: 0,
                 reason: 0,
@@ -7537,7 +7550,7 @@ mod tests {
         let _ = drain_books(&mut rx);
 
         proc.on_datagram(
-            &frame(&[enc_end_of_session(1_200)]),
+            &datagram(&[enc_end_of_session(1_200)]),
             &ctx_for(bookless, &arbiter, &instruments, PortRole::Mktdata),
         );
         // The new session re-syncs and re-uses order id 7, arriving as an ordinary delta (a
@@ -7547,12 +7560,12 @@ mod tests {
             &ctx_for(holder, &arbiter, &instruments, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &frame(&[add(1, 9, 1_400)]),
+            &datagram(&[add(1, 9, 1_400)]),
             &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
         );
         let _ = drain_books(&mut rx);
         proc.on_datagram(
-            &frame(&[add(2, 7, 1_500)]),
+            &datagram(&[add(2, 7, 1_500)]),
             &ctx_for(holder, &arbiter, &instruments, PortRole::Mktdata),
         );
         let ids: Vec<u64> = drain_books(&mut rx)
@@ -7578,7 +7591,7 @@ mod tests {
             arbiter: &'a SharedArbiter,
             instruments: &'a crate::model::InstrumentSnapshot,
             role: PortRole,
-        ) -> FrameCtx<'a> {
+        ) -> DatagramCtx<'a> {
             let mut c = make_ctx(arbiter, instruments, role);
             c.publisher = publisher;
             c
@@ -7590,7 +7603,7 @@ mod tests {
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, tape(false));
-        let anchor = frame(&[
+        let anchor = datagram(&[
             enc_snapshot_begin(&SnapshotBegin {
                 instrument_id: 0,
                 anchor_seq: 0,
@@ -7607,7 +7620,7 @@ mod tests {
         ]);
         for publisher in [pub_a, pub_b] {
             proc.on_datagram(
-                &frame(&[
+                &datagram(&[
                     enc_manifest_summary(1, 1),
                     enc_instrument_def(0, "INST-0", 1),
                 ]),
@@ -7618,7 +7631,7 @@ mod tests {
                 &ctx_for(publisher, &arbiter, &instruments, PortRole::Snapshot),
             );
             proc.on_datagram(
-                &frame(&[add(1, 100, 5_000)]),
+                &datagram(&[add(1, 100, 5_000)]),
                 &ctx_for(publisher, &arbiter, &instruments, PortRole::Mktdata),
             );
         }
@@ -7634,7 +7647,7 @@ mod tests {
         );
 
         proc.on_datagram(
-            &frame(&[enc_end_of_session(6_000)]),
+            &datagram(&[enc_end_of_session(6_000)]),
             &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
         );
         let a = lock(&arbiter).book_path_synced(&market, Transport::Edge(pub_a));
@@ -7646,7 +7659,7 @@ mod tests {
     }
 
     /// **Item G.** A reveal moves the instrument to a new `MarketKey`. When the rate limit refuses to
-    /// materialize the whole book there, the frame owes the consumer a bare `Clear` — never its
+    /// materialize the whole book there, the datagram owes the consumer a bare `Clear` — never its
     /// incremental changes, which would land under a key the consumer was never baselined for and
     /// leave the replay accumulator un-baselined so new clients never see the market either.
     #[test]
@@ -7658,13 +7671,13 @@ mod tests {
         let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
 
         // First reveal (Source ID 0): the whole book, behind a `Clear`.
-        proc.on_datagram(&frame(&[add(1, 7, 1_000)]), &mkt);
+        proc.on_datagram(&datagram(&[add(1, 7, 1_000)]), &mkt);
         let _ = drain_books(&mut rx);
 
         // A second Source ID inside the rate-limit interval: the reveal still fires, but the
         // republish does not.
         proc.on_datagram(
-            &frame(&[enc_order_add(&OrderAdd {
+            &datagram(&[enc_order_add(&OrderAdd {
                 instrument_id: 0,
                 source_id: 1,
                 side: SIDE_BID,
@@ -7710,14 +7723,14 @@ mod tests {
         };
         let victim = IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1));
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_manifest_summary(1, 1),
                 enc_instrument_def(0, "INST-0", 1),
             ]),
             &ctx_for(victim, PortRole::Combined),
         );
         proc.on_datagram(
-            &frame(&[
+            &datagram(&[
                 enc_snapshot_begin(&SnapshotBegin {
                     instrument_id: 0,
                     anchor_seq: 0,
@@ -7735,7 +7748,7 @@ mod tests {
             &ctx_for(victim, PortRole::Snapshot),
         );
         proc.on_datagram(
-            &frame(&[add(1, 7, 1_000)]),
+            &datagram(&[add(1, 7, 1_000)]),
             &ctx_for(victim, PortRole::Mktdata),
         );
         let market: MarketKey = (
@@ -7751,7 +7764,7 @@ mod tests {
         for i in 0..=MAX_PUBLISHERS {
             let ip = IpAddr::V4(Ipv4Addr::new(10, 2, (i / 256) as u8, (i % 256) as u8));
             proc.on_datagram(
-                &frame(&[enc_manifest_summary(1, 1)]),
+                &datagram(&[enc_manifest_summary(1, 1)]),
                 &ctx_for(ip, PortRole::Combined),
             );
         }

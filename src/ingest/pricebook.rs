@@ -398,7 +398,7 @@ impl PriceBook {
     ///
     /// This is also the **only** escape from a per-instrument sequence that restarted (a publisher
     /// crash, or a garbage `last_instrument_seq` installed by a snapshot): every delta below the
-    /// baseline reads as a duplicate and every snapshot as current, so the frame header's changed
+    /// baseline reads as a duplicate and every snapshot as current, so the datagram header's changed
     /// `Reset Count` must route here for every book of that publisher.
     pub fn on_end_of_session(&mut self) {
         self.bids.clear();
@@ -893,7 +893,7 @@ mod tests {
     }
 
     /// **The trap this test exists for.** `Anchor Seq` is a channel-wide mktdata sequence while
-    /// our own baseline advances only on this instrument's own deltas — every frame for
+    /// our own baseline advances only on this instrument's own deltas — every datagram for
     /// every other instrument, and every heartbeat, moves one and not the other. Comparing them
     /// makes "we are behind" true for nearly every instrument on nearly every rotation, so a
     /// subscriber would discard and rebuild a perfectly good book every cycle.

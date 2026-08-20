@@ -115,7 +115,7 @@ pub struct NormalizedQuote {
     /// Venue/source timestamp (nanoseconds since epoch), 0 if unknown.
     pub source_ts_ns: u64,
     /// When the bridge received it (user-space wall clock, nanoseconds since epoch).
-    /// Taken *after* frame decode - kept for the kernel-vs-userspace jitter comparison.
+    /// Taken *after* datagram decode - kept for the kernel-vs-userspace jitter comparison.
     pub recv_ts_ns: u64,
     /// Kernel software RX timestamp from `SO_TIMESTAMPNS` (CLOCK_REALTIME nanoseconds),
     /// captured in the driver softirq *before* user-space. 0 when unavailable (e.g. the
@@ -158,7 +158,7 @@ pub struct NormalizedTrade {
     #[serde(default)]
     pub instrument_id: u32,
     /// The instrument **universe** this trade's row carries (`ingest::feeds::Feed::category`),
-    /// stamped by the emitting processor from its `FrameCtx::category` and read back by
+    /// stamped by the emitting processor from its `DatagramCtx::category` and read back by
     /// `ingest::reconcile::feed_history` to key `history::Key` on the same grain
     /// `model::BookKey`/`authority::MarketKey` already use. Producer-side only: two disjoint
     /// universes under one Source ID can share `(channel, instrument_id)`, so without this a
@@ -177,7 +177,7 @@ pub struct NormalizedTrade {
     pub cumulative_volume: f64,
     /// Venue/source timestamp (nanoseconds since epoch), 0 if unknown.
     pub source_ts_ns: u64,
-    /// When the bridge received it (user-space wall clock, ns since epoch), after frame decode.
+    /// When the bridge received it (user-space wall clock, ns since epoch), after datagram decode.
     pub recv_ts_ns: u64,
     /// Kernel software RX timestamp from `SO_TIMESTAMPNS` (CLOCK_REALTIME ns), 0 when unavailable.
     #[serde(default)]
@@ -210,7 +210,7 @@ pub struct NormalizedMidpoint {
     pub book_ts_ns: u64,
     /// When the publisher computed the mid (ns since epoch), 0 if unknown.
     pub compute_ts_ns: u64,
-    /// When the bridge received it (user-space wall clock, ns since epoch), after frame decode.
+    /// When the bridge received it (user-space wall clock, ns since epoch), after datagram decode.
     pub recv_ts_ns: u64,
     /// Kernel software RX timestamp from `SO_TIMESTAMPNS` (CLOCK_REALTIME ns), 0 when unavailable.
     #[serde(default)]
@@ -317,7 +317,7 @@ pub struct NormalizedBook {
     /// Instrument id, unique within `channel`.
     pub instrument_id: u32,
     /// The instrument **universe** this batch's row carries, stamped by the emitting processor from
-    /// its `FrameCtx::category` — the same field, for the same reason, as
+    /// its `DatagramCtx::category` — the same field, for the same reason, as
     /// [`NormalizedInstrument::category`]: it completes the [`BookKey`] a sink needs to resolve this
     /// batch's market in [`BookSnapshot`]. Never serialized.
     #[serde(skip, default = "empty_category")]
@@ -374,7 +374,7 @@ pub struct NormalizedInstrument {
     pub instrument_id: u32,
     /// The instrument **universe** this definition's row carries
     /// (`ingest::feeds::Feed::category`), stamped by the emitting processor from its
-    /// `FrameCtx::category`. Part of `InstrumentSnapshot`'s key (see there) for the same reason
+    /// `DatagramCtx::category`. Part of `InstrumentSnapshot`'s key (see there) for the same reason
     /// `BookKey` already carries it: two disjoint universes under one Source ID can share
     /// `(channel, instrument_id)`, and a category-blind catalog either overwrites one universe's
     /// definition with the other's or, on lookup, resolves the wrong one. Never serialized —

@@ -16,7 +16,7 @@
 //! covering a slice of one league completely and thrashing across all of them.
 //!
 //! Narrowing a feed whose publishers bind a base **flat** is refused at startup rather than
-//! implemented as a frame-header test. On such a feed `channel_id` identifies mirrors, not markets —
+//! implemented as a datagram-header test. On such a feed `channel_id` identifies mirrors, not markets —
 //! each publisher carries the complete instrument universe — so narrowing it would discard
 //! redundancy without reducing a single decoded message. There is no trader-facing reason to want
 //! it, and refusing is honest where a header test would be a filter that costs CPU and buys
@@ -442,7 +442,7 @@ mod tests {
 
     /// **The refusal.** On a feed whose publishers bind a base flat, `channel_id` identifies mirrors
     /// and each publisher carries the complete universe, so narrowing it discards redundancy
-    /// without reducing a single decoded message. A frame-header filter there would cost CPU and
+    /// without reducing a single decoded message. A datagram-header filter there would cost CPU and
     /// buy nothing, so this is refused rather than implemented — and the error has to name the
     /// feed, since "the channel filter did not apply" is otherwise indistinguishable from "the ids
     /// were wrong".

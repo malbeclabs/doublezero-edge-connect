@@ -54,7 +54,7 @@ impl<D: InstrumentDef> RefDataState<D> {
         }
     }
 
-    pub fn on_frame(&mut self, reset_count: u8) {
+    pub fn on_datagram(&mut self, reset_count: u8) {
         if reset_count != self.last_reset_count {
             self.valid = false;
             self.latest_seq = 0;
@@ -147,7 +147,7 @@ mod tests {
         s.on_manifest(true, 1, 1);
         s.on_instrument_definition(defn(10, 1));
         assert!(s.ready());
-        s.on_frame(1);
+        s.on_datagram(1);
         assert!(!s.valid);
     }
 

@@ -9,7 +9,7 @@ curl -fsSL https://get.doublezero.xyz/connect | bash
 `doublezero-edge-connect` is the bridge an operator runs to turn the DoubleZero (DZ) Edge
 **binary multicast** feeds into something a trading engine can read. It connects to the
 [DoubleZero Edge](https://doublezero.xyz/dz-edge) sources you're authorized for, decodes their
-little-endian fixed-size frames, drives the reference-data subscriber state machine (so every
+little-endian fixed-size datagrams, drives the reference-data subscriber state machine (so every
 quote carries the precision needed to interpret it), and re-serves the result as one normalized,
 **engine-agnostic JSON WebSocket** — venue + symbol tagged on every message, with four latency
 timestamps for end-to-end measurement.

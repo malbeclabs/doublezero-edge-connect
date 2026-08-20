@@ -29,13 +29,13 @@ use std::collections::BTreeSet;
 const EDGE_ONLY_QUOTES: usize = 41;
 
 fn refdata() -> Vec<Vec<u8>> {
-    replay::split_frames(
+    replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     )
 }
 fn mktdata() -> Vec<Vec<u8>> {
-    replay::split_frames(
+    replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     )
@@ -46,7 +46,7 @@ fn mktdata() -> Vec<Vec<u8>> {
 fn edge_quote_ticks() -> Vec<u64> {
     let mut ticks = BTreeSet::new();
     for f in mktdata() {
-        if let Ok((_h, msgs)) = codec::decode_frame(&f) {
+        if let Ok((_h, msgs)) = codec::decode_datagram(&f) {
             for m in &msgs {
                 if let codec::Message::Quote(q) = m {
                     ticks.insert(q.source_ts);
@@ -86,9 +86,9 @@ async fn edge_leads_steady_state_public_dropped() {
 
     // Replay the full edge feed first, in wire order (refdata then mktdata).
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();
@@ -177,9 +177,9 @@ async fn edge_gap_public_fills_in() {
     // Edge refdata AND mktdata: BTC prints real quotes (revealing its Source ID and advancing the
     // floor), before the edge goes quiet — the gap that follows is mid-stream.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();

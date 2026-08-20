@@ -1,16 +1,15 @@
-//! pcap -> edge-feed frame-log converter (dev tooling).
+//! pcap -> edge-feed datagram-log converter (dev tooling).
 //!
 //! Reads a multicast pcap, selects ONE publisher by **source IP** (the demux key the bridge keys
 //! on — robust to publishers sharing a UDP port in future, per the feed team), and emits the
-//! harness's `[u32 LE length][frame bytes]` record format that `tests/common/replay.rs`
-//! (`split_frames`) replays. One UDP datagram == one edge-feed frame, so a "frame" is the UDP
-//! payload.
+//! harness's `[u32 LE length][datagram bytes]` record format that `tests/common/replay.rs`
+//! (`split_datagrams`) replays, one record per UDP payload.
 //!
-//! Frames are decoded through the real `ingest::codec` / `ingest::codec_mbo` /
+//! Datagrams are decoded through the real `ingest::codec` / `ingest::codec_mbo` /
 //! `ingest::codec_mbp`, which does double duty:
-//!   1. **Filtering** — with `--symbol BTC`, keep every refdata frame (definitions + manifest,
+//!   1. **Filtering** — with `--symbol BTC`, keep every refdata datagram (definitions + manifest,
 //!      needed so the bridge resolves precision) but only the mktdata (and, for MBO, snapshot)
-//!      frames for that symbol, yielding a small self-contained fixture.
+//!      datagrams for that symbol, yielding a small self-contained fixture.
 //!   2. **Validation** — decode failures and message-type tallies are reported, so running this
 //!      against a live capture validates the codec's byte offsets against the real feed. (This is
 //!      the first real-feed check of the MBO offsets, which are otherwise only self-consistent.)
@@ -37,9 +36,9 @@ use pcap_file::{pcap::PcapReader, DataLink};
 
 use doublezero_edge_connect::ingest::{codec, codec_mbo, codec_mbp};
 
-/// One replay stream: a list of complete frames (UDP payloads), each written as a length-prefixed
+/// One replay stream: a list of complete datagrams (UDP payloads), each written as a length-prefixed
 /// record by [`write_log`].
-type FrameLog = Vec<Vec<u8>>;
+type DatagramLog = Vec<Vec<u8>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Protocol {
@@ -49,7 +48,7 @@ enum Protocol {
 }
 
 impl Protocol {
-    /// Little-endian frame magic: TOB `0x445A`, MBO `0x4444`, MBP `0x4442`.
+    /// Little-endian datagram magic: TOB `0x445A`, MBO `0x4444`, MBP `0x4442`.
     fn magic(self) -> [u8; 2] {
         match self {
             Protocol::Tob => [0x5A, 0x44],
@@ -60,7 +59,7 @@ impl Protocol {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Convert a multicast pcap into per-publisher edge-feed frame-logs")]
+#[command(about = "Convert a multicast pcap into per-publisher edge-feed datagram-logs")]
 struct Args {
     /// Input pcap (Linux SLL / cooked capture).
     pcap: PathBuf,
@@ -73,11 +72,11 @@ struct Args {
     /// Multicast group (destination) to filter on.
     #[arg(long, default_value = "233.84.178.15")]
     group: Ipv4Addr,
-    /// Which protocol's frames to extract.
+    /// Which protocol's datagrams to extract.
     #[arg(long, value_enum, default_value = "tob")]
     protocol: Protocol,
-    /// Keep only mktdata/snapshot frames for these symbols (e.g. `--symbol BTC --symbol ETH`).
-    /// Repeatable. Omit to keep all symbols. A frame batches several instruments, so a frame
+    /// Keep only mktdata/snapshot datagrams for these symbols (e.g. `--symbol BTC --symbol ETH`).
+    /// Repeatable. Omit to keep all symbols. A datagram batches several instruments, so a datagram
     /// carrying any selected symbol is kept whole (it may also carry unselected ones).
     #[arg(long)]
     symbol: Vec<String>,
@@ -100,13 +99,13 @@ struct Args {
     /// Second publisher source IP. When set, emit ONE combined `<out>.combined.bin` of both
     /// publishers' refdata + symbol-filtered mktdata (TOB) — or refdata + snapshot +
     /// symbol-filtered order-deltas/trades (MBO) — **in capture order**, each record tagged
-    /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata, 2=snapshot][frame]`. This preserves the
+    /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata, 2=snapshot][datagram]`. This preserves the
     /// real inter-publisher interleaving the multi-publisher dedup must collapse (separate
     /// per-publisher files, replayed back-to-back, would not). Works for `--protocol tob` and
     /// `--protocol mbo`; not implemented for `--protocol mbp`.
     #[arg(long)]
     combined_with: Option<Ipv4Addr>,
-    /// MBO combined only: instead of keeping real snapshot frames, synthesize a per-publisher
+    /// MBO combined only: instead of keeping real snapshot datagrams, synthesize a per-publisher
     /// empty-book anchor (`SnapshotBegin total_orders=0` + `SnapshotEnd`) just before each
     /// publisher's first in-window delta, with `anchor_seq`/`last_instrument_seq` derived from that
     /// delta so it is contiguous after the anchor and the book syncs immediately. Use when real
@@ -145,20 +144,20 @@ fn sll_ipv4_udp(data: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr, &[u8])> {
     Some((src, dst, &udp[8..end]))
 }
 
-/// Read the pcap and return this publisher's frames for the chosen protocol, in capture order.
-fn collect_frames(args: &Args) -> Result<Vec<Vec<u8>>> {
+/// Read the pcap and return this publisher's datagrams for the chosen protocol, in capture order.
+fn collect_datagrams(args: &Args) -> Result<Vec<Vec<u8>>> {
     let file = File::open(&args.pcap).with_context(|| format!("open {:?}", args.pcap))?;
     let mut reader = PcapReader::new(file).map_err(|e| anyhow!("read pcap header: {e}"))?;
     // Only Linux SLL v1 (DLT 113) is parsed below; bail loudly on anything else. A plain-Ethernet
-    // (DLT 1) or SLL2 (DLT 276) capture would otherwise parse zero matching frames and exit with a
-    // misleading "matched 0 frames" success — the silent bad-input trap.
+    // (DLT 1) or SLL2 (DLT 276) capture would otherwise parse zero matching datagrams and exit with a
+    // misleading "matched 0 datagrams" success — the silent bad-input trap.
     let datalink = reader.header().datalink;
     if datalink != DataLink::LINUX_SLL {
         bail!("unsupported pcap link type {datalink:?}; this tool parses Linux SLL (DLT 113) only");
     }
     let magic = args.protocol.magic();
 
-    let mut frames = Vec::new();
+    let mut datagrams = Vec::new();
     // `first_ts` anchors to the FIRST packet in the file (not the first in-window packet), so
     // `--from`/`--to` are relative to capture start.
     let mut first_ts: Option<f64> = None;
@@ -179,15 +178,15 @@ fn collect_frames(args: &Args) -> Result<Vec<Vec<u8>>> {
         // magic check keeps only the requested protocol so the other doesn't look like a decode
         // failure.
         if src == args.src && dst == args.group && payload.len() >= 24 && payload[..2] == magic {
-            frames.push(payload.to_vec());
+            datagrams.push(payload.to_vec());
         }
     }
-    Ok(frames)
+    Ok(datagrams)
 }
 
-fn write_log(path: &Path, frames: &[Vec<u8>]) -> Result<()> {
+fn write_log(path: &Path, datagrams: &[Vec<u8>]) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("create {path:?}"))?);
-    for f in frames {
+    for f in datagrams {
         w.write_all(&(f.len() as u32).to_le_bytes())?;
         w.write_all(f)?;
     }
@@ -228,13 +227,13 @@ fn report_decode(label: &str, args: &Args, defs: usize, errors: u64, body: &str)
     eprintln!("  symbols defined: {defs}");
     if errors > 0 {
         eprintln!(
-            "  WARNING: {errors} frames failed to decode — possible codec offset mismatch vs the live feed"
+            "  WARNING: {errors} datagrams failed to decode — possible codec offset mismatch vs the live feed"
         );
     }
 }
 
 /// TOB: split into refdata (definitions/manifest) and mktdata (quotes/trades, symbol-filtered).
-fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
+fn process_tob(datagrams: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec::Message;
     let (mut quotes, mut trades, mut defs, mut manifests, mut hb, mut other, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
@@ -247,8 +246,8 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     // since a definition may arrive after early quotes.
     let mut mkt: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
 
-    for f in frames {
-        let Ok((_hdr, msgs)) = codec::decode_frame(f) else {
+    for f in datagrams {
+        let Ok((_hdr, msgs)) = codec::decode_datagram(f) else {
             errors += 1;
             continue;
         };
@@ -287,11 +286,11 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     }
 
     let target = resolve_symbols(&args.symbol, &symbol_to_id)?;
-    // A TOB frame batches multiple instruments' messages, so a frame carrying a selected symbol may
+    // A TOB datagram batches multiple instruments' messages, so a datagram carrying a selected symbol may
     // also carry others; it is kept whole. Track that leakage so the output is not overclaimed as
     // "selected-only".
     let mut mktdata: Vec<Vec<u8>> = Vec::new();
-    let (mut mixed_frames, mut leaked_msgs) = (0u64, 0u64);
+    let (mut mixed_datagrams, mut leaked_msgs) = (0u64, 0u64);
     for (f, ids) in mkt {
         let keep = target
             .as_ref()
@@ -300,7 +299,7 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
             if let Some(t) = &target {
                 let others = ids.iter().filter(|id| !t.contains(id)).count() as u64;
                 if others > 0 {
-                    mixed_frames += 1;
+                    mixed_datagrams += 1;
                     leaked_msgs += others;
                 }
             }
@@ -324,18 +323,18 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
             "  filter symbols {:?} -> instrument_ids {target:?}",
             args.symbol
         );
-        if mixed_frames > 0 {
+        if mixed_datagrams > 0 {
             eprintln!(
-                "  note: {mixed_frames} kept frames also batch unselected symbols ({leaked_msgs} non-selected messages retained — frames are kept whole)"
+                "  note: {mixed_datagrams} kept datagrams also batch unselected symbols ({leaked_msgs} non-selected messages retained — datagrams are kept whole)"
             );
         }
     }
     eprintln!(
-        "  wrote {} refdata frames -> {refdata_path:?}",
+        "  wrote {} refdata datagrams -> {refdata_path:?}",
         refdata.len()
     );
     eprintln!(
-        "  wrote {} mktdata frames -> {mktdata_path:?}",
+        "  wrote {} mktdata datagrams -> {mktdata_path:?}",
         mktdata.len()
     );
     Ok(())
@@ -345,15 +344,15 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
 /// deltas + trades). Symbol filter keeps that instrument's deltas/trades and its snapshot group
 /// (SnapshotOrder carries only a snapshot_id, so we keep the orders whose snapshot_id belongs to a
 /// SnapshotBegin for the target instrument).
-fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
+fn process_mbo(datagrams: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec_mbo::Message;
     let (mut adds, mut cancels, mut execs, mut trades) = (0u64, 0u64, 0u64, 0u64);
     let (mut defs, mut manifests, mut snaps, mut hb, mut other, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
 
-    // Per-frame summaries (so the symbol filter can be applied after the full scan).
-    struct Frame {
+    // Per-datagram summaries (so the symbol filter can be applied after the full scan).
+    struct Datagram {
         payload: Vec<u8>,
         refdata: bool,
         snapshot: bool,
@@ -362,14 +361,14 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         order_sids: Vec<u32>,
         md_ids: Vec<u32>, // delta/trade instrument ids
     }
-    let mut summaries: Vec<Frame> = Vec::new();
+    let mut summaries: Vec<Datagram> = Vec::new();
 
-    for f in frames {
-        let Ok((_hdr, msgs)) = codec_mbo::decode_frame(f) else {
+    for f in datagrams {
+        let Ok((_hdr, msgs)) = codec_mbo::decode_datagram(f) else {
             errors += 1;
             continue;
         };
-        let mut fr = Frame {
+        let mut fr = Datagram {
             payload: f.clone(),
             refdata: false,
             snapshot: false,
@@ -501,15 +500,15 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         );
     }
     eprintln!(
-        "  wrote {} refdata frames -> {refdata_path:?}",
+        "  wrote {} refdata datagrams -> {refdata_path:?}",
         refdata.len()
     );
     eprintln!(
-        "  wrote {} snapshot frames -> {snapshot_path:?}",
+        "  wrote {} snapshot datagrams -> {snapshot_path:?}",
         snapshot.len()
     );
     eprintln!(
-        "  wrote {} mktdata frames -> {mktdata_path:?}",
+        "  wrote {} mktdata datagrams -> {mktdata_path:?}",
         mktdata.len()
     );
     Ok(())
@@ -521,7 +520,7 @@ fn process_mbo(frames: &[Vec<u8>], args: &Args) -> Result<()> {
 /// which the spec scopes per `(channel, instrument)`, so two instruments can share one. Levels are
 /// attributed to the currently-open `SnapshotBegin` instead — well-defined, because a channel never
 /// interleaves snapshot groups.
-fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
+fn process_mbp(datagrams: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec_mbp::Message;
     let (mut levels, mut clears, mut resets, mut trades, mut batches) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -534,29 +533,29 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     let mut orphan_levels = 0u64;
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
 
-    // Per-frame summaries (so the symbol filter can be applied after the full scan).
-    struct Frame {
+    // Per-datagram summaries (so the symbol filter can be applied after the full scan).
+    struct Datagram {
         payload: Vec<u8>,
         refdata: bool,
         snapshot: bool,
         channel_wide: bool, // BatchBoundary / EndOfSession: no instrument id, kept unfiltered
-        snap_insts: Vec<u32>, // instruments this frame's begins/levels/ends belong to
+        snap_insts: Vec<u32>, // instruments this datagram's begins/levels/ends belong to
         md_ids: Vec<u32>,   // level-update/clear/reset/trade instrument ids
     }
-    let mut summaries: Vec<Frame> = Vec::new();
+    let mut summaries: Vec<Datagram> = Vec::new();
     // The open snapshot group per **channel**, in capture order: channel -> (instrument, snapshot).
     // Keyed per channel because a channel is an independent state machine with its own snapshot
     // cycle, and one snapshot port may carry several: two channels whose groups alternate there are
     // each conformant, so a single port-wide slot mis-attributes every level of the interleaved one.
     let mut open_group: HashMap<u8, (u32, u32)> = HashMap::new();
 
-    for f in frames {
-        let Ok((hdr, msgs)) = codec_mbp::decode_frame(f) else {
+    for f in datagrams {
+        let Ok((hdr, msgs)) = codec_mbp::decode_datagram(f) else {
             errors += 1;
             continue;
         };
         let chan = hdr.channel_id;
-        let mut fr = Frame {
+        let mut fr = Datagram {
             payload: f.clone(),
             refdata: false,
             snapshot: false,
@@ -684,30 +683,30 @@ fn process_mbp(frames: &[Vec<u8>], args: &Args) -> Result<()> {
         );
     }
     eprintln!(
-        "  wrote {} refdata frames -> {refdata_path:?}",
+        "  wrote {} refdata datagrams -> {refdata_path:?}",
         refdata.len()
     );
     eprintln!(
-        "  wrote {} snapshot frames -> {snapshot_path:?}",
+        "  wrote {} snapshot datagrams -> {snapshot_path:?}",
         snapshot.len()
     );
     eprintln!(
-        "  wrote {} mktdata frames -> {mktdata_path:?}",
+        "  wrote {} mktdata datagrams -> {mktdata_path:?}",
         mktdata.len()
     );
     Ok(())
 }
 
-/// Index of the first frame in `frames` whose decoded messages satisfy `pred`, or `Ok(None)` if
+/// Index of the first datagram in `datagrams` whose decoded messages satisfy `pred`, or `Ok(None)` if
 /// none match. Unlike a `position()` closure - which would have to `.unwrap()` the decode and panic
-/// on a malformed frame - this propagates a decode error via `?`, matching the rest of the
+/// on a malformed datagram - this propagates a decode error via `?`, matching the rest of the
 /// generator's fail-loud handling.
-fn first_frame_with(
-    frames: &[Vec<u8>],
+fn first_datagram_with(
+    datagrams: &[Vec<u8>],
     pred: impl Fn(&codec_mbo::Message) -> bool,
 ) -> Result<Option<usize>> {
-    for (i, f) in frames.iter().enumerate() {
-        if codec_mbo::decode_frame(f)?.1.iter().any(&pred) {
+    for (i, f) in datagrams.iter().enumerate() {
+        if codec_mbo::decode_datagram(f)?.1.iter().any(&pred) {
             return Ok(Some(i));
         }
     }
@@ -727,16 +726,16 @@ fn trim_mbo_minimal(
     mktdata: &[Vec<u8>],
     target_id: u32,
     max_deltas: u32,
-) -> Result<(FrameLog, FrameLog, FrameLog)> {
+) -> Result<(DatagramLog, DatagramLog, DatagramLog)> {
     use codec_mbo::Message;
 
-    // Refdata: keep from the first ManifestSummary frame through the first frame at/after it that
+    // Refdata: keep from the first ManifestSummary datagram through the first datagram at/after it that
     // carries the target instrument's definition. One manifest epoch + the one definition is all the
     // subscriber needs to resolve `target_id`'s precision; the live capture re-sends the same
     // manifest seq on a round-robin, so the rest is redundant.
-    let manifest_idx = first_frame_with(refdata, |m| matches!(m, Message::ManifestSummary(_)))?
+    let manifest_idx = first_datagram_with(refdata, |m| matches!(m, Message::ManifestSummary(_)))?
         .ok_or_else(|| anyhow!("no ManifestSummary in refdata"))?;
-    let def_off = first_frame_with(
+    let def_off = first_datagram_with(
         &refdata[manifest_idx..],
         |m| matches!(m, Message::InstrumentDefinition(d) if d.instrument_id == target_id),
     )?
@@ -751,7 +750,7 @@ fn trim_mbo_minimal(
     let mut received: HashMap<u32, u32> = HashMap::new();
     let mut ended: HashSet<u32> = HashSet::new();
     for f in snapshot {
-        for m in &codec_mbo::decode_frame(f)?.1 {
+        for m in &codec_mbo::decode_datagram(f)?.1 {
             match m {
                 Message::SnapshotBegin(s) => begins.push((
                     s.snapshot_id,
@@ -794,21 +793,21 @@ fn trim_mbo_minimal(
         )
     })?;
 
-    // Pass 2: keep the chosen group's frames [BEGIN..END] inclusive, and count its two sides.
-    let begin_idx = first_frame_with(
+    // Pass 2: keep the chosen group's datagrams [BEGIN..END] inclusive, and count its two sides.
+    let begin_idx = first_datagram_with(
         snapshot,
         |m| matches!(m, Message::SnapshotBegin(s) if s.snapshot_id == sid),
     )?
-    .expect("chosen snapshot group has a begin frame");
-    let end_idx = first_frame_with(
+    .expect("chosen snapshot group has a begin datagram");
+    let end_idx = first_datagram_with(
         snapshot,
         |m| matches!(m, Message::SnapshotEnd(s) if s.snapshot_id == sid),
     )?
-    .expect("chosen snapshot group has an end frame");
+    .expect("chosen snapshot group has an end datagram");
     let snap_out = snapshot[begin_idx..=end_idx].to_vec();
     let (mut bid, mut ask) = (0u32, 0u32);
     for f in &snap_out {
-        for m in &codec_mbo::decode_frame(f)?.1 {
+        for m in &codec_mbo::decode_datagram(f)?.1 {
             if let Message::SnapshotOrder(s) = m {
                 if s.snapshot_id == sid {
                     if s.side == codec_mbo::SIDE_BID {
@@ -830,7 +829,7 @@ fn trim_mbo_minimal(
     let (mut kmin, mut kmax) = (u32::MAX, 0u32);
     for f in mktdata {
         let mut keep = false;
-        for m in &codec_mbo::decode_frame(f)?.1 {
+        for m in &codec_mbo::decode_datagram(f)?.1 {
             let seq = match m {
                 Message::OrderAdd(o) if o.instrument_id == target_id => o.per_instrument_seq,
                 Message::OrderCancel(o) if o.instrument_id == target_id => o.per_instrument_seq,
@@ -849,8 +848,8 @@ fn trim_mbo_minimal(
     }
 
     eprintln!(
-        "  mbo-minimal: {} refdata frames; snapshot group sid={sid} total_orders={total} \
-         (bid={bid} ask={ask}, two-sided), {} snapshot frames; {} mktdata frames, \
+        "  mbo-minimal: {} refdata datagrams; snapshot group sid={sid} total_orders={total} \
+         (bid={bid} ask={ask}, two-sided), {} snapshot datagrams; {} mktdata datagrams, \
          post-anchor seq=[{kmin}..{kmax}]",
         refdata_out.len(),
         snap_out.len(),
@@ -859,8 +858,8 @@ fn trim_mbo_minimal(
     Ok((refdata_out, snap_out, md_out))
 }
 
-/// Collect `(rel_ts, src_ip, frame)` for any of `srcs`, in capture order, each frame's time relative
-/// to the first packet in the file — like `collect_frames` but tags source + timestamp and accepts a
+/// Collect `(rel_ts, src_ip, datagram)` for any of `srcs`, in capture order, each datagram's time relative
+/// to the first packet in the file — like `collect_datagrams` but tags source + timestamp and accepts a
 /// set, for the combined multi-publisher output. Applies only the `--to` upper bound; the `--from`
 /// lower bound is left to the caller so it can be applied **per role** (MBO keeps refdata — the
 /// slow-round-robin instrument definitions — from t=0 so the symbol's precision resolves even when
@@ -910,7 +909,7 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
     // Pass 1: build symbol -> id across both publishers (a def may follow early quotes).
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
     for (_src, f) in tagged {
-        if let Ok((_h, msgs)) = codec::decode_frame(f) {
+        if let Ok((_h, msgs)) = codec::decode_datagram(f) {
             for m in &msgs {
                 if let Message::InstrumentDefinition(d) = m {
                     symbol_to_id.insert(d.symbol.to_string(), d.instrument_id);
@@ -925,15 +924,15 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
         .map(|(s, &id)| (id, s.clone()))
         .collect();
 
-    // Pass 2: classify each frame (refdata vs selected mktdata) and emit in capture order, tagged.
+    // Pass 2: classify each datagram (refdata vs selected mktdata) and emit in capture order, tagged.
     let path = out_path(&args.out, "combined");
     let mut w = BufWriter::new(File::create(&path).with_context(|| format!("create {path:?}"))?);
     let (mut refc, mut mktc, mut errors) = (0u64, 0u64, 0u64);
-    // Raw per-(symbol, publisher) quote-message counts among the KEPT mktdata frames — the
+    // Raw per-(symbol, publisher) quote-message counts among the KEPT mktdata datagrams — the
     // pre-dedup baseline the dedup test compares its emitted counts against.
     let mut per_symbol_pub: HashMap<(String, Ipv4Addr), u64> = HashMap::new();
     for (src, f) in tagged {
-        let Ok((_h, msgs)) = codec::decode_frame(f) else {
+        let Ok((_h, msgs)) = codec::decode_datagram(f) else {
             errors += 1;
             continue;
         };
@@ -978,7 +977,7 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
     }
     w.flush()?;
     eprintln!(
-        "combined {} + {}: {refc} refdata + {mktc} mktdata frames (decode errors {errors}) -> {path:?}",
+        "combined {} + {}: {refc} refdata + {mktc} mktdata datagrams (decode errors {errors}) -> {path:?}",
         args.src,
         args.combined_with.expect("combined mode")
     );
@@ -991,12 +990,12 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
     Ok(())
 }
 
-/// Hand-encode a synthetic empty-book MBO snapshot frame (`SnapshotBegin total_orders=0` +
+/// Hand-encode a synthetic empty-book MBO snapshot datagram (`SnapshotBegin total_orders=0` +
 /// `SnapshotEnd`) anchored at `(anchor_seq, last_instrument_seq)` for `instrument_id`, in the
 /// codec_mbo wire layout (the codec's own encoders are test-only). Used by `--empty-anchor`: the
 /// same honest empty anchor `tests/fixtures/mbo_snapshot.bin` uses, computed per publisher per window
 /// so a mid-stream delta window gets a synced book without a (slow, round-robin) real snapshot.
-fn synth_empty_anchor_frame(
+fn synth_empty_anchor_datagram(
     instrument_id: u32,
     anchor_seq: u64,
     last_instrument_seq: u32,
@@ -1014,23 +1013,26 @@ fn synth_empty_anchor_frame(
     end.extend_from_slice(&anchor_seq.to_le_bytes());
     end.extend_from_slice(&SNAPSHOT_ID.to_le_bytes());
     let body: Vec<u8> = begin.into_iter().chain(end).collect();
-    let frame_len = (24 + body.len()) as u16; // 24B frame header + body
+    let datagram_len = (24 + body.len()) as u16; // 24B datagram header + body
     let mut f = vec![0x44u8, 0x44, 1, 0]; // magic 0x4444 LE, schema 1, channel 0
     f.extend_from_slice(&0u64.to_le_bytes()); // sequence (book reads the anchor from the message)
     f.extend_from_slice(&0u64.to_le_bytes()); // send ts
     f.push(2); // message count
     f.push(0); // reset count
-    f.extend_from_slice(&frame_len.to_le_bytes());
+    f.extend_from_slice(&datagram_len.to_le_bytes());
     f.extend_from_slice(&body);
     f
 }
 
 /// `(instrument_id, per_instrument_seq, mktdata_seq)` of the first order delta for a target
-/// instrument in `frame` — the seqs `--empty-anchor` anchors a synthetic snapshot just below, so the
-/// delta is contiguous after it. `None` if the frame carries no target delta or fails to decode.
-fn first_target_delta_seq(frame: &[u8], target: &Option<HashSet<u32>>) -> Option<(u32, u32, u64)> {
+/// instrument in `datagram` — the seqs `--empty-anchor` anchors a synthetic snapshot just below, so the
+/// delta is contiguous after it. `None` if the datagram carries no target delta or fails to decode.
+fn first_target_delta_seq(
+    datagram: &[u8],
+    target: &Option<HashSet<u32>>,
+) -> Option<(u32, u32, u64)> {
     use codec_mbo::Message;
-    let (h, msgs) = codec_mbo::decode_frame(frame).ok()?;
+    let (h, msgs) = codec_mbo::decode_datagram(datagram).ok()?;
     for m in &msgs {
         let (id, seq) = match m {
             Message::OrderAdd(o) => (o.instrument_id, o.per_instrument_seq),
@@ -1047,7 +1049,7 @@ fn first_target_delta_seq(frame: &[u8], target: &Option<HashSet<u32>>) -> Option
 
 /// Combined multi-publisher MBO output: both publishers' refdata + snapshot + symbol-filtered
 /// order-delta/trade mktdata in capture order, each record tagged `[u32 len][4B src_ip][1B role:
-/// 0=refdata, 1=mktdata, 2=snapshot][frame]`. The MBO counterpart to `process_tob_combined`, with two
+/// 0=refdata, 1=mktdata, 2=snapshot][datagram]`. The MBO counterpart to `process_tob_combined`, with two
 /// differences: MBO has three port roles (refdata / snapshot / mktdata) instead of two, and the
 /// `snapshot_id` spaces are **per publisher**, so a `SnapshotOrder` (which carries only a
 /// `snapshot_id`, no instrument id) is mapped back to its instrument via the `(publisher,
@@ -1060,12 +1062,12 @@ fn first_target_delta_seq(frame: &[u8], target: &Option<HashSet<u32>>) -> Option
 fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Result<()> {
     use codec_mbo::Message;
     // Pass 1: symbol -> id, and (publisher, snapshot_id) -> instrument_id, across the whole scan
-    // (a def or a SnapshotBegin may follow the frames that reference it; defs are also collected
+    // (a def or a SnapshotBegin may follow the datagrams that reference it; defs are also collected
     // before `--from` so a slow-round-robin definition still resolves the symbol).
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
     let mut snapshot_inst: HashMap<(Ipv4Addr, u32), u32> = HashMap::new();
     for (_rel, src, f) in tagged {
-        if let Ok((_h, msgs)) = codec_mbo::decode_frame(f) {
+        if let Ok((_h, msgs)) = codec_mbo::decode_datagram(f) {
             for m in &msgs {
                 match m {
                     Message::InstrumentDefinition(d) => {
@@ -1085,13 +1087,13 @@ fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Res
         .map(|(s, &id)| (id, s.clone()))
         .collect();
 
-    // Pass 2: classify each frame (refdata / snapshot / mktdata) and emit in capture order, tagged.
-    // Frames are port-segregated in practice, so each is one role; if one ever carries more than one
+    // Pass 2: classify each datagram (refdata / snapshot / mktdata) and emit in capture order, tagged.
+    // Datagrams are port-segregated in practice, so each is one role; if one ever carries more than one
     // kind, refdata wins over snapshot over mktdata (matching process_tob_combined's ref > mkt).
     let path = out_path(&args.out, "combined");
     let mut w = BufWriter::new(File::create(&path).with_context(|| format!("create {path:?}"))?);
     let (mut refc, mut snapc, mut mktc, mut errors) = (0u64, 0u64, 0u64, 0u64);
-    // Raw per-(symbol, publisher) order-delta/trade message counts among the KEPT mktdata frames —
+    // Raw per-(symbol, publisher) order-delta/trade message counts among the KEPT mktdata datagrams —
     // the pre-dedup baseline the dedup test compares its emitted depth/trade counts against.
     let mut per_symbol_pub: HashMap<(String, Ipv4Addr), u64> = HashMap::new();
     // Window-sizing diagnostics: when the target symbol's definition first appears (refdata is kept
@@ -1104,7 +1106,7 @@ fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Res
     // anchor_seq), emitted once before that publisher's first delta. Unused when real snapshots are kept.
     let mut anchor_done: HashMap<Ipv4Addr, (u32, u32, u64)> = HashMap::new();
     for (rel, src, f) in tagged {
-        let Ok((_h, msgs)) = codec_mbo::decode_frame(f) else {
+        let Ok((_h, msgs)) = codec_mbo::decode_datagram(f) else {
             errors += 1;
             continue;
         };
@@ -1164,8 +1166,8 @@ fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Res
                 .as_ref()
                 .is_none_or(|t| md_ids.iter().any(|id| t.contains(id)));
         // refdata: kept across the whole scan; snapshot/mktdata: only inside [--from, --to]. With
-        // --empty-anchor, real snapshot frames are dropped (a synthetic anchor is emitted before each
-        // publisher's first delta instead), so a snapshot-role frame falls through to `continue`.
+        // --empty-anchor, real snapshot datagrams are dropped (a synthetic anchor is emitted before each
+        // publisher's first delta instead), so a snapshot-role datagram falls through to `continue`.
         let role: u8 = if is_ref {
             0
         } else if !args.empty_anchor && in_window && is_snap && snap_keep {
@@ -1194,7 +1196,7 @@ fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Res
                     if let Some((id, seq, mseq)) = first_target_delta_seq(f, &target) {
                         let (anchor_seq, last_instr) =
                             (mseq.saturating_sub(1), seq.saturating_sub(1));
-                        let af = synth_empty_anchor_frame(id, anchor_seq, last_instr);
+                        let af = synth_empty_anchor_datagram(id, anchor_seq, last_instr);
                         w.write_all(&(af.len() as u32).to_le_bytes())?;
                         w.write_all(&src.octets())?;
                         w.write_all(&[2u8])?;
@@ -1212,7 +1214,7 @@ fn process_mbo_combined(tagged: &[(f64, Ipv4Addr, Vec<u8>)], args: &Args) -> Res
     }
     w.flush()?;
     eprintln!(
-        "combined MBO {} + {}: {refc} refdata + {snapc} snapshot + {mktc} mktdata frames (decode errors {errors}) -> {path:?}",
+        "combined MBO {} + {}: {refc} refdata + {snapc} snapshot + {mktc} mktdata datagrams (decode errors {errors}) -> {path:?}",
         args.src,
         args.combined_with.expect("combined mode")
     );
@@ -1269,7 +1271,7 @@ fn main() -> Result<()> {
             Protocol::Tob => {
                 let tagged = collect_tagged(&args, &srcs)?;
                 eprintln!(
-                    "matched {} combined TOB frames from {} + {}",
+                    "matched {} combined TOB datagrams from {} + {}",
                     tagged.len(),
                     args.src,
                     second
@@ -1279,7 +1281,7 @@ fn main() -> Result<()> {
             Protocol::Mbo => {
                 let tagged = collect_tagged_ts(&args, &srcs)?;
                 eprintln!(
-                    "matched {} combined MBO frames from {} + {}",
+                    "matched {} combined MBO datagrams from {} + {}",
                     tagged.len(),
                     args.src,
                     second
@@ -1292,11 +1294,11 @@ fn main() -> Result<()> {
             ),
         };
     }
-    let frames = collect_frames(&args)?;
-    eprintln!("matched {} {:?} frames", frames.len(), args.protocol);
+    let datagrams = collect_datagrams(&args)?;
+    eprintln!("matched {} {:?} datagrams", datagrams.len(), args.protocol);
     match args.protocol {
-        Protocol::Tob => process_tob(&frames, &args),
-        Protocol::Mbo => process_mbo(&frames, &args),
-        Protocol::Mbp => process_mbp(&frames, &args),
+        Protocol::Tob => process_tob(&datagrams, &args),
+        Protocol::Mbo => process_mbo(&datagrams, &args),
+        Protocol::Mbp => process_mbp(&datagrams, &args),
     }
 }

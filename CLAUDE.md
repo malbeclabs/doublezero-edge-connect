@@ -106,7 +106,7 @@ Modules are grouped by role under `src/`:
     message (legacy payload, or recomputed merkle root) from a raw datagram. ⚠️ **Offsets +
     merkle layout are transcribed from the agave shred format and NOT validated against a live
     `edge-solana-*` hexdump** — same draft status `codec_midpoint` had (`codec_mbo` is now
-    validated, #4). Round-trip tests pin self-consistency only. Validate against a captured frame
+    validated, #4). Round-trip tests pin self-consistency only. Validate against a captured datagram
     before trusting sigverify.
   - **`shred/verify.rs`** — ed25519 (`ed25519-dalek`) of the signature over the signed message;
     any malformed input fails verification rather than panicking.
@@ -223,7 +223,7 @@ Modules are grouped by role under `src/`:
   **only** where the publisher derives a port per channel: an excluded channel is never bound and the
   kernel discards its traffic before userspace, which is why it costs nothing and is the reason that
   derivation exists upstream. Narrowing a row whose publishers bind one base port **flat** is
-  **refused at startup**, not implemented as a frame-header test: there `channel_id` identifies
+  **refused at startup**, not implemented as a datagram-header test: there `channel_id` identifies
   mirrors, so every publisher carries the complete universe and narrowing would give up redundancy
   without reducing a single decoded message. Keyed **by group code, never globally** (one global flag
   would filter to a league and silently half-blind an unrelated mirrored feed), and takes **numeric
@@ -344,13 +344,13 @@ Modules are grouped by role under `src/`:
 - **`ingest/receiver.rs`** — the ingest hot path. All socket plumbing is **protocol-agnostic and shared**:
   `bind_multicast`, `recv_with_ts` (kernel timestamps), `wait_for_interface_ip`, the `IDLE_REJOIN`
   watchdog, `emit_status`, and `SeqTracker`. `drive()` is a generic receive loop over **N ports**
-  (1/2/3) that hands each datagram to a `FrameProcessor` via a `FrameCtx`; `run_feed()` picks the
+  (1/2/3) that hands each datagram to a `DatagramProcessor` via a `DatagramCtx`; `run_feed()` picks the
   processor + port roles from the feed's `FeedKind`. One `drive()` task serves **one publisher** —
   its own port block, its own processor state (and so its own MBO books) — and reports liveness under
   its base port via `ReceiverRegistration`, which registers only after the sockets bind (a
   never-binding receiver would otherwise flap `status` on every reconciler respawn) and deregisters
   on every exit path via `Drop`. The watchdog tracks the **mktdata** port only (refdata/snapshot keep
-  ticking when market data is wedged). `FrameCtx` carries the shared `arbiter` (not a raw `tx`);
+  ticking when market data is wedged). `DatagramCtx` carries the shared `arbiter` (not a raw `tx`);
   `ctx.emit(msg)` routes through it tagged `Transport::Edge(src_ip)`.
 - **`ingest/health.rs`** — `FeedHealth`: every receiver's liveness keyed `(venue, category, kind, base port)`
   (the same tuple as `reconcile::FeedKey`; `(venue, kind)` is not an identity once a venue carries two
@@ -629,11 +629,11 @@ Modules are grouped by role under `src/`:
   `tradeSequenceNumber` (the arbiter's windowed trade dedup races them). Validated against a live
   edge+public capture (2026-06-30): `trade_id == tradeSequenceNumber` on 257/257 shared fills and
   `side` maps `bid->buy`/`ask->sell`. No `FEEDS` row depends on it (off until enabled).
-- **`ingest/processor.rs`** — the per-protocol `FrameProcessor` impls (own each protocol's state and
+- **`ingest/processor.rs`** — the per-protocol `DatagramProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`,
   the order-level `book` and trades — `emit_book` mirrors `emit_depth`'s gates exactly, and each book's
-  sync state is reported to the arbiter *before* the frame's emissions so the re-baseline suppression has
+  sync state is reported to the arbiter *before* the datagram's emissions so the re-baseline suppression has
   a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
   suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
   incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
@@ -647,8 +647,8 @@ Modules are grouped by role under `src/`:
   datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
   sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
   instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
-  `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *frame*, so two
-  frames in one tick can emit two depths with the same `source_ts`; this is **benign** under the
+  `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *datagram*, so two
+  datagrams in one tick can emit two depths with the same `source_ts`; this is **benign** under the
   content-inclusive depth floor (same tick + same leader + new content → both admitted, distinct
   content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
   tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
@@ -663,7 +663,7 @@ Modules are grouped by role under `src/`:
   down — `pricebook`'s per-book cap is a quarter of it, so the budget only binds with several heavy
   books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's
   venue-wide clear would tear down a live peer path's published book), and a channel reset on any
-  **change** of the frame header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
+  **change** of the datagram header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
   read from the **market-data role only** and only for a publisher whose reference data we already
   hold: the three ports carry one epoch on three sockets, so a memo shared across them would re-reset
   the channel on every interleaving of a restart's backlog, and minting reference-data state from the
@@ -683,16 +683,16 @@ Modules are grouped by role under `src/`:
   `PerPublisher::take_evicted` into `forget_publisher`, which drops the evicted publisher's books,
   `revealed`/`announced_symbol` entries and per-channel snapshot/reset memos together.
 - **`ingest/codec.rs` / `codec_midpoint.rs` / `codec_mbo.rs` / `codec_mbp.rs`** — pure decoders for each protocol's
-  little-endian fixed-size frames, all built on `ingest/codec_common.rs` (shared 24B frame header, 4B
-  message header, LE readers, `cstr`, and the generic `decode_frame_with(magic, ...)` walker).
+  little-endian fixed-size datagrams, all built on `ingest/codec_common.rs` (shared 24B datagram header, 4B
+  message header, LE readers, `cstr`, and the generic `decode_datagram_with(magic, ...)` walker).
   **`codec.rs` (TOB) offsets are validated byte-for-byte** against the authoritative Go decoder in
   `edge-multicast-ref` — **do not change them without re-validating**. **`codec_mbo.rs` is now
   field-by-field validated too (#4):** shared-with-TOB types reuse the byte-validated TOB layout,
-  and the MBO-specific types are pinned by offset-independent unit tests plus a real-frame decode
+  and the MBO-specific types are pinned by offset-independent unit tests plus a real-datagram decode
   test over the byte-validated committed golden fixtures (`tests/codec_mbo_fixtures.rs`). ⚠️
   **`codec_midpoint.rs` offsets still come from the edge-feed-spec draft and are NOT
   reference-validated**; its round-trip tests only pin self-consistency, so validate against a live
-  frame hexdump before trusting its output (see "Conventions" below). **`codec_mbp.rs`
+  datagram hexdump before trusting its output (see "Conventions" below). **`codec_mbp.rs`
   (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
   against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
   a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
@@ -702,7 +702,7 @@ Modules are grouped by role under `src/`:
   so a lenient decode would
   read `depth_bound` — whose `0` claims a *complete* book — from whatever follows the body), and
   therefore also the one that rejects an unimplemented `SCHEMA_VERSION` itself rather than leaving
-  it to the shared walker: without that gate the length rule would silently reject a v2 frame whose
+  it to the shared walker: without that gate the length rule would silently reject a v2 datagram whose
   bodies legally grew, and the whole feed would decode to `Other`.
 - **`ingest/book.rs`** — `BookState`: per-instrument L3 order book + the MBO snapshot+delta recovery state
   machine (`Synced`/`Recovering`), using the per-instrument delta sequence and snapshot anchor.
@@ -935,17 +935,17 @@ Modules are grouped by role under `src/`:
 - **Midpoint offsets are still unvalidated.** The `codec_midpoint.rs` byte layout came from the
   edge-feed-spec *draft*, not a reference codec; its round-trip tests only pin self-consistency.
   Before enabling a live Midpoint feed, run the bridge with `RUST_LOG=debug` against the real
-  group/ports and confirm decoded fields against a frame hexdump. **`codec_mbo.rs` is validated
-  (#4):** shared-with-TOB types (frame/message headers, `InstrumentDefinition`, `Trade`,
+  group/ports and confirm decoded fields against a datagram hexdump. **`codec_mbo.rs` is validated
+  (#4):** shared-with-TOB types (datagram/message headers, `InstrumentDefinition`, `Trade`,
   `ManifestSummary`, type tags) reuse the byte-validated TOB layout, and the MBO-specific types are
-  pinned by offset-independent unit tests + a real-frame decode test over the committed fixtures
+  pinned by offset-independent unit tests + a real-datagram decode test over the committed fixtures
   (`tests/codec_mbo_fixtures.rs`). Oracle strength varies by type:
   `Order{Add,Cancel,Execute}`/`BatchBoundary`/`Snapshot{Begin,Order,End}` have **real-capture**
   backing from the two-sided TYO recorder fixture (#36 — the snapshot is BTC's full 44,598-order
   book, so `SnapshotOrder` is well-covered); `Trade` has no MBO fixture but shares the
   byte-validated TOB layout (pinned by a cross-codec equality test); and
   `InstrumentReset`/`Heartbeat`/`EndOfSession` have **no fixture** (offset-test-only — confirm
-  against a live frame before a live MBO feed). No `FEEDS` row uses these kinds until their
+  against a live datagram before a live MBO feed). No `FEEDS` row uses these kinds until their
   endpoints are confirmed.
 - **MBO is re-served as two derived products, never raw deltas.** The bridge reconstructs the L3 book
   and runs snapshot+delta recovery internally (`book.rs`), then derives full-state `depth` (top-N) and

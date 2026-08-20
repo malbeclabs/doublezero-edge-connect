@@ -212,7 +212,7 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
             warn!(
                 "shred sigverify enabled: shred/merkle offsets are transcribed from the agave \
                  layout and NOT validated against a live edge-solana hexdump — watch the periodic \
-                 verify tally and confirm against a captured frame before trusting it"
+                 verify tally and confirm against a captured datagram before trusting it"
             );
             let sched = Arc::new(LeaderSchedule::new(url));
             let refresher = Arc::clone(&sched);

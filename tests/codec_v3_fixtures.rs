@@ -8,9 +8,9 @@
 //! "Schema v3 reference data" section) cut specifically to prove the collision cannot occur there.
 //!
 //! **Framing differs from every other fixture here.** The rest of `tests/fixtures/*.bin` are
-//! `[u32 LE len][frame]` records (`common::replay::split_frames`). These three are raw frames
-//! packed back-to-back with no length prefix — the boundary between frames is each frame's own
-//! `frame_length` header field (offset 22, u16 LE), so they need their own splitter below.
+//! `[u32 LE len][datagram]` records (`common::replay::split_datagrams`). These three are raw datagrams
+//! packed back-to-back with no length prefix — the boundary between datagrams is each datagram's own
+//! `datagram_length` header field (offset 22, u16 LE), so they need their own splitter below.
 
 mod common;
 
@@ -19,12 +19,12 @@ use std::{
     sync::Arc,
 };
 
-use doublezero_edge_connect::ingest::{codec, codec_common::FrameHeader, codec_mbp};
+use doublezero_edge_connect::ingest::{codec, codec_common::DatagramHeader, codec_mbp};
 
-/// Split a v3 refdata fixture into raw frames using each frame's own `frame_length`, not an
-/// external length prefix — see the module doc for why this differs from `replay::split_frames`.
+/// Split a v3 refdata fixture into raw datagrams using each datagram's own `datagram_length`, not an
+/// external length prefix — see the module doc for why this differs from `replay::split_datagrams`.
 fn split_by_header(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
+    let mut datagrams = Vec::new();
     let mut off = 0usize;
     while off < bytes.len() {
         assert!(
@@ -35,40 +35,40 @@ fn split_by_header(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
         let got_magic = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
         assert_eq!(
             got_magic, magic,
-            "frame at offset {off}: magic 0x{got_magic:04X} != 0x{magic:04X}"
+            "datagram at offset {off}: magic 0x{got_magic:04X} != 0x{magic:04X}"
         );
-        let frame_len = u16::from_le_bytes([bytes[off + 22], bytes[off + 23]]) as usize;
+        let datagram_len = u16::from_le_bytes([bytes[off + 22], bytes[off + 23]]) as usize;
         assert!(
-            frame_len >= 24 && off + frame_len <= bytes.len(),
-            "frame at offset {off}: bad frame_length {frame_len} (remaining {})",
+            datagram_len >= 24 && off + datagram_len <= bytes.len(),
+            "datagram at offset {off}: bad datagram_length {datagram_len} (remaining {})",
             bytes.len() - off
         );
-        frames.push(bytes[off..off + frame_len].to_vec());
-        off += frame_len;
+        datagrams.push(bytes[off..off + datagram_len].to_vec());
+        off += datagram_len;
     }
-    frames
+    datagrams
 }
 
 fn read_fixture(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"))
 }
 
-fn tob_frames(path: &str) -> Vec<(FrameHeader, Vec<codec::Message>)> {
+fn tob_datagrams(path: &str) -> Vec<(DatagramHeader, Vec<codec::Message>)> {
     split_by_header(&read_fixture(path), codec::MAGIC)
         .iter()
         .map(|f| {
-            codec::decode_frame(f)
-                .unwrap_or_else(|e| panic!("{path}: real captured frame failed to decode: {e}"))
+            codec::decode_datagram(f)
+                .unwrap_or_else(|e| panic!("{path}: real captured datagram failed to decode: {e}"))
         })
         .collect()
 }
 
-fn mbp_frames(path: &str) -> Vec<(FrameHeader, Vec<codec_mbp::Message>)> {
+fn mbp_datagrams(path: &str) -> Vec<(DatagramHeader, Vec<codec_mbp::Message>)> {
     split_by_header(&read_fixture(path), codec_mbp::MAGIC)
         .iter()
         .map(|f| {
-            codec_mbp::decode_frame(f)
-                .unwrap_or_else(|e| panic!("{path}: real captured frame failed to decode: {e}"))
+            codec_mbp::decode_datagram(f)
+                .unwrap_or_else(|e| panic!("{path}: real captured datagram failed to decode: {e}"))
         })
         .collect()
 }
@@ -77,19 +77,19 @@ const TOB_V3: &str = "tests/fixtures/tob_v3.refdata.bin";
 const MBP_PERPS_V3: &str = "tests/fixtures/mbp_perps_v3.refdata.bin";
 const SPORTS_V3: &str = "tests/fixtures/sports_v3.refdata.bin";
 
-/// Claim 1: every frame in every v3 fixture declares `schema_version == 3`, and the decoder really
+/// Claim 1: every datagram in every v3 fixture declares `schema_version == 3`, and the decoder really
 /// took the v3 `InstrumentDefinition` branch rather than merely reading a `3` off the header — the
 /// v3 branch is the only one that populates `source_id` (`codec_common::instrument_definition`), so
 /// a definition's `source_id.is_some()` is direct evidence the v3 path executed rather than
 /// something a header-only check could be fooled by.
 #[test]
-fn every_frame_decodes_as_schema_v3_and_takes_the_v3_path() {
-    let tob = tob_frames(TOB_V3);
-    assert!(!tob.is_empty(), "{TOB_V3}: fixture carried no frames");
+fn every_datagram_decodes_as_schema_v3_and_takes_the_v3_path() {
+    let tob = tob_datagrams(TOB_V3);
+    assert!(!tob.is_empty(), "{TOB_V3}: fixture carried no datagrams");
     for (h, _) in &tob {
         assert_eq!(
             h.schema_version, 3,
-            "{TOB_V3}: frame declared schema_version {} instead of 3",
+            "{TOB_V3}: datagram declared schema_version {} instead of 3",
             h.schema_version
         );
     }
@@ -103,16 +103,19 @@ fn every_frame_decodes_as_schema_v3_and_takes_the_v3_path() {
     );
 
     for path in [MBP_PERPS_V3, SPORTS_V3] {
-        let frames = mbp_frames(path);
-        assert!(!frames.is_empty(), "{path}: fixture carried no frames");
-        for (h, _) in &frames {
+        let datagrams = mbp_datagrams(path);
+        assert!(
+            !datagrams.is_empty(),
+            "{path}: fixture carried no datagrams"
+        );
+        for (h, _) in &datagrams {
             assert_eq!(
                 h.schema_version, 3,
-                "{path}: frame declared schema_version {} instead of 3",
+                "{path}: datagram declared schema_version {} instead of 3",
                 h.schema_version
             );
         }
-        let took_v3_path = frames.iter().any(|(_, msgs)| {
+        let took_v3_path = datagrams.iter().any(|(_, msgs)| {
             msgs.iter().any(
                 |m| matches!(m, codec_mbp::Message::InstrumentDefinition(d) if d.source_id.is_some()),
             )
@@ -124,7 +127,7 @@ fn every_frame_decodes_as_schema_v3_and_takes_the_v3_path() {
     }
 }
 
-/// One decoded `InstrumentDefinition`, tagged with the frame's `channel_id` (the per-path identity
+/// One decoded `InstrumentDefinition`, tagged with the datagram's `channel_id` (the per-path identity
 /// on these captures).
 struct Def {
     channel_id: u8,
@@ -133,7 +136,7 @@ struct Def {
 }
 
 fn tob_defs(path: &str) -> Vec<Def> {
-    tob_frames(path)
+    tob_datagrams(path)
         .into_iter()
         .flat_map(|(h, msgs)| {
             msgs.into_iter().filter_map(move |m| match m {
@@ -149,7 +152,7 @@ fn tob_defs(path: &str) -> Vec<Def> {
 }
 
 fn mbp_defs(path: &str) -> Vec<Def> {
-    mbp_frames(path)
+    mbp_datagrams(path)
         .into_iter()
         .flat_map(|(h, msgs)| {
             msgs.into_iter().filter_map(move |m| match m {
@@ -286,7 +289,7 @@ fn sports_v3_ids_that_would_collide_under_v1_truncation_do_not_under_v3() {
 /// Claim 4: both perps publisher paths are represented in a simultaneous capture — unlike the older
 /// (pre-v3) perps fixtures, whose two paths were captured at different times and so could never be
 /// combined into one interleaved fixture (PROVENANCE: "the two paths' captures do not overlap in
-/// time"). The paths stamp different frame-header `channel_id`s on this feed (a repurposing of that
+/// time"). The paths stamp different datagram-header `channel_id`s on this feed (a repurposing of that
 /// field PROVENANCE already records for the retiring publisher), so distinct `channel_id`s standing
 /// for the same instrument set is the observable proxy for "both sources present".
 #[test]

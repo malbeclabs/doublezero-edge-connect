@@ -1,8 +1,8 @@
-//! Decoder for the DoubleZero Edge **Market-by-Order** feed (frame magic `0x4444`).
+//! Decoder for the DoubleZero Edge **Market-by-Order** feed (datagram magic `0x4444`).
 //!
 //! A sibling protocol carrying the full L3 resting-order population per instrument, with in-band
-//! snapshot+delta recovery. It shares the 24-byte frame header / 4-byte message header / generic
-//! frame-walker in [`crate::ingest::codec_common`]; only the magic and message bodies differ. It reuses
+//! snapshot+delta recovery. It shares the 24-byte datagram header / 4-byte message header / generic
+//! datagram-walker in [`crate::ingest::codec_common`]; only the magic and message bodies differ. It reuses
 //! the 80-byte Top-of-Book `InstrumentDefinition` layout for reference data, and adds order
 //! deltas (`OrderAdd`/`OrderCancel`/`OrderExecute`), batch/reset control messages, and a snapshot
 //! group (`SnapshotBegin`/`SnapshotOrder`/`SnapshotEnd`) on a dedicated port. The reconstructed
@@ -10,7 +10,7 @@
 //!
 //! Byte offsets below are field-validated (issue #4), no longer draft — but the strength of the
 //! oracle differs by message type, so be precise about what is proven:
-//!   * **Shared-with-TOB types** (strongest) — the frame header, message header,
+//!   * **Shared-with-TOB types** (strongest) — the datagram header, message header,
 //!     `InstrumentDefinition`, `Trade`, `ManifestSummary`, and type tags `0x01/0x02/0x04/0x06/0x07`
 //!     use the exact same wire layout as the **byte-validated** Top-of-Book [`crate::ingest::codec`]
 //!     (validated against the edge-multicast-ref Go decoder). `tests/codec_mbo_fixtures.rs`'s
@@ -23,7 +23,7 @@
 //!     `tests/codec_mbo_fixtures.rs`. The snapshot fixture is BTC's complete 44,598-order two-sided
 //!     book, so `SnapshotOrder` (which populates the book) has tens of thousands of real orders of
 //!     coverage; `total_orders == decoded order count` is asserted as a cross-field check.
-//!   * **Offset-test-only** (weakest — confirm against a live frame before trusting) — `InstrumentReset`,
+//!   * **Offset-test-only** (weakest — confirm against a live datagram before trusting) — `InstrumentReset`,
 //!     `Heartbeat` and `EndOfSession` appear in **no** committed fixture; they are pinned solely by
 //!     the offset-independent unit tests here, whose offsets are transcribed from the spec, so these
 //!     catch a test-vs-decoder typo but not a shared misreading of the spec. (`Trade` has no MBO
@@ -37,7 +37,7 @@
 use anyhow::Result;
 
 use crate::ingest::codec_common::{
-    decode_frame_with, i64le, instrument_definition, u16le, u32le, u64le, u8le, FrameHeader,
+    decode_datagram_with, i64le, instrument_definition, u16le, u32le, u64le, u8le, DatagramHeader,
     SCHEMA_V1, SCHEMA_V3,
 };
 pub use crate::ingest::codec_common::{InstrumentDefinition, MSG_HEADER_SIZE};
@@ -209,7 +209,7 @@ pub enum Message {
     OrderCancel(OrderCancel),
     OrderExecute(OrderExecute),
     /// 0x13 BatchBoundary - optional atomic batch delimiter; carries (batch_id, batch_time). The
-    /// bridge coalesces emission per frame rather than per batch, so the contents are diagnostic.
+    /// bridge coalesces emission per datagram rather than per batch, so the contents are diagnostic.
     BatchBoundary(#[allow(dead_code)] u32, #[allow(dead_code)] u64),
     InstrumentReset(InstrumentReset),
     SnapshotBegin(SnapshotBegin),
@@ -223,8 +223,8 @@ pub enum Message {
 }
 
 /// Decode one Market-by-Order UDP datagram into a header and its application messages.
-pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(
+pub fn decode_datagram(buf: &[u8]) -> Result<(DatagramHeader, Vec<Message>)> {
+    decode_datagram_with(
         buf,
         MAGIC,
         SUPPORTED_VERSIONS,
@@ -334,11 +334,11 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<M
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::ingest::codec_common::FRAME_HEADER_SIZE;
+    use crate::ingest::codec_common::DATAGRAM_HEADER_SIZE;
 
-    pub(crate) fn frame(messages: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn datagram(messages: &[Vec<u8>]) -> Vec<u8> {
         let body: Vec<u8> = messages.concat();
-        let frame_len = (FRAME_HEADER_SIZE + body.len()) as u16;
+        let datagram_len = (DATAGRAM_HEADER_SIZE + body.len()) as u16;
         let mut f = Vec::new();
         f.extend_from_slice(&MAGIC.to_le_bytes());
         f.push(1); // schema version
@@ -347,7 +347,7 @@ pub(crate) mod tests {
         f.extend_from_slice(&0u64.to_le_bytes()); // send ts
         f.push(messages.len() as u8);
         f.push(0); // reset count
-        f.extend_from_slice(&frame_len.to_le_bytes());
+        f.extend_from_slice(&datagram_len.to_le_bytes());
         f.extend_from_slice(&body);
         f
     }
@@ -441,9 +441,9 @@ pub(crate) mod tests {
             price_raw: 18_420,
             qty_raw: 1000,
         };
-        let f = frame(&[enc_order_add(&o)]);
-        assert_eq!(f.len(), FRAME_HEADER_SIZE + 52);
-        let (_h, msgs) = decode_frame(&f).unwrap();
+        let f = datagram(&[enc_order_add(&o)]);
+        assert_eq!(f.len(), DATAGRAM_HEADER_SIZE + 52);
+        let (_h, msgs) = decode_datagram(&f).unwrap();
         match &msgs[0] {
             Message::OrderAdd(got) => {
                 assert_eq!(got.instrument_id, 7);
@@ -481,12 +481,12 @@ pub(crate) mod tests {
             anchor_seq: 100,
             snapshot_id: 9,
         };
-        let f = frame(&[
+        let f = datagram(&[
             enc_snapshot_begin(&begin),
             enc_snapshot_order(&order),
             enc_snapshot_end(&end),
         ]);
-        let (_h, msgs) = decode_frame(&f).unwrap();
+        let (_h, msgs) = decode_datagram(&f).unwrap();
         assert_eq!(msgs.len(), 3);
         match (&msgs[0], &msgs[1], &msgs[2]) {
             (Message::SnapshotBegin(b), Message::SnapshotOrder(o), Message::SnapshotEnd(e)) => {
@@ -531,8 +531,8 @@ pub(crate) mod tests {
                 price_raw: 100,
                 qty_raw: 1,
             };
-            let f = frame(&[enc_order_add(&o)]);
-            let (_h, msgs) = decode_frame(&f).unwrap();
+            let f = datagram(&[enc_order_add(&o)]);
+            let (_h, msgs) = decode_datagram(&f).unwrap();
             match &msgs[0] {
                 Message::OrderAdd(got) => got.side,
                 other => panic!("expected OrderAdd, got {other:?}"),
@@ -545,11 +545,11 @@ pub(crate) mod tests {
     // --- Offset-independent field validation ---
     //
     // These build each message body by writing every field at a **literal** offset (via `put`),
-    // wrap it in a real frame, decode through `decode_frame`, and assert each decoded field equals
+    // wrap it in a real datagram, decode through `decode_datagram`, and assert each decoded field equals
     // the value written. Unlike the `enc_*` round-trips above (which mirror the decoder's own
     // sequential layout and so cannot catch a symmetric offset error), a decoder offset that
     // disagrees with the asserted layout fails here. The layouts asserted are:
-    //   * shared-with-TOB types (frame header, message header, InstrumentDefinition, Trade,
+    //   * shared-with-TOB types (datagram header, message header, InstrumentDefinition, Trade,
     //     ManifestSummary, type tags 0x01/0x02/0x04/0x06/0x07): the byte-validated `codec.rs`
     //     (validated against the edge-multicast-ref Go decoder) — these offsets are identical there;
     //   * Order{Add,Cancel,Execute}/BatchBoundary/Snapshot{Begin,Order,End}: also backed by the real
@@ -563,27 +563,27 @@ pub(crate) mod tests {
         buf[off..off + bytes.len()].copy_from_slice(bytes);
     }
 
-    /// Wrap one message body (fields placed at authoritative offsets) in a real frame. `msg_len`
-    /// is the on-wire message length (4-byte header + body); reuses the `frame` helper's 24B header.
-    fn frame_one(msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
+    /// Wrap one message body (fields placed at authoritative offsets) in a real datagram. `msg_len`
+    /// is the on-wire message length (4-byte header + body); reuses the `datagram` helper's 24B header.
+    fn datagram_one(msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
         let mut msg = vec![msg_type, msg_len, 0, 0]; // type, len, flags:u16
         msg.extend_from_slice(body);
-        frame(&[msg])
+        datagram(&[msg])
     }
 
-    /// 24-byte frame header layout (codec_common::FrameHeader, same as the byte-validated TOB
+    /// 24-byte datagram header layout (codec_common::DatagramHeader, same as the byte-validated TOB
     /// `codec.rs`). This test pins the fields it asserts below: schema_version u8@2, channel_id
-    /// u8@3, sequence u64@4, send_ts u64@12, msg_count u8@20. (reset_count u8@21 / frame_length
+    /// u8@3, sequence u64@4, send_ts u64@12, msg_count u8@20. (reset_count u8@21 / datagram_length
     /// u16@22 round out the header but are not asserted here.)
     #[test]
-    fn frame_header_offsets_match_authority() {
+    fn datagram_header_offsets_match_authority() {
         let body = vec![0u8; 8]; // EndOfSession body (ts u64@0)
-        let mut f = frame_one(MSG_END_OF_SESSION, sizes::END_OF_SESSION, &body);
+        let mut f = datagram_one(MSG_END_OF_SESSION, sizes::END_OF_SESSION, &body);
         f[2] = 1; // schema_version
         f[3] = 0; // channel_id
         put(&mut f, 4, &0x1122u64.to_le_bytes()); // sequence
         put(&mut f, 12, &0x3344u64.to_le_bytes()); // send_ts
-        let (h, _msgs) = decode_frame(&f).unwrap();
+        let (h, _msgs) = decode_datagram(&f).unwrap();
         assert_eq!(h.schema_version, 1);
         assert_eq!(h.channel_id, 0);
         assert_eq!(h.sequence, 0x1122);
@@ -626,8 +626,8 @@ pub(crate) mod tests {
             put(&mut body, 20, &1_780_000_000_000_000_000u64.to_le_bytes());
             put(&mut body, 28, &18_420i64.to_le_bytes());
             put(&mut body, 36, &1_000u64.to_le_bytes());
-            let f = frame_one(MSG_ORDER_ADD, sizes::ORDER_ADD, &body);
-            match decode_frame(&f).unwrap().1.remove(0) {
+            let f = datagram_one(MSG_ORDER_ADD, sizes::ORDER_ADD, &body);
+            match decode_datagram(&f).unwrap().1.remove(0) {
                 Message::OrderAdd(g) => {
                     assert_eq!(g.instrument_id, 7);
                     assert_eq!(g.source_id, 0x0102);
@@ -657,8 +657,8 @@ pub(crate) mod tests {
         put(&mut body, 8, &9u32.to_le_bytes());
         put(&mut body, 12, &555u64.to_le_bytes());
         put(&mut body, 20, &42u64.to_le_bytes());
-        let f = frame_one(MSG_ORDER_CANCEL, sizes::ORDER_CANCEL, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_ORDER_CANCEL, sizes::ORDER_CANCEL, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::OrderCancel(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.source_id, 1);
@@ -687,8 +687,8 @@ pub(crate) mod tests {
         put(&mut body, 28, &84u64.to_le_bytes());
         put(&mut body, 36, &18_400i64.to_le_bytes());
         put(&mut body, 44, &250u64.to_le_bytes());
-        let f = frame_one(MSG_ORDER_EXECUTE, sizes::ORDER_EXECUTE, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_ORDER_EXECUTE, sizes::ORDER_EXECUTE, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::OrderExecute(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.source_id, 1);
@@ -716,8 +716,8 @@ pub(crate) mod tests {
         put(&mut body, 16, &9u32.to_le_bytes());
         put(&mut body, 20, &42u32.to_le_bytes());
         put(&mut body, 24, &1u64.to_le_bytes());
-        let f = frame_one(MSG_SNAPSHOT_BEGIN, sizes::SNAPSHOT_BEGIN, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_SNAPSHOT_BEGIN, sizes::SNAPSHOT_BEGIN, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::SnapshotBegin(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.anchor_seq, 100);
@@ -743,8 +743,8 @@ pub(crate) mod tests {
             put(&mut body, 16, &2u64.to_le_bytes());
             put(&mut body, 24, &18_430i64.to_le_bytes());
             put(&mut body, 32, &500u64.to_le_bytes());
-            let f = frame_one(MSG_SNAPSHOT_ORDER, sizes::SNAPSHOT_ORDER, &body);
-            match decode_frame(&f).unwrap().1.remove(0) {
+            let f = datagram_one(MSG_SNAPSHOT_ORDER, sizes::SNAPSHOT_ORDER, &body);
+            match decode_datagram(&f).unwrap().1.remove(0) {
                 Message::SnapshotOrder(g) => {
                     assert_eq!(g.snapshot_id, 9);
                     assert_eq!(g.order_id, 555);
@@ -767,8 +767,8 @@ pub(crate) mod tests {
         put(&mut body, 0, &7u32.to_le_bytes());
         put(&mut body, 4, &100u64.to_le_bytes());
         put(&mut body, 12, &9u32.to_le_bytes());
-        let f = frame_one(MSG_SNAPSHOT_END, sizes::SNAPSHOT_END, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_SNAPSHOT_END, sizes::SNAPSHOT_END, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::SnapshotEnd(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.anchor_seq, 100);
@@ -792,8 +792,8 @@ pub(crate) mod tests {
             put(&mut body, 4, &13u16.to_le_bytes()); // manifest_seq
             put(&mut body, 8, &786u32.to_le_bytes()); // instrument_count
             put(&mut body, 12, &1_780u64.to_le_bytes()); // ts
-            let f = frame_one(MSG_MANIFEST_SUMMARY, 24, &body);
-            match decode_frame(&f).unwrap().1.remove(0) {
+            let f = datagram_one(MSG_MANIFEST_SUMMARY, 24, &body);
+            match decode_datagram(&f).unwrap().1.remove(0) {
                 Message::ManifestSummary(g) => g,
                 other => panic!("expected ManifestSummary, got {other:?}"),
             }
@@ -818,12 +818,12 @@ pub(crate) mod tests {
         body[37] = (-1i8) as u8; // price_exponent
         body[38] = (-8i8) as u8; // qty_exponent
         put(&mut body, 74, &13u16.to_le_bytes()); // manifest_seq
-        let f = frame_one(
+        let f = datagram_one(
             MSG_INSTRUMENT_DEFINITION,
             sizes::INSTRUMENT_DEFINITION,
             &body,
         );
-        match &decode_frame(&f).unwrap().1[0] {
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::InstrumentDefinition(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.symbol.as_ref(), "BTC");
@@ -850,8 +850,8 @@ pub(crate) mod tests {
         put(&mut body, 24, &1_500u64.to_le_bytes());
         put(&mut body, 32, &99_887_766u64.to_le_bytes());
         put(&mut body, 40, &5_000_000u64.to_le_bytes());
-        let f = frame_one(MSG_TRADE, sizes::TRADE, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_TRADE, sizes::TRADE, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::Trade(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.source_id, 1);
@@ -873,8 +873,8 @@ pub(crate) mod tests {
         let mut body = vec![0u8; 12]; // size 16 - 4 header
         put(&mut body, 0, &77u32.to_le_bytes());
         put(&mut body, 4, &1_780u64.to_le_bytes());
-        let f = frame_one(MSG_BATCH_BOUNDARY, sizes::BATCH_BOUNDARY, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_BATCH_BOUNDARY, sizes::BATCH_BOUNDARY, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::BatchBoundary(id, time) => {
                 assert_eq!(*id, 77);
                 assert_eq!(*time, 1_780);
@@ -891,8 +891,8 @@ pub(crate) mod tests {
         body[4] = 1; // reason (opaque pass-through byte)
         put(&mut body, 8, &200u64.to_le_bytes());
         put(&mut body, 16, &42u64.to_le_bytes());
-        let f = frame_one(MSG_INSTRUMENT_RESET, sizes::INSTRUMENT_RESET, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_INSTRUMENT_RESET, sizes::INSTRUMENT_RESET, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::InstrumentReset(g) => {
                 assert_eq!(g.instrument_id, 7);
                 assert_eq!(g.reason, 1);
@@ -908,8 +908,8 @@ pub(crate) mod tests {
     fn end_of_session_offsets_match_authority() {
         let mut body = vec![0u8; 8];
         put(&mut body, 0, &1_780u64.to_le_bytes());
-        let f = frame_one(MSG_END_OF_SESSION, sizes::END_OF_SESSION, &body);
-        match &decode_frame(&f).unwrap().1[0] {
+        let f = datagram_one(MSG_END_OF_SESSION, sizes::END_OF_SESSION, &body);
+        match &decode_datagram(&f).unwrap().1[0] {
             Message::EndOfSession(ts) => assert_eq!(*ts, 1_780),
             other => panic!("expected EndOfSession, got {other:?}"),
         }
@@ -918,15 +918,15 @@ pub(crate) mod tests {
     /// Heartbeat (0x01): header only, no body. Decodes to the variant with msg_count 1.
     #[test]
     fn heartbeat_decodes_with_no_body() {
-        let f = frame_one(MSG_HEARTBEAT, 4, &[]);
-        let (h, msgs) = decode_frame(&f).unwrap();
+        let f = datagram_one(MSG_HEARTBEAT, 4, &[]);
+        let (h, msgs) = decode_datagram(&f).unwrap();
         assert_eq!(h.msg_count, 1);
         assert!(matches!(msgs.as_slice(), [Message::Heartbeat]));
     }
 
     #[test]
     fn bad_magic_errors() {
-        let f = frame(&[enc_snapshot_end(&SnapshotEnd {
+        let f = datagram(&[enc_snapshot_end(&SnapshotEnd {
             instrument_id: 1,
             anchor_seq: 0,
             snapshot_id: 1,
@@ -934,7 +934,7 @@ pub(crate) mod tests {
         let mut bad = f.clone();
         bad[0] = 0x5A;
         bad[1] = 0x44; // 0x445A (Top-of-Book)
-        assert!(decode_frame(&bad).is_err());
-        assert!(decode_frame(&f).is_ok());
+        assert!(decode_datagram(&bad).is_err());
+        assert!(decode_datagram(&f).is_ok());
     }
 }

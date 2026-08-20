@@ -1,7 +1,7 @@
 //! Shared pre-broadcast arbiter: the single emit stage every ingest source funnels through.
 //!
 //! When several independent sources mirror the same feed — the multicast edge publishers
-//! (demultiplexed by source IP so each one's frame-sequence state stays separate, see
+//! (demultiplexed by source IP so each one's datagram-sequence state stays separate, see
 //! `receiver`/`processor`) **and** the Hyperliquid public WebSocket feeder ([`crate::ingest::ws_feeder`])
 //! — they all converge on one [`Arbiter`] just before the broadcast channel. The arbiter deduplicates
 //! the *output* keyed on business identity, so a subscriber sees a clean stream regardless of which
@@ -77,7 +77,7 @@ pub const QUOTE_TICK_CAP: usize = 8192;
 
 /// Cap on distinct leader `depth` snapshots tracked per `source_ts` tick by the depth floor. A book
 /// can legitimately emit several full-state snapshots at one venue event timestamp (the `emit_depth`
-/// per-frame coalescing splits one `source_ts` across frames; see `MboProcessor::emit_depth`), so the
+/// per-datagram coalescing splits one `source_ts` across datagrams; see `MboProcessor::emit_depth`), so the
 /// cap sits well above that real per-tick count and never evicts in normal operation.
 pub const DEPTH_TICK_CAP: usize = 1024;
 
@@ -102,7 +102,7 @@ const MAX_BOOK_MARKETS: usize = 16_384;
 
 /// Cap on batches withheld from one market while waiting for the new path to close a logical event.
 /// `last` is mandatory in PROTOCOL.md, but a producer that stops setting it — a bug, a truncated
-/// frame, a forged source — would otherwise withhold that market from the wire forever. Sized like
+/// datagram, a forged source — would otherwise withhold that market from the wire forever. Sized like
 /// `model`'s pending-change cap, which desynchronizes the accumulator at the same scale, so the
 /// abandoned re-baseline degrades to a bare `clear` rather than to a book claiming completeness.
 const MAX_WITHHELD_BATCHES: u32 = 8192;
@@ -1756,7 +1756,7 @@ impl Arbiter {
     /// protocols from one source IP (the tape-path gate rests on that), so an unscoped sweep would let
     /// an exiting Market-by-Order receiver tear down the same host's live Market-by-Price state. The
     /// category is what the exiting receiver and the `MarketKey` provably agree on — both take it
-    /// verbatim from the registry row (`FrameCtx::category`). Its **venue** does not: every key here
+    /// verbatim from the registry row (`DatagramCtx::category`). Its **venue** does not: every key here
     /// is filed under the *wire* venue (`MboProcessor::wire_venue`), and one registry row can carry
     /// instruments whose Source IDs resolve elsewhere — the same superset case that made
     /// `reset_all_known_depth_floors` stop sweeping by `ctx.venue`. Filtered by the row's venue this

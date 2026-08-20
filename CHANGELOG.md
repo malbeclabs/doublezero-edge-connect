@@ -644,26 +644,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - The two Lashay perps feed rows: `edge-kalshi-perps-tob` top of book on `233.84.178.3:7576/7577` and `edge-kalshi-perps-mbp` market-by-price on `233.84.178.4:31000/41000/51000`, both claiming the tape and both `ArbitrationMode::Sticky`, one publisher block each (the two paths share a block and are told apart by source IP). Both groups are live and activated, so a host subscribed to either code begins ingesting on upgrade. A `code` that does not match its live group fails silently — no warning, no failed bind, just a permanently-zero `dz_receiver_up` — so both rows are pinned against the deployment by a test. The group codes are transcribed verbatim from what the DoubleZero ledger registers today; they are scheduled to be re-registered under new names, and the rows must be updated in the same change that lands the ledger rename, never before it. (#106)
 - The incremental `book` product is arbitrated by the single-path authority gate instead of passing through the arbiter undeduped: two paths' per-instrument delta series are unrelated by construction, so publishing both on one stream corrupts a consumer's book while every sequence check the producer ran still passes. It is gated in **both** arbitration modes on purpose — a `source_ts` tick can hold several deltas, so the quote floor's per-tick latch would interleave paths inside one logical event — and there is no mode branch. A change of serving path (margin, silence, or the per-market health override) makes that market's next broadcast a re-baseline, a `clear` plus the new path's complete current level set, emitted lazily on that path's next *completed* logical event rather than as a venue-wide burst of clears; that is why the gate accumulates every eligible path's book and not just the serving one. A re-baseline the gate cannot honestly complete — a path that joined mid-stream holds only the levels that have moved since — degrades to a bare `clear` rather than claiming completeness, and the WS replay skips those markets for the same reason. Also wires the cross-path trade matcher, the only producer of the matched-lead samples the speed re-election consumes (`--arb-match-window-secs`, `dz_path_unmatched_trades_total`); it races **edge paths the authority already tracks** and nothing else, so the public backstop cannot win authority over a product it never publishes. Open question the matcher inherits: its key is the normalized `(venue, symbol, price, size, aggressor)`, and a wire `symbol` is a truncated 16-byte field, so on a sharded feed two colliding-symbol instruments can mis-pair systematically rather than merely losing a sample — `NormalizedTrade` carries no `instrument_id` to key on instead. Replays each market's accumulated book to a connecting WS client, and re-baselines a client that fell behind (an incremental product does not self-heal on the next message the way `quote`/`depth` do). Nothing exercises it in a running process yet: `MbpProcessor` emits `book` but no `FEEDS` row selects that kind, so behaviour is unchanged. (#105)
-- `MbpProcessor` and the `FeedKind::MarketByPrice` receiver path (mktdata + refdata + snapshot ports), turning decoded market-by-price frames into `PriceBook` state and the incremental `book` product. One book per `(publisher, channel, instrument)` — two paths mirror one feed on unrelated per-instrument delta sequences and one group can be sharded across channels, so nothing coarser identifies a book. Snapshot levels route by the open group per channel rather than by `snapshot_id` (monotonic per instrument, so two instruments routinely share a value), `EndOfSession` and a `Reset Count` change are scoped to the emitting path and channel, and a cross-instrument delta-buffer budget drops the largest instrument's buffer rather than the process when a cold start floods it. Seven `dz_mbp_*` counters cover resets, buffer and level overflows, orphaned snapshot levels, duplicate deltas, crossed books and publisher action-vs-quantity divergence — see `docs/metrics.md`, and `docs/input-sources.md` for the per-receiver-task memory caps. No `FEEDS` row selects the kind, so no running process behaves differently. (#104)
+- `MbpProcessor` and the `FeedKind::MarketByPrice` receiver path (mktdata + refdata + snapshot ports), turning decoded market-by-price datagrams into `PriceBook` state and the incremental `book` product. One book per `(publisher, channel, instrument)` — two paths mirror one feed on unrelated per-instrument delta sequences and one group can be sharded across channels, so nothing coarser identifies a book. Snapshot levels route by the open group per channel rather than by `snapshot_id` (monotonic per instrument, so two instruments routinely share a value), `EndOfSession` and a `Reset Count` change are scoped to the emitting path and channel, and a cross-instrument delta-buffer budget drops the largest instrument's buffer rather than the process when a cold start floods it. Seven `dz_mbp_*` counters cover resets, buffer and level overflows, orphaned snapshot levels, duplicate deltas, crossed books and publisher action-vs-quantity divergence — see `docs/metrics.md`, and `docs/input-sources.md` for the per-receiver-task memory caps. No `FEEDS` row selects the kind, so no running process behaves differently. (#104)
 - Single-path arbitration for venues whose two redundant publishers stamp no comparable clock (`ingest::authority`, `ingest::path_race`). Exactly one path is authoritative and its stream is published verbatim. **Speed and silence are judged per path, venue-wide** — latency is a property of a path, so every sample from a source IP counts toward it whatever market carried it — while **health is the one per-market rule**, overriding the elected path for a single market whose book is gapped and reverting when it recovers. Which path is faster comes from `path_race`, a cross-path trade matcher keyed on content with a FIFO per signature (so identical repeats pair in order) that measures the two copies' arrival gap on our own receive clock; the venue's own timestamps are deliberately unused, because a publisher substitutes its own clock when the venue supplies none and a path with no venue timestamp would look fastest by construction. Transfers need a median margin, a win rate and a sample floor to all hold (`--arb-*`). Nothing emits or consumes it yet — no processor wires a caller — so no running process behaves differently. (#98)
 - The incremental `book` message (PROTOCOL.md, still v1 — `book` is additive and `depth` is now marked deprecated-and-removed-in-v2): a batch of absolute price-level changes for one instrument, keyed on `(venue, channel, instrument_id)`. A re-baseline is structurally a batch led by a `clear` action rather than a separate type or a boolean, because the reference consumer's book dispatcher branches on the action alone and would silently ignore a snapshot flag; `last` is mandatory on the final batch, including a lone clear, or a buffering consumer wedges. Ships with `BookAccumulator`, the replay state a connecting client is bootstrapped from — an incremental product's last batch means nothing to a client holding no book, so the bridge accumulates and materializes a clear plus the full level set on demand. Nothing emits `book` yet: no processor and no feed row, so no running process behaves differently. (#99)
 - WebSocket subscription filters gain a `channel` dimension (the publisher's channel id) and a message-`type` dimension, so a consumer can take `book` without `quote`, or one channel's books without the rest. A message that carries no channel is excluded by an explicit `channel` filter — except `instrument`, since a client that cannot see a definition cannot scale the book it subscribed to. Both match paths (symbol-bearing and venue-level `status`) now route through the one `SubFilter::matches`, so a future dimension cannot silently exempt half the stream. Replay is also scoped: state is replayed on connect as before, and again on each `subscribe` for the filter just added, instead of only ever replaying every market at connect time. (#99)
 - Each `Feed` now declares an `ArbitrationMode` (`Coordinated`/`Sticky`), carried into the arbiter as a per-venue map. Behaviour-neutral: every existing venue is `Coordinated` — today's latch-to-leader staleness floor — and an unregistered venue defaults to it. The seam exists for venues whose redundant publishers stamp no comparable venue clock, which cannot be arbitrated by a per-tick floor. (#94)
-- `ingest::codec_mbp` — pure decoder for the Market-by-Price feed (frame magic `0x4442`): the frame
+- `ingest::codec_mbp` — pure decoder for the Market-by-Price feed (datagram magic `0x4442`): the datagram
   walk, the five message types inherited from the byte-validated Top-of-Book layout, the three
   price-keyed payloads this feed defines (`LevelUpdate`, `BookClear`, `SnapshotLevel`), and the four
   it shares byte-for-byte with Market-by-Order (`Snapshot{Begin,End}`, `BatchBoundary`,
   `InstrumentReset`). Nothing ingests it yet — no `FEEDS` row, no processor. Two rules make it
-  stricter than the sibling codecs, and they depend on each other: a frame declaring an
+  stricter than the sibling codecs, and they depend on each other: a datagram declaring an
   unimplemented schema version is rejected whole, and within v1 a body length must equal the type's
   declared size exactly. `SnapshotBegin` is a prefix-superset of Market-by-Order's, so a lenient
   decode would read `depth_bound` from whatever follows the body — and the version gate is what
-  keeps the length rule from silently rejecting a v2 frame whose bodies legally grew. Offsets are
+  keeps the length rule from silently rejecting a v2 datagram whose bodies legally grew. Offsets are
   validated field-for-field against the Go reference decoder and against two committed real captures
   of the live publisher — a sharded multi-channel set and a dense single-channel set. Four message
   types appear in neither capture and stay offset-test-only; `tests/fixtures/PROVENANCE.md` records
   that and the publisher deviations the captures contain. (#95)
-- `pcap2frames --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
+- `pcap2datagrams --protocol mbp`, so a Market-by-Price capture converts to fixtures the moment a host
   with tunnel access can take one. `--combined-with` is not implemented for it. (#95)
 - `PriceBook` (`src/ingest/pricebook.rs`): the price-keyed L2 book and its snapshot+delta recovery
   state machine for the market-by-price feed — a sibling of the order-keyed `book.rs`, since the
@@ -937,7 +937,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read/write timeouts and a concurrency cap. Labels are bounded (`venue`/`group`/`dest`/`publisher`
   and small fixed enums; no per-symbol labels).
 - Two-publisher **Market-by-Order** depth-dedup golden `tests/fixtures/mbo_btc_dual.combined.bin` plus
-  the tooling to mint it. `examples/pcap2frames.rs` `--combined-with` now supports `--protocol mbo`
+  the tooling to mint it. `examples/pcap2datagrams.rs` `--combined-with` now supports `--protocol mbo`
   (three port roles — refdata/snapshot/mktdata — vs TOB's two, with per-publisher `SnapshotOrder`
   routing); it keeps refdata across the whole scan while windowing snapshot+deltas to `[--from,--to]`
   (so the slow-round-robin instrument definition still resolves precision), reports a window-coherence
@@ -955,7 +955,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DZ_SHRED_DEDUP`) flag added earlier in this unreleased cycle. `dedup`/`sigverify` share the same
   bounded `DedupWindow` (`--shred-dedup-window-slots`). ⚠️ Dedup still depends on the unvalidated
   agave shred offsets, so a misparse could over- or under-deduplicate — confirm against a captured
-  frame before relying on it. The `curl … | bash` installer scripts (`scripts/connect*.sh`) now
+  datagram before relying on it. The `curl … | bash` installer scripts (`scripts/connect*.sh`) now
   relay the `DZ_SHRED_*` env vars into the container, so the shred forwarder can be tuned from the
   one-liner (e.g. `DZ_SHRED_DEDUP_MODE=sigverify DZ_SHRED_RPC_URL=… curl … | bash`).
 - Explicit duplicate-packet de-duplication tests across all three dedup paths. Decoded-message unit
@@ -968,7 +968,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live TYO recorder capture (publisher 148.51.123.3, BTC) of a complete 44,598-order snapshot
   (28,345 bids + 16,253 asks) plus contiguous post-anchor deltas, replacing the hand-crafted
   empty-anchor anchor from PR #2. `mbo_single_publisher_depth_contract` now asserts an active,
-  unconditional two-sided crossed-book check (`best_bid < best_ask`). The `pcap2frames` example
+  unconditional two-sided crossed-book check (`best_bid < best_ask`). The `pcap2datagrams` example
   gained `--mbo-minimal` (with `--mbo-max-deltas`) to extract this minimal fixture in one command:
   the first complete snapshot group + capped post-anchor deltas + a minimal refdata. See
   `tests/fixtures/PROVENANCE.md`.
@@ -1032,24 +1032,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not double-emit `trade` messages (Top-of-Book owns trades; MBO is depth-only).
 - End-to-end test suite that drives the release binary over loopback multicast and asserts
   the WebSocket output contract, with deduplication-oracle assertions for future work.
-- `examples/pcap2frames.rs` dev tool: converts a multicast pcap into the test harness's
-  frame-log fixtures, demultiplexing one publisher by source IP and filtering by protocol
-  (Top-of-Book/Market-by-Order) and symbol. Decoding each frame through the real codecs
+- `examples/pcap2datagrams.rs` dev tool: converts a multicast pcap into the test harness's
+  datagram-log fixtures, demultiplexing one publisher by source IP and filtering by protocol
+  (Top-of-Book/Market-by-Order) and symbol. Decoding each datagram through the real codecs
   doubles as live-feed validation of the codec byte offsets.
 - Live two-publisher Top-of-Book BTC fixtures (`tests/fixtures/tob_btc_pub{A,B}.*`) for the
   upcoming multi-publisher deduplication work; provenance and regeneration in
   `tests/fixtures/PROVENANCE.md`.
-- `pcap2frames --combined-with <ip>`: emits one capture-ordered, source-IP-and-role-tagged stream
+- `pcap2datagrams --combined-with <ip>`: emits one capture-ordered, source-IP-and-role-tagged stream
   of two publishers (`tob_btc_dual.combined.bin`), preserving the real interleaving the
   multi-publisher dedup must collapse.
-- `pcap2frames --symbol` is now repeatable (and the combined report tallies kept quote messages
+- `pcap2datagrams --symbol` is now repeatable (and the combined report tallies kept quote messages
   per `(symbol, publisher)`), enabling a multi-symbol two-publisher fixture
   (`tob_multi_dual.combined.bin`: BTC busy / SOL medium / DOGE quiet) that exercises the dedup's
   per-`(venue, symbol)` independent windows.
 - Multi-publisher Top-of-Book deduplication: when several independent publishers mirror one feed
   onto a multicast group, the bridge merges them into one clean stream. Datagrams are demultiplexed
-  by source IP (`FrameCtx.publisher`); the frame-sequence tracker is per-publisher so a slower
-  publisher's frames aren't dropped before dedup. Quotes dedup on a per-`(venue, instrument)`
+  by source IP (`DatagramCtx.publisher`); the datagram-sequence tracker is per-publisher so a slower
+  publisher's datagrams aren't dropped before dedup. Quotes dedup on a per-`(venue, instrument)`
   `source_ts` latch-to-leader floor keyed on the **canonical BBO identity** (the components of the
   spec's `bbo_hash`: bid/ask price + size + the `bid_n`/`ask_n` source counts): within one `source_ts`
   tick (the venue stamps coarsely, so a tick holds a whole sub-sequence of real top-of-book changes)
@@ -1129,17 +1129,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Applied in both `src/main.rs` and the image `ENV`.
 - `codec_mbo` field offsets validated and the blanket "draft" caveat lifted (#4, follow-up to #2),
   with the per-type oracle strength documented honestly rather than claimed uniform:
-  - **Shared-with-TOB** layouts (frame/message headers, `InstrumentDefinition`, `Trade`,
+  - **Shared-with-TOB** layouts (datagram/message headers, `InstrumentDefinition`, `Trade`,
     `ManifestSummary`, type tags) reuse the byte-validated TOB `codec.rs`; a new cross-codec test
     (`tob_shared_layouts_decode_identically`) decodes the same bytes through both codecs and asserts
     equal fields, so the sharing is self-enforcing.
   - **Real publisher capture** backs `Order{Add,Cancel,Execute}`, `BatchBoundary`, the full
     `Snapshot{Begin,Order,End}` group, and the shared `InstrumentDefinition`/`ManifestSummary` via a
-    new real-frame decode test (`tests/codec_mbo_fixtures.rs`) over the two-sided TYO recorder
+    new real-datagram decode test (`tests/codec_mbo_fixtures.rs`) over the two-sided TYO recorder
     fixtures (#36). The snapshot is BTC's complete 44,598-order book, so `SnapshotOrder` is
     well-covered, and the test asserts `total_orders == decoded order count` as a cross-field check.
   - **Offset-test-only** (no committed fixture; pinned by the offset-independent unit tests, confirm
-    against a live frame before a live MBO feed): `InstrumentReset`, `Heartbeat`, `EndOfSession`.
+    against a live datagram before a live MBO feed): `InstrumentReset`, `Heartbeat`, `EndOfSession`.
   No offset discrepancies found — the side-mapping bug fixed in #2 was the only one. The "size 20 vs
   fields-to-24" `ManifestSummary` suspicion was a non-issue: the body is 20 bytes (on-wire 24),
   identical to TOB, and no size-20 constant exists in code.
@@ -1264,18 +1264,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instrument definitions with different price/quantity exponents.
 
 ### Security
-- Hardened the codec frame walker against out-of-bounds reads: the per-message body decoders
+- Hardened the codec datagram walker against out-of-bounds reads: the per-message body decoders
   now read every field through bounds-checked little-endian readers, so a truncated or
   malformed datagram (a runt message that under-declares its length) decodes to
   `Message::Other` instead of panicking the receiver task — which previously propagated out
   of `run_feed` and exited the whole process (a single crafted datagram could take the bridge
   down for every venue and WS consumer). Applies to all three sibling codecs (TOB / Midpoint /
   Market-by-Order).
-- Bounded the per-publisher frame-sequence map (`TobProcessor`) to `MAX_PUBLISHERS` (256) with
+- Bounded the per-publisher datagram-sequence map (`TobProcessor`) to `MAX_PUBLISHERS` (256) with
   least-recently-inserted eviction. The map is keyed on the datagram source IP, which is
   unauthenticated and spoofable, so without a cap a forged-source flood could grow it without
   limit (memory-exhaustion DoS); an evicted legitimate publisher simply re-anchors its sequence
-  on its next frame.
+  on its next datagram.
 - Gated and bounded the Market-by-Order book map (`MboProcessor`). The live Hyperliquid MBO
   `FEEDS` row processes order deltas/snapshots keyed by an unauthenticated, spoofable wire
   `instrument_id`, and previously minted an unbounded `BookState` per id with no definition gate

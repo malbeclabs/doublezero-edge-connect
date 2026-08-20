@@ -130,8 +130,8 @@ enabled; the flag only controls whether they can be scraped. There is **no TLS**
 of the service surface) — terminate at a reverse proxy if you expose it beyond a trusted network.
 
 Exported series (all prefixed `dz_` / `dz_ws_` / `dz_shred_`, plus the standard Linux `process_*`):
-ingest reception per feed (datagrams, bytes, socket errors, idle rejoins, feed up/stale, frame
-sequence events); the arbiter emit stage (messages broadcast, quotes/trades dropped by dedup,
+ingest reception per feed (datagrams, bytes, socket errors, idle rejoins, feed up/stale,
+datagram-sequence events); the arbiter emit stage (messages broadcast, quotes/trades dropped by dedup,
 future/zero-timestamp quotes); the WebSocket sink (connected clients, connections accepted/rejected,
 messages sent, slow-client lags, inbound control messages, rate-limit/idle disconnects); and the
 shred forwarder (received/dropped per group, processed/parsed/forwarded/dropped, sigverify outcomes,

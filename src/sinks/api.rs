@@ -617,7 +617,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
     };
     // Falls through on an accumulator that *answered nothing*, not merely on an absent one: a market
     // holding only a bare `clear` is present and empty, and returning its `None` would shadow the
-    // `depth` entry the same frame wrote.
+    // `depth` entry the same datagram wrote.
     if let Some(levels @ (Some(_), _) | levels @ (_, Some(_))) = from_book {
         return levels;
     }
@@ -1353,7 +1353,7 @@ mod tests {
             feeds::{ArbitrationMode, FeedKind, FeedPorts, FeedPublisher},
             health::FeedHealth,
             processor::MbpProcessor,
-            receiver::{FrameCtx, FrameProcessor, PortRole},
+            receiver::{DatagramCtx, DatagramProcessor, PortRole},
         },
         model::{
             BookAccumulator, BookAction, BookChange, BookSide, NormalizedBook, NormalizedDepth,
@@ -1671,7 +1671,7 @@ mod tests {
     }
 
     /// Extract the real captured `InstrumentDefinition`s for `ids` from a Market-by-Price refdata
-    /// fixture (`[u32 LE frame length][frame bytes]` records). Reimplemented in miniature rather
+    /// fixture (`[u32 LE datagram length][datagram bytes]` records). Reimplemented in miniature rather
     /// than reused from `tests/common/replay.rs`, which lives in a separate test crate this unit
     /// test cannot reach. One definition per id (the capture's periodic reannounce repeats each one
     /// across several manifest bursts; first sighting wins, matching how the real subscriber state
@@ -1685,9 +1685,9 @@ mod tests {
                 u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
                     as usize;
             off += 4;
-            let frame = &bytes[off..off + len];
+            let datagram = &bytes[off..off + len];
             off += len;
-            let Ok((_h, msgs)) = codec_mbp::decode_frame(frame) else {
+            let Ok((_h, msgs)) = codec_mbp::decode_datagram(datagram) else {
                 continue;
             };
             for m in msgs {
@@ -1728,7 +1728,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let publisher = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
-        let ctx = |role: PortRole| FrameCtx {
+        let ctx = |role: PortRole| DatagramCtx {
             venue: "TestLashay",
             category: "testcategory",
             arbiter: &arbiter,
@@ -1751,7 +1751,7 @@ mod tests {
         let mut refdata_msgs = vec![manifest];
         refdata_msgs.extend(defs.iter().map(codec_mbp::tests::enc_instrument_definition));
         proc.on_datagram(
-            &codec_mbp::tests::frame(CHANNEL, 0, 0, &refdata_msgs),
+            &codec_mbp::tests::datagram(CHANNEL, 0, 0, &refdata_msgs),
             &ctx(PortRole::Refdata),
         );
 
@@ -1770,7 +1770,7 @@ mod tests {
                 cumulative_volume_raw: 0,
             });
             proc.on_datagram(
-                &codec_mbp::tests::frame(CHANNEL, 0, 1 + n as u64, &[reveal]),
+                &codec_mbp::tests::datagram(CHANNEL, 0, 1 + n as u64, &[reveal]),
                 &ctx(PortRole::Mktdata),
             );
         }
@@ -2372,7 +2372,7 @@ mod tests {
         );
     }
 
-    /// A `BookSnapshot` entry that answers *nothing* must not shadow the `depth` entry the same frame
+    /// A `BookSnapshot` entry that answers *nothing* must not shadow the `depth` entry the same datagram
     /// wrote. Returning on the accumulator's mere presence, a market re-baselined by a bare `clear` —
     /// present, baselined and empty — reports a null inside market while the top-N slice beside it
     /// holds one.

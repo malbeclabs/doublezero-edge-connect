@@ -307,7 +307,7 @@ struct FeedRow {
     publishers: Publishers,
     /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount — so a socket bound for channel `N` also receives
-    /// frames stamped `N + publisher_offset`. Row-level, not shape-specific: which mirror scheme
+    /// datagrams stamped `N + publisher_offset`. Row-level, not shape-specific: which mirror scheme
     /// (if any) a deployment runs is a property of the *feed*, not of whether the document happens
     /// to write its ports out explicitly or derive them from a roster — an `explicit` row is
     /// exactly as capable of being mirrored as a `derived` one (confirmed live: two publishers
@@ -1062,7 +1062,7 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
 /// Parse a single feed row (wrapped in a one-row document) and return the resulting [`Feed`].
 ///
 /// A cross-module test helper: `processor.rs`'s mirror tests want a `Feed::mirror_offset` that
-/// actually came from parsing a document — not one poked directly onto a hand-built `FrameCtx` —
+/// actually came from parsing a document — not one poked directly onto a hand-built `DatagramCtx` —
 /// so the registry's own parsing is what is under test, exactly like the live defect was.
 #[cfg(test)]
 pub(crate) fn parse_one_row(feed_json: &str) -> Feed {

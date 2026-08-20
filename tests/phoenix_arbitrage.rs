@@ -27,13 +27,13 @@ use common::{assertions, bridge::Bridge, replay, ws_client, ws_input::MockWsInpu
 use serial_test::serial;
 
 fn refdata() -> Vec<Vec<u8>> {
-    replay::split_frames(
+    replay::split_datagrams(
         &std::fs::read("tests/fixtures/phoenix_tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     )
 }
 fn mktdata() -> Vec<Vec<u8>> {
-    replay::split_frames(
+    replay::split_datagrams(
         &std::fs::read("tests/fixtures/phoenix_tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     )
@@ -94,9 +94,9 @@ async fn phoenix_edge_gap_public_trade_fills_in() {
     // Edge refdata AND mktdata: SOL prints real quotes/trades (instrument_id 0), revealing its
     // Source ID, before the edge goes quiet — the gap that follows is mid-stream.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::PHOENIX_GROUP, 9202, &refdata()).unwrap();
+        replay::send_datagrams(replay::PHOENIX_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::PHOENIX_GROUP, 9201, &mktdata()).unwrap();
+        replay::send_datagrams(replay::PHOENIX_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();
@@ -161,9 +161,9 @@ async fn phoenix_edge_leads_public_trade_deduped() {
     // Replay the edge feed (refdata then mktdata): the AMD trade 20418 prints and advances the
     // arbiter's trade dedup window.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::PHOENIX_GROUP, 9202, &refdata()).unwrap();
+        replay::send_datagrams(replay::PHOENIX_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::PHOENIX_GROUP, 9201, &mktdata()).unwrap();
+        replay::send_datagrams(replay::PHOENIX_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();

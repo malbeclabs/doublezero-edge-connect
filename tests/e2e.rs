@@ -5,26 +5,26 @@ use serial_test::serial;
 use std::time::Duration;
 
 #[test]
-fn tob_golden_splits_into_valid_frames() {
+fn tob_golden_splits_into_valid_datagrams() {
     let bytes =
         std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
-    let frames = replay::split_frames(&bytes, replay::TOB_MAGIC);
-    assert!(!frames.is_empty(), "expected at least one TOB frame");
-    for f in &frames {
+    let datagrams = replay::split_datagrams(&bytes, replay::TOB_MAGIC);
+    assert!(!datagrams.is_empty(), "expected at least one TOB datagram");
+    for f in &datagrams {
         assert!(f.len() >= 24);
         assert_eq!(u16::from_le_bytes([f[0], f[1]]), replay::TOB_MAGIC);
     }
 }
 
 #[test]
-fn tob_refdata_golden_splits_into_valid_frames() {
+fn tob_refdata_golden_splits_into_valid_datagrams() {
     let bytes = std::fs::read("tests/fixtures/tob_refdata.bin").expect("read tob_refdata.bin");
-    let frames = replay::split_frames(&bytes, replay::TOB_MAGIC);
+    let datagrams = replay::split_datagrams(&bytes, replay::TOB_MAGIC);
     assert!(
-        !frames.is_empty(),
-        "expected at least one TOB refdata frame"
+        !datagrams.is_empty(),
+        "expected at least one TOB refdata datagram"
     );
-    for f in &frames {
+    for f in &datagrams {
         assert!(f.len() >= 24);
         assert_eq!(u16::from_le_bytes([f[0], f[1]]), replay::TOB_MAGIC);
     }
@@ -63,11 +63,11 @@ async fn spike_loopback_multicast_produces_a_quote() {
     // Let the collector connect before replay begins.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
@@ -75,9 +75,9 @@ async fn spike_loopback_multicast_produces_a_quote() {
     // Fixture is in real wire order (manifest before def), so a single refdata pass retains the
     // def and the quote precision gate resolves immediately.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
     })
     .await
     .unwrap();
@@ -107,18 +107,18 @@ async fn tob_single_publisher_contract() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
     })
     .await
     .unwrap();
@@ -151,11 +151,11 @@ async fn tob_single_publisher_contract() {
 }
 
 #[test]
-fn mbo_goldens_split_into_valid_frames() {
+fn mbo_goldens_split_into_valid_datagrams() {
     for name in ["mbo_mktdata.bin", "mbo_refdata.bin", "mbo_snapshot.bin"] {
         let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
-        let frames = replay::split_frames(&bytes, replay::MBO_MAGIC);
-        assert!(!frames.is_empty(), "{name}: no frames");
+        let datagrams = replay::split_datagrams(&bytes, replay::MBO_MAGIC);
+        assert!(!datagrams.is_empty(), "{name}: no datagrams");
     }
 }
 
@@ -177,15 +177,15 @@ async fn mbo_single_publisher_depth_contract() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/mbo_refdata.bin").unwrap(),
         replay::MBO_MAGIC,
     );
-    let snapshot = replay::split_frames(
+    let snapshot = replay::split_datagrams(
         &std::fs::read("tests/fixtures/mbo_snapshot.bin").unwrap(),
         replay::MBO_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/mbo_mktdata.bin").unwrap(),
         replay::MBO_MAGIC,
     );
@@ -193,11 +193,11 @@ async fn mbo_single_publisher_depth_contract() {
     // Refdata first (definitions), then snapshot (anchor the book at empty), then mktdata
     // (deltas). The book reaches `Synced` on SnapshotEnd, after which live deltas apply directly.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 10202, &refdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 10202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 10203, &snapshot).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 10203, &snapshot).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 10201, &mktdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 10201, &mktdata).unwrap();
     })
     .await
     .unwrap();
@@ -279,28 +279,28 @@ fn two_publisher_port_blocks_are_both_ingested() {
     let metrics_bind = "127.0.0.1:19231".to_string();
     let _bridge = Bridge::spawn_with_args("HYPERLIQUID", 18231, &["--metrics-bind", &metrics_bind]);
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
     // `Bridge::spawn` returns on the FIRST receiver-bound marker, but `--feed Hyperliquid` now
     // binds 22 receivers over 55 sockets, so a one-shot send can land before these two have joined
     // — an un-joined group silently discards the datagram. Re-send each round until both publishers
-    // register traffic (idempotent: the assertion is `> 0`, and duplicate frames are deduped).
+    // register traffic (idempotent: the assertion is `> 0`, and duplicate datagrams are deduped).
     let body = scrape_until(
         &metrics_bind,
         Duration::from_secs(20),
         |b| publisher_datagrams(b, 9101) > 0 && publisher_datagrams(b, 9201) > 0,
         || {
             // Refdata before mktdata on each block (definitions gate emission), 9101's first.
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
         },
     );
     assert!(

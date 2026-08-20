@@ -58,7 +58,7 @@ memory is bounded by `window × shreds-per-slot`.
 > validated against a live `edge-solana-*` hexdump (the same caveat as the repo's unvalidated
 > Midpoint/MBO codecs). This affects **both** dedup modes: a misparse mis-keys a shred and could
 > over- or under-deduplicate (and, in sigverify mode, mis-verify). Confirm the offsets against a
-> captured frame before relying on either in production; the forwarder logs a one-time warning
+> captured datagram before relying on either in production; the forwarder logs a one-time warning
 > when sigverify is on and a periodic tally so a systematic misparse (≈100% "invalid") is obvious.
 
 ## Flags

@@ -1,5 +1,5 @@
 //! Golden-fixture tests over committed sample response bodies — the `tests/codec_*_fixtures.rs`
-//! convention, applied to this crate's JSON responses instead of binary wire frames: parse a
+//! convention, applied to this crate's JSON responses instead of binary wire datagrams: parse a
 //! recorded body, render it, assert the output.
 //!
 //! There is no live edge-connect container to record these fixtures from in this crate's own test

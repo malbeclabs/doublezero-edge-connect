@@ -70,7 +70,7 @@ pub struct Metrics {
     /// venue-level aggregate (up if ANY publisher is up). A venue can be `dz_feed_up == 1` while
     /// one of its publishers reads `dz_receiver_up == 0`; that is the wedged-mirror signal.
     pub receiver_up: IntGaugeVec,
-    /// Frame-sequence classifications per feed, by `kind` (first/ok/reset/stale).
+    /// Datagram-sequence classifications per feed, by `kind` (first/ok/reset/stale).
     pub seq_events: IntCounterVec,
 
     // --- Arbiter emit stage (labelled by `venue`) ---
@@ -238,7 +238,7 @@ pub struct Metrics {
     pub mbo_guarded_tombstones_max: IntGauge,
 
     // --- Market-by-price processor (per `venue`) ---
-    /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
+    /// One publisher-and-channel's books discarded on a datagram-header `Reset Count` change.
     pub mbp_channel_resets: IntCounterVec,
     /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
     /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
@@ -472,7 +472,7 @@ impl Metrics {
             seq_events: counter_vec(
                 &registry,
                 "dz_seq_events_total",
-                "Frame-sequence classifications per feed (first/ok/reset/stale)",
+                "Datagram-sequence classifications per feed (first/ok/reset/stale)",
                 &["venue", "kind"],
             ),
             emit: counter_vec(
@@ -642,7 +642,7 @@ impl Metrics {
             mbp_channel_resets: counter_vec(
                 &registry,
                 "dz_mbp_channel_resets_total",
-                "Publisher-and-channel book state discarded on a frame-header Reset Count change",
+                "Publisher-and-channel book state discarded on a datagram-header Reset Count change",
                 &["venue"],
             ),
             mbp_buffer_overflows: counter_vec(
