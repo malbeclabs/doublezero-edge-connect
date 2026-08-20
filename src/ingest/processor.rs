@@ -182,7 +182,7 @@ impl<D: InstrumentDef> PerPublisher<D> {
         self.states.get(&publisher)?.definition(instrument_id)
     }
 
-    /// `publisher`'s state for mutation that must **not** mint one — a reset epoch can be observed on
+    /// `publisher`'s state for mutation that must **not** mint one — a reset era can be observed on
     /// the market-data path, where [`Self::get`] would let a forged-source flood evict the real
     /// publishers' definitions.
     fn state_mut(&mut self, publisher: IpAddr) -> Option<&mut RefDataState<D>> {
@@ -374,7 +374,7 @@ impl TobProcessor {
     /// an eviction path of its own — called both when [`PerPublisher::get`] evicts `publisher` (see
     /// [`PerPublisher::take_evicted`]) and when a `ChannelReset` discards its whole definition set
     /// (the same remap risk `InstrumentReset` already guards in MBO/MBP: the old Source ID must not
-    /// survive to misdescribe whatever this publisher's ids mean under the new epoch). Does NOT
+    /// survive to misdescribe whatever this publisher's ids mean under the new era). Does NOT
     /// purge `InstrumentSnapshot`: that map is shared across every publisher of every venue, and a
     /// publisher going away (evicted, or reset) says nothing about whether its last-announced
     /// identity is still current — unlike a Source ID change, which does.
@@ -436,7 +436,7 @@ impl DatagramProcessor for TobProcessor {
         // Per edge-feed-spec, the datagram Sequence Number is monotonically increasing per channel and
         // a `Reset Count` change signals a publisher reset. On the quote feed we drop only the stale
         // (out-of-order/replayed) datagrams - those whose sequence is below the last seen within the
-        // same reset epoch - so an old datagram can never overwrite a fresher top-of-book. Forward
+        // same reset era - so an old datagram can never overwrite a fresher top-of-book. Forward
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
         let quotes_fresh = if handle_quotes {
@@ -546,7 +546,7 @@ impl DatagramProcessor for TobProcessor {
                     *self.state.get(ctx.publisher) = RefDataState::new();
                     // The whole definition set just went with it; the old Source ID must not
                     // survive to misdescribe whatever this publisher's ids mean under the new
-                    // epoch (see `forget_publisher`).
+                    // era (see `forget_publisher`).
                     self.forget_publisher(ctx.publisher);
                 }
                 Message::EndOfSession(ts) if handle_refdata => {
@@ -562,7 +562,7 @@ impl DatagramProcessor for TobProcessor {
                     // burst (~every 8s on the live Phoenix feed) while quotes stream
                     // continuously, so a startup/reset race that left `defs` short of
                     // `expected_count` would otherwise wedge the feed: every quote dropped
-                    // until a *full* burst landed within a single valid manifest epoch.
+                    // until a *full* burst landed within a single valid manifest era.
                     // Gating per instrument lets each symbol's quotes flow the moment its
                     // definition is known, independent of the others.
                     let Some(def) = self.state.def(ctx.publisher, q.instrument_id) else {
@@ -895,7 +895,7 @@ pub struct MboProcessor {
     last_top: HashMap<(IpAddr, u32), (Vec<Level>, Vec<Level>)>,
     /// The symbol each `(publisher, instrument)` last emitted `depth` under — the symbol the
     /// arbiter's depth floor actually LATCHED for that instrument. `InstrumentReset` clears the
-    /// floor by this memo rather than the *current* definition, which can differ: a manifest epoch
+    /// floor by this memo rather than the *current* definition, which can differ: a manifest era
     /// bump may reassign the id to another symbol, and clearing the new symbol would leave the
     /// wedged old-symbol entry latched. Written in `emit_depth`, evicted in lockstep with `books`,
     /// cleared on `EndOfSession` (the venue-wide clear covers everything), so its keys are always
@@ -1603,7 +1603,7 @@ impl DatagramProcessor for MboProcessor {
                     // shared. A mirror that loses its own EndOfSession datagram keeps a `Synced`
                     // book and can re-latch the cleared floor at the old high-water, wedging the
                     // venue's depth until that mirror resets on its own. Resetting every
-                    // publisher's book here is what closes that; a per-venue session epoch shared
+                    // publisher's book here is what closes that; a per-venue session era shared
                     // across the receiver tasks is what would close it properly.
                     for book in self.books.values_mut() {
                         book.on_end_of_session();
@@ -1807,7 +1807,7 @@ impl DatagramProcessor for MboProcessor {
                     self.reveal_rebaselined_ns.remove(&key);
                     // Resolve the wire venue the pre-reset depth actually latched under BEFORE
                     // dropping the cache entry that supplies it. Same remap risk as `last_top`/
-                    // `emitted_symbol`: a manifest epoch bump can reassign this instrument_id to a
+                    // `emitted_symbol`: a manifest era bump can reassign this instrument_id to a
                     // different market, and the old Source ID would then misdescribe the new one —
                     // it must not survive past this reset either.
                     let latched_venue = self.wire_venue(&key);
@@ -1824,7 +1824,7 @@ impl DatagramProcessor for MboProcessor {
                     // safest-first order:
                     //   1. `emitted_symbol` — the symbol this publisher's depth actually LATCHED
                     //      the floor under. The *current* definition can disagree: a manifest
-                    //      epoch bump may have remapped the id to another symbol, and clearing the
+                    //      era bump may have remapped the id to another symbol, and clearing the
                     //      new symbol would leave the wedged old-symbol entry latched.
                     //   2. The current definition — right whenever ids are venue-stable (this
                     //      publisher just never emitted depth for the id, e.g. the mirror latched
@@ -2311,7 +2311,7 @@ impl MbpProcessor {
 
     /// §4.9: discard everything a `Reset Count` change invalidated for one `(publisher, channel)` —
     /// its books and their open snapshot group, plus that publisher's reference data, whose
-    /// `reset_count` epoch just ended. Routed from any port, since the change can be seen on market
+    /// `reset_count` era just ended. Routed from any port, since the change can be seen on market
     /// data first. `RefDataState` is per publisher rather than per channel, so a sharded publisher's
     /// reset clears every channel's definitions — an over-approximation that self-heals on the next
     /// reference-data burst.
@@ -2507,10 +2507,10 @@ impl DatagramProcessor for MbpProcessor {
         // not silently ignored while deltas keep applying against discarded publisher state.
         //
         // Tracked from the **market-data role only**, and only for a publisher we already hold
-        // reference data for. The role restriction is what makes the epoch monotone: all three ports
-        // carry the same epoch but are separate sockets with separate kernel queues, so one memo
+        // reference data for. The role restriction is what makes the era monotone: all three ports
+        // carry the same era but are separate sockets with separate kernel queues, so one memo
         // shared across them would flip on every interleaving of a restart's backlog and re-reset the
-        // channel thousands of times. One socket is FIFO, so the market-data epoch never goes
+        // channel thousands of times. One socket is FIFO, so the market-data era never goes
         // backwards. The publisher restriction keeps [`PerPublisher::get`]'s rule: a publisher with no
         // definitions has no books to invalidate, and minting state from the market-data path is how a
         // forged-source flood would evict the real publishers' definitions.
@@ -2712,15 +2712,15 @@ impl DatagramProcessor for MbpProcessor {
                     }
                 }
                 codec_mbp::Message::SnapshotBegin(s) => {
-                    // A group whose epoch disagrees with the market data's belongs to a different run
+                    // A group whose era disagrees with the market data's belongs to a different run
                     // of the publisher: the snapshot port is its own socket, so a restart leaves the
-                    // previous epoch's rotation queued, and installing it would republish the dead
+                    // previous era's rotation queued, and installing it would republish the dead
                     // session's book as a fresh re-baseline. Its levels are then counted as orphans.
-                    // Before any market data the epoch is unknown, so the group is accepted.
+                    // Before any market data the era is unknown, so the group is accepted.
                     if self
                         .last_reset
                         .get(&(ctx.publisher, channel))
-                        .is_some_and(|epoch| *epoch != header.reset_count)
+                        .is_some_and(|era| *era != header.reset_count)
                     {
                         continue;
                     }
@@ -2869,7 +2869,7 @@ impl DatagramProcessor for MbpProcessor {
                     {
                         accum.remove(&r.instrument_id);
                         self.report_health(ctx, &key, false);
-                        // Same remap risk the health/report reset above guards: a manifest epoch
+                        // Same remap risk the health/report reset above guards: a manifest era
                         // bump can reassign this instrument_id to a different market, and the old
                         // Source ID would then misdescribe the new one. Drop it too, so the
                         // post-reset market is deferred again until a fresh delta reveals it.
@@ -3730,10 +3730,10 @@ mod tests {
     }
 
     /// A `ChannelReset` discards the whole reference-data set for the publisher that sent it — the
-    /// same remap risk MBO/MBP's `InstrumentReset` already guards (a manifest epoch bump can reassign
+    /// same remap risk MBO/MBP's `InstrumentReset` already guards (a manifest era bump can reassign
     /// an `instrument_id` to a different market), applying with more force here since the entire
     /// definition set goes at once. `revealed`/`pending_channel` must go with it, or a later reveal
-    /// under the new epoch could replay the old Source ID against a different instrument.
+    /// under the new era could replay the old Source ID against a different instrument.
     #[test]
     fn tob_channel_reset_drops_revealed_and_pending_channel() {
         let (arbiter, mut rx, instruments) = mbp_harness();
@@ -4343,7 +4343,7 @@ mod tests {
         );
     }
 
-    /// If a manifest epoch bump remaps the instrument id to a DIFFERENT symbol between the last
+    /// If a manifest era bump remaps the instrument id to a DIFFERENT symbol between the last
     /// latched depth and the reset, the floor entry is wedged under the symbol the depth was
     /// EMITTED as — the `emitted_symbol` memo — not the current definition's. Clearing the current
     /// definition's symbol would leave the old-symbol entry latched forever.
@@ -6809,8 +6809,8 @@ mod tests {
     /// once the books sync every rotation is declined. Measured against the live Lashay perps feed
     /// 2026-08-08, that was ~415 levels/s — 100% of the reference parser's ~410 levels/s — all of
     /// it landing on the orphan counter and burying the genuine anomaly that counter exists to
-    /// surface (a lost `SnapshotBegin`, an interleaved group, or the stale epoch covered by
-    /// `mbp_a_stale_epoch_snapshot_neither_installs_nor_resets`).
+    /// surface (a lost `SnapshotBegin`, an interleaved group, or the stale era covered by
+    /// `mbp_a_stale_era_snapshot_neither_installs_nor_resets`).
     #[test]
     fn mbp_a_declined_rotation_is_counted_apart_from_orphans() {
         let venue = "MbpDeclinedRotationTest";
@@ -6956,7 +6956,7 @@ mod tests {
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
         let ip = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
 
-        // A market-data flood from publishers that never sent reference data, each bumping its epoch.
+        // A market-data flood from publishers that never sent reference data, each bumping its era.
         for i in 0..(MAX_CHANNEL_KEYS as u32 + 50) {
             for reset_count in [0, 1] {
                 let mut ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
@@ -7067,19 +7067,19 @@ mod tests {
         assert_eq!(book.asks().count(), 1);
     }
 
-    /// A publisher restart bumps the epoch on all three ports, but they are separate sockets with
-    /// separate queues: the previous epoch's snapshot rotation is still arriving after the market-data
+    /// A publisher restart bumps the era on all three ports, but they are separate sockets with
+    /// separate queues: the previous era's snapshot rotation is still arriving after the market-data
     /// port has moved on. Installing it would republish the dead session's book as a fresh
     /// re-baseline, and a reset memo shared across the roles would re-reset the channel on every
     /// interleaving of the backlog.
     #[test]
-    fn mbp_a_stale_epoch_snapshot_neither_installs_nor_resets() {
-        let venue = "MbpStaleEpochTest";
+    fn mbp_a_stale_era_snapshot_neither_installs_nor_resets() {
+        let venue = "MbpStaleEraTest";
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
         let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
-        // Epoch 1: definitions, then a snapshot that installs and publishes its re-baseline.
+        // Era 1: definitions, then a snapshot that installs and publishes its re-baseline.
         proc.on_datagram(&mbp_wire::datagram(0, 1, 1, &mbp_refdata(&[41])), &refdata);
         proc.on_datagram(
             &mbp_wire::datagram(0, 1, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
@@ -7089,7 +7089,7 @@ mod tests {
         // the installed book's re-baseline reaches the wire.
         let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
         proc.on_datagram(&mbp_wire::datagram(0, 1, 3, &[mbp_reveal(41, 1)]), &mkt);
-        assert_eq!(drain_books(&mut rx).len(), 1, "the current epoch installs");
+        assert_eq!(drain_books(&mut rx).len(), 1, "the current era installs");
 
         let resets = || {
             metrics()
@@ -7112,7 +7112,7 @@ mod tests {
 
         assert!(
             drain_books(&mut rx).is_empty(),
-            "the dead epoch's book is not republished"
+            "the dead era's book is not republished"
         );
         assert_eq!(
             resets(),

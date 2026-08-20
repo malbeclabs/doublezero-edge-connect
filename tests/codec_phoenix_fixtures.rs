@@ -38,12 +38,12 @@ fn definitions() -> BTreeMap<u32, codec::InstrumentDefinition> {
     defs
 }
 
-/// The refdata fixture is a single complete manifest epoch (`seq=11`, 51 instruments). The replay
+/// The refdata fixture is a single complete manifest era (`seq=11`, 51 instruments). The replay
 /// relies on the `ManifestSummary` preceding the definitions — the subscriber drops a definition
 /// whose `manifest_seq` doesn't match the latest manifest, so a def-before-manifest fixture would
 /// silently define nothing. Pin that the first datagram leads with the manifest.
 #[test]
-fn phoenix_refdata_fixture_is_a_complete_manifest_epoch() {
+fn phoenix_refdata_fixture_is_a_complete_manifest_era() {
     let fs = datagrams("tests/fixtures/phoenix_tob_refdata.bin");
     assert!(!fs.is_empty(), "refdata fixture is empty");
     match codec::decode_datagram(&fs[0])
@@ -66,7 +66,7 @@ fn phoenix_refdata_fixture_is_a_complete_manifest_epoch() {
         "the manifest declares 51 instruments; all must be defined (so RefDataState reaches ready())"
     );
     for d in defs.values() {
-        assert_eq!(d.manifest_seq, 11, "every def shares the manifest epoch");
+        assert_eq!(d.manifest_seq, 11, "every def shares the manifest era");
         assert!(
             !d.symbol.is_empty() && d.symbol.is_ascii(),
             "instrument {} has an implausible symbol {:?}",

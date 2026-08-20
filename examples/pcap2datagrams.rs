@@ -730,7 +730,7 @@ fn trim_mbo_minimal(
     use codec_mbo::Message;
 
     // Refdata: keep from the first ManifestSummary datagram through the first datagram at/after it that
-    // carries the target instrument's definition. One manifest epoch + the one definition is all the
+    // carries the target instrument's definition. One manifest era + the one definition is all the
     // subscriber needs to resolve `target_id`'s precision; the live capture re-sends the same
     // manifest seq on a round-robin, so the rest is redundant.
     let manifest_idx = first_datagram_with(refdata, |m| matches!(m, Message::ManifestSummary(_)))?

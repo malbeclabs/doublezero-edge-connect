@@ -51,7 +51,7 @@ empty-anchor of PR #2 — so `mbo_single_publisher_depth_contract`'s crossed-boo
   the first group that is complete.
 - `mbo_mktdata.bin` is the 125 datagrams carrying BTC's contiguous post-anchor deltas (per-instrument
   seq 26761713..26762012), which apply live after the snapshot.
-- `mbo_refdata.bin` is one manifest epoch + BTC's definition, enough to resolve precision. The live
+- `mbo_refdata.bin` is one manifest era + BTC's definition, enough to resolve precision. The live
   publisher emits `ManifestSummary` with `Valid=0` (same as the TOB publisher); the bridge's
   `MboProcessor` overrides it to valid (logged once), matching `TobProcessor`.
 
@@ -210,7 +210,7 @@ address, not INADDR_ANY (`receiver::bind_multicast`). Only the `148.51.122.75` d
 `source_id=2`) were kept; every Hyperliquid datagram was dropped before writing the fixtures.
 
 **Contents.**
-- `phoenix_tob_refdata.bin` (5 datagrams): one complete manifest epoch — `ManifestSummary{valid,
+- `phoenix_tob_refdata.bin` (5 datagrams): one complete manifest era — `ManifestSummary{valid,
   manifest_seq=11, instrument_count=51}` first, then all 51 Phoenix `InstrumentDefinition`s at seq
   11. The manifest leads on purpose: the subscriber drops a definition whose `manifest_seq` doesn't
   match the latest manifest, so a def-before-manifest fixture would define nothing.
@@ -226,7 +226,7 @@ Phoenix names each market with the same bare ticker on the edge and public feeds
 
 **Regenerate.** Re-run `scripts/phoenix_capture.py --iface doublezero1 --secs 180` on a host with
 both edge multicast and internet reach, keep only the datagrams from the Phoenix publisher IP (the
-one carrying `source_id=2`), assemble a manifest-first refdata epoch, take a small mktdata slice with
+one carrying `source_id=2`), assemble a manifest-first refdata era, take a small mktdata slice with
 real trades, and length-prefix both files (`[u32 LE len][datagram]`).
 
 ### `mbo_btc_dual.combined.bin` — two-publisher Market-by-Order golden

@@ -430,7 +430,7 @@ Modules are grouped by role under `src/`:
   reset is per-publisher while the floor it clears is venue-wide: one processor per receiver task
   means a mirror that loses its own `EndOfSession` datagram keeps a `Synced` book and can re-latch
   the cleared floor at the old high-water, wedging the venue's depth until it resets on its own.
-  Closing that needs a per-venue session epoch shared across the tasks (not built).
+  Closing that needs a per-venue session era shared across the tasks (not built).
   `on_instrument_reset` likewise drops
   `last_event_ts`, scopes its clear by the symbol the depth was emitted under (the processor's
   `emitted_symbol` memo — immune to an id→symbol remap), and falls back to a venue-wide clear when
@@ -665,10 +665,10 @@ Modules are grouped by role under `src/`:
   venue-wide clear would tear down a live peer path's published book), and a channel reset on any
   **change** of the datagram header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
   read from the **market-data role only** and only for a publisher whose reference data we already
-  hold: the three ports carry one epoch on three sockets, so a memo shared across them would re-reset
+  hold: the three ports carry one era on three sockets, so a memo shared across them would re-reset
   the channel on every interleaving of a restart's backlog, and minting reference-data state from the
   market-data path is what would let a forged-source flood evict the real publishers' definitions. A
-  snapshot group whose epoch disagrees with the market data's is refused for the same reason — it
+  snapshot group whose era disagrees with the market data's is refused for the same reason — it
   belongs to the publisher's previous run, and installing it would republish a dead session's book.
   `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
   O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are

@@ -815,7 +815,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirror publisher's old-session tail — or a boundary-loss resync stamping pre-session time —
   can't re-latch the floor at the old high-water and undo the clear. `InstrumentReset` likewise
   drops the resetting book's event clock, scopes its clear by the symbol the depth was actually
-  emitted under (immune to an id→symbol remap across manifest epochs), and falls back to a
+  emitted under (immune to an id→symbol remap across manifest eras), and falls back to a
   venue-wide floor clear when neither that nor a current definition resolves. Both resets also
   purge the matching WS-replay `depth` entries, so a client connecting across the boundary is
   never replayed the ended session's final book — including a delisted instrument's phantom book,

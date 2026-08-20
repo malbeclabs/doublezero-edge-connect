@@ -578,12 +578,12 @@ pub fn bind_multicast(
 pub enum SeqCheck {
     /// First datagram seen on this channel.
     First,
-    /// Sequence at or above the last seen within the epoch (forward progress or a duplicate of
+    /// Sequence at or above the last seen within the era (forward progress or a duplicate of
     /// the last). Accepted.
     Ok,
     /// `Reset Count` changed: the publisher reset the channel and the sequence restarts. Accepted.
     Reset,
-    /// Sequence below the last seen within the same reset epoch - a reordered or duplicated
+    /// Sequence below the last seen within the same reset era - a reordered or duplicated
     /// datagram carrying a now-superseded update. Dropped, so an old message never overwrites
     /// a fresher one.
     Stale,
@@ -600,7 +600,7 @@ pub struct SeqTracker {
 impl SeqTracker {
     /// Classify a datagram and advance the tracker. A reset (`reset_count` differs from the
     /// last-seen value, per spec) re-anchors to this datagram's sequence; otherwise the sequence
-    /// is compared within the epoch. The tracker is only advanced for accepted datagrams, so a
+    /// is compared within the era. The tracker is only advanced for accepted datagrams, so a
     /// dropped stale datagram leaves the anchor on the freshest sequence.
     pub fn check(&mut self, channel_id: u8, reset_count: u8, sequence: u64) -> SeqCheck {
         match self.last.get_mut(&channel_id) {
@@ -1376,7 +1376,7 @@ mod tests {
         // Without the reset_count check this 0 would be misread as a stale datagram.
         assert_eq!(s.check(0, 1, 0), SeqCheck::Reset);
         assert_eq!(s.check(0, 1, 1), SeqCheck::Ok);
-        // Within the new epoch, lower sequences are stale again.
+        // Within the new era, lower sequences are stale again.
         assert_eq!(s.check(0, 1, 0), SeqCheck::Stale);
     }
 

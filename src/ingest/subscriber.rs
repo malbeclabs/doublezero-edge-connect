@@ -7,7 +7,7 @@
 //! Market-by-Order), which differ only in their instrument-definition *layout*, so it is generic
 //! over any definition type that implements [`InstrumentDef`] (its key + manifest sequence).
 //!
-//! One instance tracks **one publisher**: `reset_count` and the manifest epoch are scoped to
+//! One instance tracks **one publisher**: `reset_count` and the manifest era are scoped to
 //! `(source_ip, group, port)`. The per-source-IP map lives in the processors
 //! (`processor::PerPublisher`), which keeps this state machine single-publisher and unit-testable.
 
@@ -86,7 +86,7 @@ impl<D: InstrumentDef> RefDataState<D> {
         }
     }
 
-    /// True once the *whole* instrument set for the current manifest epoch is known. Quote
+    /// True once the *whole* instrument set for the current manifest era is known. Quote
     /// emission no longer gates on this (it gates per instrument via [`Self::definition`]); kept
     /// as the documented "full set complete" invariant and exercised by the tests.
     #[allow(dead_code)]
