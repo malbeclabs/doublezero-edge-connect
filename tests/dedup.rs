@@ -20,7 +20,9 @@ use doublezero_edge_connect::{
         processor::{MboProcessor, TobProcessor},
         receiver::{FrameCtx, FrameProcessor, PortRole},
     },
-    model::{BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook},
+    model::{
+        BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook, ReplayScope,
+    },
 };
 use serde_json::Value;
 use std::{
@@ -639,6 +641,7 @@ fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
 }
 
 const BOOK_VENUE: &str = "BookArmsInterleave";
+const BOOK_CATEGORY: &str = "perps";
 const BOOK_CHANNEL: u32 = 2;
 const BOOK_INSTRUMENT: u32 = 41;
 
@@ -652,6 +655,7 @@ fn level(side: BookSide, price: f64, size: f64) -> BookChange {
         side,
         price,
         size,
+        order_id: 0,
     }
 }
 
@@ -664,6 +668,9 @@ fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage
         symbol: "BTC-PERP".into(),
         channel: BOOK_CHANNEL,
         instrument_id: BOOK_INSTRUMENT,
+        category: BOOK_CATEGORY.into(),
+        // Every change this suite builds is price-aggregated (`level()` stamps `order_id: 0`).
+        order_level: false,
         changes,
         snapshot: false,
         last,
@@ -694,6 +701,7 @@ fn arm_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
                     side: BookSide::Bid,
                     price: px,
                     size: 0.0,
+                    order_id: 0,
                 },
             ],
             true,
@@ -727,6 +735,7 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
             side: BookSide::Both,
             price: 0.0,
             size: 0.0,
+            order_id: 0,
         }
     }
 
@@ -742,8 +751,12 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
     // legitimately transfer on silence.
     for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
         let t = 1_000 + i as u64 * 2_000;
-        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1), "perps");
-        arb.emit(book_batch(c.0.clone(), c.1, t + 1_000), arm(2), "perps");
+        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1), BOOK_CATEGORY);
+        arb.emit(
+            book_batch(c.0.clone(), c.1, t + 1_000),
+            arm(2),
+            BOOK_CATEGORY,
+        );
     }
 
     // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer
@@ -763,7 +776,15 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
     for b in &published {
         acc.apply(b);
     }
-    let full = acc.to_book(&BOOK_VENUE.into(), BOOK_CHANNEL, BOOK_INSTRUMENT);
+    let full = acc.to_book(
+        &(
+            BOOK_VENUE.into(),
+            BOOK_CATEGORY.into(),
+            BOOK_CHANNEL,
+            BOOK_INSTRUMENT,
+        ),
+        ReplayScope::Orders,
+    );
     assert_eq!(
         full.changes[1..].to_vec(), // [0] is the re-baseline `clear`
         vec![

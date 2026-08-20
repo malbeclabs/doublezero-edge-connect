@@ -217,6 +217,13 @@ struct Args {
     )]
     phoenix_ws_input_url: String,
 
+    /// Bind address for the Hyperliquid-compatible WebSocket sink, e.g. `0.0.0.0:8082`. Off by
+    /// default (empty disables it). This serves Hyperliquid's own schema, not the protocol in
+    /// PROTOCOL.md — point an existing Hyperliquid client's WebSocket endpoint at it. Not
+    /// subscription-gated. No TLS; terminate at a proxy if exposed.
+    #[arg(long = "hl-ws-bind", env = "HL_WS_BIND", default_value = "")]
+    hl_ws_bind: String,
+
     /// Prometheus metrics HTTP endpoint bind address (e.g. `127.0.0.1:9090`). Off by default
     /// (opt-in): empty means no endpoint is exposed. Metrics are recorded regardless; this only
     /// controls whether they can be scraped at `GET /metrics`. No TLS — terminate at a proxy.
@@ -333,11 +340,67 @@ struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     arb_match_window_secs: u64,
+
+    /// Milliseconds a delivered order-level book event is remembered so a slower publisher's copy is
+    /// recognized as a duplicate. A removed order id is never re-added regardless (`ingest::book`),
+    /// so this does not gate resurrection — but set below the arms' separation it turns a lagging
+    /// copy of a partially-filled order into a false size disagreement, which costs a forced
+    /// re-baseline and the batches withheld behind it. A per-market count cap of 1024 events bounds
+    /// the reach independently, so values much above a second are inert on a busy market.
+    #[arg(
+        long = "arb-book-dedup-window-ms",
+        env = "DZ_ARB_BOOK_DEDUP_WINDOW_MS",
+        default_value_t = 1000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    arb_book_dedup_window_ms: u64,
+
+    /// Seconds of venue time behind a channel's newest stamp an order-level book event may be and
+    /// still be admitted — and, by the same value, how long a removed order is remembered so a
+    /// lagging publisher's stale add for it can be refused. Set below the arms' worst separation and
+    /// a returning link's backlog is published as live; set far above it and every removal inside the
+    /// window is held (~4,000/s per publisher on the flagship channel, against a process-wide ceiling
+    /// of 1,048,576 entries).
+    #[arg(
+        long = "arb-book-retention-secs",
+        env = "DZ_ARB_BOOK_RETENTION_SECS",
+        default_value_t = BOOK_GUARD.retention_ns / 1_000_000_000,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    arb_book_retention_secs: u64,
+
+    /// Seconds a batch's venue stamp may be ahead of its channel's newest and still advance it. Past
+    /// it the advance is refused but the batch is still served, so a single bad stamp cannot carry the
+    /// frontier years forward and refuse every real event behind it. Must stay comfortably below
+    /// `--arb-book-retention-secs`, or one accepted jump puts the whole channel outside the window.
+    #[arg(
+        long = "arb-book-ts-jump-secs",
+        env = "DZ_ARB_BOOK_TS_JUMP_SECS",
+        default_value_t = BOOK_GUARD.max_ts_jump_ns / 1_000_000_000,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    arb_book_ts_jump_secs: u64,
+
+    /// Seconds a channel's newest venue stamp may fail to **move** before it is re-seated from the
+    /// batches actually arriving. A real tradeoff: below the arms' worst separation (2.77 s measured
+    /// at p99.99) it fires on ordinary jitter, and above it, it bounds both how long a stuck frontier
+    /// grows the removed population unforgotten and how long a market whose only surviving arm is
+    /// behind that frontier can be dark.
+    #[arg(
+        long = "arb-book-reseat-secs",
+        env = "DZ_ARB_BOOK_RESEAT_SECS",
+        default_value_t = BOOK_GUARD.reseat_after_ns / 1_000_000_000,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    arb_book_reseat_secs: u64,
 }
 
 /// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
 /// the ones `--help` advertises cannot drift apart.
 const ARB: ingest::authority::AuthorityConfig = ingest::authority::AuthorityConfig::DEFAULT;
+
+/// The same, for the resurrection guard's venue-time tunables.
+const BOOK_GUARD: ingest::arbiter::BookGuardConfig = ingest::arbiter::BookGuardConfig::DEFAULT;
 
 /// A win rate outside `0.0..=1.0` silently disables one of the two transfer conditions (above 1.0
 /// no challenger ever clears it, below 0.0 every one does), and `NaN` compares false against both.
@@ -579,6 +642,17 @@ async fn main() -> Result<()> {
         transfer_win_rate: args.arb_transfer_win_rate,
         min_window_samples: args.arb_min_window_samples as usize,
     };
+    // The resurrection guard's venue-time tunables. Validated by the type that owns the bounds, not
+    // here: both ways of getting them wrong read as a channel-wide book outage with no metric saying
+    // why, which is a typo with the same signature as an attack.
+    let book_guard = ingest::arbiter::BookGuardConfig {
+        retention_ns: args.arb_book_retention_secs * 1_000_000_000,
+        max_ts_jump_ns: args.arb_book_ts_jump_secs * 1_000_000_000,
+        reseat_after_ns: args.arb_book_reseat_secs * 1_000_000_000,
+    };
+    if let Err(why) = book_guard.validate() {
+        bail!(why);
+    }
     let arbiter: SharedArbiter = {
         let mut a = Arbiter::new(tx.clone(), TRADE_DEDUP_WINDOW);
         // Every registry venue, not just the selected ones: a message's venue comes from the wire
@@ -594,6 +668,8 @@ async fn main() -> Result<()> {
             authority_cfg,
             args.arb_match_window_secs.saturating_mul(1_000_000_000),
         );
+        a.set_book_dedup_window(args.arb_book_dedup_window_ms.saturating_mul(1_000_000));
+        a.set_book_guard(book_guard);
         Arc::new(Mutex::new(a))
     };
 
@@ -629,6 +705,26 @@ async fn main() -> Result<()> {
         max_subs: args.ws_max_subs,
         max_inbound_per_min: args.ws_max_inbound_per_min,
         broadcast_capacity: args.ws_broadcast_capacity,
+    };
+
+    // Hyperliquid-compatible sink: off by default (opt-in via `--hl-ws-bind`), and not
+    // subscription-gated — it is a rendering of whatever the shared broadcast carries, so it has no
+    // group of its own to be subscribed to. A bind failure disables it with a warning rather than
+    // taking the tunnel down, exactly as the normalized sink's does.
+    let hl_sink = if args.hl_ws_bind.is_empty() {
+        info!("Hyperliquid-compatible sink disabled (empty --hl-ws-bind)");
+        None
+    } else {
+        match sinks::hyperliquid::bind(&args.hl_ws_bind).await {
+            Ok(listener) => {
+                let (tx, books) = (tx.clone(), books.clone());
+                Some(tokio::spawn(sinks::hyperliquid::serve(listener, tx, books)))
+            }
+            Err(e) => {
+                warn!(bind = %args.hl_ws_bind, "Hyperliquid-compatible sink disabled: {e}");
+                None
+            }
+        }
     };
 
     // Prometheus metrics endpoint: off by default (opt-in via `--metrics-bind`). Recording is always
@@ -798,6 +894,10 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r?,
+        r = async { match hl_sink {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        } } => r??,
         // The metrics endpoint (when enabled) loops forever; its arm resolves only on a bind/accept
         // failure or a task panic.
         r = async { match metrics_srv {

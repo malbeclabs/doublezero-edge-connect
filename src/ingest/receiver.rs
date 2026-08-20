@@ -59,7 +59,7 @@ use crate::{
         arbiter::{lock, Publisher, SharedArbiter},
         feeds::{feeds, Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
-        processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor},
+        processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor, MAX_PUBLISHERS},
         reconcile::TapeOwner,
         sources,
     },
@@ -301,6 +301,9 @@ struct ReceiverRegistration {
     arbiter: SharedArbiter,
     key: ReceiverKey,
     up_gauge: prometheus::IntGauge,
+    /// Source IPs this receiver has carried, so their book standing goes with it. Only Market-by-Order
+    /// receivers produce that standing, and a publisher host uses one IP, so this stays tiny.
+    publishers: Vec<IpAddr>,
 }
 
 impl ReceiverRegistration {
@@ -318,7 +321,22 @@ impl ReceiverRegistration {
             arbiter,
             key,
             up_gauge,
+            publishers: Vec::new(),
         }
+    }
+
+    /// Note a publisher whose order-level books this receiver is feeding. Bounded like the processors'
+    /// own per-source state, oldest evicted first: the source IP is spoofable, and refusing new entries
+    /// at the cap would let 256 forged datagrams stop a real publisher's standing being released on
+    /// exit — the wedge this exists to close.
+    fn note_publisher(&mut self, publisher: IpAddr) {
+        if self.key.2 != FeedKind::MarketByOrder || self.publishers.contains(&publisher) {
+            return;
+        }
+        if self.publishers.len() >= MAX_PUBLISHERS {
+            self.publishers.remove(0);
+        }
+        self.publishers.push(publisher);
     }
 
     /// Record this receiver's liveness. The venue-level `status` fires only when the **venue**
@@ -337,6 +355,12 @@ impl Drop for ReceiverRegistration {
     fn drop(&mut self) {
         self.up_gauge.set(0);
         let (venue, arbiter) = (self.key.0, &self.arbiter);
+        if !self.publishers.is_empty() {
+            let mut a = lock(arbiter);
+            for &ip in &self.publishers {
+                a.forget_publisher_books(self.key.1, Publisher::Edge(ip));
+            }
+        }
         self.health.deregister(self.key, |venue_up| {
             emit_status(arbiter, venue, venue_up, 0)
         });
@@ -787,6 +811,7 @@ async fn drive<P: FrameProcessor>(
                 }
             }
 
+            reg.note_publisher(publisher);
             let ctx = FrameCtx {
                 venue,
                 category,
@@ -1168,6 +1193,94 @@ mod tests {
             "must not also emit a status under the foreign venue's name"
         );
         drop(reg);
+    }
+
+    /// A Market-by-Order receiver's exit is the authoritative signal that its publisher is gone, so it
+    /// releases that publisher's book standing. Without this a departed arm's stale `synced` claim
+    /// suppresses the surviving arm's re-baseline until `PEER_SERVING_NS`, which a sub-second
+    /// gap-and-recover cycle outruns — and a suppressed re-baseline is never retried.
+    ///
+    /// A Top-of-Book receiver of the same publisher must not do it: one publisher host serves both
+    /// protocols from one source IP, so its exit would drop a live Market-by-Order arm's standing.
+    #[test]
+    fn an_mbo_receivers_exit_releases_its_publishers_book_standing() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Publisher},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let market = ("MBODEPART".into(), "test".into(), 2u32, 41u32);
+        let registration = |kind, port| {
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let arbiter: SharedArbiter =
+                std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+            lock(&arbiter).set_book_synced(&market, Publisher::Edge(ip), true);
+            let up_gauge = metrics()
+                .receiver_up
+                .with_label_values(&["MBODEPART", "test", port]);
+            let mut reg = ReceiverRegistration::new(
+                FeedHealth::new().into(),
+                arbiter.clone(),
+                ("MBODEPART", "test", kind, 9101),
+                up_gauge,
+            );
+            reg.note_publisher(ip);
+            drop(reg);
+            arbiter
+        };
+
+        let mbo = registration(FeedKind::MarketByOrder, "9101");
+        assert!(
+            !lock(&mbo).book_arm_synced(&market, Publisher::Edge(ip)),
+            "the departed publisher's claim must go with its receiver"
+        );
+        let tob = registration(FeedKind::TopOfBook, "9102");
+        assert!(
+            lock(&tob).book_arm_synced(&market, Publisher::Edge(ip)),
+            "a quote receiver's exit says nothing about its publisher's books"
+        );
+    }
+
+    /// The release above must find the market whatever the wire called its venue. Every `MarketKey`
+    /// is filed under the **wire** venue the instrument resolved to, and one registry row can carry
+    /// instruments whose Source IDs resolve elsewhere (the superset case `reset_all_known_depth_floors`
+    /// exists for), so a release filtered by the row's own `venue` matches nothing for exactly those
+    /// markets and leaves a departed arm's phantom `synced` standing forever. The category is what the
+    /// exiting receiver and the key provably share.
+    #[test]
+    fn an_mbo_receivers_exit_releases_a_market_filed_under_a_different_wire_venue() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Publisher},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // The row's static venue; the market below is filed under a different one, as a superset
+        // row's instruments are.
+        let row_venue = "MBOWIREVENUE";
+        let market = ("HYPERLIQUID".into(), "wiretest".into(), 2u32, 41u32);
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let arbiter: SharedArbiter =
+            std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+        lock(&arbiter).set_book_synced(&market, Publisher::Edge(ip), true);
+        let up_gauge = metrics()
+            .receiver_up
+            .with_label_values(&[row_venue, "wiretest", "9103"]);
+        let mut reg = ReceiverRegistration::new(
+            FeedHealth::new().into(),
+            arbiter.clone(),
+            (row_venue, "wiretest", FeedKind::MarketByOrder, 9103),
+            up_gauge,
+        );
+        reg.note_publisher(ip);
+        drop(reg);
+        assert!(
+            !lock(&arbiter).book_arm_synced(&market, Publisher::Edge(ip)),
+            "the departed arm's claim must go even when the wire named the venue differently"
+        );
     }
 
     /// The idle interval doubles per fruitless rejoin and stops at the cap, so a permanently-silent

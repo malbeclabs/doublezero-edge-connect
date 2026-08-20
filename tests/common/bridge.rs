@@ -53,6 +53,16 @@ impl Bridge {
             "--ws-bind",
             &ws_addr,
             "--subscription-gating-disable",
+            // Both off, because their defaults are *fixed* loopback ports (9099 and 9098) while
+            // `--ws-bind` is per test. `--test-threads=1` serializes within one test binary but not
+            // across them, and cargo runs the binaries concurrently, so any two spawned bridges —
+            // in `e2e`, `ws_input_arbitrage`, `phoenix_arbitrage` — race for those two ports and
+            // whichever loses reports a bind failure. No test here drives either surface; a test
+            // that wants one should pass its own bind on a port it owns.
+            "--api-bind",
+            "",
+            "--admin-bind",
+            "",
         ];
         args.extend_from_slice(extra_args);
         let mut child = Command::new(bin)

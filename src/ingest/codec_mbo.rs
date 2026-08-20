@@ -367,6 +367,19 @@ pub(crate) mod tests {
         b
     }
 
+    pub(crate) fn enc_order_cancel(o: &OrderCancel) -> Vec<u8> {
+        let mut b = vec![MSG_ORDER_CANCEL, sizes::ORDER_CANCEL, 0, 0];
+        b.extend_from_slice(&o.instrument_id.to_le_bytes());
+        b.extend_from_slice(&o.source_id.to_le_bytes());
+        b.push(o.reason);
+        b.push(0); // reserved -> per_instrument_seq @ body+8
+        b.extend_from_slice(&o.per_instrument_seq.to_le_bytes());
+        b.extend_from_slice(&o.order_id.to_le_bytes());
+        b.extend_from_slice(&o.ts.to_le_bytes());
+        b.extend_from_slice(&[0u8; 4]); // reserved -> 32
+        b
+    }
+
     pub(crate) fn enc_snapshot_begin(s: &SnapshotBegin) -> Vec<u8> {
         let mut b = vec![MSG_SNAPSHOT_BEGIN, sizes::SNAPSHOT_BEGIN, 0, 0];
         b.extend_from_slice(&s.instrument_id.to_le_bytes());

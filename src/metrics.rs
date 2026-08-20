@@ -192,6 +192,50 @@ pub struct Metrics {
     /// key is wire-supplied, so this is the forged-market backstop: an evicted market loses its replay
     /// bootstrap, and its next batch re-baselines the consumer from whatever it accumulates again.
     pub book_markets_evicted: IntCounterVec,
+    /// Removed order ids an MBO book forgot at its resurrection-guard cap. Non-zero reopens the
+    /// resurrection path for a copy arriving later than that many removals.
+    pub mbo_removed_evicted: IntCounter,
+    /// Order-level `book` events collapsed because another publisher delivered the same venue event
+    /// first. In steady state this is the whole stream of every publisher but the fastest, so it is a
+    /// throughput figure rather than a fault.
+    pub book_events_deduped: IntCounterVec,
+    /// Two publishers reported the same venue event with different resulting state: the identity
+    /// matched and the content did not, which is the signature of a book that has silently drifted.
+    /// Any sustained non-zero rate is a correctness alarm.
+    pub mbo_path_disagreement: IntCounterVec,
+    /// Order-level changes dropped because the market had already published that order as gone — a
+    /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
+    /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
+    pub book_resurrections_dropped: IntCounterVec,
+    /// Order-level markets forced to re-baseline because two arms claimed different resting state for
+    /// one order (`reason="disagreement"`).
+    pub mbo_forced_rebaselines: IntCounterVec,
+    /// Order-level changes refused because the batch carrying them is older than its channel's
+    /// retention window — a link returning with a backlog, or a forged replay. Expected to spike once
+    /// per recovery and sit at zero otherwise.
+    pub mbo_events_past_frontier: IntCounterVec,
+    /// Order-level changes refused because they are older than the last change the market published
+    /// for that same order. The lagging-copy case the retention window is too coarse to catch, and
+    /// what keeps a stale copy of a partially-filled order from reading as a size disagreement.
+    pub mbo_events_stale: IntCounterVec,
+    /// Batches whose venue stamp was too far ahead of their channel's newest to advance it. The batch
+    /// is still processed; a sustained rate means the forward bound is being hit by ordinary jitter
+    /// and `--arb-book-ts-jump-secs` is too tight.
+    pub mbo_frontier_bounded: IntCounterVec,
+    /// Channel frontiers re-seated from the batches actually arriving, because the newest stamp had
+    /// stopped moving. One per genuine gap, session restart or clock jump.
+    pub mbo_frontier_reseats: IntCounterVec,
+    /// Removed-order entries forgotten by the process-wide ceiling rather than by age. Non-zero means
+    /// the retention window is holding more than the host was sized for; the guard's reach is shorter
+    /// than the window claims for as long as it lasts.
+    pub mbo_guard_ceiling_evictions: IntCounter,
+    /// Removed orders the resurrection guard holds across every tracked market, against the
+    /// process-wide ceiling. The headroom to watch: it is readable long before the guard runs out of it.
+    pub mbo_guarded_tombstones: IntGauge,
+    /// The largest removed population any single market holds, against the same process-wide ceiling.
+    /// Alert on this rather than on the aggregate: one market walking away from the rest is flat
+    /// headroom on the sum. Unlabelled: the market is wire-supplied and there are up to 16,384 of them.
+    pub mbo_guarded_tombstones_max: IntGauge,
 
     // --- Market-by-price processor (per `venue`) ---
     /// One publisher-and-channel's books discarded on a frame-header `Reset Count` change.
@@ -238,6 +282,20 @@ pub struct Metrics {
     pub ws_rate_limited: IntCounter,
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
+
+    // --- Hyperliquid-compatible sink (off by default) ---
+    /// Currently-connected clients of the Hyperliquid-compatible sink.
+    pub hl_sink_clients: IntGauge,
+    /// Frames sent by the Hyperliquid-compatible sink, by `channel` (l2Book/l4Book/trades).
+    pub hl_sink_messages: IntCounterVec,
+    /// What the Hyperliquid-compatible sink did not send, by `reason`: `prepare_lagged` (the shared
+    /// stage fell behind the backbone — every client missed those batches), `client_lagged` (one slow
+    /// consumer), `ambiguous_market` (two markets share a `coin`, so one of them is not served).
+    pub hl_sink_dropped: IntCounterVec,
+    /// Market price-folds the Hyperliquid-compatible sink performed. The fold is O(resting orders)
+    /// and is the sink's dominant cost, so this is what says whether it is being paid once per batch
+    /// (correct) or once per client per batch.
+    pub hl_sink_folds: IntCounter,
 
     // --- Public WS input feeders (per-venue backstops; off by default) ---
     /// Feeder health per `venue`: 1 while the public WebSocket session is connected, 0 while
@@ -660,6 +718,107 @@ impl Metrics {
                  reached; an evicted market loses its replay bootstrap.",
                 &["venue"],
             ),
+            mbo_removed_evicted: counter(
+                &registry,
+                "dz_mbo_removed_evicted_total",
+                "Removed order ids forgotten because a book's resurrection guard hit its cap. \
+                 Non-zero means a very late duplicate could resurrect a dead order; sustained \
+                 non-zero means the cap is too small for this venue's churn.",
+            ),
+            book_events_deduped: counter_vec(
+                &registry,
+                "dz_book_events_deduped_total",
+                "Order-level book events collapsed because another publisher delivered the same \
+                 venue event first. In steady state this is the whole stream of every publisher but \
+                 the fastest, so it is a throughput figure, not a fault.",
+                &["venue"],
+            ),
+            book_resurrections_dropped: counter_vec(
+                &registry,
+                "dz_book_resurrections_dropped_total",
+                "Order-level changes dropped because the market had already published that order as \
+                 gone. A venue never reuses an order id, so each one is a lagging publisher's stale \
+                 copy refused before it could resurrect a dead order in every consumer's book — the \
+                 guard order-level racing rests on, working.",
+                &["venue"],
+            ),
+            mbo_path_disagreement: counter_vec(
+                &registry,
+                "dz_mbo_path_disagreement_total",
+                "Two publishers reported the same venue event with different resulting state. The \
+                 identity matched and the content did not, which is the signature of a book that has \
+                 silently drifted. Any sustained non-zero rate is a correctness alarm.",
+                &["venue"],
+            ),
+            mbo_forced_rebaselines: counter_vec(
+                &registry,
+                "dz_mbo_forced_rebaselines_total",
+                "Order-level markets withheld and re-baselined because the cross-publisher guard \
+                 could not answer. reason=disagreement: two arms claimed different resting state for \
+                 one order, so neither is known to be right. A sustained rate is the signal to \
+                 reconsider the per-publisher book model.",
+                &["venue", "reason"],
+            ),
+            mbo_events_past_frontier: counter_vec(
+                &registry,
+                "dz_mbo_events_past_frontier_total",
+                "Order-level changes refused because their batch is older than the channel's \
+                 retention window (--arb-book-retention-secs). A returning link's backlog, or a \
+                 replay of one: expected to spike once per recovery and to sit at zero otherwise.",
+                &["venue"],
+            ),
+            mbo_events_stale: counter_vec(
+                &registry,
+                "dz_mbo_events_stale_total",
+                "Order-level changes refused because they are older than the last change published \
+                 for that same order. The lagging-copy case the retention window is too coarse to \
+                 catch; in steady state this is the trailing publisher's stale copies of orders the \
+                 leader has since filled.",
+                &["venue"],
+            ),
+            mbo_frontier_bounded: counter_vec(
+                &registry,
+                "dz_mbo_frontier_bounded_total",
+                "Batches whose venue stamp did not advance their channel's frontier. The batch is \
+                 still processed either way. reason=\"jump\" is too far ahead of the channel's own \
+                 newest stamp and is answered by --arb-book-ts-jump-secs; a sustained rate there \
+                 means the bound is catching ordinary jitter. reason=\"anchor\" is too far ahead of \
+                 THIS HOST'S clock, which no flag widens — a sustained rate means either a publisher \
+                 stamping the wrong units, or this host's clock is behind the venue's, and the \
+                 second of those also makes dz_mbo_path_disagreement_total rise for a reason that has \
+                 nothing to do with the publishers disagreeing. Check the host clock before reading \
+                 that alarm.",
+                &["venue", "reason"],
+            ),
+            mbo_frontier_reseats: counter_vec(
+                &registry,
+                "dz_mbo_frontier_reseats_total",
+                "Channel frontiers re-seated from the batches actually arriving, after the newest \
+                 venue stamp stopped moving for --arb-book-reseat-secs. One per genuine gap, session \
+                 restart or publisher clock jump.",
+                &["venue"],
+            ),
+            mbo_guard_ceiling_evictions: counter(
+                &registry,
+                "dz_mbo_guard_ceiling_evictions_total",
+                "Removed-order entries forgotten by the process-wide ceiling rather than by age. \
+                 Non-zero means the retention window is holding more than the host was sized for, and \
+                 the resurrection guard's reach is shorter than the window claims until it clears.",
+            ),
+            mbo_guarded_tombstones: gauge(
+                &registry,
+                "dz_mbo_guarded_tombstones",
+                "Removed orders the cross-publisher resurrection guard is holding across every \
+                 tracked market, against a process-wide ceiling of 1048576. Sized by the retention \
+                 window and the venue's removal rate, not by how far the publishers lag each other.",
+            ),
+            mbo_guarded_tombstones_max: gauge(
+                &registry,
+                "dz_mbo_guarded_tombstones_max",
+                "The largest removed population any single order-level market holds, against the same \
+                 process-wide ceiling of 1048576. Alert on this rather than on the aggregate: one \
+                 market whose frontier is stuck is flat headroom on the sum.",
+            ),
             trades_no_id: counter_vec(
                 &registry,
                 "dz_trades_no_id_total",
@@ -721,6 +880,28 @@ impl Metrics {
                 &registry,
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
+            ),
+            hl_sink_clients: gauge(
+                &registry,
+                "dz_hl_sink_clients",
+                "Clients connected to the Hyperliquid-compatible sink",
+            ),
+            hl_sink_messages: counter_vec(
+                &registry,
+                "dz_hl_sink_messages_total",
+                "Frames sent by the Hyperliquid-compatible sink, by channel",
+                &["channel"],
+            ),
+            hl_sink_dropped: counter_vec(
+                &registry,
+                "dz_hl_sink_dropped_total",
+                "Frames the Hyperliquid-compatible sink did not send, by reason",
+                &["reason"],
+            ),
+            hl_sink_folds: counter(
+                &registry,
+                "dz_hl_sink_folds_total",
+                "Market price-folds performed by the Hyperliquid-compatible sink",
             ),
             ws_feeder_up: gauge_vec(
                 &registry,
@@ -950,6 +1131,36 @@ mod tests {
             .inc();
         m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
         m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
+        m.mbo_removed_evicted.inc();
+        m.book_events_deduped
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_path_disagreement
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.book_resurrections_dropped
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_forced_rebaselines
+            .with_label_values(&["HYPERLIQUID", "disagreement"])
+            .inc();
+        m.mbo_events_past_frontier
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_events_stale.with_label_values(&["HYPERLIQUID"]).inc();
+        m.mbo_frontier_bounded
+            .with_label_values(&["HYPERLIQUID", "jump"])
+            .inc();
+        m.mbo_frontier_bounded
+            .with_label_values(&["HYPERLIQUID", "anchor"])
+            .inc();
+        m.mbo_frontier_reseats
+            .with_label_values(&["HYPERLIQUID"])
+            .inc();
+        m.mbo_guard_ceiling_evictions.inc();
+        m.mbo_guarded_tombstones.set(7);
+        m.mbo_guarded_tombstones_max.set(3);
+        m.hl_sink_messages.with_label_values(&["l2Book"]).inc();
         m.shred_wins.with_label_values(&["239.0.0.1"]).inc();
         m.shred_lead_ns
             .with_label_values(&["239.0.0.1"])
@@ -997,6 +1208,20 @@ mod tests {
             "dz_arm_unmatched_trades_total",
             "dz_book_dropped_total",
             "dz_book_markets_evicted_total",
+            "dz_mbo_removed_evicted_total",
+            "dz_book_events_deduped_total",
+            "dz_mbo_path_disagreement_total",
+            "dz_book_resurrections_dropped_total",
+            "dz_mbo_forced_rebaselines_total",
+            "dz_mbo_events_past_frontier_total",
+            "dz_mbo_events_stale_total",
+            "dz_mbo_frontier_bounded_total",
+            "dz_mbo_frontier_reseats_total",
+            "dz_mbo_guard_ceiling_evictions_total",
+            "dz_mbo_guarded_tombstones",
+            "dz_mbo_guarded_tombstones_max",
+            "dz_hl_sink_clients",
+            "dz_hl_sink_messages_total",
             "dz_shred_wins_total",
             "dz_shred_lead_ns",
             "dz_history_unattributable_trades_total",
