@@ -82,13 +82,6 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
-    /// `venue` resolves to a Source ID, but not under this exact name — a legacy alias that only
-    /// ever reaches this loader, never the wire, so a document naming it would split every
-    /// downstream lookup that keys on the venue string.
-    NonCanonicalVenue {
-        venue: String,
-        canonical: &'static str,
-    },
     EmptyRoster {
         venue: String,
         category: String,
@@ -174,13 +167,6 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
                  status stream would go unrecorded"
-            ),
-            RegistryError::NonCanonicalVenue { venue, canonical } => write!(
-                f,
-                "venue `{venue}` resolves to Source ID for `{canonical}`, but is not that exact \
-                 name; only `{canonical}` ever reaches the wire, and every downstream lookup keyed \
-                 on the venue string (arbitration mode, channel-filter purge, `--feed` selection) \
-                 would silently miss"
             ),
             RegistryError::EmptyRoster { venue, category } => {
                 write!(f, "{venue}/{category}: derived roster is empty")
@@ -840,23 +826,11 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
         }
     }
     // A venue `source_id_of` does not resolve is dropped by `receiver::record_revealed`, so its
-    // `status` stream goes unrecorded — a row that ingests but never reports. But resolvability
-    // alone is not enough: `source_id_of` deliberately also accepts a legacy alias for one Source
-    // ID (see the codename constant in `sources.rs`), and only the canonical name ever reaches the
-    // wire. A document naming the alias would validate here and then split every place downstream
-    // that keys on the venue string — `main.rs` sets the arbitration mode under the alias while
-    // `arbiter.rs` reads it under the canonical name and falls back to `Coordinated`, dropping the
-    // tape gate; `forget_departing_channel`'s purge never matches; and `--feed <canonical>` selects
-    // nothing. So the venue must round-trip through the canonical name, not merely resolve.
-    match sources::source_id_of(&row.venue).and_then(sources::source_name) {
-        Some(canonical) if canonical == row.venue => {}
-        Some(canonical) => {
-            return Err(RegistryError::NonCanonicalVenue {
-                venue: row.venue.clone(),
-                canonical,
-            })
-        }
-        None => return Err(RegistryError::UnknownVenue(row.venue.clone())),
+    // `status` stream goes unrecorded — a row that ingests but never reports. Resolution is exact,
+    // so a near-miss spelling is refused here rather than splitting every downstream lookup that
+    // keys on the venue string (arbitration mode, the channel-filter purge, `--feed` selection).
+    if sources::source_id_of(&row.venue).is_none() {
+        return Err(RegistryError::UnknownVenue(row.venue.clone()));
     }
 
     // Row-level: which mirror scheme (if any) a deployment runs is a property of the feed, not of
@@ -1720,22 +1694,18 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Venue canonicality
+    // Venue resolution
     // ---------------------------------------------------------------------------------------
 
-    /// `source_id_of` deliberately still resolves the legacy pre-launch codename for one Source ID
-    /// (only its registry name is ever emitted), so a document naming the alias specifically —
-    /// not merely an unresolvable venue — must be what this test exercises; a wrong-but-unresolvable
-    /// venue would already be caught by `UnknownVenue` and would pass against the old code too.
+    /// The retired pre-launch codename now resolves to nothing, so a document still naming it is
+    /// refused outright rather than validating and then splitting every downstream lookup that keys
+    /// on the venue string.
     #[test]
-    fn a_legacy_venue_alias_is_fatal() {
+    fn the_retired_venue_codename_is_fatal() {
         let row = PERPS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"LASHAY""#);
         assert!(matches!(
             build(&doc_with(&row), "test"),
-            Err(RegistryError::NonCanonicalVenue {
-                canonical: "KALSHI",
-                ..
-            })
+            Err(RegistryError::UnknownVenue(v)) if v == "LASHAY"
         ));
     }
 

@@ -1524,7 +1524,7 @@ mod tests {
             .iter()
             .find(|f| f.category == "sports")
             .expect("the built-in registry has a sports row");
-        let filter = ChannelFilter::parse("lashay-4=10,11").unwrap();
+        let filter = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
 
         let narrowed = test_reconciler_with_filter(vec![sports], filter);
         let mut ports: Vec<u16> = narrowed
@@ -1544,7 +1544,7 @@ mod tests {
         );
     }
 
-    /// The real "sports" row (group code `lashay-4`), for tests that need genuine channel-filter
+    /// The real "sports" row (group code `edge-kalshi-sports-mbp`), for tests that need genuine channel-filter
     /// narrowing — `ChannelFilter::parse` validates against the loaded registry, so a custom `Feed`
     /// with a made-up code cannot be narrowed at all.
     fn sports_row() -> Feed {
@@ -1648,7 +1648,7 @@ mod tests {
     /// `active` entirely, is what still catches it.
     ///
     /// Drives the real `tick()` across two ticks with a genuinely **narrowing channel filter** on
-    /// the real `lashay-4` sports row (`ChannelFilter::parse` validates against the loaded
+    /// the real `edge-kalshi-sports-mbp` sports row (`ChannelFilter::parse` validates against the loaded
     /// registry, so a custom `Feed`'s made-up code cannot be narrowed — see `sports_row`). Channel
     /// 10 departs; channel 11 stays admitted, so `cfg.enabled` is never emptied and the row stays
     /// resolvable.
@@ -1656,7 +1656,7 @@ mod tests {
     async fn a_self_exited_receivers_channel_is_still_forgotten_when_it_leaves_the_desired_set() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
 
@@ -1703,7 +1703,7 @@ mod tests {
         // Tick 2: narrow the channel filter to channel 11 only. `active` no longer holds channel
         // 10's key at all, so a diff against `active` (the pre-fix behaviour) would find nothing
         // to forget.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
         r.tick().await;
 
         assert!(
@@ -1919,7 +1919,7 @@ mod tests {
     async fn a_departed_channels_product_is_invisible_to_the_query_surface() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
 
         r.cfg.instruments.lock().unwrap().insert(
@@ -1997,7 +1997,7 @@ mod tests {
         // itself is now deferred until the aborted receiver is confirmed stopped (`drain_departed`);
         // drive `MAX_DRAIN_TICKS` further ticks so the bound forces it regardless of whether this
         // test's spawned receiver ever gets polled to completion on its own.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
         r.tick().await;
         for _ in 0..MAX_DRAIN_TICKS {
             r.tick().await;
@@ -2015,7 +2015,7 @@ mod tests {
     }
 
     /// N1 + N2 + N3, the deliverable: drives the real `tick()` (not a hand-called helper) across two
-    /// ticks with a genuinely **narrowing channel filter** (the real `lashay-4` sports row, via
+    /// ticks with a genuinely **narrowing channel filter** (the real `edge-kalshi-sports-mbp` sports row, via
     /// `ChannelFilter::parse`), seeding all three maps a departure purges — the catalog, the book
     /// (through the real arbiter, not a hand-built `BookReplay`), and history.
     ///
@@ -2037,7 +2037,7 @@ mod tests {
         let feed = sports_row();
         let mut r = test_reconciler_with_filter(
             vec![feed],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
         let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
@@ -2095,7 +2095,7 @@ mod tests {
             .is_empty());
 
         // Narrow the channel filter: channel 10 departs, channel 11 stays admitted.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
 
         // Tick 2: the real `tick()` aborts the receiver and queues it in `draining`. Its spawned
         // task is never polled in this harness, so it never reports finished on its own; drive
@@ -2145,7 +2145,7 @@ mod tests {
     async fn a_subscription_loss_stops_the_receiver_without_purging_its_state() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
         let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
@@ -2258,7 +2258,7 @@ mod tests {
     async fn a_write_that_lands_after_abort_is_still_purged_once_the_receiver_finishes() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
         let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
@@ -2288,7 +2288,7 @@ mod tests {
 
         // Narrow the filter: channel 10 departs. Tick 2 aborts the stand-in and queues it in
         // `draining` rather than purging right away.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
         r.tick().await;
         assert!(
             !r.active.contains_key(&key10),

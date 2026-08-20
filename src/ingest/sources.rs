@@ -28,27 +28,20 @@ pub fn source_name(source_id: u16) -> Option<&'static str> {
     }
 }
 
-/// Source ID 3's registry name, and the pre-launch codename the same row also answers to.
-///
-/// Only [`KALSHI`] is ever emitted — it is what `venue`/`source` carry on the wire and what every
-/// `venue=` metric label value holds. [`KALSHI_CODENAME`] is accepted on **input** alone: it is
-/// still what the DoubleZero ledger registers the groups under (the `code` values in `feeds.rs`),
-/// so operator- and ledger-facing strings keep resolving to this ID instead of falling through to
-/// `None`. Drop the alias once the ledger rename lands and nothing feeds the old name in.
+/// Source ID 3's registry name. The pre-launch codename it used to also answer to is gone: the
+/// ledger re-registered the groups under their `edge-kalshi-*` codes, so nothing feeds the old name
+/// in on input either.
 const KALSHI: &str = "KALSHI";
-const KALSHI_CODENAME: &str = "LASHAY";
 
-/// Map a registry source *name* back to its `Source ID`.
+/// Map a registry source *name* back to its `Source ID`, exactly — the inverse of [`source_name`].
 ///
-/// Unlike [`source_name`], this covers every name an assigned row answers to, not just the one that
-/// is emitted — see [`KALSHI_CODENAME`]. This is what lets a resolved source carry a numeric identity
-/// a consumer can join against the registry, and what `receiver::record_revealed` tests a wire venue
-/// against before recording it.
+/// This is what lets a resolved source carry a numeric identity a consumer can join against the
+/// registry, and what `receiver::record_revealed` tests a wire venue against before recording it.
 pub fn source_id_of(source: &str) -> Option<u16> {
     match source {
         "HYPERLIQUID" => Some(1),
         "PHOENIX" => Some(2),
-        KALSHI | KALSHI_CODENAME => Some(3),
+        KALSHI => Some(3),
         _ => None,
     }
 }
@@ -159,18 +152,13 @@ mod tests {
         assert_eq!(source_label(3), KALSHI);
     }
 
-    /// ID 3 answers to its pre-launch codename as well as its registry name, so operator- and
-    /// ledger-facing strings keep resolving to the same ID rather than falling through to `None`.
-    /// Only the registry name is ever *emitted*.
+    /// The pre-launch codename resolves to nothing now that the ledger no longer serves it, so a
+    /// document or operator string still carrying it is refused rather than silently accepted under
+    /// a second name for the same ID.
     #[test]
-    fn the_id_3_codename_resolves_to_the_same_id() {
+    fn only_the_registry_name_resolves_to_id_3() {
         assert_eq!(source_id_of(KALSHI), Some(3));
-        assert_eq!(source_id_of(KALSHI_CODENAME), Some(3));
-        assert_eq!(
-            source_name(3),
-            Some(KALSHI),
-            "the codename is accepted on input, never the emitted name"
-        );
+        assert_eq!(source_id_of("LASHAY"), None);
     }
 
     /// The public entry point's unregistered branch: read-lock miss, write-lock re-check,

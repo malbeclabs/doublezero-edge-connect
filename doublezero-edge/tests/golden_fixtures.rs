@@ -132,7 +132,7 @@ fn status_table_lists_venues_and_the_history_summary() {
 fn status_table_shows_the_channels_block_with_the_servers_label() {
     let body = fixture("status.json");
     let out = render::render_table(Endpoint::Status, &body).unwrap();
-    assert!(out.contains("lashay-4"), "{out}");
+    assert!(out.contains("edge-kalshi-sports-mbp"), "{out}");
     assert!(out.contains("sports.nfl"), "{out}");
     assert!(out.contains("412"), "{out}");
     assert!(

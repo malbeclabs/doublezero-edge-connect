@@ -24,7 +24,7 @@
 //!
 //! Two properties of the syntax are deliberate:
 //!
-//! - **Keyed by group code, never global.** `--channels lashay-4=10,11` narrows that feed and no
+//! - **Keyed by group code, never global.** `--channels edge-kalshi-sports-mbp=10,11` narrows that feed and no
 //!   other; an unmentioned feed ingests every channel. One global flag would let an operator filter
 //!   down to a league and silently half-blind an unrelated mirrored feed, since the two planes give
 //!   `channel_id` different meanings.
@@ -364,9 +364,9 @@ mod tests {
     #[test]
     fn an_empty_filter_admits_every_channel() {
         let f = ChannelFilter::parse("").expect("empty is valid");
-        assert!(f.admits("lashay-4", 10));
-        assert!(f.admits("lashay-4", 49));
-        assert!(f.admits("lashay-1", 2));
+        assert!(f.admits("edge-kalshi-sports-mbp", 10));
+        assert!(f.admits("edge-kalshi-sports-mbp", 49));
+        assert!(f.admits("edge-kalshi-perps-tob", 2));
         assert!(f.is_empty());
     }
 
@@ -374,11 +374,17 @@ mod tests {
     /// the two planes give `channel_id` different meanings and a global filter would conflate them.
     #[test]
     fn a_filter_on_one_feed_does_not_narrow_another() {
-        let f = ChannelFilter::parse("lashay-4=10,11").unwrap();
-        assert!(f.admits("lashay-4", 10));
-        assert!(!f.admits("lashay-4", 12));
-        assert!(f.admits("lashay-1", 1), "an unmentioned feed was narrowed");
-        assert!(f.admits("lashay-1", 2), "an unmentioned feed was narrowed");
+        let f = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
+        assert!(f.admits("edge-kalshi-sports-mbp", 10));
+        assert!(!f.admits("edge-kalshi-sports-mbp", 12));
+        assert!(
+            f.admits("edge-kalshi-perps-tob", 1),
+            "an unmentioned feed was narrowed"
+        );
+        assert!(
+            f.admits("edge-kalshi-perps-tob", 2),
+            "an unmentioned feed was narrowed"
+        );
     }
 
     /// A selected sports channel binds its socket and an excluded one binds nothing. Asserting on
@@ -387,7 +393,7 @@ mod tests {
     #[test]
     fn an_excluded_sports_channel_binds_no_socket() {
         let feed = feeds().iter().find(|f| f.category == "sports").unwrap();
-        let f = ChannelFilter::parse("lashay-4=10,11").unwrap();
+        let f = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
         let ports: Vec<u16> = f
             .publishers_for(feed)
             .iter()
@@ -413,7 +419,7 @@ mod tests {
     /// no publisher sends to, which reads as a dead feed rather than as a typo.
     #[test]
     fn an_id_outside_the_roster_is_rejected() {
-        let err = ChannelFilter::parse("lashay-4=10,63").unwrap_err();
+        let err = ChannelFilter::parse("edge-kalshi-sports-mbp=10,63").unwrap_err();
         assert!(
             matches!(err, FilterError::UnknownChannel { id: 63, .. }),
             "wrong variant: {err:?}"
@@ -427,9 +433,9 @@ mod tests {
     /// An unknown group code is a startup error for the same reason — it silently filters nothing.
     #[test]
     fn an_unknown_group_code_is_rejected() {
-        let err = ChannelFilter::parse("lashay-9=10").unwrap_err();
+        let err = ChannelFilter::parse("edge-kalshi-nonesuch=10").unwrap_err();
         assert!(
-            matches!(err, FilterError::UnknownCode { ref code, .. } if code == "lashay-9"),
+            matches!(err, FilterError::UnknownCode { ref code, .. } if code == "edge-kalshi-nonesuch"),
             "wrong variant: {err:?}"
         );
     }
@@ -442,13 +448,16 @@ mod tests {
     /// were wrong".
     #[test]
     fn narrowing_a_flat_feed_is_refused() {
-        let err = ChannelFilter::parse("lashay-1=2").unwrap_err();
+        let err = ChannelFilter::parse("edge-kalshi-perps-tob=2").unwrap_err();
         assert!(
-            matches!(err, FilterError::FlatRow { ref code, .. } if code == "lashay-1"),
+            matches!(err, FilterError::FlatRow { ref code, .. } if code == "edge-kalshi-perps-tob"),
             "wrong variant: {err:?}"
         );
         let msg = format!("{err}");
-        assert!(msg.contains("lashay-1"), "must name the feed: {msg}");
+        assert!(
+            msg.contains("edge-kalshi-perps-tob"),
+            "must name the feed: {msg}"
+        );
         assert!(msg.contains("mirrors"), "must say why: {msg}");
     }
 
@@ -607,11 +616,11 @@ mod tests {
     /// syntax behaving as two.
     #[test]
     fn whitespace_and_trailing_separators_are_tolerated() {
-        let f = ChannelFilter::parse(" lashay-4 = 10, 11 ; ").unwrap();
-        assert!(f.admits("lashay-4", 11));
-        assert!(!f.admits("lashay-4", 12));
+        let f = ChannelFilter::parse(" edge-kalshi-sports-mbp = 10, 11 ; ").unwrap();
+        assert!(f.admits("edge-kalshi-sports-mbp", 11));
+        assert!(!f.admits("edge-kalshi-sports-mbp", 12));
 
-        let trailing_comma = ChannelFilter::parse("lashay-4=10,11,").unwrap();
+        let trailing_comma = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11,").unwrap();
         assert_eq!(trailing_comma.summary(), f.summary());
     }
 
@@ -621,15 +630,15 @@ mod tests {
     #[test]
     fn a_clause_with_no_ids_is_rejected() {
         assert!(matches!(
-            ChannelFilter::parse("lashay-4=,"),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=,"),
             Err(FilterError::EmptySelection { .. })
         ));
         assert!(matches!(
-            ChannelFilter::parse("lashay-4="),
+            ChannelFilter::parse("edge-kalshi-sports-mbp="),
             Err(FilterError::EmptySelection { .. })
         ));
         assert!(matches!(
-            ChannelFilter::parse("lashay-4"),
+            ChannelFilter::parse("edge-kalshi-sports-mbp"),
             Err(FilterError::MissingIds { .. })
         ));
     }
@@ -638,7 +647,7 @@ mod tests {
     /// accepting one would mean mirroring a roster that has already moved once upstream.
     #[test]
     fn a_channel_name_is_rejected_as_an_id() {
-        let err = ChannelFilter::parse("lashay-4=nfl").unwrap_err();
+        let err = ChannelFilter::parse("edge-kalshi-sports-mbp=nfl").unwrap_err();
         assert!(
             matches!(err, FilterError::BadId { ref text, .. } if text == "nfl"),
             "wrong variant: {err:?}"
@@ -650,7 +659,7 @@ mod tests {
     #[test]
     fn a_repeated_code_is_rejected() {
         assert!(matches!(
-            ChannelFilter::parse("lashay-4=10;lashay-4=11"),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10;edge-kalshi-sports-mbp=11"),
             Err(FilterError::RepeatedCode { .. })
         ));
     }
@@ -659,7 +668,10 @@ mod tests {
     /// market missing" is answerable from the log alone.
     #[test]
     fn the_summary_names_the_narrowing() {
-        let f = ChannelFilter::parse("lashay-4=10,11").unwrap();
-        assert_eq!(f.summary(), vec!["lashay-4=2 of 31".to_string()]);
+        let f = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
+        assert_eq!(
+            f.summary(),
+            vec!["edge-kalshi-sports-mbp=2 of 31".to_string()]
+        );
     }
 }

@@ -3654,7 +3654,7 @@ mod tests {
     // /v1/status: history, channels and process blocks (Task 6)
     // -----------------------------------------------------------------------------------------
 
-    /// The real built-in "sports" row (group code `lashay-4`) — a genuinely derived, multi-channel
+    /// The real built-in "sports" row (group code `edge-kalshi-sports-mbp`) — a genuinely derived, multi-channel
     /// row, matching `sinks::admin`'s and `ingest::channel_filter`'s own tests. Using the real row (rather
     /// than a hand-built one) is what lets a real `ChannelFilter::parse` spec actually narrow it.
     fn sports_row() -> Feed {
@@ -3760,7 +3760,9 @@ mod tests {
         let row = sports_row();
         // Admits channels 10 and 11 of the sports row's 31-channel roster; every other channel
         // (12 included) is excluded by the filter.
-        let filter = Arc::new(Mutex::new(ChannelFilter::parse("lashay-4=10,11").unwrap()));
+        let filter = Arc::new(Mutex::new(
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
+        ));
         let enabled = vec![row];
 
         // Channel 10: admitted AND a receiver has genuinely registered up.
@@ -3817,7 +3819,7 @@ mod tests {
         let row_json = &rows[0];
         assert_eq!(row_json["venue"], "KALSHI");
         assert_eq!(row_json["category"], "sports");
-        assert_eq!(row_json["code"], "lashay-4");
+        assert_eq!(row_json["code"], "edge-kalshi-sports-mbp");
 
         let channels = row_json["channels"].as_array().unwrap();
         let find = |id: u64| -> &Value {

@@ -353,7 +353,7 @@ mod tests {
             .iter()
             .find(|f| f.venue == "KALSHI" && f.category == "sports")
             .expect("no sports row");
-        assert_eq!(row.code, "lashay-4");
+        assert_eq!(row.code, "edge-kalshi-sports-mbp");
         assert_eq!(row.group, Ipv4Addr::new(233, 84, 178, 20));
         assert_eq!(row.kind, FeedKind::MarketByPrice);
         assert_eq!(row.publishers.len(), 31);
@@ -438,9 +438,9 @@ mod tests {
                     "tiredsolid"
                 }
                 ("PHOENIX", "spot", FeedKind::TopOfBook) => "scottsdale",
-                ("KALSHI", "perps", FeedKind::TopOfBook) => "lashay-1",
-                ("KALSHI", "perps", FeedKind::MarketByPrice) => "lashay-2",
-                ("KALSHI", "sports", FeedKind::MarketByPrice) => "lashay-4",
+                ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
+                ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
+                ("KALSHI", "sports", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
@@ -631,15 +631,15 @@ mod tests {
     }
 
     /// Within a publisher's block the offsets follow the publisher implementation: `+1`/`+2` on every
-    /// Hyperliquid and Phoenix block and on `lashay-1`, `+10000`/`+20000` on `lashay-2` (and on the
+    /// Hyperliquid and Phoenix block and on `edge-kalshi-perps-tob`, `+10000`/`+20000` on `edge-kalshi-perps-mbp` (and on the
     /// sports market-by-price feed: 33010/43010/53010). The base port is free-form since v0.7, so this
     /// spacing is the only structural rule left — it is what an unseen block may be derived from
     /// (10901/10903 were derived this way from 10902), and a row that breaks *both* schemes is a
     /// transcription error rather than a new layout.
     ///
     /// Scoped **per row**, not per venue: Lashay's two rows legitimately use different schemes, and
-    /// framing it by scheme rather than by a venue carve-out is what keeps `lashay-3`/`lashay-4` from
-    /// re-tripping it. Lashay's exact blocks are pinned by `the_lashay_rows_expand_consistently_with_the_document`, so
+    /// framing it by scheme rather than by a venue carve-out is what keeps a later Kalshi row from
+    /// re-tripping it. Lashay's exact blocks are pinned by `the_kalshi_rows_expand_consistently_with_the_document`, so
     /// widening this one loses nothing.
     #[test]
     fn publisher_blocks_use_a_known_layout() {
@@ -690,7 +690,7 @@ mod tests {
     /// unit test cannot reach the wire, so this one is deliberately modest about what it pins:
     /// document → expansion consistency, nothing more.
     #[test]
-    fn the_lashay_rows_expand_consistently_with_the_document() {
+    fn the_kalshi_rows_expand_consistently_with_the_document() {
         // Scoped by category as well as kind: the venue now carries two market-by-price rows on
         // disjoint universes, so `find` on the kind alone would silently pick whichever the
         // document happens to list first.
@@ -701,7 +701,7 @@ mod tests {
         };
 
         let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
-        assert_eq!(tob.code, "lashay-1");
+        assert_eq!(tob.code, "edge-kalshi-perps-tob");
         assert_eq!(tob.group, Ipv4Addr::new(233, 84, 178, 3));
         assert_eq!(tob.publishers.len(), 1);
         assert_eq!(tob.publishers[0].ports.mktdata(), 31000);
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(tob.publishers[0].ports.snapshot(), None);
 
         let mbp = row(FeedKind::MarketByPrice).expect("Lashay market-by-price row");
-        assert_eq!(mbp.code, "lashay-2");
+        assert_eq!(mbp.code, "edge-kalshi-perps-mbp");
         assert_eq!(mbp.group, Ipv4Addr::new(233, 84, 178, 4));
         assert_eq!(mbp.publishers.len(), 1);
         assert_eq!(mbp.publishers[0].ports.mktdata(), 32000);

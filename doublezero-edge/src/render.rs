@@ -555,7 +555,7 @@ mod tests {
             },
             "channels": {
                 "rows": [{
-                    "venue": "KALSHI", "category": "sports", "code": "lashay-4", "excluded": 29,
+                    "venue": "KALSHI", "category": "sports", "code": "edge-kalshi-sports-mbp", "excluded": 29,
                     "channels": [
                         {"channel": 10, "allowed": true, "bound": true, "products": 2},
                         {"channel": 11, "allowed": true, "bound": false, "products": 0},

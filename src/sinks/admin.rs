@@ -319,7 +319,7 @@ fn get_channels(state: &AdminState) -> Response {
 ///   channel filter on what looks like an unrelated typo or a library defaulting to a body.
 /// - **A non-zero `Content-Length`** — `400 unsupported_request_body`, naming the query-parameter
 ///   form in the remedy. A body is otherwise silently ignored (this scaffolding never reads one),
-///   which is exactly how `curl -XPOST -d 'lashay-4=10'` or `requests.post(url, data=...)` would
+///   which is exactly how `curl -XPOST -d 'edge-kalshi-sports-mbp=10'` or `requests.post(url, data=...)` would
 ///   quietly widen the channel filter to admit-everything while looking, to the caller, like it
 ///   worked.
 fn post_channels(state: &AdminState, req: &Request) -> Response {
@@ -333,7 +333,7 @@ fn post_channels(state: &AdminState, req: &Request) -> Response {
                 "error": "missing_channels_parameter",
                 "message": "No `channels` query parameter was given.",
                 "remediation": "Pass the channel filter spec as a query parameter, e.g. \
-                    POST /admin/channels?channels=lashay-4=10,11. An empty value \
+                    POST /admin/channels?channels=edge-kalshi-sports-mbp=10,11. An empty value \
                     (?channels=) is how you explicitly clear the channel filter.",
             }),
         );
@@ -423,7 +423,7 @@ mod tests {
 
     use super::*;
 
-    /// The real built-in "sports" feed (group code `lashay-4`) — a genuinely derived,
+    /// The real built-in "sports" feed (group code `edge-kalshi-sports-mbp`) — a genuinely derived,
     /// multi-channel feed already used the same way by `ingest::channel_filter`'s and
     /// `ingest::reconcile`'s own tests. `ChannelFilter::parse` validates against the loaded registry
     /// ([`ChannelFilter::parse`]'s own docs), so a fixture built from an ad hoc `Feed` (an unknown
@@ -520,16 +520,16 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=10")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10")])
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
 
         let narrowed = crate::model::lock(&filter).clone();
-        assert!(narrowed.admits("lashay-4", 10));
+        assert!(narrowed.admits("edge-kalshi-sports-mbp", 10));
         assert!(
-            !narrowed.admits("lashay-4", 11),
+            !narrowed.admits("edge-kalshi-sports-mbp", 11),
             "the POST must narrow the live channel filter"
         );
 
@@ -560,7 +560,7 @@ mod tests {
         let setup = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=10")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10")])
             .send()
             .await
             .unwrap();
@@ -570,13 +570,16 @@ mod tests {
             "fixture sanity: the setup POST must apply"
         );
         let before = crate::model::lock(&filter).clone();
-        assert!(before.admits("lashay-4", 10) && !before.admits("lashay-4", 11));
+        assert!(
+            before.admits("edge-kalshi-sports-mbp", 10)
+                && !before.admits("edge-kalshi-sports-mbp", 11)
+        );
 
         // The attack this module defends against: a POST with a `channels` query parameter but no
         // header at all — precisely what a browser `<form action=... method=POST>` produces.
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
-            .query(&[("channels", "lashay-4=11")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=11")])
             .send()
             .await
             .unwrap();
@@ -591,8 +594,8 @@ mod tests {
             "a POST missing the required header must leave the prior channel filter untouched"
         );
         assert!(
-            after.admits("lashay-4", 10) && !after.admits("lashay-4", 11),
-            "the filter must still be the one the setup POST applied, not the attempted `lashay-4=11`"
+            after.admits("edge-kalshi-sports-mbp", 10) && !after.admits("edge-kalshi-sports-mbp", 11),
+            "the filter must still be the one the setup POST applied, not the attempted `edge-kalshi-sports-mbp=11`"
         );
     }
 
@@ -607,12 +610,12 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "anything-at-all")
-            .query(&[("channels", "lashay-4=10")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10")])
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert!(crate::model::lock(&filter).admits("lashay-4", 10));
+        assert!(crate::model::lock(&filter).admits("edge-kalshi-sports-mbp", 10));
     }
 
     /// An invalid spec is a `400` and the channel filter is left exactly as it was — never a
@@ -631,7 +634,7 @@ mod tests {
         let setup = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=10,11")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10,11")])
             .send()
             .await
             .unwrap();
@@ -641,13 +644,16 @@ mod tests {
             "fixture sanity: the setup POST must apply"
         );
         let before = crate::model::lock(&filter).clone();
-        assert!(before.admits("lashay-4", 10) && before.admits("lashay-4", 11));
-        assert!(!before.admits("lashay-4", 12));
+        assert!(
+            before.admits("edge-kalshi-sports-mbp", 10)
+                && before.admits("edge-kalshi-sports-mbp", 11)
+        );
+        assert!(!before.admits("edge-kalshi-sports-mbp", 12));
 
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=250")]) // 250 is well outside the 31-channel roster
+            .query(&[("channels", "edge-kalshi-sports-mbp=250")]) // 250 is well outside the 31-channel roster
             .send()
             .await
             .unwrap();
@@ -661,8 +667,11 @@ mod tests {
             before.summary(),
             "a rejected spec must leave the prior non-empty channel filter exactly as it was"
         );
-        assert!(after.admits("lashay-4", 10) && after.admits("lashay-4", 11));
-        assert!(!after.admits("lashay-4", 12));
+        assert!(
+            after.admits("edge-kalshi-sports-mbp", 10)
+                && after.admits("edge-kalshi-sports-mbp", 11)
+        );
+        assert!(!after.admits("edge-kalshi-sports-mbp", 12));
     }
 
     /// Findings 3/4: a channel filter that is individually valid against the whole registry (11 is
@@ -681,7 +690,7 @@ mod tests {
         let setup = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=10")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10")])
             .send()
             .await
             .unwrap();
@@ -695,7 +704,7 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=11")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=11")])
             .send()
             .await
             .unwrap();
@@ -710,7 +719,7 @@ mod tests {
             "a filter that would empty an enabled feed must leave the prior filter in force"
         );
         assert!(
-            after.admits("lashay-4", 10),
+            after.admits("edge-kalshi-sports-mbp", 10),
             "the prior filter's admission must be unchanged"
         );
     }
@@ -728,7 +737,7 @@ mod tests {
         reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=10")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10")])
             .send()
             .await
             .unwrap();
@@ -764,7 +773,7 @@ mod tests {
         reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "lashay-4=10")])
+            .query(&[("channels", "edge-kalshi-sports-mbp=10")])
             .send()
             .await
             .unwrap();
@@ -774,7 +783,7 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .body("lashay-4=11")
+            .body("edge-kalshi-sports-mbp=11")
             .send()
             .await
             .unwrap();

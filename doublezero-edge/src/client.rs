@@ -409,7 +409,11 @@ mod tests {
     fn a_channels_post_sends_no_body_and_percent_encodes_the_query() {
         let (base, rx) = capture_one_request();
         let client = reqwest::blocking::Client::new();
-        let outcome = admin_post_channels(&client, &base, "lashay-4=10,11;lashay-2=5");
+        let outcome = admin_post_channels(
+            &client,
+            &base,
+            "edge-kalshi-sports-mbp=10,11;edge-kalshi-perps-mbp=5",
+        );
         assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
 
         let raw = rx

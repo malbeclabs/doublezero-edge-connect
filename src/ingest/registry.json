@@ -149,26 +149,26 @@
     {
       "venue": "KALSHI",
       "category": "perps",
-      "code": "lashay-1",
+      "code": "edge-kalshi-perps-tob",
       "kind": "TopOfBook",
       "group": "233.84.178.3",
       "emit_trades": true,
       "arbitration": "Sticky",
       "publisher_offset": 100,
       "notes": [
-        "Perps, two separately-gated groups: lashay-1 carries top of book and lashay-2 the",
-        "market-by-price book. Both claim the tape - a host holding only lashay-2 must still serve",
+        "Perps, two separately-gated groups: edge-kalshi-perps-tob carries top of book and edge-kalshi-perps-mbp the",
+        "market-by-price book. Both claim the tape - a host holding only edge-kalshi-perps-mbp must still serve",
         "`trade` - and which of them prints is the reconciler's runtime decision.",
         "",
         "`code` is transcribed verbatim from what the DoubleZero ledger registers today, never from",
         "what reads better here: it is matched against what `doublezero status --json` reports, so a",
-        "prettier code matches nothing and activates nothing. These carry the venue's pre-launch",
-        "codename and are scheduled to be re-registered as edge-kalshi-{perps,sports}-{tob,mbp};",
-        "update these rows in the same change that lands the ledger rename, never before it.",
+        "prettier code matches nothing and activates nothing. All three Kalshi codes were moved to",
+        "the edge-kalshi-{perps,sports}-{tob,mbp} strings the ledger rename registered; until that",
+        "edit the three rows had been dark since the rename, with no warning and no failed bind.",
         "",
         "`venue` is independent of `code` - it is the source-registry name for the Source ID these",
-        "rows carry, and sources::source_id_of also accepts the codename, so ledger-facing strings",
-        "keep resolving while only the registry name is ever emitted.",
+        "rows carry. The pre-launch codename is no longer accepted on input anywhere: nothing feeds",
+        "it in now that the ledger strings have moved.",
         "",
         "Both groups are live on testnet and mainnet as of 2026-08-07; a permanently-zero",
         "dz_receiver_up here means a transcription slip, not a quiet feed.",
@@ -200,7 +200,7 @@
     {
       "venue": "KALSHI",
       "category": "perps",
-      "code": "lashay-2",
+      "code": "edge-kalshi-perps-mbp",
       "kind": "MarketByPrice",
       "group": "233.84.178.4",
       "emit_trades": true,
@@ -210,8 +210,8 @@
         "The market-by-price block is spaced +10000 / +20000, not the +1 / +2 the Hyperliquid",
         "publisher role uses.",
         "",
-        "Mirrored exactly like the lashay-1 top-of-book sibling: a second publisher on the same",
-        "port block, channel_id raised by 100. See lashay-1's MIRROR note."
+        "Mirrored exactly like the edge-kalshi-perps-tob top-of-book sibling: a second publisher on the same",
+        "port block, channel_id raised by 100. See edge-kalshi-perps-tob's MIRROR note."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 32000, "refdata": 42000, "snapshot": 52000 }]
@@ -220,7 +220,7 @@
     {
       "venue": "KALSHI",
       "category": "sports",
-      "code": "lashay-4",
+      "code": "edge-kalshi-sports-mbp",
       "kind": "MarketByPrice",
       "group": "233.84.178.20",
       "emit_trades": true,

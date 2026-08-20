@@ -12,7 +12,7 @@ sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it both as full-state `depth` and as the order-level incremental **`order_book`**, carrying
 the venue's own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
-reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
+reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `edge-kalshi-perps-mbp`
 row selects it, on a group that is live). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
 WebSocket output, fully specified in
@@ -186,22 +186,22 @@ Modules are grouped by role under `src/`:
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
   the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
   venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
-  ride separate groups with separate codes. The two **Lashay** perps rows (`lashay-1` TOB
-  `233.84.178.3:31000/41000`, `lashay-2` MBP `233.84.178.4:32000/42000/52000` — **all three rows'
+  ride separate groups with separate codes. The two **Lashay** perps rows (`edge-kalshi-perps-tob` TOB
+  `233.84.178.3:31000/41000`, `edge-kalshi-perps-mbp` MBP `233.84.178.4:32000/42000/52000` — **all three rows'
   ports confirmed against live captures on 2026-08-09**, after all three were found misprovisioned
   (see the port-provenance note in `registry.json`) — both `Sticky`, both
   claiming the tape) are exactly that case. Both groups are **live and activated** (testnet and
   mainnet, confirmed 2026-08-07), so a host subscribed to either code activates the row. ⚠️ A `code`
   that does not match its live group fails **silently** — no warning, no failed bind, just a
   permanently-zero `dz_receiver_up`. ⚠️ **No test can catch that**, and one used to claim it did:
-  `feeds::tests::the_lashay_rows_expand_consistently_with_the_document` (formerly named
+  `feeds::tests::the_kalshi_rows_expand_consistently_with_the_document` (formerly named
   `..._match_the_deployment`) asserts the document against literals written beside it — the code
   agreeing with itself. It catches a later edit that moves a value, never a value that was wrong when
   written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
   sibling row's block, with the build green throughout. **The external check is a packet capture**, and
   the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
   port moves. A third **Lashay** row
-  (`lashay-4`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
+  (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
   own deployment inventory on 2026-08-09. `33000`/`43000` is the **top-of-book sibling's** base, and a
@@ -215,7 +215,7 @@ Modules are grouped by role under `src/`:
   only thing that separates them. Each expanded `FeedPublisher` records the `channel` it came from
   (`None` on an explicit block) — the fact the channel filter below is built on.
 - **`ingest/channel_filter.rs`** — the **channel filter**: which channels of an activated feed this
-  process decodes (`--channels`/`DZ_CHANNELS`, e.g. `lashay-4=10,11`). It is an **allowlist**, not a
+  process decodes (`--channels`/`DZ_CHANNELS`, e.g. `edge-kalshi-sports-mbp=10,11`). It is an **allowlist**, not a
   threshold — the old name, "floor", implied a minimum, which is backwards: it restricts a set, and
   every unmentioned feed keeps admitting everything. Sits between the two filters either side of it
   — `reconcile` picks which *feeds* run, `sinks::ws`'s `SubFilter` picks what one *client* receives —
@@ -243,9 +243,9 @@ Modules are grouped by role under `src/`:
   remapped here. Three production IDs are assigned. Names are **uppercase** because that is the form
   that reaches consumers — `venue`/`source` on the WebSocket, every `venue=` metric label value, and
   the `SOURCE:SYMBOL` product identifier a consumer composes from them. `source_name` is the one
-  emitted name per ID; `source_id_of` additionally accepts a **legacy name** for ID 3, so operator-
-  and ledger-facing strings predating the current registry name keep resolving to the same ID
-  instead of falling through to `None` — only the registry name is ever emitted. A `venue` in `FEEDS`
+  emitted name per ID and `source_id_of` is its exact inverse. ID 3's pre-launch codename used to be
+  accepted on input as well; it was dropped once the ledger re-registered the Kalshi groups under
+  their `edge-kalshi-*` codes and nothing fed the old name in. A `venue` in `FEEDS`
   **must** be a name
   `source_id_of` resolves, or `receiver::record_revealed` silently drops it and the row's `status`
   stream goes unrecorded. An unassigned ID gets a stable synthesized `SOURCE_<id>` (distinct per ID,
@@ -604,7 +604,7 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
-  non-negative). The only `FEEDS` row of that kind is `lashay-2`, whose group is live, so these series
+  non-negative). The only `FEEDS` row of that kind is `edge-kalshi-perps-mbp`, whose group is live, so these series
   populate on any host subscribed to it — and report nothing on a host that is not.
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
@@ -696,7 +696,7 @@ Modules are grouped by role under `src/`:
   (Market-by-Price, magic `0x4442`, #95)** is validated field-for-field against the Go decoder **and
   against two committed real captures** (`tests/fixtures/mbp*.bin` — a sharded multi-channel set and
   a dense single-channel set, `tests/codec_mbp_fixtures.rs`); four types absent from both captures
-  stay offset-test-only — and the `lashay-2` group is live, so those four now decode against real
+  stay offset-test-only — and the `edge-kalshi-perps-mbp` group is live, so those four now decode against real
   traffic for the first time. It is the one codec that enforces **exact** body-length
   equality per type rather than bounds-checked reads (`SnapshotBegin` is a prefix-superset of MBO's,
   so a lenient decode would
@@ -922,7 +922,7 @@ Modules are grouped by role under `src/`:
   it is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the
   single-arm
   authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-arm
-  accumulators; `MbpProcessor` emits `book`, and the `lashay-2` row selects it on a live group.
+  accumulators; `MbpProcessor` emits `book`, and the `edge-kalshi-perps-mbp` row selects it on a live group.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.

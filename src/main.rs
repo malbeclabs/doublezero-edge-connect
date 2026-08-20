@@ -48,7 +48,7 @@ struct Args {
     )]
     publisher_ports: Vec<u16>,
 
-    /// Channels to ingest, scoped per group code: `lashay-4=10,11;lashay-1=2`. An unmentioned
+    /// Channels to ingest, scoped per group code: `edge-kalshi-sports-mbp=10,11;edge-kalshi-perps-tob=2`. An unmentioned
     /// feed ingests every channel. Ids are the contract and are validated against the feed's
     /// roster at startup; channel *names* are not mirrored here — they live in the publisher's
     /// inventory by design and have already moved once. Use `doublezero-edge channels list` to
@@ -1080,7 +1080,7 @@ mod tests {
 
     /// The regression this pins: a `--publisher-port` + `--channels` combination that empties an
     /// enabled feed while both, taken alone, are valid against the whole registry. `--publisher-port`
-    /// keeps only the sports (`lashay-4`) feed's channel-10 publisher; `--channels lashay-4=11` is a
+    /// keeps only the sports (`edge-kalshi-sports-mbp`) feed's channel-10 publisher; `--channels edge-kalshi-sports-mbp=11` is a
     /// perfectly valid clause against the full 31-channel roster, but channel 11's publisher was
     /// never in the narrowed `enabled` set to begin with, so it admits nothing.
     #[test]
@@ -1110,12 +1110,13 @@ mod tests {
 
         // Individually valid against the whole registry (11 is in the sports roster), but it names
         // a channel that --publisher-port already excluded.
-        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=11").unwrap();
+        let filter =
+            ingest::channel_filter::ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
 
         let err = check_channel_filter_covers_enabled(&enabled, &filter)
             .expect_err("a feed left with zero admitted publishers must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("lashay-4"), "{msg}");
+        assert!(msg.contains("edge-kalshi-sports-mbp"), "{msg}");
     }
 
     /// The same combination when the filter still admits the surviving publisher must pass.
@@ -1139,7 +1140,8 @@ mod tests {
         )
         .unwrap();
 
-        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=10").unwrap();
+        let filter =
+            ingest::channel_filter::ChannelFilter::parse("edge-kalshi-sports-mbp=10").unwrap();
         assert!(check_channel_filter_covers_enabled(&enabled, &filter).is_ok());
     }
 }
