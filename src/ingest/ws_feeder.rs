@@ -8,7 +8,7 @@
 //! this module owns only the Hyperliquid wire decode.
 //!
 //! **Precision before price.** Each public quote/trade is gated on its `(venue, symbol)` instrument
-//! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata stream).
+//! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata feed).
 //! The realistic backstop scenario is edge refdata healthy while mktdata stalls; a standalone public
 //! feed with no edge refdata ever is a documented limitation (it would emit nothing).
 //!

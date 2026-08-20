@@ -6,7 +6,7 @@
 //! substitute: the cross-path-common fields of a *level update* reduce to `(side, price, quantity)`,
 //! which recurs constantly on a coarse bounded price grid.
 //!
-//! So: exactly one path is authoritative and its stream is published verbatim; the other is ingested
+//! So: exactly one path is authoritative and its feed is published verbatim; the other is ingested
 //! and discarded. **Authority is per instrument on the wire, never per level** — interleaving two
 //! paths' deltas corrupts the book while every per-path sequence check still passes.
 //!
@@ -104,7 +104,7 @@ pub const OTHER_PATH: &str = "other";
 
 /// Cap on `(scope, channel, instrument)` markets whose per-market state is retained. The processor's
 /// book cap bounds only the books it holds *live*; an id space that churns (a venue relisting markets
-/// daily, or a forged stream minting ids) would otherwise grow this map for the life of the process.
+/// daily, or a forged feed minting ids) would otherwise grow this map for the life of the process.
 /// Least-recently-inserted eviction: losing an entry costs at most one stale health opinion, which
 /// that path's next report re-establishes.
 const MAX_TRACKED_MARKETS: usize = 1 << 16;
@@ -193,7 +193,7 @@ struct MarketState {
 pub struct StickyAuthority {
     /// One election per `(venue, category)`. Keyed on the venue alone this map is the defect the
     /// module doc opens with: one universe's path would hold authority over a disjoint universe it
-    /// publishes nothing for, and drop that universe's whole book stream for the life of the process.
+    /// publishes nothing for, and drop that universe's whole book feed for the life of the process.
     scopes: HashMap<ScopeKey, ScopeState>,
     markets: HashMap<MarketKey, MarketState>,
     /// Insertion order of `markets` keys, oldest at the front, for the [`MAX_TRACKED_MARKETS`]
@@ -715,7 +715,7 @@ mod tests {
     // ---- ...but it stops at the universe boundary ----
 
     /// Two disjoint universes under one Source ID each elect their own leader. Keyed on the venue the
-    /// first universe's path would drop the second universe's whole book stream — and keep dropping it,
+    /// first universe's path would drop the second universe's whole book feed — and keep dropping it,
     /// since the only escape is leader silence and the incumbent is busy streaming its own universe.
     #[test]
     fn each_universe_elects_its_own_leader() {

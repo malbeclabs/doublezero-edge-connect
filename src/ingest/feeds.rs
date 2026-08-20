@@ -45,7 +45,7 @@ impl FeedKind {
 }
 
 /// The multicast ports a feed splits its messages across. Every protocol uses a `mktdata` port
-/// (the data stream the liveness watchdog tracks) and a `refdata` port (instrument defs +
+/// (the data feed the liveness watchdog tracks) and a `refdata` port (instrument defs +
 /// manifest); Market-by-Order adds a dedicated `snapshot` port for its in-band book recovery.
 /// A loopback demo that carries everything on one port is expressed as `mktdata == refdata`.
 // `ThreePort` is constructed by Market-by-Order FEEDS rows (added with their endpoints).
@@ -54,7 +54,7 @@ impl FeedKind {
 pub enum FeedPorts {
     /// Top-of-Book and Midpoint: market data + reference data.
     TwoPort { mktdata: u16, refdata: u16 },
-    /// Market-by-Order: market data (deltas/trades) + reference data + snapshot recovery stream.
+    /// Market-by-Order: market data (deltas/trades) + reference data + snapshot recovery feed.
     ThreePort {
         mktdata: u16,
         refdata: u16,
@@ -87,7 +87,7 @@ impl FeedPorts {
 
 /// One publisher mirroring a feed: the port block it publishes on.
 ///
-/// Independent publishers mirror one venue's stream so subscribers can race them (see
+/// Independent publishers mirror one venue's feed so subscribers can race them (see
 /// `ingest::arbiter`). Two deployment models exist and both are supported:
 ///
 /// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does, on arbitrary

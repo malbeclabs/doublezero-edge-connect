@@ -76,7 +76,7 @@ than guessed: `side` is the one field on that channel a consumer acts on directi
 Hyperliquid's schema has no "unknown", so the compat tape can be shorter than the normalized one.
 
 `l2Book` publishes a market only once the bridge holds its **complete** book: it replaces a
-consumer's book wholesale on every frame, so a market accumulated mid-stream — before a producer
+consumer's book wholesale on every frame, so a market accumulated partway through — before a producer
 re-baseline — is withheld rather than published as if it were whole. An `l4Book` **re-baseline is
 rendered from the batch itself**, which is the complete book by construction, and never from the
 shared accumulator: the arbiter advances that accumulator *before* broadcasting, so a client with a

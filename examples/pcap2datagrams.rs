@@ -14,7 +14,7 @@
 //!      against a live capture validates the codec's byte offsets against the real feed. (This is
 //!      the first real-feed check of the MBO offsets, which are otherwise only self-consistent.)
 //!
-//! Output is split by content into per-role files matching the harness's separate replay streams:
+//! Output is split by content into per-role files matching the harness's separate replay feeds:
 //!   TOB -> `<prefix>.refdata.bin`, `<prefix>.mktdata.bin`
 //!   MBO -> `<prefix>.refdata.bin`, `<prefix>.snapshot.bin`, `<prefix>.mktdata.bin`
 //!   MBP -> `<prefix>.refdata.bin`, `<prefix>.snapshot.bin`, `<prefix>.mktdata.bin`
@@ -36,7 +36,7 @@ use pcap_file::{pcap::PcapReader, DataLink};
 
 use doublezero_edge_connect::ingest::{codec, codec_mbo, codec_mbp};
 
-/// One replay stream: a list of complete datagrams (UDP payloads), each written as a length-prefixed
+/// One replay feed: a list of complete datagrams (UDP payloads), each written as a length-prefixed
 /// record by [`write_log`].
 type DatagramLog = Vec<Vec<u8>>;
 
@@ -994,7 +994,7 @@ fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<(
 /// `SnapshotEnd`) anchored at `(anchor_seq, last_instrument_seq)` for `instrument_id`, in the
 /// codec_mbo wire layout (the codec's own encoders are test-only). Used by `--empty-anchor`: the
 /// same honest empty anchor `tests/fixtures/mbo_snapshot.bin` uses, computed per publisher per window
-/// so a mid-stream delta window gets a synced book without a (slow, round-robin) real snapshot.
+/// so a delta window partway through gets a synced book without a (slow, round-robin) real snapshot.
 fn synth_empty_anchor_datagram(
     instrument_id: u32,
     anchor_seq: u64,

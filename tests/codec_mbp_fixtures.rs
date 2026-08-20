@@ -5,7 +5,7 @@
 //! `fixtures/PROVENANCE.md`), because they cover different things:
 //!
 //! * `mbp_*` — the **sharded** feed: three `Channel ID`s on one group, so it is the only sample that
-//!   exercises per-channel snapshot grouping. Thin delta stream.
+//!   exercises per-channel snapshot grouping. Thin delta feed.
 //! * `mbp_perps_*` — the **dense** feed: one channel, thousands of contiguous per-instrument deltas,
 //!   which is what pins sequence handling. From the older publisher (see PROVENANCE).
 //!

@@ -282,7 +282,7 @@ fn per_symbol_dedup_is_independent() {
     let recs = read_combined("tests/fixtures/tob_multi_dual.combined.bin");
     let msgs = replay(&recs);
 
-    // (1) the dedup contract holds across the whole multi-symbol stream.
+    // (1) the dedup contract holds across the whole multi-symbol feed.
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
     // Staleness-floor non-decreasing monotonicity holds per (venue, symbol) across all symbols.
@@ -343,7 +343,7 @@ fn per_symbol_dedup_is_independent() {
     );
 }
 
-/// The literal duplicate-multicast-packet case for quotes: replay one publisher's stream, then
+/// The literal duplicate-multicast-packet case for quotes: replay one publisher's feed, then
 /// replay it again with **every mktdata datagram delivered twice** (byte-for-byte, same datagram
 /// sequence — exactly what a redundant multicast delivery looks like). The emitted quote set must be
 /// identical. The duplicate datagram is *not* rejected at the sequence gate — an equal sequence is
@@ -466,7 +466,7 @@ fn duplicate_multicast_trade_packet_collapses() {
 
 /// Two-publisher **Market-by-Order** depth dedup over the real combined golden: two live HL
 /// publishers' interleaved BTC capture, each reconstructing its own book from a synthetic empty
-/// anchor + its independent delta stream. The cross-publisher contract:
+/// anchor + its independent delta feed. The cross-publisher contract:
 ///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity).
 ///   2. Neither publisher's empty-book anchor (`source_ts == 0`) ever reaches the wire at all — an
 ///      instrument is deferred (see `ingest::processor`) until a delta-carrying message reveals its
@@ -611,7 +611,7 @@ fn mbo_prints_carry_no_venue_trade_id() {
         "golden carried no prints — the fact is unpinned"
     );
 
-    // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
+    // Scoped to the venue this golden was captured from: another venue's MBO feed may well stamp
     // real trade ids, and that is its own row's call.
     init_built_in();
     for f in feeds()
@@ -681,7 +681,7 @@ fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage
     })
 }
 
-/// One path's `(changes, last)` batch stream, parametrized on the path's price/size base so two paths
+/// One path's sequence of `(changes, last)` batches, parametrized on the path's price/size base so two paths
 /// built from it publish divergent level sets. Batches 2 and 3 are one logical event.
 fn path_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
     vec![
@@ -722,13 +722,13 @@ fn drain_books(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> Vec<Normalized
 
 /// The single-path authority gate for the incremental `book` product. Two paths mirror one venue and
 /// their per-instrument delta series are unrelated by construction, so interleaving both on one wire
-/// stream corrupts a consumer's book while every per-path sequence check the producer ran still passes.
+/// feed corrupts a consumer's book while every per-path sequence check the producer ran still passes.
 /// Pinned: only the elected path's batches reach the wire, and a `BookAccumulator` fed from the drained
 /// wire messages alone reproduces that path's level set exactly. Against the pre-gate undeduped
 /// passthrough both fail — all eight batches go out, the challenger's levels enter the consumer's book,
 /// and its `last: false` batch folds into the leader's logical event.
 #[test]
-fn interleaved_book_paths_publish_one_coherent_stream() {
+fn interleaved_book_paths_publish_one_coherent_feed() {
     fn clear_both() -> BookChange {
         BookChange {
             action: BookAction::Clear,
@@ -760,7 +760,7 @@ fn interleaved_book_paths_publish_one_coherent_stream() {
     }
 
     // The market's first admitted batch re-baselines the consumer, and this path has sent no producer
-    // re-baseline, so a bare `clear` leads the stream. Everything after it is the leader's, verbatim.
+    // re-baseline, so a bare `clear` leads the feed. Everything after it is the leader's, verbatim.
     let published = drain_books(&mut rx);
     let (first, rest) = published.split_first().expect("the re-baseline");
     assert_eq!(first.changes, vec![clear_both()]);

@@ -94,8 +94,8 @@ independent — disjoint datagram-sequence spaces (≈70.8M vs ≈53.7M) and dis
 updates: each independently samples/coalesces the BBO, so within the shared window pub A emits 4109
 BTC quotes and pub B emits 4669, and only ~370 (~9%) share an identical `source_ts`. When they DO
 coincide the content matches (369/370 agree on the full bid/ask/size tuple), but coincidence is
-under a tenth of each stream. So these exercise **real independent-publisher dedup** — merge two
-samplings of one book — NOT a "mirror collapse to one stream"; the publishers are not mirrors.
+under a tenth of each feed. So these exercise **real independent-publisher dedup** — merge two
+samplings of one book — NOT a "mirror collapse to one feed"; the publishers are not mirrors.
 Quotes dedup by a per-`(venue, symbol)` `source_ts` staleness floor keyed on raw BBO content: it
 keeps every distinct top-of-book change at the newest `source_ts` — including multiple distinct BBOs
 that share a `source_ts`, which are real intra-tick updates (this matches the `hl-bbo-feed-race`
@@ -316,7 +316,7 @@ re-capture drops in without editing a number. Two sets, because they cover diffe
 ### `mbp_{refdata,mktdata,snapshot}.bin` — the sharded feed (primary)
 
 The deployment shape the code will actually ingest: **three `Channel ID`s on one group**, so this is
-the only fixture that exercises per-channel snapshot grouping. Delta stream is thin.
+the only fixture that exercises per-channel snapshot grouping. Delta feed is thin.
 
 | | |
 |---|---|

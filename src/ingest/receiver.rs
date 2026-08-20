@@ -71,7 +71,7 @@ use crate::{
 /// (`crate::shred`) can reuse [`bind_multicast`] without re-deriving the socket plumbing.
 pub type TsSocket = AsyncFd<std::net::UdpSocket>;
 
-/// The role a feed's port plays. The market-data stream is what the liveness watchdog tracks
+/// The role a feed's port plays. The market-data feed is what the liveness watchdog tracks
 /// (reference/snapshot ports keep ticking even when market data is wedged); a processor uses the
 /// role to decide which message families to act on for a given datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub enum PortRole {
     Mktdata,
     /// Reference data: instrument definitions + manifest.
     Refdata,
-    /// The in-band snapshot recovery stream of a book protocol (Market-by-Order/-Price).
+    /// The in-band snapshot recovery feed of a book protocol (Market-by-Order/-Price).
     Snapshot,
     /// A single port carrying everything (loopback demo): both market and reference data.
     Combined,
@@ -216,7 +216,7 @@ thread_local! {
 /// `SOURCE_<id>` fallback `sources::source_label` produces for an unassigned id) would let one
 /// forged burst permanently seed phantom venues that every later edge for this row would then emit
 /// a `status` for — bounded by `sources::MAX_UNREGISTERED_SOURCES`, but still real, silent
-/// corruption of the wire `status` stream. Lock-free in the steady state; see [`LOCAL_REVEALED`].
+/// corruption of the wire `status` feed. Lock-free in the steady state; see [`LOCAL_REVEALED`].
 fn record_revealed(venue: &'static str, wire_venue: &str) {
     let already_known = LOCAL_REVEALED.with(|local| {
         local
@@ -754,7 +754,7 @@ async fn drive<P: DatagramProcessor>(
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, venue, kind = kind_label,
               publisher = publisher_name, "DZ Edge multicast receiver bound");
 
-        // Watchdog on the market-data stream specifically: rejoin when no market-data datagram has
+        // Watchdog on the market-data feed specifically: rejoin when no market-data datagram has
         // arrived for IDLE_REJOIN, regardless of refdata/snapshot (which keep ticking even when
         // market data is wedged - the exact symptom of a join on the wrong interface).
         let mut last_mkt = std::time::Instant::now();
@@ -799,7 +799,7 @@ async fn drive<P: DatagramProcessor>(
             channels[idx].dgrams.inc();
             bytes_ctr.inc_by(n as u64);
 
-            // Reset the liveness watchdog only on the market-data stream; recovery clears `down`
+            // Reset the liveness watchdog only on the market-data feed; recovery clears `down`
             // and un-escalates the rejoin interval (this is the only thing that proves the block is
             // live, so it is the only thing that may reset it).
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {

@@ -254,9 +254,9 @@ fn remove_instrument(
     ));
 }
 
-/// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata stream
+/// Top-of-Book & Trades processor: drives the reference-data state machine on the refdata feed
 /// and emits normalized quotes (gated per-instrument on a known definition) on the market-data
-/// stream. Holds the per-channel sequence tracker used to drop stale/out-of-order quote datagrams.
+/// feed. Holds the per-channel sequence tracker used to drop stale/out-of-order quote datagrams.
 pub struct TobProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
     state: PerPublisher<InstrumentDefinition>,
@@ -656,8 +656,8 @@ impl DatagramProcessor for TobProcessor {
     }
 }
 
-/// Midpoint processor: drives the reference-data state machine on the refdata stream and emits a
-/// normalized mid price (gated per-instrument on a known definition) on the market-data stream.
+/// Midpoint processor: drives the reference-data state machine on the refdata feed and emits a
+/// normalized mid price (gated per-instrument on a known definition) on the market-data feed.
 /// Structurally parallel to [`TobProcessor`] but for the `0x4D44` sibling protocol.
 pub struct MidpointProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
@@ -864,7 +864,7 @@ impl DatagramProcessor for MidpointProcessor {
 const REVEAL_REBASELINE_INTERVAL_NS: u64 = 15_000_000_000; // 15s
 
 /// Cap on the number of distinct instrument books [`MboProcessor`] tracks. The MBO `instrument_id`
-/// is an unauthenticated, spoofable wire field, so without a bound a forged stream could mint a
+/// is an unauthenticated, spoofable wire field, so without a bound a forged feed could mint a
 /// `BookState` per distinct id and grow the map without limit (memory-exhaustion DoS) — the same
 /// threat the [`MAX_PUBLISHERS`] cap addresses for the per-publisher sequence map. Real venues
 /// carry far fewer instruments than this, so it never evicts in normal operation; once full, the
@@ -872,7 +872,7 @@ const REVEAL_REBASELINE_INTERVAL_NS: u64 = 15_000_000_000; // 15s
 const MAX_BOOKS: usize = 4096;
 
 /// Market-by-Order processor: drives the reference-data state machine (refdata port), feeds order
-/// deltas and the snapshot stream into a per-instrument [`BookState`] (mktdata + snapshot ports),
+/// deltas and the snapshot feed into a per-instrument [`BookState`] (mktdata + snapshot ports),
 /// and emits a full-state `depth` snapshot whenever an instrument's top-N changes - plus `trade`
 /// prints. The reconstructed book lives here so consumers never see raw deltas (PROTOCOL.md).
 pub struct MboProcessor {
@@ -910,7 +910,7 @@ pub struct MboProcessor {
     /// not the definition, not `depth` — reaches the wire for a key until this map holds an entry
     /// (see [`Self::reveal_if_needed`]). Keyed per `(publisher, instrument)` deliberately, not
     /// coarser: one of the registry's ids is a superset covering builder DEXs alongside the primary
-    /// market, so distinct instruments on one stream can legitimately carry distinct ids — a
+    /// market, so distinct instruments on one feed can legitimately carry distinct ids — a
     /// per-publisher or per-channel cache would stamp some instruments with a neighbour's id, which
     /// is confidently wrong rather than visibly absent.
     ///
@@ -1801,7 +1801,7 @@ impl DatagramProcessor for MboProcessor {
                     // pre-reset top-N. Per-publisher: only this publisher's book is resetting.
                     self.last_top.remove(&key);
                     // The `book` product's equivalent, and for the same reason: the reset drops
-                    // `revealed` below, so the post-reset stream re-reveals — and a rate limit left
+                    // `revealed` below, so the post-reset feed re-reveals — and a rate limit left
                     // standing from the pre-reset reveal would downgrade that republish to a bare
                     // clear, leaving the re-synced book unshown until the next snapshot rotation.
                     self.reveal_rebaselined_ns.remove(&key);
@@ -1942,7 +1942,7 @@ impl DatagramProcessor for MboProcessor {
 
 /// Cap on distinct `(publisher, channel, instrument)` books one Market-by-Price receiver tracks. The
 /// wire `channel_id`/`instrument_id` and the datagram source IP are all unauthenticated and
-/// spoofable, so this bounds a forged stream exactly as [`MAX_BOOKS`] does for the order-keyed
+/// spoofable, so this bounds a forged feed exactly as [`MAX_BOOKS`] does for the order-keyed
 /// processor. Nothing may be sized off the instrument *count*: ids are sequential in today's
 /// captures but a ticker hash would spread them sparsely across the whole `u32`.
 const MAX_PRICE_BOOKS: usize = 4096;
@@ -1989,7 +1989,7 @@ struct OpenGroup {
 }
 
 /// Market-by-Price processor: drives reference data per publisher, feeds level deltas and the
-/// snapshot stream into a [`PriceBook`] per `(publisher, channel, instrument)`, and emits the
+/// snapshot feed into a [`PriceBook`] per `(publisher, channel, instrument)`, and emits the
 /// incremental `book` product plus `trade` prints.
 pub struct MbpProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
@@ -2025,7 +2025,7 @@ pub struct MbpProcessor {
     /// the definition, not `book` — reaches the wire for a key until this map holds an entry (see
     /// [`Self::reveal_if_needed`]). Keyed per `(publisher, channel, instrument)` deliberately, not
     /// coarser: one of the registry's ids is a superset covering builder DEXs alongside the primary
-    /// market, so distinct instruments on one stream can legitimately carry distinct ids — a
+    /// market, so distinct instruments on one feed can legitimately carry distinct ids — a
     /// coarser cache would stamp some instruments with a neighbour's id, which is confidently wrong
     /// rather than visibly absent. Evicted in lockstep with `books` via [`Self::forget_book`] — every
     /// key that can reveal is routed through [`Self::ensure_book`] first (including the `Trade`
@@ -2339,7 +2339,7 @@ impl MbpProcessor {
             .inc();
     }
 
-    /// Count what a delta did. `Overflow` (the per-book level cap: a malformed or forged stream) is
+    /// Count what a delta did. `Overflow` (the per-book level cap: a malformed or forged feed) is
     /// deliberately its own series rather than a gap — the cause and the resulting status both
     /// differ, and merging them would read a hostile book as a lossy network.
     fn record_outcome(&self, venue: &str, outcome: &DeltaOutcome) {
@@ -4684,7 +4684,7 @@ mod tests {
 
     /// The book map **and** the `last_top` depth-suppression map must both stay bounded under a flood
     /// of distinct (defined) instrument_ids, evicting the oldest first — otherwise a forged MBO
-    /// stream grows them without limit. Each instrument is driven all the way to `Synced` with an
+    /// feed grows them without limit. Each instrument is driven all the way to `Synced` with an
     /// emitted `depth`, so `last_top` is actually populated (an unsynced book never reaches it).
     #[test]
     fn mbo_books_map_is_bounded_under_instrument_flood() {
@@ -5499,7 +5499,7 @@ mod tests {
     }
 
     /// An `MbpProcessor` with `ids` defined and each synced from an empty-book anchor, in the drive
-    /// order the wire uses: reference data, then the snapshot stream, then deltas.
+    /// order the wire uses: reference data, then the snapshot feed, then deltas.
     fn synced_mbp_proc(
         arbiter: &SharedArbiter,
         instruments: &crate::model::InstrumentSnapshot,

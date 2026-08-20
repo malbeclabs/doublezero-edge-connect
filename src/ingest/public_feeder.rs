@@ -13,7 +13,7 @@
 //! **The backstop needs the edge to have gone live at least once.** Each venue's `instrument_known`
 //! gate reads the shared `InstrumentSnapshot`, which `ingest::processor` populates only once the edge
 //! has revealed an instrument's wire Source ID (see that module's per-instrument deferral) — refdata
-//! alone never populates it. A mid-stream gap (the edge was live, then goes quiet) is backstopped
+//! alone never populates it. A gap partway through (the edge was live, then goes quiet) is backstopped
 //! normally; a cold start with no edge price at all for that instrument leaves this gate permanently
 //! closed for it, since there is no wire-derived precision/venue to key it by.
 //!

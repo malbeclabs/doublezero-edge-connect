@@ -53,9 +53,9 @@ Every public feeder is failure-isolated (its own task with reconnect + exponenti
 decode/socket errors are logged and never touch the multicast hot path) and relies on the edge
 reference data for precision — it emits a public quote/trade only once that `(venue, symbol)`
 instrument is known. That gate opens only after the edge has revealed the instrument's wire Source
-ID at least once (refdata alone does not populate it), so the backstop covers a mid-stream edge gap
-but not a cold start where the edge has never gone live for that instrument. The outbound `wss://`
-client is the one place TLS is used (rustls + bundled webpki roots).
+ID at least once (refdata alone does not populate it), so the backstop covers an edge gap that
+opens partway through but not a cold start where the edge has never gone live for that instrument.
+The outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
 
 The **Phoenix** feeder is **trades only** — it does not backstop quotes, because the edge Phoenix
 Quote is a spline-blended BBO while Phoenix's public orderbook channel is resting-only (a different

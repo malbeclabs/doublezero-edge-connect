@@ -77,7 +77,7 @@ pub type TapeOwner = Arc<AtomicBool>;
 /// group and not the top-of-book one. Both rows claim the tape ([`Feed::emit_trades`]); this ranking
 /// is what makes exactly one of them serve it at any moment — the invariant the arbiter's
 /// `trade_id == 0` bypass rests on. Top-of-book wins when both are up: it is the venue's primary
-/// tape, and market-by-price carries prints only as a by-product of the book stream.
+/// tape, and market-by-price carries prints only as a by-product of the book feed.
 fn tape_rank(kind: FeedKind) -> Option<u8> {
     match kind {
         FeedKind::TopOfBook => Some(0),

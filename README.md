@@ -235,13 +235,13 @@ failed and it fell back — the string says which.
 _For Edge Feeds (not solana-shreds)_
 
 Open a WebSocket to `ws://<host>:8081` and read JSON. You receive only the venues you're authorized
-for; an optional `subscribe` control frame narrows the stream further:
+for; an optional `subscribe` control frame narrows the feed further:
 
 ```json
 {"method":"subscribe","subscription":{"venue":"<venue-name>","symbol":"SOL"}}
 ```
 
-On connect you first get the current instrument definitions (precision), then a stream of quotes.
+On connect you first get the current instrument definitions (precision), then quotes as they arrive.
 Any engine that speaks WebSocket + JSON consumes it with a thin (~50-100 line) adapter. The full
 wire contract is in **[PROTOCOL.md](PROTOCOL.md)** (see
 [Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine)).
@@ -254,7 +254,7 @@ deliver.
 
 ## Query market data (the `doublezero-edge` CLI)
 
-Prefer polling a candle or the current book over consuming the WebSocket stream? The bridge also
+Prefer polling a candle or the current book over consuming the WebSocket feed? The bridge also
 serves a read-only `/v1` HTTP API (on by default at `127.0.0.1:9099`, activated whenever a
 market-data feed is — see [Output sinks](docs/output-sinks.md#query-api-v1)), and
 **[`doublezero-edge`](doublezero-edge/)** is a small CLI client for it, built for scripting and for

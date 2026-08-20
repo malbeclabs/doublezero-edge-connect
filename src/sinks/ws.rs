@@ -319,14 +319,14 @@ fn text(value: serde_json::Value) -> WsMessage {
 
 /// The scope to bootstrap one market at: **the market's own granularity, always**.
 ///
-/// It is not a client choice. A bootstrap and a stream of different granularity cannot be reconciled
+/// It is not a client choice. A bootstrap and a feed of different granularity cannot be reconciled
 /// — an order-level change carries one *order's* absolute size, and a client handed price levels has
 /// no order state to apply it to — so the only consumer a fold could serve is one folding the live
-/// stream itself, which needs every resting order's size and is exactly what the fold discards. The
+/// feed itself, which needs every resting order's size and is exactly what the fold discards. The
 /// `book_scope` subscription field offered that choice and is withdrawn; it never shipped in a
 /// release.
 /// The wire `type` one market's book is served under — the same market property `book_scope` reads,
-/// and for the same reason: the bootstrap and the live stream must agree.
+/// and for the same reason: the bootstrap and the live feed must agree.
 fn book_kind(acc: &BookAccumulator) -> &'static str {
     if acc.is_order_level() {
         "order_book"
@@ -393,13 +393,13 @@ where
         let guard = crate::model::lock(books);
         guard
             .iter()
-            // A market accumulated mid-stream holds only the levels that have moved since, so
+            // A market accumulated partway through holds only the levels that have moved since, so
             // replaying it as full state would tell the client to discard the ones it never saw.
             .filter(|(_, acc)| acc.baselined())
             // The key's second element is the producer-side arbitration scope (`Feed::category`,
             // which keeps two universes' colliding instrument ids apart in the map); it is not a
             // filter dimension and never reaches the wire.
-            // Filtered and tagged under the market's *own* type, matching the live stream it
+            // Filtered and tagged under the market's *own* type, matching the live feed it
             // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and one
             // subscribed to `book` alone must not be handed a market it cannot apply.
             .filter(|((venue, _, channel, _), acc)| {
@@ -437,7 +437,7 @@ async fn serve_client(
     // Per-client state. Empty `subs` = firehose (receive every venue/symbol).
     let mut subs: Vec<SubFilter> = Vec::new();
 
-    // Replay definitions (precision first) then current book state, so a mid-stream consumer is
+    // Replay definitions (precision first) then current book state, so a consumer joining partway is
     // bootstrapped immediately instead of waiting for the next periodic book. (Quotes/trades are not
     // replayed - the next quote is itself full state.) `subs` is empty here, so this connect-time
     // replay is unfiltered.
@@ -529,7 +529,7 @@ async fn serve_client(
             msg = rx.recv() => match msg {
                 Ok(frame) => {
                     // One match path for every kind, venue-level included: a dimension added to
-                    // `matches` cannot silently exempt half the stream.
+                    // `matches` cannot silently exempt half the feed.
                     let pass = subs.is_empty()
                         || subs.iter().any(|f| {
                             f.matches(
@@ -1392,7 +1392,7 @@ mod tests {
     }
 
     /// **The compatibility guarantee.** A consumer that subscribes to `type: book` must receive
-    /// neither the bootstrap nor the live stream of an order-level market: keying those changes by
+    /// neither the bootstrap nor the live feed of an order-level market: keying those changes by
     /// price collapses two orders resting at one price to the last one's size. A distinct type is the
     /// mechanism PROTOCOL.md's forward-compatibility rule already promises, which is what makes this
     /// additive rather than breaking.
@@ -1460,7 +1460,7 @@ mod tests {
             "the order-level market must not be bootstrapped for a `book` subscription"
         );
 
-        // And the live stream is filtered by the same one `SubFilter::matches` path.
+        // And the live feed is filtered by the same one `SubFilter::matches` path.
         let mut order = book_batch("BTC", vec![level_update(BookSide::Bid, 100.0, 5.0)], true);
         order.order_level = true;
         order.changes[0].order_id = 9;
@@ -1474,7 +1474,7 @@ mod tests {
         srv.abort();
     }
 
-    /// An order-level market bootstraps as **orders**, matching the stream the client is about to
+    /// An order-level market bootstraps as **orders**, matching the feed the client is about to
     /// receive: a level bootstrap followed by order-level changes cannot be reconciled, and no
     /// subscription can ask for one.
     #[tokio::test]
@@ -1529,7 +1529,7 @@ mod tests {
         assert_eq!(
             book_type(&frame),
             "order_book",
-            "the bootstrap must carry the same type as the stream it precedes"
+            "the bootstrap must carry the same type as the feed it precedes"
         );
         let b = parse_book(&frame);
         assert_eq!(
@@ -1539,11 +1539,11 @@ mod tests {
                 .map(|c| c.order_id)
                 .collect::<Vec<_>>(),
             vec![7, 8],
-            "the default bootstrap must carry the order ids the stream carries"
+            "the default bootstrap must carry the order ids the feed carries"
         );
 
         // A subscription cannot ask for anything else. `book_scope: "levels"` used to fold the
-        // bootstrap while the live stream stayed order-level, which is unusable: an order-level
+        // bootstrap while the live feed stayed order-level, which is unusable: an order-level
         // change carries one *order's* absolute size, and a client handed price levels holds no
         // order state to apply it to. The field is gone, and an unknown key is ignored, so a client
         // still sending it is bootstrapped at the market's own granularity.
@@ -1729,20 +1729,20 @@ mod tests {
         srv.abort();
     }
 
-    /// Only a re-baselined market is bootstrapped. One accumulated mid-stream holds just the levels
+    /// Only a re-baselined market is bootstrapped. One accumulated partway through holds just the levels
     /// that have moved since, and `to_book` stamps `snapshot: true` — replaying it would tell the
     /// client to discard the rest of the book. Such a client waits for the producer's next
     /// re-baseline, as it did before the book replay existed.
     #[tokio::test]
     #[serial]
-    async fn mid_stream_markets_are_not_replayed() {
-        let mut mid_stream = BookAccumulator::new("KXETHPERP".into());
-        mid_stream.apply(&book_batch(
+    async fn markets_accumulated_partway_are_not_replayed() {
+        let mut accumulated_partway = BookAccumulator::new("KXETHPERP".into());
+        accumulated_partway.apply(&book_batch(
             "KXETHPERP",
             vec![level_update(BookSide::Bid, 0.41, 5.0)],
             true,
         ));
-        assert!(!mid_stream.baselined(), "no Clear was folded in");
+        assert!(!accumulated_partway.baselined(), "no Clear was folded in");
 
         let mut books = BookReplay::default();
         books.insert(
@@ -1752,7 +1752,7 @@ mod tests {
                 3u8,
                 7u32,
             ),
-            mid_stream,
+            accumulated_partway,
         );
         books.insert(
             (

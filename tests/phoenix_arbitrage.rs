@@ -6,7 +6,7 @@
 //!   1. **edge gap → public fills in** — replay the full edge golden (SOL prints real quotes/trades,
 //!      revealing its Source ID — see `ingest::processor`'s per-instrument deferral, which holds a
 //!      `NormalizedInstrument`/price back until the edge has revealed it at least once; an edge that
-//!      never once goes live for an instrument is not backstoppable, only a mid-stream gap is), THEN
+//!      never once goes live for an instrument is not backstoppable, only a gap partway through is), THEN
 //!      the edge goes quiet and a public Phoenix fill opens its `(venue, symbol, trade_id)` and
 //!      reaches the wire, tagged `Phoenix`.
 //!   2. **edge leads → public deduped** — replay a real edge Phoenix trade (`AMD`, `trade_id`
@@ -59,7 +59,7 @@ fn trades_for<'a>(
 /// goes quiet and a public Phoenix fill is pushed. With nothing ahead of it in the trade dedup
 /// window, the public fill is emitted — the consumer keeps seeing prints through the gap.
 ///
-/// This is a mid-stream gap, not a cold start: `ingest::processor`'s per-instrument deferral holds
+/// This is a gap partway through, not a cold start: `ingest::processor`'s per-instrument deferral holds
 /// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
 /// once (refdata alone never does — see the module docs), so an edge that never once goes live for
 /// an instrument has nothing for the public feeder to key its precision gate against either; that is
@@ -92,7 +92,7 @@ async fn phoenix_edge_gap_public_trade_fills_in() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Edge refdata AND mktdata: SOL prints real quotes/trades (instrument_id 0), revealing its
-    // Source ID, before the edge goes quiet — the gap that follows is mid-stream.
+    // Source ID, before the edge goes quiet — the gap that follows opens partway through.
     tokio::task::spawn_blocking(move || {
         replay::send_datagrams(replay::PHOENIX_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));

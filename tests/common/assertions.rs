@@ -19,7 +19,7 @@ fn ty(m: &Value) -> &str {
 }
 
 /// Every quote/trade/depth references a symbol that was already declared by an
-/// `instrument` message earlier in the stream (precision before price). The bridge
+/// `instrument` message earlier in the feed (precision before price). The bridge
 /// gates all price-carrying emissions on a known instrument definition, so trades
 /// must also be preceded by their instrument.
 pub fn instrument_before_price(msgs: &[Value]) {

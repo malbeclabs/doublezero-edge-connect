@@ -2170,7 +2170,7 @@ mod tests {
             );
             map.insert(
                 ("KALSHI".into(), "perps".into(), 3u8, 7u32),
-                inst_in("perps", 3, "KALSHI", "MIDSTREAM", 3, 7, -4, -2),
+                inst_in("perps", 3, "KALSHI", "PARTWAY", 3, 7, -4, -2),
             );
         }
         {
@@ -2200,19 +2200,19 @@ mod tests {
             assert!(baselined.baselined());
             map.insert(("KALSHI".into(), "perps".into(), 2, 41), baselined);
 
-            // A market accumulated mid-stream: no `Clear` has ever been folded in, so this holds
+            // A market accumulated partway through: no `Clear` has ever been folded in, so this holds
             // only the levels that moved since accumulation started.
-            let mut mid_stream = BookAccumulator::new("MIDSTREAM".into());
-            mid_stream.apply(&book_batch(
+            let mut partway = BookAccumulator::new("PARTWAY".into());
+            partway.apply(&book_batch(
                 "KALSHI",
-                "MIDSTREAM",
+                "PARTWAY",
                 3,
                 7,
                 vec![level_update(BookSide::Bid, 0.41, 5.0)],
                 true,
             ));
-            assert!(!mid_stream.baselined());
-            map.insert(("KALSHI".into(), "perps".into(), 3, 7), mid_stream);
+            assert!(!partway.baselined());
+            map.insert(("KALSHI".into(), "perps".into(), 3, 7), partway);
         }
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
@@ -2230,14 +2230,14 @@ mod tests {
         assert_eq!(body["pricebook"]["bids"][0][0], "0.6100");
         assert_eq!(body["pricebook"]["asks"][0][0], "0.6300");
 
-        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:MIDSTREAM%233.7/book"))
+        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:PARTWAY%233.7/book"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(
             body["coverage"]["complete"], false,
-            "a mid-stream accumulator must never claim completeness it cannot back: {body}"
+            "an accumulator seeded partway through must never claim completeness it cannot back: {body}"
         );
     }
 

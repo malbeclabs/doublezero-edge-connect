@@ -65,7 +65,7 @@ pub struct Metrics {
     /// Market-data staleness: 0 while up; the staleness in milliseconds at the last `down`
     /// transition (reset to 0 on recovery). Venue-level, like [`feed_up`](Self::feed_up).
     pub feed_stale_ms: IntGaugeVec,
-    /// Per-receiver health: 1 while this publisher's market-data stream is up, 0 while it is
+    /// Per-receiver health: 1 while this publisher's market-data feed is up, 0 while it is
     /// considered down. The per-publisher counterpart of [`feed_up`](Self::feed_up), which is the
     /// venue-level aggregate (up if ANY publisher is up). A venue can be `dz_feed_up == 1` while
     /// one of its publishers reads `dz_receiver_up == 0`; that is the wedged-mirror signal.
@@ -173,7 +173,7 @@ pub struct Metrics {
     pub tape_path_transfers: IntCounterVec,
     /// Prints the per-venue tape gate dropped as a non-serving path's copy. Its own counter rather than
     /// folded into [`trades_dropped`](Self::trades_dropped): on a `Sticky` venue the steady state is
-    /// the challenger path's whole stream, so mixing the two would hide a gate holding the tape against
+    /// the challenger path's whole feed, so mixing the two would hide a gate holding the tape against
     /// the path that should have it inside expected noise.
     pub tape_path_dropped: IntCounterVec,
     /// Markets each `path` is currently authoritative for. Split across paths means the venue's
@@ -185,7 +185,7 @@ pub struct Metrics {
     pub path_unmatched_trades: IntCounterVec,
     /// Incremental `book` batches the authority gate did not publish, by the `publisher` class whose
     /// copy was dropped: a non-authoritative path's copy, or a batch withheld while a market waits for
-    /// its new path to close a logical event. In steady state this is the challenger's whole stream, so
+    /// its new path to close a logical event. In steady state this is the challenger's whole feed, so
     /// it tracks its message rate rather than any fault.
     pub book_dropped: IntCounterVec,
     /// Markets evicted from the `book` authority gate's tracked set because the cap was reached. The
@@ -196,7 +196,7 @@ pub struct Metrics {
     /// resurrection path for a copy arriving later than that many removals.
     pub mbo_removed_evicted: IntCounter,
     /// Order-level `book` events collapsed because another publisher delivered the same venue event
-    /// first. In steady state this is the whole stream of every publisher but the fastest, so it is a
+    /// first. In steady state this is the whole feed of every publisher but the fastest, so it is a
     /// throughput figure rather than a fault.
     pub book_events_deduped: IntCounterVec,
     /// Two publishers reported the same venue event with different resulting state: the identity
@@ -243,7 +243,7 @@ pub struct Metrics {
     /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
     /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
     pub mbp_buffer_overflows: IntCounterVec,
-    /// A book discarded because its per-book price-level cap was hit — a malformed or forged stream,
+    /// A book discarded because its per-book price-level cap was hit — a malformed or forged feed,
     /// never packet loss. Deliberately not counted as a sequence gap: the cause and the resulting
     /// status differ, and merging them would read a hostile book as a lossy network.
     pub mbp_level_overflows: IntCounterVec,
@@ -636,7 +636,7 @@ impl Metrics {
                 &registry,
                 "dz_tape_path_dropped_total",
                 "Prints the per-venue tape gate dropped as a non-serving path's copy. In steady state \
-                 this is the challenger path's whole print stream.",
+                 this is the challenger path's whole print feed.",
                 &["venue"],
             ),
             mbp_channel_resets: counter_vec(
@@ -656,7 +656,7 @@ impl Metrics {
                 &registry,
                 "dz_mbp_level_overflows_total",
                 "Books discarded on hitting the per-book price-level cap (malformed or forged \
-                 stream, never packet loss — distinct from a sequence gap)",
+                 feed, never packet loss — distinct from a sequence gap)",
                 &["venue"],
             ),
             mbp_orphan_snapshot_levels: counter_vec(
@@ -708,7 +708,7 @@ impl Metrics {
                 &registry,
                 "dz_book_dropped_total",
                 "Incremental book batches the authority gate did not publish, by the transport class \
-                 whose copy was dropped (in steady state, the challenger path's whole stream).",
+                 whose copy was dropped (in steady state, the challenger path's whole feed).",
                 &["venue", "transport"],
             ),
             book_markets_evicted: counter_vec(
@@ -729,7 +729,7 @@ impl Metrics {
                 &registry,
                 "dz_book_events_deduped_total",
                 "Order-level book events collapsed because another publisher delivered the same \
-                 venue event first. In steady state this is the whole stream of every publisher but \
+                 venue event first. In steady state this is the whole feed of every publisher but \
                  the fastest, so it is a throughput figure, not a fault.",
                 &["venue"],
             ),

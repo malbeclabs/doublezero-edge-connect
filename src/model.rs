@@ -293,7 +293,7 @@ pub struct BookChange {
 }
 
 /// A batch of price-level changes for one instrument — the incremental order-book product, derived
-/// in the bridge from the Market-by-Price feed's snapshot+delta stream.
+/// in the bridge from the Market-by-Price feed's snapshots and deltas.
 ///
 /// **`(venue, channel, instrument_id)` is the identity; `symbol` is a display label.** The wire
 /// `symbol` is a fixed 16-byte field the publisher fills by keeping the rightmost 16 bytes of the
@@ -464,7 +464,7 @@ impl FeedMessage {
 /// Latest known instrument definitions, keyed by `(venue, category, channel, instrument_id)`,
 /// shared between the receivers (which update it) and the WebSocket server (which replays it to
 /// each new subscriber so reference data arrives before quotes - otherwise a client that connects
-/// mid-stream sees a quote first and has to guess the price/qty precision).
+/// partway through sees a quote first and has to guess the price/qty precision).
 ///
 /// The key is [`NormalizedBook`]/[`NormalizedInstrument`]'s wire identity triple **prefixed with
 /// the arbitration scope** (`category`), exactly [`BookKey`]/`ingest::authority::MarketKey` —
@@ -535,10 +535,10 @@ pub type CountedLevel = (f64, f64, u32);
 /// How much detail a replayed `book` re-baseline carries.
 ///
 /// **Unset follows the market**, which is what a consumer needs by default: a bootstrap of price levels
-/// followed by a live stream of order-level changes cannot be reconciled at all — each change carries one
+/// followed by a live feed of order-level changes cannot be reconciled at all — each change carries one
 /// *order's* absolute size, and applying it as a level's size corrupts the book — so the granularity has
 /// to match what the market streams. Asking for `Levels` on an order-level market is therefore only
-/// useful to a consumer that folds the stream itself.
+/// useful to a consumer that folds the feed itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplayScope {
@@ -549,7 +549,7 @@ pub enum ReplayScope {
 }
 
 /// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
-/// datagram source, so a stream that never sets `last` must not grow this without limit; the cap sits
+/// datagram source, so a feed that never sets `last` must not grow this without limit; the cap sits
 /// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
 /// rather than silently dropping changes from a book still claimed to be complete.
 const MAX_PENDING_CHANGES: usize = 8192;
@@ -580,7 +580,7 @@ impl BookAccumulator {
 
     /// Whether these levels are the market's complete book, so materializing them as a re-baseline is
     /// honest. False until a producer re-baseline (a `Clear` of both sides) has been folded in: an
-    /// accumulator seeded mid-stream holds only the levels that have moved since, and publishing that
+    /// accumulator seeded partway through holds only the levels that have moved since, and publishing that
     /// as `snapshot: true` would tell a consumer to discard the levels it is missing.
     pub fn baselined(&self) -> bool {
         self.baselined
@@ -1681,7 +1681,7 @@ mod tests {
         assert_eq!(acc.price_fold().0.len(), n);
     }
 
-    /// An event still waiting for its `last` is what the cap bounds: an unterminated stream past it is
+    /// An event still waiting for its `last` is what the cap bounds: one unterminated past it is
     /// abandoned rather than folded as a book claiming to be complete.
     #[test]
     fn an_unterminated_event_past_the_cap_is_abandoned() {

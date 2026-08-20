@@ -877,7 +877,7 @@ fn prepare_one(
             }
         }
         order.push_back(key.clone());
-        // Seeded from the shared accumulator, not rebuilt from the stream: a market re-created after
+        // Seeded from the shared accumulator, not rebuilt from the feed: a market re-created after
         // an eviction would otherwise read as price-aggregated until its next order-carrying batch,
         // and a bare `clear` in that window would reach no `l4Book` subscriber at all.
         let seed = crate::model::lock(books)
@@ -1016,7 +1016,7 @@ fn sent(channel: &'static str) {
 /// Whether this market's accumulated book may be published as full state on either book channel.
 ///
 /// `baselined` is load-bearing on **both**: an `l2Book` frame replaces a consumer's book wholesale
-/// and an `l4Book` snapshot claims completeness, so an accumulator seeded mid-stream — holding only
+/// and an `l4Book` snapshot claims completeness, so an accumulator seeded partway through — holding only
 /// the levels that have moved since — must be withheld rather than published as whole. `is_order_level`
 /// is what keeps that honest for a market whose changes are price-aggregated: this sink reads only the
 /// order population, so such a market would render as an *empty* book, telling the consumer to discard
@@ -1049,7 +1049,7 @@ fn take_market<T>(
 }
 
 /// The same copy-out for every market of this venue matching `coin`, under the same rule. Scans the
-/// map, so it is for a subscribe or a recovery — never the steady stream, which resolves one market by
+/// map, so it is for a subscribe or a recovery — never the steady feed, which resolves one market by
 /// its own key.
 fn take_markets<T>(
     books: &BookSnapshot,
@@ -1155,7 +1155,7 @@ fn frames(
             let Some(key) = p.key.as_ref() else {
                 return out;
             };
-            // **Only a coin this client is subscribed to may be pinned.** Pinning from the stream
+            // **Only a coin this client is subscribed to may be pinned.** Pinning from the feed
             // regardless would let a market that happened to publish between accept and the
             // subscribe frame claim the coin, and the subscribe path — which resolves it properly
             // against the book map — would then find the pin already taken: an empty bootstrap
@@ -1261,7 +1261,7 @@ async fn serve_client(
                                         continue;
                                     }
                                     // Overwrites: this is the authoritative resolution, against
-                                    // the book map, and it must win over anything the stream put
+                                    // the book map, and it must win over anything the feed put
                                     // there for an earlier subscription of the same coin.
                                     if let Some(key) = markets.into_iter().next() {
                                         pinned.insert(coin.to_string(), key);
@@ -2005,7 +2005,7 @@ mod tests {
 
     // --- Task 7: streaming ---
 
-    /// A market accumulated mid-stream holds only the levels that have moved since. Publishing it on
+    /// A market accumulated partway through holds only the levels that have moved since. Publishing it on
     /// either book channel would tell the client those are the whole book — `l2Book` because every
     /// frame replaces the consumer's book wholesale, `l4Book` because a snapshot claims completeness.
     #[test]
@@ -2794,12 +2794,12 @@ mod tests {
         }
     }
 
-    /// A market must not claim a coin before the client asks for it. Pinned from the stream regardless
+    /// A market must not claim a coin before the client asks for it. Pinned from the feed regardless
     /// of subscriptions, a market that published between accept and the subscribe frame took the coin,
     /// the subscribe path's own resolution could not displace it, and the client then received an empty
     /// bootstrap followed by every real frame dropped — with a `subscriptionResponse` and no error.
     #[test]
-    fn an_unsubscribed_coin_is_not_pinned_from_the_stream() {
+    fn an_unsubscribed_coin_is_not_pinned_from_the_feed() {
         let books = replay(vec![]);
         let mut pinned = Default::default();
         let stray = Arc::new(FeedMessage::Book(order_book(vec![(

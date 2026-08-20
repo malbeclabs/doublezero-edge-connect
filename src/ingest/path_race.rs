@@ -46,7 +46,7 @@
 //! Two trades with the same signature inside one window are not a collision to be avoided but an
 //! ordering to be respected: each signature holds a **FIFO** of unmatched arrivals, so a path's first
 //! copy pairs with the peer's first copy and the second with the second. Both paths see the venue's
-//! stream in order, so that pairing is the correct one. The reference implementation this borrows
+//! feed in order, so that pairing is the correct one. The reference implementation this borrows
 //! from keys on content with no such queue, which silently mis-pairs repeats.
 
 use std::{
@@ -122,7 +122,7 @@ impl Match {
 const DEFAULT_WINDOW_NS: u64 = 5_000_000_000; // 5s
 
 /// Cap on `order` entries, arrivals and tombstones alike. The multicast source is unauthenticated, so
-/// a forged stream of distinct trades must not grow this without limit; past the cap the oldest
+/// a forged feed of distinct trades must not grow this without limit; past the cap the oldest
 /// arrival is dropped, which costs a sample and nothing else.
 const MAX_PENDING: usize = 1 << 16;
 

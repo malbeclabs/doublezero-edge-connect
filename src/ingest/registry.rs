@@ -166,7 +166,7 @@ impl std::fmt::Display for RegistryError {
             RegistryError::UnknownVenue(v) => write!(
                 f,
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
-                 status stream would go unrecorded"
+                 status feed would go unrecorded"
             ),
             RegistryError::EmptyRoster { venue, category } => {
                 write!(f, "{venue}/{category}: derived roster is empty")
@@ -371,7 +371,7 @@ enum Publishers {
 struct PortBlock {
     mktdata: u16,
     refdata: u16,
-    /// Present only for the protocols with an in-band snapshot stream (market-by-order and
+    /// Present only for the protocols with an in-band snapshot feed (market-by-order and
     /// market-by-price). A two-port block leaves it out rather than repeating a plane.
     #[serde(default)]
     snapshot: Option<u16>,
@@ -436,7 +436,7 @@ struct PortBases {
     mktdata: u16,
     refdata: u16,
     /// Optional because the top-of-book plane binds a **pair** of ports — there is no in-band
-    /// snapshot stream on it, and the `5xxxx` slot is left unallocated rather than reused so the
+    /// snapshot feed on it, and the `5xxxx` slot is left unallocated rather than reused so the
     /// leading digit keeps naming the traffic class.
     #[serde(default)]
     snapshot: Option<u16>,
@@ -693,8 +693,8 @@ fn report_unknown_keys(doc: &Document) {
 /// How many ports one publisher of this protocol binds.
 ///
 /// A real property of the protocols rather than a convention: market-by-order and market-by-price
-/// recover their books from an **in-band snapshot stream** on a dedicated port, and top-of-book and
-/// midpoint have no such stream — which is why the `5xxxx` slot is left unallocated for them rather
+/// recover their books from an **in-band snapshot feed** on a dedicated port, and top-of-book and
+/// midpoint have no such feed — which is why the `5xxxx` slot is left unallocated for them rather
 /// than reused, so the leading digit keeps naming the traffic class.
 fn planes_for(kind: FeedKind) -> u8 {
     match kind {
@@ -826,7 +826,7 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
         }
     }
     // A venue `source_id_of` does not resolve is dropped by `receiver::record_revealed`, so its
-    // `status` stream goes unrecorded — a row that ingests but never reports. Resolution is exact,
+    // `status` feed goes unrecorded — a row that ingests but never reports. Resolution is exact,
     // so a near-miss spelling is refused here rather than splitting every downstream lookup that
     // keys on the venue string (arbitration mode, the channel-filter purge, `--feed` selection).
     if sources::source_id_of(&row.venue).is_none() {
@@ -1656,7 +1656,7 @@ mod tests {
         ));
     }
 
-    /// And the same typo the other way: a top-of-book row carries no in-band snapshot stream, so a
+    /// And the same typo the other way: a top-of-book row carries no in-band snapshot feed, so a
     /// third port would bind a socket the protocol never fills.
     #[test]
     fn a_top_of_book_row_with_a_snapshot_port_is_fatal() {

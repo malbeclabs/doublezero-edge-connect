@@ -16,7 +16,7 @@ contract.
   (no TLS - this service is intended for a trusted/local network; terminate TLS at a reverse
   proxy if you must expose it).
 - The server **pushes** market data. A consumer may optionally **subscribe** to narrow the
-  stream to specific venues/symbols; with no subscription it receives everything
+  feed to specific venues/symbols; with no subscription it receives everything
   (see [Subscriptions](#subscriptions--filtering)).
 - **Liveness**: the server sends periodic WebSocket Pings and closes a client that is silent
   past an idle timeout; clients may also send an app-level ping
@@ -43,8 +43,8 @@ On each new connection the producer:
 connect -> instrument (xN) -> depth (xM, current books) -> quote -> trade -> depth -> ...
 ```
 
-A consumer that connects mid-stream is therefore always able to build instruments first. New or
-changed instrument definitions may also arrive at any later point in the stream.
+A consumer that connects partway through is therefore always able to build instruments first. New or
+changed instrument definitions may also arrive at any later point in the feed.
 
 ## Message envelope
 
@@ -188,7 +188,7 @@ more than one `channel`.
 
 A single **derived mid price** for a symbol, from the DZ Edge Midpoint sibling feed. Like a
 `quote` it is **full state** per instrument (the latest mid), so it self-heals on the next message;
-a consumer that connects mid-stream sees the matching `instrument` (for precision) first.
+a consumer that connects partway through sees the matching `instrument` (for precision) first.
 
 | Field            | Type   | Meaning                                                                |
 |------------------|--------|------------------------------------------------------------------------|
@@ -238,7 +238,7 @@ first** (bids high→low, asks low→high).
 
 **Each `depth` message is full state** (the complete top *N*, not a delta), so - like `quote` - it
 **self-heals**: a consumer that drops one under backpressure recovers on the next snapshot, and a
-client that connects mid-stream is replayed the latest `depth` per symbol on connect (after the
+client that connects partway through is replayed the latest `depth` per symbol on connect (after the
 `instrument` definitions).
 
 > **Market-by-Order produces `depth` *and* `book`.** The producer runs that feed's snapshot+delta
@@ -297,12 +297,12 @@ The two granularities are **two message types**, not one type with a flag. `book
 
 **One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed, and a consumer sees one coherent book from them, never two to merge. How that happens depends on whether the changes carry an `order_id`, but the consumer contract is the same either way and it is never told which publisher it is reading.
 
-- **Price-aggregated.** The producer elects one authoritative publisher per market and republishes only its stream. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow.
+- **Price-aggregated.** The producer elects one authoritative publisher per market and republishes only its feed. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow.
 - **Order-level.** Every publisher stamps the venue's own `order_id`, so the producer instead publishes each venue event's first arrival and collapses the rest: a consumer gets each event once, from whichever publisher was fastest for *that* event. A change for an order the producer has already published as gone is refused, so a lagging publisher cannot resurrect it. A publisher recovering by snapshot republishes its whole book only when no peer is both healthy and currently serving the market, so a recovery cannot wipe a book another publisher is keeping current — while a publisher that stops reaching the producer cannot block the recovery either.
 
 Either way a consumer that honors `clear` needs nothing else.
 
-**The bootstrap matches the market, always.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a stream of different granularity. There is no way to ask for anything else: an order-level change carries one *order's* absolute size, so a client bootstrapped with price levels holds no order state to apply the live stream to.
+**The bootstrap matches the market, always.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a feed of different granularity. There is no way to ask for anything else: an order-level change carries one *order's* absolute size, so a client bootstrapped with price levels holds no order state to apply the live feed to.
 
 ### `status`
 
@@ -320,7 +320,7 @@ alone** (a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hy
 A venue is reported `down` only when **every** publisher mirroring its quote feed has gone silent
 past the idle window; a single wedged publisher does not produce a `status` transition, because the
 remaining publishers still deliver full-state updates for that venue. `status` stays what it has
-always been — the health of the venue's *quote* stream — so a depth-only (Market-by-Order) publisher
+always been — the health of the venue's *quote* feed — so a depth-only (Market-by-Order) publisher
 going silent is not reported here, and a healthy one does not suppress a quote outage.
 
 **A source whose receivers have revealed no Source ID may never produce a `status` message at
@@ -400,7 +400,7 @@ Consequences for a consumer:
   newer-generation publisher's reference data alone is enough to reveal it.
 - Both generations can be live at once — a host may hold publishers of either kind for different
   venues, or for different rows of the same venue — so a consumer should not assume the deferral
-  rule observed for one source holds for every source on the stream.
+  rule observed for one source holds for every source on the feed.
 
 The deferral itself is deliberate, for whichever generation still needs it. The alternative is
 announcing an instrument under a name the bridge guessed, which is what the previous behaviour
@@ -408,7 +408,7 @@ did.
 
 ## Subscriptions & filtering
 
-A consumer may send control messages (JSON text frames) to filter the stream. **Subscriptions
+A consumer may send control messages (JSON text frames) to filter the feed. **Subscriptions
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
@@ -446,7 +446,7 @@ are otherwise ignored.
 
 Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
 
-**The granularity of that replay is the market's, not the subscription's.** An order-level market is bootstrapped as every resting order with its `order_id`, under `order_book`; a price-aggregated one as price levels carrying `order_id: 0`, under `book` — see [*The bootstrap matches the market*](#book). The bootstrap therefore carries the same `type` as the stream it precedes, so a `{"type":"book"}` subscriber is never bootstrapped with a market it could not then apply.
+**The granularity of that replay is the market's, not the subscription's.** An order-level market is bootstrapped as every resting order with its `order_id`, under `order_book`; a price-aggregated one as price levels carrying `order_id: 0`, under `book` — see [*The bootstrap matches the market*](#book). The bootstrap therefore carries the same `type` as the feed it precedes, so a `{"type":"book"}` subscriber is never bootstrapped with a market it could not then apply.
 
 ## Heartbeat & liveness
 

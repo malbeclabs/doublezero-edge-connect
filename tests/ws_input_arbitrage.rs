@@ -8,7 +8,7 @@
 //!   2. **edge gap → public fills in** — the edge feed prints its real quotes first (revealing BTC's
 //!      Source ID and advancing the floor to the golden's last tick — see `ingest::processor`'s
 //!      per-instrument deferral, which holds prices back until the edge has revealed the instrument
-//!      at least once; a cold start with no edge price at all isn't backstoppable, only a mid-stream
+//!      at least once; a cold start with no edge price at all isn't backstoppable, only a gap partway
 //!      gap is), THEN goes quiet; the public feed opens each tick after that and is emitted, so a
 //!      consumer keeps seeing top-of-book through the gap.
 //!
@@ -144,7 +144,7 @@ async fn edge_leads_steady_state_public_dropped() {
 /// quiet and the public feed opens ticks after that — the consumer keeps seeing top-of-book through
 /// the gap, with no health check anywhere in the path.
 ///
-/// This is a mid-stream gap, not a cold start: `ingest::processor`'s per-instrument deferral holds
+/// This is a gap partway through, not a cold start: `ingest::processor`'s per-instrument deferral holds
 /// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
 /// once (refdata alone never does), so an edge that never once goes live for an instrument gives the
 /// public feeder's precision gate nothing to key against either — that is a feed that was never live
@@ -175,7 +175,7 @@ async fn edge_gap_public_fills_in() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Edge refdata AND mktdata: BTC prints real quotes (revealing its Source ID and advancing the
-    // floor), before the edge goes quiet — the gap that follows is mid-stream.
+    // floor), before the edge goes quiet — the gap that follows opens partway through.
     tokio::task::spawn_blocking(move || {
         replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));

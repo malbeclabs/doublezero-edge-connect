@@ -4,7 +4,7 @@
 //! (demultiplexed by source IP so each one's datagram-sequence state stays separate, see
 //! `receiver`/`processor`) **and** the Hyperliquid public WebSocket feeder ([`crate::ingest::ws_feeder`])
 //! — they all converge on one [`Arbiter`] just before the broadcast channel. The arbiter deduplicates
-//! the *output* keyed on business identity, so a subscriber sees a clean stream regardless of which
+//! the *output* keyed on business identity, so a subscriber sees a clean feed regardless of which
 //! source delivered a given update first. Because every source races through the **same** per-`(venue,
 //! symbol)` floor, a public-feed copy of an update the edge already emitted collapses into a no-op —
 //! and when the edge gaps, the public copy is the first to cross the floor and fills in (the backstop,
@@ -14,7 +14,7 @@
 //! - quotes ([`StalenessFloor`]): a full-state BBO is a *snapshot*, but two distinct BBOs can share
 //!   a `source_ts` (the venue stamps coarsely — block-granular — while the book changes faster), so
 //!   one `source_ts` "tick" holds a whole sub-sequence of real top-of-book changes. The catch: the
-//!   only trustworthy ordering of those changes is a *single* publisher's own stream. Arrival order
+//!   only trustworthy ordering of those changes is a *single* publisher's own feed. Arrival order
 //!   across publishers is corrupted by per-publisher network delay (the `hl-bbo-feed-race` board
 //!   shows inter-feed skew over 100 ms), so interleaving two sources inside one tick can serve a
 //!   stale sample as the freshest — on a falling price, a slower publisher's older, higher sample
@@ -96,7 +96,7 @@ const BOUND_JUMP: &str = "jump";
 const BOUND_ANCHOR: &str = "anchor";
 
 /// Cap on markets whose `book` state the authority gate tracks, evicting oldest-first. The key is
-/// wire-supplied `(channel_id, instrument_id)`, so a forged stream must cost evictions rather than
+/// wire-supplied `(channel_id, instrument_id)`, so a forged feed must cost evictions rather than
 /// memory; the cap sits an order of magnitude above the largest real venue (~1,200 instruments).
 const MAX_BOOK_MARKETS: usize = 16_384;
 
@@ -157,7 +157,7 @@ const MAX_TOMBSTONES_TOTAL: usize = 1 << 20;
 const MAX_FORGOTTEN_PER_BATCH: usize = 4_096;
 
 /// Cap on the per-channel venue clocks tracked. The channel id is wire-supplied like every other key
-/// here, so a forged stream must cost evictions rather than memory; losing a clock degrades that
+/// here, so a forged feed must cost evictions rather than memory; losing a clock degrades that
 /// channel to "frontier unset", which its next batch re-seeds.
 const MAX_CHANNEL_CLOCKS: usize = MAX_BOOK_MARKETS;
 
@@ -185,7 +185,7 @@ const DEFAULT_BOOK_DEDUP_WINDOW_NS: u64 = 1_000_000_000; // 1s
 /// **Its own constant, not [`DEFAULT_BOOK_DEDUP_WINDOW_NS`], which it used to share.** They are two
 /// different quantities that happened to hold the same number: the window is how long a delivered
 /// event is remembered, and widening it to stop healthy paths manufacturing false disagreements
-/// (250 ms -> 1 s) silently quadrupled how much of a real disagreement's stream is skipped — batches
+/// (250 ms -> 1 s) silently quadrupled how much of a real disagreement's feed is skipped — batches
 /// withheld here are lost, not delayed. Kept at the interval that was in force when the two were the
 /// same value, so the cost of a real disagreement is what it was measured at.
 const FORCED_REBASELINE_MIN_INTERVAL_NS: u64 = 250_000_000; // 250ms
@@ -912,7 +912,7 @@ struct MarketEvents {
     examined: u64,
     /// One-shot: why this market can no longer be served from either path's deltas, drained by the
     /// caller. Set when two paths disagreed about an order's resting state, because from then on
-    /// neither publisher's stream is known to describe the book a consumer holds.
+    /// neither publisher's feed is known to describe the book a consumer holds.
     forced: Option<&'static str>,
 }
 
@@ -1495,7 +1495,7 @@ struct BookMarket {
     /// the single-path gate.
     order_level: bool,
     /// **Every** eligible path's accumulated book, not just the serving one. A transfer re-baselines
-    /// the consumer against the new path's *current* levels, which exist only if its stream was folded
+    /// the consumer against the new path's *current* levels, which exist only if its feed was folded
     /// in all along. Bounded by the caller's eligibility check (`StickyAuthority::tracks_path`).
     paths: HashMap<Transport, BookAccumulator>,
     /// Set when the serving path changed. The re-baseline then waits for that path to close a logical
@@ -1951,7 +1951,7 @@ impl Arbiter {
     /// Republish `publisher`'s whole book for `key` as a re-baseline — a `clear` plus its complete
     /// current level set — and reset the shared replay entry to that path's accumulator.
     ///
-    /// `None` when the accumulator is not [`BookAccumulator::baselined`]: seeded mid-stream, it holds
+    /// `None` when the accumulator is not [`BookAccumulator::baselined`]: seeded partway through, it holds
     /// only the levels that have moved since, so publishing it as `snapshot` would tell the consumer to
     /// discard every level it is missing. The caller degrades to a bare `clear`, which is incomplete
     /// but says so — and the replay entry carries the same flag, so the WS replay skips it too.
@@ -1964,8 +1964,8 @@ impl Arbiter {
         if let Some(replay) = &self.book_replay {
             model::lock(replay).insert(key.clone(), acc.clone());
         }
-        // `Orders` scope: this re-baselines the live stream, so it must carry whatever granularity that
-        // stream carries, or an order-level consumer is handed levels and then cancels for ids it never
+        // `Orders` scope: this re-baselines the live feed, so it must carry whatever granularity that
+        // feed carries, or an order-level consumer is handed levels and then cancels for ids it never
         // saw. A price-aggregated market holds no orders, so the two scopes render identically for it.
         acc.baselined()
             .then(|| acc.to_book(key, ReplayScope::Orders))
@@ -2220,7 +2220,7 @@ impl Arbiter {
             }
             // Only for a market that holds a population. Reporting zero for one that holds nothing
             // would ask the high-water to re-seat — one pass over every tracked market — on a batch
-            // that made no state, which is a forged stream's cheapest scan.
+            // that made no state, which is a forged feed's cheapest scan.
             if let Some(n_dead) = held {
                 self.observe_market_peak(&key, n_dead);
             }
@@ -2518,7 +2518,7 @@ impl Arbiter {
     }
 
     /// The market's book as the wire has delivered it, as a `clear`-led re-baseline. `None` when no
-    /// replay map is wired or its accumulator is not [`BookAccumulator::baselined`] — seeded mid-stream
+    /// replay map is wired or its accumulator is not [`BookAccumulator::baselined`] — seeded partway through
     /// it holds only what has moved since, and publishing that as `snapshot` would tell the consumer to
     /// discard every level it is missing. Materialized under the shared lock rather than cloned out of
     /// it, for the reason `sinks/hyperliquid.rs` does the same.
@@ -2558,7 +2558,7 @@ impl Arbiter {
     }
 
     /// Broadcast one order-level batch and advance the shared replay accumulator with it, so a client
-    /// connecting mid-stream is bootstrapped from what actually reached the wire rather than from any
+    /// connecting partway through is bootstrapped from what actually reached the wire rather than from any
     /// single publisher's copy.
     fn publish_book(&mut self, key: &MarketKey, b: NormalizedBook) {
         if !self.book_markets.contains_key(key) {
@@ -2636,7 +2636,7 @@ impl Arbiter {
     /// Scope first, because it is what makes every rule below safe to state: a single Source ID can
     /// carry instrument universes that mirror nothing of one another, and this gate exists to pick
     /// one path out of a set of *mirrors*. Keyed on the venue alone it would instead pick one path
-    /// across disjoint universes and drop the other's whole stream — permanently, since the silence
+    /// across disjoint universes and drop the other's whole feed — permanently, since the silence
     /// handover needs the incumbent to stop and an incumbent streaming its own universe never does.
     /// The symptom is empty candles for that universe, indistinguishable from a market that did not
     /// trade. `Feed::category` is the registry's declaration of which rows mirror each other, and it
@@ -2663,11 +2663,11 @@ impl Arbiter {
     ///   so the tape converges on the path serving the books. Sound because a publisher host uses one
     ///   source IP for both of a venue's protocols, making path identity shared across its rows. Honored
     ///   once per election, not per print: re-honoring it on every print would let an elected path whose
-    ///   trade stream is nearly dead reclaim the tape from the healthy peer after each straggler and
+    ///   trade feed is nearly dead reclaim the tape from the healthy peer after each straggler and
     ///   mute it for another window — the two rules would fight and the tape would sawtooth. A silence
     ///   handover marks the election it overrode as spent, which is what closes that loop.
     /// - **Silence handover.** A challenger also takes over after [`NO_ID_TAPE_HANDOVER_NS`] of
-    ///   incumbent silence — otherwise an elected path whose *trade* stream is dead would mute the tape.
+    ///   incumbent silence — otherwise an elected path whose *trade* feed is dead would mute the tape.
     ///
     /// ⚠️ Two limits, both inherited from the unauthenticated wire rather than introduced here. On a
     /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged source that
@@ -2678,7 +2678,7 @@ impl Arbiter {
     /// between them the non-serving path's exclusive fills would be dropped — the registry's job is to
     /// give sharded rows distinct categories. `dz_tape_path_dropped_total` is what makes either visible
     /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
-    /// here is the challenger's whole stream.
+    /// here is the challenger's whole feed.
     ///
     /// The two `books` lookups below read the authority at the **same** `(venue, category)` grain
     /// this gate runs at, so the deferral can only ever name a path elected on *this* universe. While
@@ -3043,7 +3043,7 @@ impl Arbiter {
                             vm.depth_ticks_won[pub_idx(publisher)].inc();
                         }
                         // Update the WS-replay snapshot with the leader's admitted book, so a client
-                        // connecting mid-stream replays exactly what was broadcast (not a dropped
+                        // connecting partway through replays exactly what was broadcast (not a dropped
                         // non-leader's divergent copy).
                         if let Some(replay) = &self.depth_replay {
                             model::lock(replay)
@@ -3078,7 +3078,7 @@ impl Arbiter {
             FeedMessage::Book(b) | FeedMessage::OrderBook(b) => {
                 // The arbitration scope rides in on the key: one election per instrument universe,
                 // never one per venue (see `authority`'s module doc — a venue-wide election drops a
-                // disjoint universe's whole book stream).
+                // disjoint universe's whole book feed).
                 let scope: ScopeKey = (b.venue.clone(), category_arc(category));
                 let key: MarketKey = (scope.0.clone(), scope.1.clone(), b.channel, b.instrument_id);
                 // Eligibility first, exactly as `admit` applies it: a path past the authority's
@@ -3109,7 +3109,7 @@ impl Arbiter {
                 let prev = self.books.last_admitted(&key);
                 let leader_before = self.books.scope_leader(&scope);
                 let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
-                // Accumulate the path's stream whether or not it was admitted: a transfer republishes
+                // Accumulate the path's feed whether or not it was admitted: a transfer republishes
                 // the new path's current levels, which exist only if its copies were folded in all along.
                 self.accumulate_book(&key, publisher, b);
                 if !decision.emitted() {
@@ -4039,7 +4039,7 @@ mod tests {
 
     /// The WS-replay map records the LEADER's admitted book, never a dropped non-leader's divergent
     /// copy. Pins the review fix: the replay snapshot must match what was broadcast, so a client
-    /// connecting mid-stream never bootstraps from a book that never crossed the floor.
+    /// connecting partway through never bootstraps from a book that never crossed the floor.
     #[test]
     fn arbiter_depth_replay_records_leader_not_dropped_nonleader() {
         let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -4842,7 +4842,7 @@ mod tests {
         race_trades(&mut a, venue, path(2), path(1), 6);
         a.close_authority_windows();
 
-        // path(1) has lost the venue; its stream stops reaching the wire.
+        // path(1) has lost the venue; its feed stops reaching the wire.
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 11.0)], true, 2_000),
             path(1),
@@ -4998,13 +4998,13 @@ mod tests {
     /// started accumulating. Publishing that as `snapshot` would tell the consumer to discard every
     /// level it is missing, so the gate degrades to a bare `clear` — incomplete, but honest.
     #[test]
-    fn a_mid_stream_path_rebaselines_with_a_bare_clear() {
-        let venue = "BookMidStreamPath";
+    fn a_path_that_joined_partway_rebaselines_with_a_bare_clear() {
+        let venue = "BookPathJoinedPartway";
         let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (tx, mut rx) = broadcast::channel(64);
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
         synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 1_000);
-        // path(2) joins mid-stream: deltas only, no re-baseline of its own.
+        // path(2) joins partway through: deltas only, no re-baseline of its own.
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_100),
             path(2),
@@ -5212,7 +5212,7 @@ mod tests {
     }
 
     /// The election deferral fires once per election, not per print. Otherwise an elected path whose
-    /// trade stream is nearly dead would reclaim the tape after every straggler and mute the healthy
+    /// trade feed is nearly dead would reclaim the tape after every straggler and mute the healthy
     /// peer for another window — the two rules would fight and the tape would sawtooth.
     #[test]
     fn a_straggler_from_the_elected_path_does_not_reclaim_the_tape() {
@@ -5234,7 +5234,7 @@ mod tests {
         tape_print(&mut a, venue, path(2), 2, t0);
         let _ = drain_trades(&mut rx);
 
-        // One straggler from path(1) must not take it back; path(2)'s stream keeps reaching the wire.
+        // One straggler from path(1) must not take it back; path(2)'s feed keeps reaching the wire.
         tape_print(&mut a, venue, path(1), 3, t0 + 1);
         for i in 0..3 {
             tape_print(&mut a, venue, path(2), 10 + i, t0 + 2 + i);
@@ -6172,7 +6172,7 @@ mod tests {
             before_forced + 1
         );
 
-        // The next completed logical event re-baselines rather than resuming the delta stream, then
+        // The next completed logical event re-baselines rather than resuming the delta feed, then
         // lands on top of it — the batch is published, just not onto a book nobody vouches for.
         a.emit(
             l3_batch(VENUE, vec![order(BookAction::Update, 9, 99.0, 1.0)], 1_200),
@@ -6206,7 +6206,7 @@ mod tests {
             a.set_book_synced(&key, p, true);
         }
 
-        // Seeded mid-stream: no producer `Clear` has ever been folded in, so the accumulator holds
+        // Seeded partway through: no producer `Clear` has ever been folded in, so the accumulator holds
         // only what has moved since and cannot honestly be republished as full state.
         a.emit(
             l3_batch(VENUE, vec![order(BookAction::Update, 7, 100.0, 6.0)], 1_000),
@@ -6417,7 +6417,7 @@ mod tests {
 
     /// A forced re-baseline's rate limit is its own quantity, not the dedup window's. The two shared a
     /// number until the window was widened for its dedup reach — which is right for that job and
-    /// silently quadrupled how much of a real disagreement's stream is skipped, since a batch withheld
+    /// silently quadrupled how much of a real disagreement's feed is skipped, since a batch withheld
     /// here is lost rather than delayed. A window set far below the limit must not shorten it.
     #[test]
     fn the_rebaseline_rate_limit_does_not_follow_the_dedup_window() {
@@ -6948,7 +6948,7 @@ mod tests {
         assert_eq!(a.guard.held, held);
     }
 
-    /// The channel clocks are keyed on the wire's `(venue, category, channel_id)`, so a forged stream
+    /// The channel clocks are keyed on the wire's `(venue, category, channel_id)`, so a forged feed
     /// must cost evictions rather than memory. Losing a clock degrades that channel to "frontier
     /// unset", which its next batch re-seeds.
     ///

@@ -1,5 +1,5 @@
 //! Phoenix **public-API** WebSocket trade feeder — a [`PublicVenue`] backstop for the edge Phoenix
-//! multicast TRADE stream, off by default.
+//! multicast TRADE feed, off by default.
 //!
 //! It connects to Phoenix's public `wss://perp-api.phoenix.trade/v1/ws`, subscribes the `trades`
 //! channel per configured market, decodes each fill into a `NormalizedTrade`, and emits it through

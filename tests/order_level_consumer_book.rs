@@ -1,5 +1,5 @@
 //! The load-bearing property test the Market-by-Order design named: drive a synthetic two-publisher
-//! order-level stream through the arbiter, apply what it publishes with a naive consumer that does
+//! order-level feed through the arbiter, apply what it publishes with a naive consumer that does
 //! exactly what PROTOCOL.md tells a consumer to do, and assert that book equals the venue's at every
 //! re-baseline boundary and at the end.
 //!
@@ -416,11 +416,11 @@ fn drain_markets(
     }
 }
 
-/// Two markets on one channel, carrying **colliding order ids**: what one market's stream does to
+/// Two markets on one channel, carrying **colliding order ids**: what one market's feed does to
 /// an order must not reach the other's. Every state the merge point keeps is per market, and one
 /// kept per channel would cross them.
 #[test]
-fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
+fn one_markets_feed_leaves_another_on_the_same_channel_alone() {
     let (mut a, mut rx, fast, slow) = harness_over(&[INSTRUMENT, INSTRUMENT_B]);
     let (mut venue_a, mut venue_b) = (Book::new(), Book::new());
     let mut markets: BTreeMap<u32, Book> = BTreeMap::new();
@@ -697,7 +697,7 @@ const LIFECYCLE: [Event; 8] = [
 
 /// `rounds` copies of [`LIFECYCLE`], each on its own order ids and prices, so a scenario can run
 /// long enough for a lagging path to stay behind for the whole of it.
-fn lifecycle_stream(rounds: u64) -> Vec<Event> {
+fn lifecycle_events(rounds: u64) -> Vec<Event> {
     (0..rounds)
         .flat_map(|r| {
             LIFECYCLE
@@ -765,19 +765,19 @@ fn a_venue_time_skew_alone_does_not_drift_the_consumer() {
         venue_ns: 5_000_000,
     };
     let (_a, _rx, consumer, venue) =
-        arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, skew, true);
+        arrival_lagged_feed(&lifecycle_events(1), 1_000_000, skew, true);
     assert_eq!(consumer, venue);
 }
 
 /// A single publisher streaming a market's whole life. Nothing races, so the consumer's book has to
 /// equal the venue's after **every** event, not merely at the end.
 #[test]
-fn a_single_paths_stream_reaches_the_consumer_exactly() {
+fn a_single_paths_feed_reaches_the_consumer_exactly() {
     let (mut a, mut rx, only, peer) = harness();
     a.forget_publisher_books(CATEGORY, peer);
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    for (i, &e) in lifecycle_stream(1).iter().enumerate() {
+    for (i, &e) in lifecycle_events(1).iter().enumerate() {
         let t = 1_000 + i as u64 * 100;
         venue_apply(&mut venue, e);
         a.emit(batch(vec![ev_change(e)], t, t), only, CATEGORY);
@@ -795,7 +795,7 @@ fn two_paths_in_lockstep_publish_each_event_once() {
     let (mut venue, mut consumer) = (Book::new(), Book::new());
     let (mut published, mut expected) = (Vec::new(), Vec::new());
 
-    for (i, &e) in lifecycle_stream(1).iter().enumerate() {
+    for (i, &e) in lifecycle_events(1).iter().enumerate() {
         let t = 1_000 + i as u64 * 100;
         venue_apply(&mut venue, e);
         expected.push(ev_change(e));
@@ -818,7 +818,7 @@ fn two_paths_in_lockstep_publish_each_event_once() {
 /// by its own next copy, so a terminal comparison alone passes even with the racing guard removed
 /// outright. Step by step it does not — under correct behaviour every trailer copy is collapsed and
 /// publishes nothing, so the consumer never leaves the venue's state as of the last leader arrival.
-fn arrival_lagged_stream(
+fn arrival_lagged_feed(
     events: &[Event],
     spacing_ns: u64,
     lag: Lag,
@@ -865,7 +865,7 @@ fn arrival_lagged_stream(
 /// It replaces a sweep that stopped at 1 s, and the two tests it replaces both compared only at the
 /// **end** of the run — where a trailer replaying the venue's whole life in order has converged on
 /// its own, so they passed with the racing guard removed outright. This one goes through
-/// `arrival_lagged_stream`, which asserts after every arrival.
+/// `arrival_lagged_feed`, which asserts after every arrival.
 ///
 /// What set the old 1 s ceiling was the per-market **event count** (1,024): past it a trailing path's
 /// copy of an add for an order the leader had since partially filled stopped reading as a duplicate
@@ -881,9 +881,9 @@ fn arrival_lagged_stream(
 fn the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling() {
     // 320 events at 400 ms spans 128 s of venue time, so the widest lag below is still inside the
     // run rather than arriving after it has ended.
-    let events = lifecycle_stream(40);
+    let events = lifecycle_events(40);
     for lag_s in [0u64, 1, 10, 30, 60] {
-        let (_a, _rx, consumer, venue) = arrival_lagged_stream(
+        let (_a, _rx, consumer, venue) = arrival_lagged_feed(
             &events,
             400_000_000,
             Lag::arrival(lag_s * 1_000_000_000),
@@ -900,7 +900,7 @@ fn an_path_behind_in_arrival_only_does_not_drift_the_consumer() {
     let lag = Lag::arrival(5_000_000);
     for leader_is_first_path in [true, false] {
         let (_a, _rx, consumer, venue) =
-            arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, lag, leader_is_first_path);
+            arrival_lagged_feed(&lifecycle_events(1), 1_000_000, lag, leader_is_first_path);
         assert_eq!(
             consumer, venue,
             "leader_is_first_path={leader_is_first_path}"
@@ -1125,9 +1125,9 @@ fn an_path_that_departs_and_returns_keeps_the_consumer_exact() {
 /// the wire afterwards.
 #[test]
 fn a_permanently_slower_path_never_stops_the_market_being_served() {
-    let events = lifecycle_stream(5);
+    let events = lifecycle_events(5);
     let (mut a, mut rx, mut consumer, mut venue) =
-        arrival_lagged_stream(&events, 10_000_000, Lag::arrival(250_000_000), true);
+        arrival_lagged_feed(&events, 10_000_000, Lag::arrival(250_000_000), true);
     assert_eq!(consumer, venue, "a permanent lag must not drift the book");
 
     // Each path in turn, on a fresh order: the market is still being served from both.
@@ -1294,7 +1294,7 @@ fn a_returning_links_contiguous_backlog_reaches_no_consumer() {
 
     // The leader streams a market's life across two retention windows of venue time while the
     // returning path's link is down.
-    let events = lifecycle_stream(60);
+    let events = lifecycle_events(60);
     let spacing = 2 * RETENTION_NS / events.len() as u64;
     let stamps: Vec<u64> = (0..events.len() as u64)
         .map(|i| 1_000 + i * spacing)

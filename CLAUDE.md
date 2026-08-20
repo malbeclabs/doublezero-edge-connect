@@ -248,7 +248,7 @@ Modules are grouped by role under `src/`:
   their `edge-kalshi-*` codes and nothing fed the old name in. A `venue` in `FEEDS`
   **must** be a name
   `source_id_of` resolves, or `receiver::record_revealed` silently drops it and the row's `status`
-  stream goes unrecorded. An unassigned ID gets a stable synthesized `SOURCE_<id>` (distinct per ID,
+  feed goes unrecorded. An unassigned ID gets a stable synthesized `SOURCE_<id>` (distinct per ID,
   since the arbiter keys dedup on `(venue, symbol)`), bounded by `MAX_UNREGISTERED_SOURCES`.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
@@ -397,7 +397,7 @@ Modules are grouped by role under `src/`:
   per print would let a nearly-dead elected path sawtooth the tape away from the healthy peer); and a
   silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS`, marking the election it overrode as spent.
   The peer's prints are dropped on their own `dz_tape_path_dropped_total` (not folded into
-  `dz_trades_dropped_total`, whose steady state here is the challenger's whole stream); transfers are
+  `dz_trades_dropped_total`, whose steady state here is the challenger's whole feed); transfers are
   `dz_tape_path_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
@@ -560,7 +560,7 @@ Modules are grouped by role under `src/`:
   every sequence check the producer ran still passes. One path serves a market and the peer is ingested and
   dropped (`dz_book_dropped_total`). The gate is keyed on `(venue, category)` — `authority::ScopeKey`,
   which also prefixes `MarketKey` — never on the venue alone: one Source ID can carry universes that
-  mirror nothing, and a venue-wide election drops the losing universe's whole book stream permanently
+  mirror nothing, and a venue-wide election drops the losing universe's whole book feed permanently
   (the only escape is leader silence, and a leader streaming its own universe is never silent).
   **Speed and silence are per path, across that path's universe; health is per market**. The path-ordinal
   cap (`MAX_LABELLED_PATHS`, 8) is likewise **per scope**, so a venue carrying N universes admits up to
@@ -631,11 +631,11 @@ Modules are grouped by role under `src/`:
   `side` maps `bid->buy`/`ask->sell`. No `FEEDS` row depends on it (off until enabled).
 - **`ingest/processor.rs`** — the per-protocol `DatagramProcessor` impls (own each protocol's state and
   emit `FeedMessage`s via `ctx.emit`): `TobProcessor` (quotes + trades), `MidpointProcessor` (mids),
-  `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`,
+  `MboProcessor` (feeds order deltas + the snapshot feed into `book.rs` and emits full-state `depth`,
   the order-level `book` and trades — `emit_book` mirrors `emit_depth`'s gates exactly, and each book's
   sync state is reported to the arbiter *before* the datagram's emissions so the re-baseline suppression has
   a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
-  suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
+  suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot feed into `pricebook.rs` and emits the
   incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
@@ -712,7 +712,7 @@ Modules are grouped by role under `src/`:
   rejects, and `order_set` materializes the whole book, deterministically ordered so two publishers'
   copies compare byte-for-byte. The removed-order set (`MAX_REMOVED_ORDERS`,
   `dz_mbo_removed_evicted_total`) is **defence in depth, not the cross-publisher guard**: one book sees
-  one publisher's stream, where the sequence check already rejects a repeat, so what it catches is a
+  one publisher's feed, where the sequence check already rejects a repeat, so what it catches is a
   forged `Add` re-using a dead id at a contiguous sequence. The racing guard is at the merge point
   (`arbiter.rs`), the only scope with the shared identity to see a *peer's* delete. A refused `Add`
   still consumes its sequence number, or the next contiguous delta would read as a gap. Session and
@@ -749,7 +749,7 @@ Modules are grouped by role under `src/`:
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
   `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
-  (`status`) paths call, so a new dimension can't silently exempt half the stream; a channelless
+  (`status`) paths call, so a new dimension can't silently exempt half the feed; a channelless
   message is excluded by an explicit `channel` filter, with `status` (venue-level) the one carve-out —
   `instrument` carries its own channel and is filtered like `book`, including on the replay path. Plus app ping/pong + server WS-ping heartbeat with idle-timeout reaping, and the limits
   (max clients/subs/inbound-rate, broadcast backpressure where a slow client drops oldest). The
@@ -783,7 +783,7 @@ Modules are grouped by role under `src/`:
   subscribed to is never folded; `dz_hl_sink_folds_total` is the check. The stage's own `Lagged` becomes
   a `Prepared::Resync` — clients see their own lag but not the stage's, and `l4Book` cannot self-heal
   without being told. `l2Book` is gated on `baselined() && is_order_level()`: it *replaces* a Nautilus
-  consumer's book wholesale, so a market accumulated mid-stream must be withheld, not published as if
+  consumer's book wholesale, so a market accumulated partway through must be withheld, not published as if
   whole — and a price-aggregated market, whose orders this sink cannot read, would render as an empty
   book. An `l4Book` **re-baseline renders from the batch**, which is complete by construction, never
   from the accumulator (advanced *before* the broadcast, so a queued client would get a snapshot
