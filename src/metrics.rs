@@ -484,16 +484,16 @@ impl Metrics {
             quotes_admitted: counter_vec(
                 &registry,
                 "dz_quotes_admitted_total",
-                "Quotes admitted by the staleness floor, by winning publisher (edge/public)",
-                &["venue", "publisher"],
+                "Quotes admitted by the staleness floor, by winning transport class (edge/public)",
+                &["venue", "transport"],
             ),
             quote_ticks_won: counter_vec(
                 &registry,
                 "dz_quote_ticks_won_total",
-                "Quote source_ts ticks won (first delivery of each tick), by publisher class \
+                "Quote source_ts ticks won (first delivery of each tick), by transport class \
                  (edge/public); every tick counts exactly once, so edge/sum is the published \
                  win rate",
-                &["venue", "publisher"],
+                &["venue", "transport"],
             ),
             quotes_dropped: counter_vec(
                 &registry,
@@ -504,8 +504,8 @@ impl Metrics {
             trades_admitted: counter_vec(
                 &registry,
                 "dz_trades_admitted_total",
-                "Trades admitted by the windowed dedup, by winning publisher (edge/public)",
-                &["venue", "publisher"],
+                "Trades admitted by the windowed dedup, by winning transport class (edge/public)",
+                &["venue", "transport"],
             ),
             trades_dropped: counter_vec(
                 &registry,
@@ -548,21 +548,21 @@ impl Metrics {
             depth_admitted: counter_vec(
                 &registry,
                 "dz_depth_admitted_total",
-                "MBO depth admitted by the staleness floor, by winning publisher (edge/public)",
-                &["venue", "publisher"],
+                "MBO depth admitted by the staleness floor, by winning transport class (edge/public)",
+                &["venue", "transport"],
             ),
             depth_ticks_won: counter_vec(
                 &registry,
                 "dz_depth_ticks_won_total",
-                "MBO depth source_ts ticks won (first delivery of each tick), by publisher class \
+                "MBO depth source_ts ticks won (first delivery of each tick), by transport class \
                  (edge/public); the depth mirror of dz_quote_ticks_won_total",
-                &["venue", "publisher"],
+                &["venue", "transport"],
             ),
             depth_dropped: counter_vec(
                 &registry,
                 "dz_depth_dropped_total",
-                "MBO depth dropped by the staleness floor, by the publisher whose copy was dropped",
-                &["venue", "publisher"],
+                "MBO depth dropped by the staleness floor, by the transport class whose copy was dropped",
+                &["venue", "transport"],
             ),
             depth_floor_resets: counter_vec(
                 &registry,
@@ -707,9 +707,9 @@ impl Metrics {
             book_dropped: counter_vec(
                 &registry,
                 "dz_book_dropped_total",
-                "Incremental book batches the authority gate did not publish, by the publisher class \
+                "Incremental book batches the authority gate did not publish, by the transport class \
                  whose copy was dropped (in steady state, the challenger path's whole stream).",
-                &["venue", "publisher"],
+                &["venue", "transport"],
             ),
             book_markets_evicted: counter_vec(
                 &registry,
@@ -1013,12 +1013,12 @@ impl Metrics {
             ),
             unregistered_sources: counter(
                 &registry,
-                "dz_unregistered_sources_total",
+                "dz_unregistered_source_ids_total",
                 "Distinct Source IDs seen with no registry row",
             ),
             unregistered_source_labels_capped: counter(
                 &registry,
-                "dz_unregistered_source_labels_capped_total",
+                "dz_unregistered_source_id_labels_capped_total",
                 "Messages labelled UNREGISTERED because the distinct-unregistered-ID cap was reached",
             ),
             history_unattributable_trades: counter_vec(
@@ -1226,9 +1226,85 @@ mod tests {
             "dz_shred_lead_ns",
             "dz_history_unattributable_trades_total",
             "dz_history_feed_lagged_total",
+            "dz_unregistered_source_ids_total",
+            "dz_unregistered_source_id_labels_capped_total",
         ] {
             assert!(out.contains(name), "expected `{name}` in metrics output");
         }
+    }
+
+    /// The two cardinalities that used to share the `publisher` label must not silently re-merge:
+    /// the receiver-side series are per publisher (the value is a base port), the arbiter-side ones
+    /// per transport class (`edge`/`public`). A rename that moved a series to the wrong label would
+    /// leave a dashboard grouping base ports against `edge` and reading as a single flat series.
+    #[test]
+    fn the_publisher_and_transport_label_sets_stay_separate() {
+        let m = metrics();
+        // A CounterVec with no observed label set is absent from `gather()`, so materialize one
+        // child of every series under test rather than relying on another test having run first.
+        let v = "LabelSplitTest";
+        m.datagrams_received
+            .with_label_values(&[v, "tob", "9101", "mktdata"])
+            .inc();
+        m.datagram_bytes
+            .with_label_values(&[v, "tob", "9101"])
+            .inc();
+        m.socket_errors.with_label_values(&[v, "tob", "9101"]).inc();
+        m.idle_rejoin.with_label_values(&[v, "tob", "9101"]).inc();
+        m.receiver_up.with_label_values(&[v, "tob", "9101"]).set(1);
+        for c in [
+            &m.quotes_admitted,
+            &m.quote_ticks_won,
+            &m.trades_admitted,
+            &m.depth_admitted,
+            &m.depth_ticks_won,
+            &m.depth_dropped,
+            &m.book_dropped,
+        ] {
+            c.with_label_values(&[v, "edge"]).inc();
+        }
+
+        let mut checked = 0;
+        for (name, desc) in m
+            .registry()
+            .gather()
+            .iter()
+            .map(|f| (f.name().to_string(), f.clone()))
+        {
+            let labels: Vec<&str> = desc
+                .get_metric()
+                .first()
+                .map(|s| s.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            let has = |l: &str| labels.contains(&l);
+            match name.as_str() {
+                "dz_datagrams_received_total"
+                | "dz_datagram_bytes_total"
+                | "dz_socket_errors_total"
+                | "dz_idle_rejoin_total"
+                | "dz_receiver_up" => {
+                    assert!(has("publisher"), "{name} must keep the `publisher` label");
+                    assert!(!has("transport"), "{name} must not carry `transport`");
+                    checked += 1;
+                }
+                "dz_quotes_admitted_total"
+                | "dz_quote_ticks_won_total"
+                | "dz_trades_admitted_total"
+                | "dz_depth_admitted_total"
+                | "dz_depth_ticks_won_total"
+                | "dz_depth_dropped_total"
+                | "dz_book_dropped_total" => {
+                    assert!(has("transport"), "{name} must carry the `transport` label");
+                    assert!(!has("publisher"), "{name} must not carry `publisher`");
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            checked, 12,
+            "every series under test must have been reached"
+        );
     }
 
     /// The receiver-side counters carry `kind` and `publisher` so a six-publisher venue's series

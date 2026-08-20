@@ -35,6 +35,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shred sources; an operator who had narrowed it to `edge-` would now pick up market-data groups.
 
 ### Changed
+- ⚠️ **Metrics: eight series renamed, one label renamed, seven series moved to a new label.** Cutover,
+  no dual-publishing — a renamed series reads as a feed that went quiet, so retire or repoint any
+  dashboard and alert on the old names. The repo now uses the
+  [edge-feed-spec glossary](https://github.com/malbeclabs/edge-feed-spec/blob/main/GLOSSARY.md)'s
+  vocabulary, which bans `arm` in every sense (a redundant publisher is a `path`) and bans bare
+  `source`.
+
+  | Before | After |
+  |---|---|
+  | `dz_arm_lead_ns` | `dz_path_lead_ns` |
+  | `dz_arm_authority_transfers_total` | `dz_path_authority_transfers_total` |
+  | `dz_arm_markets_held` | `dz_path_markets_held` |
+  | `dz_arm_unmatched_trades_total` | `dz_path_unmatched_trades_total` |
+  | `dz_tape_arm_transfers_total` | `dz_tape_path_transfers_total` |
+  | `dz_tape_arm_dropped_total` | `dz_tape_path_dropped_total` |
+  | `dz_unregistered_sources_total` | `dz_unregistered_source_ids_total` |
+  | `dz_unregistered_source_labels_capped_total` | `dz_unregistered_source_id_labels_capped_total` |
+
+  The `arm` label becomes `path`, and its values `arm0`..`arm7` become `path0`..`path7`.
+
+  The `publisher` label carried two unrelated cardinalities and is split. The five receiver-side
+  series (`dz_datagrams_received_total`, `dz_datagram_bytes_total`, `dz_socket_errors_total`,
+  `dz_idle_rejoin_total`, `dz_receiver_up`) keep `publisher`, whose value is a base port. The seven
+  arbiter-side series (`dz_quotes_admitted_total`, `dz_quote_ticks_won_total`,
+  `dz_trades_admitted_total`, `dz_depth_admitted_total`, `dz_depth_ticks_won_total`,
+  `dz_depth_dropped_total`, `dz_book_dropped_total`) take **`transport`**, whose value is
+  `edge`/`public`. So `dz_quote_ticks_won_total{publisher="edge"}` becomes
+  `dz_quote_ticks_won_total{transport="edge"}`. `dz_source_id_changed_total` and
+  `dz_quotes_no_source_ts_total` were already qualified and are unchanged; the `winner`/`loser`
+  labels on the three lead histograms keep their names and now carry transport classes.
 - The Market-by-Order resurrection guard forgets a removed order on **venue time** rather than by
   agreement between the publishers. It used to hold a per-path reporter mask per removed order and retire
   it only once every path still reaching the market had independently reported that removal; a path whose

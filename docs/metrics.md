@@ -85,8 +85,8 @@ protocol — TOB, Midpoint, MBO, MBP all go through this), not by the arbiter's 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
 | `dz_source_id_changed_total` | counter | `venue` | A `(publisher, instrument)` already revealed under one wire Source ID named a different one on a later message — a publisher defect, not a decode issue. Labelled by the **new** (post-change) venue, which is also re-announced a fresh `instrument` under so the new venue's precision-before-price guarantee still holds. Should stay flat at zero; a nonzero rate means a publisher is relabeling an instrument's venue mid-stream. |
-| `dz_unregistered_sources_total` | counter | — | Distinct Source IDs seen with no registry row. |
-| `dz_unregistered_source_labels_capped_total` | counter | — | Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached. |
+| `dz_unregistered_source_ids_total` | counter | — | Distinct Source IDs seen with no registry row. |
+| `dz_unregistered_source_id_labels_capped_total` | counter | — | Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached. |
 
 ## Market-by-Price processor (per venue)
 
@@ -110,10 +110,10 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
 | `dz_emit_total` | counter | `venue`, `kind` | Messages broadcast after dedup, by `kind` (quote/trade/instrument/midpoint/depth/book). `status` is structurally possible but never routed through the arbiter today, so it is not recorded in practice. |
-| `dz_quotes_admitted_total` | counter | `venue`, `publisher` | Quotes admitted by the staleness floor, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the direct signal of the public backstop filling an edge gap. |
-| `dz_trades_admitted_total` | counter | `venue`, `publisher` | Trades admitted by the windowed dedup, attributed to the winning `publisher` (`edge`/`public`). A rise in `publisher="public"` is the trade-side signal of the public backstop filling an edge gap — the counterpart to `dz_quotes_admitted_total` for a trades-only backstop like Phoenix. |
-| `dz_quote_ticks_won_total` | counter | `venue`, `publisher` | Quote `source_ts` ticks **won** — the once-per-tick first delivery, attributed to the winning class. Every tick counts exactly once: a mirror's copy or the leader's later in-tick contents never re-count it, and a tick the public feed never delivers still counts for the edge (the walkover). `edge / sum` is the published DZ win rate (see below). `source_ts == 0` sentinel quotes bypass the floor and are not counted. |
-| `dz_depth_ticks_won_total` | counter | `venue`, `publisher` | The depth mirror of `dz_quote_ticks_won_total` (for depth the `source_ts == 0` empty-anchor tick is real and counts). |
+| `dz_quotes_admitted_total` | counter | `venue`, `transport` | Quotes admitted by the staleness floor, attributed to the winning `transport` (`edge`/`public`). A rise in `transport="public"` is the direct signal of the public backstop filling an edge gap. |
+| `dz_trades_admitted_total` | counter | `venue`, `transport` | Trades admitted by the windowed dedup, attributed to the winning `transport` (`edge`/`public`). A rise in `transport="public"` is the trade-side signal of the public backstop filling an edge gap — the counterpart to `dz_quotes_admitted_total` for a trades-only backstop like Phoenix. |
+| `dz_quote_ticks_won_total` | counter | `venue`, `transport` | Quote `source_ts` ticks **won** — the once-per-tick first delivery, attributed to the winning class. Every tick counts exactly once: a mirror's copy or the leader's later in-tick contents never re-count it, and a tick the public feed never delivers still counts for the edge (the walkover). `edge / sum` is the published DZ win rate (see below). `source_ts == 0` sentinel quotes bypass the floor and are not counted. |
+| `dz_depth_ticks_won_total` | counter | `venue`, `transport` | The depth mirror of `dz_quote_ticks_won_total` (for depth the `source_ts == 0` empty-anchor tick is real and counts). |
 | `dz_quotes_dropped_total` | counter | `venue` | Quotes dropped by the staleness floor (stale tick, non-leader, or exact repeat). |
 | `dz_trades_dropped_total` | counter | `venue` | Trades dropped by the windowed dedup (duplicate `trade_id` still inside the window). |
 | `dz_trades_no_id_total` | counter | `venue` | Trades forwarded with the `trade_id == 0` sentinel, bypassing the dedup window. A FIX-sourced publisher carries no venue trade id; keying the window on `0` would collapse the tape to one print per `(venue, symbol)` forever. A non-zero rate here means the venue's tape is un-deduped by construction — correct, but it relies on exactly one publisher owning the venue's tape (watch `dz_trades_no_id_conflict_total`). Not counted as admitted: nothing was. |
@@ -130,7 +130,7 @@ Recorded by the shared pre-broadcast emit stage (`src/ingest/arbiter.rs`). Label
 | `dz_tape_path_dropped_total` | counter | `venue` | Prints the path gate dropped as a non-serving path's copy. Deliberately its own counter rather than folded into `dz_trades_dropped_total`, whose steady state on a `Sticky` venue *is* the challenger path's whole stream — mixing them would hide a gate stuck on the wrong path inside expected noise. Read it against `dz_emit_total{kind="trade"}`: the gate holding roughly the whole venue's print rate, with `dz_tape_path_transfers_total` flat, is the shape to alert on. |
 | `dz_path_markets_held` | gauge | `venue`, `path` | Markets each path is currently **serving** — the venue's elected path, plus any market a health override moved to a peer. `path` is a stable per-venue ordinal (`path0`…`path7`, then `other`), never the spoofable source IP. All markets on one path is the steady state; a persistent split means health overrides are fragmenting the venue, i.e. the elected path's books keep gapping. |
 | `dz_path_unmatched_trades_total` | counter | `venue`, `path` | Trades a path delivered that its peer never delivered inside `--arb-match-window-secs` — a drop on one path, or a genuine one-sided print. This is election evidence lost: a rate approaching the venue's own trade rate means the paths are barely pairing, so `dz_path_lead_ns` samples a thin slice and `--arb-min-window-samples` leaves most windows unjudged. Counts window expiries only; the matcher's overload cap is a different condition and is deliberately not merged in. |
-| `dz_book_dropped_total` | counter | `venue`, `publisher` | Incremental `book` batches the authority gate did not publish: a non-authoritative path's copy, or a batch withheld while a market waits for its new path to close a logical event (a re-baseline cannot be built from half an event). In steady state this is the challenger path's entire stream, so it tracks its message rate rather than any fault — read it against `dz_emit_total{kind="book"}`. `publisher` is the dropped copy's **source class** (`edge`/`public`), not its path ordinal, so two multicast paths both count as `edge`. |
+| `dz_book_dropped_total` | counter | `venue`, `transport` | Incremental `book` batches the authority gate did not publish: a non-authoritative path's copy, or a batch withheld while a market waits for its new path to close a logical event (a re-baseline cannot be built from half an event). In steady state this is the challenger path's entire stream, so it tracks its message rate rather than any fault — read it against `dz_emit_total{kind="book"}`. `transport` is the dropped copy's **source class** (`edge`/`public`), not its path ordinal, so two multicast paths both count as `edge`. |
 | `dz_book_markets_evicted_total` | counter | `venue` | Markets evicted from the gate's per-market `book` state on reaching its cap (16,384, an order of magnitude above the largest real venue). The key is wire-supplied, so this is the forged-market backstop and should stay flat at zero. An evicted market loses its replay bootstrap and its record of which path the consumer's state came from, so its next batch re-baselines that consumer — which is what keeps eviction safe rather than silently resuming an unrelated delta series. |
 | `dz_book_events_deduped_total` | counter | `venue` | Order-level `book` events collapsed because another publisher delivered the same venue event first. Its steady state is the whole stream of every publisher but the fastest for each event, so like `dz_book_dropped_total` it is a throughput figure, not a fault — read it against `dz_emit_total{kind="book"}`. Falling to zero on a multi-publisher venue means only one publisher is reaching us. |
 | `dz_mbo_path_disagreement_total` | counter | `venue` | Two publishers reported **more** resting quantity for one order than a peer had already reported for it. A resting order only ever shrinks, so this is a publisher that missed a fill and believes its book is still contiguous — silent drift, made observable. Neither copy is published; the market re-baselines instead (`dz_mbo_forced_rebaselines_total{reason="disagreement"}`). **Any sustained rate is a correctness alarm**, and the trigger to reconsider deriving output from per-publisher books at all (dedup on input, into one shared book, makes the divergence structurally impossible). An ordinary interleaved race, where a path delivers a smaller remainder first, is not counted. |
@@ -171,10 +171,14 @@ The margin and the win rate are **independent conditions and all three must hold
 The DZ win rate to publish is the tick-won share:
 
 ```promql
-sum(rate(dz_quote_ticks_won_total{publisher="edge"}[5m]))
+sum(rate(dz_quote_ticks_won_total{transport="edge"}[5m]))
 /
 sum(rate(dz_quote_ticks_won_total[5m]))
 ```
+
+The `winner`/`loser` labels on `dz_quote_lead_ns`, `dz_trade_lead_ns` and `dz_depth_lead_ns` carry
+**transport** classes (`edge`/`public`), the same value space as the `transport` label above; they
+keep their own names because `winner`/`loser` is what distinguishes the two ends of one contest.
 
 Do **not** derive a win rate from `dz_quote_lead_ns_count`. Contests sample only in-tick
 head-to-heads — at most one per tick, consumed by whichever follower arrives first (on a
@@ -204,7 +208,7 @@ Recorded by the WebSocket sink (`src/sinks/ws.rs`).
 Recorded by the optional public WebSocket backstops (Hyperliquid `src/ingest/ws_feeder.rs`, Phoenix
 `src/ingest/phoenix_feeder.rs`; both off by default — see [Input sources](input-sources.md)). Every
 series is labelled by `venue` so multiple feeders don't collide. A feeder's actual contribution to the
-served feed shows up on the arbiter counters above, attributed to `publisher="public"`:
+served feed shows up on the arbiter counters above, attributed to `transport="public"`:
 `dz_quotes_admitted_total` for a quote backstop, `dz_trades_admitted_total` for a trade backstop
 (Phoenix is **trades-only**, so watch the trade counter, not quotes), with `dz_quote_lead_ns` /
 `dz_trade_lead_ns` giving the win margin over the source it beat.
