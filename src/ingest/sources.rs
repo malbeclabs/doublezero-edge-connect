@@ -56,7 +56,7 @@ pub fn assignments() -> &'static [SourceAssignment] {
 /// Map a wire `Source ID` to its registered source name.
 ///
 /// Returns `None` only for IDs the document assigns no row. Names are **uppercase**, which is the
-/// form that reaches consumers: this is what `venue`/`source` carry on the WebSocket and what every
+/// form that reaches consumers: this is what `venue`/`source_name` carry on the WebSocket and what every
 /// `venue=` metric label holds, so it is also the form a product identifier like `HYPERLIQUID:BTC`
 /// composes from.
 pub fn source_name(source_id: u16) -> Option<&'static str> {
@@ -111,7 +111,7 @@ pub(crate) fn label_in(
     (leaked, LabelOutcome::New)
 }
 
-/// The label to stamp as `source`/`venue` for a Source ID. Total — `venue` is never blank.
+/// The label to stamp as `source_name`/`venue` for a Source ID. Total — `venue` is never blank.
 ///
 /// A registered ID yields its registry name. An unregistered one yields a stable synthesized
 /// `SOURCE_<id>`, distinct per ID: the arbiter keys dedup on `(venue, symbol)`, so collapsing

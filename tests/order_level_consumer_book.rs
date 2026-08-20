@@ -93,7 +93,7 @@ fn batch_for(
 ) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: VENUE.into(),
-        source: VENUE.into(),
+        source_name: VENUE.into(),
         source_id: 1,
         symbol: symbol_of(instrument_id).into(),
         channel: CHANNEL,

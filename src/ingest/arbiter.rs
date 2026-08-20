@@ -3328,7 +3328,7 @@ mod tests {
     fn quote(source_ts_ns: u64, bid: f64, ask: f64) -> NormalizedQuote {
         NormalizedQuote {
             venue: "HYPERLIQUID".into(),
-            source: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bid,
@@ -3418,7 +3418,7 @@ mod tests {
         let trade = |id: u64| {
             FeedMessage::Trade(NormalizedTrade {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 0,
                 symbol: "BTC".into(),
                 channel: 0,
@@ -3452,7 +3452,7 @@ mod tests {
     fn trade(trade_id: u64) -> NormalizedTrade {
         NormalizedTrade {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 0,
@@ -3647,7 +3647,7 @@ mod tests {
         let trade = || {
             FeedMessage::Trade(NormalizedTrade {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 0,
                 symbol: "BTC".into(),
                 channel: 0,
@@ -3837,7 +3837,7 @@ mod tests {
         let trade = |recv: u64| {
             FeedMessage::Trade(NormalizedTrade {
                 venue: venue.into(),
-                source: venue.into(),
+                source_name: venue.into(),
                 source_id: 0,
                 symbol: "BTC".into(),
                 channel: 0,
@@ -3873,7 +3873,7 @@ mod tests {
     fn depth(source_ts_ns: u64, bids: Vec<[f64; 2]>, asks: Vec<[f64; 2]>) -> NormalizedDepth {
         NormalizedDepth {
             venue: "HYPERLIQUID".into(),
-            source: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bids,
@@ -4452,7 +4452,7 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Instrument(crate::model::NormalizedInstrument {
             venue: "HYPERLIQUID".into(),
-            source: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: symbol.into(),
             channel: 0,
@@ -4586,7 +4586,7 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: BOOK_CHANNEL,
@@ -5520,7 +5520,7 @@ mod tests {
         let book_on_channel = |channel: u8, instrument_id: u32, changes: Vec<BookChange>| {
             FeedMessage::Book(NormalizedBook {
                 venue: venue.into(),
-                source: venue.into(),
+                source_name: venue.into(),
                 source_id: 0,
                 symbol: "KXBTCPERP".into(),
                 channel,
@@ -5695,7 +5695,7 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel,

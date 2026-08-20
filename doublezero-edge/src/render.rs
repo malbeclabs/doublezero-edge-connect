@@ -96,7 +96,7 @@ fn render_products_list(body: &Value) -> Result<String, String> {
     let parsed: ProductsListResponse = parse(body)?;
     let headers = [
         "PRODUCT_ID",
-        "SOURCE",
+        "SOURCE_NAME",
         "STATUS",
         "FEED_KIND",
         "PRICE_INCR",
@@ -108,7 +108,7 @@ fn render_products_list(body: &Value) -> Result<String, String> {
         .map(|p| {
             vec![
                 p.product_id.clone(),
-                p.source.clone(),
+                p.source_name.clone(),
                 p.status.clone(),
                 p.feed_kind.clone(),
                 p.price_increment.clone(),
@@ -124,7 +124,7 @@ fn render_product_get(body: &Value) -> Result<String, String> {
     let p = parsed.product;
     let rows = vec![
         vec!["product_id".to_string(), p.product_id],
-        vec!["source".to_string(), p.source],
+        vec!["source_name".to_string(), p.source_name],
         vec!["symbol".to_string(), p.symbol],
         vec!["channel".to_string(), p.channel.to_string()],
         vec!["instrument_id".to_string(), p.instrument_id.to_string()],
@@ -245,7 +245,7 @@ fn render_best_bid_ask(body: &Value) -> Result<String, String> {
 fn render_status(body: &Value) -> Result<String, String> {
     let parsed: StatusResponse = parse(body)?;
     let mut out = String::new();
-    if !parsed.registry.source.is_empty() {
+    if !parsed.registry.origin.is_empty() {
         out.push_str(&render_registry_line(&parsed.registry));
         out.push_str("\n\n");
     }
@@ -336,8 +336,8 @@ pub(crate) fn render_channels_block(channels: &ChannelsBlock) -> String {
 /// block off `/admin/diagnostics` and must read the same there.
 pub(crate) fn render_registry_line(r: &RegistryBlock) -> String {
     format!(
-        "registry: source={}  version={}  rows={}  receivers={}",
-        r.source, r.version, r.rows, r.receivers
+        "registry: origin={}  version={}  rows={}  receivers={}",
+        r.origin, r.version, r.rows, r.receivers
     )
 }
 
@@ -515,10 +515,10 @@ mod tests {
     /// The `registry` line is orientation for the rest of `status`: which document, its version,
     /// and row/receiver counts, on one line.
     #[test]
-    fn the_registry_line_reports_source_version_and_counts() {
+    fn the_registry_line_reports_origin_version_and_counts() {
         let mut body = fixture_status_healthy();
         body["registry"] = serde_json::json!({
-            "source": "url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
+            "origin": "url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
             "version": 3,
             "rows": 12,
             "receivers": 27
@@ -526,7 +526,7 @@ mod tests {
         let out = render_status(&body).unwrap();
         assert!(
             out.contains(
-                "registry: source=url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json  \
+                "registry: origin=url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json  \
                  version=3  rows=12  receivers=27"
             ),
             "{out}"
@@ -534,8 +534,8 @@ mod tests {
     }
 
     /// A server predating the `registry` block sends no such key, which deserializes to the
-    /// `Default` (empty `source`) — this must render as no line at all, never a blank
-    /// "registry: source=  version=0  rows=0  receivers=0" guess.
+    /// `Default` (empty `origin`) — this must render as no line at all, never a blank
+    /// "registry: origin=  version=0  rows=0  receivers=0" guess.
     #[test]
     fn the_registry_line_is_omitted_on_an_older_server() {
         let out = render_status(&fixture_status_healthy()).unwrap();

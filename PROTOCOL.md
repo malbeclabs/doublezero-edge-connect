@@ -67,14 +67,14 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 ### `instrument`
 
 ```json
-{"type":"instrument","venue":"Hyperliquid","source":"Hyperliquid","source_id":1,"symbol":"SOL","channel":0,"instrument_id":1,"price_exponent":-2,"qty_exponent":-2}
+{"type":"instrument","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL","channel":0,"instrument_id":1,"price_exponent":-2,"qty_exponent":-2}
 ```
 
 | Field            | Type   | Meaning                                                              |
 |------------------|--------|----------------------------------------------------------------------|
 | `type`           | string | `"instrument"`.                                                      |
-| `venue`          | string | **Deprecated.** Always identical to `source`. See [`source`, `source_id`, and the deprecated `venue`](#source-source_id-and-the-deprecated-venue). |
-| `source`         | string | The source's registry name (e.g. `Hyperliquid`, `Phoenix`). **Preferred.** |
+| `venue`          | string | **Deprecated.** Always identical to `source_name`. See [`source_name`, `source_id`, and the deprecated `venue`](#source_name-source_id-and-the-deprecated-venue). |
+| `source_name`    | string | The source's registry name (e.g. `Hyperliquid`, `Phoenix`). **Preferred.** |
 | `source_id`      | number | The wire Source ID, verbatim.                                        |
 | `symbol`         | string | Instrument symbol as the venue names it (e.g. `SOL`, `SOL-PERP`).   |
 | `channel`        | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
@@ -91,7 +91,7 @@ to rescale integers.
 ### `quote`
 
 ```json
-{"type":"quote","venue":"Hyperliquid","source":"Hyperliquid","source_id":1,"symbol":"SOL",
+{"type":"quote","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL",
  "bid":184.20,"ask":184.21,"bid_size":12.5,"ask_size":8.0,"bid_n":3,"ask_n":2,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -100,8 +100,8 @@ to rescale integers.
 | Field             | Type    | Meaning                                                                 |
 |-------------------|---------|-------------------------------------------------------------------------|
 | `type`            | string  | `"quote"`.                                                              |
-| `venue`           | string  | **Deprecated.** Always identical to `source`.                           |
-| `source`          | string  | The source's registry name. **Preferred.**                              |
+| `venue`           | string  | **Deprecated.** Always identical to `source_name`.                      |
+| `source_name`     | string  | The source's registry name. **Preferred.**                              |
 | `source_id`       | number  | The wire Source ID, verbatim.                                           |
 | `symbol`          | string  | Symbol (matches an `instrument`'s `symbol`).                            |
 | `bid`             | number  | Best bid price (decimal).                                               |
@@ -137,7 +137,7 @@ source_ts_ns --> kernel_rx_ts_ns --> recv_ts_ns --> ws_send_ts_ns --> (consumer 
 ### `trade`
 
 ```json
-{"type":"trade","venue":"Hyperliquid","source":"Hyperliquid","source_id":1,"symbol":"SOL",
+{"type":"trade","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL",
  "channel":0,"instrument_id":1234,
  "price":184.20,"size":3.5,"aggressor_side":"buy","trade_id":987654,"cumulative_volume":12500.0,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
@@ -150,8 +150,8 @@ venue precision, same convention as `quote`).
 | Field               | Type    | Meaning                                                              |
 |---------------------|---------|----------------------------------------------------------------------|
 | `type`              | string  | `"trade"`.                                                           |
-| `venue`             | string  | **Deprecated.** Always identical to `source`.                        |
-| `source`            | string  | The source's registry name. **Preferred.**                           |
+| `venue`             | string  | **Deprecated.** Always identical to `source_name`.                   |
+| `source_name`       | string  | The source's registry name. **Preferred.**                           |
 | `source_id`         | number  | The wire Source ID, verbatim.                                        |
 | `symbol`            | string  | Symbol (matches an `instrument`'s `symbol`).                         |
 | `channel`           | uint8   | The publisher's channel id: the instrument set this feed carries. `0` for a source with no channel concept of its own. Filterable. |
@@ -180,7 +180,7 @@ more than one `channel`.
 ### `midpoint`
 
 ```json
-{"type":"midpoint","venue":"MidpointVenue","source":"MidpointVenue","source_id":0,"symbol":"SOL","mid":184.205,
+{"type":"midpoint","venue":"MidpointVenue","source_name":"MidpointVenue","source_id":0,"symbol":"SOL","mid":184.205,
  "method":0,"quality_flags":0,
  "book_ts_ns":1781019263715344015,"compute_ts_ns":1781019263715350000,
  "recv_ts_ns":1781019263715501230,"kernel_rx_ts_ns":1781019263715300010,
@@ -194,8 +194,8 @@ a consumer that connects partway through sees the matching `instrument` (for pre
 | Field            | Type   | Meaning                                                                |
 |------------------|--------|------------------------------------------------------------------------|
 | `type`           | string | `"midpoint"`.                                                          |
-| `venue`          | string | **Deprecated.** Always identical to `source` (a Midpoint feed maps to its own venue). |
-| `source`         | string | The source's registry name. **Preferred.**                             |
+| `venue`          | string | **Deprecated.** Always identical to `source_name` (a Midpoint feed maps to its own venue). |
+| `source_name`    | string | The source's registry name. **Preferred.**                             |
 | `source_id`      | number | The wire Source ID, verbatim (`0` when the feed names no registry row). |
 | `symbol`         | string | Symbol (matches an `instrument`'s `symbol`).                           |
 | `mid`            | number | Mid price (decimal).                                                   |
@@ -213,7 +213,7 @@ for mids). A consumer that only wants quotes/trades may ignore `midpoint` per fo
 ### `depth`
 
 ```json
-{"type":"depth","venue":"MboVenue","source":"MboVenue","source_id":0,"symbol":"SOL",
+{"type":"depth","venue":"MboVenue","source_name":"MboVenue","source_id":0,"symbol":"SOL",
  "bids":[[184.20,12.5],[184.19,4.0]],"asks":[[184.21,8.0],[184.22,6.5]],
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -226,8 +226,8 @@ first** (bids high→low, asks low→high).
 | Field            | Type     | Meaning                                                              |
 |------------------|----------|----------------------------------------------------------------------|
 | `type`           | string   | `"depth"`.                                                           |
-| `venue`          | string   | **Deprecated.** Always identical to `source` (a Market-by-Order feed maps to its own venue). |
-| `source`         | string   | The source's registry name. **Preferred.**                          |
+| `venue`          | string   | **Deprecated.** Always identical to `source_name` (a Market-by-Order feed maps to its own venue). |
+| `source_name`    | string   | The source's registry name. **Preferred.**                           |
 | `source_id`      | number   | The wire Source ID, verbatim (`0` when the feed names no registry row). |
 | `symbol`         | string   | Symbol (matches an `instrument`'s `symbol`).                         |
 | `bids`           | number[][] | `[price, size]` pairs, highest price first.                        |
@@ -252,7 +252,7 @@ client that connects partway through is replayed the latest `depth` per symbol o
 ### `book`
 
 ```json
-{"type":"book","venue":"BookVenue","source":"BookVenue","source_id":0,"symbol":"SOL","channel":2,"instrument_id":41,
+{"type":"book","venue":"BookVenue","source_name":"BookVenue","source_id":0,"symbol":"SOL","channel":2,"instrument_id":41,
  "changes":[{"action":"update","side":"bid","price":0.6200,"size":150,"order_id":0},
             {"action":"delete","side":"ask","price":0.6300,"size":0,"order_id":0}],
  "snapshot":false,"last":true,
@@ -269,8 +269,8 @@ The two granularities are **two message types**, not one type with a flag. `book
 | Field | Type | Meaning |
 |---|---|---|
 | `type` | string | `"book"` when price-aggregated, `"order_book"` when order-level. |
-| `venue` | string | **Deprecated.** Always identical to `source`. |
-| `source` | string | The source's registry name. **Preferred.** |
+| `venue` | string | **Deprecated.** Always identical to `source_name`. |
+| `source_name` | string | The source's registry name. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim. |
 | `symbol` | string | **Display label.** Not guaranteed unique — see *Identity* below. |
 | `channel` | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
@@ -308,7 +308,7 @@ Either way a consumer that honors `clear` needs nothing else.
 ### `status`
 
 ```json
-{"type":"status","venue":"Hyperliquid","source":"Hyperliquid","source_id":1,"state":"down","stale_ms":30000,"ts_ns":1781019263715344015}
+{"type":"status","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"state":"down","stale_ms":30000,"ts_ns":1781019263715344015}
 ```
 
 A **venue-level feed-health** transition. The producer emits one when a venue's **quote**
@@ -340,8 +340,8 @@ quote or trade.
 | Field       | Type   | Meaning                                                         |
 |-------------|--------|-------------------------------------------------------------------|
 | `type`      | string | `"status"`.                                                     |
-| `venue`     | string | **Deprecated.** Always identical to `source`.                   |
-| `source`    | string | The source's registry name whose quote feed changed health. **Preferred.** |
+| `venue`     | string | **Deprecated.** Always identical to `source_name`.              |
+| `source_name` | string | The source's registry name whose quote feed changed health. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim.                                   |
 | `state`     | string | `"down"` (quote multicast silent) or `"ok"` (quotes recovered). |
 | `stale_ms`  | uint64 | Milliseconds the quote feed had been silent (`0` when `"ok"`).  |
@@ -351,26 +351,29 @@ Quote delivery is **not gated** on status - it is advisory health, and because e
 full state the feed self-heals on the next quote regardless. A consumer that ignores `status`
 (per the forward-compatibility rule) simply forgoes the gray-out.
 
-### `source`, `source_id`, and the deprecated `venue`
+### `source_name`, `source_id`, and the deprecated `venue`
 
 Every message carries three fields naming where the data came from:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `source` | string | The source's registry name. **Preferred.** |
+| `source_name` | string | The source's registry name. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim. |
-| `venue` | string | **Deprecated.** Always identical to `source`. |
+| `venue` | string | **Deprecated.** Always identical to `source_name`. |
 
-**This release changes what `venue` contains.** `source_id` is now the Source ID the publisher
-stamped on the wire, passed through unmodified, and `source`/`venue` are both that ID's registry
-name. Previously the bridge substituted its own configured label when it did not recognise an ID.
-It no longer does: a publisher stamping an incorrect Source ID now produces messages named for the
-source that ID identifies, because the Source ID is the contract and a wrong one is a publisher
-defect to fix at the publisher.
+**This release renames `source` to `source_name`, and changes what `venue` contains.** The bare
+`source` key is gone — the edge-feed-spec glossary bans it, since `source` always takes a qualifier.
+`source_id` is now the Source ID the publisher stamped on the wire, passed through unmodified, and
+`source_name`/`venue` are both that ID's registry name. Previously the bridge substituted its own
+configured label when it did not recognise an ID. It no longer does: a publisher stamping an
+incorrect Source ID now produces messages named for the source that ID identifies, because the
+Source ID is the contract and a wrong one is a publisher defect to fix at the publisher.
 
-If you filter or key on `venue`, re-check your values against a live feed rather than assuming they
-are unchanged. `venue` and `source` always hold the same string; new consumers should read `source`,
-or `source_id` for a stable numeric identity that needs no string matching.
+`venue` remains the compatibility alias and carries the identical value, so a consumer reading
+`source` today either reads `venue` (no work) or moves to `source_name`. If you filter or key on
+`venue`, re-check your values against a live feed rather than assuming they are unchanged; new
+consumers should read `source_name`, or `source_id` for a stable numeric identity that needs no
+string matching.
 
 An unregistered Source ID yields a stable synthesized name (`SOURCE_<id>`) rather than being dropped,
 so data always flows and an unrecognised source is visible rather than silent.
@@ -413,10 +416,11 @@ A consumer may send control messages (JSON text frames) to filter the feed. **Su
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint8, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+A subscription filter is `{ "source_name"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint8, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source_name` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
 
-`source` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them, so a
-disagreeing pair matches nothing; supply one.
+`source_name` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them,
+so a disagreeing pair matches nothing; supply one. The retired `source` key is an unknown field and
+is **ignored**, so a filter that still names it is widened to whatever its remaining keys select.
 
 `venue`, `symbol` and `channel` are **scope** dimensions - which markets - and `type` is a **kind** dimension: which messages. The two behave differently on purpose.
 
@@ -528,10 +532,14 @@ on connect:
   rate limits with broadcast backpressure**.
 - **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; the incremental pair supersedes it with the complete book — `book` on a Market-by-Price feed, [`order_book`](#book) on a Market-by-Order one. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement whichever of the two their markets are served under.
 - **Additive in this revision, so still v1:** the [`order_book`](#book) message type, carrying the Market-by-Order feed's order-level book, and `order_id` on a book change. An existing consumer subscribed to `book` is served exactly the price-aggregated markets it was served before; `order_book` is a type it does not know and ignores. Deliberately a **new type** rather than a new field on `book` — see [*They are separate types*](#book) for why a field would have corrupted such a consumer instead.
+- **Breaking within v1: `source` is now `source_name`**, both on every message and as a subscription
+  filter key. The forward-compatibility rule below covers the *arrival* of `source_name`, not the
+  *departure* of `source`; `venue` still carries the identical value, so the migration is to read
+  `venue` or to read `source_name`.
 - **Breaking within v1: what `venue` contains changed**, and emission is now gated on a Source ID
   having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
-  no removed ones) but change *values* an existing consumer may depend on — see [`source`,
-  `source_id`, and the deprecated `venue`](#source-source_id-and-the-deprecated-venue) and [*A
+  no removed ones) but change *values* an existing consumer may depend on — see [`source_name`,
+  `source_id`, and the deprecated `venue`](#source_name-source_id-and-the-deprecated-venue) and [*A
   symbol appears only once its source is
   known*](#a-symbol-appears-only-once-its-source-is-known). The forward-compatibility rule below
   covers unknown fields/types, not this.

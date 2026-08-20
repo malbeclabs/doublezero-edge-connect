@@ -1566,7 +1566,7 @@ mod tests {
     ) -> FeedMessage {
         FeedMessage::Book(crate::model::NormalizedBook {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -1925,7 +1925,7 @@ mod tests {
             ("KALSHI".into(), "sports".into(), 10u8, 1u32),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "DEPARTED".into(),
                 channel: 10,
@@ -2062,7 +2062,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "NARROWED".into(),
                 channel: 10,
@@ -2177,7 +2177,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "STILLHERE".into(),
                 channel: 10,
@@ -2396,7 +2396,7 @@ mod tests {
     ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -2445,7 +2445,7 @@ mod tests {
     ) -> NormalizedTrade {
         NormalizedTrade {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,

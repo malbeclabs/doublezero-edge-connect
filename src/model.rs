@@ -75,15 +75,15 @@ fn intern_static(
         .clone()
 }
 
-/// Serde default for `source` on payloads written before the field existed. `Arc<str>` has no
+/// Serde default for `source_name` on payloads written before the field existed. `Arc<str>` has no
 /// `Default`, so the field needs an explicit default function rather than `#[serde(default)]`.
-pub fn empty_source() -> Arc<str> {
+pub fn empty_source_name() -> Arc<str> {
     Arc::from("")
 }
 
 /// Default for the producer-side-only `category` field carried by [`NormalizedInstrument`] and
 /// [`NormalizedTrade`] (`#[serde(skip)]` — see their docs for why it must never reach the wire).
-/// `Arc<str>` has no `Default`, so this needs the same explicit function [`empty_source`] does.
+/// `Arc<str>` has no `Default`, so this needs the same explicit function [`empty_source_name`] does.
 pub fn empty_category() -> Arc<str> {
     Arc::from("")
 }
@@ -94,10 +94,10 @@ pub struct NormalizedQuote {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -138,10 +138,10 @@ pub struct NormalizedTrade {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -194,10 +194,10 @@ pub struct NormalizedMidpoint {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -229,10 +229,10 @@ pub struct NormalizedDepth {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -304,10 +304,10 @@ pub struct NormalizedBook {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     /// Display label. Not unique in general — see the type docs.
@@ -359,10 +359,10 @@ pub struct NormalizedInstrument {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -395,10 +395,10 @@ pub struct FeedStatus {
     pub venue: Arc<str>,
     /// The source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     /// `"down"` when the quote feed has gone silent, `"ok"` once quotes flow again.
@@ -842,7 +842,7 @@ impl BookAccumulator {
         let (venue, category, channel, instrument_id) = key;
         NormalizedBook {
             venue: venue.clone(),
-            source: venue.clone(),
+            source_name: venue.clone(),
             source_id: self.source_id,
             symbol: self.symbol.clone(),
             channel: *channel,
@@ -1030,7 +1030,7 @@ mod tests {
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -1174,7 +1174,7 @@ mod tests {
         assert_eq!(b.channel(), Some(2));
         let q = FeedMessage::Status(FeedStatus {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             state: "ok".into(),
             stale_ms: 0,
@@ -1443,11 +1443,13 @@ mod tests {
         );
     }
 
+    /// `venue` is the compatibility alias and carries the identical string; the bare `source` key
+    /// the glossary bans must be gone from the wire, not merely deprecated.
     #[test]
-    fn a_quote_serializes_both_the_new_and_the_deprecated_source_fields() {
+    fn a_quote_serializes_source_name_and_the_deprecated_venue_but_no_bare_source() {
         let q = NormalizedQuote {
             venue: Arc::from("HYPERLIQUID"),
-            source: Arc::from("HYPERLIQUID"),
+            source_name: Arc::from("HYPERLIQUID"),
             source_id: 1,
             symbol: Arc::from("SOL"),
             bid: 1.0,
@@ -1462,9 +1464,13 @@ mod tests {
             ws_send_ts_ns: 0,
         };
         let v: serde_json::Value = serde_json::to_value(&q).unwrap();
-        assert_eq!(v["venue"], "HYPERLIQUID");
-        assert_eq!(v["source"], "HYPERLIQUID");
+        assert_eq!(v["source_name"], "HYPERLIQUID");
+        assert_eq!(v["venue"], v["source_name"]);
         assert_eq!(v["source_id"], 1);
+        assert!(
+            v.get("source").is_none(),
+            "bare `source` still emitted: {v}"
+        );
     }
 
     /// A payload written before these fields existed must still deserialize, or every committed
@@ -1475,7 +1481,7 @@ mod tests {
             "bid_size":3.0,"ask_size":4.0,"source_ts_ns":0,"recv_ts_ns":0}"#;
         let q: NormalizedQuote = serde_json::from_str(json).unwrap();
         assert_eq!(&*q.venue, "PHOENIX");
-        assert_eq!(&*q.source, "");
+        assert_eq!(&*q.source_name, "");
         assert_eq!(q.source_id, 0);
     }
 
@@ -1488,7 +1494,7 @@ mod tests {
         let mut acc = BookAccumulator::new(Arc::from("SOL"));
         acc.apply(&NormalizedBook {
             venue: venue.clone(),
-            source: venue.clone(),
+            source_name: venue.clone(),
             source_id: 1,
             symbol: Arc::from("SOL"),
             channel: 0,
@@ -1524,7 +1530,7 @@ mod tests {
             out.source_id, 1,
             "the id the producer resolved, not a placeholder"
         );
-        assert_eq!(out.source, venue);
+        assert_eq!(out.source_name, venue);
     }
 
     // ---- order-level (L3) accumulation ----

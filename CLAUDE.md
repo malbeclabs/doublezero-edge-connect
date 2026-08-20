@@ -143,8 +143,8 @@ Modules are grouped by role under `src/`:
   source wins only when the URL is empty, so an operator combining a bind-mounted file with the
   image must clear `DZ_FEED_REGISTRY_URL` too (`scripts/connect.sh` does this automatically when
   `DZ_FEED_REGISTRY` is set and the operator hasn't set a URL of their own). `Loaded::log_resolved`
-  is the one place that announces which source actually won (`"feed registry resolved"`,
-  `source`/`version`/`rows`/`receivers`); `connect.sh` greps it after startup and echoes it, since
+  is the one place that announces which document actually won (`"feed registry resolved"`,
+  `origin`/`version`/`rows`/`receivers`); `connect.sh` greps it after startup and echoes it, since
   the URL-failure fallback above is silent by design and that log line is the only signal.
   There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at

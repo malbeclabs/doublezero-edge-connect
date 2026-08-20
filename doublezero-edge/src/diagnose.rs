@@ -16,7 +16,7 @@ pub fn render_diagnose(body: &Value) -> Result<String, String> {
     out.push_str(&render_tunnel(&d.tunnel));
     out.push_str("\n\n");
     out.push_str(&render_subscriptions(&d.subscriptions));
-    if !d.registry.source.is_empty() {
+    if !d.registry.origin.is_empty() {
         out.push_str("\n\n");
         out.push_str(&render::render_registry_line(&d.registry));
     }
@@ -236,7 +236,7 @@ mod tests {
             },
             "subscriptions": {"market_data_codes": [], "shred_codes": [], "other_codes": []},
             "activation": {"receivers": [], "ws_on": false, "api_on": false, "shred_sources": []},
-            "registry": {"source": "built-in", "version": 3, "rows": 4, "receivers": 9},
+            "registry": {"origin": "built-in", "version": 3, "rows": 4, "receivers": 9},
             "binds": {"ws": "0.0.0.0:8081", "api": "", "admin": "127.0.0.1:9098", "metrics": ""}
         })
     }
@@ -258,7 +258,7 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("disconnected"), "the session table: {out}");
-        assert!(out.contains("registry: source=built-in"), "{out}");
+        assert!(out.contains("registry: origin=built-in"), "{out}");
         assert!(
             out.contains("api=(unset)"),
             "an unset bind must read as such: {out}"

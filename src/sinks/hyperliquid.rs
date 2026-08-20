@@ -1520,7 +1520,7 @@ mod tests {
     fn book_with(changes: Vec<BookChange>) -> NormalizedBook {
         NormalizedBook {
             venue: VENUE.into(),
-            source: VENUE.into(),
+            source_name: VENUE.into(),
             source_id: 1,
             symbol: "BTC".into(),
             channel: 0,
@@ -1562,7 +1562,7 @@ mod tests {
     ) -> NormalizedTrade {
         NormalizedTrade {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id: 1,
             symbol: symbol.into(),
             price,

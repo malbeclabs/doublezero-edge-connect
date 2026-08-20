@@ -61,7 +61,7 @@ const TUNNEL_DOWN: &str = r#"{
     "subscriptions": {"market_data_codes":[],"shred_codes":[],"other_codes":[]},
     "activation": {"receivers":[],"ws_on":false,"api_on":false,"shred_sources":[]},
     "last_attempt": null,
-    "registry": {"source":"built-in","version":3,"rows":4,"receivers":9},
+    "registry": {"origin":"built-in","version":3,"rows":4,"receivers":9},
     "binds": {"ws":"0.0.0.0:8081","api":"0.0.0.0:9099","admin":"127.0.0.1:9098","metrics":""}
 }"#;
 

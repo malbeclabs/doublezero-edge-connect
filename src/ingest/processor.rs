@@ -356,7 +356,7 @@ impl TobProcessor {
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
             channel,
@@ -518,7 +518,7 @@ impl DatagramProcessor for TobProcessor {
                             let source = venue_arc(source_label(source_id));
                             let inst = NormalizedInstrument {
                                 venue: source.clone(),
-                                source: source.clone(),
+                                source_name: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
                                 channel: header.channel_id,
@@ -582,7 +582,7 @@ impl DatagramProcessor for TobProcessor {
                     let source = venue_arc(venue);
                     let quote = NormalizedQuote {
                         venue: source.clone(),
-                        source: source.clone(),
+                        source_name: source.clone(),
                         source_id: q.source_id,
                         symbol,
                         bid: apply_exponent(q.bid_price_raw, price_exponent),
@@ -625,7 +625,7 @@ impl DatagramProcessor for TobProcessor {
                     let source = venue_arc(venue);
                     let trade = NormalizedTrade {
                         venue: source.clone(),
-                        source: source.clone(),
+                        source_name: source.clone(),
                         source_id: t.source_id,
                         symbol,
                         channel,
@@ -725,7 +725,7 @@ impl MidpointProcessor {
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
             channel,
@@ -810,7 +810,7 @@ impl DatagramProcessor for MidpointProcessor {
                         let source = venue_arc(source_label(source_id));
                         let inst = NormalizedInstrument {
                             venue: source.clone(),
-                            source: source.clone(),
+                            source_name: source.clone(),
                             source_id,
                             symbol: d.symbol.clone(),
                             channel: header.channel_id,
@@ -838,7 +838,7 @@ impl DatagramProcessor for MidpointProcessor {
                     let source = venue_arc(venue);
                     let midpoint = NormalizedMidpoint {
                         venue: source.clone(),
-                        source: source.clone(),
+                        source_name: source.clone(),
                         source_id: mp.source_id,
                         symbol,
                         mid: apply_exponent(mp.mid_price_raw, price_exponent),
@@ -1020,7 +1020,7 @@ impl MboProcessor {
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
             channel,
@@ -1231,7 +1231,7 @@ impl MboProcessor {
         let source = venue_arc(venue);
         let depth = NormalizedDepth {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
             bids: scale(&bids_raw),
@@ -1446,7 +1446,7 @@ impl MboProcessor {
         let source = venue_arc(venue);
         ctx.emit(FeedMessage::Book(NormalizedBook {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol,
             channel: self.pending_channel.get(&key).copied().unwrap_or(0),
@@ -1563,7 +1563,7 @@ impl DatagramProcessor for MboProcessor {
                             let source = venue_arc(source_label(source_id));
                             let inst = NormalizedInstrument {
                                 venue: source.clone(),
-                                source: source.clone(),
+                                source_name: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
                                 channel: header.channel_id,
@@ -1719,7 +1719,7 @@ impl DatagramProcessor for MboProcessor {
                             .unwrap_or(0);
                         let trade = NormalizedTrade {
                             venue: source.clone(),
-                            source: source.clone(),
+                            source_name: source.clone(),
                             source_id: o.source_id,
                             symbol: def.symbol.clone(),
                             channel,
@@ -1768,7 +1768,7 @@ impl DatagramProcessor for MboProcessor {
                     let source = venue_arc(venue);
                     let trade = NormalizedTrade {
                         venue: source.clone(),
-                        source: source.clone(),
+                        source_name: source.clone(),
                         source_id: t.source_id,
                         symbol,
                         channel,
@@ -2096,7 +2096,7 @@ impl MbpProcessor {
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
             channel: ctx.canonical_channel(key.1),
@@ -2416,7 +2416,7 @@ impl MbpProcessor {
         let source = venue_arc(venue);
         ctx.emit(FeedMessage::Book(NormalizedBook {
             venue: source.clone(),
-            source: source.clone(),
+            source_name: source.clone(),
             source_id,
             symbol: def.symbol.clone(),
             channel: ctx.canonical_channel(channel),
@@ -2577,7 +2577,7 @@ impl DatagramProcessor for MbpProcessor {
                             let source = venue_arc(source_label(source_id));
                             let inst = NormalizedInstrument {
                                 venue: source.clone(),
-                                source: source.clone(),
+                                source_name: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
                                 channel: ctx.canonical_channel(channel),
@@ -2942,7 +2942,7 @@ impl DatagramProcessor for MbpProcessor {
                     let source = venue_arc(venue);
                     let trade = NormalizedTrade {
                         venue: source.clone(),
-                        source: source.clone(),
+                        source_name: source.clone(),
                         source_id: t.source_id,
                         symbol,
                         // `channel` is this datagram's header channel id, canonicalized for
@@ -4605,7 +4605,7 @@ mod tests {
 
         let base = NormalizedInstrument {
             venue: "TestVenue".into(),
-            source: "TestVenue".into(),
+            source_name: "TestVenue".into(),
             source_id: 0,
             symbol: "BTC".into(),
             channel: 0,
@@ -5827,7 +5827,7 @@ mod tests {
         };
         assert_eq!(inst.source_id, 1, "verbatim wire Source ID");
         assert_eq!(
-            &*inst.source, "HYPERLIQUID",
+            &*inst.source_name, "HYPERLIQUID",
             "named from the wire id, not the feed row"
         );
         assert_eq!(&*inst.venue, "HYPERLIQUID");
@@ -5859,7 +5859,7 @@ mod tests {
         );
         assert_eq!(books[0].source_id, 1, "verbatim wire Source ID");
         assert_eq!(
-            &*books[0].source, "HYPERLIQUID",
+            &*books[0].source_name, "HYPERLIQUID",
             "named from the wire id, not the feed row"
         );
         assert_eq!(&*books[0].venue, "HYPERLIQUID");

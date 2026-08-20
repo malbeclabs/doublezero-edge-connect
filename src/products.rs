@@ -259,7 +259,7 @@ mod tests {
     ) -> NormalizedInstrument {
         NormalizedInstrument {
             venue: "HYPERLIQUID".into(),
-            source: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
             source_id: 1,
             symbol: symbol.into(),
             channel,

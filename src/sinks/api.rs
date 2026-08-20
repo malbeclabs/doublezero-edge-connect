@@ -354,7 +354,7 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 }
 
 /// One product's identity + registry-derived fields. Carries the discrete identity fields
-/// (`source_id`/`source`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
+/// (`source_id`/`source_name`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
 /// string — an agent joining on identity should never have to re-parse the display id.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
     let pid = products::ProductId {
@@ -367,7 +367,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
     json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
-        "source": i.source.as_ref(),
+        "source_name": i.source_name.as_ref(),
         "symbol": i.symbol.as_ref(),
         "channel": i.channel,
         "instrument_id": i.instrument_id,
@@ -999,7 +999,7 @@ fn status(state: &ApiState) -> Response {
 pub(crate) fn registry_block() -> Value {
     match crate::ingest::feeds::registry_info() {
         Some(info) => json!({
-            "source": info.origin,
+            "origin": info.origin,
             "version": info.version,
             "rows": info.rows,
             "receivers": info.receivers,
@@ -1394,7 +1394,7 @@ mod tests {
     ) -> NormalizedInstrument {
         NormalizedInstrument {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -1482,7 +1482,7 @@ mod tests {
         let p = &products[0];
         assert_eq!(p["product_id"], "HYPERLIQUID:BTC");
         assert_eq!(p["source_id"], 1);
-        assert_eq!(p["source"], "HYPERLIQUID");
+        assert_eq!(p["source_name"], "HYPERLIQUID");
         assert_eq!(p["symbol"], "BTC");
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 41);
@@ -2142,7 +2142,7 @@ mod tests {
     ) -> NormalizedBook {
         NormalizedBook {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id: 3,
             symbol: symbol.into(),
             channel,
@@ -2412,7 +2412,7 @@ mod tests {
             ("KALSHI".into(), "EMPTYACC".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "EMPTYACC".into(),
                 bids: vec![[0.61, 100.0]],
@@ -2462,7 +2462,7 @@ mod tests {
             ("KALSHI".into(), "COLLIDE".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "COLLIDE".into(),
                 bids: vec![[0.61, 100.0]],
@@ -2514,7 +2514,7 @@ mod tests {
             ("HUGE".into(), "HUGEL3".into()),
             NormalizedDepth {
                 venue: "HUGE".into(),
-                source: "HUGE".into(),
+                source_name: "HUGE".into(),
                 source_id: 3,
                 symbol: "HUGEL3".into(),
                 // Deliberately unequal to the accumulator's own best bid (1.0) and best ask (it has
@@ -2723,7 +2723,7 @@ mod tests {
             ("KALSHI".into(), "L3MKT".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "L3MKT".into(),
                 bids: vec![[0.61, 140.0], [0.60, 10.0]],
@@ -2817,7 +2817,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -2862,7 +2862,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids,
@@ -2960,7 +2960,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[99.5, 3.0]],
@@ -3024,7 +3024,7 @@ mod tests {
             ("KALSHI".into(), "COLLIDE".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "COLLIDE".into(),
                 bids: vec![[0.61, 100.0]],
@@ -3080,7 +3080,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -3185,7 +3185,7 @@ mod tests {
             ("KALSHI".into(), "COLLIDE".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "COLLIDE".into(),
                 bids: vec![[0.61, 100.0]],
@@ -3200,7 +3200,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -3250,7 +3250,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -3265,7 +3265,7 @@ mod tests {
             ("PHOENIX".into(), "SOL".into()),
             NormalizedDepth {
                 venue: "PHOENIX".into(),
-                source: "PHOENIX".into(),
+                source_name: "PHOENIX".into(),
                 source_id: 2,
                 symbol: "SOL".into(),
                 bids: vec![[10.0, 1.0]],
@@ -3406,7 +3406,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         let r = &body["registry"];
-        assert_eq!(r["source"], expected.origin);
+        assert_eq!(r["origin"], expected.origin);
         assert_eq!(r["version"], expected.version);
         assert_eq!(r["rows"], expected.rows);
         assert_eq!(r["receivers"], expected.receivers);
@@ -3456,7 +3456,7 @@ mod tests {
             ("HYPERLIQUID".into(), "DEPTHED".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "DEPTHED".into(),
                 bids: Vec::new(),

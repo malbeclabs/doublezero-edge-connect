@@ -8,7 +8,7 @@
 //!
 //! So the document is supplied to the container at runtime, from one of three sources, in
 //! precedence order. This is also the seam the DoubleZero ledger drops into: it becomes a fourth
-//! [`Source`] and nothing else here changes.
+//! [`Origin`] and nothing else here changes.
 //!
 //! The parsed document is **leaked once into `'static`** at startup. The registry is immutable and
 //! process-lived, so this allocates once and never grows, and it is what keeps the seam free
@@ -44,7 +44,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the registry document comes from, in precedence order.
 #[derive(Debug, Clone)]
-pub enum Source {
+pub enum Origin {
     /// `--feed-registry-url` — fetched once at startup. The precursor to reading the ledger.
     Url(String),
     /// `--feed-registry <path>` — a bind-mounted document.
@@ -53,15 +53,15 @@ pub enum Source {
     BuiltIn,
 }
 
-impl Source {
-    /// Resolve the two CLI flags to a source. A URL wins over a path; neither set means built-in.
-    pub fn from_flags(url: &str, path: &str) -> Source {
+impl Origin {
+    /// Resolve the two CLI flags to an origin. A URL wins over a path; neither set means built-in.
+    pub fn from_flags(url: &str, path: &str) -> Origin {
         if !url.is_empty() {
-            Source::Url(url.to_string())
+            Origin::Url(url.to_string())
         } else if !path.is_empty() {
-            Source::File(PathBuf::from(path))
+            Origin::File(PathBuf::from(path))
         } else {
-            Source::BuiltIn
+            Origin::BuiltIn
         }
     }
 }
@@ -532,7 +532,7 @@ impl Loaded {
     pub fn log_resolved(&self) {
         let snap = self.info();
         info!(
-            source = snap.origin,
+            origin = snap.origin,
             version = snap.version,
             rows = snap.rows,
             receivers = snap.receivers,
@@ -553,20 +553,20 @@ impl Loaded {
 /// **A rejected document degrades or refuses depending on where it came from, and the asymmetry is
 /// the whole point:**
 ///
-/// - [`Source::Url`] — *any* failure (unreachable host, malformed body, a `version` this build
+/// - [`Origin::Url`] — *any* failure (unreachable host, malformed body, a `version` this build
 ///   predates, a validation error) warns and falls back to the built-in copy. A remote registry is
 ///   infrastructure that moves underneath a running fleet, and because resolution happens only at
 ///   startup, refusing would not kill the fleet when the document changed — it would kill each
 ///   process at its next reschedule, hours later and far from the cause. A host that is *up* and
 ///   serving one new field must not be worse than a host that is down.
-/// - [`Source::File`] and [`Source::BuiltIn`] — fatal. A bind-mounted file is an operator's explicit
+/// - [`Origin::File`] and [`Origin::BuiltIn`] — fatal. A bind-mounted file is an operator's explicit
 ///   instruction about this one container, so a wrong one must not run; and a built-in copy that
 ///   does not load is a build defect.
 ///
 /// The built-in copy is by construction last-known-good, which is what makes the fallback safe.
-pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
-    match &source {
-        Source::Url(url) => {
+pub async fn load(origin: Origin) -> Result<Loaded, RegistryError> {
+    match &origin {
+        Origin::Url(url) => {
             let fallback = |reason: &str| {
                 build(BUILT_IN, &format!("built-in ({reason})"))
                     .expect("the built-in feed registry document is valid")
@@ -588,7 +588,7 @@ pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
                 },
             }
         }
-        Source::File(path) => match std::fs::read_to_string(path) {
+        Origin::File(path) => match std::fs::read_to_string(path) {
             // Fatal, like the parse errors beside it: a bind-mounted file is an operator's
             // explicit instruction about this one container, and a wrong or missing one (an
             // unmounted volume, a typo'd path) must not silently start on the built-in copy — that
@@ -599,7 +599,7 @@ pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
             }),
             Ok(text) => build(&text, &format!("file {}", path.display())),
         },
-        Source::BuiltIn => load_built_in(),
+        Origin::BuiltIn => load_built_in(),
     }
 }
 
@@ -1414,7 +1414,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_url_document_falls_back() {
         let url = serve("this is not json").await;
-        let loaded = load(Source::Url(url))
+        let loaded = load(Origin::Url(url))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1425,7 +1425,7 @@ mod tests {
     #[tokio::test]
     async fn a_future_version_from_a_url_falls_back() {
         let url = serve(r#"{"version":99,"feeds":[]}"#).await;
-        let loaded = load(Source::Url(url))
+        let loaded = load(Origin::Url(url))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1435,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_url_document_falls_back() {
         let url = serve(r#"{"version":1,"feeds":[]}"#).await;
-        let loaded = load(Source::Url(url))
+        let loaded = load(Origin::Url(url))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1451,7 +1451,7 @@ mod tests {
                 "publishers":{"explicit":[{"mktdata":9201,"refdata":9202}]}}]}"#,
         )
         .await;
-        let loaded = load(Source::Url(url)).await.expect("valid document");
+        let loaded = load(Origin::Url(url)).await.expect("valid document");
         assert!(loaded.origin().starts_with("url "), "{}", loaded.origin());
         assert_eq!(loaded.rows.len(), 1);
     }
@@ -1462,7 +1462,7 @@ mod tests {
     async fn an_unparseable_file_document_is_fatal() {
         let path = std::env::temp_dir().join("dz-registry-bad.json");
         std::fs::write(&path, "this is not json").unwrap();
-        let err = load(Source::File(path.clone())).await;
+        let err = load(Origin::File(path.clone())).await;
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, Err(RegistryError::Parse(_))));
     }
@@ -1472,7 +1472,7 @@ mod tests {
     /// not silently start on the built-in copy the way the `Url` source does.
     #[tokio::test]
     async fn an_unreadable_file_is_fatal() {
-        let err = load(Source::File(PathBuf::from("/nonexistent/registry.json")))
+        let err = load(Origin::File(PathBuf::from("/nonexistent/registry.json")))
             .await
             .map(|_| ())
             .expect_err("an unreadable file must not fall back");
@@ -1484,7 +1484,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_url_still_falls_back() {
         // Nothing listens on this loopback port: the connection is refused.
-        let loaded = load(Source::Url("http://127.0.0.1:1".to_string()))
+        let loaded = load(Origin::Url("http://127.0.0.1:1".to_string()))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1778,11 +1778,11 @@ mod tests {
 
     #[test]
     fn flags_resolve_in_precedence_order() {
-        assert!(matches!(Source::from_flags("", ""), Source::BuiltIn));
-        assert!(matches!(Source::from_flags("", "/p"), Source::File(_)));
+        assert!(matches!(Origin::from_flags("", ""), Origin::BuiltIn));
+        assert!(matches!(Origin::from_flags("", "/p"), Origin::File(_)));
         assert!(matches!(
-            Source::from_flags("http://x", "/p"),
-            Source::Url(_)
+            Origin::from_flags("http://x", "/p"),
+            Origin::Url(_)
         ));
     }
 
@@ -1894,7 +1894,7 @@ mod tests {
                 "publishers":{"explicit":[{"mktdata":7576,"refdata":7577}]}}]}"#,
         )
         .await;
-        let loaded = load(Source::Url(url)).await.expect("must degrade, not die");
+        let loaded = load(Origin::Url(url)).await.expect("must degrade, not die");
         assert!(
             loaded.origin().starts_with("built-in ("),
             "{}",

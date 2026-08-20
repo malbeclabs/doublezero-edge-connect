@@ -143,7 +143,7 @@ struct SubFilter {
     /// a client sends both they are ANDed, so a disagreeing pair matches nothing rather than
     /// silently honouring one.
     #[serde(default)]
-    source: Option<String>,
+    source_name: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
     /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
@@ -157,7 +157,7 @@ struct SubFilter {
 }
 
 impl SubFilter {
-    /// The single match path. `venue`/`source` are aliases and are ANDed. `symbol`/`channel` are
+    /// The single match path. `venue`/`source_name` are aliases and are ANDed. `symbol`/`channel` are
     /// `None` for a venue-level message (today only `status`), and a `None` on the *message* side
     /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
     /// symbol- or channel-scoped subscriber must still receive it. A filter dimension the message
@@ -170,7 +170,7 @@ impl SubFilter {
             .as_deref()
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
             && self
-                .source
+                .source_name
                 .as_deref()
                 .is_none_or(|s| s.eq_ignore_ascii_case(venue))
             // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
@@ -685,7 +685,7 @@ mod tests {
         use super::prepare;
         let b = FeedMessage::Book(NormalizedBook {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -720,7 +720,7 @@ mod tests {
         );
         let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -765,7 +765,7 @@ mod tests {
     fn sample_quote() -> NormalizedQuote {
         NormalizedQuote {
             venue: "HYPERLIQUID".into(),
-            source: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bid: 1.0,
@@ -943,7 +943,7 @@ mod tests {
                 ),
                 NormalizedInstrument {
                     venue: "HYPERLIQUID".into(),
-                    source: "HYPERLIQUID".into(),
+                    source_name: "HYPERLIQUID".into(),
                     source_id: 0,
                     symbol: arc,
                     channel: 0,
@@ -1069,7 +1069,7 @@ mod tests {
                 ),
                 NormalizedInstrument {
                     venue: "KALSHI".into(),
-                    source: "KALSHI".into(),
+                    source_name: "KALSHI".into(),
                     source_id: 0,
                     symbol: arc,
                     channel,
@@ -1169,7 +1169,7 @@ mod tests {
     fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: symbol.into(),
             channel: 0,
@@ -1689,7 +1689,7 @@ mod tests {
             ),
             NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 0,
                 symbol: "KXBTCPERP".into(),
                 channel: 2,
@@ -1848,9 +1848,10 @@ mod tests {
     }
 
     #[test]
-    fn a_source_filter_selects_the_same_messages_as_a_venue_filter() {
+    fn a_source_name_filter_selects_the_same_messages_as_a_venue_filter() {
         let by_venue: SubFilter = serde_json::from_str(r#"{"venue":"HYPERLIQUID"}"#).unwrap();
-        let by_source: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+        let by_source: SubFilter =
+            serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
         for kind in ["quote", "trade", "status"] {
             assert_eq!(
                 by_venue.matches("HYPERLIQUID", Some("SOL"), None, kind),
@@ -1862,18 +1863,33 @@ mod tests {
 
     /// The alias keeps the case-insensitivity the venue key already had.
     #[test]
-    fn a_source_filter_is_case_insensitive() {
-        let f: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+    fn a_source_name_filter_is_case_insensitive() {
+        let f: SubFilter = serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
         assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
     }
 
     /// Both keys present and disagreeing must match nothing — silently honouring one would make a
     /// client's filter mean something it did not ask for.
     #[test]
-    fn disagreeing_source_and_venue_keys_match_nothing() {
+    fn disagreeing_source_name_and_venue_keys_match_nothing() {
         let f: SubFilter =
-            serde_json::from_str(r#"{"venue":"HYPERLIQUID","source":"PHOENIX"}"#).unwrap();
+            serde_json::from_str(r#"{"venue":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
         assert!(!f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
         assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
+    }
+
+    /// The retired `source` key is now an unknown field, and `SubFilter` ignores unknown fields —
+    /// so a filter naming only it degrades to the rest of the filter, here `{}`, the firehose. That
+    /// widening is the break: a client filtering on `source` must move to `source_name` or `venue`.
+    #[test]
+    fn the_retired_source_key_is_ignored_not_honoured() {
+        let retired: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+        assert_eq!(retired, serde_json::from_str::<SubFilter>("{}").unwrap());
+        assert!(retired.matches("PHOENIX", Some("SOL"), None, "quote"));
+        // Paired with a live dimension it narrows on that dimension alone.
+        let with_symbol: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","symbol":"SOL"}"#).unwrap();
+        assert!(with_symbol.matches("PHOENIX", Some("SOL"), None, "quote"));
+        assert!(!with_symbol.matches("HYPERLIQUID", Some("BTC"), None, "quote"));
     }
 }

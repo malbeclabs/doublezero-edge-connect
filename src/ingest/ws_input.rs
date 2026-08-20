@@ -233,7 +233,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     };
     let quote = NormalizedQuote {
         venue: venue_arc(hl_venue()),
-        source: venue_arc(hl_venue()),
+        source_name: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: d.coin.into(),
         bid: bid_px,
@@ -270,7 +270,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
     };
     let trade = NormalizedTrade {
         venue: venue_arc(hl_venue()),
-        source: venue_arc(hl_venue()),
+        source_name: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: t.coin.into(),
         channel,
@@ -338,7 +338,7 @@ mod tests {
             (hl_venue().into(), HL_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
                 venue: hl_venue().into(),
-                source: hl_venue().into(),
+                source_name: hl_venue().into(),
                 source_id: 0,
                 symbol: symbol.into(),
                 channel: 0,

@@ -213,10 +213,10 @@ served fresh at every container start — no rebuild needed to pick up a new ven
 with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY` (the
 installer clears the default URL for you in that case — see the table above). A host that can't
 reach the URL falls back to the built-in copy **silently by design**; the bridge's own startup log
-says which source actually won, and the one-liner echoes it for you:
+says which document actually won, and the one-liner echoes it for you:
 
 ```
-==> Feed registry: source="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
+==> Feed registry: origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
 ```
 
 That line only appears at startup, so `/v1/status` reports it too — which is how you check a
@@ -224,11 +224,11 @@ running process, or compare a fleet, without reading logs on each box:
 
 ```bash
 doublezero-edge status --jq '.registry'
-# {"source":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
+# {"origin":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
 #  "version":1,"rows":3,"receivers":33}
 ```
 
-A `source` of `built-in` on a host you expected to be using the hosted document means the fetch
+An `origin` of `built-in` on a host you expected to be using the hosted document means the fetch
 failed and it fell back — the string says which.
 
 ## Consume Edge Feeds

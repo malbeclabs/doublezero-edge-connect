@@ -663,7 +663,7 @@ fn level(side: BookSide, price: f64, size: f64) -> BookChange {
 fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: BOOK_VENUE.into(),
-        source: BOOK_VENUE.into(),
+        source_name: BOOK_VENUE.into(),
         source_id: 0,
         symbol: "BTC-PERP".into(),
         channel: BOOK_CHANNEL,

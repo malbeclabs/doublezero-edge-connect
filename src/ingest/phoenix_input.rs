@@ -199,7 +199,7 @@ impl PhoenixVenue {
         let source_ts_ns = unix_seconds_to_ns(&fill.timestamp);
         let trade = NormalizedTrade {
             venue: venue_arc(phoenix_venue()),
-            source: venue_arc(phoenix_venue()),
+            source_name: venue_arc(phoenix_venue()),
             source_id: PHOENIX_SOURCE_ID,
             symbol: symbol.into(),
             channel,
@@ -342,7 +342,7 @@ mod tests {
             (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
                 venue: phoenix_venue().into(),
-                source: phoenix_venue().into(),
+                source_name: phoenix_venue().into(),
                 source_id: 0,
                 symbol: symbol.into(),
                 channel: 0,

@@ -247,7 +247,7 @@ static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
 /// provenance any more than it overwrites its rows.
 static REGISTRY_INFO: OnceLock<registry::RegistryInfo> = OnceLock::new();
 
-/// Resolve the registry document from `source` and install it.
+/// Resolve the registry document from `origin` and install it.
 ///
 /// Called once from `main` before any receiver spawns. A repeat call is ignored rather than
 /// swapping the set under running receivers — books and reference data are keyed to the topology
@@ -257,8 +257,8 @@ static REGISTRY_INFO: OnceLock<registry::RegistryInfo> = OnceLock::new();
 /// that had already logged "feed registry resolved" would leave a breadcrumb naming a document the
 /// process then discarded, which is worse than no breadcrumb at all. A loser's rows stay leaked —
 /// a one-off in a case that should not happen, and cheaper than making the install fallible.
-pub async fn init(source: registry::Source) -> Result<(), registry::RegistryError> {
-    let loaded = registry::load(source).await?;
+pub async fn init(origin: registry::Origin) -> Result<(), registry::RegistryError> {
+    let loaded = registry::load(origin).await?;
     let info = loaded.info();
     if FEEDS.set(loaded.rows).is_ok() {
         // Installed only by the winning document, and only if it carried a block: a loser must not
@@ -271,7 +271,7 @@ pub async fn init(source: registry::Source) -> Result<(), registry::RegistryErro
         loaded.log_resolved();
     } else {
         warn!(
-            source = loaded.origin(),
+            origin = loaded.origin(),
             "feed registry was already installed; this document was discarded"
         );
     }

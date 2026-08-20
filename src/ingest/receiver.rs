@@ -413,7 +413,7 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
             .sender()
             .send(Arc::new(FeedMessage::Status(FeedStatus {
                 venue: wire_venue.clone(),
-                source: wire_venue,
+                source_name: wire_venue,
                 source_id,
                 state: state.to_string(),
                 stale_ms,
@@ -1034,7 +1034,7 @@ mod tests {
         match &*rx.try_recv().expect("a status was emitted") {
             FeedMessage::Status(s) => {
                 assert_eq!(s.venue.as_ref(), venue);
-                assert_eq!(s.source.as_ref(), venue);
+                assert_eq!(s.source_name.as_ref(), venue);
                 assert_eq!(s.source_id, 3);
                 assert_eq!(s.state, "ok");
             }
@@ -1126,7 +1126,7 @@ mod tests {
         };
         let quote = NormalizedQuote {
             venue: wire_venue.into(),
-            source: wire_venue.into(),
+            source_name: wire_venue.into(),
             source_id: 2,
             symbol: "X".into(),
             bid: 1.0,

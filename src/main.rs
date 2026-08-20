@@ -567,7 +567,7 @@ async fn main() -> Result<()> {
     // only at startup, refusing would not kill the fleet when the document changed but each process
     // at its next reschedule, far from the cause. A `--feed-registry` file is an operator's explicit
     // instruction about this one container, so a document that was read but rejected is fatal here.
-    feeds::init(ingest::registry::Source::from_flags(
+    feeds::init(ingest::registry::Origin::from_flags(
         &args.feed_registry_url,
         &args.feed_registry,
     ))
