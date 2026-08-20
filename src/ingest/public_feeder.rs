@@ -195,7 +195,7 @@ pub fn resolve_instrument(
     instruments: &InstrumentSnapshot,
     venue: &str,
     symbol: &str,
-) -> Option<(u32, u32)> {
+) -> Option<(u8, u32)> {
     crate::model::lock(instruments)
         .values()
         .find(|i| i.venue.as_ref() == venue && i.symbol.as_ref() == symbol)

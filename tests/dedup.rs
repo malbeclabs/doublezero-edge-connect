@@ -642,7 +642,7 @@ fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
 
 const BOOK_VENUE: &str = "BookPathsInterleave";
 const BOOK_CATEGORY: &str = "perps";
-const BOOK_CHANNEL: u32 = 2;
+const BOOK_CHANNEL: u8 = 2;
 const BOOK_INSTRUMENT: u32 = 41;
 
 fn path(n: u8) -> Transport {

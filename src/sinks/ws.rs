@@ -48,7 +48,7 @@ struct PreparedFrame {
     symbol: Option<Arc<str>>,
     /// The message's `channel_id`, or `None` for a type that carries none. Populated when the
     /// incremental `book` message lands; every current type is `None`.
-    channel: Option<u32>,
+    channel: Option<u8>,
 }
 
 /// Serialize one backbone message once: clone it, stamp the shared `ws_send_ts_ns`, render the JSON,
@@ -149,7 +149,7 @@ struct SubFilter {
     /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
     /// client-selectable: exactly one arbitrated book per market reaches the wire.
     #[serde(default)]
-    channel: Option<u32>,
+    channel: Option<u8>,
     /// Message `type` (`quote`/`trade`/`book`/...). Named `msg_type` in Rust because `type` is a
     /// keyword; the wire name is `type`.
     #[serde(rename = "type", default)]
@@ -162,7 +162,7 @@ impl SubFilter {
     /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
     /// symbol- or channel-scoped subscriber must still receive it. A filter dimension the message
     /// *does* carry is matched normally.
-    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u32>, kind: &str) -> bool {
+    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u8>, kind: &str) -> bool {
         // Venue codes are registry identifiers, not free text - match case-insensitively so a
         // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol and
         // type stay exact (venues name symbols precisely; types are a closed protocol set).
@@ -363,7 +363,7 @@ where
 {
     // Each kind passes its own channel: a channel-bearing kind that passed `None` would leave a
     // `{"channel":N}` client with no bootstrap at all.
-    let pass = |venue: &str, symbol: &str, channel: Option<u32>, kind: &str| {
+    let pass = |venue: &str, symbol: &str, channel: Option<u8>, kind: &str| {
         subs.is_empty()
             || subs
                 .iter()
@@ -938,7 +938,7 @@ mod tests {
                 (
                     Arc::<str>::from("HYPERLIQUID"),
                     Arc::<str>::from("default"),
-                    0u32,
+                    0u8,
                     n as u32,
                 ),
                 NormalizedInstrument {
@@ -1058,7 +1058,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
 
         let mut defs = HashMap::new();
-        for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
+        for (sym, channel) in [("KXBTCPERP", 2u8), ("KXETHPERP", 3)] {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
@@ -1215,7 +1215,7 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>,
+        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
         books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1290,7 +1290,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1410,7 +1410,7 @@ mod tests {
             (
                 Arc::<str>::from("HYPERLIQUID"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             order_level_accumulator("BTC"),
@@ -1421,7 +1421,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1513,7 +1513,7 @@ mod tests {
             (
                 Arc::<str>::from("HYPERLIQUID"),
                 Arc::<str>::from("perps"),
-                0u32,
+                0u8,
                 1u32,
             ),
             acc,
@@ -1586,7 +1586,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1595,7 +1595,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                3u32,
+                3u8,
                 7u32,
             ),
             accumulator("KXETHPERP", 0.41, 0.43),
@@ -1638,6 +1638,43 @@ mod tests {
         srv.abort();
     }
 
+    /// A `channel` past the wire's width is refused as a malformed frame, not accepted as a filter
+    /// that then matches nothing for the life of the client. The frame is refused, the connection is
+    /// not.
+    #[tokio::test]
+    #[serial]
+    async fn a_subscribe_channel_above_the_wire_width_is_answered_with_an_error() {
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), BookReplay::default()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":300}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("error frame");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("frame parses");
+        assert_eq!(v["channel"], "error", "got {frame}");
+        assert_eq!(v["error"], "unrecognized message", "got {frame}");
+
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":3}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+
+        srv.abort();
+    }
+
     /// Precision before price: the `instrument` definition is replayed ahead of the market's `book`.
     #[tokio::test]
     #[serial]
@@ -1647,7 +1684,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             NormalizedInstrument {
@@ -1667,7 +1704,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1712,7 +1749,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                3u32,
+                3u8,
                 7u32,
             ),
             mid_stream,
@@ -1721,7 +1758,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1766,7 +1803,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),

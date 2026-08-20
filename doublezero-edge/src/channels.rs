@@ -89,7 +89,7 @@ pub struct DropRow {
     pub venue: String,
     pub category: String,
     pub code: String,
-    pub channel: u32,
+    pub channel: u8,
     pub name: String,
     pub products: u64,
 }

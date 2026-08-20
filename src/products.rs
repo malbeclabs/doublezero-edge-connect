@@ -27,7 +27,7 @@ use crate::{ingest::sources::source_label, model::InstrumentSnapshot};
 pub struct ProductId {
     pub source_id: u16,
     pub symbol: Arc<str>,
-    pub channel: u32,
+    pub channel: u8,
     pub instrument_id: u32,
     /// The instrument universe this market belongs to (`ingest::feeds::Feed::category`) —
     /// producer-side only, carried so a caller holding a `ProductId` can look the market back up
@@ -60,7 +60,7 @@ pub struct ParsedId {
     pub source: String,
     pub symbol: String,
     /// `(channel, instrument_id)` when the id carried the disambiguating suffix.
-    pub identity: Option<(u32, u32)>,
+    pub identity: Option<(u8, u32)>,
 }
 
 /// Parse a product id. Returns `None` for anything malformed rather than guessing — an agent that
@@ -254,7 +254,7 @@ mod tests {
     fn instrument(
         category: &str,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) -> NormalizedInstrument {
         NormalizedInstrument {

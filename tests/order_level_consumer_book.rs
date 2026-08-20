@@ -25,7 +25,7 @@ use std::{
 use tokio::sync::broadcast;
 
 const VENUE: &str = "HYPERLIQUID";
-const CHANNEL: u32 = 1;
+const CHANNEL: u8 = 1;
 const INSTRUMENT: u32 = 7;
 /// A second market on the **same channel**, for a scenario that has to show one market's traffic
 /// leaving another's alone.

@@ -150,7 +150,7 @@ pub struct NormalizedTrade {
     /// `ingest::public_feeder::resolve_instrument`, which resolves the real value from the edge
     /// catalog instead where one exists.
     #[serde(default)]
-    pub channel: u32,
+    pub channel: u8,
     /// Instrument id, unique within `channel`. Additive alongside `channel` (see its doc): together
     /// they are the identity `history::Key` groups on, closing the gap that let a price-aggregated
     /// venue's mirrored paths (identical instrument set, distinct `channel`) drop every trade rather
@@ -313,7 +313,7 @@ pub struct NormalizedBook {
     /// Display label. Not unique in general — see the type docs.
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this feed carries. Filterable.
-    pub channel: u32,
+    pub channel: u8,
     /// Instrument id, unique within `channel`.
     pub instrument_id: u32,
     /// The instrument **universe** this batch's row carries, stamped by the emitting processor from
@@ -368,7 +368,7 @@ pub struct NormalizedInstrument {
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this definition came from. Filterable.
     #[serde(default)]
-    pub channel: u32,
+    pub channel: u8,
     /// Instrument id, unique within `channel`.
     #[serde(default)]
     pub instrument_id: u32,
@@ -452,7 +452,7 @@ impl FeedMessage {
     /// The `channel_id` this message is about, for per-channel subscription filtering. The
     /// incremental `book` product and the `instrument` definition that scales it carry one; every
     /// other type is venue/symbol-scoped.
-    pub fn channel(&self) -> Option<u32> {
+    pub fn channel(&self) -> Option<u8> {
         match self {
             FeedMessage::Book(b) | FeedMessage::OrderBook(b) => Some(b.channel),
             FeedMessage::Instrument(i) => Some(i.channel),
@@ -488,7 +488,7 @@ impl FeedMessage {
 /// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
 /// diverge.
 pub type InstrumentSnapshot =
-    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>>>;
+    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
@@ -889,7 +889,7 @@ pub type BookSnapshot = Arc<Mutex<BookReplay>>;
 
 /// A market's replay key: the arbitration scope plus the wire identity. Structurally
 /// `ingest::authority::MarketKey`, and required to stay so — see [`BookSnapshot`].
-pub type BookKey = (Arc<str>, Arc<str>, u32, u32);
+pub type BookKey = (Arc<str>, Arc<str>, u8, u32);
 
 /// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
 pub type BookMap = HashMap<BookKey, BookAccumulator>;
@@ -1023,7 +1023,7 @@ mod tests {
     const TEST_CATEGORY: &str = "testcategory";
 
     /// The replay key a test's accumulator materializes under.
-    fn bkey(venue: &Arc<str>, channel: u32, instrument_id: u32) -> BookKey {
+    fn bkey(venue: &Arc<str>, channel: u8, instrument_id: u32) -> BookKey {
         (venue.clone(), TEST_CATEGORY.into(), channel, instrument_id)
     }
 
@@ -1076,6 +1076,10 @@ mod tests {
         assert_eq!(v["venue"], "KALSHI");
         assert_eq!(v["symbol"], "KXBTCPERP");
         assert_eq!(v["channel"], 2);
+        // A `u8` `channel` still renders as a bare JSON number: JSON carries no integer width.
+        assert!(serde_json::to_string(&m)
+            .unwrap()
+            .contains(r#""channel":2"#));
         assert_eq!(v["instrument_id"], 41);
         assert_eq!(v["snapshot"], false);
         assert_eq!(v["last"], true);

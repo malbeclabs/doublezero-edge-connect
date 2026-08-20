@@ -35,7 +35,7 @@ pub struct Product {
     pub source_id: u32,
     pub source: String,
     pub symbol: String,
-    pub channel: u32,
+    pub channel: u8,
     pub instrument_id: u32,
     pub price_increment: String,
     pub base_increment: String,
@@ -212,7 +212,7 @@ pub struct ChannelRow {
 /// send one or both — this type must keep parsing regardless.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelEntry {
-    pub channel: u32,
+    pub channel: u8,
     pub allowed: bool,
     pub bound: bool,
     pub products: u64,

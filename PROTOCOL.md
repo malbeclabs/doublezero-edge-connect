@@ -76,7 +76,7 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 | `source`         | string | The source's registry name (e.g. `Hyperliquid`, `Phoenix`). **Preferred.** |
 | `source_id`      | number | The wire Source ID, verbatim.                                        |
 | `symbol`         | string | Instrument symbol as the venue names it (e.g. `SOL`, `SOL-PERP`).   |
-| `channel`        | uint32 | The publisher's channel id: the instrument set this feed carries. Filterable. |
+| `channel`        | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
 | `instrument_id`  | uint32 | Instrument id, unique within `channel`.                              |
 | `price_exponent` | int8   | Price increment exponent: tick size = `10^price_exponent` (e.g. `-2` -> `0.01`). |
 | `qty_exponent`   | int8   | Size increment exponent: step = `10^qty_exponent`.                  |
@@ -153,7 +153,7 @@ venue precision, same convention as `quote`).
 | `source`            | string  | The source's registry name. **Preferred.**                           |
 | `source_id`         | number  | The wire Source ID, verbatim.                                        |
 | `symbol`            | string  | Symbol (matches an `instrument`'s `symbol`).                         |
-| `channel`           | uint32  | The publisher's channel id: the instrument set this feed carries. `0` for a source with no channel concept of its own. Filterable. |
+| `channel`           | uint8   | The publisher's channel id: the instrument set this feed carries. `0` for a source with no channel concept of its own. Filterable. |
 | `instrument_id`     | uint32  | Instrument id, unique within `channel`.                              |
 | `price`             | number  | Trade price (decimal).                                               |
 | `size`              | number  | Trade size (decimal).                                                |
@@ -272,7 +272,7 @@ The two granularities are **two message types**, not one type with a flag. `book
 | `source` | string | The source's registry name. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim. |
 | `symbol` | string | **Display label.** Not guaranteed unique — see *Identity* below. |
-| `channel` | uint32 | The publisher's channel id: the instrument set this feed carries. Filterable. |
+| `channel` | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
 | `instrument_id` | uint32 | Instrument id, unique within `channel`. |
 | `changes` | object[] | Book changes, in order. `{ "action", "side", "price", "size", "order_id" }`. |
 | `changes[].action` | string | `"clear"`, `"update"`, or `"delete"`. |
@@ -412,7 +412,7 @@ A consumer may send control messages (JSON text frames) to filter the stream. **
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint8, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
 
 `source` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them, so a
 disagreeing pair matches nothing; supply one.

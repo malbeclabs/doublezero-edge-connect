@@ -76,7 +76,7 @@ const BYTES_PER_BUCKET: usize = 93;
 pub struct Key {
     pub source_id: u16,
     pub category: Arc<str>,
-    pub channel: u32,
+    pub channel: u8,
     pub instrument_id: u32,
 }
 
@@ -302,7 +302,7 @@ impl Store {
     /// occupancy to this one). Used by the `/v1/status` `channels` block to answer, per channel,
     /// "how much of the store does an admitted channel actually hold" — the number that turns a
     /// flat RSS reading into an answer to "is my channel filter narrow enough."
-    pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
+    pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u8) -> usize {
         self.products
             .keys()
             .filter(|k| k.source_id == source_id && k.category == *category && k.channel == channel)
@@ -553,7 +553,7 @@ impl Store {
     ///
     /// Keeps `buckets_total` in step (subtracting exactly the removed products' own bucket counts),
     /// the same discipline every other removal path in this module follows — see that field's doc.
-    pub fn forget_channel(&mut self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
+    pub fn forget_channel(&mut self, source_id: u16, category: &Arc<str>, channel: u8) -> usize {
         let doomed: Vec<Key> = self
             .products
             .keys()

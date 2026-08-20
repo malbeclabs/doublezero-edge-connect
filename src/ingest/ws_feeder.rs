@@ -335,7 +335,7 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (hl_venue().into(), HL_CATEGORY.into(), 0u32, 1u32),
+            (hl_venue().into(), HL_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
                 venue: hl_venue().into(),
                 source: hl_venue().into(),

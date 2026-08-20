@@ -850,7 +850,6 @@ impl Reconciler {
         let Some(channel) = publisher.channel else {
             return;
         };
-        let channel = u32::from(channel);
 
         // N1's invariant, made loud rather than merely documented: by the time this runs, `tick`
         // must have already aborted this key's receiver (if it was running at all) — otherwise a
@@ -1560,7 +1559,7 @@ mod tests {
         venue: &str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         category: &str,
         changes: Vec<crate::model::BookChange>,
@@ -1593,7 +1592,7 @@ mod tests {
         source_id: u16,
         symbol: &str,
         category: &'static str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) {
         let mut a = crate::ingest::arbiter::lock(&r.cfg.arbiter);
@@ -1884,11 +1883,11 @@ mod tests {
         let key_perps = ("KALSHI", "perps", FeedKind::MarketByPrice, 33030u16);
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "perps".into(), 10u32, 1u32),
+            ("KALSHI".into(), "perps".into(), 10u8, 1u32),
             test_instrument_in("perps", "KALSHI", 3, "KXBTCPERP", 10, 1),
         );
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32),
             test_instrument_in("sports", "KALSHI", 3, "LAKERSWIN", 10, 1),
         );
 
@@ -1896,11 +1895,11 @@ mod tests {
 
         let map = r.cfg.instruments.lock().unwrap();
         assert!(
-            !map.contains_key(&("KALSHI".into(), "perps".into(), 10u32, 1u32)),
+            !map.contains_key(&("KALSHI".into(), "perps".into(), 10u8, 1u32)),
             "the departing perps row's own catalog entry must be purged"
         );
         let peer = map
-            .get(&("KALSHI".into(), "sports".into(), 10u32, 1u32))
+            .get(&("KALSHI".into(), "sports".into(), 10u8, 1u32))
             .expect(
                 "the sports row's catalog entry, sharing channel 10 under the same venue, must \
                  survive — a category-blind filter would have dropped it too",
@@ -1923,7 +1922,7 @@ mod tests {
         );
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
                 source: "KALSHI".into(),
@@ -2040,8 +2039,8 @@ mod tests {
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
         let book_key: crate::ingest::authority::MarketKey =
             (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
         let hist_key = history::Key {
@@ -2148,8 +2147,8 @@ mod tests {
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
         let book_key: crate::ingest::authority::MarketKey =
             (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
         let hist_key = history::Key {
@@ -2261,8 +2260,8 @@ mod tests {
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
 
         // Tick 1: both channels admitted (spawns real, never-polled receivers).
         r.tick().await;
@@ -2380,7 +2379,7 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
         test_instrument_in("default", venue, source_id, symbol, channel, instrument_id)
@@ -2392,7 +2391,7 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
@@ -2413,7 +2412,7 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         price: f64,
         source_ts_ns: u64,
@@ -2438,7 +2437,7 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         price: f64,
         source_ts_ns: u64,
@@ -2477,7 +2476,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -2544,7 +2543,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -2609,11 +2608,11 @@ mod tests {
             // Two paths of one price-aggregated venue: identical symbol and instrument_id, distinct
             // channel - exactly the shape `tests/fixtures/PROVENANCE.md` records for the live feed.
             map.insert(
-                ("KALSHI".into(), "default".into(), 1u32, 99u32),
+                ("KALSHI".into(), "default".into(), 1u8, 99u32),
                 test_instrument("KALSHI", 3, "KXBTCPERP", 1, 99),
             );
             map.insert(
-                ("KALSHI".into(), "default".into(), 2u32, 99u32),
+                ("KALSHI".into(), "default".into(), 2u8, 99u32),
                 test_instrument("KALSHI", 3, "KXBTCPERP", 2, 99),
             );
         }
@@ -2697,7 +2696,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));

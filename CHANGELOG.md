@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shred sources; an operator who had narrowed it to `edge-` would now pick up market-data groups.
 
 ### Changed
+- The wire `channel` is a `u8` throughout, matching every codec's decode and the edge-feed-spec glossary. Emitted JSON is unchanged; a `subscribe` filter carrying a `channel` above 255 is now answered with the sink's error frame instead of being accepted as a filter that matches nothing.
 - ⚠️ **Metrics: eight series renamed, one label renamed, seven series moved to a new label.** Cutover,
   no dual-publishing — a renamed series reads as a feed that went quiet, so retire or repoint any
   dashboard and alert on the old names. The repo now uses the

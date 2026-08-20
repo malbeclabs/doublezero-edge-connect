@@ -147,10 +147,10 @@ impl FrameCtx<'_> {
     /// **Never call this for producer-side state** (book keys, sequence trackers, reset counts,
     /// snapshot cycles) — those must stay keyed on the raw wire channel id, because the two paths
     /// are independently sequenced and collapsing that corrupts book recovery.
-    pub fn canonical_channel(&self, wire_channel: u8) -> u32 {
+    pub fn canonical_channel(&self, wire_channel: u8) -> u8 {
         match self.mirror_offset {
-            Some(offset) if wire_channel >= offset => u32::from(wire_channel - offset),
-            _ => u32::from(wire_channel),
+            Some(offset) if wire_channel >= offset => wire_channel - offset,
+            _ => wire_channel,
         }
     }
 
@@ -1211,7 +1211,7 @@ mod tests {
         };
 
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let market = ("MBODEPART".into(), "test".into(), 2u32, 41u32);
+        let market = ("MBODEPART".into(), "test".into(), 2u8, 41u32);
         let registration = |kind, port| {
             let (tx, _rx) = tokio::sync::broadcast::channel(8);
             let arbiter: SharedArbiter =
@@ -1261,7 +1261,7 @@ mod tests {
         // The row's static venue; the market below is filed under a different one, as a superset
         // row's instruments are.
         let row_venue = "MBOWIREVENUE";
-        let market = ("HYPERLIQUID".into(), "wiretest".into(), 2u32, 41u32);
+        let market = ("HYPERLIQUID".into(), "wiretest".into(), 2u8, 41u32);
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
         let arbiter: SharedArbiter =
             std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));

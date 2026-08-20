@@ -243,7 +243,7 @@ fn remove_instrument(
     instruments: &crate::model::InstrumentSnapshot,
     venue: &Arc<str>,
     category: &Arc<str>,
-    channel: u32,
+    channel: u8,
     instrument_id: u32,
 ) {
     crate::model::lock(instruments).remove(&(
@@ -291,7 +291,7 @@ pub struct TobProcessor {
     /// key is `(old_venue, channel, instrument_id)`, and `channel`/`instrument_id` don't change
     /// with the Source ID, so no separate "what was it last announced under" memo is needed the
     /// way a mutable `symbol` key used to require.
-    pending_channel: HashMap<(IpAddr, u32), u32>,
+    pending_channel: HashMap<(IpAddr, u32), u8>,
 }
 
 impl TobProcessor {
@@ -510,7 +510,7 @@ impl FrameProcessor for TobProcessor {
                     // under the STALE id, would make correctness rest on the arbiter incidentally
                     // deduping a redundant broadcast rather than on this decision.
                     let key = (ctx.publisher, d.instrument_id);
-                    self.pending_channel.insert(key, header.channel_id as u32);
+                    self.pending_channel.insert(key, header.channel_id);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
                             let source = venue_arc(source_label(source_id));
@@ -519,7 +519,7 @@ impl FrameProcessor for TobProcessor {
                                 source: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
-                                channel: header.channel_id as u32,
+                                channel: header.channel_id,
                                 instrument_id: d.instrument_id,
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
@@ -671,7 +671,7 @@ pub struct MidpointProcessor {
     /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
     /// see [`TobProcessor::pending_channel`], including why a Source ID change's
     /// `InstrumentSnapshot` purge reads its current value directly rather than a separate memo.
-    pending_channel: HashMap<(IpAddr, u32), u32>,
+    pending_channel: HashMap<(IpAddr, u32), u8>,
 }
 
 impl Default for MidpointProcessor {
@@ -801,7 +801,7 @@ impl FrameProcessor for MidpointProcessor {
                     // that later emission, and re-announce now if already revealed by an earlier
                     // burst (the periodic reannounce this feed's manifest bursts already drive).
                     let key = (ctx.publisher, d.instrument_id);
-                    self.pending_channel.insert(key, header.channel_id as u32);
+                    self.pending_channel.insert(key, header.channel_id);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         let source = venue_arc(source_label(source_id));
                         let inst = NormalizedInstrument {
@@ -809,7 +809,7 @@ impl FrameProcessor for MidpointProcessor {
                             source: source.clone(),
                             source_id,
                             symbol: d.symbol.clone(),
-                            channel: header.channel_id as u32,
+                            channel: header.channel_id,
                             instrument_id: d.instrument_id,
                             category: category_arc(ctx.category),
                             price_exponent: d.price_exponent,
@@ -923,7 +923,7 @@ pub struct MboProcessor {
     /// (last-definition-wins, matching `RefDataState.defs`'s own per-`instrument_id` semantics).
     /// Same bound reasoning as `revealed` above. Also what a Source ID change's `InstrumentSnapshot`
     /// purge reads its current value from directly — see [`TobProcessor::pending_channel`].
-    pending_channel: HashMap<(IpAddr, u32), u32>,
+    pending_channel: HashMap<(IpAddr, u32), u8>,
     /// Order-level changes the current frame's applied deltas produced, tagged with the instrument they
     /// touched. Reused across frames (cleared at the top of each) so the hot path allocates nothing per
     /// event, and bounded by one datagram's message count.
@@ -1551,7 +1551,7 @@ impl FrameProcessor for MboProcessor {
                     // already revealed, skip this and let the eager `reveal_if_needed` call below
                     // handle it: see `TobProcessor`'s definition path for why.
                     let key = (ctx.publisher, d.instrument_id);
-                    self.pending_channel.insert(key, header.channel_id as u32);
+                    self.pending_channel.insert(key, header.channel_id);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
                             let source = venue_arc(source_label(source_id));
@@ -1560,7 +1560,7 @@ impl FrameProcessor for MboProcessor {
                                 source: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
-                                channel: header.channel_id as u32,
+                                channel: header.channel_id,
                                 instrument_id: d.instrument_id,
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
@@ -4613,7 +4613,7 @@ mod tests {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1);
             let entry = map
-                .get(&("TestVenue".into(), "default".into(), 0u32, 1u32))
+                .get(&("TestVenue".into(), "default".into(), 0u8, 1u32))
                 .unwrap();
             assert_eq!(entry.price_exponent, -2);
             assert_eq!(entry.qty_exponent, -4);
@@ -4635,7 +4635,7 @@ mod tests {
             let map = instruments.lock().unwrap();
             assert_eq!(map.len(), 1, "still one entry after conflicting write");
             let entry = map
-                .get(&("TestVenue".into(), "default".into(), 0u32, 1u32))
+                .get(&("TestVenue".into(), "default".into(), 0u8, 1u32))
                 .unwrap();
             assert_eq!(
                 entry.price_exponent, -3,
@@ -5327,7 +5327,7 @@ mod tests {
                 "the mirror must not mint a second catalog entry: {keys:?}"
             );
             assert!(
-                cat.contains_key(&("KALSHI".into(), "testcategory".into(), 10u32, 41u32)),
+                cat.contains_key(&("KALSHI".into(), "testcategory".into(), 10u8, 41u32)),
                 "the single entry must live under the canonical channel: {keys:?}"
             );
         }
@@ -5338,7 +5338,7 @@ mod tests {
         // ordinary mirrored refdata bursts get, now reached via the channel offset instead of a
         // repeated burst on one channel.
         let seen = drain_all(&mut rx);
-        let inst_channels: Vec<u32> = seen
+        let inst_channels: Vec<u8> = seen
             .iter()
             .filter_map(|m| match m {
                 FeedMessage::Instrument(i) => Some(i.channel),
@@ -5424,7 +5424,7 @@ mod tests {
         // Every `book` this frame pair emitted still carries the canonical channel, proving the
         // collapse is consumer-facing only and not a side effect of the books above having stayed
         // apart.
-        let book_channels: Vec<u32> = drain_all(&mut rx)
+        let book_channels: Vec<u8> = drain_all(&mut rx)
             .iter()
             .filter_map(|m| match m {
                 FeedMessage::Book(b) => Some(b.channel),
@@ -6909,7 +6909,7 @@ mod tests {
         let market = (
             crate::model::venue_arc("HYPERLIQUID"),
             crate::model::category_arc("testcategory"),
-            3u32,
+            3u8,
             41u32,
         );
         let path = Transport::Edge(TEST_PUB);
@@ -7181,7 +7181,7 @@ mod tests {
                 &(
                     crate::model::venue_arc("SOURCE_0"),
                     crate::model::category_arc("testcategory"),
-                    0u32,
+                    0u8,
                     0u32,
                 ),
                 Transport::Edge(TEST_PUB)

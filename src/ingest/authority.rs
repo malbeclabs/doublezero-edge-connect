@@ -83,7 +83,7 @@ use crate::ingest::arbiter::{Admit, Transport};
 pub type ScopeKey = (Arc<str>, Arc<str>);
 
 /// The published market key: the arbitration scope plus the wire identity pair.
-pub type MarketKey = (Arc<str>, Arc<str>, u32, u32);
+pub type MarketKey = (Arc<str>, Arc<str>, u8, u32);
 
 /// The scope one market arbitrates in. Two `Arc` bumps, not an allocation.
 fn scope_of(key: &MarketKey) -> ScopeKey {

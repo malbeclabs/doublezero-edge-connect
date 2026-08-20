@@ -192,7 +192,7 @@ const FORCED_REBASELINE_MIN_INTERVAL_NS: u64 = 250_000_000; // 250ms
 
 /// One order-level channel: an arbitration scope plus the wire's `channel_id`. The grain the venue
 /// clock is kept at, since a market's own stamps say nothing about how far the venue has moved.
-type ChannelKey = (Arc<str>, Arc<str>, u32);
+type ChannelKey = (Arc<str>, Arc<str>, u8);
 
 /// The cross-publisher resurrection guard's venue-time tunables (`--arb-book-*`), so the values a
 /// test-built arbiter guards on and the ones `--help` advertises cannot drift apart.
@@ -1392,7 +1392,7 @@ pub struct Arbiter {
     /// symbol-keyed rate limit would starve a `{"channel":N}` subscriber of a definition another
     /// channel announced first. Bounded by the distinct instrument count, like the
     /// `InstrumentSnapshot` `processor::upsert_instrument` maintains.
-    instrument_defs: HashMap<(Arc<str>, u32, u32), (InstrumentId, u64)>,
+    instrument_defs: HashMap<(Arc<str>, u8, u32), (InstrumentId, u64)>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -2588,7 +2588,7 @@ impl Arbiter {
     /// `apply_book_replay` recreates the replay entry with `baselined() == false`, and
     /// `sinks/ws.rs`'s replay path then hides the market from every new client until the path
     /// happens to emit a `Clear` of its own accord.
-    pub fn forget_channel_books(&mut self, venue: &str, category: &str, channel: u32) -> usize {
+    pub fn forget_channel_books(&mut self, venue: &str, category: &str, channel: u8) -> usize {
         let doomed: Vec<MarketKey> = self
             .book_markets
             .keys()
@@ -4533,7 +4533,7 @@ mod tests {
     use crate::model::{BookAction, BookChange, BookSide, NormalizedBook};
     use std::collections::BTreeMap;
 
-    const BOOK_CHANNEL: u32 = 2;
+    const BOOK_CHANNEL: u8 = 2;
     const BOOK_INSTRUMENT: u32 = 41;
 
     /// The arbitration scope every book test runs in: one venue, one instrument universe.
@@ -5516,8 +5516,8 @@ mod tests {
 
         // A second channel, same venue/category as the doomed markets — a still-running sibling
         // channel. `book()` always stamps `BOOK_CHANNEL`, so this batch is built by hand.
-        const OTHER_CHANNEL: u32 = BOOK_CHANNEL + 1;
-        let book_on_channel = |channel: u32, instrument_id: u32, changes: Vec<BookChange>| {
+        const OTHER_CHANNEL: u8 = BOOK_CHANNEL + 1;
+        let book_on_channel = |channel: u8, instrument_id: u32, changes: Vec<BookChange>| {
             FeedMessage::Book(NormalizedBook {
                 venue: venue.into(),
                 source: venue.into(),
@@ -5689,7 +5689,7 @@ mod tests {
     /// A `book` batch on an explicit `channel` (the `book()` helper always stamps `BOOK_CHANNEL`).
     fn book_ch(
         venue: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         changes: Vec<BookChange>,
     ) -> FeedMessage {
@@ -5753,7 +5753,7 @@ mod tests {
     /// `(channel, instrument_id)`, one on a peer **channel**. Returns the arbiter, its replay map
     /// and the four keys in that order.
     fn seeded_books(venue: &str) -> (Arbiter, crate::model::BookSnapshot, Vec<MarketKey>) {
-        const OTHER_CHANNEL: u32 = BOOK_CHANNEL + 1;
+        const OTHER_CHANNEL: u8 = BOOK_CHANNEL + 1;
         let (tx, _rx) = broadcast::channel(1);
         let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
         let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
@@ -6948,24 +6948,29 @@ mod tests {
         assert_eq!(a.guard.held, held);
     }
 
-    /// The channel clocks are keyed on the wire's `channel_id`, so a forged stream must cost evictions
-    /// rather than memory. Losing a clock degrades that channel to "frontier unset", which its next
-    /// batch re-seeds.
+    /// The channel clocks are keyed on the wire's `(venue, category, channel_id)`, so a forged stream
+    /// must cost evictions rather than memory. Losing a clock degrades that channel to "frontier
+    /// unset", which its next batch re-seeds.
+    ///
+    /// Driven across venues rather than channels: a `channel_id` is a `u8`, so the 256 that exist
+    /// cannot reach a cap this far above them, while the venue is the wire Source ID's name and is
+    /// bounded only by [`crate::ingest::sources::MAX_UNREGISTERED_SOURCES`].
     #[test]
     fn the_channel_clocks_are_bounded() {
-        const VENUE: &str = "BookClockBound";
-        let (mut a, mut rx) = racing(VENUE, &[path(1)]);
-        for channel in 0..(MAX_CHANNEL_CLOCKS as u32 + 8) {
-            let FeedMessage::Book(mut b) = l3_batch_at(
-                VENUE,
-                vec![order(BookAction::Update, 1, 100.0, 1.0)],
-                1_000,
-                1_000,
-            ) else {
-                unreachable!()
-            };
-            b.channel = channel;
-            a.emit(FeedMessage::Book(b), path(1), TEST_CATEGORY);
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        for n in 0..(MAX_CHANNEL_CLOCKS + 8) {
+            let venue = format!("BookClockBound{n}");
+            a.emit(
+                l3_batch_at(
+                    &venue,
+                    vec![order(BookAction::Update, 1, 100.0, 1.0)],
+                    1_000,
+                    1_000,
+                ),
+                path(1),
+                TEST_CATEGORY,
+            );
         }
         let _ = drain_books(&mut rx);
         assert!(a.channel_clocks.len() <= MAX_CHANNEL_CLOCKS);
