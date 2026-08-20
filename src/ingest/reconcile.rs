@@ -1077,9 +1077,9 @@ fn resolve_ts_ns(source_ts_ns: u64, recv_ts_ns: u64) -> u64 {
 ///
 /// Keys straight off the message: `NormalizedTrade` now carries `channel`/`instrument_id` *and*
 /// `category` itself (the identity `history::Key` groups on), populated at every emission site
-/// alongside the `symbol` a price-aggregated venue's mirrored arms can share. There is
+/// alongside the `symbol` a price-aggregated venue's mirrored paths can share. There is
 /// deliberately no symbol lookup here anymore - matching by `(venue, symbol)` against the
-/// instrument catalog is exactly what dropped every trade on a venue whose two arms carry an
+/// instrument catalog is exactly what dropped every trade on a venue whose two paths carry an
 /// identical instrument set under distinct `channel`s (see `history::Key`'s docs), because every
 /// symbol on such a venue matched more than once. `category` closes the companion gap: two
 /// disjoint universes under one Source ID can share `(channel, instrument_id)`, and without it
@@ -2589,24 +2589,24 @@ mod tests {
     }
 
     /// The headline test, and the inverse of the defect: a price-aggregated venue's two mirrored
-    /// arms carry an identical instrument set (same symbol, same `instrument_id`) under distinct
+    /// paths carry an identical instrument set (same symbol, same `instrument_id`) under distinct
     /// `channel`s. Before this fix, `feed_history` resolved a trade's identity by matching
-    /// `(venue, symbol)` against the catalog, and a mirrored-arm symbol always matched twice - so
+    /// `(venue, symbol)` against the catalog, and a mirrored-path symbol always matched twice - so
     /// every trade on such a venue was silently dropped as ambiguous. Keying straight off the
-    /// message's own `channel`/`instrument_id` instead means a trade for one arm lands only in that
-    /// arm's product, never merged with (or blocked by) its mirror.
+    /// message's own `channel`/`instrument_id` instead means a trade for one path lands only in that
+    /// path's product, never merged with (or blocked by) its mirror.
     ///
     /// Revert-verify: reintroducing a `(venue, symbol)` catalog match in place of reading
     /// `t.channel`/`t.instrument_id` directly (i.e. restoring the deleted `trade_identity`) makes
     /// this test fail — both catalog entries match the trade's symbol, so it is dropped instead of
-    /// reaching either arm's product. Confirmed by hand before landing this test.
+    /// reaching either path's product. Confirmed by hand before landing this test.
     #[tokio::test]
-    async fn a_mirrored_arm_trade_is_attributed_to_its_own_product() {
+    async fn a_mirrored_path_trade_is_attributed_to_its_own_product() {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         {
             let mut map = instruments.lock().unwrap();
-            // Two arms of one price-aggregated venue: identical symbol and instrument_id, distinct
+            // Two paths of one price-aggregated venue: identical symbol and instrument_id, distinct
             // channel - exactly the shape `tests/fixtures/PROVENANCE.md` records for the live feed.
             map.insert(
                 ("KALSHI".into(), "default".into(), 1u32, 99u32),
@@ -2638,7 +2638,7 @@ mod tests {
             instruments.clone(),
         ));
 
-        // A trade for arm 2 only.
+        // A trade for path 2 only.
         let now = crate::model::now_ns();
         tx.send(Arc::new(FeedMessage::Trade(test_trade(
             "KALSHI",
@@ -2661,7 +2661,7 @@ mod tests {
             if let Some(trades) = body["trades"].as_array() {
                 if !trades.is_empty() {
                     assert_eq!(trades[0]["price"], "0.62");
-                    // The mirror arm's own product must stay empty - the trade landed in exactly
+                    // The mirror path's own product must stay empty - the trade landed in exactly
                     // one product, not both and not neither.
                     let other =
                         reqwest::get(format!("{base}/v1/products/KALSHI:KXBTCPERP%231.99/ticker"))
@@ -2672,14 +2672,14 @@ mod tests {
                         other_body["trades"]
                             .as_array()
                             .is_some_and(|t| t.is_empty()),
-                        "the peer arm's product must not also see this trade"
+                        "the peer path's product must not also see this trade"
                     );
                     return;
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("the mirrored-arm trade never reached its product via the API");
+        panic!("the mirrored-path trade never reached its product via the API");
     }
 
     /// An implausible venue clock must not permanently wedge a product's history. Without the clamp,
@@ -2823,7 +2823,7 @@ mod tests {
     /// The bind failure contract `apply_api` shares with `apply_ws`: a port already in use must
     /// leave the API off (and the process alive) rather than propagating an error.
     ///
-    /// Revert-verify: changing `apply_api`'s `Err(e) => warn!(..)` arm to `Err(e) => panic!(..)`
+    /// Revert-verify: changing `apply_api`'s `Err(e) => warn!(..)` path to `Err(e) => panic!(..)`
     /// makes this test fail — confirmed by hand before landing this test.
     #[tokio::test]
     async fn an_occupied_port_disables_the_api_without_crashing() {

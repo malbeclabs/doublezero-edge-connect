@@ -121,7 +121,7 @@ pub(crate) const MAX_PUBLISHERS: usize = 256;
 /// Per-publisher reference-data state, bounded exactly like the per-publisher sequence map.
 ///
 /// `reset_count` is scoped to `(source_ip, group, port)`, so two publishers sharing a port block
-/// carry unrelated reset counters: under one shared [`RefDataState`] either arm's restart clears the
+/// carry unrelated reset counters: under one shared [`RefDataState`] either path's restart clears the
 /// other's instrument set, blanking both, since every emission path gates on a resolved definition.
 /// The source IP is spoofable, so the map takes the same [`MAX_PUBLISHERS`] least-recently-inserted
 /// eviction as the sequence map — an evicted publisher re-learns its definitions from the next
@@ -1036,9 +1036,9 @@ impl MboProcessor {
     ///
     /// Drops the **same set** [`Self::book_for`]'s eviction does, and for the same reason: a sibling
     /// map left behind outlives the state that gave it meaning. `synced_reported` is the one that
-    /// corrupts rather than leaks — the arbiter reads a departed arm's `synced = true` as a healthy
-    /// peer and suppresses the surviving arm's only re-baseline — and it cannot be corrected later,
-    /// because `market_key` resolves through `revealed`. So the arm is released here, while
+    /// corrupts rather than leaks — the arbiter reads a departed path's `synced = true` as a healthy
+    /// peer and suppresses the surviving path's only re-baseline — and it cannot be corrected later,
+    /// because `market_key` resolves through `revealed`. So the path is released here, while
     /// `revealed` still resolves it.
     fn forget_publisher(&mut self, publisher: IpAddr, ctx: &FrameCtx) {
         let stale: Vec<(IpAddr, u32)> = self
@@ -1163,7 +1163,7 @@ impl MboProcessor {
                         let symbol_still_served = self.books.keys().any(|(_p, i)| *i == old_id);
                         if !symbol_still_served {
                             // Resolved against the evicted book's OWN publisher: reference data is
-                            // per publisher, so two arms can map one id to different symbols.
+                            // per publisher, so two paths can map one id to different symbols.
                             if let (Some(def), Some(venue)) =
                                 (self.state.def(old_pub, old_id), evicted_venue)
                             {
@@ -1339,7 +1339,7 @@ impl MboProcessor {
 
     /// Report this instrument's book sync state to the arbiter when it has changed. The arbiter's
     /// re-baseline suppression reads these, so a book that gaps must say so — otherwise a peer that is
-    /// itself recovering would see a phantom healthy arm and suppress the only re-baseline on offer.
+    /// itself recovering would see a phantom healthy path and suppress the only re-baseline on offer.
     fn report_synced(&mut self, instrument_id: u32, ctx: &FrameCtx) {
         let key = (ctx.publisher, instrument_id);
         let synced = self.books.get(&key).is_some_and(|b| b.is_synced());
@@ -1351,8 +1351,8 @@ impl MboProcessor {
     /// waiting until the book has actually dropped leaves nothing to key the report by.
     ///
     /// Reported under **`key`'s own publisher**, not `ctx.publisher`: a feed-wide `EndOfSession` and a
-    /// publisher eviction both report for arms other than the one whose datagram is being handled, and
-    /// naming the wrong arm there would leave the departed one's `synced = true` standing while
+    /// publisher eviction both report for paths other than the one whose datagram is being handled, and
+    /// naming the wrong path there would leave the departed one's `synced = true` standing while
     /// clearing an innocent peer's.
     fn set_synced(&mut self, key: (IpAddr, u32), synced: bool, ctx: &FrameCtx) {
         if self.synced_reported.get(&key) == Some(&synced) {
@@ -1549,7 +1549,7 @@ impl FrameProcessor for MboProcessor {
                     // — re-announce now (the periodic reannounce this feed's manifest bursts
                     // already drive). If this definition's own `source_id` differs from what's
                     // already revealed, skip this and let the eager `reveal_if_needed` call below
-                    // handle it: see `TobProcessor`'s definition arm for why.
+                    // handle it: see `TobProcessor`'s definition path for why.
                     let key = (ctx.publisher, d.instrument_id);
                     self.pending_channel.insert(key, header.channel_id as u32);
                     if let Some(&source_id) = self.revealed.get(&key) {
@@ -1604,8 +1604,8 @@ impl FrameProcessor for MboProcessor {
                     }
                     // EVERY book just dropped to `Recovering`, so every one of them must say so —
                     // the reset above is feed-wide, and reporting only this publisher's would leave
-                    // the arbiter reading a peer's stale `synced = true` as a healthy arm and
-                    // suppressing the surviving arm's only re-baseline. `touched` can carry only
+                    // the arbiter reading a peer's stale `synced = true` as a healthy path and
+                    // suppressing the surviving path's only re-baseline. `touched` can carry only
                     // this publisher's (it is keyed by instrument id alone), so the peers are
                     // reported here.
                     let peers: Vec<(IpAddr, u32)> = self
@@ -1906,13 +1906,13 @@ impl FrameProcessor for MboProcessor {
                 codec_mbo::Message::BatchBoundary(_, _) | codec_mbo::Message::Heartbeat => {}
                 // Catches `Other`, and — since match guards don't count toward exhaustiveness —
                 // also `ManifestSummary`/`InstrumentDefinition` on a role that doesn't handle
-                // refdata (their guarded arms above fell through): the same silent drop
-                // `handle_refdata`-gated arms get in `TobProcessor`/`MidpointProcessor`.
+                // refdata (their guarded paths above fell through): the same silent drop
+                // `handle_refdata`-gated paths get in `TobProcessor`/`MidpointProcessor`.
                 _ => {}
             }
         }
 
-        // Sync state first: the arbiter decides whether a re-baseline is safe from these, so an arm must
+        // Sync state first: the arbiter decides whether a re-baseline is safe from these, so a path must
         // have declared itself before the book it publishes arrives.
         for instrument_id in touched {
             self.report_synced(instrument_id, ctx);
@@ -1943,7 +1943,7 @@ const MAX_PRICE_BOOKS: usize = 4096;
 
 /// Cap on distinct `(publisher, channel)` pairs whose reset counter and open snapshot group are
 /// tracked. Both key components are unauthenticated wire data, so an unbounded map is a
-/// memory-exhaustion vector; two arms across a handful of shards sit far below this.
+/// memory-exhaustion vector; two paths across a handful of shards sit far below this.
 const MAX_CHANNEL_KEYS: usize = 256;
 
 /// Deltas [`MbpProcessor`] holds buffered **across every book** before the overflow policy fires —
@@ -1988,9 +1988,9 @@ struct OpenGroup {
 pub struct MbpProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
     state: PerPublisher<codec_mbp::InstrumentDefinition>,
-    /// One independent book per `(publisher, channel, instrument)`. Two arms mirror one feed but
+    /// One independent book per `(publisher, channel, instrument)`. Two paths mirror one feed but
     /// their per-instrument delta series are unrelated by construction, so their books can never be
-    /// merged — which arm reaches the wire is the authority gate's decision, downstream.
+    /// merged — which path reaches the wire is the authority gate's decision, downstream.
     books: HashMap<PriceBookKey, PriceBook>,
     /// Insertion order of `books` keys, oldest at the front, for the [`MAX_PRICE_BOOKS`] eviction.
     books_order: VecDeque<PriceBookKey>,
@@ -2159,9 +2159,9 @@ impl MbpProcessor {
             while self.books.len() >= MAX_PRICE_BOOKS {
                 match self.books_order.pop_front() {
                     Some(old) => {
-                        // Unhealthy before forgetting: this arm no longer holds that market, and
+                        // Unhealthy before forgetting: this path no longer holds that market, and
                         // leaving the authority its last `healthy` report would keep electing it
-                        // while a peer arm's live book is dropped.
+                        // while a peer path's live book is dropped.
                         self.report_health(ctx, &old, false);
                         self.forget_book(&old);
                     }
@@ -2257,8 +2257,8 @@ impl MbpProcessor {
     /// streaming and the dropped one recovers on its next snapshot.
     fn enforce_buffer_budget(&mut self, ctx: &FrameCtx) {
         while self.buffered_total > MAX_BUFFERED_DELTAS_ACROSS_BOOKS {
-            // The arm that filled the budget is the one sending, so take its own largest buffer
-            // first: a global maximum would let one flooding arm cost a peer arm its recovering book.
+            // The path that filled the budget is the one sending, so take its own largest buffer
+            // first: a global maximum would let one flooding path cost a peer path its recovering book.
             let largest = self
                 .largest_buffer(|(p, _, _)| *p == ctx.publisher)
                 .or_else(|| self.largest_buffer(|_| true));
@@ -2273,7 +2273,7 @@ impl MbpProcessor {
         }
     }
 
-    /// Report one book's `Ready`-ness for its market, but only when it changed: an unhealthy arm
+    /// Report one book's `Ready`-ness for its market, but only when it changed: an unhealthy path
     /// loses the market to its peer, so this is a transition signal rather than a per-frame one.
     fn report_health(&mut self, ctx: &FrameCtx, key: &PriceBookKey, healthy: bool) {
         if self.health_reported.get(key) == Some(&healthy) {
@@ -2292,7 +2292,7 @@ impl MbpProcessor {
         };
         // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
         // instrument universe, so a report filed without it targets nothing the gate ever admitted.
-        // `ctx.canonical_channel`, not the raw `key.1`, so a mirror arm's health report lands on
+        // `ctx.canonical_channel`, not the raw `key.1`, so a mirror path's health report lands on
         // the SAME `MarketKey` `send_book` admits its `book` under — see `FrameCtx::canonical_channel`.
         let market: MarketKey = (
             venue_arc(venue),
@@ -2485,7 +2485,7 @@ impl FrameProcessor for MbpProcessor {
         if handle_refdata {
             self.state.get(ctx.publisher).on_frame(header.reset_count);
             // The only `get()` this function makes that can evict a publisher: the
-            // `ManifestSummary`/`InstrumentDefinition` arms below are gated on this same
+            // `ManifestSummary`/`InstrumentDefinition` branches below are gated on this same
             // `handle_refdata`, so they land on a publisher already inserted here and never
             // trigger a fresh eviction of their own. Draining here is what keeps the derived
             // per-publisher maps (`books`/`revealed`/`open`/`last_reset`) from
@@ -2562,7 +2562,7 @@ impl FrameProcessor for MbpProcessor {
                     // this feed's manifest bursts already drive). If this definition's own
                     // `source_id` differs from what's already revealed, skip this and let the
                     // eager `reveal_if_needed` call below handle it: see `TobProcessor`'s
-                    // definition arm for why.
+                    // definition path for why.
                     let key = (ctx.publisher, channel, d.instrument_id);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
@@ -2878,9 +2878,9 @@ impl FrameProcessor for MbpProcessor {
                 }
                 codec_mbp::Message::EndOfSession(ts) => {
                     info!(ts, channel, "mbp end of session");
-                    // §4.7: per-arm and per-channel — the shard whose session ended. Dropping every
+                    // §4.7: per-path and per-channel — the shard whose session ended. Dropping every
                     // publisher's books (as the order-keyed processor does) would tear down a live
-                    // peer arm's published book; reporting each market unhealthy is what hands
+                    // peer path's published book; reporting each market unhealthy is what hands
                     // authority to that peer instead.
                     let keys: Vec<PriceBookKey> = self
                         .books
@@ -2939,14 +2939,14 @@ impl FrameProcessor for MbpProcessor {
                         symbol,
                         // `channel` is this frame's header channel id, canonicalized for
                         // consumer-facing identity (see `FrameCtx::canonical_channel`) — a mirror
-                        // publisher's `N + offset` becomes the same `N` its peer arm carries, so
+                        // publisher's `N + offset` becomes the same `N` its peer path carries, so
                         // the history/catalog see one market rather than two. This is still the
-                        // field that disambiguates a price-aggregated venue's mirrored arms
-                        // (identical instrument set, distinct wire `channel` per arm) from each
+                        // field that disambiguates a price-aggregated venue's mirrored paths
+                        // (identical instrument set, distinct wire `channel` per path) from each
                         // other's identical-looking content, so it must ride the message rather
                         // than be re-derived downstream by a `symbol` match that can't tell them
                         // apart — the raw wire book/sequence state that actually keeps the two
-                        // arms independent is untouched by this canonicalization.
+                        // paths independent is untouched by this canonicalization.
                         channel: ctx.canonical_channel(channel),
                         instrument_id: t.instrument_id,
                         category: category_arc(ctx.category),
@@ -2970,8 +2970,8 @@ impl FrameProcessor for MbpProcessor {
                 codec_mbp::Message::Heartbeat(_) | codec_mbp::Message::Other(_) => {}
                 // Match guards don't count toward exhaustiveness, so this also catches
                 // `ManifestSummary`/`InstrumentDefinition` on a role that doesn't handle refdata
-                // (their guarded arms above fell through) — the same silent drop the
-                // `handle_refdata`-gated arms get in the three sibling processors.
+                // (their guarded paths above fell through) — the same silent drop the
+                // `handle_refdata`-gated paths get in the three sibling processors.
                 _ => {}
             }
         }
@@ -3143,8 +3143,8 @@ mod tests {
     }
 
     /// Two publishers share one port block and differ only by source IP. `reset_count` is
-    /// per-publisher state, so one arm's restart must not clear the other arm's instrument set —
-    /// which would blank both arms until the next refdata burst, since every emission path gates on
+    /// per-publisher state, so one path's restart must not clear the other path's instrument set —
+    /// which would blank both paths until the next refdata burst, since every emission path gates on
     /// a resolved definition. Driven through `on_datagram` so it pins the wiring, not just the map.
     #[test]
     fn refdata_reset_is_scoped_to_the_publisher_that_reset() {
@@ -3788,7 +3788,7 @@ mod tests {
     }
 
     /// Round-3 review, finding A: `ManifestSummary`/`InstrumentDefinition` must be gated on
-    /// `handle_refdata` exactly like TOB/Midpoint's sibling arms. Before that gate, decode doesn't
+    /// `handle_refdata` exactly like TOB/Midpoint's sibling paths. Before that gate, decode doesn't
     /// care what physical port a message type arrives on, so a forged datagram to the **Mktdata**
     /// port carrying those two message types still called `state.get()` for a never-before-seen
     /// publisher — evicting an old one on the same axis `pending_channel` shares — while the drain
@@ -4221,7 +4221,7 @@ mod tests {
         let instruments = Arc::new(Mutex::new(HashMap::new()));
         let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut proc = MboProcessor::new(depth, tape(false));
-        // Reference-data state is per publisher, so each arm publishes its own manifest burst -
+        // Reference-data state is per publisher, so each path publishes its own manifest burst -
         // which is what they do on the wire, sharing one refdata port.
         for publisher in [pub_a, pub_b] {
             proc.on_datagram(
@@ -5279,16 +5279,16 @@ mod tests {
     /// socket, stamping every wire `channel_id` raised by `publisher_offset` — so one receiver
     /// decodes frames stamped both channel 10 and channel 110 for the identical market. The
     /// datagram source IP is deliberately the SAME for both frames here (the registry's own
-    /// `DEPLOYMENT` note keys the two arms apart by `channel_id`, never by host), which is what
+    /// `DEPLOYMENT` note keys the two paths apart by `channel_id`, never by host), which is what
     /// makes this a real regression guard: if `ensure_book`/`note_reset_count`/`revealed` ever
-    /// canonicalized their channel instead of using the raw wire one, the two arms below would
+    /// canonicalized their channel instead of using the raw wire one, the two paths below would
     /// collapse into ONE producer-side key (same IP, same canonical channel) and corrupt book
     /// recovery — the exact failure `Feed::mirror_offset`'s docs warn against.
     ///
-    /// Catalog identity must go the other way: `reveal_if_needed` canonicalizes, so both arms'
+    /// Catalog identity must go the other way: `reveal_if_needed` canonicalizes, so both paths'
     /// eager v3 reveals resolve to ONE catalog entry, not two.
     #[test]
-    fn mbp_mirror_offset_collapses_catalog_identity_but_keeps_arms_separate() {
+    fn mbp_mirror_offset_collapses_catalog_identity_but_keeps_paths_separate() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
         let base = mbp_ctx_mirrored("TV", &arbiter, &instruments, PortRole::Combined, 100);
@@ -5311,9 +5311,9 @@ mod tests {
                 ],
             )
         };
-        // The base arm, wire channel 10.
+        // The base path, wire channel 10.
         proc.on_datagram(&def_frame(10), &base);
-        // The mirror arm, wire channel 110 (10 + the 100 offset) — same source IP, same
+        // The mirror path, wire channel 110 (10 + the 100 offset) — same source IP, same
         // instrument, same Source ID: the same market as far as a consumer is concerned.
         proc.on_datagram(&def_frame(110), &mirror);
 
@@ -5332,7 +5332,7 @@ mod tests {
             );
         }
 
-        // Only ONE `Instrument` reaches the wire: canonicalizing both arms onto channel 10 means
+        // Only ONE `Instrument` reaches the wire: canonicalizing both paths onto channel 10 means
         // the mirror's reveal is, correctly, an identical-precision reannounce of the SAME
         // `(venue, channel, instrument_id)` the arbiter already rate-limits — the same collapse
         // ordinary mirrored refdata bursts get, now reached via the channel offset instead of a
@@ -5348,18 +5348,18 @@ mod tests {
         assert_eq!(
             inst_channels,
             vec![10],
-            "the mirror's reveal must ride the canonical channel and collapse into the base arm's"
+            "the mirror's reveal must ride the canonical channel and collapse into the base path's"
         );
 
         // Producer-side state stays keyed on the RAW wire channel: two distinct reveal entries,
-        // one per arm, even though they collapsed to one catalog entry above.
+        // one per path, even though they collapsed to one catalog entry above.
         assert_eq!(
             proc.revealed.len(),
             2,
-            "each arm's own reveal memo must survive independently"
+            "each path's own reveal memo must survive independently"
         );
 
-        // Sync each arm's own book to `Ready` from an empty anchor (an empty snapshot cycle, same
+        // Sync each path's own book to `Ready` from an empty anchor (an empty snapshot cycle, same
         // shape `synced_mbp_proc` below drives) so a following delta actually applies rather than
         // merely buffering — the only way to observe divergent book *content*, not just presence.
         proc.on_datagram(
@@ -5376,7 +5376,7 @@ mod tests {
             Some(BookStatus::Ready)
         );
 
-        // Now apply a DIFFERENT price on each arm's book — a stand-in for the two arms' genuinely
+        // Now apply a DIFFERENT price on each path's book — a stand-in for the two paths' genuinely
         // independent delta sequences.
         let level = |price: i64| {
             mbp_wire::enc_level_update(&codec_mbp::LevelUpdate {
@@ -5401,16 +5401,16 @@ mod tests {
             proc.books.len(),
             2,
             "one book per (publisher, wire channel, instrument) — the mirror must not share the \
-             base arm's book"
+             base path's book"
         );
         let base_book = proc
             .books
             .get(&(TEST_PUB, 10, 41))
-            .expect("the base arm's own book, keyed on its raw wire channel");
+            .expect("the base path's own book, keyed on its raw wire channel");
         let mirror_book = proc
             .books
             .get(&(TEST_PUB, 110, 41))
-            .expect("the mirror arm's own book, keyed on ITS raw wire channel");
+            .expect("the mirror path's own book, keyed on ITS raw wire channel");
         assert_eq!(
             base_book.bids().map(|(p, _)| p).collect::<Vec<_>>(),
             vec![100]
@@ -5418,7 +5418,7 @@ mod tests {
         assert_eq!(
             mirror_book.bids().map(|(p, _)| p).collect::<Vec<_>>(),
             vec![200],
-            "the two arms' books must evolve independently"
+            "the two paths' books must evolve independently"
         );
 
         // Every `book` this frame pair emitted still carries the canonical channel, proving the
@@ -5439,9 +5439,9 @@ mod tests {
 
     /// **The live regression, end to end.** The mirror offset here does not come from a
     /// hand-built `FrameCtx` — it comes from parsing an `explicit` registry row (the shape the
-    /// live mirrored feeds actually use: one shared port block, two arms separated only by
+    /// live mirrored feeds actually use: one shared port block, two paths separated only by
     /// `channel_id`), exactly the document shape that used to be hard-wired to `mirror_offset:
-    /// None`. Two arms stamp the same market at channel 1 and channel 101 (the offsets seen on
+    /// None`. Two paths stamp the same market at channel 1 and channel 101 (the offsets seen on
     /// the live host); if the registry still dropped an `explicit` row's `publisher_offset`, this
     /// collapses to zero (`None`) and the catalog would carry two entries instead of one.
     #[test]
@@ -5486,7 +5486,7 @@ mod tests {
         assert_eq!(
             cat.len(),
             1,
-            "an explicit row's declared mirror must collapse the two arms into one catalog entry"
+            "an explicit row's declared mirror must collapse the two paths into one catalog entry"
         );
     }
 
@@ -6070,7 +6070,7 @@ mod tests {
     }
 
     /// `ManifestSummary`/`InstrumentDefinition` must be gated on `handle_refdata` exactly like the
-    /// three sibling processors' arms. Decode does not care what physical port a message type
+    /// three sibling processors' paths. Decode does not care what physical port a message type
     /// arrives on, so before the gate one forged datagram to the **market-data** port — source IP
     /// spoofed to the real publisher's, carrying `ManifestSummary { manifest_seq: latest + 1 }` —
     /// reached `RefDataState::on_manifest` and cleared `defs`. Every MBP emission path gates on a
@@ -6367,16 +6367,16 @@ mod tests {
         }
     }
 
-    /// §4.7 — `EndOfSession` from one arm must drop only that arm's books. Under the order-keyed
-    /// processor's handler it also cleared the venue's shared floor, so one arm shutting down tore
+    /// §4.7 — `EndOfSession` from one path must drop only that path's books. Under the order-keyed
+    /// processor's handler it also cleared the venue's shared floor, so one path shutting down tore
     /// down the live published book.
     #[test]
-    fn mbp_end_of_session_is_scoped_to_the_emitting_arm() {
+    fn mbp_end_of_session_is_scoped_to_the_emitting_path() {
         let (arbiter, _rx, instruments) = mbp_harness();
         let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
         let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
         let mut proc = MbpProcessor::new(tape(false));
-        // Reference-data state is per publisher, so each arm sends its own burst — which is what
+        // Reference-data state is per publisher, so each path sends its own burst — which is what
         // they do on the wire, sharing one refdata port.
         for publisher in [pub_a, pub_b] {
             let mut refdata = make_ctx(&arbiter, &instruments, PortRole::Combined);
@@ -6401,12 +6401,12 @@ mod tests {
         assert_eq!(
             mbp_status(&proc, pub_a, 0, 41),
             Some(BookStatus::AwaitingSnapshot),
-            "the ending arm's book is dropped"
+            "the ending path's book is dropped"
         );
         assert_eq!(
             mbp_status(&proc, pub_b, 0, 41),
             Some(BookStatus::Ready),
-            "the peer arm keeps serving; authority transfers to it"
+            "the peer path keeps serving; authority transfers to it"
         );
     }
 
@@ -6875,7 +6875,7 @@ mod tests {
         );
     }
 
-    /// The authority gate decides which arm reaches the wire from per-market health, so a book
+    /// The authority gate decides which path reaches the wire from per-market health, so a book
     /// leaving `Ready` has to be reported. Only transitions are reported, not every frame.
     #[test]
     fn mbp_book_health_reaches_the_authority() {
@@ -6912,8 +6912,8 @@ mod tests {
             3u32,
             41u32,
         );
-        let arm = Publisher::Edge(TEST_PUB);
-        let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, arm);
+        let path = Publisher::Edge(TEST_PUB);
+        let healthy = |a: &SharedArbiter| lock(a).authority().healthy(&market, path);
 
         proc.on_datagram(
             &mbp_wire::frame(3, 0, 100, &[mbp_wire::enc_end_of_session(9_000)]),
@@ -6921,7 +6921,7 @@ mod tests {
         );
         assert!(
             !healthy(&arbiter),
-            "an ended session hands the market to the peer arm"
+            "an ended session hands the market to the peer path"
         );
 
         // The recovery direction is what pins a real report: `healthy` answers true for a market the
@@ -7122,8 +7122,8 @@ mod tests {
     }
 
     /// The book map is bounded the same way, since the wire `instrument_id` is spoofable too. An
-    /// evicted book must also be reported unhealthy: this arm no longer holds that market, and a stale
-    /// `healthy` report would keep the authority electing it while a peer arm's live book is dropped.
+    /// evicted book must also be reported unhealthy: this path no longer holds that market, and a stale
+    /// `healthy` report would keep the authority electing it while a peer path's live book is dropped.
     #[test]
     fn mbp_books_map_is_bounded_under_instrument_flood() {
         let (arbiter, _rx, instruments) = mbp_harness();
@@ -7186,7 +7186,7 @@ mod tests {
                 ),
                 Publisher::Edge(TEST_PUB)
             ),
-            "an evicted book leaves its market unhealthy for this arm"
+            "an evicted book leaves its market unhealthy for this path"
         );
     }
 
@@ -7364,8 +7364,8 @@ mod tests {
         );
     }
 
-    /// The arbiter's re-baseline suppression reads each arm's sync state, so the processor must report
-    /// one — and report a gap, or a recovering peer would see a phantom healthy arm and suppress the
+    /// The arbiter's re-baseline suppression reads each path's sync state, so the processor must report
+    /// one — and report a gap, or a recovering peer would see a phantom healthy path and suppress the
     /// only re-baseline on offer.
     #[test]
     fn a_gapped_book_reports_itself_unsynced() {
@@ -7567,8 +7567,8 @@ mod tests {
 
     /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
     /// `mbo_end_of_session_resets_peer_publisher_books` for why), so every one of them must report it.
-    /// A peer left claiming `synced` is a phantom healthy arm, and the arbiter suppresses the
-    /// surviving arm's only re-baseline against it.
+    /// A peer left claiming `synced` is a phantom healthy path, and the arbiter suppresses the
+    /// surviving path's only re-baseline against it.
     #[test]
     fn end_of_session_reports_every_publishers_book_unsynced() {
         use crate::ingest::sources::source_label;
@@ -7629,19 +7629,19 @@ mod tests {
             0,
         );
         assert!(
-            lock(&arbiter).book_arm_synced(&market, Publisher::Edge(pub_b)),
-            "B's arm must be synced before the session ends"
+            lock(&arbiter).book_path_synced(&market, Publisher::Edge(pub_b)),
+            "B's path must be synced before the session ends"
         );
 
         proc.on_datagram(
             &frame(&[enc_end_of_session(6_000)]),
             &ctx_for(pub_a, &arbiter, &instruments, PortRole::Mktdata),
         );
-        let a = lock(&arbiter).book_arm_synced(&market, Publisher::Edge(pub_a));
-        let b = lock(&arbiter).book_arm_synced(&market, Publisher::Edge(pub_b));
+        let a = lock(&arbiter).book_path_synced(&market, Publisher::Edge(pub_a));
+        let b = lock(&arbiter).book_path_synced(&market, Publisher::Edge(pub_b));
         assert!(
             !a && !b,
-            "both books dropped to Recovering, so both arms must say so (a={a}, b={b})"
+            "both books dropped to Recovering, so both paths must say so (a={a}, b={b})"
         );
     }
 
@@ -7692,10 +7692,10 @@ mod tests {
 
     /// **Item H.** A publisher evicted from the reference-data map takes its `revealed` entry with it,
     /// and `revealed` is what resolves the market — so a `synced = true` left behind in the arbiter can
-    /// never be corrected afterwards. The arm is released while the key still resolves, and the
+    /// never be corrected afterwards. The path is released while the key still resolves, and the
     /// eviction drops the same sibling maps a book eviction does.
     #[test]
-    fn an_evicted_publisher_releases_its_arm_and_its_sibling_state() {
+    fn an_evicted_publisher_releases_its_path_and_its_sibling_state() {
         use crate::ingest::sources::source_label;
         use std::net::Ipv4Addr;
         let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(1024);
@@ -7744,7 +7744,7 @@ mod tests {
             0,
             0,
         );
-        assert!(lock(&arbiter).book_arm_synced(&market, Publisher::Edge(victim)));
+        assert!(lock(&arbiter).book_path_synced(&market, Publisher::Edge(victim)));
 
         // Fill the per-publisher reference-data map past its cap; the victim was inserted first, so
         // it is the one evicted.
@@ -7756,7 +7756,7 @@ mod tests {
             );
         }
         assert!(
-            !lock(&arbiter).book_arm_synced(&market, Publisher::Edge(victim)),
+            !lock(&arbiter).book_path_synced(&market, Publisher::Edge(victim)),
             "an evicted publisher's serving claim must go with its reference data"
         );
         assert!(

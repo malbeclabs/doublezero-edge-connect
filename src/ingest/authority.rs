@@ -1,14 +1,14 @@
-//! Single-arm authority for venues whose redundant publishers have no comparable clock.
+//! Single-path authority for venues whose redundant publishers have no comparable clock.
 //!
 //! `Coordinated` arbitration (`arbiter::StalenessFloor`) buckets two copies on a venue-assigned
-//! coordinate and re-latches the leader every tick. That needs a coordinate the arms share. A
-//! FIX-sourced arm and a WS-sourced arm of one venue have none, and a content hash cannot
-//! substitute: the cross-arm-common fields of a *level update* reduce to `(side, price, quantity)`,
+//! coordinate and re-latches the leader every tick. That needs a coordinate the paths share. A
+//! FIX-sourced path and a WS-sourced path of one venue have none, and a content hash cannot
+//! substitute: the cross-path-common fields of a *level update* reduce to `(side, price, quantity)`,
 //! which recurs constantly on a coarse bounded price grid.
 //!
-//! So: exactly one arm is authoritative and its stream is published verbatim; the other is ingested
+//! So: exactly one path is authoritative and its stream is published verbatim; the other is ingested
 //! and discarded. **Authority is per instrument on the wire, never per level** — interleaving two
-//! arms' deltas corrupts the book while every per-arm sequence check still passes.
+//! paths' deltas corrupts the book while every per-path sequence check still passes.
 //!
 //! # What the election is scoped to
 //!
@@ -16,7 +16,7 @@
 //! publishing rows carry (`ingest::feeds::Feed::category`), which is the registry's declaration of
 //! which rows *mirror* one another. Not per venue, for the reason the trade tape's gate is not
 //! either: one Source ID can carry universes that mirror nothing of each other, and this gate exists
-//! to pick one arm out of a set of *mirrors*. Keyed on the venue it picks one arm across disjoint
+//! to pick one path out of a set of *mirrors*. Keyed on the venue it picks one path across disjoint
 //! universes and drops every batch of the other's — **permanently**, because the only escape is
 //! leader silence and a leader streaming its own universe is never silent. The symptom is a universe
 //! whose books simply never appear, behind a `dz_book_dropped_total` that looks exactly like a
@@ -29,46 +29,46 @@
 //!
 //! # What is scoped where
 //!
-//! Latency is a property of an *arm*, not of a market: every message from a source IP is evidence
-//! about that arm, whatever market carried it. The three transfer triggers therefore sit at two
+//! Latency is a property of an *path*, not of a market: every message from a source IP is evidence
+//! about that path, whatever market carried it. The three transfer triggers therefore sit at two
 //! grains, and confusing them produces the two failures this module is shaped to avoid.
 //!
-//! * **Speed** — per arm, across the arm's whole universe. Pooled evidence, one verdict per universe
+//! * **Speed** — per path, across the path's whole universe. Pooled evidence, one verdict per universe
 //!   per window ([`StickyAuthority::close_window`]). Splitting it per market splits the evidence as
 //!   finely as it can be split, and across 1,200 sleepy markets that is no evidence at all. Pooling
-//!   it wider than the universe is the opposite error: arms on disjoint universes never carry the
+//!   it wider than the universe is the opposite error: paths on disjoint universes never carry the
 //!   same market, so evidence from one says nothing about the other, and the wider pool would decide
 //!   a contest between publishers that are not competing.
-//! * **Silence** — per arm, across the arm's whole universe. An arm is live or it is not. Scoping
+//! * **Silence** — per path, across the path's whole universe. A path is live or it is not. Scoping
 //!   silence per market is a *bug*: a market quieter than `leader_timeout` makes every challenger
 //!   message read as leader silence, so authority ping-pongs on every update and re-baselines the
 //!   consumer's book each time.
-//! * **Health** — per market, and it has to stay there. An arm can be `Synced` on 1,200 markets and
+//! * **Health** — per market, and it has to stay there. A path can be `Synced` on 1,200 markets and
 //!   `Gap` on one. A universe-wide health rule would either hand the whole universe over for one bad
 //!   book or keep serving that book, and under incremental output a lost level does not self-heal
 //!   until the next snapshot.
 //!
 //! Health is an **override**, computed from health and the universe's leader rather than stored: a
-//! market whose leader is unhealthy is served by a healthy arm, and reverts on its own when the
+//! market whose leader is unhealthy is served by a healthy path, and reverts on its own when the
 //! leader's book recovers. Nothing to unwind, and no second authority to keep in sync.
 //!
 //! # Bounding
 //!
 //! The multicast source is unauthenticated and a [`Publisher`] is a spoofable source IP, so **only
-//! arms holding a metric ordinal are eligible**: past [`MAX_LABELLED_ARMS`] a publisher is neither
+//! paths holding a metric ordinal are eligible**: past [`MAX_LABELLED_PATHS`] a publisher is neither
 //! recorded nor ever authoritative. The cap that existed to bound the metric label set bounds
-//! admission too, which keeps the per-arm state from growing under a forged flood. Real deployments
-//! run two arms.
+//! admission too, which keeps the per-path state from growing under a forged flood. Real deployments
+//! run two paths.
 //!
 //! What stays keyed on wire-supplied `(channel_id, instrument_id)` — under its scope — is per-market
-//! health and the last-admitted arm. A caller only reports markets that resolve to a definition and a
+//! health and the last-admitted path. A caller only reports markets that resolve to a definition and a
 //! book, but that bounds only what it holds *live* — a churning id space would still grow this map
 //! for the life of the process — so [`MAX_TRACKED_MARKETS`] bounds it here.
 //!
 //! A caller holding its own per-market state must drop it through [`StickyAuthority::forget_market`],
 //! and in the same step. Dropping one half is worse than dropping neither: `last_admitted` is what
 //! tells the caller a market changed hands, so an entry gone from here while the caller still holds
-//! that market's book makes the next arm's deltas read as a continuation of the previous arm's.
+//! that market's book makes the next path's deltas read as a continuation of the previous path's.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -78,7 +78,7 @@ use std::{
 use crate::ingest::arbiter::{Admit, Publisher};
 
 /// The arbitration scope: a venue's Source ID plus the instrument **universe** within it
-/// (`ingest::feeds::Feed::category`). One election, one arm numbering and one silence clock per
+/// (`ingest::feeds::Feed::category`). One election, one path numbering and one silence clock per
 /// scope — see the module doc for why the venue alone is the wrong grain.
 pub type ScopeKey = (Arc<str>, Arc<str>);
 
@@ -90,26 +90,26 @@ fn scope_of(key: &MarketKey) -> ScopeKey {
     (key.0.clone(), key.1.clone())
 }
 
-/// Cap on distinct arms per **scope**, not per venue: the numbering exists to identify a universe's
+/// Cap on distinct paths per **scope**, not per venue: the numbering exists to identify a universe's
 /// mirrors, and a venue carrying two universes runs two independent sets of mirrors. Doubles as the
 /// admission bound — see the module doc.
-pub(crate) const MAX_LABELLED_ARMS: usize = 8;
+pub(crate) const MAX_LABELLED_PATHS: usize = 8;
 
-const ARM_LABELS: [&str; MAX_LABELLED_ARMS] = [
-    "arm0", "arm1", "arm2", "arm3", "arm4", "arm5", "arm6", "arm7",
+const PATH_LABELS: [&str; MAX_LABELLED_PATHS] = [
+    "path0", "path1", "path2", "path3", "path4", "path5", "path6", "path7",
 ];
 
-/// Returned for an arm past [`MAX_LABELLED_ARMS`]: unlabelled, unrecorded, never authoritative.
-pub const OTHER_ARM: &str = "other";
+/// Returned for a path past [`MAX_LABELLED_PATHS`]: unlabelled, unrecorded, never authoritative.
+pub const OTHER_PATH: &str = "other";
 
 /// Cap on `(scope, channel, instrument)` markets whose per-market state is retained. The processor's
 /// book cap bounds only the books it holds *live*; an id space that churns (a venue relisting markets
 /// daily, or a forged stream minting ids) would otherwise grow this map for the life of the process.
 /// Least-recently-inserted eviction: losing an entry costs at most one stale health opinion, which
-/// that arm's next report re-establishes.
+/// that path's next report re-establishes.
 const MAX_TRACKED_MARKETS: usize = 1 << 16;
 
-/// Cap on matched-lead samples retained per arm per window. Overflow is head-biased — an arm busy
+/// Cap on matched-lead samples retained per path per window. Overflow is head-biased — a path busy
 /// enough to hit it decides on the window's first 4096 matches — so the cap sits well above what the
 /// margin test needs rather than being a tight bound.
 const MAX_WINDOW_SAMPLES: usize = 4096;
@@ -123,14 +123,14 @@ pub struct AuthorityConfig {
     pub transfer_margin_ns: u64,
     /// ...and lead in at least this fraction of its own matched samples.
     pub transfer_win_rate: f64,
-    /// Matched samples an arm needs before its window is judged at all. Without a floor a single
+    /// Matched samples a path needs before its window is judged at all. Without a floor a single
     /// match transfers a whole universe, which is the opposite of sticky.
     pub min_window_samples: usize,
 }
 
 impl AuthorityConfig {
     /// The defaults, so an [`Arbiter`](crate::ingest::arbiter::Arbiter) built without a config still
-    /// gates books rather than silently interleaving arms.
+    /// gates books rather than silently interleaving paths.
     ///
     /// **`main.rs`'s `--arb-*` clap defaults are derived from this**, not written out beside it — two
     /// hand-maintained copies of five numbers is exactly how a documented default drifts from the one
@@ -150,19 +150,19 @@ impl Default for AuthorityConfig {
     }
 }
 
-/// Per-arm state within one scope.
+/// Per-path state within one scope.
 #[derive(Default)]
-struct Arm {
-    /// Arrival of this arm's most recent message anywhere in the scope — the silence clock.
+struct Path {
+    /// Arrival of this path's most recent message anywhere in the scope — the silence clock.
     last_seen_ns: u64,
-    /// Signed matched leads for the open window: negative when this arm beat the leader.
+    /// Signed matched leads for the open window: negative when this path beat the leader.
     samples: Vec<i64>,
 }
 
-/// Per-scope authority: one leader, one arm set, one sampling window per `(venue, category)`.
+/// Per-scope authority: one leader, one path set, one sampling window per `(venue, category)`.
 struct ScopeState {
     leader: Publisher,
-    arms: HashMap<Publisher, Arm>,
+    paths: HashMap<Publisher, Path>,
     window_opened_ns: u64,
 }
 
@@ -173,26 +173,26 @@ impl ScopeState {
     fn take_authority(&mut self, leader: Publisher, arrival_ns: u64) {
         self.leader = leader;
         self.window_opened_ns = arrival_ns;
-        for arm in self.arms.values_mut() {
-            arm.samples.clear();
+        for path in self.paths.values_mut() {
+            path.samples.clear();
         }
     }
 }
 
-/// Per-market state. Health and the last-admitted arm only; authority itself spans the scope.
+/// Per-market state. Health and the last-admitted path only; authority itself spans the scope.
 #[derive(Default)]
 struct MarketState {
-    /// Arms known unhealthy here (`gap`/`awaiting-snapshot`). Absent means healthy, so a market whose
+    /// Paths known unhealthy here (`gap`/`awaiting-snapshot`). Absent means healthy, so a market whose
     /// processor does not report health still gets served.
     unhealthy: HashSet<Publisher>,
-    /// Who was last admitted here, so `opened_tick` marks a real change of served arm rather than
+    /// Who was last admitted here, so `opened_tick` marks a real change of served path rather than
     /// every leader message.
     last_admitted: Option<Publisher>,
 }
 
 pub struct StickyAuthority {
     /// One election per `(venue, category)`. Keyed on the venue alone this map is the defect the
-    /// module doc opens with: one universe's arm would hold authority over a disjoint universe it
+    /// module doc opens with: one universe's path would hold authority over a disjoint universe it
     /// publishes nothing for, and drop that universe's whole book stream for the life of the process.
     scopes: HashMap<ScopeKey, ScopeState>,
     markets: HashMap<MarketKey, MarketState>,
@@ -200,7 +200,7 @@ pub struct StickyAuthority {
     /// eviction. Bounding *this* rather than `markets` is what lets [`Self::forget_market`] leave its
     /// entry behind: a stale one costs a no-op pop, and the queue can still never outgrow the cap.
     market_order: VecDeque<MarketKey>,
-    /// Arm ordinals per scope, for the same reason `scopes` is: an ordinal names one of a universe's
+    /// Path ordinals per scope, for the same reason `scopes` is: an ordinal names one of a universe's
     /// mirrors, and two universes' publishers are not each other's mirrors. Nested rather than keyed
     /// on `(ScopeKey, Publisher)` so the per-message lookup borrows the scope instead of building a
     /// composite key.
@@ -242,12 +242,12 @@ impl StickyAuthority {
         self.markets.entry(key.clone()).or_default()
     }
 
-    /// Record an arm's book health for one market. `false` means `gap`/`awaiting-snapshot`; the
+    /// Record a path's book health for one market. `false` means `gap`/`awaiting-snapshot`; the
     /// processor calls this on every state transition.
     pub fn set_health(&mut self, key: &MarketKey, publisher: Publisher, healthy: bool) {
-        // Same eligibility bound as `admit`: an ineligible arm (past the labelled cap — the source IP
+        // Same eligibility bound as `admit`: an ineligible path (past the labelled cap — the source IP
         // is spoofable) is never authoritative, so it must not enter per-market state either.
-        if self.arm_ordinal(&scope_of(key), publisher) == OTHER_ARM {
+        if self.path_ordinal(&scope_of(key), publisher) == OTHER_PATH {
             return;
         }
         let m = self.market_mut(key);
@@ -276,17 +276,17 @@ impl StickyAuthority {
         arrival_ns: u64,
     ) -> Admit<Publisher> {
         let scope = scope_of(&key);
-        // Ineligible arms enter no map and are never authoritative (see the module doc).
-        if self.arm_ordinal(&scope, publisher) == OTHER_ARM {
+        // Ineligible paths enter no map and are never authoritative (see the module doc).
+        if self.path_ordinal(&scope, publisher) == OTHER_PATH {
             return Admit::Dropped;
         }
         let timeout = self.cfg.leader_timeout_ns;
 
         let Some(state) = self.scopes.get_mut(&scope) else {
-            // No dark start: the first eligible arm to deliver is provisionally authoritative.
-            let arms = HashMap::from([(
+            // No dark start: the first eligible path to deliver is provisionally authoritative.
+            let paths = HashMap::from([(
                 publisher,
-                Arm {
+                Path {
                     last_seen_ns: arrival_ns,
                     samples: Vec::new(),
                 },
@@ -295,23 +295,23 @@ impl StickyAuthority {
                 scope,
                 ScopeState {
                     leader: publisher,
-                    arms,
+                    paths,
                     window_opened_ns: arrival_ns,
                 },
             );
             self.market_mut(&key).last_admitted = Some(publisher);
             return Admit::Emitted { opened_tick: true };
         };
-        state.arms.entry(publisher).or_default().last_seen_ns = arrival_ns;
+        state.paths.entry(publisher).or_default().last_seen_ns = arrival_ns;
         // Silence is measured against the leader's last message ANYWHERE in the scope, not against
-        // this market's: a quiet market is not a dead arm.
-        let leader_last = state.arms.get(&state.leader).map_or(0, |a| a.last_seen_ns);
+        // this market's: a quiet market is not a dead path.
+        let leader_last = state.paths.get(&state.leader).map_or(0, |a| a.last_seen_ns);
         if state.leader != publisher && arrival_ns.saturating_sub(leader_last) > timeout {
             state.take_authority(publisher, arrival_ns);
         }
         // Then the per-market health override. One definition of "who serves this market", shared
         // with `leader_of` and the gauge — computing it a second time here is how the unhealthy
-        // leader ends up re-authorising itself when it is the arm sending. It resolves its own scope
+        // leader ends up re-authorising itself when it is the path sending. It resolves its own scope
         // from the key, so there is no second place for the two to disagree.
         if self.serving(&key) != Some(publisher) {
             return Admit::Dropped;
@@ -334,60 +334,60 @@ impl StickyAuthority {
         }
     }
 
-    /// A stable, bounded metric label for an arm within one scope, so a spoofable source IP never
-    /// becomes a label value. Past the cap returns [`OTHER_ARM`] and records nothing — which is also
-    /// what makes that arm ineligible. The mapping is logged once, on first sight.
+    /// A stable, bounded metric label for a path within one scope, so a spoofable source IP never
+    /// becomes a label value. Past the cap returns [`OTHER_PATH`] and records nothing — which is also
+    /// what makes that path ineligible. The mapping is logged once, on first sight.
     ///
     /// Numbering restarts per scope, so the same ordinal names different publishers in two universes
     /// of one venue. That is the point: an ordinal identifies one of a universe's *mirrors*, and a
-    /// numbering shared across universes would have labelled two unrelated publishers as one arm in
-    /// the very metrics that diagnose an arm going dark.
-    pub fn arm_ordinal(&mut self, scope: &ScopeKey, publisher: Publisher) -> &'static str {
+    /// numbering shared across universes would have labelled two unrelated publishers as one path in
+    /// the very metrics that diagnose a path going dark.
+    pub fn path_ordinal(&mut self, scope: &ScopeKey, publisher: Publisher) -> &'static str {
         if let Some(&label) = self.ordinals.get(scope).and_then(|m| m.get(&publisher)) {
             return label;
         }
-        let arms = self.ordinals.entry(scope.clone()).or_default();
-        let Some(&label) = ARM_LABELS.get(arms.len()) else {
-            return OTHER_ARM;
+        let paths = self.ordinals.entry(scope.clone()).or_default();
+        let Some(&label) = PATH_LABELS.get(paths.len()) else {
+            return OTHER_PATH;
         };
-        arms.insert(publisher, label);
+        paths.insert(publisher, label);
         tracing::info!(
             venue = %scope.0,
             category = %scope.1,
-            arm = label,
+            path = label,
             ?publisher,
-            "arbitration arm registered"
+            "arbitration path registered"
         );
         label
     }
 
-    /// An arm's metric label, minting nothing — [`Self::arm_ordinal`] both labels *and* admits, so it
+    /// A path's metric label, minting nothing — [`Self::path_ordinal`] both labels *and* admits, so it
     /// must only be reached from a path that has applied the eligibility rule. A metric label is not
     /// one: a publisher can reach the counters without ever having been admitted, and registering it
     /// there would spend the scope's admission budget on a source that never serves a book.
-    pub fn arm_label(&self, scope: &ScopeKey, publisher: Publisher) -> &'static str {
+    pub fn path_label(&self, scope: &ScopeKey, publisher: Publisher) -> &'static str {
         self.ordinals
             .get(scope)
             .and_then(|m| m.get(&publisher))
             .copied()
-            .unwrap_or(OTHER_ARM)
+            .unwrap_or(OTHER_PATH)
     }
 
-    /// An arm's label under **any** universe of `venue` — for the one caller that cannot name one.
-    /// [`Self::markets_held_all`] sums a venue's universes because `dz_arm_markets_held` is labelled
-    /// `{venue, arm}`, so its rows have a venue and no scope. Deterministic — lowest ordinal wins —
+    /// A path's label under **any** universe of `venue` — for the one caller that cannot name one.
+    /// [`Self::markets_held_all`] sums a venue's universes because `dz_path_markets_held` is labelled
+    /// `{venue, path}`, so its rows have a venue and no scope. Deterministic — lowest ordinal wins —
     /// rather than `HashMap`-order dependent, so a host publishing two universes reports one stable
     /// label instead of alternating between them. Every other metrics path is scope-keyed and uses
-    /// [`Self::arm_label`].
-    pub fn arm_label_in_venue(&self, venue: &str, publisher: Publisher) -> &'static str {
+    /// [`Self::path_label`].
+    pub fn path_label_in_venue(&self, venue: &str, publisher: Publisher) -> &'static str {
         self.ordinals
             .iter()
             .filter(|((v, _), _)| v.as_ref() == venue)
-            .filter_map(|(_, arms)| arms.get(&publisher).copied())
-            // Lexicographic, which is ordinal order only while [`MAX_LABELLED_ARMS`] <= 10
-            // ("arm10" < "arm2"). Raising the cap past ten means parsing the suffix here.
+            .filter_map(|(_, paths)| paths.get(&publisher).copied())
+            // Lexicographic, which is ordinal order only while [`MAX_LABELLED_PATHS`] <= 10
+            // ("path10" < "path2"). Raising the cap past ten means parsing the suffix here.
             .min()
-            .unwrap_or(OTHER_ARM)
+            .unwrap_or(OTHER_PATH)
     }
 
     /// The scope-wide leader, before any per-market health override.
@@ -395,10 +395,10 @@ impl StickyAuthority {
         self.scopes.get(scope).map(|v| v.leader)
     }
 
-    /// The arm actually serving one market: its scope's leader, or a healthy arm overriding it when
+    /// The path actually serving one market: its scope's leader, or a healthy path overriding it when
     /// the leader's book here is not. `None` only when the scope has no leader yet.
     ///
-    /// The alternative is chosen by most-recently-live rather than by map order, so two arms cannot
+    /// The alternative is chosen by most-recently-live rather than by map order, so two paths cannot
     /// be picked differently on two calls with the same state.
     fn serving(&self, key: &MarketKey) -> Option<Publisher> {
         let scope = scope_of(key);
@@ -406,52 +406,53 @@ impl StickyAuthority {
         if self.healthy(key, leader) {
             return Some(leader);
         }
-        let arms = &self.scopes.get(&scope)?.arms;
+        let paths = &self.scopes.get(&scope)?.paths;
         Some(
-            arms.iter()
+            paths
+                .iter()
                 .filter(|(a, _)| **a != leader && self.healthy(key, **a))
-                // The ordinal breaks a `last_seen_ns` tie: without it two tying arms are ordered by
+                // The ordinal breaks a `last_seen_ns` tie: without it two tying paths are ordered by
                 // `HashMap` iteration and could alternate as the override, interleaving their deltas.
-                .max_by_key(|&(&a, arm)| (arm.last_seen_ns, self.arm_label(&scope, a)))
+                .max_by_key(|&(&a, path)| (path.last_seen_ns, self.path_label(&scope, a)))
                 .map_or(leader, |(a, _)| *a),
         )
     }
 
-    /// The arm actually serving one market — its scope's leader, or a healthy arm overriding it.
+    /// The path actually serving one market — its scope's leader, or a healthy path overriding it.
     pub fn leader_of(&self, key: &MarketKey) -> Option<Publisher> {
         self.serving(key)
     }
 
-    /// Whether `scope` has recorded `arm` at all — true exactly for the arms [`Self::admit`] found
-    /// eligible, so a caller can bound its own per-arm state on the same rule without paying for (or
+    /// Whether `scope` has recorded `path` at all — true exactly for the paths [`Self::admit`] found
+    /// eligible, so a caller can bound its own per-path state on the same rule without paying for (or
     /// re-deriving) the ordinal.
-    pub fn tracks_arm(&self, scope: &ScopeKey, arm: Publisher) -> bool {
+    pub fn tracks_path(&self, scope: &ScopeKey, path: Publisher) -> bool {
         self.scopes
             .get(scope)
-            .is_some_and(|v| v.arms.contains_key(&arm))
+            .is_some_and(|v| v.paths.contains_key(&path))
     }
 
-    /// The arm last admitted for one market — who the consumer's book state came from. A change of
+    /// The path last admitted for one market — who the consumer's book state came from. A change of
     /// this across an [`Self::admit`] is what obliges the caller to re-baseline that market.
     pub fn last_admitted(&self, key: &MarketKey) -> Option<Publisher> {
         self.markets.get(key)?.last_admitted
     }
 
-    /// Every known `(venue, arm)` with the market count it currently serves — the `dz_arm_markets_held`
-    /// input. Arms serving nothing are reported as `0`, so a displaced arm's gauge falls instead of
+    /// Every known `(venue, path)` with the market count it currently serves — the `dz_path_markets_held`
+    /// input. Paths serving nothing are reported as `0`, so a displaced path's gauge falls instead of
     /// going stale.
     ///
-    /// Summed **across a venue's universes**, because the gauge is labelled `{venue, arm}`: election
+    /// Summed **across a venue's universes**, because the gauge is labelled `{venue, path}`: election
     /// is per scope, but the published series is not, and inventing a label here would change a
     /// contract the dashboards read.
     ///
-    /// **O(markets + arms)**, resolving each market's serving arm exactly once: the metrics tick runs
-    /// this under the shared arbiter lock, so a per-arm rescan of every market would stall ingest.
+    /// **O(markets + paths)**, resolving each market's serving path exactly once: the metrics tick runs
+    /// this under the shared arbiter lock, so a per-path rescan of every market would stall ingest.
     pub fn markets_held_all(&self) -> Vec<(Arc<str>, Publisher, usize)> {
         let mut held: HashMap<(Arc<str>, Publisher), usize> = self
             .scopes
             .iter()
-            .flat_map(|((venue, _), v)| v.arms.keys().map(|&a| ((venue.clone(), a), 0)))
+            .flat_map(|((venue, _), v)| v.paths.keys().map(|&a| ((venue.clone(), a), 0)))
             .collect();
         for key in self.markets.keys() {
             if let Some(p) = self.leader_of(key) {
@@ -468,30 +469,30 @@ impl StickyAuthority {
         self.markets.remove(key);
     }
 
-    /// Record one matched cross-arm lead for `arm` in `scope`: **negative** when `arm` beat the
-    /// authoritative arm's copy of the same event. Pooled per arm across every market **of that one
-    /// universe**, because latency is an arm property but arms on disjoint universes never carry the
+    /// Record one matched cross-path lead for `path` in `scope`: **negative** when `path` beat the
+    /// authoritative path's copy of the same event. Pooled per path across every market **of that one
+    /// universe**, because latency is a path property but paths on disjoint universes never carry the
     /// same market and so are not competing.
     ///
-    /// The caller pairs the two arms' copies of the same **trade** and diffs its own receive clock.
-    /// Never derive this from `Admit::Contest`'s `lead_ns`: that is inter-arm *phase* — the interval
+    /// The caller pairs the two paths' copies of the same **trade** and diffs its own receive clock.
+    /// Never derive this from `Admit::Contest`'s `lead_ns`: that is inter-path *phase* — the interval
     /// to the leader's previous, unrelated message — and is structurally non-negative, so a
     /// challenger could never win.
-    pub fn observe_matched_lead(&mut self, scope: &ScopeKey, arm: Publisher, lead_ns: i64) {
+    pub fn observe_matched_lead(&mut self, scope: &ScopeKey, path: Publisher, lead_ns: i64) {
         // Eligibility first, so an entry created here is bounded exactly as `admit`'s is.
-        if self.arm_ordinal(scope, arm) == OTHER_ARM {
+        if self.path_ordinal(scope, path) == OTHER_PATH {
             return;
         }
         let Some(v) = self.scopes.get_mut(scope) else {
             return;
         };
-        if arm == v.leader {
+        if path == v.leader {
             return; // the leader does not compete with itself
         }
-        // `or_default`, not `get_mut`: a matched lead is evidence about an arm whether or not
+        // `or_default`, not `get_mut`: a matched lead is evidence about a path whether or not
         // `admit` has seen it yet, and silently discarding it would leave the sampler dependent on
         // the order the two paths happen to fire in.
-        let a = v.arms.entry(arm).or_default();
+        let a = v.paths.entry(path).or_default();
         if a.samples.len() < MAX_WINDOW_SAMPLES {
             a.samples.push(lead_ns);
         }
@@ -499,7 +500,7 @@ impl StickyAuthority {
 
     /// Close every elapsed sampling window, transferring a scope's authority where a challenger
     /// cleared every condition. Returns the scopes that moved, so the caller counts
-    /// `dz_arm_authority_transfers_total{reason="margin"}`. `now_ns` is on [`Self::admit`]'s clock.
+    /// `dz_path_authority_transfers_total{reason="margin"}`. `now_ns` is on [`Self::admit`]'s clock.
     pub fn close_window(&mut self, now_ns: u64) -> Vec<(ScopeKey, Publisher)> {
         // Saturate rather than cast: a `transfer_margin_ns` past `i64::MAX` would wrap negative and
         // invert both conditions, making every window transfer.
@@ -510,9 +511,9 @@ impl StickyAuthority {
             if now_ns.saturating_sub(v.window_opened_ns) < cfg.sample_interval_ns {
                 continue;
             }
-            let winner = best_challenger(&v.arms, v.leader, margin, &cfg);
-            for arm in v.arms.values_mut() {
-                arm.samples.clear();
+            let winner = best_challenger(&v.paths, v.leader, margin, &cfg);
+            for path in v.paths.values_mut() {
+                path.samples.clear();
             }
             v.window_opened_ns = now_ns;
             if let Some(c) = winner {
@@ -530,21 +531,21 @@ impl StickyAuthority {
 /// `transfer_win_rate` of its own samples AND supplied at least `min_window_samples` of them.
 /// `None` when none cleared all three — the ordinary case, and why authority is sticky.
 fn best_challenger(
-    arms: &HashMap<Publisher, Arm>,
+    paths: &HashMap<Publisher, Path>,
     leader: Publisher,
     margin: i64,
     cfg: &AuthorityConfig,
 ) -> Option<Publisher> {
     let mut best: Option<(Publisher, i64)> = None;
-    for (&p, arm) in arms {
-        if p == leader || arm.samples.len() < cfg.min_window_samples.max(1) {
+    for (&p, path) in paths {
+        if p == leader || path.samples.len() < cfg.min_window_samples.max(1) {
             continue;
         }
-        let wins = arm.samples.iter().filter(|&&l| l < -margin).count();
-        if (wins as f64) / (arm.samples.len() as f64) < cfg.transfer_win_rate {
+        let wins = path.samples.iter().filter(|&&l| l < -margin).count();
+        if (wins as f64) / (path.samples.len() as f64) < cfg.transfer_win_rate {
             continue;
         }
-        let mut leads = arm.samples.clone();
+        let mut leads = path.samples.clone();
         leads.sort_unstable();
         let median = leads[leads.len() / 2];
         if median > -margin {
@@ -562,7 +563,7 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn arm(n: u8) -> Publisher {
+    fn path(n: u8) -> Publisher {
         Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
     }
 
@@ -627,7 +628,7 @@ mod tests {
         for id in 0..flood {
             a.set_health(
                 &(VENUE.into(), CATEGORY.into(), 2, id as u32),
-                arm(1),
+                path(1),
                 false,
             );
         }
@@ -648,19 +649,19 @@ mod tests {
         );
     }
 
-    /// An arm past the labelled cap is never authoritative, so a health report from one — the source IP
+    /// A path past the labelled cap is never authoritative, so a health report from one — the source IP
     /// is spoofable — must not enter per-market state either.
     #[test]
-    fn an_ineligible_arm_reports_no_health() {
+    fn an_ineligible_path_reports_no_health() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        for n in 0..MAX_LABELLED_ARMS as u8 {
-            assert_ne!(a.arm_ordinal(&scope(), arm(n)), OTHER_ARM);
+        for n in 0..MAX_LABELLED_PATHS as u8 {
+            assert_ne!(a.path_ordinal(&scope(), path(n)), OTHER_PATH);
         }
-        let ineligible = arm(MAX_LABELLED_ARMS as u8);
+        let ineligible = path(MAX_LABELLED_PATHS as u8);
         a.set_health(&key(), ineligible, false);
         assert!(
             a.markets.is_empty(),
-            "an ineligible arm mints no market state"
+            "an ineligible path mints no market state"
         );
         assert!(
             a.healthy(&key(), ineligible),
@@ -670,35 +671,35 @@ mod tests {
 
     // ---- election across one universe ----
 
-    /// The first eligible arm to deliver is provisionally authoritative, so there is no dark start.
+    /// The first eligible path to deliver is provisionally authoritative, so there is no dark start.
     #[test]
-    fn first_arm_takes_authority() {
+    fn first_path_takes_authority() {
         let mut a = StickyAuthority::new(no_window_cfg());
         assert_eq!(
-            a.admit(key(), arm(1), 1_000),
+            a.admit(key(), path(1), 1_000),
             Admit::Emitted { opened_tick: true }
         );
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
     }
 
-    /// `opened_tick` marks a change of served arm, not every leader message, so the
+    /// `opened_tick` marks a change of served path, not every leader message, so the
     /// `*_ticks_won_total` family keeps meaning "took the key".
     #[test]
     fn leader_keeps_emitting_without_reopening() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         assert_eq!(
-            a.admit(key(), arm(1), 2_000),
+            a.admit(key(), path(1), 2_000),
             Admit::Emitted { opened_tick: false }
         );
     }
 
     #[test]
-    fn the_non_authoritative_arm_is_dropped() {
+    fn the_non_authoritative_path_is_dropped() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        assert_eq!(a.admit(key(), arm(2), 1_400), Admit::Dropped);
-        assert_eq!(a.admit(key(), arm(2), 1_500), Admit::Dropped);
+        a.admit(key(), path(1), 1_000);
+        assert_eq!(a.admit(key(), path(2), 1_400), Admit::Dropped);
+        assert_eq!(a.admit(key(), path(2), 1_500), Admit::Dropped);
     }
 
     /// Authority spans a universe: winning it serves every market in that universe, including one
@@ -706,57 +707,57 @@ mod tests {
     #[test]
     fn authority_is_universe_wide_not_per_market() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        assert_eq!(a.admit(other_market(), arm(2), 1_100), Admit::Dropped);
-        assert!(a.admit(other_market(), arm(1), 1_200).emitted());
+        a.admit(key(), path(1), 1_000);
+        assert_eq!(a.admit(other_market(), path(2), 1_100), Admit::Dropped);
+        assert!(a.admit(other_market(), path(1), 1_200).emitted());
     }
 
     // ---- ...but it stops at the universe boundary ----
 
     /// Two disjoint universes under one Source ID each elect their own leader. Keyed on the venue the
-    /// first universe's arm would drop the second universe's whole book stream — and keep dropping it,
+    /// first universe's path would drop the second universe's whole book stream — and keep dropping it,
     /// since the only escape is leader silence and the incumbent is busy streaming its own universe.
     #[test]
     fn each_universe_elects_its_own_leader() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         assert!(
-            a.admit(other_universe(), arm(2), 1_100).emitted(),
+            a.admit(other_universe(), path(2), 1_100).emitted(),
             "a second universe's book was dropped by the first universe's leader"
         );
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
-        assert_eq!(a.scope_leader(&other_scope()), Some(arm(2)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
+        assert_eq!(a.scope_leader(&other_scope()), Some(path(2)));
         // ...and neither displaced the other: both keep serving.
-        assert!(a.admit(key(), arm(1), 1_200).emitted());
-        assert!(a.admit(other_universe(), arm(2), 1_300).emitted());
+        assert!(a.admit(key(), path(1), 1_200).emitted());
+        assert!(a.admit(other_universe(), path(2), 1_300).emitted());
     }
 
-    /// The control for the test above: **within** one universe the single-arm gate is unchanged. The
-    /// scope is narrower, not weaker — a peer arm on the same universe is still ingested and dropped.
+    /// The control for the test above: **within** one universe the single-path gate is unchanged. The
+    /// scope is narrower, not weaker — a peer path on the same universe is still ingested and dropped.
     #[test]
-    fn a_peer_arm_in_the_same_universe_is_still_dropped() {
+    fn a_peer_path_in_the_same_universe_is_still_dropped() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        assert_eq!(a.admit(key(), arm(2), 1_100), Admit::Dropped);
-        assert_eq!(a.admit(other_market(), arm(2), 1_200), Admit::Dropped);
+        a.admit(key(), path(1), 1_000);
+        assert_eq!(a.admit(key(), path(2), 1_100), Admit::Dropped);
+        assert_eq!(a.admit(other_market(), path(2), 1_200), Admit::Dropped);
     }
 
-    /// Ordinals are per scope, so the first arm of each universe is `arm0`. Sharing one numbering
-    /// across universes would label two unrelated publishers as one arm in exactly the metrics that
-    /// diagnose an arm going dark — and would spend one universe's admission slots on the other's
+    /// Ordinals are per scope, so the first path of each universe is `path0`. Sharing one numbering
+    /// across universes would label two unrelated publishers as one path in exactly the metrics that
+    /// diagnose a path going dark — and would spend one universe's admission slots on the other's
     /// publishers.
     #[test]
-    fn arm_ordinals_do_not_leak_across_universes() {
+    fn path_ordinals_do_not_leak_across_universes() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        assert_eq!(a.arm_ordinal(&scope(), arm(1)), "arm0");
+        assert_eq!(a.path_ordinal(&scope(), path(1)), "path0");
         assert_eq!(
-            a.arm_ordinal(&other_scope(), arm(2)),
-            "arm0",
-            "a different publisher, but the first arm of its own universe"
+            a.path_ordinal(&other_scope(), path(2)),
+            "path0",
+            "a different publisher, but the first path of its own universe"
         );
         // Each universe then numbers its own mirrors independently.
-        assert_eq!(a.arm_ordinal(&scope(), arm(2)), "arm1");
-        assert_eq!(a.arm_ordinal(&other_scope(), arm(1)), "arm1");
+        assert_eq!(a.path_ordinal(&scope(), path(2)), "path1");
+        assert_eq!(a.path_ordinal(&other_scope(), path(1)), "path1");
     }
 
     // ---- silence: across the universe, and the idle-market bug it fixes ----
@@ -764,13 +765,13 @@ mod tests {
     #[test]
     fn silent_leader_times_out() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         assert!(
-            !a.admit(key(), arm(2), 1_000 + TIMEOUT).emitted(),
+            !a.admit(key(), path(2), 1_000 + TIMEOUT).emitted(),
             "not yet past"
         );
-        assert!(a.admit(key(), arm(2), 1_001 + TIMEOUT).emitted());
-        assert_eq!(a.scope_leader(&scope()), Some(arm(2)));
+        assert!(a.admit(key(), path(2), 1_001 + TIMEOUT).emitted());
+        assert_eq!(a.scope_leader(&scope()), Some(path(2)));
     }
 
     /// **The bug universe-wide silence exists to fix.** With the clock scoped per market it only
@@ -783,67 +784,67 @@ mod tests {
     fn an_idle_market_does_not_flap_while_the_leader_is_busy_elsewhere() {
         let mut a = StickyAuthority::new(no_window_cfg());
         let idle = other_market();
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         let mut transfers = 0;
-        // Ten updates on the idle market an hour apart, while arm(1) streams the busy one.
+        // Ten updates on the idle market an hour apart, while path(1) streams the busy one.
         for i in 1..=10u64 {
             let t = 1_000 + i * 3_600_000_000_000;
-            a.admit(key(), arm(1), t - 1); // the leader is alive, on another market
-            if a.admit(idle.clone(), arm(2), t).emitted() {
+            a.admit(key(), path(1), t - 1); // the leader is alive, on another market
+            if a.admit(idle.clone(), path(2), t).emitted() {
                 transfers += 1;
             }
         }
         assert_eq!(transfers, 0, "a quiet market must not transfer authority");
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
     }
 
     /// ...but a leader that goes quiet across its whole universe still yields.
     #[test]
     fn a_leader_silent_across_the_universe_still_yields() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         assert!(a
-            .admit(other_market(), arm(2), 1_000 + TIMEOUT * 2)
+            .admit(other_market(), path(2), 1_000 + TIMEOUT * 2)
             .emitted());
-        assert_eq!(a.scope_leader(&scope()), Some(arm(2)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(2)));
     }
 
     // ---- health: per market, an override rather than a transfer ----
 
-    /// A market whose venue leader is gapped is served by a healthy arm — that market only. Under
+    /// A market whose venue leader is gapped is served by a healthy path — that market only. Under
     /// incremental output a lost level does not self-heal until the next snapshot, so holding it
     /// would serve a knowingly-wrong book.
     #[test]
     fn an_unhealthy_leader_yields_one_market_not_the_venue() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.admit(other_market(), arm(1), 1_000);
-        a.set_health(&key(), arm(1), false);
+        a.admit(key(), path(1), 1_000);
+        a.admit(other_market(), path(1), 1_000);
+        a.set_health(&key(), path(1), false);
 
         assert!(
-            a.admit(key(), arm(2), 1_100).emitted(),
+            a.admit(key(), path(2), 1_100).emitted(),
             "the bad market moves"
         );
-        assert_eq!(a.admit(key(), arm(1), 1_200), Admit::Dropped);
+        assert_eq!(a.admit(key(), path(1), 1_200), Admit::Dropped);
         // The venue, and every other market, is untouched.
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
-        assert!(a.admit(other_market(), arm(1), 1_300).emitted());
-        assert_eq!(a.admit(other_market(), arm(2), 1_350), Admit::Dropped);
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
+        assert!(a.admit(other_market(), path(1), 1_300).emitted());
+        assert_eq!(a.admit(other_market(), path(2), 1_350), Admit::Dropped);
     }
 
     /// The override reverts on its own when the leader's book recovers — it is computed, not stored.
     #[test]
     fn the_override_reverts_when_the_leaders_book_recovers() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.set_health(&key(), arm(1), false);
-        assert!(a.admit(key(), arm(2), 1_100).emitted());
-        a.set_health(&key(), arm(1), true);
+        a.admit(key(), path(1), 1_000);
+        a.set_health(&key(), path(1), false);
+        assert!(a.admit(key(), path(2), 1_100).emitted());
+        a.set_health(&key(), path(1), true);
         assert!(
-            a.admit(key(), arm(1), 1_200).emitted(),
+            a.admit(key(), path(1), 1_200).emitted(),
             "back to the leader"
         );
-        assert_eq!(a.admit(key(), arm(2), 1_250), Admit::Dropped);
+        assert_eq!(a.admit(key(), path(2), 1_250), Admit::Dropped);
     }
 
     /// An unhealthy challenger must not take over from an unhealthy leader — that flaps between two
@@ -851,57 +852,57 @@ mod tests {
     #[test]
     fn an_unhealthy_challenger_does_not_get_the_override() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.set_health(&key(), arm(1), false);
-        a.set_health(&key(), arm(2), false);
-        assert_eq!(a.admit(key(), arm(2), 1_100), Admit::Dropped);
+        a.admit(key(), path(1), 1_000);
+        a.set_health(&key(), path(1), false);
+        a.set_health(&key(), path(2), false);
+        assert_eq!(a.admit(key(), path(2), 1_100), Admit::Dropped);
     }
 
-    // ---- arm eligibility and labelling ----
+    // ---- path eligibility and labelling ----
 
     /// Ordinals are stable per venue, bounded, and never expose a spoofable source IP as a label.
     #[test]
-    fn arm_ordinals_are_stable_and_bounded() {
+    fn path_ordinals_are_stable_and_bounded() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        assert_eq!(a.arm_ordinal(&scope(), arm(1)), "arm0");
-        assert_eq!(a.arm_ordinal(&scope(), arm(2)), "arm1");
-        assert_eq!(a.arm_ordinal(&scope(), arm(1)), "arm0", "stable");
+        assert_eq!(a.path_ordinal(&scope(), path(1)), "path0");
+        assert_eq!(a.path_ordinal(&scope(), path(2)), "path1");
+        assert_eq!(a.path_ordinal(&scope(), path(1)), "path0", "stable");
         assert_eq!(
-            a.arm_ordinal(&("Other".into(), CATEGORY.into()), arm(9)),
-            "arm0",
+            a.path_ordinal(&("Other".into(), CATEGORY.into()), path(9)),
+            "path0",
             "per venue"
         );
         for n in 3..=8 {
-            a.arm_ordinal(&scope(), arm(n));
+            a.path_ordinal(&scope(), path(n));
         }
-        assert_eq!(a.arm_ordinal(&scope(), arm(200)), OTHER_ARM, "cap holds");
+        assert_eq!(a.path_ordinal(&scope(), path(200)), OTHER_PATH, "cap holds");
     }
 
-    /// Past the cap an arm is not merely unlabelled — it is never authoritative and enters no map, so
-    /// a forged-source flood can neither displace a real arm nor grow the per-arm state.
+    /// Past the cap a path is not merely unlabelled — it is never authoritative and enters no map, so
+    /// a forged-source flood can neither displace a real path nor grow the per-path state.
     #[test]
-    fn an_arm_past_the_cap_is_never_authoritative() {
+    fn an_path_past_the_cap_is_never_authoritative() {
         let mut a = StickyAuthority::new(no_window_cfg());
         for n in 1..=8 {
-            a.arm_ordinal(&scope(), arm(n));
+            a.path_ordinal(&scope(), path(n));
         }
-        assert_eq!(a.admit(key(), arm(200), 1_000), Admit::Dropped);
+        assert_eq!(a.admit(key(), path(200), 1_000), Admit::Dropped);
         assert_eq!(a.scope_leader(&scope()), None, "no venue was created");
     }
 
-    /// The gauge counts the arm actually *serving* each market, so a health override shows as a split
-    /// venue rather than as the elected arm still holding everything.
+    /// The gauge counts the path actually *serving* each market, so a health override shows as a split
+    /// venue rather than as the elected path still holding everything.
     #[test]
-    fn markets_held_counts_the_arm_actually_serving() {
+    fn markets_held_counts_the_path_actually_serving() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.admit(other_market(), arm(1), 1_000);
-        assert_eq!(held(&a, arm(1)), 2);
-        assert_eq!(held(&a, arm(2)), 0);
-        a.set_health(&key(), arm(1), false);
-        a.admit(key(), arm(2), 1_100);
-        assert_eq!(held(&a, arm(1)), 1);
-        assert_eq!(held(&a, arm(2)), 1);
+        a.admit(key(), path(1), 1_000);
+        a.admit(other_market(), path(1), 1_000);
+        assert_eq!(held(&a, path(1)), 2);
+        assert_eq!(held(&a, path(2)), 0);
+        a.set_health(&key(), path(1), false);
+        a.admit(key(), path(2), 1_100);
+        assert_eq!(held(&a, path(1)), 1);
+        assert_eq!(held(&a, path(2)), 1);
     }
 
     fn held(a: &StickyAuthority, publisher: Publisher) -> usize {
@@ -912,101 +913,108 @@ mod tests {
     }
 
     /// A market forgotten by the caller must leave nothing behind: a stale `last_admitted` would make
-    /// the next arm's deltas read as a continuation of the arm that used to serve it.
+    /// the next path's deltas read as a continuation of the path that used to serve it.
     #[test]
     fn a_forgotten_market_leaves_no_trace() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.admit(other_market(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
+        a.admit(other_market(), path(1), 1_000);
         a.forget_market(&key());
         assert_eq!(a.last_admitted(&key()), None);
-        assert_eq!(a.last_admitted(&other_market()), Some(arm(1)));
+        assert_eq!(a.last_admitted(&other_market()), Some(path(1)));
     }
 
     /// A label lookup must not admit: the metrics path sees every publisher that sent a trade, so
     /// minting there would spend the venue's eight admission slots on sources that never serve a book.
     #[test]
-    fn arm_label_never_registers_an_arm() {
+    fn path_label_never_registers_an_path() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        assert_eq!(a.arm_label(&scope(), arm(9)), OTHER_ARM);
+        assert_eq!(a.path_label(&scope(), path(9)), OTHER_PATH);
         assert_eq!(
-            a.arm_ordinal(&scope(), arm(1)),
-            "arm0",
+            a.path_ordinal(&scope(), path(1)),
+            "path0",
             "the slot was not taken"
         );
-        assert_eq!(a.arm_label(&scope(), arm(1)), "arm0");
+        assert_eq!(a.path_label(&scope(), path(1)), "path0");
     }
 
-    /// The re-baseline trigger: it tracks the arm actually admitted, so a health override registers
+    /// The re-baseline trigger: it tracks the path actually admitted, so a health override registers
     /// as a change even though the venue leader never moved.
     #[test]
-    fn last_admitted_tracks_the_served_arm() {
+    fn last_admitted_tracks_the_served_path() {
         let mut a = StickyAuthority::new(no_window_cfg());
         assert_eq!(a.last_admitted(&key()), None);
-        a.admit(key(), arm(1), 1_000);
-        assert_eq!(a.last_admitted(&key()), Some(arm(1)));
-        a.set_health(&key(), arm(1), false);
-        a.admit(key(), arm(2), 1_100);
-        assert_eq!(a.last_admitted(&key()), Some(arm(2)));
-        // A dropped copy never becomes the served arm.
-        a.admit(key(), arm(1), 1_200);
-        assert_eq!(a.last_admitted(&key()), Some(arm(2)));
+        a.admit(key(), path(1), 1_000);
+        assert_eq!(a.last_admitted(&key()), Some(path(1)));
+        a.set_health(&key(), path(1), false);
+        a.admit(key(), path(2), 1_100);
+        assert_eq!(a.last_admitted(&key()), Some(path(2)));
+        // A dropped copy never becomes the served path.
+        a.admit(key(), path(1), 1_200);
+        assert_eq!(a.last_admitted(&key()), Some(path(2)));
     }
 
-    /// The gauge sweep reports every known arm, including one serving nothing — a displaced arm whose
+    /// The gauge sweep reports every known path, including one serving nothing — a displaced path whose
     /// series simply stopped being written would read as still holding its pre-transfer markets.
     #[test]
-    fn markets_held_all_reports_idle_arms_as_zero() {
+    fn markets_held_all_reports_idle_paths_as_zero() {
         let mut a = StickyAuthority::new(no_window_cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.admit(other_market(), arm(1), 1_000);
-        a.admit(key(), arm(2), 1_100); // dropped, but arm(2) is now known to the venue
+        a.admit(key(), path(1), 1_000);
+        a.admit(other_market(), path(1), 1_000);
+        a.admit(key(), path(2), 1_100); // dropped, but path(2) is now known to the venue
         let mut all = a.markets_held_all();
         all.sort_by_key(|(_, p, _)| format!("{p:?}"));
         assert_eq!(
             all,
-            vec![(Arc::from(VENUE), arm(1), 2), (Arc::from(VENUE), arm(2), 0)]
+            vec![
+                (Arc::from(VENUE), path(1), 2),
+                (Arc::from(VENUE), path(2), 0)
+            ]
         );
     }
 
     // ---- pooled matched-lead re-election ----
 
-    /// Samples pool across markets, because latency is an arm property. Matches spread over three
+    /// Samples pool across markets, because latency is a path property. Matches spread over three
     /// markets elect at the venue level.
     #[test]
     fn pooled_samples_across_markets_transfer_the_venue() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for i in 0..10 {
             let m: MarketKey = (VENUE.into(), CATEGORY.into(), 2, 40 + i % 3);
-            a.admit(m, arm(1), 1_000);
-            a.observe_matched_lead(&scope(), arm(2), -50_000);
+            a.admit(m, path(1), 1_000);
+            a.observe_matched_lead(&scope(), path(2), -50_000);
         }
         assert_eq!(
             a.close_window(2_000_000),
-            vec![(scope(), arm(2))],
+            vec![(scope(), path(2))],
             "a sustained pooled margin transfers"
         );
-        assert_eq!(a.scope_leader(&scope()), Some(arm(2)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(2)));
     }
 
     /// The floor is the difference between sticky and raced: a lone fast match is noise.
     #[test]
     fn one_fast_sample_does_not_transfer() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
-        a.observe_matched_lead(&scope(), arm(2), -5_000_000);
+        a.admit(key(), path(1), 1_000);
+        a.observe_matched_lead(&scope(), path(2), -5_000_000);
         assert!(a.close_window(2_000_000).is_empty());
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
     }
 
     /// Both conditions are independent and both must hold: a heavy tail cannot carry a transfer.
     #[test]
     fn a_minority_of_wins_does_not_transfer_however_large() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for i in 0..10 {
-            a.observe_matched_lead(&scope(), arm(2), if i < 5 { -9_000_000 } else { 9_000_000 });
+            a.observe_matched_lead(
+                &scope(),
+                path(2),
+                if i < 5 { -9_000_000 } else { 9_000_000 },
+            );
         }
         assert!(a.close_window(2_000_000).is_empty(), "50% < 0.8 win rate");
     }
@@ -1015,9 +1023,9 @@ mod tests {
     #[test]
     fn winning_within_the_margin_does_not_transfer() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for _ in 0..10 {
-            a.observe_matched_lead(&scope(), arm(2), -500); // inside the 1_000ns margin
+            a.observe_matched_lead(&scope(), path(2), -500); // inside the 1_000ns margin
         }
         assert!(a.close_window(2_000_000).is_empty());
     }
@@ -1025,9 +1033,9 @@ mod tests {
     #[test]
     fn window_does_not_close_early() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for _ in 0..10 {
-            a.observe_matched_lead(&scope(), arm(2), -50_000);
+            a.observe_matched_lead(&scope(), path(2), -50_000);
         }
         assert!(a.close_window(1_500).is_empty(), "interval has not elapsed");
         assert!(!a.close_window(2_000_000).is_empty());
@@ -1037,26 +1045,26 @@ mod tests {
     #[test]
     fn window_close_resets_the_sample_set() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for _ in 0..10 {
-            a.observe_matched_lead(&scope(), arm(2), -50_000);
+            a.observe_matched_lead(&scope(), path(2), -50_000);
         }
         assert!(!a.close_window(2_000_000).is_empty());
-        // arm(2) leads now; arm(1) needs its own fresh evidence to win it back.
+        // path(2) leads now; path(1) needs its own fresh evidence to win it back.
         assert!(a.close_window(4_000_000).is_empty());
     }
 
     /// A handover restarts the window, so a silence transfer is not undone at the next close on the
-    /// displaced arm's evidence.
+    /// displaced path's evidence.
     #[test]
     fn a_silence_transfer_restarts_the_sampling_window() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for _ in 0..10 {
-            a.observe_matched_lead(&scope(), arm(2), 9_000_000); // arm(1) is faster
+            a.observe_matched_lead(&scope(), path(2), 9_000_000); // path(1) is faster
         }
-        a.admit(key(), arm(2), 1_001 + TIMEOUT); // arm(1) went silent
-        assert_eq!(a.scope_leader(&scope()), Some(arm(2)));
+        a.admit(key(), path(2), 1_001 + TIMEOUT); // path(1) went silent
+        assert_eq!(a.scope_leader(&scope()), Some(path(2)));
         assert!(
             a.close_window(TIMEOUT * 3).is_empty(),
             "pre-handover samples must not hand it straight back"
@@ -1064,33 +1072,33 @@ mod tests {
     }
 
     /// A margin transfer must not vouch for the new leader's liveness. The silence clock is each
-    /// arm's own `last_seen_ns`, advanced only by real messages, so winning on samples does not make
-    /// a quiet arm look live — it is still displaced by the next message from an arm that is.
+    /// path's own `last_seen_ns`, advanced only by real messages, so winning on samples does not make
+    /// a quiet path look live — it is still displaced by the next message from a path that is.
     #[test]
     fn a_margin_transfer_does_not_fake_the_new_leaders_liveness() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for _ in 0..10 {
-            a.observe_matched_lead(&scope(), arm(2), -50_000);
+            a.observe_matched_lead(&scope(), path(2), -50_000);
         }
-        // arm(2) wins the window on a ticker far past its own last message (it never sent one).
+        // path(2) wins the window on a ticker far past its own last message (it never sent one).
         assert!(!a.close_window(TIMEOUT * 5).is_empty());
-        assert_eq!(a.scope_leader(&scope()), Some(arm(2)));
-        // arm(1) is live, arm(2) has said nothing: authority comes straight back on silence.
-        assert!(a.admit(key(), arm(1), TIMEOUT * 5 + 1).emitted());
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(2)));
+        // path(1) is live, path(2) has said nothing: authority comes straight back on silence.
+        assert!(a.admit(key(), path(1), TIMEOUT * 5 + 1).emitted());
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
     }
 
     /// The leader's own samples are never collected: it does not compete with itself, and counting
-    /// them would let evidence measured against a displaced arm outvote the challenger.
+    /// them would let evidence measured against a displaced path outvote the challenger.
     #[test]
     fn the_leader_does_not_sample_against_itself() {
         let mut a = StickyAuthority::new(cfg());
-        a.admit(key(), arm(1), 1_000);
+        a.admit(key(), path(1), 1_000);
         for _ in 0..10 {
-            a.observe_matched_lead(&scope(), arm(1), -9_000_000);
+            a.observe_matched_lead(&scope(), path(1), -9_000_000);
         }
         assert!(a.close_window(2_000_000).is_empty());
-        assert_eq!(a.scope_leader(&scope()), Some(arm(1)));
+        assert_eq!(a.scope_leader(&scope()), Some(path(1)));
     }
 }

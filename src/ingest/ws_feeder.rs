@@ -54,7 +54,7 @@ fn hl_venue() -> &'static str {
 /// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
 /// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
 /// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
-/// backstop its own universe rather than another arm of the same one, and the gate would stop
+/// backstop its own universe rather than another path of the same one, and the gate would stop
 /// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
 /// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
 /// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.

@@ -36,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The Market-by-Order resurrection guard forgets a removed order on **venue time** rather than by
-  agreement between the publishers. It used to hold a per-arm reporter mask per removed order and retire
-  it only once every arm still reaching the market had independently reported that removal; an arm whose
+  agreement between the publishers. It used to hold a per-path reporter mask per removed order and retire
+  it only once every path still reaching the market had independently reported that removal; a path whose
   own snapshot anchor never held the order could never report it, so the population grew with the market's
   whole history until a cap gave way and the market was **disowned** — dark for every consumer until some
   producer re-baselined it, which for a healthy publisher is its next recovery rather than its next
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel the arbiter now tracks the newest venue stamp accepted and refuses anything older than
   `newest - --arb-book-retention-secs`, forgetting removed entries on the same frontier; an event older
   than its own order's last published change is refused before any size comparison, which also removes the
-  false size disagreements that capped the tolerable inter-arm lag at about a second.
+  false size disagreements that capped the tolerable inter-path lag at about a second.
 - ⚠️ **`dz_mbo_market_invalidations_total` is removed.** It never shipped in a release, but a host
   running a build from this cycle exports it, so retire any alert or dashboard on it. The refusals to
   watch instead are `dz_mbo_events_past_frontier_total` (a link returning with a backlog) and
@@ -64,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when the forward bound has been refusing continuously — a publisher whose clock crawls has all of its
   tiny advances accepted, which would keep the movement-keyed hatch from ever firing.
 - `--arb-book-retention-secs` (30), `--arb-book-ts-jump-secs` (5) and `--arb-book-reseat-secs` (10) tune
-  the guard above. The retention default is sized against a measured p99.99 inter-arm separation of 2.77 s
+  the guard above. The retention default is sized against a measured p99.99 inter-path separation of 2.77 s
   and 3,958 removals/s per publisher per channel: ~119k entries, 11% of the process-wide ceiling. A jump
   bound at or above the retention window is refused at startup: one accepted jump would put a whole channel
   outside that window.
@@ -81,8 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Six order-level paths silently dropped or corrupted consumer state. An `InstrumentReset` resolved
   its market through the `revealed` entry it had already removed, so the raced-state drop was dead
   code and every re-used order id was refused as a resurrection. A departing Market-by-Order
-  receiver released its arm's serving claim filtered by the registry row's venue while every market
-  is filed under the *wire* venue, so for a superset row nothing matched and a departed arm's
+  receiver released its path's serving claim filtered by the registry row's venue while every market
+  is filed under the *wire* venue, so for a superset row nothing matched and a departed path's
   phantom `synced` kept suppressing the survivor's only re-baseline. The arbiter's degraded forced
   re-baseline hand-deleted the replay entry while its paired state survived, leaving a market
   invisible to every newly-connecting client. `EndOfSession` dropped every publisher's book but
@@ -118,7 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is now explicit at that eviction and holds for a batch large enough to cross the cap on its
   own. After: 3.7 µs at 36,768 and 5.5 µs at the cap.
 - `dz_mbo_guarded_tombstones_max` no longer reads zero while a market holds the real maximum. It
-  followed the market holding it back down, so when that market's arms caught up and it retired, the
+  followed the market holding it back down, so when that market's paths caught up and it retired, the
   gauge reported the shrunken figure — full headroom — while a market that had gone quiet still held
   its whole population, which is the market the gauge exists to find. It now re-seats on the largest
   survivor, as it already did when the holding market was dropped.
@@ -128,18 +128,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed 250 ms now. On the real capture the wider window drops **one** batch against 24–217 at 250 ms,
   because the false disagreements stop happening at all; this is about the worst case per
   disagreement, not the observed total.
-- The resurrection guard's retirement no longer stalls on a removal one arm never reports. It ran
-  head-of-queue over the removal order, so an arm whose snapshot anchor post-dates a removal — it
+- The resurrection guard's retirement no longer stalls on a removal one path never reports. It ran
+  head-of-queue over the removal order, so a path whose snapshot anchor post-dates a removal — it
   never held that order, so it never reports it — blocked every tombstone behind it for the life of
-  the market, and the population reverted from the arms' lag spread to the market's whole history,
+  the market, and the population reverted from the paths' lag spread to the market's whole history,
   exiting only at the per-market cap where the market is disowned. Retirement now also sweeps out of
   queue order, on a threshold that doubles after each sweep so it costs O(1) amortized per tombstone
-  and nothing at all while the arms keep up. **What counts as evidence is unchanged** — every arm
+  and nothing at all while the paths keep up. **What counts as evidence is unchanged** — every path
   still reaching the market must have reported the removal — so a forged datagram buys exactly what
-  it bought before: one arm's bit on the one order it names.
+  it bought before: one path's bit on the one order it names.
 - A market disowned by the process-wide tombstone ceiling is announced when it happens rather than on
   its next batch. That market is not the one being admitted and need never send another — a market
-  whose arms drifted apart and then both went quiet is exactly how one comes to hold the most
+  whose paths drifted apart and then both went quiet is exactly how one comes to hold the most
   tombstones — so its consumers kept a book that silently stopped updating while a client connecting a
   second later got none at all.
 - A disowning survives `MAX_BOOK_MARKETS` eviction. The record lived on the per-market state eviction
@@ -147,18 +147,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reading as ordinary and resumed serving deltas onto a book nothing vouches for.
 - The Market-by-Order resurrection guard no longer corrupts a consumer's book when the two
   publishers drift far apart. It was bounded by a per-market count of 512 removed orders, which is a
-  count standing in for a *time* tolerance, and past it — 150 ms of inter-arm lag on a busy market,
-  against 186 ms measured between the real publishers — it evicted a tombstone a lagging arm could
+  count standing in for a *time* tolerance, and past it — 150 ms of inter-path lag on a busy market,
+  against 186 ms measured between the real publishers — it evicted a tombstone a lagging path could
   still race and then re-baselined the market from our own accumulated view, which is the view the
   guard had just failed to protect: the resurrected orders were republished as a complete book and
-  re-seeded as live, and nothing removed them again. Now a tombstone is retired as soon as every arm
-  still reaching the market has reported the removal, so the population sizes itself to the arms' lag;
+  re-seeded as live, and nothing removed them again. Now a tombstone is retired as soon as every path
+  still reaching the market has reported the removal, so the population sizes itself to the paths' lag;
   it is bounded process-wide instead of per market (the same aggregate memory, spent where the guard
   needs it), with the ceiling charged to the market holding the tombstones rather than to whichever
   market records the next removal; and a guard that genuinely cannot answer **disowns** the market —
   state and replay entry dropped, consumers told to drop the book, nothing published until a producer
   re-baselines it — rather than republishing our own view. Replaying the two real captured publishers,
-  a consumer that ended 994 orders wrong at 300 ms of inter-arm lag, permanently, now holds the venue's
+  a consumer that ended 994 orders wrong at 300 ms of inter-path lag, permanently, now holds the venue's
   book exactly, and the guard's eviction never fires at any lag tested. With the wider dedup window
   below, first divergence on that capture moves from **153 ms to 2 s** — exact at every step through
   1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` now partially fills every order, so
@@ -170,11 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `--arb-book-dedup-window-ms` now defaults to 1000 (was 250). The window stopped being the guard's
-  reach, so what it governs now is whether a lagging arm's copy is recognized as a duplicate at all:
-  below the arms' real separation, a stale copy of an add for an order the leader has since partially
+  reach, so what it governs now is whether a lagging path's copy is recognized as a duplicate at all:
+  below the paths' real separation, a stale copy of an add for an order the leader has since partially
   filled reads as a size *disagreement* between two healthy publishers, forcing a re-baseline whose
   withheld batches are lost. On the real two-publisher capture this is worth 500 ms → 2 s of tolerated
-  inter-arm lag, and it takes the disagreements those healthy arms manufactured to zero. Costs no
+  inter-path lag, and it takes the disagreements those healthy paths manufactured to zero. Costs no
   memory — `seen` is capped at 1024 events per market independently of the window, which is also why a
   value much above a second is inert on a busy market: 1 s and 10 s measure identically. It did cost
   something else, now fixed below: the same value was the forced re-baseline's rate limit, whose
@@ -220,8 +220,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - The Market-by-Order cross-publisher resurrection guard no longer loses to its own bound. Three
-  ways it did: a forced re-baseline stamped the arm that discharged it as owning the floors it
-  seeded, so that arm — the one whose stale, larger size raised the flag — could re-assert it
+  ways it did: a forced re-baseline stamped the path that discharged it as owning the floors it
+  seeded, so that path — the one whose stale, larger size raised the flag — could re-assert it
   unchallenged; the eviction that decides whether losing an entry costs anything was scoped by the
   dedup window, which is the wrong horizon (the guard exists for copies arriving after it) read off
   the wrong clock (a delete mutated the entry in place, so a tombstone carried its add's timestamp);
@@ -229,7 +229,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the normal state of a 44,598-order market. Eviction is now scoped by what is evicted — a live
   floor re-seeds itself and goes silently, a tombstone re-baselines the market and is counted on the
   existing `dz_mbo_forced_rebaselines_total{reason="guard_evicted"}` — with the two populations
-  bounded apart so neither starves the other, and a tombstone every serving arm has reported treated
+  bounded apart so neither starves the other, and a tombstone every serving path has reported treated
   as spent so a busy market's dead orders cannot fill the guard and re-baseline it forever.
 - A forced re-baseline no longer discards a batch that removed an order. Only a tombstone-creating
   removal can cross the guard's dead-order bound, so the batch a `guard_evicted` force discarded always
@@ -238,9 +238,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way the order stayed live in the republished book and the seed marked it live in the guard too, so
   nothing removed it again. A batch that removed nothing is still dropped, which keeps a disagreement's
   torn logical event off the wire wherever the removal does not make dropping it worse.
-- The serving-arm set the guard reads to decide whether a tombstone is spent is now refreshed on the
+- The serving-path set the guard reads to decide whether a tombstone is spent is now refreshed on the
   batch that creates a market's race state, not from the one after it. A session reset drops that
-  state while the arms keep serving, so the batch re-creating it treated every tombstone it made as
+  state while the paths keep serving, so the batch re-creating it treated every tombstone it made as
   spent and evicted one without re-baselining.
 - The Hyperliquid-compatible sink holds the shared book map's mutex — the one the ingest emit path
   takes on every published batch — for a clone and nothing else; every rendering step runs after the
@@ -255,7 +255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the larger of the two. A resting order only shrinks, so a larger claim means one of the books has
   drifted — and which one is unknowable at the merge point: the larger rewinds a consumer past a
   fill the venue already applied, and preferring the smaller lets a forged size mute a real order.
-  The market stops being served from either arm's deltas and is republished whole instead. The same
+  The market stops being served from either path's deltas and is republished whole instead. The same
   happens when the cross-publisher resurrection guard is asked to age out an order a peer's copy could
   still be racing, which would otherwise silently reopen the path that guard exists to close (an
   eviction past that horizon costs the guard nothing and is left alone, so a book far larger than the
@@ -270,7 +270,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orders now seed the guard, so a peer claiming more than the snapshot holds is still caught as
   drift. Session and instrument boundaries keep dropping it outright: a new id space is the one case
   where that is correct.
-- A departed Market-by-Order publisher no longer suppresses a surviving arm's re-baseline for 30s.
+- A departed Market-by-Order publisher no longer suppresses a surviving path's re-baseline for 30s.
   Its receiver's exit is the authoritative departure signal and now releases its book standing;
   `PEER_SERVING_NS` stays only as the backstop for a publisher that goes quiet without
   deregistering. A gap-and-recover cycle is sub-second, so the timer never bound on it — and a
@@ -321,7 +321,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of which a departure purge could never reach (it purges by the registry's roster id alone),
   leaving them served forever. Ingest now canonicalises the wire channel to the base id for every
   consumer-facing identity — catalog, history, book, product id — while producer-side state (books,
-  sequence tracking, reset counts) stays keyed on the raw wire channel, since the two arms are
+  sequence tracking, reset counts) stays keyed on the raw wire channel, since the two paths are
   independently sequenced.
 - `doublezero-edge`'s `client::get`/`classify` treated a `2xx` response with an undecodable body
   as success, printing the synthesized `invalid_response` envelope to stdout with exit code 0 —
@@ -426,7 +426,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - The query API's history feeder resolved a `trade`'s product by matching `(venue, symbol)` against
   the instrument catalog, dropping any trade whose symbol matched more than one market. On a
-  price-aggregated venue whose redundant publisher arms carry an identical instrument set under
+  price-aggregated venue whose redundant publisher paths carry an identical instrument set under
   distinct channel ids, *every* symbol matches twice, so every trade was silently dropped: zero
   candles and zero ticker history for that venue's whole product set, indistinguishable from a
   market that simply had not traded. `trade` now carries its own `channel`/`instrument_id` (see
@@ -557,7 +557,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live stream order-level, so the one consumer it was meant to serve — one folding the stream itself —
   was handed a bootstrap with no order state to fold against.
 - Order-level `book` events are **raced across publishers on venue event identity** rather than served
-  by one elected arm: each event is published once, from whichever publisher delivered it first. What
+  by one elected path: each event is published once, from whichever publisher delivered it first. What
   carries correctness is a per-order guard at the merge point, not the dedup window — a change for an
   order the producer has already published as gone is refused, so an arbitrarily late copy costs a
   redundant emission and cannot resurrect a dead order. A publisher recovering by snapshot republishes
@@ -608,13 +608,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
 
 ### Changed
-- Trade-tape ownership is now a **runtime** decision instead of the static `Feed.emit_trades` flag. A venue's feeds can ride separate multicast groups with separate subscription codes, so a host may hold one and not the other and still needs a tape on the wire; both rows now claim trades and the reconciler ranks the running receivers (top of book over market-by-price) and flips an `AtomicBool` each processor reads per print. Ownership therefore moves **without respawning** the receiver that keeps it — a respawn would drop a healthy publisher's books and reference data every time a peer feed's subscription changed. `emit_trades` survives as the static capability claim, pinned against the ranking by a new agreement test in place of `at_most_one_trade_emitting_row_per_venue`. Within the owning row, a **per-venue tape leader** gates `Sticky` venues one level down: those arms share no trade-id space (one may stamp the `trade_id == 0` sentinel while its peer stamps a real venue id, a pair neither the sentinel latch nor the dedup window collapses), so the gate is id-independent: first arm to print leads, an arm the authority tracks displaces one it does not, the book-elected arm takes over once per election, and a silent incumbent yields after 5s so a dead trade stream never mutes the tape. Row ownership is likewise ordered liveness before rank, so a subscribed-but-dead row cannot hold the tape while its peer decodes prints and drops them. Together they preserve the invariant the sentinel bypass rests on: **at most one tape emitter per venue at any moment.** `dz_tape_owner_changes_total`, `dz_tape_arm_transfers_total` and `dz_tape_arm_dropped_total` report the moves and the drops. Every venue live today is `Coordinated`, so the arm gate changes nothing currently running. (#106)
+- Trade-tape ownership is now a **runtime** decision instead of the static `Feed.emit_trades` flag. A venue's feeds can ride separate multicast groups with separate subscription codes, so a host may hold one and not the other and still needs a tape on the wire; both rows now claim trades and the reconciler ranks the running receivers (top of book over market-by-price) and flips an `AtomicBool` each processor reads per print. Ownership therefore moves **without respawning** the receiver that keeps it — a respawn would drop a healthy publisher's books and reference data every time a peer feed's subscription changed. `emit_trades` survives as the static capability claim, pinned against the ranking by a new agreement test in place of `at_most_one_trade_emitting_row_per_venue`. Within the owning row, a **per-venue tape leader** gates `Sticky` venues one level down: those paths share no trade-id space (one may stamp the `trade_id == 0` sentinel while its peer stamps a real venue id, a pair neither the sentinel latch nor the dedup window collapses), so the gate is id-independent: first path to print leads, a path the authority tracks displaces one it does not, the book-elected path takes over once per election, and a silent incumbent yields after 5s so a dead trade stream never mutes the tape. Row ownership is likewise ordered liveness before rank, so a subscribed-but-dead row cannot hold the tape while its peer decodes prints and drops them. Together they preserve the invariant the sentinel bypass rests on: **at most one tape emitter per venue at any moment.** `dz_tape_owner_changes_total`, `dz_tape_path_transfers_total` and `dz_tape_path_dropped_total` report the moves and the drops. Every venue live today is `Coordinated`, so the path gate changes nothing currently running. (#106)
 
 ### Added
-- The two Lashay perps feed rows: `edge-kalshi-perps-tob` top of book on `233.84.178.3:7576/7577` and `edge-kalshi-perps-mbp` market-by-price on `233.84.178.4:31000/41000/51000`, both claiming the tape and both `ArbitrationMode::Sticky`, one publisher block each (the two arms share a block and are told apart by source IP). Both groups are live and activated, so a host subscribed to either code begins ingesting on upgrade. A `code` that does not match its live group fails silently — no warning, no failed bind, just a permanently-zero `dz_receiver_up` — so both rows are pinned against the deployment by a test. The group codes are transcribed verbatim from what the DoubleZero ledger registers today; they are scheduled to be re-registered under new names, and the rows must be updated in the same change that lands the ledger rename, never before it. (#106)
-- The incremental `book` product is arbitrated by the single-arm authority gate instead of passing through the arbiter undeduped: two arms' per-instrument delta series are unrelated by construction, so publishing both on one stream corrupts a consumer's book while every sequence check the producer ran still passes. It is gated in **both** arbitration modes on purpose — a `source_ts` tick can hold several deltas, so the quote floor's per-tick latch would interleave arms inside one logical event — and there is no mode branch. A change of serving arm (margin, silence, or the per-market health override) makes that market's next broadcast a re-baseline, a `clear` plus the new arm's complete current level set, emitted lazily on that arm's next *completed* logical event rather than as a venue-wide burst of clears; that is why the gate accumulates every eligible arm's book and not just the serving one. A re-baseline the gate cannot honestly complete — an arm that joined mid-stream holds only the levels that have moved since — degrades to a bare `clear` rather than claiming completeness, and the WS replay skips those markets for the same reason. Also wires the cross-arm trade matcher, the only producer of the matched-lead samples the speed re-election consumes (`--arb-match-window-secs`, `dz_arm_unmatched_trades_total`); it races **edge arms the authority already tracks** and nothing else, so the public backstop cannot win authority over a product it never publishes. Open question the matcher inherits: its key is the normalized `(venue, symbol, price, size, aggressor)`, and a wire `symbol` is a truncated 16-byte field, so on a sharded feed two colliding-symbol instruments can mis-pair systematically rather than merely losing a sample — `NormalizedTrade` carries no `instrument_id` to key on instead. Replays each market's accumulated book to a connecting WS client, and re-baselines a client that fell behind (an incremental product does not self-heal on the next message the way `quote`/`depth` do). Nothing exercises it in a running process yet: `MbpProcessor` emits `book` but no `FEEDS` row selects that kind, so behaviour is unchanged. (#105)
-- `MbpProcessor` and the `FeedKind::MarketByPrice` receiver arm (mktdata + refdata + snapshot ports), turning decoded market-by-price frames into `PriceBook` state and the incremental `book` product. One book per `(publisher, channel, instrument)` — two arms mirror one feed on unrelated per-instrument delta sequences and one group can be sharded across channels, so nothing coarser identifies a book. Snapshot levels route by the open group per channel rather than by `snapshot_id` (monotonic per instrument, so two instruments routinely share a value), `EndOfSession` and a `Reset Count` change are scoped to the emitting arm and channel, and a cross-instrument delta-buffer budget drops the largest instrument's buffer rather than the process when a cold start floods it. Seven `dz_mbp_*` counters cover resets, buffer and level overflows, orphaned snapshot levels, duplicate deltas, crossed books and publisher action-vs-quantity divergence — see `docs/metrics.md`, and `docs/input-sources.md` for the per-receiver-task memory caps. No `FEEDS` row selects the kind, so no running process behaves differently. (#104)
-- Single-arm arbitration for venues whose two redundant publishers stamp no comparable clock (`ingest::authority`, `ingest::arm_race`). Exactly one arm is authoritative and its stream is published verbatim. **Speed and silence are judged per arm, venue-wide** — latency is a property of an arm, so every sample from a source IP counts toward it whatever market carried it — while **health is the one per-market rule**, overriding the elected arm for a single market whose book is gapped and reverting when it recovers. Which arm is faster comes from `arm_race`, a cross-arm trade matcher keyed on content with a FIFO per signature (so identical repeats pair in order) that measures the two copies' arrival gap on our own receive clock; the venue's own timestamps are deliberately unused, because a publisher substitutes its own clock when the venue supplies none and an arm with no venue timestamp would look fastest by construction. Transfers need a median margin, a win rate and a sample floor to all hold (`--arb-*`). Nothing emits or consumes it yet — no processor wires a caller — so no running process behaves differently. (#98)
+- The two Lashay perps feed rows: `edge-kalshi-perps-tob` top of book on `233.84.178.3:7576/7577` and `edge-kalshi-perps-mbp` market-by-price on `233.84.178.4:31000/41000/51000`, both claiming the tape and both `ArbitrationMode::Sticky`, one publisher block each (the two paths share a block and are told apart by source IP). Both groups are live and activated, so a host subscribed to either code begins ingesting on upgrade. A `code` that does not match its live group fails silently — no warning, no failed bind, just a permanently-zero `dz_receiver_up` — so both rows are pinned against the deployment by a test. The group codes are transcribed verbatim from what the DoubleZero ledger registers today; they are scheduled to be re-registered under new names, and the rows must be updated in the same change that lands the ledger rename, never before it. (#106)
+- The incremental `book` product is arbitrated by the single-path authority gate instead of passing through the arbiter undeduped: two paths' per-instrument delta series are unrelated by construction, so publishing both on one stream corrupts a consumer's book while every sequence check the producer ran still passes. It is gated in **both** arbitration modes on purpose — a `source_ts` tick can hold several deltas, so the quote floor's per-tick latch would interleave paths inside one logical event — and there is no mode branch. A change of serving path (margin, silence, or the per-market health override) makes that market's next broadcast a re-baseline, a `clear` plus the new path's complete current level set, emitted lazily on that path's next *completed* logical event rather than as a venue-wide burst of clears; that is why the gate accumulates every eligible path's book and not just the serving one. A re-baseline the gate cannot honestly complete — a path that joined mid-stream holds only the levels that have moved since — degrades to a bare `clear` rather than claiming completeness, and the WS replay skips those markets for the same reason. Also wires the cross-path trade matcher, the only producer of the matched-lead samples the speed re-election consumes (`--arb-match-window-secs`, `dz_path_unmatched_trades_total`); it races **edge paths the authority already tracks** and nothing else, so the public backstop cannot win authority over a product it never publishes. Open question the matcher inherits: its key is the normalized `(venue, symbol, price, size, aggressor)`, and a wire `symbol` is a truncated 16-byte field, so on a sharded feed two colliding-symbol instruments can mis-pair systematically rather than merely losing a sample — `NormalizedTrade` carries no `instrument_id` to key on instead. Replays each market's accumulated book to a connecting WS client, and re-baselines a client that fell behind (an incremental product does not self-heal on the next message the way `quote`/`depth` do). Nothing exercises it in a running process yet: `MbpProcessor` emits `book` but no `FEEDS` row selects that kind, so behaviour is unchanged. (#105)
+- `MbpProcessor` and the `FeedKind::MarketByPrice` receiver path (mktdata + refdata + snapshot ports), turning decoded market-by-price frames into `PriceBook` state and the incremental `book` product. One book per `(publisher, channel, instrument)` — two paths mirror one feed on unrelated per-instrument delta sequences and one group can be sharded across channels, so nothing coarser identifies a book. Snapshot levels route by the open group per channel rather than by `snapshot_id` (monotonic per instrument, so two instruments routinely share a value), `EndOfSession` and a `Reset Count` change are scoped to the emitting path and channel, and a cross-instrument delta-buffer budget drops the largest instrument's buffer rather than the process when a cold start floods it. Seven `dz_mbp_*` counters cover resets, buffer and level overflows, orphaned snapshot levels, duplicate deltas, crossed books and publisher action-vs-quantity divergence — see `docs/metrics.md`, and `docs/input-sources.md` for the per-receiver-task memory caps. No `FEEDS` row selects the kind, so no running process behaves differently. (#104)
+- Single-path arbitration for venues whose two redundant publishers stamp no comparable clock (`ingest::authority`, `ingest::path_race`). Exactly one path is authoritative and its stream is published verbatim. **Speed and silence are judged per path, venue-wide** — latency is a property of a path, so every sample from a source IP counts toward it whatever market carried it — while **health is the one per-market rule**, overriding the elected path for a single market whose book is gapped and reverting when it recovers. Which path is faster comes from `path_race`, a cross-path trade matcher keyed on content with a FIFO per signature (so identical repeats pair in order) that measures the two copies' arrival gap on our own receive clock; the venue's own timestamps are deliberately unused, because a publisher substitutes its own clock when the venue supplies none and a path with no venue timestamp would look fastest by construction. Transfers need a median margin, a win rate and a sample floor to all hold (`--arb-*`). Nothing emits or consumes it yet — no processor wires a caller — so no running process behaves differently. (#98)
 - The incremental `book` message (PROTOCOL.md, still v1 — `book` is additive and `depth` is now marked deprecated-and-removed-in-v2): a batch of absolute price-level changes for one instrument, keyed on `(venue, channel, instrument_id)`. A re-baseline is structurally a batch led by a `clear` action rather than a separate type or a boolean, because the reference consumer's book dispatcher branches on the action alone and would silently ignore a snapshot flag; `last` is mandatory on the final batch, including a lone clear, or a buffering consumer wedges. Ships with `BookAccumulator`, the replay state a connecting client is bootstrapped from — an incremental product's last batch means nothing to a client holding no book, so the bridge accumulates and materializes a clear plus the full level set on demand. Nothing emits `book` yet: no processor and no feed row, so no running process behaves differently. (#99)
 - WebSocket subscription filters gain a `channel` dimension (the publisher's channel id) and a message-`type` dimension, so a consumer can take `book` without `quote`, or one channel's books without the rest. A message that carries no channel is excluded by an explicit `channel` filter — except `instrument`, since a client that cannot see a definition cannot scale the book it subscribed to. Both match paths (symbol-bearing and venue-level `status`) now route through the one `SubFilter::matches`, so a future dimension cannot silently exempt half the stream. Replay is also scoped: state is replayed on connect as before, and again on each `subscribe` for the filter just added, instead of only ever replaying every market at connect time. (#99)
 - Each `Feed` now declares an `ArbitrationMode` (`Coordinated`/`Sticky`), carried into the arbiter as a per-venue map. Behaviour-neutral: every existing venue is `Coordinated` — today's latch-to-leader staleness floor — and an unregistered venue defaults to it. The seam exists for venues whose redundant publishers stamp no comparable venue clock, which cannot be arbitrated by a per-tick floor. (#94)

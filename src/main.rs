@@ -283,7 +283,7 @@ struct Args {
     )]
     subscription_gating_disable: bool,
 
-    /// Seconds between arm re-election samples for `Sticky` venues. Longer holds a slower arm
+    /// Seconds between path re-election samples for `Sticky` venues. Longer holds a slower path
     /// longer; shorter risks flapping authority, which re-baselines every consumer's book.
     #[arg(
         long = "arb-sample-interval-secs",
@@ -292,7 +292,7 @@ struct Args {
     )]
     arb_sample_interval_secs: u64,
 
-    /// Microseconds a challenger must beat the authoritative arm by, on median, to take authority.
+    /// Microseconds a challenger must beat the authoritative path by, on median, to take authority.
     #[arg(
         long = "arb-transfer-margin-us",
         env = "DZ_ARB_TRANSFER_MARGIN_US",
@@ -320,7 +320,7 @@ struct Args {
     )]
     arb_leader_timeout_secs: u64,
 
-    /// Matched cross-arm samples an arm needs in a window before its speed is judged at all. Below
+    /// Matched cross-path samples a path needs in a window before its speed is judged at all. Below
     /// this the window is ignored, so a handful of lucky matches cannot move a venue.
     #[arg(
         long = "arb-min-window-samples",
@@ -330,8 +330,8 @@ struct Args {
     )]
     arb_min_window_samples: u64,
 
-    /// Seconds an arm's trade waits for the peer arm's copy of the same print before it counts as
-    /// unmatched. Must exceed the worst plausible inter-arm lead and stay well under the interval
+    /// Seconds a path's trade waits for the peer path's copy of the same print before it counts as
+    /// unmatched. Must exceed the worst plausible inter-path lead and stay well under the interval
     /// between repeats of one identical trade.
     #[arg(
         long = "arb-match-window-secs",
@@ -343,7 +343,7 @@ struct Args {
 
     /// Milliseconds a delivered order-level book event is remembered so a slower publisher's copy is
     /// recognized as a duplicate. A removed order id is never re-added regardless (`ingest::book`),
-    /// so this does not gate resurrection — but set below the arms' separation it turns a lagging
+    /// so this does not gate resurrection — but set below the paths' separation it turns a lagging
     /// copy of a partially-filled order into a false size disagreement, which costs a forced
     /// re-baseline and the batches withheld behind it. A per-market count cap of 1024 events bounds
     /// the reach independently, so values much above a second are inert on a busy market.
@@ -357,7 +357,7 @@ struct Args {
 
     /// Seconds of venue time behind a channel's newest stamp an order-level book event may be and
     /// still be admitted — and, by the same value, how long a removed order is remembered so a
-    /// lagging publisher's stale add for it can be refused. Set below the arms' worst separation and
+    /// lagging publisher's stale add for it can be refused. Set below the paths' worst separation and
     /// a returning link's backlog is published as live; set far above it and every removal inside the
     /// window is held (~4,000/s per publisher on the flagship channel, against a process-wide ceiling
     /// of 1,048,576 entries).
@@ -382,9 +382,9 @@ struct Args {
     arb_book_ts_jump_secs: u64,
 
     /// Seconds a channel's newest venue stamp may fail to **move** before it is re-seated from the
-    /// batches actually arriving. A real tradeoff: below the arms' worst separation (2.77 s measured
+    /// batches actually arriving. A real tradeoff: below the paths' worst separation (2.77 s measured
     /// at p99.99) it fires on ordinary jitter, and above it, it bounds both how long a stuck frontier
-    /// grows the removed population unforgotten and how long a market whose only surviving arm is
+    /// grows the removed population unforgotten and how long a market whose only surviving path is
     /// behind that frontier can be dark.
     #[arg(
         long = "arb-book-reseat-secs",
@@ -633,7 +633,7 @@ async fn main() -> Result<()> {
     // subscription blip that briefly takes the sink down must not reset the window it comes back up
     // to. The reconciler owns feeding it (only while the sink is up) and reading it (the API sink).
     let history: Arc<Mutex<history::Store>> = Arc::new(Mutex::new(history::Store::new()));
-    // Single-arm authority tunables for `Sticky` venues, plus the cross-arm matcher's pairing window,
+    // Single-path authority tunables for `Sticky` venues, plus the cross-path matcher's pairing window,
     // validated here at startup and handed to the arbiter.
     let authority_cfg = ingest::authority::AuthorityConfig {
         leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
@@ -673,8 +673,8 @@ async fn main() -> Result<()> {
         Arc::new(Mutex::new(a))
     };
 
-    // The arm sampler: closes each elapsed re-election window (a margin transfer moves venue
-    // authority here), refreshes the O(markets × arms) gauges and drains the matcher's unmatched
+    // The path sampler: closes each elapsed re-election window (a margin transfer moves venue
+    // authority here), refreshes the O(markets × paths) gauges and drains the matcher's unmatched
     // counts. Off the emit path entirely, so a slow sweep never touches ingest latency.
     let sampler = {
         let arbiter = arbiter.clone();
@@ -856,7 +856,7 @@ async fn main() -> Result<()> {
     // The subscription reconciler owns market-data receivers, the WebSocket sink, and the shred
     // forwarder: it polls `doublezero status` and activates/deactivates them as the host's
     // subscriptions change (default-on with fail-open; `--subscription-gating-disable` forces the
-    // static always-on model). It loops forever, so its arm resolves only on a task panic.
+    // static always-on model). It loops forever, so its path resolves only on a task panic.
     let reconciler = tokio::spawn(
         ingest::reconcile::Reconciler::new(ingest::reconcile::ReconcilerConfig {
             tx: tx.clone(),
@@ -880,7 +880,7 @@ async fn main() -> Result<()> {
         .run(),
     );
 
-    // The reconciler, the arm sampler and the (independent, config-gated) public feeders + metrics
+    // The reconciler, the path sampler and the (independent, config-gated) public feeders + metrics
     // endpoint all loop forever; the process exits only if one of them panics or the metrics server
     // fails to bind.
     tokio::select! {
@@ -898,13 +898,13 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
-        // The metrics endpoint (when enabled) loops forever; its arm resolves only on a bind/accept
+        // The metrics endpoint (when enabled) loops forever; its path resolves only on a bind/accept
         // failure or a task panic.
         r = async { match metrics_srv {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
-        // The admin surface (when enabled) loops forever; its arm resolves only on a task panic or a
+        // The admin surface (when enabled) loops forever; its path resolves only on a task panic or a
         // fatal accept error (a bind failure was already handled non-fatally above).
         r = async { match admin_srv {
             Some(handle) => handle.await,

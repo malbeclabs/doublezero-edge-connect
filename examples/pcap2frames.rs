@@ -238,8 +238,8 @@ fn process_tob(frames: &[Vec<u8>], args: &Args) -> Result<()> {
     use codec::Message;
     let (mut quotes, mut trades, mut defs, mut manifests, mut hb, mut other, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-    // Does this arm stamp the "no venue trade id" sentinel always, never, or sometimes? Run once per
-    // `--src` to get the answer per arm; a cross-arm comparison of the real ids is out of scope.
+    // Does this path stamp the "no venue trade id" sentinel always, never, or sometimes? Run once per
+    // `--src` to get the answer per path; a cross-path comparison of the real ids is out of scope.
     let mut zero_id_trades = 0u64;
     let mut symbol_to_id: HashMap<String, u32> = HashMap::new();
     let mut refdata: Vec<Vec<u8>> = Vec::new();

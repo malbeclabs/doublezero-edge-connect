@@ -3876,8 +3876,8 @@ mod tests {
             p["resident_memory_bytes"].as_f64().unwrap_or(0.0) > 0.0,
             "a running process must report positive resident memory: {p}"
         );
-        // A bare `is_number()` type check passes even if `process_metric`'s `COUNTER` arm were
-        // hardcoded to `Some(0.0)` — only the `GAUGE` arm above was ever revert-tested. By the time
+        // A bare `is_number()` type check passes even if `process_metric`'s `COUNTER` branch were
+        // hardcoded to `Some(0.0)` — only the `GAUGE` branch above was ever revert-tested. By the time
         // this test runs the process has executed the harness plus every test ahead of it in this
         // binary, so its cumulative CPU time is a real, positive sample, not a granularity artifact.
         assert!(

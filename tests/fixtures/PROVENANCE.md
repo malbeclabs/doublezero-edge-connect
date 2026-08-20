@@ -346,10 +346,10 @@ known deviations below before treating anything here as normative.
 Recorded so a later capture can be checked against them, and so nothing here is mistaken for the
 protocol's intent. All three are publisher-side, not decoder-side.
 
-1. **The two redundant arms of the older feed stamp different `Channel ID`s** (`1` and `2`) while
+1. **The two redundant paths of the older feed stamp different `Channel ID`s** (`1` and `2`) while
    carrying an identical instrument set — same ids, same symbols. The spec defines `Channel ID` as
    sharding *the active instrument set* across instances, which these two are not doing. It matters
-   beyond tidiness: a market key that includes the channel would put the two arms on separate keys,
+   beyond tidiness: a market key that includes the channel would put the two paths on separate keys,
    so they would never arbitrate against each other. Treated as a defect of the publisher being
    retired; the sharded feed above does channels correctly (zero instrument-id overlap between them).
 2. **Symbols overflow the 16-byte symbol field on the sharded feed.** 2,312 of its definitions carry
@@ -362,32 +362,32 @@ protocol's intent. All three are publisher-side, not decoder-side.
    `EndOfSession` have. Three are exceptional events and a quiet window explaining their absence is
    expected; `BatchBoundary` is not, so confirm whether the publisher emits it at all.
 
-### Measured: the two perps arms use disjoint `trade_id` conventions
+### Measured: the two perps paths use disjoint `trade_id` conventions
 
-The arms split cleanly, and identically on both protocols. Measured 2026-08-07 with
+The paths split cleanly, and identically on both protocols. Measured 2026-08-07 with
 `examples/pcap2frames.rs`, which reports `zero_id_trades=` alongside `trades=`; `--src` selects one
-publisher, so one run per source IP gives the per-arm answer.
+publisher, so one run per source IP gives the per-path answer.
 
-| Arm | Protocol | trades | `zero_id_trades` |
+| Path | Protocol | trades | `zero_id_trades` |
 |---|---|---|---|
 | `148.51.121.69` | top-of-book | 102 | 102 (always) |
 | `148.51.120.6`  | top-of-book | 65  | 0 (never) |
 | `148.51.121.69` | market-by-price | 102 | 102 (always) |
 | `148.51.120.6`  | market-by-price | 65  | 0 (never) |
 
-**This is why the tape gate is `trade_id`-independent rather than a sentinel latch.** One arm's prints
+**This is why the tape gate is `trade_id`-independent rather than a sentinel latch.** One path's prints
 bypass the dedup window (the `0` sentinel means "no venue trade id"); the peer's carry real ids and
 route to `WindowedDedup`. The two copies of one fill therefore never meet in either mechanism, so a
 sentinel-only gate would collapse nothing and every print would double.
 
 Two limits on what this shows. The captures do not overlap in time, so this is disjoint id
-conventions on a shared group, not a captured duplicate — a simultaneous two-arm capture would
-demonstrate it outright. And it does not establish whether the two arms stamp *different real* ids
-for the same fill; that needs content-matched id sets across arms and is not measured here. The
+conventions on a shared group, not a captured duplicate — a simultaneous two-path capture would
+demonstrate it outright. And it does not establish whether the two paths stamp *different real* ids
+for the same fill; that needs content-matched id sets across paths and is not measured here. The
 id-independent gate covers that case regardless.
 
-Also worth knowing: the two arms' captures do **not** overlap in time (the older feed's are ~16s
-apart), so no two-arm interleaved fixture can be cut from them — a future capture should run both
+Also worth knowing: the two paths' captures do **not** overlap in time (the older feed's are ~16s
+apart), so no two-path interleaved fixture can be cut from them — a future capture should run both
 publishers simultaneously. `--combined-with` is not implemented for `--protocol mbp` either.
 
 ### Regenerating
@@ -420,8 +420,8 @@ one cut-off symbol standing for two instrument ids — **cannot occur on this sc
 retires the argument that trade dedup keyed on `(venue, symbol)` can silently drop a second market's
 fills. These fixtures are the evidence for that claim; without them it rests on an upstream assertion.
 
-**Both arms are present in every set** — unlike the older captures, these are simultaneous, so an
-interleaved two-arm fixture can be cut from this warehouse when one is needed.
+**Both paths are present in every set** — unlike the older captures, these are simultaneous, so an
+interleaved two-path fixture can be cut from this warehouse when one is needed.
 
 ### Regenerating
 

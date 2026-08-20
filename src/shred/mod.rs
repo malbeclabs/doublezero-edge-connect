@@ -367,7 +367,7 @@ async fn receiver_task(
                     warn!(%group, %e, "shred recv error; rejoining");
                     continue 'rejoin;
                 }
-                // The socket was not actually ready (spurious wakeup): re-arm readability.
+                // The socket was not actually ready (spurious wakeup): wait for readability again.
                 Err(_would_block) => continue,
             }
         }
@@ -1031,10 +1031,10 @@ mod tests {
     }
 
     /// End-to-end cross-group de-dup win metrics: the *same* shred arriving from two distinct source
-    /// groups forwards exactly one copy, and the `Action::DropDuplicate` arm in `forwarder_task`
+    /// groups forwards exactly one copy, and the `Action::DropDuplicate` branch in `forwarder_task`
     /// reaches `dz_shred_wins_total{winner}` + `dz_shred_lead_ns{winner}` (not just the plain-drop
     /// counter). This closes the gap the `From<Vec<u8>>` (sentinel-group) helper leaves: with one
-    /// group every duplicate is a same-group plain drop, so that arm was never exercised end-to-end.
+    /// group every duplicate is a same-group plain drop, so that branch was never exercised end-to-end.
     /// Uses source groups unique to this test and asserts on the metric *delta* (the registry is a
     /// process-global shared across the bin's tests), so it holds without `#[serial]`.
     #[tokio::test]

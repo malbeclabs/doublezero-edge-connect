@@ -238,7 +238,7 @@ fn decode_message(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Messa
     decode_body(msg_type, b, o, schema_version).unwrap_or(Message::Other(msg_type))
 }
 
-// Field offsets per arm are validated against the authorities documented in the module header and
+// Field offsets per branch are validated against the authorities documented in the module header and
 // asserted by the offset-independent tests below (e.g. `order_add_offsets_match_authority`, which
 // carries the OrderAdd field map). Do not change an offset without updating its matching test.
 fn decode_body(msg_type: u8, b: &[u8], o: usize, schema_version: u8) -> Option<Message> {

@@ -250,11 +250,11 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // real defect in the second publisher, not a decode issue: it is misreporting its own identity on
     // every quote in this capture. Under the old `unwrap_or(ctx.venue)` fallback, id 3 was unmapped, so
     // BOTH publishers' quotes fell back to this feed's static venue ("HYPERLIQUID") and competed on ONE
-    // dedup floor, silently merging the mislabeled arm into the correct one — exactly the "name it
+    // dedup floor, silently merging the mislabeled path into the correct one — exactly the "name it
     // after the multicast group it arrived on" workaround the plan reversal exists to remove. With the
-    // fallback gone, the two arms are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
-    // for the other venue = 7508) and no longer share a floor, so the cross-arm duplication this
-    // fixture's two mirrors actually represent is no longer collapsed — each arm now only dedups
+    // fallback gone, the two paths are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
+    // for the other venue = 7508) and no longer share a floor, so the cross-path duplication this
+    // fixture's two mirrors actually represent is no longer collapsed — each path now only dedups
     // against itself (4699 -> 4508, 4133 -> 3000). This is the correct, intended behavior of the new
     // rule: the output is visibly wrong about which publisher this is, which is what surfaces the
     // second publisher's defect instead of hiding it. The fix belongs at that publisher, not here.
@@ -481,7 +481,7 @@ fn duplicate_multicast_trade_packet_collapses() {
 ///      registry resolves to a different registered venue, not Hyperliquid. Honestly reported (no
 ///      `ctx.venue` fallback), they are two different venues and never share a depth floor, so
 ///      nothing here collapses across them — this is the intended visible symptom of the second
-///      publisher's defect, not a regression. (Real cross-publisher collapse — two arms honestly sharing one
+///      publisher's defect, not a regression. (Real cross-publisher collapse — two paths honestly sharing one
 ///      Source ID — is proven separately by `mbo_depth_mirror_from_second_publisher_collapses`,
 ///      whose synthetic mirror is a byte-for-byte copy and so shares the original's id.)
 ///
@@ -640,12 +640,12 @@ fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-const BOOK_VENUE: &str = "BookArmsInterleave";
+const BOOK_VENUE: &str = "BookPathsInterleave";
 const BOOK_CATEGORY: &str = "perps";
 const BOOK_CHANNEL: u32 = 2;
 const BOOK_INSTRUMENT: u32 = 41;
 
-fn arm(n: u8) -> Publisher {
+fn path(n: u8) -> Publisher {
     Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
 }
 
@@ -681,9 +681,9 @@ fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage
     })
 }
 
-/// One arm's `(changes, last)` batch stream, parametrized on the arm's price/size base so two arms
+/// One path's `(changes, last)` batch stream, parametrized on the path's price/size base so two paths
 /// built from it publish divergent level sets. Batches 2 and 3 are one logical event.
-fn arm_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
+fn path_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
     vec![
         (
             vec![
@@ -720,15 +720,15 @@ fn drain_books(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> Vec<Normalized
     out
 }
 
-/// The single-arm authority gate for the incremental `book` product. Two arms mirror one venue and
+/// The single-path authority gate for the incremental `book` product. Two paths mirror one venue and
 /// their per-instrument delta series are unrelated by construction, so interleaving both on one wire
-/// stream corrupts a consumer's book while every per-arm sequence check the producer ran still passes.
-/// Pinned: only the elected arm's batches reach the wire, and a `BookAccumulator` fed from the drained
-/// wire messages alone reproduces that arm's level set exactly. Against the pre-gate undeduped
+/// stream corrupts a consumer's book while every per-path sequence check the producer ran still passes.
+/// Pinned: only the elected path's batches reach the wire, and a `BookAccumulator` fed from the drained
+/// wire messages alone reproduces that path's level set exactly. Against the pre-gate undeduped
 /// passthrough both fail — all eight batches go out, the challenger's levels enter the consumer's book,
 /// and its `last: false` batch folds into the leader's logical event.
 #[test]
-fn interleaved_book_arms_publish_one_coherent_stream() {
+fn interleaved_book_paths_publish_one_coherent_stream() {
     fn clear_both() -> BookChange {
         BookChange {
             action: BookAction::Clear,
@@ -741,25 +741,25 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
 
     let (tx, mut rx) = broadcast::channel(64);
     let mut arb = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
-    let (leader, challenger) = (arm_batches(100.0, 5.0), arm_batches(200.0, 50.0));
+    let (leader, challenger) = (path_batches(100.0, 5.0), path_batches(200.0, 50.0));
     assert_ne!(
         leader, challenger,
-        "identical arms would pass with the gate removed"
+        "identical paths would pass with the gate removed"
     );
 
-    // Arm-by-arm, arrivals microseconds apart: past the 2s `leader_timeout_ns` authority would
+    // Path-by-path, arrivals microseconds apart: past the 2s `leader_timeout_ns` authority would
     // legitimately transfer on silence.
     for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
         let t = 1_000 + i as u64 * 2_000;
-        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1), BOOK_CATEGORY);
+        arb.emit(book_batch(l.0.clone(), l.1, t), path(1), BOOK_CATEGORY);
         arb.emit(
             book_batch(c.0.clone(), c.1, t + 1_000),
-            arm(2),
+            path(2),
             BOOK_CATEGORY,
         );
     }
 
-    // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer
+    // The market's first admitted batch re-baselines the consumer, and this path has sent no producer
     // re-baseline, so a bare `clear` leads the stream. Everything after it is the leader's, verbatim.
     let published = drain_books(&mut rx);
     let (first, rest) = published.split_first().expect("the re-baseline");
@@ -769,7 +769,7 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
             .map(|b| (b.changes.clone(), b.last))
             .collect::<Vec<_>>(),
         leader,
-        "the wire must carry the elected arm's batches verbatim and none of the challenger's"
+        "the wire must carry the elected path's batches verbatim and none of the challenger's"
     );
 
     let mut acc = BookAccumulator::new(published[0].symbol.clone());
@@ -792,7 +792,7 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
             level(BookSide::Ask, 101.0, 7.0),
             level(BookSide::Ask, 101.5, 2.0),
         ],
-        "a consumer applying only what we published must hold the elected arm's book"
+        "a consumer applying only what we published must hold the elected path's book"
     );
 }
 

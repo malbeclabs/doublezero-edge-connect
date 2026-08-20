@@ -188,8 +188,8 @@ pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &
 /// separately-maintained symbol→identity map would.
 ///
 /// First match wins. Safe here because neither venue this module backstops presents one symbol under
-/// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored arms
-/// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-arm venue of its own,
+/// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored paths
+/// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-path venue of its own,
 /// this would need the same disambiguation `products::resolve` applies instead of a bare first match.
 pub fn resolve_instrument(
     instruments: &InstrumentSnapshot,

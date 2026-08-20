@@ -49,21 +49,21 @@ pub fn instrument_before_price(msgs: &[Value]) {
 /// (`recv_ts_ns`, `kernel_rx_ts_ns`, `ws_send_ts_ns`) are deliberately excluded.
 /// Duplicate frames from competing publishers carry identical business fields but
 /// different receipt timestamps; a business-content key collapses them so this
-/// assertion catches missing dedup. Do NOT add `recv_ts_ns` to any key arm — that
+/// assertion catches missing dedup. Do NOT add `recv_ts_ns` to any key path — that
 /// gives each copy a distinct key and defeats the oracle.
 ///
-/// **Quote arm:** `source_ts_ns` is venue-assigned content (identical across publishers
+/// **Quote branch:** `source_ts_ns` is venue-assigned content (identical across publishers
 /// for the same update); the transport sequence number is NOT, which is why
 /// content + source_ts is the right cross-publisher identity and a seqnum would not be.
 /// Content includes `bid_n`/`ask_n` (the source counts) — they are part of the canonical
 /// BBO identity (`bbo_hash`), so two quotes that differ only in count are NOT duplicates.
 ///
-/// **Trade arm:** `trade_id` is treated as globally unique for the run. A real
+/// **Trade branch:** `trade_id` is treated as globally unique for the run. A real
 /// multi-publisher trade deduper will be WINDOWED (bounded memory) and can only collapse
 /// copies within the window, so this oracle assumes window >= worst-case inter-publisher
 /// lag.
 ///
-/// **Depth arm:** identity is content-inclusive (venue + symbol + source_ts_ns + bids +
+/// **Depth path:** identity is content-inclusive (venue + symbol + source_ts_ns + bids +
 /// asks). Keying on source_ts_ns alone would false-fail when two publishers emit the
 /// same snapshot at the same event timestamp but with different book content (a valid
 /// divergence), and would false-collapse snapshots from a batch split across frames.

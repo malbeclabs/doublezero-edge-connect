@@ -6,7 +6,6 @@
 //! re-served.
 
 pub mod arbiter;
-pub mod arm_race;
 pub mod authority;
 pub mod book;
 pub mod channel_filter;
@@ -18,6 +17,7 @@ pub mod codec_midpoint;
 pub mod diagnostics;
 pub mod feeds;
 pub mod health;
+pub mod path_race;
 pub mod phoenix_feeder;
 pub mod pricebook;
 pub mod processor;

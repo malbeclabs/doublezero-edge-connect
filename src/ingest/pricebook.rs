@@ -582,7 +582,7 @@ fn clear_side_levels(
 mod tests {
     use super::*;
     // Only the tests name the from-price scope now: the apply path derives its behaviour from the
-    // whole-side one so that every unrecognized byte is refused (see the `Clear` arm of `on_delta`).
+    // whole-side one so that every unrecognized byte is refused (see the `Clear` branch of `on_delta`).
     use crate::ingest::codec_mbp::SCOPE_FROM_PRICE;
 
     /// Action values from the spec's enum: 1=New, 2=Change, 3=Delete, 0=Unknown.
@@ -939,7 +939,7 @@ mod tests {
     }
 
     /// A group is only ever opened from `Ready` once `K` proves we are behind, so the live book is
-    /// already known-stale. Failing to replace it must stop us serving it — otherwise this arm keeps
+    /// already known-stale. Failing to replace it must stop us serving it — otherwise this path keeps
     /// claiming a market it knows it cannot serve, and the authority gate never fails over.
     #[test]
     fn a_failed_snapshot_end_from_ready_discards_the_stale_book() {

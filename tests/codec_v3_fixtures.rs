@@ -124,7 +124,7 @@ fn every_frame_decodes_as_schema_v3_and_takes_the_v3_path() {
     }
 }
 
-/// One decoded `InstrumentDefinition`, tagged with the frame's `channel_id` (the per-arm identity
+/// One decoded `InstrumentDefinition`, tagged with the frame's `channel_id` (the per-path identity
 /// on these captures).
 struct Def {
     channel_id: u8,
@@ -283,14 +283,14 @@ fn sports_v3_ids_that_would_collide_under_v1_truncation_do_not_under_v3() {
     }
 }
 
-/// Claim 4: both perps publisher arms are represented in a simultaneous capture — unlike the older
-/// (pre-v3) perps fixtures, whose two arms were captured at different times and so could never be
-/// combined into one interleaved fixture (PROVENANCE: "the two arms' captures do not overlap in
-/// time"). The arms stamp different frame-header `channel_id`s on this feed (a repurposing of that
+/// Claim 4: both perps publisher paths are represented in a simultaneous capture — unlike the older
+/// (pre-v3) perps fixtures, whose two paths were captured at different times and so could never be
+/// combined into one interleaved fixture (PROVENANCE: "the two paths' captures do not overlap in
+/// time"). The paths stamp different frame-header `channel_id`s on this feed (a repurposing of that
 /// field PROVENANCE already records for the retiring publisher), so distinct `channel_id`s standing
 /// for the same instrument set is the observable proxy for "both sources present".
 #[test]
-fn both_perps_publisher_arms_are_present() {
+fn both_perps_publisher_paths_are_present() {
     for (path, defs) in [
         (TOB_V3, tob_defs(TOB_V3)),
         (MBP_PERPS_V3, mbp_defs(MBP_PERPS_V3)),
@@ -299,10 +299,10 @@ fn both_perps_publisher_arms_are_present() {
         assert!(
             channels.len() >= 2,
             "{path}: InstrumentDefinitions carried only channel_id(s) {channels:?} — expected at \
-             least 2, one per simultaneously-captured publisher arm"
+             least 2, one per simultaneously-captured publisher path"
         );
 
-        // The two arms mirror one instrument universe (PROVENANCE), so the same instrument ids
+        // The two paths mirror one instrument universe (PROVENANCE), so the same instrument ids
         // should reappear under a second channel_id — not just an unrelated stray channel byte.
         let mut ids_by_channel: BTreeMap<u8, BTreeSet<u32>> = BTreeMap::new();
         for d in &defs {
@@ -319,7 +319,7 @@ fn both_perps_publisher_arms_are_present() {
         assert!(
             shared_with_another,
             "{path}: no two channel_ids shared any instrument id — does not look like mirrored \
-             publisher arms of one universe"
+             publisher paths of one universe"
         );
     }
 }

@@ -153,8 +153,8 @@ pub struct NormalizedTrade {
     pub channel: u32,
     /// Instrument id, unique within `channel`. Additive alongside `channel` (see its doc): together
     /// they are the identity `history::Key` groups on, closing the gap that let a price-aggregated
-    /// venue's mirrored arms (identical instrument set, distinct `channel`) drop every trade rather
-    /// than risk misattributing one to the wrong arm.
+    /// venue's mirrored paths (identical instrument set, distinct `channel`) drop every trade rather
+    /// than risk misattributing one to the wrong path.
     #[serde(default)]
     pub instrument_id: u32,
     /// The instrument **universe** this trade's row carries (`ingest::feeds::Feed::category`),
@@ -647,7 +647,7 @@ impl BookAccumulator {
                             .insert(c.order_id, (is_bid, key, c.price, c.size));
                     }
                     // A `Clear` carrying an order id is a producer bug: it names a side, and acting on
-                    // one order would clear neither side. Fall through to the side-scoped arms below.
+                    // one order would clear neither side. Fall through to the side-scoped paths below.
                     BookAction::Clear => self.clear_side(c.side, &mut cleared),
                 }
                 continue;
@@ -867,8 +867,8 @@ impl BookAccumulator {
 }
 
 /// Accumulated book state per market, replayed on connect and on each subscribe. Written by the
-/// arbiter on the authority gate's admit decision, so it always holds the authoritative arm's book
-/// rather than a discarded arm's copy.
+/// arbiter on the authority gate's admit decision, so it always holds the authoritative path's book
+/// rather than a discarded path's copy.
 ///
 /// Keyed identically to `ingest::authority::MarketKey` — `(venue, category, channel, instrument_id)`
 /// — and that shared grain is load-bearing, not incidental. The gate's own per-market state
@@ -956,7 +956,7 @@ impl BookReplay {
     // arbiter can drop all three together. `Arbiter::reset_book_for_market` /
     // `Arbiter::forget_channel_books` are the seams; a caller reaching in here directly (as an
     // earlier version of the channel-departure purge did) leaves `last_admitted` behind, so a
-    // restored channel whose arm is unchanged never re-baselines and a market silently stays
+    // restored channel whose path is unchanged never re-baselines and a market silently stays
     // hidden from every new client. See those methods' docs.
 }
 

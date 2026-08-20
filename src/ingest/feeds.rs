@@ -160,7 +160,7 @@ impl FeedPublisher {
 ///
 /// Both modes hold exactly one authoritative publisher per key; what differs is when authority
 /// transfers. `Coordinated` re-latches every tick, because the publishers stamp a venue clock that
-/// is comparable between them. `Sticky` cannot: its arms carry no shared coordinate — no stable
+/// is comparable between them. `Sticky` cannot: its paths carry no shared coordinate — no stable
 /// entry id, no per-entry venue timestamp, and the transport's own send time is not the venue's —
 /// and a content hash is no substitute, since a level oscillating 100 -> 0 -> 100 emits
 /// byte-identical updates and collapsing those leaves a subscriber holding 0 at a price that has
@@ -169,7 +169,7 @@ impl FeedPublisher {
 pub enum ArbitrationMode {
     /// Comparable venue clock: latch to the tick's leader, re-latch every tick.
     Coordinated,
-    /// No comparable coordinate: elect one arm and hold it, transferring only on a health verdict,
+    /// No comparable coordinate: elect one path and hold it, transferring only on a health verdict,
     /// on silence, or on a sustained speed margin.
     Sticky,
 }
@@ -224,7 +224,7 @@ pub struct Feed {
     /// the mirror's `N + offset` and the base publisher's `N` are one market — one catalog entry,
     /// one book, one history series — to everything downstream of that point. It must **never**
     /// be applied to producer-side state (books, sequence tracking, reset counts, snapshot
-    /// cycles): those stay keyed on the raw wire channel id precisely because the two arms are
+    /// cycles): those stay keyed on the raw wire channel id precisely because the two paths are
     /// separately sequenced, and collapsing that would corrupt book recovery.
     ///
     /// Ports are unaffected: the mirror sends to the identical port block, so this never factors
@@ -478,8 +478,8 @@ mod tests {
     ///
     /// The invariant itself — at most one tape emitter per venue at any moment, which is what
     /// licenses the `trade_id == 0` bypass in `arbiter::emit` — is enforced at runtime by
-    /// `tape_owners` (one row per venue) and the arbiter's per-venue tape leader (one arm within it),
-    /// with `dz_tape_owner_changes_total` / `dz_tape_arm_transfers_total` reporting the moves.
+    /// `tape_owners` (one row per venue) and the arbiter's per-venue tape leader (one path within it),
+    /// with `dz_tape_owner_changes_total` / `dz_tape_path_transfers_total` reporting the moves.
     #[test]
     fn emit_trades_agrees_with_the_tape_ownership_rule() {
         for f in feeds() {
@@ -493,7 +493,7 @@ mod tests {
         }
     }
 
-    /// A venue's arms are the same hosts whatever protocol they speak, so every row for a venue
+    /// A venue's paths are the same hosts whatever protocol they speak, so every row for a venue
     /// must declare the same arbitration mode. Disagreement would make the arbiter's per-venue mode
     /// depend on which row registered last.
     #[test]
@@ -512,7 +512,7 @@ mod tests {
 
     /// The venues that predate arbitration modes race on a comparable venue clock and must keep
     /// doing so — the mode is a seam, not a behavior change. Scoped by exclusion rather than
-    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose arms carry
+    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose paths carry
     /// no shared clock can declare it; a new such venue is the feature working, not a regression.
     #[test]
     fn existing_venues_are_coordinated() {

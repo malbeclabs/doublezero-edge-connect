@@ -116,7 +116,7 @@ pub struct FrameCtx<'a> {
     /// The instrument **universe** this receiver's row carries (`Feed::category`), passed straight
     /// through to the arbiter on every emit. Carried here rather than derived from the message
     /// because it is a property of the row, and rows sharing a venue can carry universes that
-    /// mirror nothing: without it the arbiter's tape gate elects one arm across both and drops the
+    /// mirror nothing: without it the arbiter's tape gate elects one path across both and drops the
     /// other universe's prints for good.
     pub category: &'static str,
     /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
@@ -145,7 +145,7 @@ impl FrameCtx<'_> {
     /// is what makes that one market rather than two.
     ///
     /// **Never call this for producer-side state** (book keys, sequence trackers, reset counts,
-    /// snapshot cycles) — those must stay keyed on the raw wire channel id, because the two arms
+    /// snapshot cycles) — those must stay keyed on the raw wire channel id, because the two paths
     /// are independently sequenced and collapsing that corrupts book recovery.
     pub fn canonical_channel(&self, wire_channel: u8) -> u32 {
         match self.mirror_offset {
@@ -1196,12 +1196,12 @@ mod tests {
     }
 
     /// A Market-by-Order receiver's exit is the authoritative signal that its publisher is gone, so it
-    /// releases that publisher's book standing. Without this a departed arm's stale `synced` claim
-    /// suppresses the surviving arm's re-baseline until `PEER_SERVING_NS`, which a sub-second
+    /// releases that publisher's book standing. Without this a departed path's stale `synced` claim
+    /// suppresses the surviving path's re-baseline until `PEER_SERVING_NS`, which a sub-second
     /// gap-and-recover cycle outruns — and a suppressed re-baseline is never retried.
     ///
     /// A Top-of-Book receiver of the same publisher must not do it: one publisher host serves both
-    /// protocols from one source IP, so its exit would drop a live Market-by-Order arm's standing.
+    /// protocols from one source IP, so its exit would drop a live Market-by-Order path's standing.
     #[test]
     fn an_mbo_receivers_exit_releases_its_publishers_book_standing() {
         use crate::ingest::{
@@ -1233,12 +1233,12 @@ mod tests {
 
         let mbo = registration(FeedKind::MarketByOrder, "9101");
         assert!(
-            !lock(&mbo).book_arm_synced(&market, Publisher::Edge(ip)),
+            !lock(&mbo).book_path_synced(&market, Publisher::Edge(ip)),
             "the departed publisher's claim must go with its receiver"
         );
         let tob = registration(FeedKind::TopOfBook, "9102");
         assert!(
-            lock(&tob).book_arm_synced(&market, Publisher::Edge(ip)),
+            lock(&tob).book_path_synced(&market, Publisher::Edge(ip)),
             "a quote receiver's exit says nothing about its publisher's books"
         );
     }
@@ -1247,7 +1247,7 @@ mod tests {
     /// is filed under the **wire** venue the instrument resolved to, and one registry row can carry
     /// instruments whose Source IDs resolve elsewhere (the superset case `reset_all_known_depth_floors`
     /// exists for), so a release filtered by the row's own `venue` matches nothing for exactly those
-    /// markets and leaves a departed arm's phantom `synced` standing forever. The category is what the
+    /// markets and leaves a departed path's phantom `synced` standing forever. The category is what the
     /// exiting receiver and the key provably share.
     #[test]
     fn an_mbo_receivers_exit_releases_a_market_filed_under_a_different_wire_venue() {
@@ -1278,8 +1278,8 @@ mod tests {
         reg.note_publisher(ip);
         drop(reg);
         assert!(
-            !lock(&arbiter).book_arm_synced(&market, Publisher::Edge(ip)),
-            "the departed arm's claim must go even when the wire named the venue differently"
+            !lock(&arbiter).book_path_synced(&market, Publisher::Edge(ip)),
+            "the departed path's claim must go even when the wire named the venue differently"
         );
     }
 

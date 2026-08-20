@@ -183,7 +183,7 @@
         "deployment inventory - or it is marked unverified. Never by reading prose that describes an",
         "allocation; read the values the publisher actually renders.",
         "",
-        "One publisher per row: the two arms share a port block and are distinguished, for",
+        "One publisher per row: the two paths share a port block and are distinguished, for",
         "producer-side state (RefDataState, sequence tracking), only by datagram source IP.",
         "",
         "MIRROR. A second publisher mirrors the whole roster on that SAME port block, stamping",

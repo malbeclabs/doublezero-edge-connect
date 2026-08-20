@@ -156,36 +156,36 @@ pub struct Metrics {
     pub quotes_future_rejected: IntCounterVec,
     /// Quotes forwarded with the `source_ts == 0` "not available" sentinel (bypass the floor).
     pub quotes_no_source_ts: IntCounterVec,
-    /// Nanoseconds between the two arms' copies of one **matched trade**, on our own receive clock —
+    /// Nanoseconds between the two paths' copies of one **matched trade**, on our own receive clock —
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
-    /// [`crate::ingest::arm_race::ArmRace`] pairs, never by a dropped copy's inter-arm phase.
-    pub arm_lead_ns: HistogramVec,
+    /// [`crate::ingest::path_race::PathRace`] pairs, never by a dropped copy's inter-path phase.
+    pub path_lead_ns: HistogramVec,
     /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
     /// thresholds are too loose: every transfer re-baselines each consumer's book.
-    pub arm_transfers: IntCounterVec,
+    pub path_transfers: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
     /// drop, so a sustained rate means subscriptions are flapping.
     pub tape_owner_changes: IntCounterVec,
-    /// Trade-tape ownership moving from one **arm** to another within a venue — the arm-level twin of
+    /// Trade-tape ownership moving from one **path** to another within a venue — the path-level twin of
     /// [`tape_owner_changes`](Self::tape_owner_changes), and the same read: each transfer is a window
     /// where a print may double or drop.
-    pub tape_arm_transfers: IntCounterVec,
-    /// Prints the per-venue tape gate dropped as a non-serving arm's copy. Its own counter rather than
+    pub tape_path_transfers: IntCounterVec,
+    /// Prints the per-venue tape gate dropped as a non-serving path's copy. Its own counter rather than
     /// folded into [`trades_dropped`](Self::trades_dropped): on a `Sticky` venue the steady state is
-    /// the challenger arm's whole stream, so mixing the two would hide a gate holding the tape against
-    /// the arm that should have it inside expected noise.
-    pub tape_arm_dropped: IntCounterVec,
-    /// Markets each `arm` is currently authoritative for. Split across arms means the venue's
-    /// authority is fragmented; all on one arm is the steady state.
-    pub arm_markets_held: IntGaugeVec,
-    /// Trades an `arm` delivered that its peer never did inside the match window — a drop on one arm,
+    /// the challenger path's whole stream, so mixing the two would hide a gate holding the tape against
+    /// the path that should have it inside expected noise.
+    pub tape_path_dropped: IntCounterVec,
+    /// Markets each `path` is currently authoritative for. Split across paths means the venue's
+    /// authority is fragmented; all on one path is the steady state.
+    pub path_markets_held: IntGaugeVec,
+    /// Trades an `path` delivered that its peer never did inside the match window — a drop on one path,
     /// or a genuine one-sided print. The denominator for how much of the election's evidence is being
-    /// lost; a rate near the trade rate means the arms are barely pairing at all.
-    pub arm_unmatched_trades: IntCounterVec,
+    /// lost; a rate near the trade rate means the paths are barely pairing at all.
+    pub path_unmatched_trades: IntCounterVec,
     /// Incremental `book` batches the authority gate did not publish, by the `publisher` class whose
-    /// copy was dropped: a non-authoritative arm's copy, or a batch withheld while a market waits for
-    /// its new arm to close a logical event. In steady state this is the challenger's whole stream, so
+    /// copy was dropped: a non-authoritative path's copy, or a batch withheld while a market waits for
+    /// its new path to close a logical event. In steady state this is the challenger's whole stream, so
     /// it tracks its message rate rather than any fault.
     pub book_dropped: IntCounterVec,
     /// Markets evicted from the `book` authority gate's tracked set because the cap was reached. The
@@ -207,7 +207,7 @@ pub struct Metrics {
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
     pub book_resurrections_dropped: IntCounterVec,
-    /// Order-level markets forced to re-baseline because two arms claimed different resting state for
+    /// Order-level markets forced to re-baseline because two paths claimed different resting state for
     /// one order (`reason="disagreement"`).
     pub mbo_forced_rebaselines: IntCounterVec,
     /// Order-level changes refused because the batch carrying them is older than its channel's
@@ -597,26 +597,26 @@ impl Metrics {
                 "Quotes forwarded with the source_ts==0 sentinel (floor bypassed)",
                 &["venue"],
             ),
-            arm_lead_ns: histogram_vec(
+            path_lead_ns: histogram_vec(
                 &registry,
-                "dz_arm_lead_ns",
-                "Nanoseconds between the two arms' copies of one matched trade, on our own receive \
+                "dz_path_lead_ns",
+                "Nanoseconds between the two paths' copies of one matched trade, on our own receive \
                  clock. The series the re-election thresholds are read off.",
                 &["venue", "winner"],
                 LEAD_NS_BUCKETS,
             ),
-            arm_transfers: counter_vec(
+            path_transfers: counter_vec(
                 &registry,
-                "dz_arm_authority_transfers_total",
+                "dz_path_authority_transfers_total",
                 "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
                  means the thresholds are too loose — every transfer re-baselines each consumer.",
                 &["venue", "reason"],
             ),
-            arm_markets_held: gauge_vec(
+            path_markets_held: gauge_vec(
                 &registry,
-                "dz_arm_markets_held",
-                "Markets each arm is currently authoritative for.",
-                &["venue", "arm"],
+                "dz_path_markets_held",
+                "Markets each path is currently authoritative for.",
+                &["venue", "path"],
             ),
             tape_owner_changes: counter_vec(
                 &registry,
@@ -625,18 +625,18 @@ impl Metrics {
                  Each move is a window in which a print may double or drop.",
                 &["venue"],
             ),
-            tape_arm_transfers: counter_vec(
+            tape_path_transfers: counter_vec(
                 &registry,
-                "dz_tape_arm_transfers_total",
-                "Trade-tape ownership moving between a venue's arms. The arm-level twin of \
+                "dz_tape_path_transfers_total",
+                "Trade-tape ownership moving between a venue's paths. The path-level twin of \
                  dz_tape_owner_changes_total.",
                 &["venue"],
             ),
-            tape_arm_dropped: counter_vec(
+            tape_path_dropped: counter_vec(
                 &registry,
-                "dz_tape_arm_dropped_total",
-                "Prints the per-venue tape gate dropped as a non-serving arm's copy. In steady state \
-                 this is the challenger arm's whole print stream.",
+                "dz_tape_path_dropped_total",
+                "Prints the per-venue tape gate dropped as a non-serving path's copy. In steady state \
+                 this is the challenger path's whole print stream.",
                 &["venue"],
             ),
             mbp_channel_resets: counter_vec(
@@ -697,18 +697,18 @@ impl Metrics {
                  result",
                 &["venue", "kind"],
             ),
-            arm_unmatched_trades: counter_vec(
+            path_unmatched_trades: counter_vec(
                 &registry,
-                "dz_arm_unmatched_trades_total",
-                "Trades one arm delivered that its peer never did inside the match window — a drop \
-                 on that arm, or a one-sided print. Election evidence lost.",
-                &["venue", "arm"],
+                "dz_path_unmatched_trades_total",
+                "Trades one path delivered that its peer never did inside the match window — a drop \
+                 on that path, or a one-sided print. Election evidence lost.",
+                &["venue", "path"],
             ),
             book_dropped: counter_vec(
                 &registry,
                 "dz_book_dropped_total",
                 "Incremental book batches the authority gate did not publish, by the publisher class \
-                 whose copy was dropped (in steady state, the challenger arm's whole stream).",
+                 whose copy was dropped (in steady state, the challenger path's whole stream).",
                 &["venue", "publisher"],
             ),
             book_markets_evicted: counter_vec(
@@ -754,7 +754,7 @@ impl Metrics {
                 &registry,
                 "dz_mbo_forced_rebaselines_total",
                 "Order-level markets withheld and re-baselined because the cross-publisher guard \
-                 could not answer. reason=disagreement: two arms claimed different resting state for \
+                 could not answer. reason=disagreement: two paths claimed different resting state for \
                  one order, so neither is known to be right. A sustained rate is the signal to \
                  reconsider the per-publisher book model.",
                 &["venue", "reason"],
@@ -1100,18 +1100,18 @@ mod tests {
         m.depth_ticks_won
             .with_label_values(&["HYPERLIQUID", "edge"])
             .inc();
-        m.arm_lead_ns
+        m.path_lead_ns
             .with_label_values(&["KALSHI", "leader"])
             .observe(123_456.0);
-        m.arm_transfers
+        m.path_transfers
             .with_label_values(&["KALSHI", "silence"])
             .inc();
-        m.arm_markets_held
-            .with_label_values(&["KALSHI", "arm0"])
+        m.path_markets_held
+            .with_label_values(&["KALSHI", "path0"])
             .set(1);
         m.tape_owner_changes.with_label_values(&["KALSHI"]).inc();
-        m.tape_arm_transfers.with_label_values(&["KALSHI"]).inc();
-        m.tape_arm_dropped.with_label_values(&["KALSHI"]).inc();
+        m.tape_path_transfers.with_label_values(&["KALSHI"]).inc();
+        m.tape_path_dropped.with_label_values(&["KALSHI"]).inc();
         m.mbp_channel_resets.with_label_values(&["KALSHI"]).inc();
         m.mbp_buffer_overflows.with_label_values(&["KALSHI"]).inc();
         m.mbp_level_overflows.with_label_values(&["KALSHI"]).inc();
@@ -1126,8 +1126,8 @@ mod tests {
         m.mbp_divergence
             .with_label_values(&["KALSHI", "delete_with_quantity"])
             .inc();
-        m.arm_unmatched_trades
-            .with_label_values(&["KALSHI", "arm1"])
+        m.path_unmatched_trades
+            .with_label_values(&["KALSHI", "path1"])
             .inc();
         m.book_dropped.with_label_values(&["KALSHI", "edge"]).inc();
         m.book_markets_evicted.with_label_values(&["KALSHI"]).inc();
@@ -1191,12 +1191,12 @@ mod tests {
             "dz_depth_lead_ns",
             "dz_quote_ticks_won_total",
             "dz_depth_ticks_won_total",
-            "dz_arm_lead_ns",
-            "dz_arm_authority_transfers_total",
-            "dz_arm_markets_held",
+            "dz_path_lead_ns",
+            "dz_path_authority_transfers_total",
+            "dz_path_markets_held",
             "dz_tape_owner_changes_total",
-            "dz_tape_arm_transfers_total",
-            "dz_tape_arm_dropped_total",
+            "dz_tape_path_transfers_total",
+            "dz_tape_path_dropped_total",
             "dz_mbp_channel_resets_total",
             "dz_mbp_buffer_overflows_total",
             "dz_mbp_level_overflows_total",
@@ -1205,7 +1205,7 @@ mod tests {
             "dz_mbp_duplicate_deltas_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",
-            "dz_arm_unmatched_trades_total",
+            "dz_path_unmatched_trades_total",
             "dz_book_dropped_total",
             "dz_book_markets_evicted_total",
             "dz_mbo_removed_evicted_total",

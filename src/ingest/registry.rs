@@ -220,7 +220,7 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "market-by-order rows on `{}` and `{}` share category `{category}`; a departing \
                  receiver releases its publishers' book standing by category, so each exit would \
-                 release the other venue's live arms",
+                 release the other venue's live paths",
                 venues[0], venues[1]
             ),
             RegistryError::DuplicateGroupPort { venue, group, port } => write!(
@@ -755,7 +755,7 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
         // agree on, since the key is filed under the *wire* venue and the row's venue can differ.
         // That is exact only while one venue's rows own the category: two Market-by-Order rows on
         // different venues, served by one publisher host, would have each exit release the other's
-        // live arms, and a recovering arm can then wipe a book a healthy peer is serving.
+        // live paths, and a recovering path can then wipe a book a healthy peer is serving.
         if f.kind == FeedKind::MarketByOrder {
             match mbo_categories.entry(f.category) {
                 std::collections::hash_map::Entry::Occupied(e) if *e.get() != f.venue => {
@@ -1575,7 +1575,7 @@ mod tests {
 
     /// Two venues' Market-by-Order rows must not share a `category`. A departing receiver releases
     /// its publishers' book standing by category — the one scope it and the `MarketKey` provably
-    /// agree on — so each venue's exit would release the other's live arms, and a recovering arm can
+    /// agree on — so each venue's exit would release the other's live paths, and a recovering path can
     /// then wipe a book a healthy peer is serving. Nothing downstream notices; the invariant is the
     /// only thing that says so, and it is written where whoever adds the second row will read it.
     #[test]

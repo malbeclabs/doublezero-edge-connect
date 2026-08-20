@@ -93,7 +93,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
     };
     // An order-level batch renders under its own `type`. Only the tag differs — the body is the same
     // `NormalizedBook` — and the wrap is local to serialization, so the filter fields below are still
-    // read off the original message and no other `match` on `FeedMessage` grows an arm.
+    // read off the original message and no other `match` on `FeedMessage` grows a path.
     let payload: Utf8Bytes = match &m {
         FeedMessage::Book(b) if b.order_level => {
             serde_json::to_string(&FeedMessage::OrderBook(b.clone())).ok()?
@@ -146,7 +146,7 @@ struct SubFilter {
     source: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
-    /// The wire `channel_id` — the competition, not the arm. Arm identity is deliberately not
+    /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
     /// client-selectable: exactly one arbitrated book per market reaches the wire.
     #[serde(default)]
     channel: Option<u32>,

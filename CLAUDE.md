@@ -79,7 +79,7 @@ Modules are grouped by role under `src/`:
 - **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
   `pricebook` (the price-keyed sibling of `book`), `authority`,
   `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
-  `subscriber`, `arbiter`, `authority` + `arm_race` (the single-arm `book` gate and the cross-arm trade
+  `subscriber`, `arbiter`, `authority` + `path_race` (the single-path `book` gate and the cross-path trade
   matcher its re-election runs on), the **`subscriptions`** detector + **`reconcile`** activation loop (which
   decide what runs — see Architecture above), the optional public feeders (`public_feeder`
   scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
@@ -161,7 +161,7 @@ Modules are grouped by role under `src/`:
   `MarketByOrder` category** (a departing receiver releases its publishers' book standing by
   category — the one scope it and the `MarketKey` provably share, see
   `Arbiter::forget_publisher_books` — so two venues carrying that kind under one category would have
-  each exit release the other's live arms). The first four used to be
+  each exit release the other's live paths). The first four used to be
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
   `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a channel
@@ -370,12 +370,12 @@ Modules are grouped by role under `src/`:
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher, category)` (quotes → quote
   floor, depth → depth floor, trades → the per-`(venue, category)` **tape leader** then the window, `book` → the
-  single-arm authority gate below, `Instrument` → a rate limit on the precision pair per
+  single-path authority gate below, `Instrument` → a rate limit on the precision pair per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
   broadcast as `Arc<FeedMessage>` (a per-subscriber delivery is a refcount bump, not a deep clone).
-  Every arm returns an
+  Every path returns an
   `Admit<Publisher>`: `Emitted{opened_tick}` broadcasts and bumps the admitted/winner counter —
   plus, when the sample *opened* its `source_ts` tick, the once-per-tick
   `dz_quote_ticks_won_total`/`dz_depth_ticks_won_total` (the published win-rate primitive:
@@ -385,26 +385,26 @@ Modules are grouped by role under `src/`:
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
   plain collapse. The **tape leader** (`tape_leader`, keyed `(venue, category)`, `Sticky` venues only —
   the `category` `emit` parameter is the feed row's, never a wire field: PROTOCOL.md is a consumer
-  contract and this is producer-side keying) is the arm-level twin of
+  contract and this is producer-side keying) is the path-level twin of
   the reconciler's row ownership, and both are needed before the `trade_id == 0` bypass is sound: a
-  sticky venue's arms share no trade-id space (one may stamp the sentinel while its peer stamps a real
+  sticky venue's paths share no trade-id space (one may stamp the sentinel while its peer stamps a real
   venue id — a pair neither the sentinel latch nor `WindowedDedup` collapses), so the gate is
-  **id-independent**. Four rules: first arm to print leads (a TOB-only deployment carries no `book`
-  traffic, so `scope_leader()` is `None` forever and electing first would mute the tape); an arm the
+  **id-independent**. Four rules: first path to print leads (a TOB-only deployment carries no `book`
+  traffic, so `scope_leader()` is `None` forever and electing first would mute the tape); a path the
   authority *tracks* displaces one it does not (the slot is first-come on an unauthenticated wire);
-  the book-*elected* arm takes over, **once per election** rather than per print (arm identity is
+  the book-*elected* path takes over, **once per election** rather than per print (path identity is
   shared across a venue's rows — one source IP per publisher host, both protocols — and re-honouring
-  per print would let a nearly-dead elected arm sawtooth the tape away from the healthy peer); and a
+  per print would let a nearly-dead elected path sawtooth the tape away from the healthy peer); and a
   silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS`, marking the election it overrode as spent.
-  The peer's prints are dropped on their own `dz_tape_arm_dropped_total` (not folded into
+  The peer's prints are dropped on their own `dz_tape_path_dropped_total` (not folded into
   `dz_trades_dropped_total`, whose steady state here is the challenger's whole stream); transfers are
-  `dz_tape_arm_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
+  `dz_tape_path_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
   wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
   no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
-  that *sharded* prints rather than mirroring them would lose the non-serving arm's fills (giving them
+  that *sharded* prints rather than mirroring them would lose the non-serving path's fills (giving them
   distinct categories is the registry's job). The two `books` lookups inside it read the authority at
-  the same `(venue, category)` grain, so the deferral can only ever name an arm elected on *this*
+  the same `(venue, category)` grain, so the deferral can only ever name a path elected on *this*
   universe. `no_id_owner` is skipped entirely
   for `Sticky` venues: it is the `Coordinated` guard, and it cannot see a gate-approved handover.
   `emit` increments **pre-resolved per-venue metric children** (cached in the
@@ -438,10 +438,10 @@ Modules are grouped by role under `src/`:
   book replayed to a new client). The *quote* floor is
   deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
-  The `Book` arm has **two** gates, chosen by what the wire supplies rather than by venue name. A batch
+  The `Book` branch has **two** gates, chosen by what the wire supplies rather than by venue name. A batch
   carrying a non-zero `order_id` (or for a market whose `BookMarket::order_level` memo says an earlier one
   did — that covers a bare `clear`) on a `Coordinated` venue is **raced per venue event**; everything else
-  takes the single-arm authority below. Routing on *content* rather than on a report is deliberate: an
+  takes the single-path authority below. Routing on *content* rather than on a report is deliberate: an
   evicted market re-routes on its next order-level batch instead of reverting to the authority for good,
   and a forged sync report cannot divert a price-aggregated market off that gate. Racing keys on
   `OrderEvent` = `(order_id, action, price bits, size bits)` per market — never `per_instrument_seq`,
@@ -455,7 +455,7 @@ Modules are grouped by role under `src/`:
   (`dz_book_resurrections_dropped_total`): a `size == 0` event records the order as removed and any later
   non-zero change for it is refused, because a lagging peer's *first and only* copy of an `Add` for an order
   another publisher already killed passes every check `book.rs` makes — that book legitimately still holds
-  the order. **What retires an entry is venue time, not the arms and not a count.** Per channel
+  the order. **What retires an entry is venue time, not the paths and not a count.** Per channel
   (`ChannelClock`, keyed `(venue, category, channel)` — a market's own stamps say nothing about how far the
   venue has moved, so a per-market clock would forget nothing on a quiet market and everything at once when
   it woke) the arbiter tracks the newest `source_ts_ns` accepted, and the **frontier** is
@@ -469,7 +469,7 @@ Modules are grouped by role under `src/`:
   legitimate. Rule 3 runs **before** the size comparison: a stale copy of an add for an order the venue has
   since partially filled claims more than the peer reported, and testing size first reads that as drift and
   forces a re-baseline — the false disagreement rule 3 exists to subsume, and what used to cap the tolerable
-  inter-arm lag at the dedup window's 1,024-event count (~1.15 s on the flagship market). Rule 4's carve-out
+  inter-path lag at the dedup window's 1,024-event count (~1.15 s on the flagship market). Rule 4's carve-out
   is scoped to rule 3 alone: a **removal** is never refused for being older than the order it removes, which
   would strand that order live in every consumer's book. ⚠️ A removed entry's `last_ts` is **frozen at the
   removal** — later copies are published, idempotently, but do not refresh it, or one laggard repeating
@@ -495,7 +495,7 @@ Modules are grouped by role under `src/`:
   `newest_ts` from the highest stamp among the batches actually arriving, once it has failed to **move**
   for that long **or** the forward bound has been refusing continuously for that long. The second trigger
   is not redundant: a publisher whose clock *crawls* — a unit mismatch, an old-session replay — has every
-  one of its tiny advances accepted, which keeps the movement timer fresh forever while every honest arm is
+  one of its tiny advances accepted, which keeps the movement timer fresh forever while every honest path is
   refused, and the frontier then pins below the whole channel for the life of the process. The sample is
   taken *before* rule 1 can refuse a batch (a session restarting lower is exactly the batch rule 1 refuses)
   and, with that timer, is cleared only by a write that **consumed** it — a write landing below the highest
@@ -520,10 +520,10 @@ Modules are grouped by role under `src/`:
   count cap (`MAX_GUARDED_ORDERS`), while a **removed entry** is re-seeded by nothing and has **no count cap
   at all**: what sizes it is the retention window, and a count standing in for a time tolerance is
   simultaneously far too much for a quiet market and far too little for a busy one. At the shipped 30 s
-  against a measured p99.99 inter-arm separation of 2.77 s and 3,958 removals/s per publisher per channel,
+  against a measured p99.99 inter-path separation of 2.77 s and 3,958 removals/s per publisher per channel,
   that is ~119k entries on the flagship channel, 11% of the process-wide `MAX_TOMBSTONES_TOTAL` (1 Mi).
   Forgetting is **head-of-queue, bounded per batch** (`MAX_FORGOTTEN_PER_BATCH`): `dead` is in removal order,
-  which is only *approximately* ordered by `last_ts` since two arms' stamps interleave, so the head-only
+  which is only *approximately* ordered by `last_ts` since two paths' stamps interleave, so the head-only
   walk leaves bounded slack (under 10%) — do not add a `debug_assert` that the queue is sorted, it fires on
   production-shaped input — and the per-batch bound is for the other end, an upward re-seat after a long gap
   making the whole population eligible at once, where taking 119k entries inline would stall every receiver
@@ -538,49 +538,49 @@ Modules are grouped by role under `src/`:
   alert on is `dz_mbo_guarded_tombstones_max`, and the refusals are
   `dz_mbo_events_past_frontier_total`/`dz_mbo_events_stale_total` against
   `dz_mbo_frontier_bounded_total`/`dz_mbo_frontier_reseats_total`.
-  A forced re-baseline's seeded floors are owned by **no arm**:
-  what is republished is the pointwise-minimum view of every arm, so stamping the arm whose batch
+  A forced re-baseline's seeded floors are owned by **no path**:
+  what is republished is the pointwise-minimum view of every path, so stamping the path whose batch
   discharged the flag would exempt it from the gate and let it re-assert the stale size the
   re-baseline was called to correct. `dz_mbo_path_disagreement_total` is the
   drift observable and is a *monotonic* check — a resting order only shrinks, so a publisher claiming
-  **more** than a peer already reported has missed a fill; an interleaved race, where an arm delivers the
+  **more** than a peer already reported has missed a fill; an interleaved race, where a path delivers the
   smaller remainder first, is not counted. Both copies are still published rather than preferring the
   smaller: the peer could be the drifted one, and dropping the larger would let a forged small size mute a
   real publisher's order. A `Clear`-led batch never races — it is published only when no peer is **both**
   synced and recently on the wire (`PEER_SERVING_NS`). The flag alone would let a departed publisher
   suppress this product's only self-heal forever; requiring a delivery also settles the both-recovering
-  race, since whichever arm publishes first records one. A session boundary restarts the venue's id space,
+  race, since whichever path publishes first records one. A session boundary restarts the venue's id space,
   so `reset_book_session_for_market` clears the removed entries **and** the channel's clock — narrower than
   `reset_book_for_market` on purpose, since a peer that missed the session end is still serving that market.
-- **`ingest/authority.rs` + `ingest/arm_race.rs`** — the **single-arm gate the arbiter's `Book` arm runs**
+- **`ingest/authority.rs` + `ingest/path_race.rs`** — the **single-path gate the arbiter's `Book` branch runs**
   for a price-aggregated market, in *both* arbitration modes with no `mode_for` branch (#105): one
   `source_ts` tick can hold several
-  deltas, so the quote floor's per-tick latch would interleave two arms inside one logical event, and the
-  arms' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
-  every sequence check the producer ran still passes. One arm serves a market and the peer is ingested and
+  deltas, so the quote floor's per-tick latch would interleave two paths inside one logical event, and the
+  paths' per-instrument delta sequences are unrelated by construction — a consumer's book corrupts while
+  every sequence check the producer ran still passes. One path serves a market and the peer is ingested and
   dropped (`dz_book_dropped_total`). The gate is keyed on `(venue, category)` — `authority::ScopeKey`,
   which also prefixes `MarketKey` — never on the venue alone: one Source ID can carry universes that
   mirror nothing, and a venue-wide election drops the losing universe's whole book stream permanently
   (the only escape is leader silence, and a leader streaming its own universe is never silent).
-  **Speed and silence are per arm, across that arm's universe; health is per market**. The arm-ordinal
-  cap (`MAX_LABELLED_ARMS`, 8) is likewise **per scope**, so a venue carrying N universes admits up to
-  `8 x N` arms — the forged-flood bound still holds per universe, which is the grain that decides
-  anything, and the metric label set stays `{venue, arm}` (`dz_arm_markets_held` sums a venue's
-  universes; two universes' `arm0` are different publishers)
+  **Speed and silence are per path, across that path's universe; health is per market**. The path-ordinal
+  cap (`MAX_LABELLED_PATHS`, 8) is likewise **per scope**, so a venue carrying N universes admits up to
+  `8 x N` paths — the forged-flood bound still holds per universe, which is the grain that decides
+  anything, and the metric label set stays `{venue, path}` (`dz_path_markets_held` sums a venue's
+  universes; two universes' `path0` are different publishers)
   (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
-  overrides the elected arm for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
-  **Anything but "the arm that last reached the wire for this market" re-baselines the consumer**: a
-  serving-arm change (margin, silence, or that health override), a market's first admission, or a market
-  whose state was evicted. The re-baseline is a `clear` plus the new arm's complete current level set,
-  `snapshot`/`last` true — so the gate accumulates **every eligible arm's** book (`BookMarket::arms`), not
-  only the serving one. Three constraints shape it: it is emitted lazily on that arm's next *completed*
+  overrides the elected path for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
+  **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
+  serving-path change (margin, silence, or that health override), a market's first admission, or a market
+  whose state was evicted. The re-baseline is a `clear` plus the new path's complete current level set,
+  `snapshot`/`last` true — so the gate accumulates **every eligible path's** book (`BookMarket::paths`), not
+  only the serving one. Three constraints shape it: it is emitted lazily on that path's next *completed*
   logical event, never as a venue-wide burst of clears (most markets are idle, and `to_book` of a
   half-applied event goes out stamped `last` as a torn book); the wait is **bounded**
   (`MAX_WITHHELD_BATCHES`) because `last` is a promise made by an unauthenticated producer; and it
-  degrades to a **bare `clear`** unless `BookAccumulator::baselined` holds — an arm that has sent no
+  degrades to a **bare `clear`** unless `BookAccumulator::baselined` holds — a path that has sent no
   producer re-baseline holds only the levels that moved since it started accumulating, and publishing
   that as `snapshot` would tell the consumer to discard the rest. The replay map mirrors the serving
-  arm's accumulator, that flag included, so `sinks/ws.rs` skips exactly the markets this cannot
+  path's accumulator, that flag included, so `sinks/ws.rs` skips exactly the markets this cannot
   re-baseline.
   Per-market state is capped by `MAX_BOOK_MARKETS` (`dz_book_markets_evicted_total`) and eviction drops
   the accumulators, the replay entry **and** `StickyAuthority`'s own per-market entry together — that
@@ -592,18 +592,18 @@ Modules are grouped by role under `src/`:
   clients (`arbiter::tests::evicting_one_universes_market_spares_the_others_replay_entry`).
   `sinks/ws.rs` and `sinks/api.rs` skip the scope element: it is a producer-side key that never
   reaches the wire. `reset_book_for_market` is the session-reset seam (no venue-wide variant: the MBP
-  processor scopes `EndOfSession` per arm and channel, handing those markets to the peer). `arm_race` is the **only** producer of the matched-lead
-  samples the speed re-election consumes: it pairs the two arms' copies of the same **trade** by content
+  processor scopes `EndOfSession` per path and channel, handing those markets to the peer). `path_race` is the **only** producer of the matched-lead
+  samples the speed re-election consumes: it pairs the two paths' copies of the same **trade** by content
   (`((venue, category), symbol, price bits, size bits, aggressor)`, FIFO per signature so identical
   repeats pair in order) and measures the gap on our own `recv_ts_ns`, never a publisher-stamped time.
   Pairs form **within one scope**: it is the sole producer of the election's evidence and that election
   is per universe, so a cross-universe pair would mint a foreign publisher into a scope's admission
-  slots and could elect an arm serving no `book` there. Trades only — a
-  level update's cross-arm-common fields recur on a coarse price grid and would mis-pair constantly — and
-  **edge arms the authority already tracks only** (`Arbiter::race_eligible`): the public backstop decodes
+  slots and could elect a path serving no `book` there. Trades only — a
+  level update's cross-path-common fields recur on a coarse price grid and would mis-pair constantly — and
+  **edge paths the authority already tracks only** (`Arbiter::race_eligible`): the public backstop decodes
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
-  admission slots. `dz_arm_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
-  `Admit::Contest` lead (that is inter-arm phase against an unrelated earlier message, and structurally
+  admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
+  `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
   non-negative). The only `FEEDS` row of that kind is `edge-kalshi-perps-mbp`, whose group is live, so these series
   populate on any host subscribed to it — and report nothing on a host that is not.
 - **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
@@ -634,7 +634,7 @@ Modules are grouped by role under `src/`:
   `MboProcessor` (feeds order deltas + the snapshot stream into `book.rs` and emits full-state `depth`,
   the order-level `book` and trades — `emit_book` mirrors `emit_depth`'s gates exactly, and each book's
   sync state is reported to the arbiter *before* the frame's emissions so the re-baseline suppression has
-  a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy arm and
+  a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
   suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot stream into `pricebook.rs` and emits the
   incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
@@ -653,7 +653,7 @@ Modules are grouped by role under `src/`:
   content → distinct oracle key) — we deliberately do **not** mutate `source_ts` with a synthetic
   tiebreak (it's a latency stamp; PROTOCOL.md promises only full-state/self-heal, not a unique
   `source_ts` per depth).
-  `MbpProcessor` keys its books on **`(publisher, channel, instrument)`** — two arms mirror one feed
+  `MbpProcessor` keys its books on **`(publisher, channel, instrument)`** — two paths mirror one feed
   with unrelated per-instrument delta series, and one group is sharded across channels whose state
   machines are independent — and carries the design's cross-instrument/cross-publisher conformance
   items: `SnapshotLevel` routes by the **open group** per `(publisher, channel)` (never by
@@ -662,7 +662,7 @@ Modules are grouped by role under `src/`:
   overflow drops the largest instrument's buffer and marks it `Gap` rather than taking the channel
   down — `pricebook`'s per-book cap is a quarter of it, so the budget only binds with several heavy
   books), `EndOfSession` scoped to the emitting `(publisher, channel)` (the order-keyed handler's
-  venue-wide clear would tear down a live peer arm's published book), and a channel reset on any
+  venue-wide clear would tear down a live peer path's published book), and a channel reset on any
   **change** of the frame header's `Reset Count` (`!=`, never `>`, so the `255 -> 0` wrap counts) —
   read from the **market-data role only** and only for a publisher whose reference data we already
   hold: the three ports carry one epoch on three sockets, so a memo shared across them would re-reset
@@ -672,11 +672,11 @@ Modules are grouped by role under `src/`:
   belongs to the publisher's previous run, and installing it would republish a dead session's book.
   `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
   O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are
-  reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped arm
+  reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped path
   over to its peer. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
   `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
   whole-side clear would tell the consumer to drop levels this book still holds. Its
-  `ManifestSummary`/`InstrumentDefinition` arms are `handle_refdata`-gated exactly like the three
+  `ManifestSummary`/`InstrumentDefinition` branches are `handle_refdata`-gated exactly like the three
   siblings' — decode does not care which physical port a type arrives on, so without it one forged
   datagram on the market-data or snapshot port clears a publisher's definitions and every emission
   path (which all gate on a resolved definition) goes dark for the venue — and it drains
@@ -741,7 +741,7 @@ Modules are grouped by role under `src/`:
   all consumers of a message — see PROTOCOL.md). With no clients connected the serializer skips the
   work. On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
-  materialized from the serving arm's `BookAccumulator` and scoped by the `channel` filter dimension like
+  materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
   every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
   `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
   scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
@@ -919,9 +919,9 @@ Modules are grouped by role under `src/`:
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
   `to_book` stamps `last: true` and a half-applied rebuild would replay as a complete torn book, and
-  it is honest about completeness only while `baselined` holds. The arbiter's `Book` arm is the
-  single-arm
-  authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-arm
+  it is honest about completeness only while `baselined` holds. The arbiter's `Book` branch is the
+  single-path
+  authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-path
   accumulators; `MbpProcessor` emits `book`, and the `edge-kalshi-perps-mbp` row selects it on a live group.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the

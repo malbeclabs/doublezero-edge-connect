@@ -521,7 +521,7 @@ mod tests {
         let future: DiagnosticsResponse = serde_json::from_str(
             r#"{"diagnosis":{"code":"ok","summary":"s","remediation":"r"},
                 "activation":{"receivers":[{"venue":"LASHAY","kind":"market_by_price",
-                                            "publisher":32000,"liveness":"up","arm":"a"}],
+                                            "publisher":32000,"liveness":"up","unheard_of":"a"}],
                               "ws_on":true,"api_on":true},
                 "peering":{"nothing":"this build knows"}}"#,
         )

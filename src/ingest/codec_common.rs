@@ -422,7 +422,7 @@ mod tests {
     /// each generation decodes to the same thing, apart from the `source_id` v1 cannot carry.
     ///
     /// This is the test that fails if a later edit fixes one layout and forgets the other — the
-    /// failure mode a shared decoder exists to prevent, and the reason the two arms are not allowed
+    /// failure mode a shared decoder exists to prevent, and the reason the two generations are not allowed
     /// to drift into separate files again.
     #[test]
     fn both_generations_decode_the_same_instrument_identically() {
