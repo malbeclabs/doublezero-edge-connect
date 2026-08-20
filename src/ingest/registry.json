@@ -23,8 +23,13 @@
     "",
     "`publishers` is a tagged union. `explicit` carries port blocks verbatim; `derived` carries a",
     "published set of channels plus per-role bases and expands to `base + id` per channel, one",
-    "publisher per channel. Adding a field to this schema is a version bump: an older binary must",
-    "reject a document it does not fully understand rather than silently ignore half of it."
+    "publisher per channel.",
+    "",
+    "Adding a field is NOT a version bump. The loader has no deny_unknown_fields anywhere: an unknown",
+    "key is warned about by path and ignored, so an additive republish reaches an older fleet without",
+    "a rebuild - which is what every caller depends on. `version` bumps only for a change that",
+    "reinterprets what an existing field MEANS, since that is what an older binary would read",
+    "wrongly. A missing REQUIRED field stays fatal, so a typo cannot quietly default."
   ],
   "feeds": [
     {
