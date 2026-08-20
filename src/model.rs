@@ -322,6 +322,14 @@ pub struct NormalizedBook {
     /// batch's market in [`BookSnapshot`]. Never serialized.
     #[serde(skip, default = "empty_category")]
     pub category: Arc<str>,
+    /// Whether this market's changes are order-level (each `size` one *order's* absolute quantity,
+    /// `order_id` non-zero) rather than price-aggregated. **Never serialized** — it selects the wire
+    /// `type` (`order_book` vs `book`) in `sinks::ws::prepare`, which is where the distinction
+    /// exists. It cannot be recovered from `changes`: an order-level re-baseline's leading `Clear`
+    /// carries `order_id: 0` and a lone clear is a complete message, so content alone cannot tell
+    /// the two apart.
+    #[serde(skip)]
+    pub order_level: bool,
     pub changes: Vec<BookChange>,
     /// Advisory: this batch is part of a rebuild rather than ordinary activity. Deliberately NOT
     /// what re-baselines a consumer — `changes[0].action == Clear` is.
@@ -411,6 +419,15 @@ pub enum FeedMessage {
     Midpoint(NormalizedMidpoint),
     Depth(NormalizedDepth),
     Book(NormalizedBook),
+    /// The order-level book, as it appears **on the wire only**. Internally there is one book
+    /// product — one accumulator, one authority gate, one replay entry — so the whole pipeline
+    /// carries [`Self::Book`] and only the serializer distinguishes them. Constructed in
+    /// `sinks::ws` at the two points that render JSON, from `NormalizedBook::order_level`; nothing
+    /// broadcasts it. A separate `type` is what keeps this additive: PROTOCOL.md's
+    /// forward-compatibility rule has consumers ignore unknown *types*, and a v1 consumer that
+    /// ignored a new `order_id` *field* on `book` would key order-level changes by price and
+    /// silently corrupt its book instead.
+    OrderBook(NormalizedBook),
     Status(FeedStatus),
 }
 
@@ -425,7 +442,9 @@ impl FeedMessage {
             FeedMessage::Trade(t) => (t.venue.as_ref(), t.symbol.as_ref()),
             FeedMessage::Midpoint(m) => (m.venue.as_ref(), m.symbol.as_ref()),
             FeedMessage::Depth(d) => (d.venue.as_ref(), d.symbol.as_ref()),
-            FeedMessage::Book(b) => (b.venue.as_ref(), b.symbol.as_ref()),
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => {
+                (b.venue.as_ref(), b.symbol.as_ref())
+            }
             FeedMessage::Status(s) => (s.venue.as_ref(), ""),
         }
     }
@@ -435,7 +454,7 @@ impl FeedMessage {
     /// other type is venue/symbol-scoped.
     pub fn channel(&self) -> Option<u32> {
         match self {
-            FeedMessage::Book(b) => Some(b.channel),
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => Some(b.channel),
             FeedMessage::Instrument(i) => Some(i.channel),
             _ => None,
         }
@@ -829,6 +848,7 @@ impl BookAccumulator {
             channel: *channel,
             instrument_id: *instrument_id,
             category: category.clone(),
+            order_level: self.order_level,
             changes: vec![BookChange {
                 action: BookAction::Clear,
                 side: BookSide::Both,
@@ -1016,6 +1036,7 @@ mod tests {
             channel: 2,
             instrument_id: 41,
             category: TEST_CATEGORY.into(),
+            order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
             snapshot,
             last,
@@ -1468,6 +1489,7 @@ mod tests {
             symbol: Arc::from("SOL"),
             channel: 0,
             instrument_id: 41,
+            order_level: false,
             changes: vec![
                 BookChange {
                     action: BookAction::Clear,

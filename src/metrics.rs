@@ -202,7 +202,7 @@ pub struct Metrics {
     /// Two publishers reported the same venue event with different resulting state: the identity
     /// matched and the content did not, which is the signature of a book that has silently drifted.
     /// Any sustained non-zero rate is a correctness alarm.
-    pub mbo_arm_disagreement: IntCounterVec,
+    pub mbo_path_disagreement: IntCounterVec,
     /// Order-level changes dropped because the market had already published that order as gone — a
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
@@ -742,9 +742,9 @@ impl Metrics {
                  guard order-level racing rests on, working.",
                 &["venue"],
             ),
-            mbo_arm_disagreement: counter_vec(
+            mbo_path_disagreement: counter_vec(
                 &registry,
-                "dz_mbo_arm_disagreement_total",
+                "dz_mbo_path_disagreement_total",
                 "Two publishers reported the same venue event with different resulting state. The \
                  identity matched and the content did not, which is the signature of a book that has \
                  silently drifted. Any sustained non-zero rate is a correctness alarm.",
@@ -785,7 +785,7 @@ impl Metrics {
                  means the bound is catching ordinary jitter. reason=\"anchor\" is too far ahead of \
                  THIS HOST'S clock, which no flag widens — a sustained rate means either a publisher \
                  stamping the wrong units, or this host's clock is behind the venue's, and the \
-                 second of those also makes dz_mbo_arm_disagreement_total rise for a reason that has \
+                 second of those also makes dz_mbo_path_disagreement_total rise for a reason that has \
                  nothing to do with the publishers disagreeing. Check the host clock before reading \
                  that alarm.",
                 &["venue", "reason"],
@@ -1135,7 +1135,7 @@ mod tests {
         m.book_events_deduped
             .with_label_values(&["HYPERLIQUID"])
             .inc();
-        m.mbo_arm_disagreement
+        m.mbo_path_disagreement
             .with_label_values(&["HYPERLIQUID"])
             .inc();
         m.book_resurrections_dropped
@@ -1210,7 +1210,7 @@ mod tests {
             "dz_book_markets_evicted_total",
             "dz_mbo_removed_evicted_total",
             "dz_book_events_deduped_total",
-            "dz_mbo_arm_disagreement_total",
+            "dz_mbo_path_disagreement_total",
             "dz_book_resurrections_dropped_total",
             "dz_mbo_forced_rebaselines_total",
             "dz_mbo_events_past_frontier_total",

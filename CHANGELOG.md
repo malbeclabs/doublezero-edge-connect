@@ -508,15 +508,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second protocol: PROTOCOL.md is unaffected. See
   [Output sinks](docs/output-sinks.md#hyperliquid-compatible-sink), including what a stock
   NautilusTrader client can and cannot receive.
-- **Market-by-Order now serves the order-level `book` alongside its existing `depth`.** The bridge no
+- **Market-by-Order now serves an order-level book alongside its existing `depth`.** The bridge no
   longer throws the order identity away: every change carries the venue's own `order_id`, a snapshot
   install re-baselines as a `clear` plus the full order set, and `depth` keeps working unchanged for
-  the consumers on it. PROTOCOL.md stays **v1**, but this is filed there as breaking *within* v1:
-  `book` previously came only from Market-by-Price feeds, so an existing consumer that ignores
-  `order_id` and keys these changes by price corrupts its book, and must exclude Market-by-Order
-  markets from its `book` subscription.
-- `order_id` on a `book` change: the venue's order id for an order-level change, `0` when the change
-  is price-aggregated (Market-by-Price) and carries no order identity.
+  the consumers on it. It arrives as its **own message type, `order_book`** — same envelope and
+  fields as `book`, with each change one *order's* resulting state — so PROTOCOL.md stays **v1** and
+  the addition is genuinely additive. A new `order_id` field on `book` would not have been: `book`
+  previously came only from Market-by-Price feeds, and a consumer written before that field existed,
+  correctly ignoring it as the forward-compatibility rule instructs, would have keyed order-level
+  changes by price and silently corrupted its own book — two orders resting at one price collapsing
+  to the last one's size. A type is what that rule can actually protect. Subscriptions follow:
+  `{"type":"book"}` still selects exactly the price-aggregated markets it always did, bootstrap
+  included.
+- `order_id` on a book change: the venue's order id on an `order_book` change, `0` on a `book` one
+  (price-aggregated, no order identity).
 - The `book` bootstrap **follows the market**: an order-level market is bootstrapped as orders and a
   price-aggregated one as levels. A bootstrap and a stream of different granularity cannot be
   reconciled — an order-level change carries one *order's* absolute size, and applying it as a level's
@@ -533,7 +538,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wipe a live book and a departed publisher cannot block one either.
   `--arb-book-dedup-window-ms` (default 250) tunes how long a delivered event is remembered.
 - `dz_book_events_deduped_total{venue}`, `dz_book_resurrections_dropped_total{venue}`,
-  `dz_mbo_arm_disagreement_total{venue}` and `dz_mbo_removed_evicted_total`. The disagreement counter
+  `dz_mbo_path_disagreement_total{venue}` and `dz_mbo_removed_evicted_total`. The disagreement counter
   is the one to alert on: it fires when a publisher claims more resting quantity for an order than a
   peer already reported, which is a book that has silently drifted. See `docs/metrics.md`.
 - Every message now carries `source` and `source_id` alongside `venue`. The subscription filter

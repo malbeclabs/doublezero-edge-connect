@@ -10,8 +10,8 @@ data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks four ed
 sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
-re-serves it both as full-state `depth` and as the order-level incremental `book`, carrying the venue's
-own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
+re-serves it both as full-state `depth` and as the order-level incremental **`order_book`**, carrying
+the venue's own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
 reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `lashay-2`
 row selects it, on a group that is live). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
@@ -541,7 +541,7 @@ Modules are grouped by role under `src/`:
   A forced re-baseline's seeded floors are owned by **no arm**:
   what is republished is the pointwise-minimum view of every arm, so stamping the arm whose batch
   discharged the flag would exempt it from the gate and let it re-assert the stale size the
-  re-baseline was called to correct. `dz_mbo_arm_disagreement_total` is the
+  re-baseline was called to correct. `dz_mbo_path_disagreement_total` is the
   drift observable and is a *monotonic* check — a resting order only shrinks, so a publisher claiming
   **more** than a peer already reported has missed a fill; an interleaved race, where an arm delivers the
   smaller remainder first, is not counted. Both copies are still published rather than preferring the
@@ -899,8 +899,18 @@ Modules are grouped by role under `src/`:
   `order_id` (`0` = price-aggregated), and `BookAccumulator` keys order-level changes by it while keeping
   the price maps for the aggregated kind; `price_fold` folds the orders into levels **with a count per
   level**, which a price-keyed accumulator structurally cannot produce, and `to_book(ReplayScope)`
-  materializes either rendering, and `is_order_level` is what the `book` bootstrap follows so a client's
-  bootstrap always matches the granularity the market streams (a subscription cannot ask for the other). A `Clear` names a *side*, so it always carries
+  materializes either rendering, and `is_order_level` is what the book bootstrap follows so a client's
+  bootstrap always matches the granularity the market streams (a subscription cannot ask for the other).
+  It is also what picks the **wire type**: `NormalizedBook::order_level` (`#[serde(skip)]`, the same
+  internal-only treatment `category` gets) selects `order_book` over `book` at the two points that
+  render JSON — `sinks::ws::prepare` and `replay_scoped`. `FeedMessage::OrderBook` exists *only* to
+  carry that tag: internally there is one book product (one accumulator, one authority gate, one
+  replay entry) so the whole pipeline carries `FeedMessage::Book`, and nothing broadcasts the other.
+  ⚠️ Do **not** derive the type from a batch's `changes`: an order-level re-baseline leads with a
+  `Clear` carrying `order_id: 0`, and a lone clear is a complete message, so content cannot tell the
+  two apart. The separation is a **compatibility requirement**, not cosmetic — see PROTOCOL.md
+  *They are separate types*: a new `order_id` field on `book` would have corrupted every consumer
+  that correctly ignored it. A `Clear` names a *side*, so it always carries
   `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
   of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
   `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
@@ -939,8 +949,8 @@ Modules are grouped by role under `src/`:
   endpoints are confirmed.
 - **MBO is re-served as two derived products, never raw deltas.** The bridge reconstructs the L3 book
   and runs snapshot+delta recovery internally (`book.rs`), then derives full-state `depth` (top-N) and
-  the order-level incremental `book` from it. A `book` change is one order's **absolute resulting
-  state**, not the wire's add/cancel/execute event, and a recovery still surfaces only as a
+  the order-level incremental `order_book` from it. An `order_book` change is one order's **absolute
+  resulting state**, not the wire's add/cancel/execute event, and a recovery still surfaces only as a
   `Clear`-led re-baseline — do not expose the raw order events. `depth` is additive and unchanged:
   there are testers on it, and deleting it is its own change (PROTOCOL.md v2).
   **`docs/order-level-test-inventory.md` says which of this product's tests pin the consumer contract

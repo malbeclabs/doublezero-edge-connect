@@ -669,6 +669,8 @@ fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage
         channel: BOOK_CHANNEL,
         instrument_id: BOOK_INSTRUMENT,
         category: BOOK_CATEGORY.into(),
+        // Every change this suite builds is price-aggregated (`level()` stamps `order_id: 0`).
+        order_level: false,
         changes,
         snapshot: false,
         last,

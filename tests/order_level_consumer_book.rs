@@ -99,6 +99,10 @@ fn batch_for(
         channel: CHANNEL,
         instrument_id,
         category: CATEGORY.into(),
+        // The whole suite models one Market-by-Order market, so this is `true` outright rather than
+        // sniffed from `changes`: a re-baseline leads with a `Clear` carrying `order_id: 0`, and a
+        // lone clear carries nothing else, so content would mislabel the batches under test.
+        order_level: true,
         changes,
         snapshot: false,
         last: true,
@@ -866,7 +870,7 @@ fn arrival_lagged_stream(
 /// What set the old 1 s ceiling was the per-market **event count** (1,024): past it a trailing arm's
 /// copy of an add for an order the leader had since partially filled stopped reading as a duplicate
 /// and read as a second publisher claiming a larger resting size — a false
-/// `dz_mbo_arm_disagreement_total`, and the batches withheld behind the re-baseline it forced were
+/// `dz_mbo_path_disagreement_total`, and the batches withheld behind the re-baseline it forced were
 /// lost rather than delayed. The venue-time rules subsume it: that copy is refused for being older
 /// than the last change published for its order, before any size comparison. The ceiling is now the
 /// retention window, and the widest step below is twice it.

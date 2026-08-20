@@ -1448,6 +1448,7 @@ impl MboProcessor {
             channel: self.pending_channel.get(&key).copied().unwrap_or(0),
             instrument_id,
             category: category_arc(ctx.category),
+            order_level: true,
             changes,
             snapshot: mode != BookEmit::Delta,
             last: true,
@@ -2415,6 +2416,7 @@ impl MbpProcessor {
             channel: ctx.canonical_channel(channel),
             instrument_id,
             category: category_arc(ctx.category),
+            order_level: false,
             changes,
             snapshot,
             last: true,
@@ -6282,6 +6284,24 @@ mod tests {
         assert_eq!(books[0].channel, 7, "the frame header's channel_id");
         assert_eq!(books[0].instrument_id, 41, "the wire instrument id");
         assert_eq!(&*books[0].symbol, "INST-41", "a display label only");
+        // The mirror of the Market-by-Order assertion: marked order-level, this market would be
+        // served as `order_book` and disappear from every `{"type":"book"}` subscriber it has today.
+        // Asserted on a *second* frame as well: the first batch of a market is the re-baseline the
+        // arbiter materializes from its own accumulator, so only the later, forwarded batch carries
+        // the flag this processor stamped.
+        assert!(
+            !books[0].order_level,
+            "the re-baseline must be price-aggregated"
+        );
+        proc.on_datagram(
+            &mbp_wire::frame(7, 0, 101, &[mbp_level(41, 2, MBP_BID, 6300, 20, 8_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        let later = drain_books(&mut rx);
+        assert!(
+            later.last().is_some_and(|b| !b.order_level),
+            "and so must the batches the processor stamps itself: {later:?}"
+        );
     }
 
     /// The `instrument` definition carries the same identity pair, so a consumer joins a book to its
@@ -7190,6 +7210,14 @@ mod tests {
         let revealed = drain_books(&mut rx);
         let first = revealed.last().expect("a book message must be emitted");
         assert!(first.snapshot);
+        // This flag is what `sinks::ws` renders as `type: "order_book"`. Unset here, an order-level
+        // market goes out tagged `book` and a consumer keying by price collapses co-priced orders —
+        // the corruption the separate type exists to prevent. Asserted on the emission, not on a
+        // hand-built fixture, because this is the only production writer.
+        assert!(
+            first.order_level,
+            "a Market-by-Order batch must be marked order-level"
+        );
         assert_eq!(
             first
                 .changes
@@ -7212,6 +7240,7 @@ mod tests {
         );
         assert_eq!(last.source_ts_ns, 6_000);
         assert!(!last.snapshot);
+        assert!(last.order_level, "every batch, not just the re-baseline");
     }
 
     /// The same run still produces `depth`: this adds a product, it does not replace one.

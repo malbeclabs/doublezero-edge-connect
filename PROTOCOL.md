@@ -36,7 +36,7 @@ On each new connection the producer:
 2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and a
    `book` re-baseline (a `clear` plus the complete book) for every market that has one, at the
    market's own granularity.
-3. **Streams** `quote`/`trade`/`midpoint`/`depth`/`book` messages as they arrive, fanned out to all
+3. **Streams** `quote`/`trade`/`midpoint`/`depth`/`book`/`order_book` messages as they arrive, fanned out to all
    connected consumers.
 
 ```
@@ -57,7 +57,8 @@ Every message is a JSON object tagged by a `type` field (`snake_case`):
 | `trade`      | A trade print (last sale).               |
 | `midpoint`   | A single derived mid price.              |
 | `depth`      | A full order-book depth snapshot.        |
-| `book`       | A batch of incremental order-book changes, price-aggregated or order-level. |
+| `book`       | A batch of incremental **price-aggregated** order-book changes. |
+| `order_book` | The same batch shape, **order-level**: each change is one order's state, keyed by the venue's `order_id`. |
 | `status`     | A venue-level feed-health transition.    |
 
 Consumers **must ignore unknown `type` values and unknown fields** (forward compatibility).
@@ -242,7 +243,7 @@ client that connects mid-stream is replayed the latest `depth` per symbol on con
 
 > **Market-by-Order produces `depth` *and* `book`.** The producer runs that feed's snapshot+delta
 > recovery internally and derives both products from the same reconstructed L3 book: this full-state
-> top-*N* `depth`, and the order-level [`book`](#book) carrying the venue's own `order_id`. Neither
+> top-*N* `depth`, and the order-level [`order_book`](#book) carrying the venue's own `order_id`. Neither
 > re-serves the upstream's raw add/cancel/execute events — a `book` change is the *resulting state* of
 > one order, so a consumer needs no delta arithmetic, and a recovery still surfaces only as a
 > re-baseline.
@@ -260,11 +261,13 @@ client that connects mid-stream is replayed the latest `depth` per symbol on con
 
 A batch of **incremental** book changes for one instrument, derived in the producer from a DZ Edge order-book feed. Unlike `depth`, a `book` message is not full state: apply the changes in order to the book you already hold.
 
-A change is either **price-aggregated** (`order_id: 0`, from the Market-by-Price feed) or **order-level** (a non-zero `order_id`, the venue's own, from the Market-by-Order feed). The two never mix within a market, and `order_id` is what says which you are reading.
+The two granularities are **two message types**, not one type with a flag. `book` is price-aggregated: every change is a price level's resulting size and `order_id` is `0`. `order_book` is order-level: every change is one *order's* resulting size, keyed by the venue's own `order_id`, and several orders may rest at one price. The envelope and every field are otherwise identical, so a consumer that handles both shares one parser and routes on `type`; one that handles only `book` ignores `order_book` under the forward-compatibility rule and is unaffected. A market is served under exactly one of the two, never both — a Market-by-Price feed produces `book`, a Market-by-Order feed `order_book`.
+
+**They are separate types because they cannot be mixed by accident.** Applying an order-level change as if it were price-aggregated is silent corruption, not degraded output: two orders resting at one price collapse to the last one's size, and deleting either removes a level the other still occupies. Had order-level changes ridden `book` with a new `order_id` field, a consumer written before that field existed — and correctly ignoring it, exactly as this document tells it to — would have corrupted its own book. The type is what the forward-compatibility rule can actually protect.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `type` | string | `"book"`. |
+| `type` | string | `"book"` when price-aggregated, `"order_book"` when order-level. |
 | `venue` | string | **Deprecated.** Always identical to `source`. |
 | `source` | string | The source's registry name. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim. |
@@ -409,7 +412,7 @@ A consumer may send control messages (JSON text frames) to filter the stream. **
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = book updates only). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+A subscription filter is `{ "source"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint32, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
 
 `source` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them, so a
 disagreeing pair matches nothing; supply one.
@@ -418,7 +421,7 @@ disagreeing pair matches nothing; supply one.
 
 A scope dimension never excludes a message that is not about one market. A message type that carries no channel (everything except `book` and `instrument`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects channel 2's book updates and channel 2's instrument definitions - enough to scale those books - and nothing else. The one carve-out is a venue-level message (`status`), which carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
 
-A `type` filter is **absolute**: it delivers that message type and nothing else, including no `instrument` and no `status`. Filters are a union, so a consumer that wants books plus reference data and health subscribes to each - `{"type":"book"}`, `{"type":"instrument"}`, `{"type":"status"}` - or omits `type` and scopes by `venue`/`symbol`/`channel` instead. A client that sets `type` and never asks for `instrument` gets the connect-time replay of the definitions that exist then, and no later ones; that is the filter it asked for.
+A `type` filter is **absolute**: it delivers that message type and nothing else, including no `instrument` and no `status`. Filters are a union, so a consumer that wants books plus reference data and health subscribes to each - `{"type":"book"}`, `{"type":"order_book"}`, `{"type":"instrument"}`, `{"type":"status"}` - or omits `type` and scopes by `venue`/`symbol`/`channel` instead. A client that sets `type` and never asks for `instrument` gets the connect-time replay of the definitions that exist then, and no later ones; that is the filter it asked for.
 
 `symbol` cannot select a single `book` market where a venue's tickers collide under truncation (see *Identity* under [`book`](#book)); such a subscription delivers every colliding market's book. Filtering `book` down to one market is not expressible in v1.
 
@@ -443,7 +446,7 @@ are otherwise ignored.
 
 Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
 
-**The granularity of that replay is the market's, not the subscription's.** An order-level market is bootstrapped as every resting order with its `order_id`, a price-aggregated one as price levels carrying `order_id: 0` — see [*The bootstrap matches the market*](#book).
+**The granularity of that replay is the market's, not the subscription's.** An order-level market is bootstrapped as every resting order with its `order_id`, under `order_book`; a price-aggregated one as price levels carrying `order_id: 0`, under `book` — see [*The bootstrap matches the market*](#book). The bootstrap therefore carries the same `type` as the stream it precedes, so a `{"type":"book"}` subscriber is never bootstrapped with a market it could not then apply.
 
 ## Heartbeat & liveness
 
@@ -487,11 +490,13 @@ on connect:
       "depth":                                       # full snapshot each message (self-healing)
         inst = instrument(msg.venue, msg.symbol)
         replace_book(inst, msg.bids, msg.asks)       # overwrite, don't merge
-      "book":                                        # incremental; apply in order
+      "book" | "order_book":                         # incremental; apply in order
+        # One handler covers both: the envelope is identical and the type says how to key.
+        # "book" -> key by c.price. "order_book" -> key by c.order_id (several orders may rest
+        # at one price, so keying an order_book change by price collapses them). A consumer that
+        # only implements "book" simply omits the second label and ignores those messages.
         book = book_for(msg.venue, msg.channel, msg.instrument_id)
         for c in msg.changes:                        # "clear" re-baselines, not msg.snapshot
-          # c.order_id == 0 keys the change by price; non-zero keys it by the venue's order id.
-          # The bootstrap arrives at the same granularity, so one dispatcher covers both.
           apply(book, c.action, c.side, c.price, c.size, c.order_id)
         if msg.last: publish(book)                   # honor `last` or you wedge
       _: ignore        # unknown type
@@ -517,11 +522,11 @@ on connect:
 ## Versioning & compatibility
 
 - This document defines **v1**, which includes: the `instrument`/`quote`/`trade`/`midpoint`/`depth`/
-  `book` data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
+  `book`/`order_book` data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
-- **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; `book` supersedes it with the complete book, incrementally and — on that feed — at order level. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement `book`.
-- **Breaking within v1: `book` now carries order-level changes.** Previously `book` came only from Market-by-Price feeds and Market-by-Order served `depth` alone; both serve `book` now, and a Market-by-Order market's changes carry the venue's own `order_id`. The field is additive; the markets it arrives for are not. A consumer that ignores `order_id` keys those changes by price, collapsing two orders resting at one price to the last one's size and removing the whole level when either is deleted — so **it must exclude Market-by-Order markets from its `book` subscription**, identified from `feed_kind` on `/v1/products` or from the first change it sees on a market, since [the two granularities never mix within one](#book).
+- **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; the incremental pair supersedes it with the complete book — `book` on a Market-by-Price feed, [`order_book`](#book) on a Market-by-Order one. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement whichever of the two their markets are served under.
+- **Additive in this revision, so still v1:** the [`order_book`](#book) message type, carrying the Market-by-Order feed's order-level book, and `order_id` on a book change. An existing consumer subscribed to `book` is served exactly the price-aggregated markets it was served before; `order_book` is a type it does not know and ignores. Deliberately a **new type** rather than a new field on `book` — see [*They are separate types*](#book) for why a field would have corrupted such a consumer instead.
 - **Breaking within v1: what `venue` contains changed**, and emission is now gated on a Source ID
   having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
   no removed ones) but change *values* an existing consumer may depend on — see [`source`,

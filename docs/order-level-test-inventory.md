@@ -76,7 +76,7 @@ Collapse, refusal and re-baseline suppression, all decided on the broadcast:
 
 The forced re-baseline a size disagreement raises, and what the republished view may claim:
 
-- `a_size_disagreement_forces_a_rebaseline_rather_than_a_guess` (also asserts `dz_mbo_arm_disagreement_total` and the forced-re-baseline counter)
+- `a_size_disagreement_forces_a_rebaseline_rather_than_a_guess` (also asserts `dz_mbo_path_disagreement_total` and the forced-re-baseline counter)
 - `a_forced_rebaseline_republishes_the_wire_not_an_arms_own_book`
 - `the_arm_that_discharges_a_rebaseline_does_not_own_the_floor_it_seeds`
 - `a_rebaseline_seeds_the_guard_with_its_own_orders` (the drop is the assertion; the counter confirms *why* it was dropped)

@@ -78,19 +78,38 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         }
         FeedMessage::Book(b) => {
             b.ws_send_ts_ns = now;
-            "book"
+            if b.order_level {
+                "order_book"
+            } else {
+                "book"
+            }
+        }
+        FeedMessage::OrderBook(b) => {
+            b.ws_send_ts_ns = now;
+            "order_book"
         }
         FeedMessage::Instrument(_) => "instrument",
         FeedMessage::Status(_) => "status",
     };
-    let payload: Utf8Bytes = serde_json::to_string(&m).ok()?.into();
+    // An order-level batch renders under its own `type`. Only the tag differs — the body is the same
+    // `NormalizedBook` — and the wrap is local to serialization, so the filter fields below are still
+    // read off the original message and no other `match` on `FeedMessage` grows an arm.
+    let payload: Utf8Bytes = match &m {
+        FeedMessage::Book(b) if b.order_level => {
+            serde_json::to_string(&FeedMessage::OrderBook(b.clone())).ok()?
+        }
+        _ => serde_json::to_string(&m).ok()?,
+    }
+    .into();
     let (venue, symbol) = match &m {
         FeedMessage::Instrument(i) => (i.venue.clone(), Some(i.symbol.clone())),
         FeedMessage::Quote(q) => (q.venue.clone(), Some(q.symbol.clone())),
         FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone())),
         FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone())),
         FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone())),
-        FeedMessage::Book(b) => (b.venue.clone(), Some(b.symbol.clone())),
+        FeedMessage::Book(b) | FeedMessage::OrderBook(b) => {
+            (b.venue.clone(), Some(b.symbol.clone()))
+        }
         FeedMessage::Status(s) => (s.venue.clone(), None),
     };
     Some(Arc::new(PreparedFrame {
@@ -298,13 +317,6 @@ fn text(value: serde_json::Value) -> WsMessage {
     WsMessage::Text(value.to_string().into())
 }
 
-/// Replay current full state matching `subs` (empty = everything): instrument definitions first so
-/// precision is known before any book, then the latest `depth` per `(venue, symbol)` and a `book`
-/// re-baseline per `(venue, channel, instrument_id)`.
-///
-/// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
-/// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
-/// state, so the overlap a connect-then-subscribe client sees is harmless.
 /// The scope to bootstrap one market at: **the market's own granularity, always**.
 ///
 /// It is not a client choice. A bootstrap and a stream of different granularity cannot be reconciled
@@ -313,6 +325,16 @@ fn text(value: serde_json::Value) -> WsMessage {
 /// stream itself, which needs every resting order's size and is exactly what the fold discards. The
 /// `book_scope` subscription field offered that choice and is withdrawn; it never shipped in a
 /// release.
+/// The wire `type` one market's book is served under — the same market property `book_scope` reads,
+/// and for the same reason: the bootstrap and the live stream must agree.
+fn book_kind(acc: &BookAccumulator) -> &'static str {
+    if acc.is_order_level() {
+        "order_book"
+    } else {
+        "book"
+    }
+}
+
 fn book_scope(acc: &BookAccumulator) -> ReplayScope {
     if acc.is_order_level() {
         ReplayScope::Orders
@@ -321,6 +343,13 @@ fn book_scope(acc: &BookAccumulator) -> ReplayScope {
     }
 }
 
+/// Replay current full state matching `subs` (empty = everything): instrument definitions first so
+/// precision is known before any book, then the latest `depth` per `(venue, symbol)` and a `book`
+/// re-baseline per `(venue, channel, instrument_id)`.
+///
+/// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
+/// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
+/// state, so the overlap a connect-then-subscribe client sees is harmless.
 async fn replay_scoped<W>(
     write: &mut W,
     instruments: &InstrumentSnapshot,
@@ -370,12 +399,19 @@ where
             // The key's second element is the producer-side arbitration scope (`Feed::category`,
             // which keeps two universes' colliding instrument ids apart in the map); it is not a
             // filter dimension and never reaches the wire.
+            // Filtered and tagged under the market's *own* type, matching the live stream it
+            // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and one
+            // subscribed to `book` alone must not be handed a market it cannot apply.
             .filter(|((venue, _, channel, _), acc)| {
-                pass(venue, acc.symbol(), Some(*channel), "book")
+                pass(venue, acc.symbol(), Some(*channel), book_kind(acc))
             })
             .map(|(key, acc)| {
-                let scope = book_scope(acc);
-                FeedMessage::Book(acc.to_book(key, scope))
+                let book = acc.to_book(key, book_scope(acc));
+                if acc.is_order_level() {
+                    FeedMessage::OrderBook(book)
+                } else {
+                    FeedMessage::Book(book)
+                }
             })
             .collect()
     };
@@ -654,6 +690,7 @@ mod tests {
             symbol: "KXBTCPERP".into(),
             channel: 2,
             instrument_id: 41,
+            order_level: false,
             changes: vec![BookChange {
                 action: BookAction::Update,
                 side: BookSide::Bid,
@@ -1137,6 +1174,7 @@ mod tests {
             symbol: symbol.into(),
             channel: 0,
             instrument_id: 0,
+            order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
             snapshot: false,
             last,
@@ -1225,11 +1263,21 @@ mod tests {
         .ok()
     }
 
+    /// Accepts either book type — the granularity is the market's, and most callers here assert the
+    /// body rather than the tag. `book_type` is what pins the tag.
     fn parse_book(frame: &str) -> NormalizedBook {
         match serde_json::from_str(frame).expect("frame parses") {
-            FeedMessage::Book(b) => b,
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => b,
             other => panic!("expected a book frame, got {other:?}"),
         }
+    }
+
+    /// The wire `type` of a frame, verbatim.
+    fn book_type(frame: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(frame).expect("frame parses")["type"]
+            .as_str()
+            .expect("a type tag")
+            .to_string()
     }
 
     /// A connecting client is bootstrapped with the accumulated `book` state as a re-baseline: a
@@ -1269,6 +1317,158 @@ mod tests {
                 level_update(BookSide::Bid, 0.61, 10.0),
                 level_update(BookSide::Ask, 0.63, 20.0),
             ]
+        );
+
+        srv.abort();
+    }
+
+    /// An order-level accumulator, bootstrappable: a `Clear`-led re-baseline holding two resting
+    /// orders at one price — the population a price-keyed consumer would collapse to one.
+    fn order_level_accumulator(symbol: &str) -> BookAccumulator {
+        let mut acc = BookAccumulator::new(symbol.into());
+        acc.apply(&book_batch(
+            symbol,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 5.0,
+                    order_id: 7,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 3.0,
+                    order_id: 8,
+                },
+            ],
+            true,
+        ));
+        acc
+    }
+
+    /// The wire `type` follows the market's granularity, and **only** the tag differs: a consumer
+    /// routing on `type` never has to inspect a change to learn which product it holds.
+    #[test]
+    fn the_wire_type_follows_the_market_granularity() {
+        use super::prepare;
+        let level = book_batch(
+            "KXBTCPERP",
+            vec![level_update(BookSide::Bid, 0.62, 150.0)],
+            true,
+        );
+        let mut order = level.clone();
+        order.order_level = true;
+        order.changes[0].order_id = 7;
+
+        let plain = prepare(&FeedMessage::Book(level)).expect("serializes");
+        assert_eq!(
+            plain.kind, "book",
+            "a price-aggregated market keeps the type it always had"
+        );
+        let f = prepare(&FeedMessage::Book(order)).expect("serializes");
+        assert_eq!(f.kind, "order_book");
+        assert!(
+            f.payload.as_str().contains(r#""type":"order_book""#),
+            "the rendered tag must match the filter kind, got {}",
+            f.payload.as_str()
+        );
+        // Same envelope either way, so a consumer that does know `order_book` parses it with the body
+        // it already has.
+        assert!(f.payload.as_str().contains(r#""order_id":7"#));
+        // The filter fields are read off the original message, so re-tagging cannot disturb them —
+        // asserted against the price-aggregated frame rather than literals, since losing `channel`
+        // here would silently strip order-level markets from every `{"channel":N}` subscriber.
+        assert_eq!((f.channel, &f.symbol), (plain.channel, &plain.symbol));
+    }
+
+    /// **The compatibility guarantee.** A consumer that subscribes to `type: book` must receive
+    /// neither the bootstrap nor the live stream of an order-level market: keying those changes by
+    /// price collapses two orders resting at one price to the last one's size. A distinct type is the
+    /// mechanism PROTOCOL.md's forward-compatibility rule already promises, which is what makes this
+    /// additive rather than breaking.
+    ///
+    /// Scoped to a client that *asks*, deliberately. The connect-time replay is unfiltered — an empty
+    /// filter list is the documented firehose — so an `order_book` frame does reach a client that
+    /// subscribed to nothing, and safety there rests on it ignoring unknown types, exactly as it does
+    /// for any type added since it was written.
+    #[tokio::test]
+    #[serial]
+    async fn a_book_subscriber_is_never_served_an_order_level_market() {
+        use futures_util::SinkExt;
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("HYPERLIQUID"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
+            order_level_accumulator("BTC"),
+        );
+        // A price-aggregated market beside it, so "received nothing" cannot pass this by accident:
+        // the `book` subscriber must still be bootstrapped with this one.
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u32,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Drain the unfiltered connect replay (both markets) — see the note above.
+        for _ in 0..2 {
+            next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("connect replay");
+        }
+
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"type":"book"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+
+        // The scoped replay: the price-aggregated market, and only it.
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped book replay");
+        assert_eq!(book_type(&frame), "book", "got {frame}");
+        assert_eq!(&*parse_book(&frame).symbol, "KXBTCPERP");
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "the order-level market must not be bootstrapped for a `book` subscription"
+        );
+
+        // And the live stream is filtered by the same one `SubFilter::matches` path.
+        let mut order = book_batch("BTC", vec![level_update(BookSide::Bid, 100.0, 5.0)], true);
+        order.order_level = true;
+        order.changes[0].order_id = 9;
+        let _ = tx.send(Arc::new(FeedMessage::Book(order)));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "a live order-level batch must not reach a `book` subscriber"
         );
 
         srv.abort();
@@ -1323,11 +1523,15 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
             .unwrap();
-        let b = parse_book(
-            &next_frame(&mut ws, Duration::from_secs(2))
-                .await
-                .expect("replayed book"),
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed book");
+        assert_eq!(
+            book_type(&frame),
+            "order_book",
+            "the bootstrap must carry the same type as the stream it precedes"
         );
+        let b = parse_book(&frame);
         assert_eq!(
             b.changes
                 .iter()

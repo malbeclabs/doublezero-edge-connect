@@ -1525,6 +1525,7 @@ mod tests {
             symbol: "BTC".into(),
             channel: 0,
             instrument_id: 7,
+            order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
             snapshot: false,
             last: true,

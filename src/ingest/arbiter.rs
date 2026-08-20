@@ -2270,7 +2270,7 @@ impl Arbiter {
         }
         if disagreed > 0 {
             metrics()
-                .mbo_arm_disagreement
+                .mbo_path_disagreement
                 .with_label_values(&[venue])
                 .inc_by(disagreed);
         }
@@ -2285,11 +2285,12 @@ impl Arbiter {
         // whereas a stranded order is permanent. Depends on `last` being set (both processors
         // always set it): a non-final batch buffers in the accumulator, so its removal would not
         // reach a re-baseline materialized before the event terminates.
-        let stranding = forced.is_some() && !kept.iter().any(|c| c.order_id != 0 && c.size == 0.0);
+        let safe_to_drop =
+            forced.is_some() && !kept.iter().any(|c| c.order_id != 0 && c.size == 0.0);
         if let Some(reason) = forced {
             self.force_rebaseline(&key, &b.venue, reason);
         }
-        if stranding {
+        if safe_to_drop {
             self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
         } else if !kept.is_empty() {
             let out = if kept.len() == b.changes.len() {
@@ -3064,7 +3065,11 @@ impl Arbiter {
             // interleave two arms inside one logical event, and the arms' per-instrument delta series
             // are unrelated by construction — a consumer's book corrupts while every per-arm sequence
             // check the producer ran still passes.
-            FeedMessage::Book(b) => {
+            // `OrderBook` shares this arm rather than getting one of its own: it is a wire tag, and
+            // the gate it needs is identical. Nothing broadcasts it today (`sinks::ws` mints it at
+            // serialization), so this is reachability insurance — one that arbitrates correctly
+            // instead of panicking or bypassing the gate if that ever changes.
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => {
                 // The arbitration scope rides in on the key: one election per instrument universe,
                 // never one per venue (see `authority`'s module doc — a venue-wide election drops a
                 // disjoint universe's whole book stream).
@@ -4581,6 +4586,7 @@ mod tests {
             channel: BOOK_CHANNEL,
             instrument_id,
             category: TEST_CATEGORY.into(),
+            order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
             snapshot: false,
             last,
@@ -5514,6 +5520,7 @@ mod tests {
                 channel,
                 instrument_id,
                 category: TEST_CATEGORY.into(),
+                order_level: changes.iter().any(|c| c.order_id != 0),
                 changes,
                 snapshot: false,
                 last: true,
@@ -5688,6 +5695,7 @@ mod tests {
             channel,
             instrument_id,
             category: TEST_CATEGORY.into(),
+            order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
             snapshot: false,
             last: true,
@@ -5914,7 +5922,7 @@ mod tests {
 
     // ---- order-level (L3) book racing ----
 
-    /// The venue most racing tests use. The two that read `dz_mbo_arm_disagreement_total` name their
+    /// The venue most racing tests use. The two that read `dz_mbo_path_disagreement_total` name their
     /// own instead: that counter is process-global, so sharing a label would make their before/after
     /// deltas depend on test execution order.
     const L3_VENUE: &str = "HYPERLIQUID";
@@ -5959,7 +5967,7 @@ mod tests {
 
     fn disagreements(venue: &str) -> u64 {
         metrics()
-            .mbo_arm_disagreement
+            .mbo_path_disagreement
             .with_label_values(&[venue])
             .get()
     }
