@@ -1,7 +1,7 @@
 //! Empirical validation of the market-by-price decoder against **real captured datagrams**, plus the
 //! cross-codec pinning of the types it inherits from top-of-book.
 //!
-//! Two fixture sets, both real captures of the Lashay publisher (`tests/fixtures/mbp*.bin`, see
+//! Two fixture sets, both real captures of the Kalshi publisher (`tests/fixtures/mbp*.bin`, see
 //! `fixtures/PROVENANCE.md`), because they cover different things:
 //!
 //! * `mbp_*` — the **sharded** feed: three `Channel ID`s on one group, so it is the only sample that

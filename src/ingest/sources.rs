@@ -1,9 +1,9 @@
-//! Transcription of the upstream source registry
-//! (`edge-feed-spec/sources/spec.md`) — the canonical `Source ID` allocation.
+//! A **registry mirror** of the `Source ID` allocation. `edge-feed-spec/sources/spec.md` is the
+//! sole authority; this file is a copy of it and never a second source of truth.
 //!
 //! A Source ID identifies the source whose order book a price was derived from. IDs are stable and
-//! are never reused. This module is the **only** place the registry is mirrored; add a row here when
-//! upstream assigns a new production ID (1-1023).
+//! are never reused. This module is the **only** place that registry is mirrored; add a row here
+//! when upstream assigns a new production ID (1-1023).
 
 use std::{
     collections::HashMap,

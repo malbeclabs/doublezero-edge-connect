@@ -36,7 +36,7 @@ impl Bridge {
     }
 
     /// Like [`Self::spawn`] but appends `extra_args` to the binary's argv — used to point the WS
-    /// **input** feeder at a mock (`--ws-input-url` / `--ws-input-coins`) for the arbitrage E2E.
+    /// **input** at a mock (`--ws-input-url` / `--ws-input-coins`) for the arbitrage E2E.
     pub fn spawn_with_args(venue: &str, ws_port: u16, extra_args: &[&str]) -> Self {
         let bin = env!("CARGO_BIN_EXE_doublezero-edge-connect");
         let ws_addr = format!("127.0.0.1:{ws_port}");

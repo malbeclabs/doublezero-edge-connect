@@ -37,7 +37,7 @@ pub const TRADE_RING: usize = 1_000;
 /// `MAX_PRODUCTS * TRADE_RING * size_of::<Print>()` is 8,192 * 1,000 * 24 B = 187.5 MiB.
 ///
 /// 1,024 was sized against nothing in particular and sat below even one real venue: a single
-/// perps venue alone carries on the order of 1,300 live markets (`ingest::public_feeder`'s own
+/// perps venue alone carries on the order of 1,300 live markets (`ingest::public_input`'s own
 /// `instrument_known` doc), so that venue *alone* was already thrashing this cap before a second
 /// feed's channels were counted. Raised 8x to 8,192 — proportionate to a handful of concurrently
 /// admitted venues/channels rather than to the sports feed's own tens-of-thousands universe, which

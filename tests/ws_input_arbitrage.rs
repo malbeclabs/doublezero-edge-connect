@@ -1,5 +1,5 @@
 //! Backstop-arbitrage E2E: drive the real bridge with **both** the DZ Edge multicast replayer and
-//! the mock Hyperliquid public WS input feeder, and assert the shared arbiter races them correctly.
+//! the mock Hyperliquid public WS input, and assert the shared arbiter races them correctly.
 //!
 //! Two cases, both over the unchanged WS output contract (`ws_client` + `assertions`):
 //!   1. **edge leads in steady state** — the edge feed advances the per-(venue, symbol) floor first,
@@ -65,7 +65,7 @@ fn edge_quote_ticks() -> Vec<u64> {
 /// edge's, content dedup is *not* what drops them; only the floor's leader/stale logic is. The emitted
 /// count therefore equals the edge-only count. Falsifiable: bypass the floor's leader rule and the
 /// distinctive public copy at the high-water tick re-emits, pushing the count past `EDGE_ONLY_QUOTES`.
-/// The test also pins the load-bearing `source_ts = block_time_ms × 1_000_000` identity (the feeder
+/// The test also pins the load-bearing `source_ts = block_time_ms × 1_000_000` identity (the input
 /// reverses it) by asserting every edge tick is an exact ms multiple.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -93,7 +93,7 @@ async fn edge_leads_steady_state_public_dropped() {
     .await
     .unwrap();
 
-    // Let the edge mktdata be fully processed (floor advanced to the max edge tick) and the feeder
+    // Let the edge mktdata be fully processed (floor advanced to the max edge tick) and the input
     // connect/subscribe.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -106,7 +106,7 @@ async fn edge_leads_steady_state_public_dropped() {
     let mut public_bids = Vec::new();
     for (i, &ts) in ticks.iter().enumerate() {
         // The edge derives source_ts = block_time_ms × 1_000_000, so each tick is an exact ms
-        // multiple; pin that identity (the feeder reverses it) and mirror onto the SAME tick.
+        // multiple; pin that identity (the input reverses it) and mirror onto the SAME tick.
         assert_eq!(
             ts % 1_000_000,
             0,
@@ -147,7 +147,7 @@ async fn edge_leads_steady_state_public_dropped() {
 /// This is a gap partway through, not a cold start: `ingest::processor`'s per-instrument deferral holds
 /// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
 /// once (refdata alone never does), so an edge that never once goes live for an instrument gives the
-/// public feeder's precision gate nothing to key against either — that is a feed that was never live
+/// public input's precision gate nothing to key against either — that is a feed that was never live
 /// for the instrument, not a gap in one that was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -184,7 +184,7 @@ async fn edge_gap_public_fills_in() {
     .await
     .unwrap();
     // Let the edge mktdata be fully processed (BTC revealed, floor advanced to the max edge tick)
-    // and the feeder connect.
+    // and the input connect.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Public feed opens two successive ticks AFTER the edge's last real tick (well clear of the

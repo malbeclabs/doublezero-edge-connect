@@ -319,7 +319,7 @@ impl TobProcessor {
     /// plan's own fixtures prove a publisher can mislabel every message it sends), and pinning the
     /// first id forever would leave the new venue with no definition anywhere once the wire moves
     /// on — not on the wire, not in `InstrumentSnapshot`, not in the WS replay map, not in the
-    /// public feeder's precision gate — while quotes/trades kept naming themselves correctly from
+    /// public input's precision gate — while quotes/trades kept naming themselves correctly from
     /// their own verbatim field. Counted in `dz_source_id_changed_total{venue}` (the new venue).
     ///
     /// A Source ID change also PURGES the stale `(old_venue, channel, instrument_id)` entry from
@@ -598,7 +598,7 @@ impl DatagramProcessor for TobProcessor {
                     };
                     // Cross-source dedup happens downstream in the shared arbiter: the per-(venue,
                     // instrument) source_ts latch-to-leader floor races this edge publisher against
-                    // the other edge publishers and the public WS feeder for the tick, emitting only
+                    // the other edge publishers and the public WS input for the tick, emitting only
                     // the leader. `ctx.emit` tags the quote with this datagram's source IP as the
                     // floor's leader identity, and the arbiter keys the BBO identity on the canonical
                     // bbo_hash (incl. the bid_n/ask_n carried on `quote`). (See `ingest::arbiter`.)
@@ -1983,7 +1983,7 @@ struct OpenGroup {
     /// Declining is the ordinary steady state, not an error: a book that is `Ready` and already
     /// past the rotation's `Last Instrument Seq` refuses it (§4.2), and publishers rotate
     /// snapshots continuously. Without this flag every level of every declined rotation scored as
-    /// an orphan, which on the live Lashay perps feed is ~100% of all snapshot levels — burying
+    /// an orphan, which on the live Kalshi perps feed is ~100% of all snapshot levels — burying
     /// the genuine anomaly the orphan counter exists to surface.
     accepted: bool,
 }
@@ -3071,7 +3071,7 @@ mod tests {
     }
 
     // The quote latch-to-leader floor and the trade windowed dedup now live in the shared
-    // `ingest::arbiter` (lifted out of `TobProcessor` so the multicast processors and the WS feeder
+    // `ingest::arbiter` (lifted out of `TobProcessor` so the multicast processors and the WS input
     // converge on one floor per (venue, symbol)). Their unit coverage — leader latch, non-leader
     // drop, stale-tick drop, capacity bound, source_ts==0 bypass, the bbo_hash identity incl.
     // bid_n/ask_n, and the public-loses-to-edge backstop — lives in `arbiter::tests`.
@@ -6807,7 +6807,7 @@ mod tests {
     /// counted apart from orphans rather than summed with them.
     ///
     /// This is the steady state, not an edge case: publishers rotate snapshots continuously, so
-    /// once the books sync every rotation is declined. Measured against the live Lashay perps feed
+    /// once the books sync every rotation is declined. Measured against the live Kalshi perps feed
     /// 2026-08-08, that was ~415 levels/s — 100% of the reference parser's ~410 levels/s — all of
     /// it landing on the orphan counter and burying the genuine anomaly that counter exists to
     /// surface (a lost `SnapshotBegin`, an interleaved group, or the stale era covered by

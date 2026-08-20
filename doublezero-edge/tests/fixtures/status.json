@@ -1,7 +1,7 @@
 {
   "venues": [
     { "venue": "Hyperliquid", "status": "online" },
-    { "venue": "Lashay", "status": "online" },
+    { "venue": "Kalshi", "status": "online" },
     { "venue": "Phoenix", "status": "offline" }
   ],
   "history": {

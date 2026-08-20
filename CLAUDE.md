@@ -54,7 +54,7 @@ instrument snapshot. `main.rs` selects the *candidate* feeds (`--feed`, or all o
 hands everything to the **subscription reconciler** (`ingest::reconcile`), which is the single
 activation authority: it decides *which* of those feeds (plus the WS sink and the shred forwarder)
 actually run, based on what the host is subscribed to. `main.rs`'s top-level `select!` then awaits
-the reconciler plus the independently-spawned public WS input feeders and metrics endpoint; the
+the reconciler plus the independently-spawned public WS inputs and metrics endpoint; the
 process exits only if one of those tasks panics.
 
 **Activation is subscription-driven and dynamic** (`ingest::reconcile` + `ingest::subscriptions`):
@@ -68,10 +68,10 @@ always-on set; a transient CLI error → keep current activations. `--subscripti
 forces the static model. A single feed dying no longer exits the process — the reconciler respawns
 it on the next tick.
 
-Ingest has **two source transports** that converge on one shared `arbiter` before the broadcast:
-the always-on DZ Edge **multicast** receivers, and optional **public WebSocket** feeders (off by
-default) that backstop the edge feed — Hyperliquid (`ingest::ws_feeder`, quotes + trades) and
-Phoenix (`ingest::phoenix_feeder`, trades only). Both transports emit the same `FeedMessage`s and
+Ingest has **two inputs** that converge on one shared `arbiter` before the broadcast:
+the always-on DZ Edge **multicast** receivers, and optional **public WebSocket** inputs (off by
+default) that backstop the edge feed — Hyperliquid (`ingest::ws_input`, quotes + trades) and
+Phoenix (`ingest::phoenix_input`, trades only). Both inputs emit the same `FeedMessage`s and
 race in the arbiter's one per-`(venue, symbol)` floor (see `ingest/arbiter.rs` below), so
 cross-source duplicates collapse and the public copy fills in only when the edge gaps.
 
@@ -81,8 +81,8 @@ Modules are grouped by role under `src/`:
   `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
   `subscriber`, `arbiter`, `authority` + `path_race` (the single-path `book` gate and the cross-path trade
   matcher its re-election runs on), the **`subscriptions`** detector + **`reconcile`** activation loop (which
-  decide what runs — see Architecture above), the optional public feeders (`public_feeder`
-  scaffolding + `ws_feeder`/`phoenix_feeder` venues), and the codecs (`codec`, `codec_common`,
+  decide what runs — see Architecture above), the optional public inputs (`public_input`
+  scaffolding + `ws_input`/`phoenix_input` venues), and the codecs (`codec`, `codec_common`,
   `codec_midpoint`, `codec_mbo`, `codec_mbp`). Intra-pipeline references use `crate::ingest::*`; this half knows
   nothing about how the data is re-served.
 - **`sinks/`** — the output features, each off the hot path so one never affects another: `ws`
@@ -188,7 +188,7 @@ Modules are grouped by role under `src/`:
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
   the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a
   venue's tape is the reconciler's runtime decision (see `reconcile.rs`), because a venue's rows can
-  ride separate groups with separate codes. The two **Lashay** perps rows (`edge-kalshi-perps-tob` TOB
+  ride separate groups with separate codes. The two **Kalshi** perps rows (`edge-kalshi-perps-tob` TOB
   `233.84.178.3:31000/41000`, `edge-kalshi-perps-mbp` MBP `233.84.178.4:32000/42000/52000` — **all three rows'
   ports confirmed against live captures on 2026-08-09**, after all three were found misprovisioned
   (see the port-provenance note in `registry.json`) — both `Sticky`, both
@@ -202,7 +202,7 @@ Modules are grouped by role under `src/`:
   written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
   sibling row's block, with the build green throughout. **The external check is a packet capture**, and
   the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
-  port moves. A third **Lashay** row
+  port moves. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
@@ -412,11 +412,11 @@ Modules are grouped by role under `src/`:
   `emit` increments **pre-resolved per-venue metric children** (cached in the
   `Arbiter`, mirroring the receiver's `SeqEvents`) instead of a per-message `with_label_values`
   label lookup.
-  Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS feeder share
+  Wrapped `Arc<Mutex<Arbiter>>` (`SharedArbiter`) so the multicast receivers and the WS input share
   **one** floor per `(venue, symbol)` and race on it. The wire `venue`/`symbol` are `Arc<str>`
   (venues interned via `model::venue_arc`), so building the dedup key allocates nothing in steady
   state. The quote floor lived inside `TobProcessor` under
-  PR #29; it was lifted here so a different transport (the WS feeder) can race in the same floor.
+  PR #29; it was lifted here so the WS input can race in the same floor.
   **Depth diverges from quotes in one deliberate way: it has NO `source_ts == 0` bypass** (#28). For
   quotes 0 is the "not available" sentinel and is forwarded unlatched; for depth 0 is a *real* state —
   the initial synced-but-empty book each publisher emits right after its snapshot anchor — and the two
@@ -608,13 +608,13 @@ Modules are grouped by role under `src/`:
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
   non-negative). The only `FEEDS` row of that kind is `edge-kalshi-perps-mbp`, whose group is live, so these series
   populate on any host subscribed to it — and report nothing on a host that is not.
-- **`ingest/public_feeder.rs`** — venue-generic **public WS input feeder** scaffolding shared by all
+- **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
   `venue`; no-op when `subscribe_msgs()` is empty; never propagates an error), the frame pump, and the
   decode helpers (`instrument_known`, `parse_decimal`, `finite_non_negative`). Each venue implements
   only its URL + subscribe frames + wire decode.
-- **`ingest/ws_feeder.rs`** — the Hyperliquid `PublicVenue` (off by default), the first public backstop.
+- **`ingest/ws_input.rs`** — the Hyperliquid `PublicVenue` (off by default), the first public backstop.
   Connects `wss://api.hyperliquid.xyz/ws` over TLS, subscribes `bbo` + `trades` per coin on one
   connection, decodes the HL JSON → `FeedMessage`, scales the public block time (ms) to ns so it
   shares the **same canonical `source_ts`** as the edge copy, and emits through the shared arbiter as
@@ -622,7 +622,7 @@ Modules are grouped by role under `src/`:
   shared snapshot (precision before price, supplied by edge refdata). Backstop behavior falls out of
   the floor: edge leads each tick in steady state (public copy dropped as a no-op), public fills in on
   an edge gap — no health check.
-- **`ingest/phoenix_feeder.rs`** — the Phoenix `PublicVenue` (off by default), **trades only** (the
+- **`ingest/phoenix_input.rs`** — the Phoenix `PublicVenue` (off by default), **trades only** (the
   edge Quote is a spline-blended BBO; the public book is resting-only, a different quantity, so no
   quote backstop). Subscribes Phoenix's public `trades` channel per market; Phoenix names each market
   with the **same bare ticker on the edge and public feeds** (edge `instrument_id == public assetId`),
@@ -973,14 +973,14 @@ Modules are grouped by role under `src/`:
   non-empty/present, **and** (for the subscription-gated ones — market-data receivers, the WS sink,
   the shred forwarder) when the reconciler sees the host subscribed to the relevant group. ws
   (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only
-  *activated* when a market-data feed is subscribed; the public WS input feeder is **off** by
+  *activated* when a market-data feed is subscribed; the public WS input is **off** by
   default (on when `--ws-input-coins` is non-empty) and is **not** subscription-gated, and neither is
   the Hyperliquid-compatible sink (**off**, on when `--hl-ws-bind` is non-empty) — it renders whatever
   the broadcast carries, so it has no group of its own to be subscribed to. README has the
   full activation tables.
 - No TLS on the **service surface** — the WebSocket output and multicast input target a trusted/local
   network; terminate TLS at a reverse proxy if exposed. The **one** exception is the outbound
-  `wss://` client in `ingest/ws_feeder.rs` (public HL feed), which uses rustls + bundled webpki roots.
+  `wss://` client in `ingest/ws_input.rs` (public HL feed), which uses rustls + bundled webpki roots.
 
 ## Packaging and release (the `doublezero-edge` CLI)
 

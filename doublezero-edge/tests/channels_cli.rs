@@ -225,7 +225,7 @@ fn channels_set_surfaces_a_400_from_the_admin_surface_verbatim() {
     );
     let admin_url = mock_server(
         "400 Bad Request",
-        r#"{"error":"invalid_channel_filter","message":"channel filter narrows `perps1` (LASHAY/perps), whose publishers bind one base port flat.","remediation":"..."}"#,
+        r#"{"error":"invalid_channel_filter","message":"channel filter narrows `perps1` (KALSHI/perps), whose publishers bind one base port flat.","remediation":"..."}"#,
     );
     let r = run_with_stdin(
         &[

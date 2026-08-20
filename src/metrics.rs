@@ -297,12 +297,12 @@ pub struct Metrics {
     /// (correct) or once per client per batch.
     pub hl_sink_folds: IntCounter,
 
-    // --- Public WS input feeders (per-venue backstops; off by default) ---
-    /// Feeder health per `venue`: 1 while the public WebSocket session is connected, 0 while
+    // --- Public WS inputs (per-venue backstops; off by default) ---
+    /// Input health per `venue`: 1 while the public WebSocket session is connected, 0 while
     /// down/reconnecting.
     pub ws_feeder_up: IntGaugeVec,
     /// Public WS (re)connect cycles per `venue` — incremented each time a session ends or a connect
-    /// attempt fails and the feeder backs off to retry.
+    /// attempt fails and the input backs off to retry.
     pub ws_feeder_reconnects: IntCounterVec,
     /// Public WS frames that failed to decode (undecodable envelope; dropped best-effort), by `venue`.
     pub ws_feeder_decode_errors: IntCounterVec,
@@ -906,7 +906,7 @@ impl Metrics {
             ws_feeder_up: gauge_vec(
                 &registry,
                 "dz_ws_feeder_up",
-                "Public WS input feeder health: 1 while connected, 0 while down/reconnecting",
+                "Public WS input health: 1 while connected, 0 while down/reconnecting",
                 &["venue"],
             ),
             ws_feeder_reconnects: counter_vec(

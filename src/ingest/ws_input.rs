@@ -1,10 +1,10 @@
-//! Hyperliquid **public** WebSocket input feeder — the first [`PublicVenue`] backstop, off by
+//! Hyperliquid **public** WebSocket input — the first [`PublicVenue`] backstop, off by
 //! default.
 //!
 //! It connects to Hyperliquid's own `wss://api.hyperliquid.xyz/ws`, subscribes `bbo` + `trades` per
 //! configured coin, decodes the JSON into the same `FeedMessage`s the multicast pipeline produces,
 //! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. The
-//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_feeder`];
+//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_input`];
 //! this module owns only the Hyperliquid wire decode.
 //!
 //! **Precision before price.** Each public quote/trade is gated on its `(venue, symbol)` instrument
@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
-        public_feeder::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
+        public_input::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
@@ -138,9 +138,9 @@ impl PublicVenue for HyperliquidVenue {
     }
 }
 
-/// Run the Hyperliquid public WS input feeder forever (reconnecting on any failure). Returns
-/// immediately as a no-op when `coins` is empty (the feeder is off by default). Thin wrapper over the
-/// venue-generic [`public_feeder::run`].
+/// Run the Hyperliquid public WS input forever (reconnecting on any failure). Returns
+/// immediately as a no-op when `coins` is empty (the input is off by default). Thin wrapper over the
+/// venue-generic [`public_input::run`].
 pub async fn run(
     url: String,
     coins: Vec<String>,
@@ -157,7 +157,7 @@ pub async fn run(
              some subscriptions may be rejected"
         );
     }
-    public_feeder::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
+    public_input::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
 }
 
 /// Decode one text frame and emit any resulting quote/trade. Unknown channels (e.g.
@@ -516,7 +516,7 @@ mod tests {
     /// The backstop must name itself the way the edge does, or one market becomes two keys in the
     /// arbiter's `(venue, symbol)` dedup floor and both copies reach the wire.
     #[test]
-    fn a_public_feeder_labels_itself_from_the_registry() {
+    fn a_public_input_labels_itself_from_the_registry() {
         let hl = HyperliquidVenue {
             url: DEFAULT_WS_INPUT_URL.to_string(),
             coins: vec!["BTC".to_string()],

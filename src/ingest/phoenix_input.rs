@@ -1,4 +1,4 @@
-//! Phoenix **public-API** WebSocket trade feeder — a [`PublicVenue`] backstop for the edge Phoenix
+//! Phoenix **public-API** WebSocket trade input — a [`PublicVenue`] backstop for the edge Phoenix
 //! multicast TRADE feed, off by default.
 //!
 //! It connects to Phoenix's public `wss://perp-api.phoenix.trade/v1/ws`, subscribes the `trades`
@@ -18,7 +18,7 @@
 //! `bid -> buy` / `ask -> sell`; and the fill's `baseAmount` (size) and `quoteAmount / baseAmount`
 //! (price) equal the edge's size and trade price (every shared fill had `numFills == 1`). So a public
 //! fill tagged `(venue="PHOENIX", symbol, trade_id)` lines up 1:1 with the edge copy and dedups. No
-//! `FEEDS` row depends on this feeder; it stays off until explicitly enabled with
+//! `FEEDS` row depends on this input; it stays off until explicitly enabled with
 //! `--phoenix-ws-input-markets`.
 
 use std::collections::BTreeSet;
@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::{
     ingest::{
         arbiter::{lock, SharedArbiter, Transport},
-        public_feeder::{self, finite_non_negative, resolve_instrument, PublicVenue},
+        public_input::{self, finite_non_negative, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
@@ -280,9 +280,9 @@ fn unix_seconds_to_ns(ts: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Run the Phoenix public-API trade feeder forever (reconnecting on any failure). Returns
-/// immediately as a no-op when `markets` is empty (the feeder is off by default). Thin wrapper over
-/// the venue-generic [`public_feeder::run`].
+/// Run the Phoenix public-API trade input forever (reconnecting on any failure). Returns
+/// immediately as a no-op when `markets` is empty (the input is off by default). Thin wrapper over
+/// the venue-generic [`public_input::run`].
 pub async fn run(
     url: String,
     markets: Vec<String>,
@@ -296,10 +296,10 @@ pub async fn run(
         tracing::info!(
             venue = phoenix_venue(),
             markets = ?markets,
-            "Phoenix public trade feeder backing markets (must match the edge Phoenix symbols verbatim)"
+            "Phoenix public trade input backing markets (must match the edge Phoenix symbols verbatim)"
         );
     }
-    public_feeder::run(PhoenixVenue::new(url, markets), arbiter, instruments).await
+    public_input::run(PhoenixVenue::new(url, markets), arbiter, instruments).await
 }
 
 #[cfg(test)]
@@ -571,7 +571,7 @@ mod tests {
     /// The backstop must name itself the way the edge does, or one market becomes two keys in the
     /// arbiter's `(venue, symbol)` dedup floor and both copies reach the wire.
     #[test]
-    fn a_public_feeder_labels_itself_from_the_registry() {
+    fn a_public_input_labels_itself_from_the_registry() {
         let v = venue(&["SOL"]);
         assert_eq!(
             v.venue(),

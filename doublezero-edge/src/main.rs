@@ -770,8 +770,8 @@ mod tests {
 
     #[test]
     fn build_path_encodes_the_product_id() {
-        let path = build_path(Endpoint::Ticker, &["LASHAY:EAVE#120.1165".to_string()]).unwrap();
-        assert_eq!(path, "/v1/products/LASHAY:EAVE%23120.1165/ticker");
+        let path = build_path(Endpoint::Ticker, &["KALSHI:EAVE#120.1165".to_string()]).unwrap();
+        assert_eq!(path, "/v1/products/KALSHI:EAVE%23120.1165/ticker");
     }
 
     #[test]

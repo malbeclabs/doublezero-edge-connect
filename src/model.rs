@@ -147,7 +147,7 @@ pub struct NormalizedTrade {
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this feed carries. Filterable. `0` for a
     /// source whose wire has no channel concept of its own (the public WS backstops) — see
-    /// `ingest::public_feeder::resolve_instrument`, which resolves the real value from the edge
+    /// `ingest::public_input::resolve_instrument`, which resolves the real value from the edge
     /// catalog instead where one exists.
     #[serde(default)]
     pub channel: u8,
@@ -965,7 +965,7 @@ impl BookReplay {
 /// Every shared mutex in the ingest path (`InstrumentSnapshot`, `DepthSnapshot`, the arbiter) is
 /// held only across panic-free critical sections (`HashMap`/`HashSet` work), so the protected state
 /// is always left consistent. Recovering from poisoning rather than `.lock().unwrap()` keeps an
-/// **unrelated** panic in one ingest task (e.g. the WS feeder) from cascading into every other
+/// **unrelated** panic in one ingest task (e.g. the WS input) from cascading into every other
 /// source the moment it next takes the lock — the failure-isolation contract.
 pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())

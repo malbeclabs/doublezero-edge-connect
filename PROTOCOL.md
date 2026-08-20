@@ -4,8 +4,9 @@ An **engine-agnostic** WebSocket protocol for streaming normalized two-sided top
 (best bid / best ask) market data. It carries the venue and symbol in every message, uses
 plain JSON, and is independent of any trading framework.
 
-`doublezero-edge-connect` is the **reference producer** (it ingests the DoubleZero Edge binary multicast feed
-and re-serves it in this format) - but it is not part of the protocol. Any engine that can open a WebSocket and parse JSON can
+`doublezero-edge-connect` — **the bridge** — is the reference implementation of this protocol's
+producer side (it ingests the DoubleZero Edge binary multicast feed and re-serves it in this format),
+but it is not part of the protocol. Any engine that can open a WebSocket and parse JSON can
 consume it by writing a thin (~50-100 line) adapter to its own internal types. The producer's
 *input* (multicast, binary, etc.) is an implementation detail; only the *output* below is the
 contract.

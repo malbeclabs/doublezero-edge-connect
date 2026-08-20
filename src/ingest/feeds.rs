@@ -429,7 +429,7 @@ mod tests {
         for f in feeds() {
             assert!(!f.code.is_empty(), "{} {:?} has no code", f.venue, f.kind);
         }
-        // Keyed on `(venue, category, kind)` and not on venue alone: Lashay's two rows ride
+        // Keyed on `(venue, category, kind)` and not on venue alone: Kalshi's two rows ride
         // *different* groups, which is what makes tape ownership a runtime decision in the first
         // place.
         for f in feeds() {
@@ -637,9 +637,9 @@ mod tests {
     /// (10901/10903 were derived this way from 10902), and a row that breaks *both* schemes is a
     /// transcription error rather than a new layout.
     ///
-    /// Scoped **per row**, not per venue: Lashay's two rows legitimately use different schemes, and
+    /// Scoped **per row**, not per venue: Kalshi's two rows legitimately use different schemes, and
     /// framing it by scheme rather than by a venue carve-out is what keeps a later Kalshi row from
-    /// re-tripping it. Lashay's exact blocks are pinned by `the_kalshi_rows_expand_consistently_with_the_document`, so
+    /// re-tripping it. Kalshi's exact blocks are pinned by `the_kalshi_rows_expand_consistently_with_the_document`, so
     /// widening this one loses nothing.
     #[test]
     fn publisher_blocks_use_a_known_layout() {
@@ -700,7 +700,7 @@ mod tests {
                 .find(|f| f.venue == "KALSHI" && f.category == "perps" && f.kind == kind)
         };
 
-        let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
+        let tob = row(FeedKind::TopOfBook).expect("Kalshi top-of-book row");
         assert_eq!(tob.code, "edge-kalshi-perps-tob");
         assert_eq!(tob.group, Ipv4Addr::new(233, 84, 178, 3));
         assert_eq!(tob.publishers.len(), 1);
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(tob.publishers[0].ports.refdata(), 41000);
         assert_eq!(tob.publishers[0].ports.snapshot(), None);
 
-        let mbp = row(FeedKind::MarketByPrice).expect("Lashay market-by-price row");
+        let mbp = row(FeedKind::MarketByPrice).expect("Kalshi market-by-price row");
         assert_eq!(mbp.code, "edge-kalshi-perps-mbp");
         assert_eq!(mbp.group, Ipv4Addr::new(233, 84, 178, 4));
         assert_eq!(mbp.publishers.len(), 1);

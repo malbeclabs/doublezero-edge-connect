@@ -199,7 +199,7 @@ before picking the busy/quiet pair).
 concurrent edge-multicast + public-API capture taken 2026-06-30 (`scripts/phoenix_capture.py` on
 branch `bdz/phoenix-capture-script`; raw artifacts archived under
 `worktrees/edge-pcaps/phoenix-capture-20260630/`). They back the Phoenix public-trade backstop
-(`ingest::phoenix_feeder`, #53), its decode golden (`tests/codec_phoenix_fixtures.rs`), and its E2E
+(`ingest::phoenix_input`, #53), its decode golden (`tests/codec_phoenix_fixtures.rs`), and its E2E
 (`tests/phoenix_arbitrage.rs`).
 
 **Why a slice — the source-id filter.** The capture host wildcard-bound `("", 9201/9202)`, so it
@@ -308,7 +308,7 @@ captured epoch is still within the RPC's retention.
 
 ## Market-by-price fixtures
 
-Real captures of the Lashay publisher, datagram magic `0x4442`, taken 2026-08-07 from a host with the
+Real captures of the Kalshi publisher, datagram magic `0x4442`, taken 2026-08-07 from a host with the
 DoubleZero tunnel up. **These are an interim capture** — a longer one with publisher fixes is
 expected, and `tests/codec_mbp_fixtures.rs` asserts invariants rather than recorded counts so a
 re-capture drops in without editing a number. Two sets, because they cover different things.

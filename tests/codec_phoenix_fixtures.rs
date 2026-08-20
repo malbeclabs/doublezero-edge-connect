@@ -2,7 +2,7 @@
 //! (publisher `148.51.122.75`, `source_id=2`) of a concurrent edge+public capture (2026-06-30; see
 //! `fixtures/PROVENANCE.md`) decoded through the real `codec::decode_datagram`.
 //!
-//! This is the ground truth behind the Phoenix public-trade backstop (`ingest::phoenix_feeder`,
+//! This is the ground truth behind the Phoenix public-trade backstop (`ingest::phoenix_input`,
 //! #53): the same capture proved the dedup key — the public `tradeSequenceNumber` equals the edge
 //! on-chain `trade_id` on 257/257 shared fills, and Phoenix names each market with the same bare
 //! ticker on both feeds (edge `instrument_id == public assetId`). The exact `(instrument_id ->
@@ -101,7 +101,7 @@ fn phoenix_refdata_fixture_is_a_complete_manifest_era() {
 /// Every fixture trade is a real Phoenix (`source_id=2`) fill referencing a defined instrument, and
 /// carries the on-chain `trade_id` that the public feed reported as `tradeSequenceNumber` for the
 /// same fill. Pinning the exact `(instrument_id, trade_id)` pairs anchors the dedup key the
-/// `phoenix_feeder` relies on.
+/// `phoenix_input` relies on.
 #[test]
 fn phoenix_mktdata_fixture_trades_validate() {
     let defined: BTreeSet<u32> = definitions().into_keys().collect();

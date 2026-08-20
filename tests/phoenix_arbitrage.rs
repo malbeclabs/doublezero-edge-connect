@@ -1,8 +1,8 @@
 //! Phoenix backstop-arbitrage E2E: drive the real bridge with the `--feed Phoenix` multicast
-//! replayer and the mock Phoenix **public** WS trade feeder, and assert the shared arbiter races
+//! replayer and the mock Phoenix **public** WS trade input, and assert the shared arbiter races
 //! them correctly over the unchanged WS output contract.
 //!
-//! Two cases, both trades only (the Phoenix feeder backstops trades, not quotes):
+//! Two cases, both trades only (the Phoenix input backstops trades, not quotes):
 //!   1. **edge gap → public fills in** — replay the full edge golden (SOL prints real quotes/trades,
 //!      revealing its Source ID — see `ingest::processor`'s per-instrument deferral, which holds a
 //!      `NormalizedInstrument`/price back until the edge has revealed it at least once; an edge that
@@ -17,7 +17,7 @@
 //! Both use the committed Phoenix golden (`phoenix_tob_refdata.bin` / `phoenix_tob_marketdata.bin`,
 //! the clean source_id=2 slice of the 2026-06-30 capture; see `fixtures/PROVENANCE.md`). They are
 //! the live-data half of verification item #1 (public `tradeSequenceNumber` == edge `trade_id`):
-//! the codec golden pins the edge ids, and these prove the feeder keys dedup on the same identity.
+//! the codec golden pins the edge ids, and these prove the input keys dedup on the same identity.
 
 mod common;
 
@@ -62,7 +62,7 @@ fn trades_for<'a>(
 /// This is a gap partway through, not a cold start: `ingest::processor`'s per-instrument deferral holds
 /// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
 /// once (refdata alone never does — see the module docs), so an edge that never once goes live for
-/// an instrument has nothing for the public feeder to key its precision gate against either; that is
+/// an instrument has nothing for the public input to key its precision gate against either; that is
 /// a feed that was never live for the instrument, not a gap in one that was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -100,7 +100,7 @@ async fn phoenix_edge_gap_public_trade_fills_in() {
     })
     .await
     .unwrap();
-    // Let refdata+mktdata be processed (SOL revealed) and the feeder connect.
+    // Let refdata+mktdata be processed (SOL revealed) and the input connect.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Public Phoenix fill during the gap that follows: bid (aggressing buy),
@@ -167,7 +167,7 @@ async fn phoenix_edge_leads_public_trade_deduped() {
     })
     .await
     .unwrap();
-    // Let the edge mktdata be fully processed and the feeder connect/subscribe.
+    // Let the edge mktdata be fully processed and the input connect/subscribe.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Push the public copy of the same fill: same id, distinctive price (base=1, quote=PUBLIC_PRICE).

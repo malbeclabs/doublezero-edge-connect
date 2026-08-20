@@ -90,7 +90,7 @@ fn a_409_ambiguous_response_exits_1() {
         "409 Conflict",
         r#"{"error":"ambiguous_product","message":"matches more than one market","remediation":"Disambiguate using one of the listed candidates.","candidates":["A#1.1","A#1.2"]}"#,
     );
-    let r = run(&["--url", &url, "products", "get", "LASHAY:EAVE-27JAN01-YES"]);
+    let r = run(&["--url", &url, "products", "get", "KALSHI:EAVE-27JAN01-YES"]);
     assert_eq!(r.status, 1, "stdout: {} stderr: {}", r.stdout, r.stderr);
     assert!(r.stderr.contains("ambiguous_product"), "{}", r.stderr);
 }

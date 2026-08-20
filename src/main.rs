@@ -177,16 +177,16 @@ struct Args {
     )]
     shred_dedup_window_slots: u64,
 
-    /// Coins to subscribe on the Hyperliquid **public** WebSocket input feeder, repeatable/
+    /// Coins to subscribe on the Hyperliquid **public** WebSocket input, repeatable/
     /// comma-separated (e.g. `--ws-input-coins BTC,ETH`). This is the backstop arbitrage source: it
     /// races the public feed against the DZ Edge multicast in the shared arbiter, so the edge wins in
     /// steady state and the public copy fills in only when the edge gaps. Empty (the default) leaves
-    /// the feeder off.
+    /// the input off.
     #[arg(long = "ws-input-coins", env = "WS_INPUT_COINS", value_delimiter = ',')]
     ws_input_coins: Vec<String>,
 
-    /// URL for the public WS input feeder. Defaults to Hyperliquid's public endpoint; override to
-    /// point the feeder at a local mock (e.g. in tests).
+    /// URL for the public WS input. Defaults to Hyperliquid's public endpoint; override to
+    /// point the input at a local mock (e.g. in tests).
     #[arg(
         long = "ws-input-url",
         env = "WS_INPUT_URL",
@@ -194,13 +194,13 @@ struct Args {
     )]
     ws_input_url: String,
 
-    /// Phoenix market symbols to back on the **public-API** trade feeder, repeatable/comma-separated
+    /// Phoenix market symbols to back on the **public-API** trade input, repeatable/comma-separated
     /// (bare tickers, e.g. `--phoenix-ws-input-markets SOL,BTC`). Phoenix uses the same symbol on the
     /// edge and public feeds (edge `instrument_id == public assetId`), so these are both the public
     /// subscribe symbols and the edge symbols. This backstop races Phoenix's public trades against the
     /// DZ Edge Phoenix multicast in the shared arbiter (deduped on trade_id), so the edge wins in
     /// steady state and the public copy fills in only when the edge gaps. Trades only — no quote
-    /// backstop. Empty (the default) leaves the feeder off.
+    /// backstop. Empty (the default) leaves the input off.
     #[arg(
         long = "phoenix-ws-input-markets",
         env = "PHOENIX_WS_INPUT_MARKETS",
@@ -208,8 +208,8 @@ struct Args {
     )]
     phoenix_ws_input_markets: Vec<String>,
 
-    /// URL for the Phoenix public WS trade feeder. Defaults to Phoenix's public endpoint; override to
-    /// point the feeder at a local mock (e.g. in tests).
+    /// URL for the Phoenix public WS trade input. Defaults to Phoenix's public endpoint; override to
+    /// point the input at a local mock (e.g. in tests).
     #[arg(
         long = "phoenix-ws-input-url",
         env = "PHOENIX_WS_INPUT_URL",
@@ -623,7 +623,7 @@ async fn main() -> Result<()> {
     // deep clone of the message's owned `String`/`Vec` fields (see `arbiter`/`sinks::ws`).
     let (tx, _rx) = broadcast::channel::<Arc<model::FeedMessage>>(args.ws_broadcast_capacity);
     // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
-    // feeder) emits through this one instance, so cross-source duplicates collapse on one
+    // input) emits through this one instance, so cross-source duplicates collapse on one
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -773,17 +773,17 @@ async fn main() -> Result<()> {
         dedup_window_slots: args.shred_dedup_window_slots,
     };
 
-    // Public WS input feeder: off unless `--ws-input-coins` is non-empty (the source/sink activation
+    // Public WS input: off unless `--ws-input-coins` is non-empty (the source/sink activation
     // convention). It emits through the same shared arbiter as the multicast receivers, so the public
     // feed races the edge per (venue, symbol) tick and backstops it. Failure-isolated: it reconnects
     // internally and never returns, so its churn can't touch the multicast hot path.
     let ws_input = if args.ws_input_coins.is_empty() {
-        info!("public WS input feeder disabled (no --ws-input-coins)");
+        info!("public WS input disabled (no --ws-input-coins)");
         None
     } else {
         info!(coins = ?args.ws_input_coins, url = %args.ws_input_url,
-              "starting public WS input feeder");
-        Some(tokio::spawn(ingest::ws_feeder::run(
+              "starting public WS input");
+        Some(tokio::spawn(ingest::ws_input::run(
             args.ws_input_url.clone(),
             args.ws_input_coins.clone(),
             arbiter.clone(),
@@ -791,16 +791,16 @@ async fn main() -> Result<()> {
         )))
     };
 
-    // Phoenix public-API trade feeder: off unless `--phoenix-ws-input-markets` is non-empty. Same
-    // shape as the HL feeder — its own failure-isolated task emitting through the shared arbiter, so
+    // Phoenix public-API trade input: off unless `--phoenix-ws-input-markets` is non-empty. Same
+    // shape as the HL input — its own failure-isolated task emitting through the shared arbiter, so
     // public trades race the edge Phoenix multicast (deduped on trade_id) and backstop it.
     let phoenix_ws_input = if args.phoenix_ws_input_markets.is_empty() {
-        info!("Phoenix public WS trade feeder disabled (no --phoenix-ws-input-markets)");
+        info!("Phoenix public WS trade input disabled (no --phoenix-ws-input-markets)");
         None
     } else {
         info!(markets = ?args.phoenix_ws_input_markets, url = %args.phoenix_ws_input_url,
-              "starting Phoenix public WS trade feeder");
-        Some(tokio::spawn(ingest::phoenix_feeder::run(
+              "starting Phoenix public WS trade input");
+        Some(tokio::spawn(ingest::phoenix_input::run(
             args.phoenix_ws_input_url.clone(),
             args.phoenix_ws_input_markets.clone(),
             arbiter.clone(),
@@ -880,7 +880,7 @@ async fn main() -> Result<()> {
         .run(),
     );
 
-    // The reconciler, the path sampler and the (independent, config-gated) public feeders + metrics
+    // The reconciler, the path sampler and the (independent, config-gated) public inputs + metrics
     // endpoint all loop forever; the process exits only if one of them panics or the metrics server
     // fails to bind.
     tokio::select! {

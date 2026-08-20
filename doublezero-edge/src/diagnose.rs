@@ -278,10 +278,10 @@ mod tests {
     fn a_present_v1_status_renders_its_venues() {
         let body = json!({
             "diagnostics": diagnostics_fixture(),
-            "status": {"venues": [{"venue": "LASHAY", "status": "online"}]}
+            "status": {"venues": [{"venue": "KALSHI", "status": "online"}]}
         });
         let out = render_diagnose(&body).unwrap();
-        assert!(out.contains("LASHAY"), "{out}");
+        assert!(out.contains("KALSHI"), "{out}");
         assert!(out.contains("online"), "{out}");
     }
 

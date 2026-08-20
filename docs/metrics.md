@@ -97,7 +97,7 @@ Recorded by the Market-by-Price processor (`src/ingest/processor.rs`), which dem
 | `dz_mbp_channel_resets_total` | counter | `venue` | One publisher-and-channel's books discarded on a datagram-header `Reset Count` change — any change, including the `255 -> 0` wrap. Read from the **market-data port only**: the three ports carry the same era on separate sockets, so a shared memo would count one publisher restart once per interleaved datagram of its backlog. |
 | `dz_mbp_buffer_overflows_total` | counter | `venue` | Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer and marked it `Gap`. Sustained means the publisher's snapshot period is too long for this host's memory budget — a tuning signal, not a fault. |
 | `dz_mbp_level_overflows_total` | counter | `venue` | A book discarded on hitting its per-book price-level cap. Deliberately **not** the same series as a sequence gap: the cause is a malformed or forged feed, never packet loss, and the resulting book status differs. |
-| `dz_mbp_orphan_snapshot_levels_total` | counter | `venue` | `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups, a lost `SnapshotBegin`, or a rotation from the publisher's previous era still draining after a restart (its group is refused rather than installed, so the dead session's book is never republished). An **anomaly**: a level that should have been attributable was not. A rotation the book declined is deliberately *not* counted here — see the next row. Measured at ~2.6% of snapshot levels on the live Lashay perps groups (2026-08-08), reproduced independently by `marketbyprice-parser` with zero host-side UDP errors, so upstream loss or reordering rather than a receive-side defect. |
+| `dz_mbp_orphan_snapshot_levels_total` | counter | `venue` | `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups, a lost `SnapshotBegin`, or a rotation from the publisher's previous era still draining after a restart (its group is refused rather than installed, so the dead session's book is never republished). An **anomaly**: a level that should have been attributable was not. A rotation the book declined is deliberately *not* counted here — see the next row. Measured at ~2.6% of snapshot levels on the live Kalshi perps groups (2026-08-08), reproduced independently by `marketbyprice-parser` with zero host-side UDP errors, so upstream loss or reordering rather than a receive-side defect. |
 | `dz_mbp_declined_rotation_levels_total` | counter | `venue` | Levels of a rotation the book **declined** because it is already synced past it (`Ready` and at or beyond the rotation's `Last Instrument Seq`). Expected and benign: publishers rotate snapshots continuously, so in steady state this tracks essentially the whole snapshot-level rate. It exists so that rate stays out of the orphan counter, which otherwise reads ~100% and hides the real anomaly. Alert on the *orphan* series, not this one. |
 | `dz_mbp_duplicate_deltas_total` | counter | `venue` | Deltas discarded as duplicates. **Worth an alert:** a `Ready` book emitting nothing but duplicates is the signature of a baseline installed above the publisher's real counter, which is deliberately not self-healed (only a routed `Reset Count` clears it), so this counter is the only thing that surfaces that wedge. |
 | `dz_mbp_crossed_total` | counter | `venue` | Crossed inside markets observed at a `BatchBoundary`. Observability only, never acted on. |
@@ -203,11 +203,11 @@ Recorded by the WebSocket sink (`src/sinks/ws.rs`).
 | `dz_ws_rate_limited_total` | counter | — | Clients disconnected for exceeding the inbound rate limit. |
 | `dz_ws_idle_timeout_total` | counter | — | Clients reaped for crossing the idle timeout. |
 
-## Public WS input feeders
+## Public WS inputs
 
-Recorded by the optional public WebSocket backstops (Hyperliquid `src/ingest/ws_feeder.rs`, Phoenix
-`src/ingest/phoenix_feeder.rs`; both off by default — see [Input sources](input-sources.md)). Every
-series is labelled by `venue` so multiple feeders don't collide. A feeder's actual contribution to the
+Recorded by the optional public WebSocket backstops (Hyperliquid `src/ingest/ws_input.rs`, Phoenix
+`src/ingest/phoenix_input.rs`; both off by default — see [Inputs](input-sources.md)). Every
+series is labelled by `venue` so multiple inputs don't collide. An input's actual contribution to the
 served feed shows up on the arbiter counters above, attributed to `transport="public"`:
 `dz_quotes_admitted_total` for a quote backstop, `dz_trades_admitted_total` for a trade backstop
 (Phoenix is **trades-only**, so watch the trade counter, not quotes), with `dz_quote_lead_ns` /
@@ -216,7 +216,7 @@ served feed shows up on the arbiter counters above, attributed to `transport="pu
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
 | `dz_ws_feeder_up` | gauge | `venue` | `1` while the public WS session is connected, `0` while down/reconnecting. |
-| `dz_ws_feeder_reconnects_total` | counter | `venue` | (Re)connect cycles — a session ended or a connect attempt failed and the feeder backed off to retry. |
+| `dz_ws_feeder_reconnects_total` | counter | `venue` | (Re)connect cycles — a session ended or a connect attempt failed and the input backed off to retry. |
 | `dz_ws_feeder_decode_errors_total` | counter | `venue` | Public WS frames that failed to decode (dropped best-effort). |
 | `dz_ws_feeder_messages_total` | counter | `venue`, `kind` | Business messages decoded from the public WS and emitted, by `kind` (quote/trade). |
 

@@ -319,7 +319,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disconnect` on `docker stop` never ran and every restart left the onchain session to expire on
   its own. It now matches the values' `Up` suffix, as the installers' new probe does.
 - `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows
-  span more than one category, even when its own category resolves unambiguously (e.g. Lashay's
+  span more than one category, even when its own category resolves unambiguously (e.g. Kalshi's
   single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
   fallback now filters by `(venue, category)` instead of venue alone.
 - `doublezero-edge`'s admin-surface connection failure still said the surface is "off unless
@@ -613,7 +613,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **deliberately declined**, not just genuinely unroutable ones. A book that is `Ready` and already
   past a rotation's `Last Instrument Seq` refuses it by design, but refusing opened no route, so its
   levels fell through the same branch as a lost `SnapshotBegin`. Publishers rotate snapshots
-  continuously, so once the books sync this is the steady state: measured against the live Lashay
+  continuously, so once the books sync this is the steady state: measured against the live Kalshi
   perps groups, it was ~415 levels/s — 100% of the feed's snapshot-level rate — which buried the
   anomaly the counter exists to surface. A declined rotation now holds the route with an `accepted:
   false` marker (so its levels stay attributable and out of a neighbouring instrument's book) and is
@@ -642,7 +642,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Trade-tape ownership is now a **runtime** decision instead of the static `Feed.emit_trades` flag. A venue's feeds can ride separate multicast groups with separate subscription codes, so a host may hold one and not the other and still needs a tape on the wire; both rows now claim trades and the reconciler ranks the running receivers (top of book over market-by-price) and flips an `AtomicBool` each processor reads per print. Ownership therefore moves **without respawning** the receiver that keeps it — a respawn would drop a healthy publisher's books and reference data every time a peer feed's subscription changed. `emit_trades` survives as the static capability claim, pinned against the ranking by a new agreement test in place of `at_most_one_trade_emitting_row_per_venue`. Within the owning row, a **per-venue tape leader** gates `Sticky` venues one level down: those paths share no trade-id space (one may stamp the `trade_id == 0` sentinel while its peer stamps a real venue id, a pair neither the sentinel latch nor the dedup window collapses), so the gate is id-independent: first path to print leads, a path the authority tracks displaces one it does not, the book-elected path takes over once per election, and a silent incumbent yields after 5s so a dead trade feed never mutes the tape. Row ownership is likewise ordered liveness before rank, so a subscribed-but-dead row cannot hold the tape while its peer decodes prints and drops them. Together they preserve the invariant the sentinel bypass rests on: **at most one tape emitter per venue at any moment.** `dz_tape_owner_changes_total`, `dz_tape_path_transfers_total` and `dz_tape_path_dropped_total` report the moves and the drops. Every venue live today is `Coordinated`, so the path gate changes nothing currently running. (#106)
 
 ### Added
-- The two Lashay perps feed rows: `edge-kalshi-perps-tob` top of book on `233.84.178.3:7576/7577` and `edge-kalshi-perps-mbp` market-by-price on `233.84.178.4:31000/41000/51000`, both claiming the tape and both `ArbitrationMode::Sticky`, one publisher block each (the two paths share a block and are told apart by source IP). Both groups are live and activated, so a host subscribed to either code begins ingesting on upgrade. A `code` that does not match its live group fails silently — no warning, no failed bind, just a permanently-zero `dz_receiver_up` — so both rows are pinned against the deployment by a test. The group codes are transcribed verbatim from what the DoubleZero ledger registers today; they are scheduled to be re-registered under new names, and the rows must be updated in the same change that lands the ledger rename, never before it. (#106)
+- The two Kalshi perps feed rows: `edge-kalshi-perps-tob` top of book on `233.84.178.3:7576/7577` and `edge-kalshi-perps-mbp` market-by-price on `233.84.178.4:31000/41000/51000`, both claiming the tape and both `ArbitrationMode::Sticky`, one publisher block each (the two paths share a block and are told apart by source IP). Both groups are live and activated, so a host subscribed to either code begins ingesting on upgrade. A `code` that does not match its live group fails silently — no warning, no failed bind, just a permanently-zero `dz_receiver_up` — so both rows are pinned against the deployment by a test. The group codes are transcribed verbatim from what the DoubleZero ledger registers today; they are scheduled to be re-registered under new names, and the rows must be updated in the same change that lands the ledger rename, never before it. (#106)
 - The incremental `book` product is arbitrated by the single-path authority gate instead of passing through the arbiter undeduped: two paths' per-instrument delta series are unrelated by construction, so publishing both on one feed corrupts a consumer's book while every sequence check the producer ran still passes. It is gated in **both** arbitration modes on purpose — a `source_ts` tick can hold several deltas, so the quote floor's per-tick latch would interleave paths inside one logical event — and there is no mode branch. A change of serving path (margin, silence, or the per-market health override) makes that market's next broadcast a re-baseline, a `clear` plus the new path's complete current level set, emitted lazily on that path's next *completed* logical event rather than as a venue-wide burst of clears; that is why the gate accumulates every eligible path's book and not just the serving one. A re-baseline the gate cannot honestly complete — a path that joined partway through holds only the levels that have moved since — degrades to a bare `clear` rather than claiming completeness, and the WS replay skips those markets for the same reason. Also wires the cross-path trade matcher, the only producer of the matched-lead samples the speed re-election consumes (`--arb-match-window-secs`, `dz_path_unmatched_trades_total`); it races **edge paths the authority already tracks** and nothing else, so the public backstop cannot win authority over a product it never publishes. Open question the matcher inherits: its key is the normalized `(venue, symbol, price, size, aggressor)`, and a wire `symbol` is a truncated 16-byte field, so on a sharded feed two colliding-symbol instruments can mis-pair systematically rather than merely losing a sample — `NormalizedTrade` carries no `instrument_id` to key on instead. Replays each market's accumulated book to a connecting WS client, and re-baselines a client that fell behind (an incremental product does not self-heal on the next message the way `quote`/`depth` do). Nothing exercises it in a running process yet: `MbpProcessor` emits `book` but no `FEEDS` row selects that kind, so behaviour is unchanged. (#105)
 - `MbpProcessor` and the `FeedKind::MarketByPrice` receiver path (mktdata + refdata + snapshot ports), turning decoded market-by-price datagrams into `PriceBook` state and the incremental `book` product. One book per `(publisher, channel, instrument)` — two paths mirror one feed on unrelated per-instrument delta sequences and one group can be sharded across channels, so nothing coarser identifies a book. Snapshot levels route by the open group per channel rather than by `snapshot_id` (monotonic per instrument, so two instruments routinely share a value), `EndOfSession` and a `Reset Count` change are scoped to the emitting path and channel, and a cross-instrument delta-buffer budget drops the largest instrument's buffer rather than the process when a cold start floods it. Seven `dz_mbp_*` counters cover resets, buffer and level overflows, orphaned snapshot levels, duplicate deltas, crossed books and publisher action-vs-quantity divergence — see `docs/metrics.md`, and `docs/input-sources.md` for the per-receiver-task memory caps. No `FEEDS` row selects the kind, so no running process behaves differently. (#104)
 - Single-path arbitration for venues whose two redundant publishers stamp no comparable clock (`ingest::authority`, `ingest::path_race`). Exactly one path is authoritative and its feed is published verbatim. **Speed and silence are judged per path, venue-wide** — latency is a property of a path, so every sample from a source IP counts toward it whatever market carried it — while **health is the one per-market rule**, overriding the elected path for a single market whose book is gapped and reverting when it recovers. Which path is faster comes from `path_race`, a cross-path trade matcher keyed on content with a FIFO per signature (so identical repeats pair in order) that measures the two copies' arrival gap on our own receive clock; the venue's own timestamps are deliberately unused, because a publisher substitutes its own clock when the venue supplies none and a path with no venue timestamp would look fastest by construction. Transfers need a median margin, a win rate and a sample floor to all hold (`--arb-*`). Nothing emits or consumes it yet — no processor wires a caller — so no running process behaves differently. (#98)
@@ -856,7 +856,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the group that delivered first led by). A same-group retransmit stays a plain drop.
   - Recording is always on (only the `/metrics` exposer stays gated by `--metrics-bind`); lead
     times are clamped non-negative.
-- Phoenix public-API trade feeder (`ingest::phoenix_feeder`), an off-by-default backstop for the edge
+- Phoenix public-API trade input (`ingest::phoenix_input`), an off-by-default backstop for the edge
   Phoenix multicast TRADE feed (#53). It subscribes Phoenix's public `trades` channel per market,
   emits `NormalizedTrade`s through the shared arbiter as `Transport::PublicWs` (deduped on
   `trade_id` = the public `tradeSequenceNumber`), and is enabled with `--phoenix-ws-input-markets`
@@ -925,7 +925,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `edge`/`public` — the direct signal of the public backstop filling an edge gap)), the WebSocket
   sink (`dz_ws_clients`, `dz_ws_connections_total`, `dz_ws_messages_sent_total`,
   `dz_ws_bytes_sent_total`, `dz_ws_client_lagged_total`, `dz_ws_inbound_total`,
-  `dz_ws_rate_limited_total`, `dz_ws_idle_timeout_total`), the public WS input feeder
+  `dz_ws_rate_limited_total`, `dz_ws_idle_timeout_total`), the public WS input
   (`dz_ws_feeder_up`, `dz_ws_feeder_reconnects_total`, `dz_ws_feeder_decode_errors_total`,
   `dz_ws_feeder_messages_total`), and the shred forwarder (`dz_shred_*` —
   datagrams and bytes received per group, processed/parsed/unparsed/forwarded/dropped, verify-ok,
@@ -999,7 +999,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error can't drop a datagram bound for a healthy one. A shred-side failure is logged and
   isolated — it never takes the market-data bridge down. Datagrams that fill the recv buffer
   (likely truncated, no `MSG_TRUNC`) are dropped rather than forwarded corrupt (#24).
-- Hyperliquid **public** WebSocket input feeder (`src/ingest/ws_feeder.rs`), a second ingest source
+- Hyperliquid **public** WebSocket input (`src/ingest/ws_input.rs`), a second ingest source
   that backstops the DZ Edge multicast feed (#8). It connects to `wss://api.hyperliquid.xyz/ws` over
   TLS, subscribes `bbo` + `trades` per configured coin on one connection, decodes the HL JSON into the
   same `FeedMessage`s the multicast pipeline produces, and emits them through the shared arbiter as a
@@ -1013,7 +1013,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnect + exponential backoff; decode/socket errors are logged and swallowed), and each public
   quote/trade is gated on its `(venue, symbol)` instrument being known (precision before price). A mock
   HL WS input harness drives two new E2E cases (edge-leads-in-steady-state, edge-gap→public-fills-in).
-  The feeder adds no new WebSocket output fields of its own; it populates the same `bid_n`/`ask_n`
+  The input adds no new WebSocket output fields of its own; it populates the same `bid_n`/`ask_n`
   (from the public `bbo` level's `n`) the edge feed serves.
   - Reconnect backoff resets to the floor only after a session stays up past a minimum duration, so a
     connect-then-immediate-drop loop keeps escalating instead of hammering the public endpoint.
@@ -1114,9 +1114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     allowing GRE + UDP 44880 admits only the *outer* encapsulated packets — the decapsulated inner
     multicast re-traverses `INPUT` on the tunnel interface (`doublezero1`) and must be allowed too
     (`sudo ufw allow in on doublezero1`). Mirrored in `README.md` / `scripts/README.md`.
-- Public-feeder transport scaffolding extracted into a venue-generic `ingest::public_feeder`
+- Public-input transport scaffolding extracted into a venue-generic `ingest::public_input`
   (a `PublicVenue` trait + one reconnecting run loop + shared decode helpers); Hyperliquid
-  (`ingest::ws_feeder`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
+  (`ingest::ws_input`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
   labelled by `venue` so a second venue's series don't collide.
 - Container logs can no longer fill the host disk, and the default is quieter:
   - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with
@@ -1146,7 +1146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README refocused on the **operator**: it now leads with what the bridge does, the install
   one-liner (`curl -fsSL https://get.doublezero.xyz/connect | bash`, plus the testnet/devnet
   variants), and how to configure/override it via environment variables before the pipe. The
-  detailed per-feature reference (self-hosting/from-source + Docker, output sinks, input sources,
+  detailed per-feature reference (self-hosting/from-source + Docker, output sinks, inputs,
   Solana shred forwarding) moved into a new `docs/` directory the README links out to. Removed the
   misleading `https://doublezero.xyz/install` command that contradicted the canonical
   `get.doublezero.xyz/connect` one-liner.
@@ -1176,7 +1176,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The quote latch-to-leader floor and the windowed trade dedup moved out of `TobProcessor` into a
   shared pre-broadcast `Arbiter` (`src/ingest/arbiter.rs`) that owns the broadcast `Sender` and
   exposes one `emit(msg, publisher)` entry point (#8). Every ingest source — each multicast receiver
-  and the new public WS feeder — funnels through one `Arc<Mutex<Arbiter>>`, so they all race on the
+  and the new public WS input — funnels through one `Arc<Mutex<Arbiter>>`, so they all race on the
   same per-`(venue, symbol)` floor instead of each owning a private one. A `Transport { Edge(IpAddr),
   PublicWs }` enum is the floor's leader identity. Behavior-preserving for the edge path (the
   two-publisher and single-publisher counts are unchanged); the refactor itself adds no output fields.

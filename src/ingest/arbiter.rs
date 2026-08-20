@@ -2,7 +2,7 @@
 //!
 //! When several independent sources mirror the same feed — the multicast edge publishers
 //! (demultiplexed by source IP so each one's datagram-sequence state stays separate, see
-//! `receiver`/`processor`) **and** the Hyperliquid public WebSocket feeder ([`crate::ingest::ws_feeder`])
+//! `receiver`/`processor`) **and** the Hyperliquid public WebSocket input ([`crate::ingest::ws_input`])
 //! — they all converge on one [`Arbiter`] just before the broadcast channel. The arbiter deduplicates
 //! the *output* keyed on business identity, so a subscriber sees a clean feed regardless of which
 //! source delivered a given update first. Because every source races through the **same** per-`(venue,
@@ -1349,7 +1349,7 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 /// MBO `depth` through its own latch-to-leader floor (keyed on [`DepthId`] — but with no
 /// `source_ts == 0` bypass, see the `Depth` branch), trades through the [`WindowedDedup`] on `trade_id`,
 /// and everything else (`Instrument`/`Midpoint`/`Status`) is broadcast unchanged. Wrapped in
-/// [`SharedArbiter`] so the multicast receiver tasks and the WS feeder share one instance — hence one
+/// [`SharedArbiter`] so the multicast receiver tasks and the WS input share one instance — hence one
 /// floor per `(venue, symbol)`, on which all sources race.
 pub struct Arbiter {
     /// The backbone carries `Arc<FeedMessage>` so a per-subscriber delivery is a refcount bump, not
@@ -1399,7 +1399,7 @@ pub struct Arbiter {
     venue_metrics: HashMap<Arc<str>, VenueMetrics>,
     /// Per-venue arbitration mode, populated at startup from every `FEEDS` row — not from the
     /// *selected* rows: `emit`'s venue comes from the wire SourceID, so a venue can reach the
-    /// arbiter without its feed being ingested (a remapped SourceID, or a public feeder, neither of
+    /// arbiter without its feed being ingested (a remapped SourceID, or a public input, neither of
     /// which is `--feed`-gated). A venue absent from the map arbitrates as `Coordinated`. Keyed on
     /// the registry's `&'static str` rather than the `Arc<str>` the dedup keys use; lookups borrow
     /// as `&str`, so this needs no `venue_arc` interning.
@@ -2866,7 +2866,7 @@ impl Arbiter {
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
                 // `recv_ts_ns` is the cross-source-comparable arrival clock (host wall clock,
-                // sampled for both the edge receiver and the public WS feeder).
+                // sampled for both the edge receiver and the public WS input).
                 let decision =
                     self.quotes
                         .admit(key, q.source_ts_ns, QuoteId::of(q), publisher, q.recv_ts_ns);
@@ -3185,7 +3185,7 @@ impl Arbiter {
     }
 }
 
-/// Process-wide handle to the one [`Arbiter`]: every multicast receiver task and the WS feeder hold
+/// Process-wide handle to the one [`Arbiter`]: every multicast receiver task and the WS input hold
 /// a clone and lock it for the brief admit-decision-plus-send critical section.
 pub type SharedArbiter = Arc<Mutex<Arbiter>>;
 
@@ -3195,7 +3195,7 @@ pub type SharedArbiter = Arc<Mutex<Arbiter>>;
 /// `HashMap`/`HashSet` work and an ignored `broadcast::send` — so the protected dedup state is always
 /// left consistent. Recovering from poisoning (rather than `.lock().unwrap()`) therefore keeps an
 /// **unrelated** panic in any one ingest task from cascading into every other source: the multicast
-/// receivers' hot path stays isolated from a WS-feeder fault, which is the failure-isolation contract.
+/// receivers' hot path stays isolated from a WS-input fault, which is the failure-isolation contract.
 pub fn lock(arbiter: &SharedArbiter) -> std::sync::MutexGuard<'_, Arbiter> {
     arbiter
         .lock()

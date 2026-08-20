@@ -1709,10 +1709,10 @@ mod tests {
     /// v3 definitions), so a bare definition never reaches `InstrumentSnapshot` on its own
     /// (`ingest::processor`'s per-instrument deferral) — and the capture's own market data covers
     /// neither id (it is filtered to a different instrument), so a minimal synthetic `Trade`
-    /// reveals each one under Lashay's registered Source ID instead.
+    /// reveals each one under Kalshi's registered Source ID instead.
     fn ingest_real_mbp_collision(instruments: &InstrumentSnapshot) {
         const CHANNEL: u8 = 120;
-        const LASHAY_SOURCE_ID: u16 = 3;
+        const KALSHI_SOURCE_ID: u16 = 3;
         let defs = real_mbp_definitions("tests/fixtures/mbp.refdata.bin", &[1165, 1403]);
         assert_eq!(
             defs.len(),
@@ -1729,7 +1729,7 @@ mod tests {
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let publisher = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
         let ctx = |role: PortRole| DatagramCtx {
-            venue: "TestLashay",
+            venue: "TestKalshi",
             category: "testcategory",
             arbiter: &arbiter,
             instruments,
@@ -1755,12 +1755,12 @@ mod tests {
             &ctx(PortRole::Refdata),
         );
 
-        // A definition alone never reaches `InstrumentSnapshot`; reveal each id under Lashay's
+        // A definition alone never reaches `InstrumentSnapshot`; reveal each id under Kalshi's
         // real Source ID via a minimal `Trade` (the capture's own mktdata does not cover either).
         for (n, id) in [1165u32, 1403u32].into_iter().enumerate() {
             let reveal = codec_mbp::tests::enc_trade(&codec_mbp::Trade {
                 instrument_id: id,
-                source_id: LASHAY_SOURCE_ID,
+                source_id: KALSHI_SOURCE_ID,
                 aggressor_side: 0,
                 trade_flags: 0,
                 source_ts: 0,
@@ -3073,7 +3073,7 @@ mod tests {
         }
         // Hyperliquid:BTC has a depth entry (a derivable best level); Phoenix:SOL has neither a
         // book nor a depth entry, so nothing is derivable for it — it must be omitted entirely,
-        // never reported with a fabricated/zeroed level. Lashay:KXBTCPERP has a `BookAccumulator`
+        // never reported with a fabricated/zeroed level. Kalshi:KXBTCPERP has a `BookAccumulator`
         // entry instead, exercising `BookAccumulator::{best_bid, best_ask}` (not just the depth
         // fallback every other case here goes through).
         depth.lock().unwrap().insert(
@@ -3140,16 +3140,16 @@ mod tests {
             .expect("Hyperliquid:BTC present");
         assert_eq!(hl["bids"][0][0], "100.00");
         assert_eq!(hl["asks"][0][0], "101.00");
-        let lashay = pricebooks
+        let kalshi = pricebooks
             .iter()
             .find(|p| p["product_id"] == "KALSHI:KXBTCPERP")
-            .expect("Lashay:KXBTCPERP present");
+            .expect("Kalshi:KXBTCPERP present");
         assert_eq!(
-            lashay["bids"][0][0], "0.6100",
+            kalshi["bids"][0][0], "0.6100",
             "from BookAccumulator::best_bid, not depth"
         );
         assert_eq!(
-            lashay["asks"][0][0], "0.6300",
+            kalshi["asks"][0][0], "0.6300",
             "from BookAccumulator::best_ask, not depth"
         );
     }
@@ -3414,12 +3414,12 @@ mod tests {
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
-    /// registry rung filtered by `(venue, category)` — Lashay's `sports` category carries exactly
+    /// registry rung filtered by `(venue, category)` — Kalshi's `sports` category carries exactly
     /// one `FEEDS` kind and resolves it, same as Phoenix's single-category venue; and `"unknown"`
-    /// — never a guess — for Lashay's `perps` category, which genuinely carries two (Top-of-Book +
+    /// — never a guess — for Kalshi's `perps` category, which genuinely carries two (Top-of-Book +
     /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
     /// category per venue could not express the difference the `(venue, category)` filter makes:
-    /// a venue-wide filter would see Lashay's four rows together (three kinds across two
+    /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
     /// categories) and report `"unknown"` for `sports` too, which would be a false negative for
     /// the very venue this fix targets.
     #[tokio::test]
@@ -3499,13 +3499,13 @@ mod tests {
         assert_eq!(
             kind_of("UNRESOLVED"),
             "unknown",
-            "Lashay's perps category genuinely has two FEEDS kinds and no evidence yet for this \
+            "Kalshi's perps category genuinely has two FEEDS kinds and no evidence yet for this \
              identity — never guess"
         );
         assert_eq!(
             kind_of("SINGLE_CATEGORY"),
             "market_by_price",
-            "Lashay's sports category has exactly one FEEDS kind, distinct from its ambiguous \
+            "Kalshi's sports category has exactly one FEEDS kind, distinct from its ambiguous \
              perps category on the same venue"
         );
     }

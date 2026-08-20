@@ -133,7 +133,7 @@ the `Args` struct in [`src/main.rs`](src/main.rs); per-feature config lives in t
 > A venue whose feeds ride separate groups is gated per group, and its `trade` tape **follows
 > whichever of them is active** — so a host subscribed only to a venue's depth feed still gets a tape,
 > and the pick moves without restarting the receiver that keeps it. See
-> [Input sources](docs/input-sources.md).
+> [Inputs](docs/input-sources.md).
 
 > **Logging defaults.** Unset, `RUST_LOG` defaults to `warn,doublezero_edge_connect=info`: the
 > bridge's own startup/operational lines stay at `info` while noisy dependency chatter is held to
@@ -423,7 +423,7 @@ It reuses this crate's shred forwarder directly; see **[shred-proxy/README.md](s
   [Self-hosting](docs/self-hosting.md) ·
   [Output sinks](docs/output-sinks.md) ·
   [Metrics](docs/metrics.md) ·
-  [Input sources](docs/input-sources.md) ·
+  [Inputs](docs/input-sources.md) ·
   [Shred forwarding](docs/shred-forwarding.md)
 - **[PROTOCOL.md](PROTOCOL.md)** — the WebSocket JSON contract (v1).
 - **[scripts/README.md](scripts/README.md)** — the installer scripts and full env-var reference.

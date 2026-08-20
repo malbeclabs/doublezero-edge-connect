@@ -30,7 +30,7 @@ PRODUCT_ID                        SOURCE       STATUS   FEED_KIND        PRICE_I
 --------------------------------  -----------  -------  ---------------  ----------  ---------
 HYPERLIQUID:BTC                   Hyperliquid  online   top_of_book      0.01        0.00001
 HYPERLIQUID:ETH                   Hyperliquid  offline  top_of_book      0.001       0.0001
-LASHAY:EAVE-27JAN01-YES#120.1165  Lashay       online   market_by_price  0.01        1";
+KALSHI:EAVE-27JAN01-YES#120.1165  Kalshi       online   market_by_price  0.01        1";
     assert_eq!(
         out, expected,
         "\n--- actual ---\n{out}\n--- expected ---\n{expected}"

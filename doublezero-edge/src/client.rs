@@ -277,12 +277,12 @@ mod tests {
     }
 
     /// The one byte that must never survive unescaped: left alone, a URL parser reads `#` as the
-    /// start of a fragment, so `LASHAY:EAVE-27JAN01-YES#120.1165` would arrive at the server missing
+    /// start of a fragment, so `KALSHI:EAVE-27JAN01-YES#120.1165` would arrive at the server missing
     /// everything from `#` onward.
     #[test]
     fn a_disambiguation_suffix_hash_is_percent_encoded() {
-        let got = encode_path_segment("LASHAY:EAVE-27JAN01-YES#120.1165");
-        assert_eq!(got, "LASHAY:EAVE-27JAN01-YES%23120.1165");
+        let got = encode_path_segment("KALSHI:EAVE-27JAN01-YES#120.1165");
+        assert_eq!(got, "KALSHI:EAVE-27JAN01-YES%23120.1165");
         assert!(!got.contains('#'));
     }
 
