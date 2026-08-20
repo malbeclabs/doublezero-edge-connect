@@ -50,7 +50,7 @@ struct Args {
 
     /// Channels to ingest, scoped per group code: `edge-kalshi-sports-mbp=10,11;edge-kalshi-perps-tob=2`. An unmentioned
     /// feed ingests every channel. Ids are the contract and are validated against the feed's
-    /// roster at startup; channel *names* are not mirrored here — they live in the publisher's
+    /// published set at startup; channel *names* are not mirrored here — they live in the publisher's
     /// inventory by design and have already moved once. Use `doublezero-edge channels list` to
     /// see what a bound channel actually contains.
     ///
@@ -1081,7 +1081,7 @@ mod tests {
     /// The regression this pins: a `--publisher-port` + `--channels` combination that empties an
     /// enabled feed while both, taken alone, are valid against the whole registry. `--publisher-port`
     /// keeps only the sports (`edge-kalshi-sports-mbp`) feed's channel-10 publisher; `--channels edge-kalshi-sports-mbp=11` is a
-    /// perfectly valid clause against the full 31-channel roster, but channel 11's publisher was
+    /// perfectly valid clause against the full 31-channel published set, but channel 11's publisher was
     /// never in the narrowed `enabled` set to begin with, so it admits nothing.
     #[test]
     fn a_publisher_port_and_channel_filter_combo_that_empties_a_feed_is_refused() {
@@ -1094,7 +1094,7 @@ mod tests {
             .publishers
             .iter()
             .find(|p| p.channel == Some(10))
-            .expect("channel 10 is in the sports roster")
+            .expect("channel 10 is in the sports published set")
             .base_port();
 
         let enabled = filter_publishers(
@@ -1108,7 +1108,7 @@ mod tests {
             "only the sports feed's channel-10 publisher should remain"
         );
 
-        // Individually valid against the whole registry (11 is in the sports roster), but it names
+        // Individually valid against the whole registry (11 is in the sports published set), but it names
         // a channel that --publisher-port already excluded.
         let filter =
             ingest::channel_filter::ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
@@ -1131,7 +1131,7 @@ mod tests {
             .publishers
             .iter()
             .find(|p| p.channel == Some(10))
-            .expect("channel 10 is in the sports roster")
+            .expect("channel 10 is in the sports published set")
             .base_port();
 
         let enabled = filter_publishers(

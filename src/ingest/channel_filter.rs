@@ -31,7 +31,7 @@
 //! - **Ids are the contract; names are not.** Channel *names* live in the publisher's inventory by
 //!   design — they have already moved once, and a copy here would drift exactly as four superseded
 //!   port allocations did. The channel filter takes numeric ids and validates them against the
-//!   roster in the **loaded document**, so a typo fails startup instead of filtering nothing.
+//!   published set in the **loaded document**, so a typo fails startup instead of filtering nothing.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -54,7 +54,7 @@ pub struct ChannelFilter {
 #[derive(Debug, Clone)]
 struct Selection {
     ids: BTreeSet<u8>,
-    roster_size: usize,
+    published_set_size: usize,
 }
 
 /// Why a channel filter was refused at startup.
@@ -76,17 +76,17 @@ pub enum FilterError {
     EmptySelection { code: String },
     /// An id that is not a number in `0..=255`.
     BadId { code: String, text: String },
-    /// An id outside the roster of one of the feeds carrying the code.
+    /// An id outside the published set of one of the feeds carrying the code.
     ///
     /// Carries the offending **feed**, not just the code: one clause narrows every feed that
-    /// carries its code, so the id has to be legal for all of them, and "not in the roster" is only
+    /// carries its code, so the id has to be legal for all of them, and "not in the published set" is only
     /// actionable if the operator is told which feed.
     UnknownChannel {
         code: String,
         venue: String,
         category: String,
         id: u8,
-        roster: Vec<u8>,
+        published_set: Vec<u8>,
     },
     /// A feed whose publishers bind a base flat — narrowing it is refused, not implemented.
     FlatRow {
@@ -129,16 +129,16 @@ impl std::fmt::Display for FilterError {
                 venue,
                 category,
                 id,
-                roster,
+                published_set,
             } => write!(
                 f,
-                "channel filter names channel {id} on `{code}`, which is not in the roster of \
+                "channel filter names channel {id} on `{code}`, which is not in the published set of \
                  {venue}/{category}. Every feed carrying a code is narrowed by the same clause, so \
-                 an id must be in every one of their rosters: an id in none of them binds a port no \
+                 an id must be in every one of their published sets: an id in none of them binds a port no \
                  publisher sends to (which reads as a dead feed rather than as a typo), and an id \
-                 in only some leaves the remaining feeds binding no socket at all. Roster of \
+                 in only some leaves the remaining feeds binding no socket at all. Published set of \
                  {venue}/{category}: {}",
-                roster
+                published_set
                     .iter()
                     .map(u8::to_string)
                     .collect::<Vec<_>>()
@@ -163,7 +163,7 @@ impl std::fmt::Display for FilterError {
 impl std::error::Error for FilterError {}
 
 /// The channel ids a feed's publishers were derived from, ascending. Empty for a flat feed.
-fn roster(f: &Feed) -> BTreeSet<u8> {
+fn published_set(f: &Feed) -> BTreeSet<u8> {
     f.publishers.iter().filter_map(|p| p.channel).collect()
 }
 
@@ -178,8 +178,8 @@ impl ChannelFilter {
     /// Parse `<code>=<id>[,<id>...][;<code>=...]`, resolving and validating against the **loaded**
     /// registry document.
     ///
-    /// Validation is against the document rather than a compiled-in list on purpose: the roster is
-    /// the publisher's to change, so the only roster this process can honestly check an id against
+    /// Validation is against the document rather than a compiled-in list on purpose: the published set is
+    /// the publisher's to change, so the only published set this process can honestly check an id against
     /// is the one it is about to bind. This is also where the trust boundary the loadable registry
     /// moved gets re-established — an id is now operator input reaching a set of feeds that are
     /// themselves operator input, and neither the compiler nor the test suite can see either.
@@ -191,9 +191,9 @@ impl ChannelFilter {
     ///
     /// Separate from [`ChannelFilter::parse`] so the tests can supply their own feeds. The property
     /// that decides this function's hardest case — one code spanning several **derived** feeds with
-    /// **different** rosters — is not expressible in the built-in document, and a test that cannot
+    /// **different** published sets — is not expressible in the built-in document, and a test that cannot
     /// construct it cannot fail on it. That is not hypothetical: validating against the union of the
-    /// rosters passed every test written against the built-in document while leaving a feed bound to
+    /// published sets passed every test written against the built-in document while leaving a feed bound to
     /// nothing.
     fn parse_within(feed_rows: &'static [Feed], spec: &str) -> Result<ChannelFilter, FilterError> {
         let mut admitted: HashMap<&'static str, Selection> = HashMap::new();
@@ -223,14 +223,14 @@ impl ChannelFilter {
             let code: &'static str = first.code;
 
             // Per feed, never merged. The flat-feed refusal has to see each feed's own shape, and
-            // the id check below has to see each feed's own roster: an id legal for one feed and
+            // the id check below has to see each feed's own published set: an id legal for one feed and
             // not another is not a partial narrowing, it is a feed narrowed to **zero**
             // publishers — which binds nothing, and, if it is the only enabled feed, takes the WS
             // sink and the query API down with it (they come up only when a market-data feed is
             // running).
-            let mut rosters: Vec<(&'static Feed, BTreeSet<u8>)> = Vec::new();
+            let mut published_sets: Vec<(&'static Feed, BTreeSet<u8>)> = Vec::new();
             for f in &matching {
-                let r = roster(f);
+                let r = published_set(f);
                 if r.is_empty() {
                     return Err(FilterError::FlatRow {
                         code: code.to_string(),
@@ -238,7 +238,7 @@ impl ChannelFilter {
                         category: f.category.to_string(),
                     });
                 }
-                rosters.push((f, r));
+                published_sets.push((f, r));
             }
 
             let mut wanted = BTreeSet::new();
@@ -254,14 +254,14 @@ impl ChannelFilter {
                     code: code.to_string(),
                     text: id.to_string(),
                 })?;
-                for (f, r) in &rosters {
+                for (f, r) in &published_sets {
                     if !r.contains(&id) {
                         return Err(FilterError::UnknownChannel {
                             code: code.to_string(),
                             venue: f.venue.to_string(),
                             category: f.category.to_string(),
                             id,
-                            roster: r.iter().copied().collect(),
+                            published_set: r.iter().copied().collect(),
                         });
                     }
                 }
@@ -272,18 +272,18 @@ impl ChannelFilter {
                     code: code.to_string(),
                 });
             }
-            // Every id is in every feed's roster and there is at least one, so each of these feeds
+            // Every id is in every feed's published set and there is at least one, so each of these feeds
             // keeps at least one publisher by construction. That is the invariant the per-feed
             // check above exists to establish, not a coincidence of the ids an operator happened to
             // pick.
-            let roster_size = rosters
+            let published_set_size = published_sets
                 .iter()
                 .flat_map(|(_, r)| r.iter().copied())
                 .collect::<BTreeSet<u8>>()
                 .len();
             let selection = Selection {
                 ids: wanted,
-                roster_size,
+                published_set_size,
             };
             if admitted.insert(code, selection).is_some() {
                 return Err(FilterError::RepeatedCode {
@@ -326,7 +326,7 @@ impl ChannelFilter {
         self.admitted.is_empty()
     }
 
-    /// What this channel filter narrowed, for the startup log: `code=admitted of roster`. Which
+    /// What this channel filter narrowed, for the startup log: `code=admitted of published set`. Which
     /// channels a process actually bound is the first question a "why is this market missing"
     /// report asks.
     ///
@@ -337,7 +337,7 @@ impl ChannelFilter {
         let mut out: Vec<String> = self
             .admitted
             .iter()
-            .map(|(code, s)| format!("{code}={} of {}", s.ids.len(), s.roster_size))
+            .map(|(code, s)| format!("{code}={} of {}", s.ids.len(), s.published_set_size))
             .collect();
         out.sort();
         out
@@ -403,7 +403,7 @@ mod tests {
     }
 
     /// The other half of the same property, and the one that fails if `publishers_for` ever starts
-    /// filtering a feed nobody narrowed: an unmentioned feed binds its whole roster.
+    /// filtering a feed nobody narrowed: an unmentioned feed binds its whole published set.
     #[test]
     fn an_unmentioned_feed_binds_every_publisher() {
         let feed = feeds().iter().find(|f| f.category == "sports").unwrap();
@@ -415,10 +415,10 @@ mod tests {
         );
     }
 
-    /// An id outside the feed's roster is a startup error. Silently admitting it would bind a port
+    /// An id outside the feed's published set is a startup error. Silently admitting it would bind a port
     /// no publisher sends to, which reads as a dead feed rather than as a typo.
     #[test]
-    fn an_id_outside_the_roster_is_rejected() {
+    fn an_id_outside_the_published_set_is_rejected() {
         let err = ChannelFilter::parse("edge-kalshi-sports-mbp=10,63").unwrap_err();
         assert!(
             matches!(err, FilterError::UnknownChannel { id: 63, .. }),
@@ -471,7 +471,7 @@ mod tests {
     // measures neither of them.
     // -------------------------------------------------------------------------------------------
 
-    /// A derived feed with the given roster, leaked so it can join a `&'static [Feed]`.
+    /// A derived feed with the given published set, leaked so it can join a `&'static [Feed]`.
     fn derived_row(code: &'static str, category: &'static str, channels: &[u8]) -> Feed {
         let pubs: Vec<FeedPublisher> = channels
             .iter()
@@ -528,8 +528,8 @@ mod tests {
     /// binds zero sockets, and if it is the only enabled feed the WS sink and query API go down
     /// with it, since both activate only while a market-data feed is running.
     ///
-    /// Validating against the union of the rosters accepted exactly this. The refusal must name the
-    /// feed it would have emptied, or "not in the roster" is unactionable when several feeds share a
+    /// Validating against the union of the published sets accepted exactly this. The refusal must name the
+    /// feed it would have emptied, or "not in the published set" is unactionable when several feeds share a
     /// code.
     #[test]
     fn an_id_missing_from_one_feed_of_a_shared_code_is_refused() {
@@ -538,7 +538,7 @@ mod tests {
             derived_row("shared", "extras", &[10, 12]),
         ]);
 
-        // 11 is in the first feed's roster and not the second's. Under the union rule this parsed
+        // 11 is in the first feed's published set and not the second's. Under the union rule this parsed
         // cleanly and left `extras` with no publisher at all.
         let err = ChannelFilter::parse_within(doc, "shared=11").unwrap_err();
         assert!(
@@ -644,7 +644,7 @@ mod tests {
     }
 
     /// A non-numeric id is a typo, not a name: names deliberately do not live in this repo, so
-    /// accepting one would mean mirroring a roster that has already moved once upstream.
+    /// accepting one would mean mirroring a published set that has already moved once upstream.
     #[test]
     fn a_channel_name_is_rejected_as_an_id() {
         let err = ChannelFilter::parse("edge-kalshi-sports-mbp=nfl").unwrap_err();

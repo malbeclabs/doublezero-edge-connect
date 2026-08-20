@@ -1090,9 +1090,9 @@ fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
 
 /// The `channels` block: per enabled row that carries a channel id (i.e. every row except a flat
 /// one — see `ingest::channel_filter`'s docs for why a flat row has no channel concept to narrow), the
-/// row's full channel roster with whether the filter admits it, whether a receiver is genuinely
-/// **bound** for it, and how many products it currently holds in `history::Store` — plus a total
-/// count of channels this filter excludes.
+/// row's full published set of channels with whether the filter admits it, whether a receiver is
+/// genuinely **bound** for it, and how many products it currently holds in `history::Store` — plus
+/// a total count of channels this filter excludes.
 ///
 /// "Bound" is read off the real receiver liveness (`SharedFeedHealth::liveness`, keyed exactly as
 /// the reconciler keys its own receiver map), not off `ChannelFilter::admits` alone. Task 5's admin
@@ -3757,7 +3757,7 @@ mod tests {
     async fn status_channels_block_distinguishes_admission_from_real_liveness() {
         let (instruments, depth, books, history, health, _filter, _enabled) = empty_state();
         let row = sports_row();
-        // Admits channels 10 and 11 of the sports row's 31-channel roster; every other channel
+        // Admits channels 10 and 11 of the sports row's 31-channel published set; every other channel
         // (12 included) is excluded by the filter.
         let filter = Arc::new(Mutex::new(
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
@@ -3851,7 +3851,7 @@ mod tests {
 
         assert_eq!(
             row_json["excluded"], 29,
-            "31-channel roster minus the 2 admitted: {row_json}"
+            "31-channel published set minus the 2 admitted: {row_json}"
         );
         assert_eq!(
             body["channels"]["excluded_by_filter"], 29,
@@ -3891,7 +3891,7 @@ mod tests {
 
     /// One `derived`-shaped publisher for a test `Feed` row, carrying a channel id and (optionally)
     /// a display label — the server-side counterpart of what `ingest::registry::expand` produces
-    /// from a document roster.
+    /// from a document published set.
     fn channel_pub(base: u16, channel: u8, label: Option<&'static str>) -> FeedPublisher {
         FeedPublisher {
             ports: FeedPorts::ThreePort {

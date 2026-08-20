@@ -1,11 +1,11 @@
 {
   "version": 1,
   "notes": [
-    "The feed registry as data. Which group carries which feed, on which ports, with which channel",
-    "roster, is the publisher's to decide and it changes without our involvement. This document is",
-    "supplied to the container at runtime (--feed-registry-url, --feed-registry) and this copy is",
-    "only the compiled-in fallback, so the container runs standalone and has a last-known-good to",
-    "fall back to when a fetch fails.",
+    "The feed registry as data. Which group carries which feed, on which ports, with which published",
+    "set of channels, is the publisher's to decide and it changes without our involvement. This",
+    "document is supplied to the container at runtime (--feed-registry-url, --feed-registry) and this",
+    "copy is only the compiled-in fallback, so the container runs standalone and has a",
+    "last-known-good to fall back to when a fetch fails.",
     "",
     "The authoritative fleet list is the feed-capture recorder inventory in the private infra repo,",
     "NOT the publisher deployment inventory - the latter covers only a subset of the hosts on the",
@@ -22,9 +22,9 @@
     "just a receiver that never starts. A wrong port fails the same way, one layer down.",
     "",
     "`publishers` is a tagged union. `explicit` carries port blocks verbatim; `derived` carries a",
-    "channel roster plus per-plane bases and expands to `base + id` per channel, one publisher per",
-    "channel. Adding a field to this schema is a version bump: an older binary must reject a document",
-    "it does not fully understand rather than silently ignore half of it."
+    "published set of channels plus per-plane bases and expands to `base + id` per channel, one",
+    "publisher per channel. Adding a field to this schema is a version bump: an older binary must",
+    "reject a document it does not fully understand rather than silently ignore half of it."
   ],
   "feeds": [
     {
@@ -186,7 +186,7 @@
         "One publisher per row: the two paths share a port block and are distinguished, for",
         "producer-side state (RefDataState, sequence tracking), only by datagram source IP.",
         "",
-        "MIRROR. A second publisher mirrors the whole roster on that SAME port block, stamping",
+        "MIRROR. A second publisher mirrors the whole published set on that SAME port block, stamping",
         "every wire channel_id raised by 100 - confirmed live on 2026-08-11 from a product catalog",
         "listing every market twice, at channel N and channel N+100. publisher_offset records that",
         "for ingest: it canonicalises the mirror's channel id back to the base publisher's for",
@@ -233,7 +233,7 @@
         "ranges - the upstream allocation is mid-migration and any numeric gap between the universes",
         "is a coincidence of current numbering, owned upstream and enforced nowhere in our code.",
         "",
-        "ROSTER. One channel is a league or a sport, and each is an independent state machine with",
+        "PUBLISHED SET. One channel is a league or a sport, and each is an independent state machine with",
         "its own Reset Count, sequence series, Manifest Seq and snapshot cycle - so one channel maps",
         "to one publisher and therefore one receiver task with its own processor state and books.",
         "Ids are permanent from first publication: promoting a competition out of a tag channel takes",
@@ -255,7 +255,7 @@
         "correcting it is an edit to this document, not a rebuild.",
         "",
         "DEPLOYMENT. One publisher per channel and no failover today. A second publisher takes this",
-        "same roster with every id offset by +100, leaving the ports untouched - the port names the",
+        "same published set with every id offset by +100, leaving the ports untouched - the port names the",
         "league so a subscriber binds one socket per league and hears both publishers on it, while",
         "channel_id names the league AND the publisher so the two are sequenced separately.",
         "publisher_offset records that +100 for ingest: it canonicalises the mirror's channel id back",
@@ -264,14 +264,14 @@
         "not yet published, which is why this document carries no row for it.",
         "",
         "SOURCE ADDRESSES. Two, confirmed by a warehouse capture on 2026-08-11: both publishers",
-        "carry the WHOLE roster, mirroring each other, and are separated by the channel offset above.",
+        "carry the WHOLE published set, mirroring each other, and are separated by the channel offset above.",
         "An earlier capture (2026-08-09) saw one address and the note here said so; the second host",
         "came up between them, so treat any count recorded here as of its date and re-measure.",
         "",
         "That two-publisher shape is the one the book gate is built for - it elects one per",
         "(venue, category) and drops the peer's copy. What would break it is a publisher PER CHANNEL,",
         "since 31 addresses on one (venue, category) would leave one channel served and thirty",
-        "dropped. That is not the deployment: the roster is mirrored, not sharded."
+        "dropped. That is not the deployment: the published set is mirrored, not sharded."
       ],
       "publishers": {
         "derived": {

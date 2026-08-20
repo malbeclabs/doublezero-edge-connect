@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(
             kept.len(),
             1,
-            "channel {channel} must be in the sports roster exactly once"
+            "channel {channel} must be in the sports published set exactly once"
         );
         Feed {
             publishers: Box::leak(kept.into_boxed_slice()),
@@ -621,7 +621,7 @@ mod tests {
     /// An invalid spec is a `400` and the channel filter is left exactly as it was — never a
     /// partial apply, and never a silent reset to default. Starts from a **non-empty** channel
     /// filter (a prior valid `POST`) so an implementation that resets to empty on error cannot pass
-    /// by coincidence — the failure mode I4 exists to catch. An id outside the feed's roster is one
+    /// by coincidence — the failure mode I4 exists to catch. An id outside the feed's published set is one
     /// of `ChannelFilter::parse`'s refusals; reusing it here (rather than a second, laxer check) is
     /// what this test actually pins.
     #[tokio::test]
@@ -653,7 +653,8 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(format!("{base}/admin/channels"))
             .header(REQUIRED_HEADER, "1")
-            .query(&[("channels", "edge-kalshi-sports-mbp=250")]) // 250 is well outside the 31-channel roster
+            // 250 is well outside the 31-channel published set
+            .query(&[("channels", "edge-kalshi-sports-mbp=250")])
             .send()
             .await
             .unwrap();

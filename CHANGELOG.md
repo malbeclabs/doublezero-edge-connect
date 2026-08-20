@@ -349,7 +349,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the receivers, but leaves their data alone to resync onto once the subscription returns.
 - A mirror publisher that raises every channel id by a fixed offset on the same ports (registry
   `derived.publisher_offset`) minted a second catalog/history/book entry under the raised id, half
-  of which a departure purge could never reach (it purges by the registry's roster id alone),
+  of which a departure purge could never reach (it purges by the registry's published set id alone),
   leaving them served forever. Ingest now canonicalises the wire channel to the base id for every
   consumer-facing identity — catalog, history, book, product id — while producer-side state (books,
   sequence tracking, reset counts) stays keyed on the raw wire channel, since the two paths are
@@ -481,7 +481,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the file source's documented contract.
 - An `explicit` publisher list left empty in the document installed a row with zero publishers —
   no error, no receivers, and a healthy-looking `rows=1 receivers=0` log line. It is now rejected
-  the same way an empty `derived` roster already was.
+  the same way an empty `derived` published set already was.
 - The feed registry fetch had no bound on response size, so a hostile or compromised endpoint could
   OOM the process instead of ever reaching the built-in fallback, and then crash-loop re-fetching on
   restart. The fetch is now capped, checking both a declared `Content-Length` and the accumulated

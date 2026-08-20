@@ -134,15 +134,15 @@ pub struct FeedPublisher {
     /// row too — turning the coincidence above into a guarantee of being wrong.
     pub channel: Option<u8>,
     /// A short human label for this channel (e.g. `"sports.nfl"`), carried verbatim from the
-    /// document's `derived.channels` roster when that entry supplied one. `None` for every publisher
+    /// document's `derived.channels` published set when that entry supplied one. `None` for every publisher
     /// today: the built-in document ships with no labels (the upstream inventory that owns them is
     /// still being made reachable at runtime), and an `explicit` block has no channel concept to
     /// label at all.
     ///
     /// **Display only.** It is never used for lookup, matching or identity — the channel **id** is
-    /// the only contract — and it is not accepted anywhere a channel id is expected. A `range` roster
+    /// the only contract — and it is not accepted anywhere a channel id is expected. A `range`
     /// entry may never carry one (a range names many channels, not one), which the schema enforces
-    /// structurally: only the single-id roster shape has a `label` field at all, so a `label`
+    /// structurally: only the single-id shape has a `label` field at all, so a `label`
     /// written on a `range` entry lands in that entry's unknown-keys map and is warned about like any
     /// other unrecognised key, never applied.
     pub label: Option<&'static str>,
@@ -213,7 +213,7 @@ pub struct Feed {
     /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
     pub arbitration: ArbitrationMode,
-    /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
+    /// A second publisher mirrors this row's whole published set on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount (`publisher_offset` in the document, a row-level
     /// field — an `explicit` row can declare it exactly like a `derived` one) — so the socket
     /// bound for channel `N` also receives datagrams stamped `N + offset`. `None` for every row with
@@ -323,9 +323,9 @@ mod tests {
     /// retired on 2026-08-08 and are never reissued. An id here that the publisher does not
     /// send binds a socket that stays silent, which reads as a dead publisher.
     #[test]
-    fn the_sports_roster_is_the_published_thirty_one() {
+    fn the_sports_published_set_is_thirty_one_channels() {
         let ids = sports_channel_ids();
-        assert_eq!(ids.len(), 31, "roster size changed: {ids:?}");
+        assert_eq!(ids.len(), 31, "published set size changed: {ids:?}");
         assert_eq!(ids.first().copied(), Some(10));
         assert_eq!(ids.last().copied(), Some(49));
         for reserved in 30..=38 {

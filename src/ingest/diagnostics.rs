@@ -399,7 +399,7 @@ fn traffic_verdict(s: &DiagnosticsSnapshot, ok_code: &'static str, prefix: &str)
     // Zero receivers is its own answer, never `ok`. Reaching here means the feeds were expected to
     // be running — a subscribed group, or gating off entirely — so an empty set is a selection that
     // excluded everything (`--feed`, `--publisher-port`, or a channel filter narrower than the
-    // row's roster), not a healthy idle state. Its remediation is the opposite of the no-traffic
+    // row's published set), not a healthy idle state. Its remediation is the opposite of the no-traffic
     // rung's: nothing bound a socket, so no firewall can be at fault.
     if receivers.is_empty() {
         return Diagnosis::new(

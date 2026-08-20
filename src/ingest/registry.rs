@@ -1,8 +1,8 @@
 //! The feed registry as **data**, not code.
 //!
-//! Which group carries which feed, on which ports, with which channel roster, is the publisher's
-//! to decide and it changes without our involvement — upstream reallocated it four times in dated
-//! specs, each reversing the last. Compiling those numbers in makes every such change a rebuild,
+//! Which group carries which feed, on which ports, with which published set of channels, is the
+//! publisher's to decide and it changes without our involvement — upstream reallocated it four
+//! times in dated specs, each reversing the last. Compiling those numbers in makes every such change a rebuild,
 //! and makes a stale copy invisible: a wrong port binds a socket that stays silent, and a wrong
 //! group code activates nothing, with no warning either way.
 //!
@@ -82,7 +82,7 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
-    EmptyRoster {
+    EmptyPublishedSet {
         venue: String,
         category: String,
     },
@@ -168,8 +168,8 @@ impl std::fmt::Display for RegistryError {
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
                  status feed would go unrecorded"
             ),
-            RegistryError::EmptyRoster { venue, category } => {
-                write!(f, "{venue}/{category}: derived roster is empty")
+            RegistryError::EmptyPublishedSet { venue, category } => {
+                write!(f, "{venue}/{category}: derived published set is empty")
             }
             RegistryError::EmptyPublishers { venue, category } => write!(
                 f,
@@ -305,11 +305,11 @@ struct FeedRow {
     emit_trades: bool,
     arbitration: WireArbitration,
     publishers: Publishers,
-    /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
+    /// A second publisher mirrors this row's whole published set on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount — so a socket bound for channel `N` also receives
     /// datagrams stamped `N + publisher_offset`. Row-level, not shape-specific: which mirror scheme
     /// (if any) a deployment runs is a property of the *feed*, not of whether the document happens
-    /// to write its ports out explicitly or derive them from a roster — an `explicit` row is
+    /// to write its ports out explicitly or derive them from a published set — an `explicit` row is
     /// exactly as capable of being mirrored as a `derived` one (confirmed live: two publishers
     /// sharing one explicit port block, separated only by `channel_id`). `None` (the default)
     /// means no such mirror. See [`crate::ingest::feeds::Feed::mirror_offset`] for what this
@@ -357,13 +357,13 @@ impl From<WireArbitration> for ArbitrationMode {
     }
 }
 
-/// How a row lists its publishers: port blocks verbatim, or a channel roster to expand.
+/// How a row lists its publishers: port blocks verbatim, or a published set of channels to expand.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Publishers {
     /// One entry per publisher, ports written out.
     Explicit(Vec<PortBlock>),
-    /// A channel roster plus per-plane bases; one publisher per channel at `base + id`.
+    /// A published set of channels plus per-plane bases; one publisher per channel at `base + id`.
     Derived(Derived),
 }
 
@@ -397,7 +397,7 @@ struct Derived {
     unknown: Unknown,
 }
 
-/// One entry of a `derived.channels` roster: either an inclusive `[lo, hi]` span, or a single
+/// One entry of a `derived.channels` published set: either an inclusive `[lo, hi]` span, or a single
 /// channel id optionally carrying a display `label`.
 ///
 /// **Untagged, not the externally-tagged form the rest of this module uses**, and deliberately so:
@@ -844,8 +844,8 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
     };
 
     // A row with no publishers binds nothing and serves nothing, but validates cleanly and reads
-    // healthy — the desired feed set is simply empty. `Derived` already refuses an empty roster
-    // (`EmptyRoster`, above), but `explicit` had no equivalent check; this catches both shapes,
+    // healthy — the desired feed set is simply empty. `Derived` already refuses an empty published set
+    // (`EmptyPublishedSet`, above), but `explicit` had no equivalent check; this catches both shapes,
     // whichever produced the empty list.
     if publishers.is_empty() {
         return Err(RegistryError::EmptyPublishers {
@@ -901,7 +901,7 @@ fn ports(mktdata: u16, refdata: u16, snapshot: Option<u16>) -> FeedPorts {
     }
 }
 
-/// Expand a derived roster into one [`FeedPublisher`] per channel, ascending.
+/// Expand a derived published set into one [`FeedPublisher`] per channel, ascending.
 ///
 /// A channel is an independent state machine (its own `Reset Count`, sequence series, manifest seq
 /// and snapshot cycle), so one channel is one receiver task with its own processor state and books
@@ -909,7 +909,7 @@ fn ports(mktdata: u16, refdata: u16, snapshot: Option<u16>) -> FeedPorts {
 /// is the arithmetic the publisher itself asserts; a subscriber that computes it differently joins
 /// the right group and hears silence.
 fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryError> {
-    let entries = roster_entries(row, &d.channels)?;
+    let entries = published_set_entries(row, &d.channels)?;
     let p = &d.ports;
     entries
         .iter()
@@ -941,9 +941,9 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
         .collect()
 }
 
-/// One resolved roster id, with its label if the document supplied one (always `None` for an id
-/// that came from a `range` — see [`ChannelSpec`]).
-struct RosterEntry {
+/// One published set id, with its label if the document supplied one (always `None` for an id that
+/// came from a `range` — see [`ChannelSpec`]).
+struct PublishedSetEntry {
     id: u8,
     label: Option<String>,
 }
@@ -951,7 +951,7 @@ struct RosterEntry {
 /// Flatten ranges and singletons into a deduped, ascending list of ids with their labels.
 ///
 /// Deduped rather than rejected on repeat: the same id reaching the expander twice would produce two
-/// publishers on one port block, and the roster is a human-edited list where a singleton overlapping
+/// publishers on one port block, and the published set is a human-edited list where a singleton overlapping
 /// a range is a plausible edit, not a corrupt document. The dedup is **reported** rather than
 /// swallowed — silently accepting it would hide the one case where it is not benign, an author who
 /// wrote the id twice meaning two different channels and got one.
@@ -960,10 +960,10 @@ struct RosterEntry {
 /// singleton's label seen earlier or later for the same id) — dedup is about the id, not about
 /// picking a winning label, and the ordering is document order via a stable merge rather than an
 /// artifact of sort order.
-fn roster_entries(
+fn published_set_entries(
     row: &FeedRow,
     channels: &[ChannelSpec],
-) -> Result<Vec<RosterEntry>, RegistryError> {
+) -> Result<Vec<PublishedSetEntry>, RegistryError> {
     let mut merged: std::collections::BTreeMap<u8, Option<String>> =
         std::collections::BTreeMap::new();
     let mut listed = 0usize;
@@ -990,7 +990,7 @@ fn roster_entries(
                 merged
                     .entry(*id)
                     .and_modify(|existing| match (existing.as_deref(), label.as_deref()) {
-                        // Two labels for one id: the roster disagrees with itself about what this
+                        // Two labels for one id: the published set disagrees with itself about what this
                         // channel is called. Keeping the first silently would show an operator a
                         // name the document does not unambiguously assign — and the duplicate-id
                         // case already warns, so saying nothing here is the inconsistent choice.
@@ -1017,18 +1017,18 @@ fn roster_entries(
             category = row.category,
             listed,
             distinct,
-            "feed registry: channel roster repeats ids; the duplicates were collapsed"
+            "feed registry: the published set repeats channel ids; the duplicates were collapsed"
         );
     }
     if merged.is_empty() {
-        return Err(RegistryError::EmptyRoster {
+        return Err(RegistryError::EmptyPublishedSet {
             venue: row.venue.clone(),
             category: row.category.clone(),
         });
     }
     Ok(merged
         .into_iter()
-        .map(|(id, label)| RosterEntry { id, label })
+        .map(|(id, label)| PublishedSetEntry { id, label })
         .collect())
 }
 
@@ -1037,7 +1037,8 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
-/// The sports channel roster, read from the **document** rather than from the expanded rows.
+/// The sports row's published set of channels, read from the **document** rather than from the
+/// expanded rows.
 ///
 /// A test helper, not a source of truth: reading the document is what lets the port tests assert
 /// the `base + id` derivation instead of merely echoing whatever the expander produced.
@@ -1050,12 +1051,12 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
         .find(|f| f.category == "sports")
         .expect("built-in document has no sports row");
     match &row.publishers {
-        Publishers::Derived(d) => roster_entries(row, &d.channels)
-            .expect("sports roster")
+        Publishers::Derived(d) => published_set_entries(row, &d.channels)
+            .expect("sports published set")
             .into_iter()
             .map(|e| e.id)
             .collect(),
-        Publishers::Explicit(_) => panic!("the sports row must carry a derived roster"),
+        Publishers::Explicit(_) => panic!("the sports row must carry a derived published set"),
     }
 }
 
@@ -1431,11 +1432,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_roster_is_fatal() {
+    fn an_empty_published_set_is_fatal() {
         let row = SPORTS_ROW.replace(r#"{"range":[10,12]},{"id":49}"#, "");
         assert!(matches!(
             build(&doc_with(&row), "test"),
-            Err(RegistryError::EmptyRoster { .. })
+            Err(RegistryError::EmptyPublishedSet { .. })
         ));
     }
 
@@ -1474,7 +1475,7 @@ mod tests {
 
     /// A singleton that also falls inside a range yields one publisher, not two on one port block.
     #[test]
-    fn overlapping_roster_entries_dedup() {
+    fn overlapping_published_set_entries_dedup() {
         let row = SPORTS_ROW.replace(r#"{"id":49}"#, r#"{"id":11}"#);
         let loaded = build(&doc_with(&row), "test").unwrap();
         assert_eq!(loaded.rows[0].publishers.len(), 3);
@@ -1484,10 +1485,10 @@ mod tests {
     // Channel labels
     // ---------------------------------------------------------------------------------------
 
-    /// A single-channel roster entry may carry a `label`; a sibling entry with none must report the
-    /// field **absent**, not `null` — the field is display-only and its absence is the normal case
-    /// (the built-in document ships with none at all), so a spurious `null` would be a regression a
-    /// bare "no error" check could not catch.
+    /// A single-channel published-set entry may carry a `label`; a sibling entry with none must
+    /// report the field **absent**, not `null` — the field is display-only and its absence is the
+    /// normal case (the built-in document ships with none at all), so a spurious `null` would be a
+    /// regression a bare "no error" check could not catch.
     #[test]
     fn a_channel_label_is_carried_and_an_unlabelled_sibling_has_none() {
         let row = SPORTS_ROW.replace(r#"{"id":49}"#, r#"{"id":49,"label":"sports.catchall"}"#);
@@ -1503,7 +1504,7 @@ mod tests {
         assert_eq!(
             by_channel(10).label,
             None,
-            "an unlabelled roster entry must carry no label, not an empty one"
+            "an unlabelled published set entry must carry no label, not an empty one"
         );
     }
 
@@ -1713,8 +1714,8 @@ mod tests {
     // Empty publisher lists
     // ---------------------------------------------------------------------------------------
 
-    /// An empty `explicit` list has no roster to reject the way `derived` does (see
-    /// `an_empty_roster_is_fatal` above, which covers the derived shape) — it must be checked on
+    /// An empty `explicit` list has no published set to reject the way `derived` does (see
+    /// `an_empty_published_set_is_fatal` above, which covers the derived shape) — it must be checked on
     /// the resulting publisher list itself, whichever shape produced it.
     #[test]
     fn an_empty_explicit_publisher_list_is_fatal() {

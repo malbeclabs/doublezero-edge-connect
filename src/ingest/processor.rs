@@ -5283,7 +5283,7 @@ mod tests {
         c
     }
 
-    /// **The mirror finding.** A second publisher mirrors this channel's whole roster on the SAME
+    /// **The mirror finding.** A second publisher mirrors this channel's whole published set on the SAME
     /// socket, stamping every wire `channel_id` raised by `publisher_offset` — so one receiver
     /// decodes datagrams stamped both channel 10 and channel 110 for the identical market. The
     /// datagram source IP is deliberately the SAME for both datagrams here (the registry's own

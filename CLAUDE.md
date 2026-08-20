@@ -125,9 +125,9 @@ Modules are grouped by role under `src/`:
   `--feed-registry-url` (the precursor to reading the DoubleZero ledger, which drops in as a fourth
   `Source`), `--feed-registry <path>` (a bind-mounted file), else the `include_str!`-ed built-in copy
   — parsed, validated, expanded and **leaked into `'static`**, which is what keeps `FeedKey`, the
-  metric labels and every `&'static str` field unchanged downstream. ⚠️ **Never add a channel roster,
-  port base or group `code` as a Rust constant.** Those numbers live in a publisher inventory that
-  changes without our involvement (the same allocation was decided four times upstream in dated
+  metric labels and every `&'static str` field unchanged downstream. ⚠️ **Never add a published set of
+  channels, port base or group `code` as a Rust constant.** Those numbers live in a publisher
+  inventory that changes without our involvement (the same allocation was decided four times upstream in dated
   specs, each reversing the last), and compiling them in makes every upstream change a rebuild while
   making a stale copy invisible — a wrong port binds a socket that stays silent. **A rejected document
   degrades or refuses depending on where it came from, and the asymmetry is the point:** a `Url`
@@ -150,7 +150,7 @@ Modules are grouped by role under `src/`:
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
   Validation covers the structural per-row rules (non-empty `code`/`category`, a `venue` that
-  `sources::source_id_of` resolves, base ports unique within a row, a non-empty roster, no port
+  `sources::source_id_of` resolves, base ports unique within a row, a non-empty published set, no port
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
   planes, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key from a
   silently two-port block whose book never syncs into a startup error) **and the five cross-row
@@ -164,10 +164,10 @@ Modules are grouped by role under `src/`:
   each exit release the other's live paths). The first four used to be
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
-  `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a channel
-  roster plus per-plane bases and expands to `base + channel_id` on every plane (one channel is an
+  `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a published
+  set of channels plus per-plane bases and expands to `base + channel_id` on every plane (one channel is an
   independent state machine — its own `Reset Count`, sequence series, manifest seq and snapshot cycle
-  — so one channel is one `FeedPublisher` and one receiver task); a roster that repeats an id
+  — so one channel is one `FeedPublisher` and one receiver task); a published set that repeats an id
   collapses it and says so. There is **no hot reload**: books and reference data are keyed to the
   topology in effect when they were built.
 - **`ingest/feeds.rs`** — the registry **types** plus the one accessor. `feeds()` returns the rows
@@ -207,7 +207,7 @@ Modules are grouped by role under `src/`:
   own deployment inventory on 2026-08-09. `33000`/`43000` is the **top-of-book sibling's** base, and a
   market-by-price row built on it joins the right group and receives nothing, which reads as a dead
   publisher rather than as a misconfiguration — this row carried those bases until that check. A
-  second publisher takes the same roster with every id offset by **+100** and the ports untouched: the
+  second publisher takes the same published set with every id offset by **+100** and the ports untouched: the
   port names the league, so a subscriber binds one socket per league and hears both publishers on it,
   while `channel_id` names the league *and* the publisher so the two are sequenced separately. Never argue that the
   universes are separate because their `channel_id` ranges do not overlap — the allocation is
@@ -229,7 +229,7 @@ Modules are grouped by role under `src/`:
   would filter to a league and silently half-blind an unrelated mirrored feed), and takes **numeric
   ids only** — channel *names* live in the publisher's inventory by design and a copy here would
   drift exactly as four superseded port allocations did. Every id is validated against the **loaded
-  document's** roster and an unknown id or code is fatal at startup, because a channel filter that
+  document's** published set and an unknown id or code is fatal at startup, because a channel filter that
   silently filters nothing is worse than one that refuses to start. Parsed once in `main`; the
   reconciler consumes it as an *input* to the desired receiver set (`feed_keys`), so `reconcile`
   remains the single activation authority and its spawn/abort diff is unchanged. **Two mechanisms,
@@ -824,7 +824,7 @@ Modules are grouped by role under `src/`:
   host is running doesn't need log access), `history` (`history::Store::stats()` verbatim — products tracked/at cap,
   buckets, bucket budget, estimated bytes, window, evictions, late drops), `channels` (per enabled
   row that carries a channel id — every row but a flat one, see `ingest/channel_filter.rs` — its full
-  roster with `allowed` from the channel filter alone, `bound` from **real** receiver liveness
+  published set with `allowed` from the channel filter alone, `bound` from **real** receiver liveness
   (`SharedFeedHealth::liveness`, keyed exactly as the reconciler's own receiver map — an
   admitted-but-unsubscribed channel reads `Unregistered`/`Down` here rather than a false "bound",
   the exact field the admin surface's own `GET` had to caveat instead of fix, since it has no
