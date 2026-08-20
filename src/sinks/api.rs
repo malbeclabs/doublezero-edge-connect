@@ -26,7 +26,7 @@
 //! - **No field is fabricated to fill out the emulated envelope.** `price_increment`/
 //!   `base_increment` are derived from the instrument's own price/qty exponent (`10^exponent`);
 //!   `volume_24h`, `price_percentage_change_24h`, `base_currency_id`/`quote_currency_id` and
-//!   `quote_increment` have no honest source in this crate's reference data or its one-hour window,
+//!   `quote_increment` have no honest basis in this crate's reference data or its one-hour window,
 //!   so they are omitted rather than guessed. An absent field is safe under PROTOCOL.md's
 //!   forward-compat rule; a fabricated one silently corrupts an agent's reasoning.
 //! - **Errors carry a remedy.** Every error body names what went wrong *and* what to do about it —
@@ -379,7 +379,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
 }
 
 /// `10^exponent` rendered as a decimal string — `price_increment`/`base_increment`. Derivable from
-/// the instrument's own exponent, unlike `quote_increment` (no honest source; deliberately omitted
+/// the instrument's own exponent, unlike `quote_increment` (no honest basis; deliberately omitted
 /// — see the module docs).
 fn increment_string(exponent: i8) -> String {
     decimal_string(10f64.powi(exponent as i32), exponent)
@@ -2518,7 +2518,7 @@ mod tests {
                 source_id: 3,
                 symbol: "HUGEL3".into(),
                 // Deliberately unequal to the accumulator's own best bid (1.0) and best ask (it has
-                // none), so the assertion below says *which* source answered rather than only that
+                // none), so the assertion below says *which* book answered rather than only that
                 // some answer came back.
                 bids: vec![[0.5, 7.0]],
                 asks: vec![[2.0, 1.0]],

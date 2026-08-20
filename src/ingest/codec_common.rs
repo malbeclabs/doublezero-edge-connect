@@ -93,7 +93,7 @@ pub fn cstr(b: &[u8], start: usize, len: usize) -> Option<String> {
 ///
 /// `source_id` is `Option` rather than a sentinel because its absence is a permanent property of a
 /// v1 datagram, not a missing value — a consumer that must handle "this publisher predates
-/// per-instrument source attribution" should be made to see that in the type.
+/// per-instrument Source ID attribution" should be made to see that in the type.
 #[derive(Debug, Clone)]
 pub struct InstrumentDefinition {
     pub instrument_id: u32,
@@ -343,7 +343,7 @@ mod tests {
         let d = instrument_definition(&f, DATAGRAM_HEADER_SIZE, 1).expect("v1 definition decodes");
 
         assert_eq!(d.instrument_id, 41);
-        assert_eq!(d.source_id, None, "v1 carries no per-instrument source id");
+        assert_eq!(d.source_id, None, "v1 carries no per-instrument Source ID");
         assert_eq!(&*d.symbol, "BTC-USDT");
         assert_eq!(d.price_exponent, -8);
         assert_eq!(d.qty_exponent, -6);

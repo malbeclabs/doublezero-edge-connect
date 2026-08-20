@@ -8,7 +8,7 @@
 //! over any definition type that implements [`InstrumentDef`] (its key + manifest sequence).
 //!
 //! One instance tracks **one publisher**: `reset_count` and the manifest era are scoped to
-//! `(source_ip, group, port)`. The per-source-IP map lives in the processors
+//! `(source_ip, group, port)`. The per-publisher map lives in the processors
 //! (`processor::PerPublisher`), which keeps this state machine single-publisher and unit-testable.
 
 use std::collections::HashMap;

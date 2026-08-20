@@ -1,7 +1,7 @@
 //! Venue-generic **public WebSocket input** scaffolding — the transport half shared by every
-//! public backstop source (Hyperliquid, Phoenix, …).
+//! public backstop venue (Hyperliquid, Phoenix, …).
 //!
-//! A public input is a second ingest source, off by default, that connects to a venue's own public
+//! A public input is off by default and connects to a venue's own public
 //! `wss://`, decodes its JSON into the same [`FeedMessage`]s the multicast pipeline produces, and
 //! emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. It is a
 //! different transport from the multicast receiver — it never touches the `DatagramProcessor` /

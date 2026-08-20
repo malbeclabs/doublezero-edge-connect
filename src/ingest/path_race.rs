@@ -121,7 +121,7 @@ impl Match {
 /// lead by a wide margin, and stay far below the interval between repeats of one signature.
 const DEFAULT_WINDOW_NS: u64 = 5_000_000_000; // 5s
 
-/// Cap on `order` entries, arrivals and tombstones alike. The multicast source is unauthenticated, so
+/// Cap on `order` entries, arrivals and tombstones alike. The multicast wire is unauthenticated, so
 /// a forged feed of distinct trades must not grow this without limit; past the cap the oldest
 /// arrival is dropped, which costs a sample and nothing else.
 const MAX_PENDING: usize = 1 << 16;
@@ -131,7 +131,7 @@ const MAX_PENDING: usize = 1 << 16;
 /// arbiter lock, so one path repeating one signature must not be able to lengthen it.
 const MAX_PER_SIGNATURE: usize = 8;
 
-/// Cap on distinct `(scope, path)` counter keys. A [`Transport`] is a spoofable source IP, so past the
+/// Cap on distinct `(scope, path)` counter keys. A [`Transport`] is a spoofable source IP address, so past the
 /// cap a new key is refused rather than grown into.
 const MAX_UNMATCHED_KEYS: usize = 1024;
 
@@ -505,7 +505,7 @@ mod tests {
         );
     }
 
-    /// The pending set is bounded: the source is unauthenticated, so a flood of distinct trades must
+    /// The pending set is bounded: the wire is unauthenticated, so a flood of distinct trades must
     /// cost samples rather than memory.
     #[test]
     fn pending_arrivals_are_bounded() {
@@ -586,7 +586,7 @@ mod tests {
         );
     }
 
-    /// The counter map is keyed on a spoofable source IP, so it must refuse new keys past its cap
+    /// The counter map is keyed on a spoofable source IP address, so it must refuse new keys past its cap
     /// while still counting the keys it already holds.
     #[test]
     fn the_unmatched_counter_map_is_bounded() {

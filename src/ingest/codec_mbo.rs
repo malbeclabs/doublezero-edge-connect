@@ -555,7 +555,7 @@ pub(crate) mod tests {
     //   * Order{Add,Cancel,Execute}/BatchBoundary/Snapshot{Begin,Order,End}: also backed by the real
     //     two-sided capture decoded in `tests/codec_mbo_fixtures.rs` (#36).
     // For the types with NO committed fixture (InstrumentReset, Heartbeat, EndOfSession), the test
-    // below shares its sole human source with the decoder: it catches a test-vs-decoder typo, not a
+    // below shares its sole human reference with the decoder: it catches a test-vs-decoder typo, not a
     // common misreading of the spec. See the module header for the per-type oracle strength.
 
     /// Write `bytes` at a literal offset into a zeroed body.

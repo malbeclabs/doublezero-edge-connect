@@ -74,7 +74,7 @@ source instead gets the `clap` default, which is empty — no network call unles
 bridge tries the URL first when it's non-empty, so pass an empty `--feed-registry-url ""` alongside
 the file if you've also set a URL. A URL that can't be reached or fails validation falls back to
 the built-in document silently by design; check `sudo docker logs <container> | grep 'feed
-registry resolved'` (or the equivalent for a bare process) to see which source actually loaded.
+registry resolved'` (or the equivalent for a bare process) to see which document actually loaded.
 
 The document also carries the **`sources` block** — the Source ID → registry-name allocation,
 generated from `edge-feed-spec/sources/spec.md`, which stays the authority for it:

@@ -73,10 +73,10 @@ the always-on DZ Edge **multicast** receivers, and optional **public WebSocket**
 default) that backstop the edge feed — Hyperliquid (`ingest::ws_input`, quotes + trades) and
 Phoenix (`ingest::phoenix_input`, trades only). Both inputs emit the same `FeedMessage`s and
 race in the arbiter's one per-`(venue, symbol)` floor (see `ingest/arbiter.rs` below), so
-cross-source duplicates collapse and the public copy fills in only when the edge gaps.
+cross-transport duplicates collapse and the public copy fills in only when the edge gaps.
 
 Modules are grouped by role under `src/`:
-- **`ingest/`** — the source→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
+- **`ingest/`** — the input→`FeedMessage` pipeline: `feeds`, `receiver`, `processor`, `book`,
   `pricebook` (the price-keyed sibling of `book`), `authority`,
   `health` (per-receiver liveness aggregated to the venue-level `status`/`dz_feed_up`),
   `subscriber`, `arbiter`, `authority` + `path_race` (the single-path `book` gate and the cross-path trade
@@ -98,7 +98,7 @@ Modules are grouped by role under `src/`:
   dedup/sigverify state lives (no cross-task sharing); receivers stay dumb (recv → push bytes). It
   reuses `ingest::receiver::{bind_multicast, wait_for_interface_ip}` (now `pub`) rather than
   duplicating socket plumbing. `shred/discovery.rs` shells out to `doublezero multicast group list`
-  and prefix-selects the source groups. Activate-on-discovery; off when no source is found.
+  and prefix-selects the source groups. Activate-on-discovery; off when no source group is found.
   **Sigverify + dedup (`--shred-rpc-url`):** with an RPC URL the forwarder forwards exactly one
   valid copy of each shred; without one it forwards everything (the bare behaviour). The forwarder
   threads each datagram through `parse` → leader lookup → `dedup`:
@@ -123,7 +123,7 @@ Modules are grouped by role under `src/`:
 - **`ingest/registry.rs` + `ingest/registry.json`** — the feed registry as **data**. The rows are a
   JSON document resolved once at startup from one of three sources in precedence order —
   `--feed-registry-url` (the precursor to reading the DoubleZero ledger, which drops in as a fourth
-  `Source`), `--feed-registry <path>` (a bind-mounted file), else the `include_str!`-ed built-in copy
+  `Origin`), `--feed-registry <path>` (a bind-mounted file), else the `include_str!`-ed built-in copy
   — parsed, validated, expanded and **leaked into `'static`**, which is what keeps `FeedKey`, the
   metric labels and every `&'static str` field unchanged downstream. ⚠️ **Never add a published set of
   channels, port base or group `code` as a Rust constant.** Those numbers live in a publisher
@@ -140,7 +140,7 @@ Modules are grouped by role under `src/`:
   The binary's own `clap` default for `--feed-registry-url` is empty (running from source reaches
   no network); the **image** bakes in the hosted URL as a `Dockerfile` `ENV` instead, so it stays
   inspectable via `docker inspect` and overridable with `-e` without a rebuild either way — a `File`
-  source wins only when the URL is empty, so an operator combining a bind-mounted file with the
+  origin wins only when the URL is empty, so an operator combining a bind-mounted file with the
   image must clear `DZ_FEED_REGISTRY_URL` too (`scripts/connect.sh` does this automatically when
   `DZ_FEED_REGISTRY` is set and the operator hasn't set a URL of their own). `Loaded::log_resolved`
   is the one place that announces which document actually won (`"feed registry resolved"`,
@@ -371,7 +371,7 @@ Modules are grouped by role under `src/`:
   — gated on a sticky per-venue carrier set, since a carrier that *stopped* leaves the liveness map
   and must not hand the aggregate to a depth-only peer. The venue edge is computed and published
   inside the lock (`with_edge`), so two receivers crossing opposite edges can't publish out of order.
-- **`ingest/arbiter.rs`** — the shared **pre-broadcast emit stage** every ingest source funnels
+- **`ingest/arbiter.rs`** — the shared **pre-broadcast emit stage** every ingest input funnels
   through. `Arbiter` owns the broadcast `Sender` plus the dedup state — the per-`(venue, symbol)`
   latch-to-leader `StalenessFloor` for quotes (keyed on `QuoteId`, the canonical BBO fixed-point, with
   the `Transport` enum as the per-tick leader identity), a **second `StalenessFloor` for MBO `depth`**
@@ -389,7 +389,7 @@ Modules are grouped by role under `src/`:
   plus, when the sample *opened* its `source_ts` tick, the once-per-tick
   `dz_quote_ticks_won_total`/`dz_depth_ticks_won_total` (the published win-rate primitive:
   `edge/sum`; every tick scores exactly once, walkovers included — see docs/metrics.md) —
-  `Contest{winner, lead_ns}` drops the losing cross-source copy and records the head-to-head
+  `Contest{winner, lead_ns}` drops the losing cross-publisher copy and records the head-to-head
   lead-time histogram (`dz_quote_lead_ns`/`dz_trade_lead_ns`/`dz_depth_lead_ns`, #60 — a *margin*
   diagnostic, not a win rate: one contest slot per tick, in-tick losers only), `Dropped` is a
   plain collapse. The **tape leader** (`tape_leader`, keyed `(venue, category)`, `Sticky` venues only —
@@ -402,13 +402,13 @@ Modules are grouped by role under `src/`:
   traffic, so `scope_leader()` is `None` forever and electing first would mute the tape); a path the
   authority *tracks* displaces one it does not (the slot is first-come on an unauthenticated wire);
   the book-*elected* path takes over, **once per election** rather than per print (path identity is
-  shared across a venue's rows — one source IP per publisher host, both protocols — and re-honouring
+  shared across a venue's rows — one source IP address per publisher host, both protocols — and re-honouring
   per print would let a nearly-dead elected path sawtooth the tape away from the healthy peer); and a
   silent incumbent yields after `NO_ID_TAPE_HANDOVER_NS`, marking the election it overrode as spent.
   The peer's prints are dropped on their own `dz_tape_path_dropped_total` (not folded into
   `dz_trades_dropped_total`, whose steady state here is the challenger's whole feed); transfers are
   `dz_tape_path_transfers_total`. ⚠️ Two residual limits, both inherited from the unauthenticated
-  wire: on a venue with no `book` traffic the authority tracks nobody, so a forged source printing first
+  wire: on a venue with no `book` traffic the authority tracks nobody, so a forged publisher printing first
   holds the tape until it goes quiet for a window — the same primitive `StickyAuthority::admit`'s
   no-dark-start already exposes for `book` — and the gate spans a whole **category**, so rows sharing one
   that *sharded* prints rather than mirroring them would lose the non-serving path's fills (giving them
@@ -445,7 +445,7 @@ Modules are grouped by role under `src/`:
   `emitted_symbol` memo — immune to an id→symbol remap), and falls back to a venue-wide clear when
   nothing resolves. Both resets also purge the matching WS-replay `depth` entries (no ended-session
   book replayed to a new client). The *quote* floor is
-  deliberately exempt (TOB `source_ts` is epoch block time, monotonic across sessions). `Status`
+  deliberately exempt (TOB `source_ts` is block time in the Unix epoch, monotonic across sessions). `Status`
   routes straight to `sender()` (no business identity to dedup).
   The `Book` branch has **two** gates, chosen by what the wire supplies rather than by venue name. A batch
   carrying a non-zero `order_id` (or for a market whose `BookMarket::order_level` memo says an earlier one
@@ -646,14 +646,14 @@ Modules are grouped by role under `src/`:
   a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
   suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot feed into `pricebook.rs` and emits the
   incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
-  quote/trade/depth cross-source dedup is **not** here anymore — it moved to `arbiter.rs`.
+  quote/trade/depth cross-transport dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
-  IP and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
+  IP address and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
   a shared port block one publisher's restart would otherwise clear every publisher's definitions and
   blank the venue. Reads take the **non-inserting** `PerPublisher::def`; only the refdata handlers use
-  the inserting `get`, so a forged-source market-data flood can't evict a real publisher's definitions.
+  the inserting `get`, so a forged-publisher market-data flood cannot evict a real publisher's definitions.
   `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
-  datagram source IP): two publishers mirror one feed but their instance-scoped per-instrument delta
+  datagram source IP address): two publishers mirror one feed but their instance-scoped per-instrument delta
   sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
   instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
   `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *datagram*, so two
@@ -676,7 +676,7 @@ Modules are grouped by role under `src/`:
   read from the **market-data role only** and only for a publisher whose reference data we already
   hold: the three ports carry one era on three sockets, so a memo shared across them would re-reset
   the channel on every interleaving of a restart's backlog, and minting reference-data state from the
-  market-data path is what would let a forged-source flood evict the real publishers' definitions. A
+  market-data path is what would let a forged-publisher flood evict the real publishers' definitions. A
   snapshot group whose era disagrees with the market data's is refused for the same reason — it
   belongs to the publisher's previous run, and installing it would republish a dead session's book.
   `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
@@ -740,7 +740,7 @@ Modules are grouped by role under `src/`:
   consumers never see a price before its precision, but a single symbol flows without waiting for
   the full set (an all-or-nothing gate could wedge the feed on a startup/reset race). Uses
   wraparound-safe u16 sequence comparison (`is_later`). One instance tracks **one publisher** — the
-  per-source-IP map lives in `processor.rs` (`PerPublisher`), keeping this state machine
+  per-publisher map lives in `processor.rs` (`PerPublisher`), keeping this state machine
   single-publisher and unit-testable.
 - **`sinks/ws.rs`** — fans the broadcast out to clients (on by default; disable with an empty
   `--ws-bind`). **Serializes each message once, not per client:** a single serializer task reads the
@@ -976,7 +976,7 @@ Modules are grouped by role under `src/`:
   publisher is fixed.
 - `--iface` accepts an interface name (resolved to its IPv4 via `ip -4 -o addr show`) or an IPv4
   literal directly.
-- **Source/sink activation is uniform**: a source or sink runs when its key config value is
+- **Input/sink activation is uniform**: an input or sink runs when its key config value is
   non-empty/present, **and** (for the subscription-gated ones — market-data receivers, the WS sink,
   the shred forwarder) when the reconciler sees the host subscribed to the relevant group. ws
   (output) is *configured* by a non-empty `--ws-bind` (`--ws-bind ""` disables it outright) but only

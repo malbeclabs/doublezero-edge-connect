@@ -13,7 +13,7 @@
 //! feed with no edge refdata ever is a documented limitation (it would emit nothing).
 //!
 //! ⚠️ Decimal-string px/sz are parsed straight to real-unit `f64`s — the same unit space the edge
-//! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-source
+//! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-transport
 //! dedup is decided by publisher leadership per tick, never by content equality (see the arbiter).
 
 use serde::Deserialize;
@@ -94,7 +94,7 @@ struct Level {
 }
 
 /// A `trades` payload element. `tid` is Hyperliquid's trade id — the same value the edge feed carries
-/// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-source copies on it.
+/// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-transport copies on it.
 #[derive(Deserialize)]
 struct TradeData {
     coin: String,
@@ -310,7 +310,7 @@ mod tests {
     use super::*;
 
     /// [`HL_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
-    /// venue's top-of-book row, the source of both the quotes and the prints it emits.
+    /// venue's top-of-book row, the row that carries both the quotes and the prints it emits.
     ///
     /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
     /// universes is the case `Feed::category` exists to express, so that assertion would fail a

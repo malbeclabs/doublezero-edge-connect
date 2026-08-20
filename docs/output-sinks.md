@@ -187,10 +187,10 @@ a `coverage` block with the same honesty (`complete: false` rather than a guess 
 levels might not be all of them).
 
 **The catalog is not necessarily every instrument the feed defines.** A product is listed in
-`/v1/products` once its source is known: immediately, for a publisher whose reference data carries
+`/v1/products` once its Source ID is known: immediately, for a publisher whose reference data carries
 its own Source ID; only after its first price, for a publisher whose reference data carries no Source
-ID of its own (see PROTOCOL.md's [*A symbol appears only once its source is
-known*](../PROTOCOL.md#a-symbol-appears-only-once-its-source-is-known)). Both publisher generations
+ID of its own (see PROTOCOL.md's [*A symbol appears only once its Source ID is
+known*](../PROTOCOL.md#a-symbol-appears-only-once-its-source-id-is-known)). Both publisher generations
 can be live on the same host at once, so a defined-but-never-traded instrument on the latter kind of
 publisher is legitimately absent from the catalog while every instrument from the former kind appears
 up front.

@@ -155,7 +155,7 @@ pub struct ShredConfig {
     pub sources: Vec<SocketAddrV4>,
     /// Local destinations every datagram is fanned out to.
     pub forward: Vec<SocketAddr>,
-    /// Deduplication mode. The single source of truth for forwarder behaviour.
+    /// Deduplication mode. The single authority for forwarder behaviour.
     pub mode: DedupMode,
     /// Solana JSON-RPC endpoint for the leader schedule. Consumed only when `mode` is
     /// [`DedupMode::Sigverify`] (and required there); ignored otherwise.
@@ -201,7 +201,7 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-    // The mode is the single source of truth. Sigverify builds a leader schedule (and requires an
+    // The mode is the single authority. Sigverify builds a leader schedule (and requires an
     // RPC URL — main rejects `Sigverify` without one before we get here); dedup-only and bare run
     // with no schedule, distinguished by the `dedup` bool passed to the forwarder below.
     let schedule = match cfg.mode {

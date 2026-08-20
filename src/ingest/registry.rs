@@ -34,7 +34,7 @@ const BUILT_IN: &str = include_str!("registry.json");
 /// This is for a change that reinterprets what a field *means*, not for one that adds a field —
 /// additive changes are handled by ignoring and reporting unknown keys, so they never bump this and
 /// never reach a rejection. A document whose version this build does not know is one whose existing
-/// fields it may read wrongly, which is why it is refused rather than applied: under a URL source
+/// fields it may read wrongly, which is why it is refused rather than applied: under a URL origin
 /// that refusal degrades to the built-in copy, under a file it is fatal (see [`load`]).
 const SUPPORTED_VERSION: u32 = 1;
 
@@ -103,7 +103,7 @@ pub enum RegistryError {
         venue: String,
         category: String,
     },
-    /// A `--feed-registry` file could not be read. Unlike a `Url` source, this is an operator's
+    /// A `--feed-registry` file could not be read. Unlike a `Url` origin, this is an operator's
     /// explicit instruction about this one container, so it must not silently degrade.
     ReadFailed {
         path: PathBuf,
@@ -548,7 +548,7 @@ impl Loaded {
 
 /// Resolve and validate the registry, leaking the rows into `'static`.
 ///
-/// Async only because the URL source fetches; the file and built-in sources never await.
+/// Async only because the `Url` origin fetches; the file and built-in ones never await.
 ///
 /// **A rejected document degrades or refuses depending on where it came from, and the asymmetry is
 /// the whole point:**
@@ -1131,7 +1131,7 @@ fn leak(s: &str) -> &'static str {
 /// The sports row's published set of channels, read from the **document** rather than from the
 /// expanded rows.
 ///
-/// A test helper, not a source of truth: reading the document is what lets the port tests assert
+/// A test helper, not the authority: reading the document is what lets the port tests assert
 /// the `base + id` derivation instead of merely echoing whatever the expander produced.
 #[cfg(test)]
 pub(crate) fn sports_channel_ids() -> Vec<u8> {
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     /// A bind-mounted file is an operator's explicit instruction about this one container, so a
-    /// wrong one must **not** run — the asymmetry with the URL source is the whole point.
+    /// wrong one must **not** run — the asymmetry with the URL origin is the whole point.
     #[tokio::test]
     async fn an_unparseable_file_document_is_fatal() {
         let path = std::env::temp_dir().join("dz-registry-bad.json");
@@ -1469,7 +1469,7 @@ mod tests {
 
     /// A file that cannot be *read* is fatal, like the parse errors beside it — it is an operator's
     /// explicit instruction about this one container (an unmounted volume, a typo'd path), and must
-    /// not silently start on the built-in copy the way the `Url` source does.
+    /// not silently start on the built-in copy the way the `Url` origin does.
     #[tokio::test]
     async fn an_unreadable_file_is_fatal() {
         let err = load(Origin::File(PathBuf::from("/nonexistent/registry.json")))
@@ -1479,7 +1479,7 @@ mod tests {
         assert!(matches!(err, RegistryError::ReadFailed { .. }), "{err:?}");
     }
 
-    /// The `Url` source's degrade-on-failure behavior is unchanged: a fetch failure (as opposed to
+    /// The `Url` origin's degrade-on-failure behavior is unchanged: a fetch failure (as opposed to
     /// the file case above, now fatal) still falls back to the built-in document.
     #[tokio::test]
     async fn an_unreachable_url_still_falls_back() {
@@ -1853,7 +1853,7 @@ mod tests {
 
     /// A name that is not the uppercase form consumers see is refused: it is emitted verbatim as
     /// `venue` and as every `venue=` metric label value, so a lowercase row would split a consumer's
-    /// `SOURCE:SYMBOL` join against the same source seen from another host.
+    /// `SOURCE:SYMBOL` join against the same upstream source seen from another host.
     #[test]
     fn a_non_uppercase_source_name_is_fatal() {
         assert!(matches!(
@@ -1883,7 +1883,7 @@ mod tests {
         }
     }
 
-    /// A malformed block under a `Url` source degrades to the built-in document like every other
+    /// A malformed block under a `Url` origin degrades to the built-in document like every other
     /// rejection there, rather than killing a fleet at its next reschedule.
     #[tokio::test]
     async fn a_url_document_with_a_bad_sources_block_degrades() {

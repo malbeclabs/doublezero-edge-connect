@@ -1056,7 +1056,7 @@ const MAX_PLAUSIBLE_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 /// than trusting an implausible venue clock).
 fn resolve_ts_ns(source_ts_ns: u64, recv_ts_ns: u64) -> u64 {
     if source_ts_ns == 0 {
-        return recv_ts_ns; // the "not available" sentinel - never a real epoch time
+        return recv_ts_ns; // the "not available" sentinel - never a real wall-clock time
     }
     let too_far_future = source_ts_ns > recv_ts_ns.saturating_add(MAX_PLAUSIBLE_FUTURE_SKEW_NS);
     let window_ns = history::WINDOW_SECS.saturating_mul(1_000_000_000);
@@ -2531,7 +2531,7 @@ mod tests {
     }
 
     /// The sentinel case Task 4/5's docs call out by name: `source_ts_ns == 0` must bucket by
-    /// `recv_ts_ns`, never by the sentinel itself — a print bucketed at the epoch would silently
+    /// `recv_ts_ns`, never by the sentinel itself — a print bucketed at 1970 would silently
     /// vanish from every window query. Checked directly against the stored `Print`, which is why
     /// this doesn't need an API round-trip: `recent_trades` returns the raw ring, ts_ns included.
     ///

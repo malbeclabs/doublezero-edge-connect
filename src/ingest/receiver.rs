@@ -119,7 +119,7 @@ pub struct DatagramCtx<'a> {
     /// mirror nothing: without it the arbiter's tape gate elects one path across both and drops the
     /// other universe's prints for good.
     pub category: &'static str,
-    /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
+    /// The shared pre-broadcast arbiter every ingest input emits through (dedup + fan-out).
     pub arbiter: &'a SharedArbiter,
     pub instruments: &'a InstrumentSnapshot,
     /// Kernel `SCM_TIMESTAMPNS` RX timestamp (CLOCK_REALTIME), or 0 if unavailable.
@@ -128,7 +128,7 @@ pub struct DatagramCtx<'a> {
     pub recv_ts_ns: u64,
     /// Which port this datagram arrived on.
     pub role: PortRole,
-    /// Source IP of the datagram — the publisher identity. Independent publishers mirror one feed
+    /// Source IP address of the datagram — the publisher identity. Independent publishers mirror one feed
     /// onto the same group (sharing `channel_id`), so per-publisher state (sequence tracking, MBO
     /// books) keys on this rather than the port.
     pub publisher: IpAddr,
@@ -161,9 +161,9 @@ impl DatagramCtx<'_> {
     /// Also records the message's own (wire-resolved) venue as one this feed row has revealed data
     /// under (see [`record_revealed`]), so a later `status` for this row names what its receivers
     /// actually emit rather than the row's static `venue`. This runs before the arbiter's own
-    /// admit decision, so a copy the arbiter goes on to drop as a cross-source duplicate still
+    /// admit decision, so a copy the arbiter goes on to drop as a cross-publisher duplicate still
     /// counts as revealed — deliberate: revealing records what this row's wire decoded and
-    /// attempted to emit, a source-identity fact, independent of whether the arbiter's dedup floor
+    /// attempted to emit, a Source-ID fact, independent of whether the arbiter's dedup floor
     /// later broadcasts that particular copy.
     pub fn emit(&self, msg: FeedMessage) {
         let (wire_venue, _) = msg.venue_symbol();
@@ -301,7 +301,7 @@ struct ReceiverRegistration {
     arbiter: SharedArbiter,
     key: ReceiverKey,
     up_gauge: prometheus::IntGauge,
-    /// Source IPs this receiver has carried, so their book standing goes with it. Only Market-by-Order
+    /// Source IP addresses this receiver has carried, so their book standing goes with it. Only Market-by-Order
     /// receivers produce that standing, and a publisher host uses one IP, so this stays tiny.
     publishers: Vec<IpAddr>,
 }
@@ -326,7 +326,7 @@ impl ReceiverRegistration {
     }
 
     /// Note a publisher whose order-level books this receiver is feeding. Bounded like the processors'
-    /// own per-source state, oldest evicted first: the source IP is spoofable, and refusing new entries
+    /// own per-publisher state, oldest evicted first: the source IP address is spoofable, and refusing new
     /// at the cap would let 256 forged datagrams stop a real publisher's standing being released on
     /// exit — the wedge this exists to close.
     fn note_publisher(&mut self, publisher: IpAddr) {
@@ -369,7 +369,7 @@ impl Drop for ReceiverRegistration {
 
 /// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when every one of
 /// the venue's quote publishers has gone silent past [`IDLE_REJOIN`], `"ok"` when one recovers.
-/// Consumers gray out / restore the source on these. Best-effort (ignored if no subscriber is
+/// Consumers gray out / restore the upstream source on these. Best-effort (ignored if no subscriber is
 /// connected). Called only from `FeedHealth`'s `on_edge`, i.e. only on a venue-level edge, and with
 /// that lock held — so two receivers can't publish contradictory states out of order. `stale_ms` is
 /// only meaningful on a `down` edge.
@@ -456,7 +456,7 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
     }
 }
 
-/// The source IP of a received datagram (its `recvmsg` source address), used to demultiplex
+/// The source IP address of a received datagram (its `recvmsg` source address), used to demultiplex
 /// independent publishers that mirror one feed onto the same multicast group. Falls back to
 /// `0.0.0.0` if the kernel attached no source address.
 fn datagram_src_ip(addr: Option<SockaddrStorage>) -> IpAddr {
@@ -1201,7 +1201,7 @@ mod tests {
     /// gap-and-recover cycle outruns — and a suppressed re-baseline is never retried.
     ///
     /// A Top-of-Book receiver of the same publisher must not do it: one publisher host serves both
-    /// protocols from one source IP, so its exit would drop a live Market-by-Order path's standing.
+    /// protocols from one source IP address, so its exit would drop a live Market-by-Order path's standing.
     #[test]
     fn an_mbo_receivers_exit_releases_its_publishers_book_standing() {
         use crate::ingest::{

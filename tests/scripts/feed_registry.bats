@@ -35,7 +35,7 @@ run_args() {
   grep '^docker run ' "$DOCKER_LOG"
 }
 
-@test "surfaces the resolved feed registry source from the bridge log" {
+@test "surfaces the resolved feed registry origin from the bridge log" {
   local out="$BATS_TEST_TMPDIR/out" extra="$BATS_TEST_TMPDIR/extra.log"
   printf 'feed registry resolved origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56\n' >"$extra"
   ( common_env; export DZ_TEST_DOCKER_LOG_EXTRA="$extra" DZ_INSTALL_CLI=0
@@ -43,7 +43,7 @@ run_args() {
   status=$?
   [ "$status" -eq 0 ] || { echo "# exited $status"; sed 's/^/#   /' "$out"; false; }
   grep -q 'Feed registry:.*origin="url https://get.doublezero.xyz' "$out" \
-    || { echo "# never surfaced the resolved registry source:"; sed 's/^/#   /' "$out"; false; }
+    || { echo "# never surfaced the resolved registry origin:"; sed 's/^/#   /' "$out"; false; }
 }
 
 @test "no resolved-registry log line yet: warns instead of failing" {

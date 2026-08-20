@@ -110,10 +110,10 @@ impl SeqEvents {
     }
 }
 
-/// Cap on the number of distinct publishers (source IPs) tracked by [`TobProcessor`]'s per-publisher
-/// sequence map. The source IP comes from an *unauthenticated, spoofable* UDP datagram, so without a
+/// Cap on the number of distinct publishers (source IP addresses) tracked by [`TobProcessor`]'s per-publisher
+/// sequence map. The source IP address comes from an *unauthenticated, spoofable* UDP datagram, so without a
 /// bound an attacker who can inject into the multicast group could mint a fresh `SeqTracker` per
-/// forged source IP and grow the map without limit (memory-exhaustion DoS). Real deployments have a
+/// forged source IP address and grow the map without limit (memory-exhaustion DoS). Real deployments have a
 /// handful of mirrored publishers, so this is set far above that; once full, the least-recently-
 /// inserted publisher is evicted (it simply re-anchors its sequence on its next datagram).
 pub(crate) const MAX_PUBLISHERS: usize = 256;
@@ -123,7 +123,7 @@ pub(crate) const MAX_PUBLISHERS: usize = 256;
 /// `reset_count` is scoped to `(source_ip, group, port)`, so two publishers sharing a port block
 /// carry unrelated reset counters: under one shared [`RefDataState`] either path's restart clears the
 /// other's instrument set, blanking both, since every emission path gates on a resolved definition.
-/// The source IP is spoofable, so the map takes the same [`MAX_PUBLISHERS`] least-recently-inserted
+/// The source IP address is spoofable, so the map takes the same [`MAX_PUBLISHERS`] least-recently-inserted
 /// eviction as the sequence map — an evicted publisher re-learns its definitions from the next
 /// reference-data burst.
 struct PerPublisher<D> {
@@ -154,7 +154,7 @@ impl<D> Default for PerPublisher<D> {
 impl<D: InstrumentDef> PerPublisher<D> {
     /// The state for `publisher`, **creating it on first sight** — reference-data writes only. A
     /// read must use [`Self::def`]: minting an entry from the market-data path would let a forged-
-    /// source flood evict the real publishers' definitions without ever sending reference data.
+    /// publisher flood evict the real publishers' definitions without ever sending reference data.
     ///
     /// A `get()` on a not-yet-tracked publisher is the only place an eviction can happen (the cap is
     /// a fixed constant, so at most one pop per call); see [`Self::take_evicted`] for what a caller
@@ -183,7 +183,7 @@ impl<D: InstrumentDef> PerPublisher<D> {
     }
 
     /// `publisher`'s state for mutation that must **not** mint one — a reset era can be observed on
-    /// the market-data path, where [`Self::get`] would let a forged-source flood evict the real
+    /// the market-data path, where [`Self::get`] would let a forged-publisher flood evict the real
     /// publishers' definitions.
     fn state_mut(&mut self, publisher: IpAddr) -> Option<&mut RefDataState<D>> {
         self.states.get_mut(&publisher)
@@ -236,7 +236,7 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 /// inverse of [`upsert_instrument`], which only ever inserts. There is no other removal path for
 /// this map in the crate, so anything that stops naming an identity (chiefly a Source ID change:
 /// `reveal_if_needed`'s `previous.is_some()` branch) must call this explicitly, or the stale entry
-/// sits in the connect-time replay snapshot for the life of the process — describing a source
+/// sits in the connect-time replay snapshot for the life of the process — describing a publisher
 /// that no longer carries this data, alongside the correct one, with nothing on the wire saying
 /// which is current.
 fn remove_instrument(
@@ -262,8 +262,8 @@ pub struct TobProcessor {
     state: PerPublisher<InstrumentDefinition>,
     /// Per-publisher, per-channel datagram sequence tracker. Independent publishers mirror this feed
     /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
-    /// datagrams stale and drop them before dedup; keying by source IP keeps each publisher's sequence
-    /// state separate. Bounded to [`MAX_PUBLISHERS`] entries (the source IP is spoofable, so the map
+    /// datagrams stale and drop them before dedup; keying by source IP address keeps each publisher's sequence
+    /// state separate. Bounded to [`MAX_PUBLISHERS`] entries (the source IP address is spoofable, so the map
     /// must not grow without limit); `seq_order` records insertion order for the eviction.
     seq: HashMap<IpAddr, SeqTracker>,
     /// Insertion order of `seq` keys, oldest at the front, for the [`MAX_PUBLISHERS`] eviction.
@@ -324,7 +324,7 @@ impl TobProcessor {
     ///
     /// A Source ID change also PURGES the stale `(old_venue, channel, instrument_id)` entry from
     /// `InstrumentSnapshot`: `upsert_instrument` only ever inserts, so without this the old entry
-    /// would sit in the connect-time replay for the life of the process, describing a source that
+    /// would sit in the connect-time replay for the life of the process, describing a publisher that
     /// no longer carries this data. `channel`/`instrument_id` are unaffected by the Source ID
     /// change, so the current `pending_channel` value and this call's own `instrument_id` are
     /// exactly what the old entry was filed under — unlike the display `symbol`, the identity
@@ -385,7 +385,7 @@ impl TobProcessor {
 
     /// The sequence tracker for `publisher`, creating it on first sight. The map is bounded to
     /// [`MAX_PUBLISHERS`]: when a *new* publisher would overflow it, the least-recently-inserted one
-    /// is evicted first. Source IPs are spoofable, so this bound is what stops a forged-source flood
+    /// is evicted first. Source IP addresses are spoofable, so this bound is what stops a forged-publisher flood
     /// from growing the map without limit; a legitimate publisher evicted under such a flood simply
     /// re-anchors (`SeqCheck::First`) on its next datagram, with no data loss beyond a stale-check reset.
     fn seq_for(&mut self, publisher: IpAddr) -> &mut SeqTracker {
@@ -596,10 +596,10 @@ impl DatagramProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    // Cross-source dedup happens downstream in the shared arbiter: the per-(venue,
+                    // Cross-transport dedup happens downstream in the shared arbiter: the per-(venue,
                     // instrument) source_ts latch-to-leader floor races this edge publisher against
                     // the other edge publishers and the public WS input for the tick, emitting only
-                    // the leader. `ctx.emit` tags the quote with this datagram's source IP as the
+                    // the leader. `ctx.emit` tags the quote with this datagram's source IP address as the
                     // floor's leader identity, and the arbiter keys the BBO identity on the canonical
                     // bbo_hash (incl. the bid_n/ask_n carried on `quote`). (See `ingest::arbiter`.)
                     ctx.emit(FeedMessage::Quote(quote));
@@ -644,7 +644,7 @@ impl DatagramProcessor for TobProcessor {
                         kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
                         ws_send_ts_ns: 0, // stamped by the WS server just before send
                     };
-                    // The arbiter's windowed trade dedup (on trade_id) collapses any cross-source
+                    // The arbiter's windowed trade dedup (on trade_id) collapses any cross-transport
                     // copy downstream; this feed only gates on whether it owns this venue's trades.
                     if self.tape.load(Ordering::Relaxed) {
                         ctx.emit(FeedMessage::Trade(trade));
@@ -1101,7 +1101,7 @@ impl MboProcessor {
     /// **Every publisher's markets, matching the book reset that precedes it.** The handler drops all of
     /// them to `Recovering` and reports all of them unsynced, so leaving a peer's tombstones behind
     /// refuses the new session's re-used ids for exactly the markets nothing is serving any more — the
-    /// `InstrumentReset` failure, one handler over. It also means an `EndOfSession` from a source
+    /// `InstrumentReset` failure, one handler over. It also means an `EndOfSession` from a publisher
     /// holding no books of its own still clears the state of the ones that were just reset.
     fn reset_all_known_book_events(&self, ctx: &DatagramCtx) {
         let mut arb = lock(ctx.arbiter);
@@ -1124,7 +1124,7 @@ impl MboProcessor {
     ///    definition for precision), so it would be pure dead memory; this mirrors the per-instrument
     ///    definition gate the Top-of-Book / Midpoint quote paths already apply.
     /// 2. Bounds the map to [`MAX_BOOKS`] `(publisher, instrument)` pairs with least-recently-inserted
-    ///    eviction, so even a flood of *defined* forged instrument_ids (the source IP is also
+    ///    eviction, so even a flood of *defined* forged instrument_ids (the source IP address is also
     ///    spoofable — the same threat the cap already addresses) can't grow it without limit. Eviction
     ///    also drops the evicted pair's `last_top` and (when no other publisher still serves that
     ///    symbol) the shared `depth` (WS replay) entry in lockstep, so neither sibling map outgrows
@@ -1941,7 +1941,7 @@ impl DatagramProcessor for MboProcessor {
 }
 
 /// Cap on distinct `(publisher, channel, instrument)` books one Market-by-Price receiver tracks. The
-/// wire `channel_id`/`instrument_id` and the datagram source IP are all unauthenticated and
+/// wire `channel_id`/`instrument_id` and the datagram source IP address are all unauthenticated and
 /// spoofable, so this bounds a forged feed exactly as [`MAX_BOOKS`] does for the order-keyed
 /// processor. Nothing may be sized off the instrument *count*: ids are sequential in today's
 /// captures but a ticker hash would spread them sparsely across the whole `u32`.
@@ -2513,7 +2513,7 @@ impl DatagramProcessor for MbpProcessor {
         // channel thousands of times. One socket is FIFO, so the market-data era never goes
         // backwards. The publisher restriction keeps [`PerPublisher::get`]'s rule: a publisher with no
         // definitions has no books to invalidate, and minting state from the market-data path is how a
-        // forged-source flood would evict the real publishers' definitions.
+        // forged-publisher flood would evict the real publishers' definitions.
         if ctx.role.handles_mktdata()
             && self.state.state_mut(ctx.publisher).is_some()
             && self
@@ -3092,7 +3092,7 @@ mod tests {
     }
 
     /// The per-publisher sequence map must stay bounded under a flood of distinct (spoofable) source
-    /// IPs, evicting the oldest first — otherwise a forged-source flood grows it without limit.
+    /// IP addresses, evicting the oldest first — otherwise a forged-publisher flood grows it without limit.
     #[test]
     fn tob_seq_map_is_bounded_under_publisher_flood() {
         use super::MAX_PUBLISHERS;
@@ -3118,8 +3118,8 @@ mod tests {
     }
 
     /// The per-publisher reference-data map carries a full instrument set per entry, so it needs the
-    /// same [`MAX_PUBLISHERS`] bound as the sequence map — the source IP is spoofable. A *read* must
-    /// mint nothing, or a market-data flood from forged sources would evict the real publishers'
+    /// same [`MAX_PUBLISHERS`] bound as the sequence map — the source IP address is spoofable. A *read* must
+    /// mint nothing, or a market-data flood from forged publishers would evict the real publishers'
     /// definitions without ever sending reference data.
     #[test]
     fn refdata_state_map_is_bounded_and_reads_mint_nothing() {
@@ -3150,7 +3150,7 @@ mod tests {
         assert_eq!(m.states.len(), before, "a read must not create an entry");
     }
 
-    /// Two publishers share one port block and differ only by source IP. `reset_count` is
+    /// Two publishers share one port block and differ only by source IP address. `reset_count` is
     /// per-publisher state, so one path's restart must not clear the other path's instrument set —
     /// which would blank both paths until the next refdata burst, since every emission path gates on
     /// a resolved definition. Driven through `on_datagram` so it pins the wiring, not just the map.
@@ -3312,7 +3312,7 @@ mod tests {
         out
     }
 
-    /// The single-publisher source IP `make_ctx` stamps on every datagram, so book-map keys in these
+    /// The single-publisher source IP address `make_ctx` stamps on every datagram, so book-map keys in these
     /// tests are `(TEST_PUB, instrument_id)` (the MBO books re-key by publisher).
     const TEST_PUB: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
 
@@ -3403,7 +3403,7 @@ mod tests {
         b
     }
 
-    /// [`make_ctx`], but with an explicit publisher source IP — for the tests below that need
+    /// [`make_ctx`], but with an explicit publisher source IP address — for the tests below that need
     /// several distinct (spoofable) publishers rather than the single fixed `TEST_PUB`.
     fn tob_ctx<'a>(
         arbiter: &'a SharedArbiter,
@@ -3480,7 +3480,7 @@ mod tests {
     /// The root-cause fix: a Source ID change purges the stale `(old_venue, symbol)` entry from
     /// `InstrumentSnapshot`. `upsert_instrument` only ever inserts and there is no other removal
     /// path for that map anywhere in the crate, so without this the old entry would sit in the
-    /// connect-time replay snapshot for the life of the process — describing a source that no
+    /// connect-time replay snapshot for the life of the process — describing a publisher that no
     /// longer carries this data, alongside the correct one, with nothing saying which is current.
     /// Price-triggered (the general path every Source ID change goes through, predating and
     /// independent of the v3 eager reveal), so this pins the fix in `reveal_if_needed` itself
@@ -3526,16 +3526,16 @@ mod tests {
                 0,
                 41
             )),
-            "the stale entry under the OLD source must be purged, not merely superseded"
+            "the stale entry under the OLD source name must be purged, not merely superseded"
         );
         assert!(
             map.contains_key(&(venue_arc("PHOENIX"), category_arc("testcategory"), 0, 41)),
-            "the entry under the CURRENT source must remain"
+            "the entry under the CURRENT source name must remain"
         );
     }
 
     /// A v3 definition burst that changes an already-revealed instrument's Source ID must emit
-    /// exactly ONE `Instrument`, under the new source — not the stale re-announce under the OLD id
+    /// exactly ONE `Instrument`, under the new source name — not the stale re-announce under the OLD id
     /// (the existing "already revealed" block) followed by the eager reveal's own announcement
     /// under the new one. Correctness here must not rest on the arbiter incidentally deduping a
     /// redundant broadcast — the re-announce block is skipped outright when this definition's own
@@ -3585,7 +3585,7 @@ mod tests {
         assert_eq!(
             seen,
             vec![(2, "PHOENIX".to_string())],
-            "exactly one Instrument, under the new source — no redundant re-announce under the old one"
+            "exactly one Instrument, under the new source name — no redundant re-announce under the old one"
         );
     }
 
@@ -3663,7 +3663,7 @@ mod tests {
 
     /// `revealed`/`pending_channel` are keyed `(source_ip, instrument_id)` — the same spoofable axis
     /// `MAX_PUBLISHERS` bounds `state`/`seq` on — but had no eviction path of their own. A forged-
-    /// source flood that only ever sends refdata (never a quote) would otherwise grow `pending_channel`
+    /// publisher flood that only ever sends refdata (never a quote) would otherwise grow `pending_channel`
     /// without limit. `PerPublisher::take_evicted` (drained on every `get()`-driven eviction) is what
     /// closes that: the oldest publisher's entries in both maps must disappear in the same pass its
     /// `state`/`seq` entry does.
@@ -5286,7 +5286,7 @@ mod tests {
     /// **The mirror finding.** A second publisher mirrors this channel's whole published set on the SAME
     /// socket, stamping every wire `channel_id` raised by `publisher_offset` — so one receiver
     /// decodes datagrams stamped both channel 10 and channel 110 for the identical market. The
-    /// datagram source IP is deliberately the SAME for both datagrams here (the registry's own
+    /// datagram source IP address is deliberately the SAME for both datagrams here (the registry's own
     /// `DEPLOYMENT` note keys the two paths apart by `channel_id`, never by host), which is what
     /// makes this a real regression guard: if `ensure_book`/`note_reset_count`/`revealed` ever
     /// canonicalized their channel instead of using the raw wire one, the two paths below would
@@ -5321,7 +5321,7 @@ mod tests {
         };
         // The base path, wire channel 10.
         proc.on_datagram(&def_datagram(10), &base);
-        // The mirror path, wire channel 110 (10 + the 100 offset) — same source IP, same
+        // The mirror path, wire channel 110 (10 + the 100 offset) — same source IP address, same
         // instrument, same Source ID: the same market as far as a consumer is concerned.
         proc.on_datagram(&def_datagram(110), &mirror);
 
@@ -6080,7 +6080,7 @@ mod tests {
 
     /// `ManifestSummary`/`InstrumentDefinition` must be gated on `handle_refdata` exactly like the
     /// three sibling processors' paths. Decode does not care what physical port a message type
-    /// arrives on, so before the gate one forged datagram to the **market-data** port — source IP
+    /// arrives on, so before the gate one forged datagram to the **market-data** port — source IP address
     /// spoofed to the real publisher's, carrying `ManifestSummary { manifest_seq: latest + 1 }` —
     /// reached `RefDataState::on_manifest` and cleared `defs`. Every MBP emission path gates on a
     /// resolved definition (`ensure_book`/`send_book`/`exponents`), so the venue's `book` and tape
@@ -6125,7 +6125,7 @@ mod tests {
 
     /// The bounding half of the same gate, mirroring
     /// `mbo_manifest_burst_via_mktdata_port_does_not_leak_pending_channel`: a role that does not
-    /// handle reference data must process no reference-data message at all, so a forged-source
+    /// handle reference data must process no reference-data message at all, so a forged-publisher
     /// burst to the market-data port mints no `PerPublisher` state whatsoever.
     #[test]
     fn mbp_manifest_burst_via_mktdata_port_mints_no_refdata_state() {
@@ -6202,7 +6202,7 @@ mod tests {
         );
         assert!(
             !proc.revealed.keys().any(|(p, _, _)| *p == first),
-            "and its revealed source ids"
+            "and its revealed Source IDs"
         );
         assert!(
             !proc.open.keys().any(|(p, _)| *p == first)
@@ -6950,7 +6950,7 @@ mod tests {
     /// The `(publisher, channel)` reset/open-group maps take their keys from unauthenticated wire
     /// data, so they must stay bounded — and a publisher we hold no reference data for must not enter
     /// them at all: it has no books to invalidate, and minting state from the market-data path is what
-    /// would let a forged-source flood evict the real publishers' definitions.
+    /// would let a forged-publisher flood evict the real publishers' definitions.
     #[test]
     fn mbp_channel_key_maps_are_bounded_and_untracked_publishers_mint_nothing() {
         let (arbiter, _rx, instruments) = mbp_harness();
@@ -7477,7 +7477,7 @@ mod tests {
     }
 
     /// `EndOfSession` drops every publisher's book, so the raced state of every one of them has to go
-    /// with it. Scoped to the sending publisher, an `EndOfSession` from a source holding no books of
+    /// with it. Scoped to the sending publisher, an `EndOfSession` from a publisher holding no books of
     /// its own — a refdata-only mirror, an evicted publisher, one forged datagram — resets every real
     /// book to `Recovering` and clears no tombstones, and the new session's re-used order ids are then
     /// refused for exactly the markets nothing is serving any more.

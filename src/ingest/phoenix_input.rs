@@ -9,7 +9,7 @@
 //!
 //! **Trades only.** We deliberately do NOT emit quotes: the edge Quote is a spline-blended BBO, while
 //! Phoenix's public orderbook channel is resting-only — a different quantity. A BBO backstop is
-//! deferred until a comparable public blended source is identified.
+//! deferred until a comparable public blended feed is identified.
 //!
 //! Validated against a concurrent edge+public capture (2026-06-30, `edge-pcaps/phoenix-capture-20260630`),
 //! on the 257 fills shared by both feeds: the public `tradeSequenceNumber` equals the edge on-chain

@@ -1,6 +1,6 @@
 //! pcap -> edge-feed datagram-log converter (dev tooling).
 //!
-//! Reads a multicast pcap, selects ONE publisher by **source IP** (the demux key the bridge keys
+//! Reads a multicast pcap, selects ONE publisher by **source IP address** (the demux key the bridge keys
 //! on — robust to publishers sharing a UDP port in future, per the feed team), and emits the
 //! harness's `[u32 LE length][datagram bytes]` record format that `tests/common/replay.rs`
 //! (`split_datagrams`) replays, one record per UDP payload.
@@ -66,7 +66,7 @@ struct Args {
     /// Output prefix; per-role suffixes are appended (e.g. `<prefix>.mktdata.bin`).
     #[arg(short, long)]
     out: PathBuf,
-    /// Publisher source IP to select (the demux key).
+    /// Publisher source IP address to select (the demux key).
     #[arg(long)]
     src: Ipv4Addr,
     /// Multicast group (destination) to filter on.
@@ -96,7 +96,7 @@ struct Args {
     /// Cap on post-anchor deltas kept under `--mbo-minimal`.
     #[arg(long, default_value_t = 300)]
     mbo_max_deltas: u32,
-    /// Second publisher source IP. When set, emit ONE combined `<out>.combined.bin` of both
+    /// Second publisher source IP address. When set, emit ONE combined `<out>.combined.bin` of both
     /// publishers' refdata + symbol-filtered mktdata (TOB) — or refdata + snapshot +
     /// symbol-filtered order-deltas/trades (MBO) — **in capture order**, each record tagged
     /// `[u32 len][4B src_ip][1B role: 0=refdata, 1=mktdata, 2=snapshot][datagram]`. This preserves the
@@ -859,7 +859,7 @@ fn trim_mbo_minimal(
 }
 
 /// Collect `(rel_ts, src_ip, datagram)` for any of `srcs`, in capture order, each datagram's time relative
-/// to the first packet in the file — like `collect_datagrams` but tags source + timestamp and accepts a
+/// to the first packet in the file — like `collect_datagrams` but tags source IP address + timestamp and accepts a
 /// set, for the combined multi-publisher output. Applies only the `--to` upper bound; the `--from`
 /// lower bound is left to the caller so it can be applied **per role** (MBO keeps refdata — the
 /// slow-round-robin instrument definitions — from t=0 so the symbol's precision resolves even when
@@ -903,7 +903,7 @@ fn collect_tagged(args: &Args, srcs: &[Ipv4Addr]) -> Result<Vec<(Ipv4Addr, Vec<u
 }
 
 /// Combined multi-publisher TOB output: both publishers' refdata + symbol-filtered mktdata in
-/// capture order, each record tagged with its source IP and role, preserving the real interleaving.
+/// capture order, each record tagged with its source IP address and role, preserving the real interleaving.
 fn process_tob_combined(tagged: &[(Ipv4Addr, Vec<u8>)], args: &Args) -> Result<()> {
     use codec::Message;
     // Pass 1: build symbol -> id across both publishers (a def may follow early quotes).

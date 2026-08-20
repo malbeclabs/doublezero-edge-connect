@@ -270,9 +270,9 @@ async fn mbo_single_publisher_depth_contract() {
 /// series. Before multi-publisher support the bridge bound only one block and the other
 /// publisher's datagrams were never received at all.
 ///
-/// Both senders share one source IP (see `tests/common/replay.rs` TODO(#3)), so the arbiter
+/// Both senders share one source IP address (see `tests/common/replay.rs` TODO(#3)), so the arbiter
 /// correctly collapses their identical content on the wire — deliberately NOT asserted here. This
-/// test is about ingest reach; per-source-IP dedup is covered by `tests/dedup.rs`.
+/// test is about ingest reach; per-publisher dedup is covered by `tests/dedup.rs`.
 #[test]
 #[serial]
 fn two_publisher_port_blocks_are_both_ingested() {

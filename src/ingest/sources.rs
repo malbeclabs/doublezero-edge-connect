@@ -1,7 +1,7 @@
 //! The `Source ID` -> registry-name mirror.
 //!
 //! `edge-feed-spec/sources/spec.md` is the sole authority for this allocation; nothing here decides
-//! it. A Source ID identifies the source whose order book a price was derived from, IDs are stable
+//! it. A Source ID identifies the upstream source whose order book a price was derived from, IDs are stable
 //! and are never reused, and the wire value is authoritative — a publisher stamping the wrong ID is
 //! a publisher defect fixed at the publisher, reported here as-is and never substituted.
 //!
@@ -73,7 +73,7 @@ const KALSHI: &str = "KALSHI";
 
 /// Map a registry source *name* back to its `Source ID`, exactly — the inverse of [`source_name`].
 ///
-/// This is what lets a resolved source carry a numeric identity a consumer can join against the
+/// This is what lets a resolved source name carry a numeric identity a consumer can join against the
 /// registry, and what `receiver::record_revealed` tests a wire venue against before recording it.
 pub fn source_id_of(source: &str) -> Option<u16> {
     assignments()

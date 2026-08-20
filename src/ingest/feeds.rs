@@ -92,11 +92,11 @@ impl FeedPorts {
 ///
 /// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does, on arbitrary
 ///   base ports — see the `FEEDS` docs): one `FeedPublisher` row per publisher, one receiver task
-///   each, and each task sees exactly one source IP.
+///   each, and each task sees exactly one source IP address.
 /// - **Shared port block** (all publishers to one `(group, port)`): a single `FeedPublisher` row,
-///   one receiver task, and that task sees N source IPs.
+///   one receiver task, and that task sees N source IP addresses.
 ///
-/// Either way the *publisher identity* the arbiter races on is the datagram source IP, never the
+/// Either way the *publisher identity* the arbiter races on is the datagram source IP address, never the
 /// port — so the dedup path is identical. The operator-facing identity is the
 /// [`base port`](FeedPublisher::base_port): what `--publisher-port` selects and what the
 /// `publisher` metric label carries. Deliberately a port and not a host name — the port block is
@@ -240,7 +240,7 @@ pub struct Feed {
 /// compile error and leaves [`feeds()`] the one entry point.
 static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
 
-/// The winning install's provenance (source/version/row+receiver counts) — the same figures
+/// The winning install's provenance (origin/version/row+receiver counts) — the same figures
 /// [`registry::Loaded::log_resolved`] logs once at startup, kept here so a running process can
 /// report them (`/v1/status`'s `registry` block) without re-reading logs. Set alongside [`FEEDS`]
 /// and never afterward, for the identical reason: a losing install must not overwrite the winner's

@@ -116,7 +116,7 @@ pub mod sizes {
     pub const SNAPSHOT_LEVEL: usize = 32;
 }
 
-/// 52-byte trade print. `trade_id == 0` means the upstream had no venue trade id (a FIX source has
+/// 52-byte trade print. `trade_id == 0` means the upstream had no venue trade id (a FIX publisher has
 /// none); the arbiter bypasses its dedup window on that sentinel rather than keying on it.
 #[derive(Debug, Clone)]
 pub struct Trade {
@@ -663,7 +663,7 @@ pub(crate) mod tests {
         assert_eq!(d.manifest_seq, 3);
     }
 
-    /// spec: Trade 0x04, 52 bytes. Body: id @0, source @4, aggressor @6, flags @7, ts @8,
+    /// spec: Trade 0x04, 52 bytes. Body: id @0, source_id @4, aggressor @6, flags @7, ts @8,
     /// price i64 @16, qty @24, trade_id @32, cumulative @40.
     ///
     /// NOTE the aggressor encoding is 1=Buy / 2=Sell / 0=Unknown — a DIFFERENT value space from
@@ -808,7 +808,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// spec: LevelUpdate 0x40, 48 bytes. Body: id @0, source @4, side @6, action @7, seq @8,
+    /// spec: LevelUpdate 0x40, 48 bytes. Body: id @0, source_id @4, side @6, action @7, seq @8,
     /// price i64 @12, qty u64 @20, ts @28, order_count @36, level_index @38, reason @40, flags @41.
     #[test]
     fn level_update_decodes() {
@@ -893,7 +893,7 @@ pub(crate) mod tests {
         assert_eq!((u.side, u.action, u.update_reason), (200, 200, 200));
     }
 
-    /// spec: BookClear 0x41, 36 bytes. Body: id @0, source @4, clear_side @6, scope @7, seq @8,
+    /// spec: BookClear 0x41, 36 bytes. Body: id @0, source_id @4, clear_side @6, scope @7, seq @8,
     /// from_price i64 @12, ts @20, clear_reason @28.
     #[test]
     fn book_clear_decodes() {

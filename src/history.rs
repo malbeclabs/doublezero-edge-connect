@@ -243,7 +243,7 @@ impl Store {
         self.products.is_empty()
     }
 
-    /// Whether the store currently tracks `key` at all — the single source of truth
+    /// Whether the store currently tracks `key` at all — the single authority
     /// [`Retention::held`] reports. `true` even for a product whose current window is empty (it
     /// stopped trading within the hour, or simply hasn't yet); `false` for one this store has never
     /// seen, or has evicted for capacity. See [`Retention::held`]'s doc for why this distinction
@@ -1280,7 +1280,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------------
-    // stats / products_for — the `/v1/status` `history` and `channels` blocks' data source
+    // stats / products_for — the `/v1/status` `history` and `channels` blocks' backing data
     // -------------------------------------------------------------------------------------------
 
     /// The signal an over-wide channel filter produces is products at cap with a rising eviction count —

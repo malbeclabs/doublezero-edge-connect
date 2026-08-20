@@ -7,7 +7,7 @@ format this bridge consumes. The TOB goldens below come from the DoubleZero Edge
 oracle in the source repo. The **live-capture** fixtures (the MBO trio, the multi-publisher TOB
 files, and the shreds) are described in their own sections.
 
-| File | Source | Port role |
+| File | Origin | Port role |
 |------|--------|-----------|
 | tob_marketdata.bin | server/tests/fixtures/hl_block_mode/golden/tob_marketdata.bin | TOB mktdata |
 | tob_refdata.bin | server/tests/fixtures/hl_block_mode/golden/tob_refdata.bin | TOB refdata |
@@ -85,7 +85,7 @@ Hyperliquid TOB feed**, for the multi-publisher dedup work (issue #3). They are 
 independent — disjoint datagram-sequence spaces (≈70.8M vs ≈53.7M) and distinct wire `source_id`
 (3 vs 1) — and time-aligned (each spans the same ~40s window, `source_ts` 1781705333..1781705373).
 
-| File | Publisher | Source IP | mktdata port |
+| File | Publisher | Source IP address | mktdata port |
 |------|-----------|-----------|--------------|
 | tob_btc_pubA.{refdata,mktdata}.bin | A | 148.51.120.79 | 9201 |
 | tob_btc_pubB.{refdata,mktdata}.bin | B | 148.51.123.3  | 9601 |
@@ -115,8 +115,8 @@ defs/120s), so a shorter window omits it and the precision gate never resolves B
 others is kept whole (pub A: 1 such datagram, 22 non-BTC messages retained); they are not strictly
 BTC-only.
 
-**Demux is by source IP, not UDP port** — publishers are on distinct ports today, but the feed
-team intends to normalize that, so source IP is the robust publisher key.
+**Demux is by source IP address, not UDP port** — publishers are on distinct ports today, but the feed
+team intends to normalize that, so source IP address is the robust publisher key.
 
 **Codec validation against the live feed** (every datagram decoded through the bridge's own codec):
 - TOB: **0 framing errors** across ~130k datagrams from both publishers.
@@ -138,7 +138,7 @@ cargo run --example pcap2datagrams -- tyo_tob.pcap --src 148.51.123.3 --symbol B
   -o tests/fixtures/tob_btc_pubB
 ```
 
-The converter (`examples/pcap2datagrams.rs`) demuxes one publisher by source IP, keeps TOB datagrams
+The converter (`examples/pcap2datagrams.rs`) demuxes one publisher by source IP address, keeps TOB datagrams
 (magic `0x445A`), filters mktdata to the chosen symbol, and writes the `[u32 LE length][datagram]`
 record format `tests/common/replay.rs` replays.
 
@@ -320,7 +320,7 @@ the only fixture that exercises per-channel snapshot grouping. Delta feed is thi
 
 | | |
 |---|---|
-| Source | market-by-price group `233.84.178.20`, publisher `148.51.120.6` |
+| Origin | market-by-price group `233.84.178.20`, publisher `148.51.120.6` |
 | Ports | `33010`/`33063`/`33120` mktdata, `43010`/`43063`/`43120` refdata, `53010`/`53063`/`53120` snapshot |
 | Channels | 10, 63, 120 (encoded in the port number; each an independent state machine) |
 | Capture | 2026-08-07 16:54:58 UTC, 39.6s, 12,535 market-by-price datagrams |
@@ -335,7 +335,7 @@ known deviations below before treating anything here as normative.
 
 | | |
 |---|---|
-| Source | market-by-price group `233.84.178.4`, publisher `148.51.121.69` |
+| Origin | market-by-price group `233.84.178.4`, publisher `148.51.121.69` |
 | Ports | `31000` mktdata, `41000` refdata, `51000` snapshot |
 | Capture | 2026-08-07 16:55:54 UTC, first 8s of a 39s capture, 2,712 datagrams |
 | Whole capture | 13 instruments; 101/101 complete snapshot groups; `depth_bound == 0` on all; `KXBTCPERP` ran 12,892 deltas over `1294579..1307470` with zero gaps and zero duplicates |
@@ -366,7 +366,7 @@ protocol's intent. All three are publisher-side, not decoder-side.
 
 The paths split cleanly, and identically on both protocols. Measured 2026-08-07 with
 `examples/pcap2datagrams.rs`, which reports `zero_id_trades=` alongside `trades=`; `--src` selects one
-publisher, so one run per source IP gives the per-path answer.
+publisher, so one run per source IP address gives the per-path answer.
 
 | Path | Protocol | trades | `zero_id_trades` |
 |---|---|---|---|
@@ -399,7 +399,7 @@ cargo run --example pcap2datagrams -- mbp.pcap --protocol mbp --group <group> \
 ```
 
 Keep at least one multi-channel set and one dense-delta set; the fixture tests assert both shapes.
-Record the source IP, capture date, datagram counts and observed `depth_bound` above.
+Record the source IP address, capture date, datagram counts and observed `depth_bound` above.
 
 ## Schema v3 reference data — `tob_v3`, `mbp_perps_v3`, `sports_v3`
 

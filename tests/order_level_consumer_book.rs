@@ -1519,7 +1519,7 @@ fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
 /// frontier arbitrarily far ahead of real venue time. Past that point every honest publisher on the
 /// channel is refused, the whole removed population ages out at once, and the forger's own stamps are
 /// the only ones left inside the window — a channel-wide blackout and a blind guard from one spoofed
-/// source. The absolute anchor against the host clock is what stops it, and it is the same check the
+/// publisher. The absolute anchor against the host clock is what stops it, and it is the same check the
 /// quote and depth floors already apply to this field.
 #[test]
 fn a_stream_of_in_bound_stamps_cannot_ratchet_the_frontier_past_the_host_clock() {
@@ -1554,7 +1554,7 @@ fn a_stream_of_in_bound_stamps_cannot_ratchet_the_frontier_past_the_host_clock()
 
     // Two hundred batches, each one step inside the per-step forward bound. Nothing but an absolute
     // anchor refuses these. They carry the forger's own order, which legitimately reaches the wire —
-    // this is an unauthenticated wire and nothing here stops a source publishing.
+    // this is an unauthenticated wire and nothing here stops a forged publisher.
     for i in 1..=200u64 {
         let t = base + i * 4_900_000_000;
         a.emit(

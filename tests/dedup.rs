@@ -45,7 +45,7 @@ fn port_role(role: u8) -> PortRole {
 
 /// Replay combined MBO records through a single re-keyed `MboProcessor` feeding the shared `Arbiter`
 /// in capture order, collecting the emitted WS messages as JSON. The production demux+dedup path:
-/// each record's source IP becomes `DatagramCtx.publisher`, so the processor reconstructs an independent
+/// each record's source IP address becomes `DatagramCtx.publisher`, so the processor reconstructs an independent
 /// book per `(publisher, instrument)` and the cross-publisher latch-to-leader depth floor runs in the
 /// arbiter — exactly as in the binary.
 fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
@@ -114,7 +114,7 @@ fn read_combined(path: &str) -> Vec<(IpAddr, u8, Vec<u8>)> {
 
 /// Replay combined records through a single `TobProcessor` feeding the shared `Arbiter` in capture
 /// order and collect the emitted WS messages as JSON. This is the production demux+dedup path: each
-/// record's source IP becomes `DatagramCtx.publisher`, so the per-publisher SeqTracker runs in the
+/// record's source IP address becomes `DatagramCtx.publisher`, so the per-publisher SeqTracker runs in the
 /// processor and the cross-publisher latch-to-leader floor + trade dedup run in the arbiter, exactly
 /// as in the binary (where the arbiter is the one process-wide emit stage).
 fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
@@ -365,7 +365,7 @@ fn duplicate_multicast_quote_packet_collapses() {
         .cloned()
         .collect();
 
-    // Variant: each mktdata datagram is delivered a second time, immediately, from the same source.
+    // Variant: each mktdata datagram is delivered a second time, immediately, from the same publisher.
     let mut doubled = Vec::new();
     for r in &baseline {
         doubled.push(r.clone());
@@ -386,7 +386,7 @@ fn duplicate_multicast_quote_packet_collapses() {
     );
 }
 
-/// Cross-source duplicate at the packet level: replay one publisher, then replay it with each
+/// Cross-publisher duplicate at the packet level: replay one publisher, then replay it with each
 /// mktdata datagram **also** delivered from a second publisher IP (a mirror of the same feed). The
 /// leader (first to open each tick) wins and the mirror is a non-leader no-op, so the emitted quote
 /// set is unchanged — the multi-publisher dedup collapses the redundant feed.

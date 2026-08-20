@@ -178,7 +178,7 @@ struct Args {
     shred_dedup_window_slots: u64,
 
     /// Coins to subscribe on the Hyperliquid **public** WebSocket input, repeatable/
-    /// comma-separated (e.g. `--ws-input-coins BTC,ETH`). This is the backstop arbitrage source: it
+    /// comma-separated (e.g. `--ws-input-coins BTC,ETH`). This is the backstop arbitrage input: it
     /// races the public feed against the DZ Edge multicast in the shared arbiter, so the edge wins in
     /// steady state and the public copy fills in only when the edge gaps. Empty (the default) leaves
     /// the input off.
@@ -395,7 +395,7 @@ struct Args {
     arb_book_reseat_secs: u64,
 }
 
-/// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
+/// The single origin of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
 /// the ones `--help` advertises cannot drift apart.
 const ARB: ingest::authority::AuthorityConfig = ingest::authority::AuthorityConfig::DEFAULT;
 
@@ -622,8 +622,8 @@ async fn main() -> Result<()> {
     // The backbone carries `Arc<FeedMessage>`: a per-subscriber delivery is a refcount bump, not a
     // deep clone of the message's owned `String`/`Vec` fields (see `arbiter`/`sinks::ws`).
     let (tx, _rx) = broadcast::channel::<Arc<model::FeedMessage>>(args.ws_broadcast_capacity);
-    // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
-    // input) emits through this one instance, so cross-source duplicates collapse on one
+    // The shared pre-broadcast arbiter: every ingest input (each multicast receiver and the WS
+    // input) emits through this one instance, so cross-transport duplicates collapse on one
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -745,7 +745,7 @@ async fn main() -> Result<()> {
     let shred_explicit_sources = shred::parse_sources(&args.shred_sources)?;
     if !args.shred_disable {
         let mode = args.shred_dedup_mode;
-        // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
+        // The mode is the single authority: sigverify needs an RPC URL, and an RPC URL set in
         // any other mode is ignored (warn rather than silently promote — the user chose the mode).
         if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
             bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
@@ -773,7 +773,7 @@ async fn main() -> Result<()> {
         dedup_window_slots: args.shred_dedup_window_slots,
     };
 
-    // Public WS input: off unless `--ws-input-coins` is non-empty (the source/sink activation
+    // Public WS input: off unless `--ws-input-coins` is non-empty (the input/sink activation
     // convention). It emits through the same shared arbiter as the multicast receivers, so the public
     // feed races the edge per (venue, symbol) tick and backstops it. Failure-isolated: it reconnects
     // internally and never returns, so its churn can't touch the multicast hot path.

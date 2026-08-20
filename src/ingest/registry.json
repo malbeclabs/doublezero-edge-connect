@@ -210,14 +210,14 @@
         "allocation; read the values the publisher actually renders.",
         "",
         "One publisher per row: the two paths share a port block and are distinguished, for",
-        "producer-side state (RefDataState, sequence tracking), only by datagram source IP.",
+        "producer-side state (RefDataState, sequence tracking), only by datagram source IP address.",
         "",
         "MIRROR. A second publisher mirrors the whole published set on that SAME port block, stamping",
         "every wire channel_id raised by 100 - confirmed live on 2026-08-11 from a product catalog",
         "listing every market twice, at channel N and channel N+100. publisher_offset records that",
         "for ingest: it canonicalises the mirror's channel id back to the base publisher's for",
         "catalog/history identity ONLY, never for the per-publisher book and sequence state above,",
-        "which stays keyed on the raw wire channel id and the source-IP split."
+        "which stays keyed on the raw wire channel id and the per-publisher split."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 31000, "refdata": 41000 }]
@@ -289,7 +289,7 @@
         "sequence state that has to stay separate. The top-of-book sibling on group 233.84.178.17 is",
         "not yet published, which is why this document carries no row for it.",
         "",
-        "SOURCE ADDRESSES. Two, confirmed by a warehouse capture on 2026-08-11: both publishers",
+        "SOURCE IP ADDRESSES. Two, confirmed by a warehouse capture on 2026-08-11: both publishers",
         "carry the WHOLE published set, mirroring each other, and are separated by the channel offset above.",
         "An earlier capture (2026-08-09) saw one address and the note here said so; the second host",
         "came up between them, so treat any count recorded here as of its date and re-measure.",

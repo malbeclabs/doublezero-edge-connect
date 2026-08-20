@@ -1,11 +1,11 @@
-//! Shared pre-broadcast arbiter: the single emit stage every ingest source funnels through.
+//! Shared pre-broadcast arbiter: the single emit stage every ingest input funnels through.
 //!
-//! When several independent sources mirror the same feed — the multicast edge publishers
-//! (demultiplexed by source IP so each one's datagram-sequence state stays separate, see
+//! When several independent publishers mirror the same feed — the multicast edge publishers
+//! (demultiplexed by source IP address so each one's datagram-sequence state stays separate, see
 //! `receiver`/`processor`) **and** the Hyperliquid public WebSocket input ([`crate::ingest::ws_input`])
 //! — they all converge on one [`Arbiter`] just before the broadcast channel. The arbiter deduplicates
 //! the *output* keyed on business identity, so a subscriber sees a clean feed regardless of which
-//! source delivered a given update first. Because every source races through the **same** per-`(venue,
+//! transport delivered a given update first. Because every publisher races through the **same** per-`(venue,
 //! symbol)` floor, a public-feed copy of an update the edge already emitted collapses into a no-op —
 //! and when the edge gaps, the public copy is the first to cross the floor and fills in (the backstop,
 //! with no health check; see [`Transport`]).
@@ -16,11 +16,11 @@
 //!   one `source_ts` "tick" holds a whole sub-sequence of real top-of-book changes. The catch: the
 //!   only trustworthy ordering of those changes is a *single* publisher's own feed. Arrival order
 //!   across publishers is corrupted by per-publisher network delay (the `hl-bbo-feed-race` board
-//!   shows inter-feed skew over 100 ms), so interleaving two sources inside one tick can serve a
+//!   shows inter-feed skew over 100 ms), so interleaving two transports inside one tick can serve a
 //!   stale sample as the freshest — on a falling price, a slower publisher's older, higher sample
 //!   landing last reads as a phantom uptick. So the floor **latches to the leader**: per `(venue,
 //!   symbol)` tick it emits only the *leader* (first publisher to open the tick — the lowest-delay
-//!   source for it) and drops other publishers' samples at that `source_ts`; the leader is
+//!   publisher for it) and drops other publishers' samples at that `source_ts`; the leader is
 //!   re-selected each new tick. Output `source_ts` is non-decreasing per key, and within each tick
 //!   the emitted series is one publisher's coherent, in-order subsequence.
 //! - trades ([`WindowedDedup`]): a trade is a *point-in-time event*, not state, so a floor would lose
@@ -59,7 +59,7 @@ use crate::{
     },
 };
 
-/// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-source trade
+/// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-transport trade
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
 pub const TRADE_DEDUP_WINDOW: usize = 8192;
 
@@ -102,14 +102,14 @@ const MAX_BOOK_MARKETS: usize = 16_384;
 
 /// Cap on batches withheld from one market while waiting for the new path to close a logical event.
 /// `last` is mandatory in PROTOCOL.md, but a producer that stops setting it — a bug, a truncated
-/// datagram, a forged source — would otherwise withhold that market from the wire forever. Sized like
+/// datagram, a forged publisher — would otherwise withhold that market from the wire forever. Sized like
 /// `model`'s pending-change cap, which desynchronizes the accumulator at the same scale, so the
 /// abandoned re-baseline degrades to a bare `clear` rather than to a book claiming completeness.
 const MAX_WITHHELD_BATCHES: u32 = 8192;
 
 /// How long a peer's last delivered batch keeps its claim to be serving a market. Past it the peer is
 /// treated as not serving, so a recovering path's re-baseline goes out: a publisher that stops reaching
-/// us — host drained, group withdrawn, source forged and then silent — reports nothing on its own
+/// us — host drained, group withdrawn, publisher forged and then silent — reports nothing on its own
 /// behalf, and a claim that never expires would suppress the *only* self-heal this product has for the
 /// life of the process. Erring toward publishing is safe (a re-baseline is full state); erring toward
 /// suppressing is the wedge.
@@ -224,7 +224,7 @@ impl BookGuardConfig {
         if self.retention_ns <= MAX_FUTURE_SKEW_NS {
             return Err(format!(
                 "--arb-book-retention-secs ({}) must exceed the {}s host-clock skew the frontier \
-                 tolerates: below it a source stamping just inside that skew holds the frontier \
+                 tolerates: below it a publisher stamping just inside that skew holds the frontier \
                  above every honest publisher on the channel",
                 self.retention_ns / 1_000_000_000,
                 MAX_FUTURE_SKEW_NS / 1_000_000_000
@@ -270,8 +270,8 @@ pub enum Transport {
 }
 
 impl Transport {
-    /// A stable, low-cardinality metric label for the source class. Deliberately collapses the
-    /// edge publisher's source IP to `"edge"` — the per-IP identity matters to the floor but would
+    /// A stable, low-cardinality metric label for the transport class. Deliberately collapses the
+    /// edge publisher's source IP address to `"edge"` — the per-IP identity matters to the floor but would
     /// blow up metric cardinality (and is spoofable), so it is never used as a label.
     pub fn label(self) -> &'static str {
         match self {
@@ -286,16 +286,16 @@ impl Transport {
 const CANONICAL_BBO_EXP: i32 = 8;
 
 /// The canonical business identity of a quote at a `source_ts` tick — the components of the spec's
-/// `bbo_hash`: bid/ask price + size at the canonical `10^-8` fixed-point scale, plus the source
-/// counts `bid_n`/`ask_n`. EXCLUDES `source_ts` (the floor tracks that separately).
+/// `bbo_hash`: bid/ask price + size at the canonical `10^-8` fixed-point scale, plus the
+/// `Bid/Ask Source Count`s `bid_n`/`ask_n`. EXCLUDES `source_ts` (the floor tracks that separately).
 ///
-/// Why canonical `-8` integers and not the raw `f64` bits: sources publish the same economic price
+/// Why canonical `-8` integers and not the raw `f64` bits: the two transports publish the same price
 /// in different encodings — the edge feed as `raw * 10^exp`, the public WS as a JSON float — and
 /// `raw as f64 * 10^exp` is **not** bit-identical to the parsed float for the same value (`0.1` is
 /// inexact in binary). Bit-comparing `f64`s would treat the two as distinct, so the *same* BBO from
-/// two sources would not share an identity — silently defeating cross-source dedup. Rounding each
+/// two transports would not share an identity — silently defeating cross-transport dedup. Rounding each
 /// value to a fixed `10^-8` integer collapses both encodings to the same canonical key, matching
-/// `StableBBOHash`. A change in `bid_n`/`ask_n` (orders/sources at the top) is a distinct BBO.
+/// `StableBBOHash`. A change in `bid_n`/`ask_n` (the count at the top) is a distinct BBO.
 ///
 /// The fixed-point integers are `i128`, not `i64`: a float→int cast **saturates**, so with `i64`
 /// any value above ~9.2e10 (at the `10^-8` scale) would clamp to `i64::MAX` and two genuinely
@@ -316,7 +316,7 @@ pub struct QuoteId {
 
 impl QuoteId {
     /// The canonical content identity of a normalized quote: each BBO `f64` rounded to a `10^-8`
-    /// fixed-point integer (so two sources' encodings of the same price collapse), plus the counts.
+    /// fixed-point integer (so both transports' encodings of the same price collapse), plus the counts.
     pub fn of(q: &NormalizedQuote) -> Self {
         let canon = |x: f64| (x * 10f64.powi(CANONICAL_BBO_EXP)).round() as i128;
         Self {
@@ -395,7 +395,7 @@ impl DepthId {
 
 /// The outcome of a de-dup admission decision, shared by [`StalenessFloor`] and [`WindowedDedup`].
 /// The caller forwards on [`Admit::Emitted`] and drops otherwise; [`Admit::Contest`] additionally
-/// reports a *cross-source* head-to-head: another publisher already won this identity, and this is
+/// reports a head-to-head: another publisher already won this identity, and this is
 /// the first losing copy from a different publisher, arriving `lead_ns` after the `winner` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admit<P> {
@@ -406,10 +406,10 @@ pub enum Admit<P> {
     /// open. One `true` per tick is the once-per-tick win the `dz_*_ticks_won_total` counters
     /// publish (see [`crate::metrics::Metrics::quote_ticks_won`]).
     Emitted { opened_tick: bool },
-    /// Dropped with no cross-source contest to report: stale tick, exact repeat, a same-publisher
+    /// Dropped with no contest to report: stale tick, exact repeat, a same-publisher
     /// duplicate, or a subsequent follower at a tick whose contest was already counted.
     Dropped,
-    /// Dropped as the first losing copy of a cross-source contest: `winner` delivered this identity
+    /// Dropped as the first losing copy of a contest: `winner` delivered this identity
     /// `lead_ns` nanoseconds earlier. Recorded once per identity so the count is one-per-contest.
     Contest { winner: P, lead_ns: u64 },
 }
@@ -422,7 +422,7 @@ impl<P> Admit<P> {
 }
 
 /// Per-key tick state for the [`StalenessFloor`]: the leader latched at the current `source_ts`
-/// tick, when that leader's opening copy arrived (for the cross-source lead-time measure), whether
+/// tick, when that leader's opening copy arrived (for the lead-time measure), whether
 /// a losing follower has already been counted at this tick, and the leader's distinct content set
 /// (FIFO-bounded to `tick_cap`).
 struct TickState<V, P> {
@@ -524,8 +524,8 @@ impl<K: Eq + Hash, V: Eq + Hash + Clone, P: Eq + Copy> StalenessFloor<K, V, P> {
                     Admit::Emitted { opened_tick: true }
                 } else if publisher != st.leader {
                     // A non-leader sample at this tick: its arrival order vs the leader is
-                    // delay-corrupted so it is dropped, but the *first* one is a cross-source
-                    // contest the leader won — report the lead once (later followers just drop).
+                    // delay-corrupted so it is dropped, but the *first* one is a contest the
+                    // leader won — report the lead once (later followers just drop).
                     if st.follower_recorded {
                         Admit::Dropped
                     } else {
@@ -731,7 +731,7 @@ struct ChannelClock {
     moved_at: u64,
     /// The monotonic time the forward bound started refusing advances **continuously**, cleared by
     /// any accepted one. The movement-keyed wait above is not enough on its own, and the case that
-    /// needs this is an ordinary publisher bug rather than a forged source: **a unit mismatch where
+    /// needs this is an ordinary publisher bug rather than a forged publisher: **a unit mismatch where
     /// the mis-stamping path owns the clock.** Path A stamps milliseconds and seeds the channel; path B
     /// stamps nanoseconds and is a million times ahead of it — but B is *not* past the host-clock
     /// anchor, because B is emitting the correct time, so the anchor cannot recover this. Meanwhile
@@ -1344,7 +1344,7 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 }
 
 /// The shared emit stage: owns the broadcast `Sender` plus the dedup state, and exposes one
-/// `emit(msg, publisher)` entry point every ingest source funnels through. Quotes pass through the
+/// `emit(msg, publisher)` entry point every ingest input funnels through. Quotes pass through the
 /// per-`(venue, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Transport`),
 /// MBO `depth` through its own latch-to-leader floor (keyed on [`DepthId`] — but with no
 /// `source_ts == 0` bypass, see the `Depth` branch), trades through the [`WindowedDedup`] on `trade_id`,
@@ -1355,8 +1355,8 @@ pub struct Arbiter {
     /// The backbone carries `Arc<FeedMessage>` so a per-subscriber delivery is a refcount bump, not
     /// a deep clone of the message's `String`/`Vec`s.
     tx: broadcast::Sender<Arc<FeedMessage>>,
-    /// Cross-source dedup for quotes. Deliberately EXEMPT from the session-reset escape hatch the
-    /// depth floor gets (see `depths` below): the TOB `source_ts` is epoch block time, monotonic
+    /// Cross-transport dedup for quotes. Deliberately EXEMPT from the session-reset escape hatch the
+    /// depth floor gets (see `depths` below): the TOB `source_ts` is block time in the Unix epoch, monotonic
     /// across sessions by construction, so a session boundary cannot restart it below the latched
     /// high-water — and 0, the "not available" sentinel, bypasses this floor entirely. Revisit if
     /// a venue with a session-scoped quote clock is ever added. The key `(venue, symbol)` is
@@ -1448,7 +1448,7 @@ pub struct Arbiter {
     book_replay: Option<BookSnapshot>,
     /// Per order-level market, each publisher's standing (see [`PeerState`]). Bounded twice: evicted
     /// alongside `book_markets`, and the inner map only admits paths the authority already counts, so a
-    /// spoofed-source flood cannot grow it.
+    /// spoofed-publisher flood cannot grow it.
     book_sync: HashMap<MarketKey, HashMap<Transport, PeerState>>,
     /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
     book_events: HashMap<MarketKey, MarketEvents>,
@@ -1482,7 +1482,7 @@ struct TapeLead {
 struct PeerState {
     synced: bool,
     /// Monotonic time of this publisher's last *published* batch for the market; `0` until it publishes
-    /// one, which is what keeps a source that only ever sent reference data from claiming to serve.
+    /// one, which is what keeps a publisher that only ever sent reference data from claiming to serve.
     last_batch_ns: u64,
 }
 
@@ -1722,7 +1722,7 @@ impl Arbiter {
     /// same and wipe the consumer twice.
     ///
     /// Ineligible paths are ignored, exactly as [`StickyAuthority::admit`] ignores them: the report keys
-    /// on a spoofable source IP, so without this a forged flood would both grow the map and mint an
+    /// on a spoofable source IP address, so without this a forged flood would both grow the map and mint an
     /// unbounded supply of peers whose claim suppresses a real publisher's re-baseline.
     pub fn set_book_synced(&mut self, key: &MarketKey, publisher: Transport, synced: bool) {
         if self
@@ -1753,7 +1753,7 @@ impl Arbiter {
     /// market wedges for the life of the process.
     ///
     /// Scoped to the **category**, and to the sync claims only. One publisher host serves several
-    /// protocols from one source IP (the tape-path gate rests on that), so an unscoped clear would let
+    /// protocols from one source IP address (the tape-path gate rests on that), so an unscoped clear would let
     /// an exiting Market-by-Order receiver tear down the same host's live Market-by-Price state. The
     /// category is what the exiting receiver and the `MarketKey` provably agree on — both take it
     /// verbatim from the registry row (`DatagramCtx::category`). Its **venue** does not: every key here
@@ -1862,7 +1862,7 @@ impl Arbiter {
     /// repopulates from the first admitted new-session depth. Cleared floor entries are counted in
     /// `dz_depth_floor_resets_total{venue, reason}`.
     ///
-    /// Worst case of a spurious reset (e.g. a forged `EndOfSession` — the source IP is spoofable):
+    /// Worst case of a spurious reset (e.g. a forged `EndOfSession` — the source IP address is spoofable):
     /// a still-live publisher's next depth re-opens the tick, possibly re-admitting a snapshot at
     /// an already-served `source_ts` — full-state, so consumers self-heal. Strictly better than
     /// the permanent wedge the reset prevents.
@@ -2452,7 +2452,7 @@ impl Arbiter {
     /// unauthenticated producer.
     ///
     /// **Republished from the shared replay map, never from a path's own accumulator.** The replay map
-    /// holds what actually reached the wire; a path's accumulator holds whatever that source sent, and
+    /// holds what actually reached the wire; a path's accumulator holds whatever that publisher sent, and
     /// on an unauthenticated wire republishing it as `snapshot`/`last` would let one forged datagram —
     /// a size claim large enough to be a disagreement — buy the wholesale replacement of a market's
     /// book with a fabricated one. What the flag protects is the consumer, and full state it already
@@ -2622,9 +2622,9 @@ impl Arbiter {
     /// Two filters, both load-bearing. **An edge path only**: the public WS backstop reaches `emit` with
     /// the same trades, decodes them from parsed JSON rather than the paths' shared fixed-point, and
     /// serves no `book` at all — matching it would poison `dz_path_lead_ns` with edge-vs-public leads
-    /// and could hand a venue's books to a source that publishes none. **Already tracked by the
+    /// and could hand a venue's books to a publisher that publishes none. **Already tracked by the
     /// authority**: `observe_matched_lead` creates a path entry for whatever it is handed, so an
-    /// untracked publisher (a peer feed row of the same universe, a forged source IP) would otherwise
+    /// untracked publisher (a peer feed row of the same universe, a forged source IP address) would otherwise
     /// spend one of the universe's eight admission slots and could displace a real mirror path.
     fn race_eligible(&self, scope: &ScopeKey, publisher: Transport) -> bool {
         matches!(publisher, Transport::Edge(_)) && self.books.tracks_path(scope, publisher)
@@ -2661,7 +2661,7 @@ impl Arbiter {
     ///   that hole on a venue with no `book` traffic, where the authority tracks nobody — see below.)
     /// - **Defer to the book election.** A challenger the authority has *elected* takes over at once,
     ///   so the tape converges on the path serving the books. Sound because a publisher host uses one
-    ///   source IP for both of a venue's protocols, making path identity shared across its rows. Honored
+    ///   source IP address for both of a venue's protocols, making path identity shared across its rows. Honored
     ///   once per election, not per print: re-honoring it on every print would let an elected path whose
     ///   trade feed is nearly dead reclaim the tape from the healthy peer after each straggler and
     ///   mute it for another window — the two rules would fight and the tape would sawtooth. A silence
@@ -2670,7 +2670,7 @@ impl Arbiter {
     ///   incumbent silence — otherwise an elected path whose *trade* feed is dead would mute the tape.
     ///
     /// ⚠️ Two limits, both inherited from the unauthenticated wire rather than introduced here. On a
-    /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged source that
+    /// venue with **no `book` traffic** the authority tracks and elects nobody, so a forged publisher that
     /// prints first holds the tape until it goes quiet for a window — the same primitive
     /// [`StickyAuthority::admit`]'s no-dark-start already exposes for the `book` product, and not
     /// closable without an identity the wire does not carry. And the gate spans a whole **category**:
@@ -2822,11 +2822,11 @@ impl Arbiter {
     }
 
     /// Apply the appropriate dedup and broadcast if the message survives it. `publisher` is the
-    /// source racing for the quote floor's per-tick leadership; it is ignored for non-quote
+    /// transport racing for the quote floor's per-tick leadership; it is ignored for non-quote
     /// messages. The send result is ignored: a no-subscriber send desyncs no one, and a unique
     /// update dropped by a slow per-client channel is unrecoverable regardless.
     ///
-    /// `category` is the emitting source's instrument **universe** (`ingest::feeds::Feed::category`,
+    /// `category` is the emitting row's instrument **universe** (`ingest::feeds::Feed::category`,
     /// supplied by the caller because it is a property of the *row*, not of the message). Only the
     /// `Sticky` trade gate reads it, and it is deliberately a parameter rather than a field on the
     /// wire types: those serialize into the WebSocket JSON, which PROTOCOL.md fixes as a consumer
@@ -2865,7 +2865,7 @@ impl Arbiter {
                     return;
                 }
                 let key = (q.venue.clone(), q.symbol.clone());
-                // `recv_ts_ns` is the cross-source-comparable arrival clock (host wall clock,
+                // `recv_ts_ns` is the cross-transport-comparable arrival clock (host wall clock,
                 // sampled for both the edge receiver and the public WS input).
                 let decision =
                     self.quotes
@@ -2886,7 +2886,7 @@ impl Arbiter {
                         }
                         let _ = self.tx.send(Arc::new(msg));
                     }
-                    // A cross-source follower lost this tick: record how far the winner led, on top
+                    // A cross-publisher follower lost this tick: record how far the winner led, on top
                     // of the plain drop count. The losing copy is `publisher` (the non-leader at
                     // this tick) — labelling both ends keeps an edge-vs-edge mirror race out of the
                     // headline edge-vs-public margin (see `quote_lead_ns` docs).
@@ -3008,7 +3008,7 @@ impl Arbiter {
             }
             FeedMessage::Depth(d) => {
                 // Reject an implausibly-far-future `source_ts` before it can advance the floor — the
-                // book event timestamp is venue/wire data and the source IP is spoofable, so one
+                // book event timestamp is venue/wire data and the source IP address is spoofable, so one
                 // forged far-future depth would otherwise latch `high_water` ahead and wedge depth
                 // for that symbol until restart (mirrors the quote branch; see `MAX_FUTURE_SKEW_NS`).
                 if d.source_ts_ns > now_ns().saturating_add(MAX_FUTURE_SKEW_NS) {
@@ -3034,7 +3034,7 @@ impl Arbiter {
                         let vm = self.vm(&d.venue);
                         vm.emit[EMIT_DEPTH].inc();
                         // Attribute the admitted depth to its winning publisher — the depth mirror of
-                        // `quotes_admitted`. A rise for a given source shows which publisher currently
+                        // `quotes_admitted`. A rise for a given transport shows which publisher currently
                         // leads the reconstructed book (and, were a public depth backstop ever added,
                         // `publisher="public"` would flag it filling an edge gap).
                         vm.depth_admitted[pub_idx(publisher)].inc();
@@ -3053,7 +3053,7 @@ impl Arbiter {
                     }
                     // A cross-publisher follower lost this depth tick: record how far the winner led
                     // (the depth mirror of `quote_lead_ns`), on top of the drop count attributed to
-                    // the losing publisher class (which source is *losing* the book race — the
+                    // the losing publisher class (which transport is *losing* the book race — the
                     // symmetric counterpart of `depth_admitted`'s winner attribution).
                     Admit::Contest { winner, lead_ns } => {
                         let vm = self.vm(&d.venue);
@@ -3082,7 +3082,7 @@ impl Arbiter {
                 let scope: ScopeKey = (b.venue.clone(), category_arc(category));
                 let key: MarketKey = (scope.0.clone(), scope.1.clone(), b.channel, b.instrument_id);
                 // Eligibility first, exactly as `admit` applies it: a path past the authority's
-                // per-universe cap enters no map here either, so a forged source can neither be
+                // per-universe cap enters no map here either, so a forged publisher can neither be
                 // served nor evict a real market's state.
                 if self.books.path_ordinal(&scope, publisher) == OTHER_PATH {
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
@@ -3174,9 +3174,9 @@ impl Arbiter {
                 let _ = self.tx.send(Arc::new(msg));
             }
             // `Status` is currently never routed through `emit` — receivers send it straight via
-            // `sender()` (see `emit_status`), and no other source produces it — so `dz_emit_total
+            // `sender()` (see `emit_status`), and no other call site produces it — so `dz_emit_total
             // {kind="status"}` is unreachable in practice today. The path is kept for match
-            // exhaustiveness and stays correct if a future source ever emits status through here.
+            // exhaustiveness and stays correct if a future call site ever emits status through here.
             FeedMessage::Status(s) => {
                 self.vm(&s.venue).emit[EMIT_STATUS].inc();
                 let _ = self.tx.send(Arc::new(msg));
@@ -3194,7 +3194,7 @@ pub type SharedArbiter = Arc<Mutex<Arbiter>>;
 /// The emit critical section ([`Arbiter::emit`]) is panic-free by construction — it only does
 /// `HashMap`/`HashSet` work and an ignored `broadcast::send` — so the protected dedup state is always
 /// left consistent. Recovering from poisoning (rather than `.lock().unwrap()`) therefore keeps an
-/// **unrelated** panic in any one ingest task from cascading into every other source: the multicast
+/// **unrelated** panic in any one ingest task from cascading into every other input: the multicast
 /// receivers' hot path stays isolated from a WS-input fault, which is the failure-isolation contract.
 pub fn lock(arbiter: &SharedArbiter) -> std::sync::MutexGuard<'_, Arbiter> {
     arbiter
@@ -3299,7 +3299,7 @@ mod tests {
     fn trade_new_admitted_repeat_dropped() {
         let mut d: WindowedDedup<&str, u64, u8> = WindowedDedup::new(8);
         assert!(d.admit("BTC", 1, 1, 0).emitted());
-        // A competing publisher's copy of the same id -> a cross-source contest (the loser), the
+        // A competing publisher's copy of the same id -> a cross-publisher contest (the loser), the
         // first publisher led by the arrival delta.
         assert_eq!(
             d.admit("BTC", 1, 2, 40),
@@ -3356,7 +3356,7 @@ mod tests {
     }
 
     /// `QuoteId` distinguishes distinct BBOs and equates identical ones, so the floor drops a
-    /// source's own exact `(source_ts, content)` republish through the arbiter's emit path.
+    /// publisher's own exact `(source_ts, content)` republish through the arbiter's emit path.
     #[test]
     fn arbiter_emit_drops_same_source_exact_repeat() {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -3409,7 +3409,7 @@ mod tests {
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0), (1001, 100.2)]);
     }
 
-    /// Trades dedup by `trade_id` through the arbiter regardless of which source delivered them, so
+    /// Trades dedup by `trade_id` through the arbiter regardless of which transport delivered them, so
     /// a public copy of an edge trade is a no-op.
     #[test]
     fn arbiter_trade_dedup_across_sources() {
@@ -3618,7 +3618,7 @@ mod tests {
 
     /// The same BBO at the same `source_ts` mirrored by two distinct multicast publishers collapses
     /// to one emission: the first publisher to open the tick leads it, and the second's identical
-    /// copy is a non-leader no-op. This is the cross-source duplicate-packet case.
+    /// copy is a non-leader no-op. This is the cross-publisher duplicate-packet case.
     #[test]
     fn duplicate_quote_from_two_multicast_publishers_emitted_once() {
         let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -3638,7 +3638,7 @@ mod tests {
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
     }
 
-    /// Two identical trade packets (same `trade_id`) from the same source collapse to one emission
+    /// Two identical trade packets (same `trade_id`) from the same publisher collapse to one emission
     /// via the windowed dedup, regardless of any other field.
     #[test]
     fn duplicate_trade_packet_from_same_source_emitted_once() {
@@ -3732,7 +3732,7 @@ mod tests {
 
     /// The canonical `QuoteId` collapses two `f64` encodings of the same economic price — the edge's
     /// `raw * 10^exp` and a parsed public float, which are not bit-identical — onto one identity, so
-    /// a cross-source copy dedups. (Raw `f64` bits would treat them as distinct.)
+    /// a cross-transport copy dedups. (Raw `f64` bits would treat them as distinct.)
     #[test]
     fn quote_id_canonicalizes_equivalent_float_encodings() {
         let edge_px = 6788_f64 * 10f64.powi(-1); // 678.8 via raw*10^exp
@@ -3747,7 +3747,7 @@ mod tests {
         assert_ne!(a, QuoteId::of(&quote(1000, 678.9, 999.0)));
     }
 
-    /// End-to-end through `emit`: a cross-source quote contest must reach the lead-time histogram
+    /// End-to-end through `emit`: a cross-publisher quote contest must reach the lead-time histogram
     /// (attributed to the right `winner`/`loser` child) and bump the drop counter — not just return
     /// `Admit::Contest`. Keyed on a venue unique to this test so its metric children start at 0 and
     /// no parallel test touches them, so the absolute counts are assertable without `#[serial]`.
@@ -3827,7 +3827,7 @@ mod tests {
         );
     }
 
-    /// End-to-end through `emit`: a cross-source trade contest reaches the trade lead-time histogram
+    /// End-to-end through `emit`: a cross-publisher trade contest reaches the trade lead-time histogram
     /// and the drop counter (the trade-side mirror of the quote test above).
     #[test]
     fn arbiter_emit_records_trade_contest_into_lead_histogram() {
@@ -5033,7 +5033,7 @@ mod tests {
 
     /// The public WS backstop reaches `emit` with the same trades but decodes them from parsed JSON
     /// and serves no `book` at all. Admitting it as a path would poison the lead histogram and could
-    /// hand a venue's books to a source that publishes none.
+    /// hand a venue's books to a publisher that publishes none.
     #[test]
     fn the_public_backstop_is_not_an_election_path() {
         let venue = "BookPublicNotAnPath";
@@ -5045,7 +5045,7 @@ mod tests {
     }
 
     /// A trade publisher the authority does not track — a peer feed row of the same venue, or a forged
-    /// source IP — must not spend one of the universe's eight admission slots through the metrics path.
+    /// source IP address — must not spend one of the universe's eight admission slots through the metrics path.
     /// Once they are gone a real mirror path is ineligible and the venue can never fail over.
     #[test]
     fn an_untracked_trade_publisher_never_becomes_an_path() {
@@ -5074,7 +5074,7 @@ mod tests {
         );
     }
 
-    /// A path past the authority's per-universe cap enters no per-market map, so a forged source can
+    /// A path past the authority's per-universe cap enters no per-market map, so a forged publisher can
     /// neither be served nor evict a real market's book state through the gate.
     #[test]
     fn an_ineligible_path_creates_no_book_state() {
@@ -6248,7 +6248,7 @@ mod tests {
         );
     }
 
-    /// A forged source can raise a disagreement against any real order for the price of one datagram,
+    /// A forged publisher can raise a disagreement against any real order for the price of one datagram,
     /// so the re-baseline that follows must republish what the wire agreed on and never the raising
     /// path's own book — otherwise the cheapest input on the wire buys wholesale replacement of a
     /// market's book with a fabricated one.
@@ -6825,7 +6825,7 @@ mod tests {
     }
 
     /// A publisher that reports itself synced and then never reaches the wire — drained host, withdrawn
-    /// group, a forged source that went quiet — must not suppress the surviving path's re-baseline. A
+    /// group, a forged publisher that went quiet — must not suppress the surviving path's re-baseline. A
     /// re-baseline is this product's only self-heal, so a claim that never expires wedges the market for
     /// the life of the process.
     #[test]
@@ -7458,7 +7458,7 @@ mod tests {
         );
     }
 
-    /// A publisher whose clock **crawls** — a unit mismatch, an old-session replay, a forged source
+    /// A publisher whose clock **crawls** — a unit mismatch, an old-session replay, a forged publisher
     /// stepping by a microsecond — has every one of its tiny advances accepted, so the
     /// movement-keyed re-seat never elapses while every honest path on the channel is refused as too
     /// far ahead. The frontier then pins below the whole channel: nothing is refused, but nothing is

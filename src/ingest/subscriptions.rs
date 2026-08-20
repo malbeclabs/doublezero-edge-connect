@@ -3,8 +3,8 @@
 //! `doublezero status --json` reports exactly the multicast groups **this host** is subscribed to,
 //! in its `multicast_groups` field: a comma-separated list of `ROLE:code` entries where `S:` is a
 //! subscriber and `P:` a publisher, e.g.
-//! `"S:edge-solana-root,S:edge-solana-shreds,S:tiredsolid,S:scottsdale"`. That is the source of
-//! truth the reconciler (`crate::ingest::reconcile`) uses to decide which market-data receivers,
+//! `"S:edge-solana-root,S:edge-solana-shreds,S:tiredsolid,S:scottsdale"`. That is the authority
+//! the reconciler (`crate::ingest::reconcile`) uses to decide which market-data receivers,
 //! shred sources, and the WebSocket sink to run.
 //!
 //! The network-wide `doublezero multicast group list` (what the shred forwarder discovered from

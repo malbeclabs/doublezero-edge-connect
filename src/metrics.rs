@@ -21,7 +21,7 @@ use prometheus::{
     HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 
-/// Buckets (nanoseconds) for the de-dup *lead-time* histograms: how far ahead the winning source
+/// Buckets (nanoseconds) for the de-dup *lead-time* histograms: how far ahead the winning publisher
 /// was when the losing duplicate arrived. Spans ~50µs … 1s, dense in the sub-millisecond range
 /// where the edge feed beats the public/cross-group copy in steady state, with a long tail for the
 /// tens-to-hundreds-of-ms inter-feed skew seen when a path is slow.
@@ -114,7 +114,7 @@ pub struct Metrics {
     /// to the first one seen, or the new venue would never get a definition anywhere. Labelled by
     /// the NEW (post-change) venue.
     pub source_id_changed: IntCounterVec,
-    /// Quote-tick *cross-source* contest lead time (ns): on a `source_ts` tick another publisher
+    /// Quote-tick *cross-publisher* contest lead time (ns): on a `source_ts` tick another publisher
     /// already led, how far ahead the leader was when this publisher's first copy arrived, labelled
     /// by the `winner` **and** `loser` (edge/public). Its `_count` is the head-to-head contest
     /// count. Labelling both ends keeps an edge-vs-edge mirror race (small, sub-ms leads in a
@@ -122,13 +122,13 @@ pub struct Metrics {
     /// `{winner="edge",loser="public"}` are the margin by which DZ (edge) beats the public feed,
     /// while `{winner="edge",loser="edge"}` is the inter-mirror skew. See [`LEAD_NS_BUCKETS`].
     pub quote_lead_ns: HistogramVec,
-    /// Trade *cross-source* contest lead time (ns): when a duplicate `trade_id` arrives from a
+    /// Trade *cross-publisher* contest lead time (ns): when a duplicate `trade_id` arrives from a
     /// different publisher than the one that first delivered it, how far ahead the first was,
     /// labelled by the `winner` and `loser` (see [`quote_lead_ns`](Self::quote_lead_ns)).
     pub trade_lead_ns: HistogramVec,
     /// MBO `depth` snapshots admitted by the staleness floor, attributed to the winning `publisher`
     /// (edge/public) — the depth mirror of [`quotes_admitted`]. Per-publisher books race on one floor
-    /// per (venue, symbol); a rise here for a given publisher class shows which source is currently
+    /// per (venue, symbol); a rise here for a given publisher class shows which transport is currently
     /// leading the reconstructed book.
     pub depth_admitted: IntCounterVec,
     /// MBO `depth` `source_ts` ticks *won* — the depth mirror of
@@ -138,7 +138,7 @@ pub struct Metrics {
     /// MBO `depth` snapshots dropped by the staleness floor (stale tick, non-leader publisher's
     /// redundant book, or the leader's exact content repeat — the cross-publisher collapse),
     /// attributed to the `publisher` class whose copy was dropped — the symmetric counterpart of
-    /// [`depth_admitted`](Self::depth_admitted)'s winner attribution, so a lagging source (who is
+    /// [`depth_admitted`](Self::depth_admitted)'s winner attribution, so a lagging publisher (who is
     /// *losing* the book race) is directly visible.
     pub depth_dropped: IntCounterVec,
     /// Depth-floor entries cleared by the session-reset escape hatch, by `reason`
@@ -146,7 +146,7 @@ pub struct Metrics {
     /// latched high-water would otherwise wedge depth permanently; see
     /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_venue`].
     pub depth_floor_resets: IntCounterVec,
-    /// Depth *cross-source* contest lead time (ns): when a second publisher's book snapshot arrives
+    /// Depth *cross-publisher* contest lead time (ns): when a second publisher's book snapshot arrives
     /// at a `source_ts` tick the leader already opened, how far ahead the leader was, labelled by the
     /// `winner` and `loser` — the depth mirror of [`quote_lead_ns`](Self::quote_lead_ns).
     pub depth_lead_ns: HistogramVec,
@@ -530,7 +530,7 @@ impl Metrics {
                 &registry,
                 "dz_quote_lead_ns",
                 "Nanoseconds the winning publisher led the losing duplicate by, per quote-tick \
-                 cross-source contest, by winner and loser (edge/public). Splitting on both ends \
+                 cross-publisher contest, by winner and loser (edge/public). Splitting on both ends \
                  keeps an edge-vs-edge mirror race out of the headline edge-vs-public margin: \
                  {winner=\"edge\",loser=\"public\"} is 'DZ beats the public feed'.",
                 &["venue", "winner", "loser"],
@@ -540,7 +540,7 @@ impl Metrics {
                 &registry,
                 "dz_trade_lead_ns",
                 "Nanoseconds the winning publisher led the losing duplicate by, per trade \
-                 cross-source contest, by winner and loser (edge/public). See dz_quote_lead_ns \
+                 cross-publisher contest, by winner and loser (edge/public). See dz_quote_lead_ns \
                  for why both ends are labelled.",
                 &["venue", "winner", "loser"],
                 LEAD_NS_BUCKETS,

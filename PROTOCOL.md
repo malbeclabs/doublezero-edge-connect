@@ -32,8 +32,8 @@ On each new connection the producer:
    publisher whose reference data carries no Source ID of its own, that means **known and priced
    at least once** - a symbol it defines but has not yet priced is not replayed. For a publisher
    whose reference data carries its own Source ID, every symbol it defines is replayed, priced or
-   not (see [*A symbol appears only once its source is
-   known*](#a-symbol-appears-only-once-its-source-is-known)).
+   not (see [*A symbol appears only once its Source ID is
+   known*](#a-symbol-appears-only-once-its-source-id-is-known)).
 2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and a
    `book` re-baseline (a `clear` plus the complete book) for every market that has one, at the
    market's own granularity.
@@ -74,7 +74,7 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 |------------------|--------|----------------------------------------------------------------------|
 | `type`           | string | `"instrument"`.                                                      |
 | `venue`          | string | **Deprecated.** Always identical to `source_name`. See [`source_name`, `source_id`, and the deprecated `venue`](#source_name-source_id-and-the-deprecated-venue). |
-| `source_name`    | string | The source's registry name (e.g. `Hyperliquid`, `Phoenix`). **Preferred.** |
+| `source_name`    | string | The upstream source's registry name (e.g. `Hyperliquid`, `Phoenix`). **Preferred.** |
 | `source_id`      | number | The wire Source ID, verbatim.                                        |
 | `symbol`         | string | Instrument symbol as the venue names it (e.g. `SOL`, `SOL-PERP`).   |
 | `channel`        | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
@@ -101,16 +101,16 @@ to rescale integers.
 |-------------------|---------|-------------------------------------------------------------------------|
 | `type`            | string  | `"quote"`.                                                              |
 | `venue`           | string  | **Deprecated.** Always identical to `source_name`.                      |
-| `source_name`     | string  | The source's registry name. **Preferred.**                              |
+| `source_name`     | string  | The upstream source's registry name. **Preferred.**                              |
 | `source_id`       | number  | The wire Source ID, verbatim.                                           |
 | `symbol`          | string  | Symbol (matches an `instrument`'s `symbol`).                            |
 | `bid`             | number  | Best bid price (decimal).                                               |
 | `ask`             | number  | Best ask price (decimal).                                               |
 | `bid_size`        | number  | Size at best bid (decimal).                                             |
 | `ask_size`        | number  | Size at best ask (decimal).                                             |
-| `bid_n`           | uint16  | Orders/sources at best bid (`0` if the venue does not report it). Part of the top-of-book identity: a change here is a distinct quote even at an unchanged price/size. |
-| `ask_n`           | uint16  | Orders/sources at best ask (`0` if unavailable).                        |
-| `source_ts_ns`    | uint64  | Venue/source timestamp, ns since Unix epoch. `0` if unknown.            |
+| `bid_n`           | uint16  | Count at best bid (`0` if the venue does not report it). Part of the top-of-book identity: a change here is a distinct quote even at an unchanged price/size. |
+| `ask_n`           | uint16  | Count at best ask (`0` if unavailable).                        |
+| `source_ts_ns`    | uint64  | Venue timestamp, ns since Unix epoch. `0` if unknown.            |
 | `recv_ts_ns`      | uint64  | Producer user-space receive time (after decode), ns since epoch.        |
 | `kernel_rx_ts_ns` | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`, `CLOCK_REALTIME`) captured in the driver softirq, before user space. `0` if unavailable. |
 | `ws_send_ts_ns`   | uint64  | Wall clock sampled the instant this quote is serialized for the consumers. A single value shared by all consumers of this message (the producer serializes once and fans the identical frame out), not a per-connection send time. `0` if not stamped. |
@@ -151,17 +151,17 @@ venue precision, same convention as `quote`).
 |---------------------|---------|----------------------------------------------------------------------|
 | `type`              | string  | `"trade"`.                                                           |
 | `venue`             | string  | **Deprecated.** Always identical to `source_name`.                   |
-| `source_name`       | string  | The source's registry name. **Preferred.**                           |
+| `source_name`       | string  | The upstream source's registry name. **Preferred.**                           |
 | `source_id`         | number  | The wire Source ID, verbatim.                                        |
 | `symbol`            | string  | Symbol (matches an `instrument`'s `symbol`).                         |
-| `channel`           | uint8   | The publisher's channel id: the instrument set this feed carries. `0` for a source with no channel concept of its own. Filterable. |
+| `channel`           | uint8   | The publisher's channel id: the instrument set this feed carries. `0` for an upstream source with no channel concept of its own. Filterable. |
 | `instrument_id`     | uint32  | Instrument id, unique within `channel`.                              |
 | `price`             | number  | Trade price (decimal).                                               |
 | `size`              | number  | Trade size (decimal).                                                |
 | `aggressor_side`    | string  | `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.      |
 | `trade_id`          | uint64  | Venue-assigned trade identifier.                                     |
 | `cumulative_volume` | number  | Session cumulative traded volume (decimal); `0` if not provided.     |
-| `source_ts_ns`      | uint64  | Venue/source timestamp, ns since epoch. `0` if unknown.              |
+| `source_ts_ns`      | uint64  | Venue timestamp, ns since epoch. `0` if unknown.              |
 | `recv_ts_ns`        | uint64  | Producer user-space receive time (after decode), ns since epoch.     |
 | `kernel_rx_ts_ns`   | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable.          |
 | `ws_send_ts_ns`     | uint64  | Wall clock the instant this trade is serialized; shared by all consumers of this message (serialized once, not per-connection). `0` if unset.|
@@ -195,7 +195,7 @@ a consumer that connects partway through sees the matching `instrument` (for pre
 |------------------|--------|------------------------------------------------------------------------|
 | `type`           | string | `"midpoint"`.                                                          |
 | `venue`          | string | **Deprecated.** Always identical to `source_name` (a Midpoint feed maps to its own venue). |
-| `source_name`    | string | The source's registry name. **Preferred.**                             |
+| `source_name`    | string | The upstream source's registry name. **Preferred.**                             |
 | `source_id`      | number | The wire Source ID, verbatim (`0` when the feed names no registry row). |
 | `symbol`         | string | Symbol (matches an `instrument`'s `symbol`).                           |
 | `mid`            | number | Mid price (decimal).                                                   |
@@ -227,7 +227,7 @@ first** (bids high→low, asks low→high).
 |------------------|----------|----------------------------------------------------------------------|
 | `type`           | string   | `"depth"`.                                                           |
 | `venue`          | string   | **Deprecated.** Always identical to `source_name` (a Market-by-Order feed maps to its own venue). |
-| `source_name`    | string   | The source's registry name. **Preferred.**                           |
+| `source_name`    | string   | The upstream source's registry name. **Preferred.**                           |
 | `source_id`      | number   | The wire Source ID, verbatim (`0` when the feed names no registry row). |
 | `symbol`         | string   | Symbol (matches an `instrument`'s `symbol`).                         |
 | `bids`           | number[][] | `[price, size]` pairs, highest price first.                        |
@@ -270,7 +270,7 @@ The two granularities are **two message types**, not one type with a flag. `book
 |---|---|---|
 | `type` | string | `"book"` when price-aggregated, `"order_book"` when order-level. |
 | `venue` | string | **Deprecated.** Always identical to `source_name`. |
-| `source_name` | string | The source's registry name. **Preferred.** |
+| `source_name` | string | The upstream source's registry name. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim. |
 | `symbol` | string | **Display label.** Not guaranteed unique — see *Identity* below. |
 | `channel` | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
@@ -290,7 +290,7 @@ The two granularities are **two message types**, not one type with a flag. `book
 
 **Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
 
-**Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative source changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
+**Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative path changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
 
 **`last` is mandatory and must be honored.** A consumer that buffers a logical event until its final batch will wait forever if it is dropped — including on a re-baseline whose only change is the `clear`.
 
@@ -314,7 +314,7 @@ Either way a consumer that honors `clear` needs nothing else.
 A **venue-level feed-health** transition. The producer emits one when a venue's **quote**
 (market-data) multicast goes silent past the idle watchdog (`state:"down"`), and again when quotes
 recover (`state:"ok"`). It is emitted only on the **edge** (not repeatedly while silent), so a
-consumer can gray out / restore that source. Unlike `quote`/`instrument` it carries **no `symbol`**
+consumer can gray out / restore that upstream source. Unlike `quote`/`instrument` it carries **no `symbol`**
 - it is about the whole venue feed - so the server matches it against a subscription **by venue
 alone** (a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status).
 
@@ -324,24 +324,24 @@ remaining publishers still deliver full-state updates for that venue. `status` s
 always been — the health of the venue's *quote* feed — so a depth-only (Market-by-Order) publisher
 going silent is not reported here, and a healthy one does not suppress a quote outage.
 
-**A source whose receivers have revealed no Source ID may never produce a `status` message at
+**An upstream source whose receivers have revealed no Source ID may never produce a `status` message at
 all.** The naming this message carries — like every other message's — depends on a Source ID
-observed on the wire (see [*A symbol appears only once its source is
-known*](#a-symbol-appears-only-once-its-source-is-known)); a source that never reveals its
+observed on the wire (see [*A symbol appears only once its Source ID is
+known*](#a-symbol-appears-only-once-its-source-id-is-known)); an upstream source that never reveals its
 identity this way has no name to emit `status` under, healthy or not. A consumer should not infer
-"up" from the absence of a `status` message for a source it expects to hear from.
+"up" from the absence of a `status` message for an upstream source it expects to hear from.
 
 For a publisher whose reference data carries no Source ID of its own, revealing requires a decoded
 price, so in practice this is the "no market data decoded" case its name suggests. For a publisher
 whose reference data carries its own Source ID, reference data alone reveals it — `status` can
-still be emitted for a source whose receivers have decoded reference data but never a single
+still be emitted for an upstream source whose receivers have decoded reference data but never a single
 quote or trade.
 
 | Field       | Type   | Meaning                                                         |
 |-------------|--------|-------------------------------------------------------------------|
 | `type`      | string | `"status"`.                                                     |
 | `venue`     | string | **Deprecated.** Always identical to `source_name`.              |
-| `source_name` | string | The source's registry name whose quote feed changed health. **Preferred.** |
+| `source_name` | string | The upstream source's registry name whose quote feed changed health. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim.                                   |
 | `state`     | string | `"down"` (quote multicast silent) or `"ok"` (quotes recovered). |
 | `stale_ms`  | uint64 | Milliseconds the quote feed had been silent (`0` when `"ok"`).  |
@@ -357,7 +357,7 @@ Every message carries three fields naming where the data came from:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `source_name` | string | The source's registry name. **Preferred.** |
+| `source_name` | string | The upstream source's registry name. **Preferred.** |
 | `source_id` | number | The wire Source ID, verbatim. |
 | `venue` | string | **Deprecated.** Always identical to `source_name`. |
 
@@ -366,7 +366,7 @@ Every message carries three fields naming where the data came from:
 `source_id` is now the Source ID the publisher stamped on the wire, passed through unmodified, and
 `source_name`/`venue` are both that ID's registry name. Previously the bridge substituted its own
 configured label when it did not recognise an ID. It no longer does: a publisher stamping an
-incorrect Source ID now produces messages named for the source that ID identifies, because the
+incorrect Source ID now produces messages named for the upstream source that ID identifies, because the
 Source ID is the contract and a wrong one is a publisher defect to fix at the publisher.
 
 `venue` remains the compatibility alias and carries the identical value, so a consumer reading
@@ -376,9 +376,11 @@ consumers should read `source_name`, or `source_id` for a stable numeric identit
 string matching.
 
 An unregistered Source ID yields a stable synthesized name (`SOURCE_<id>`) rather than being dropped,
-so data always flows and an unrecognised source is visible rather than silent.
+so data always flows and an unrecognised Source ID is visible rather than silent.
 
-### A symbol appears only once its source is known
+**Planned for v2: `venue` names a matching engine, not a venue.** The edge-feed-spec glossary is explicit that a Source ID identifies one matching engine and that a venue may hold several IDs, so the field is misnamed as well as redundant. Retiring it — rather than merely deprecating it, which this release does — is a v2 change, and upstream's own `sources/spec.md` still describes the field the old way.
+
+### A symbol appears only once its Source ID is known
 
 A message is emitted for an instrument only after that instrument's Source ID has been observed —
 but *when* that happens depends on the publisher's reference-data generation.
@@ -399,12 +401,12 @@ Consequences for a consumer:
 - The connect-time replay contains one `instrument` per symbol whose Source ID is known — every
   symbol a newer-generation publisher defines, but only the priced ones for a publisher (or
   Midpoint) still on the original generation.
-- For a publisher still on the original generation, a `status` message may never appear for a
-  source whose receivers have decoded no market data at all (see [`status`](#status)); a
+- For a publisher still on the original generation, a `status` message may never appear for an
+  upstream source whose receivers have decoded no market data at all (see [`status`](#status)); a
   newer-generation publisher's reference data alone is enough to reveal it.
 - Both generations can be live at once — a host may hold publishers of either kind for different
   venues, or for different rows of the same venue — so a consumer should not assume the deferral
-  rule observed for one source holds for every source on the feed.
+  rule observed for one upstream source holds for every one on the feed.
 
 The deferral itself is deliberate, for whichever generation still needs it. The alternative is
 announcing an instrument under a name the bridge guessed, which is what the previous behaviour
@@ -540,8 +542,8 @@ on connect:
   having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
   no removed ones) but change *values* an existing consumer may depend on — see [`source_name`,
   `source_id`, and the deprecated `venue`](#source_name-source_id-and-the-deprecated-venue) and [*A
-  symbol appears only once its source is
-  known*](#a-symbol-appears-only-once-its-source-is-known). The forward-compatibility rule below
+  symbol appears only once its Source ID is
+  known*](#a-symbol-appears-only-once-its-source-id-is-known). The forward-compatibility rule below
   covers unknown fields/types, not this.
 - There is no `v` field on the wire; the contract is this spec plus the
   **forward-compatibility rule**: consumers ignore unknown message types and unknown fields,

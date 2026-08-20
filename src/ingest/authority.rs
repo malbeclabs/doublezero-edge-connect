@@ -29,7 +29,7 @@
 //!
 //! # What is scoped where
 //!
-//! Latency is a property of an *path*, not of a market: every message from a source IP is evidence
+//! Latency is a property of an *path*, not of a market: every message from a source IP address is evidence
 //! about that path, whatever market carried it. The three transfer triggers therefore sit at two
 //! grains, and confusing them produces the two failures this module is shaped to avoid.
 //!
@@ -54,7 +54,7 @@
 //!
 //! # Bounding
 //!
-//! The multicast source is unauthenticated and a [`Transport`] is a spoofable source IP, so **only
+//! The multicast wire is unauthenticated and a [`Transport`] is a spoofable source IP address, so **only
 //! paths holding a metric ordinal are eligible**: past [`MAX_LABELLED_PATHS`] a publisher is neither
 //! recorded nor ever authoritative. The cap that existed to bound the metric label set bounds
 //! admission too, which keeps the per-path state from growing under a forged flood. Real deployments
@@ -245,7 +245,7 @@ impl StickyAuthority {
     /// Record a path's book health for one market. `false` means `gap`/`awaiting-snapshot`; the
     /// processor calls this on every state transition.
     pub fn set_health(&mut self, key: &MarketKey, publisher: Transport, healthy: bool) {
-        // Same eligibility bound as `admit`: an ineligible path (past the labelled cap — the source IP
+        // Same eligibility bound as `admit`: an ineligible path (past the labelled cap — the source IP address
         // is spoofable) is never authoritative, so it must not enter per-market state either.
         if self.path_ordinal(&scope_of(key), publisher) == OTHER_PATH {
             return;
@@ -334,7 +334,7 @@ impl StickyAuthority {
         }
     }
 
-    /// A stable, bounded metric label for a path within one scope, so a spoofable source IP never
+    /// A stable, bounded metric label for a path within one scope, so a spoofable source IP address never
     /// becomes a label value. Past the cap returns [`OTHER_PATH`] and records nothing — which is also
     /// what makes that path ineligible. The mapping is logged once, on first sight.
     ///
@@ -364,7 +364,7 @@ impl StickyAuthority {
     /// A path's metric label, minting nothing — [`Self::path_ordinal`] both labels *and* admits, so it
     /// must only be reached from a path that has applied the eligibility rule. A metric label is not
     /// one: a publisher can reach the counters without ever having been admitted, and registering it
-    /// there would spend the scope's admission budget on a source that never serves a book.
+    /// there would spend the scope's admission budget on a publisher that never serves a book.
     pub fn path_label(&self, scope: &ScopeKey, publisher: Transport) -> &'static str {
         self.ordinals
             .get(scope)
@@ -649,7 +649,7 @@ mod tests {
         );
     }
 
-    /// A path past the labelled cap is never authoritative, so a health report from one — the source IP
+    /// A path past the labelled cap is never authoritative, so a health report from one — the source IP address
     /// is spoofable — must not enter per-market state either.
     #[test]
     fn an_ineligible_path_reports_no_health() {
@@ -860,7 +860,7 @@ mod tests {
 
     // ---- path eligibility and labelling ----
 
-    /// Ordinals are stable per venue, bounded, and never expose a spoofable source IP as a label.
+    /// Ordinals are stable per venue, bounded, and never expose a spoofable source IP address as a label.
     #[test]
     fn path_ordinals_are_stable_and_bounded() {
         let mut a = StickyAuthority::new(no_window_cfg());
@@ -879,7 +879,7 @@ mod tests {
     }
 
     /// Past the cap a path is not merely unlabelled — it is never authoritative and enters no map, so
-    /// a forged-source flood can neither displace a real path nor grow the per-path state.
+    /// a forged-publisher flood can neither displace a real path nor grow the per-path state.
     #[test]
     fn an_path_past_the_cap_is_never_authoritative() {
         let mut a = StickyAuthority::new(no_window_cfg());

@@ -70,8 +70,8 @@ fn multicast_sender() -> std::io::Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_multicast_loop_v4(true)?;
     sock.set_multicast_ttl_v4(1)?;
-    // TODO(#3): multi-source replay needs distinct src IPs + a re-sequenced fixture; all
-    // datagrams here share one source IP, so independent-publisher MBO demux can't be
+    // TODO(#3): multi-publisher replay needs distinct src IPs + a re-sequenced fixture; all
+    // datagrams here share one source IP address, so independent-publisher MBO demux can't be
     // exercised yet.
     sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
     Ok(sock)

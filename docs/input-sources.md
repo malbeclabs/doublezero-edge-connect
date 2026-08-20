@@ -65,7 +65,7 @@ the public feed and to tag the emitted trade — and trade dedup keys on the pub
 Validated against a concurrent edge+public capture (2026-06-30): the public `tradeSequenceNumber`
 equals the edge `trade_id` on every shared fill (257/257) and `side` maps `bid -> buy` / `ask -> sell`.
 
-> **Caveat — trade dedup window vs. reconnect lag.** Cross-source trade dedup is a fixed-size
+> **Caveat — trade dedup window vs. reconnect lag.** Cross-transport trade dedup is a fixed-size
 > windowed `trade_id` cache. A long public reconnect can deliver trades whose ids have aged out of
 > the window during a high-volume burst, which would re-emit a duplicate trade. Sizing the window
 > against the public feed's unbounded-lag failure mode is tracked separately (window-sizing issue);

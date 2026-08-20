@@ -35,7 +35,7 @@ const ACTION_DELETE: u8 = 3;
 pub(crate) const MAX_BUFFERED_DELTAS: usize = 1 << 18;
 
 /// Cap on price levels held per book — both the live sides and the snapshot under assembly. The
-/// multicast source is unauthenticated, so a forged feed of level updates at distinct prices would
+/// multicast wire is unauthenticated, so a forged feed of level updates at distinct prices would
 /// otherwise grow both maps without limit; ~50x the spec's own worst-case per-instrument sizing.
 /// Matches `book.rs`'s `MAX_ORDERS_PER_BOOK`.
 const MAX_LEVELS_PER_BOOK: usize = 1 << 18;
@@ -1412,7 +1412,7 @@ mod tests {
 
     // ---- Level bound ----
 
-    /// The multicast source is unauthenticated, so a forged feed of level updates at distinct
+    /// The multicast wire is unauthenticated, so a forged feed of level updates at distinct
     /// prices must not grow the book without limit. At the cap the book *and* the buffer are
     /// discarded — leaving the buffer would just relocate the flood — and the instrument awaits a
     /// snapshot rather than declaring a gap it never had.

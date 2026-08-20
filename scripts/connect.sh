@@ -545,7 +545,7 @@ preflight_ws_port
 # ----------------------------------------------------------------------------
 # DZ_FEED_REGISTRY names a path the BRIDGE reads *inside the container* (--feed-registry). Passing
 # the env var through with no matching mount would have the bridge look for a file that was never
-# copied in -- it resolves to nothing, and the bridge treats a missing/unreadable File source as
+# copied in -- it resolves to nothing, and the bridge treats a missing/unreadable File origin as
 # FATAL (an operator's explicit instruction about this one container), so the container would just
 # crash-loop. Wire the mount here instead: require an absolute path (the only kind `docker -v` can
 # bind at an identical container-side path) and bind-mount it read-only at that exact path, so the
@@ -556,14 +556,14 @@ if [ -n "${DZ_FEED_REGISTRY:-}" ]; then
     /*) : ;;
     *) die "DZ_FEED_REGISTRY must be an absolute path (it is read INSIDE the container at this exact path, bind-mounted from the same path on this host). Got: $DZ_FEED_REGISTRY" ;;
   esac
-  [ -f "$DZ_FEED_REGISTRY" ] || die "DZ_FEED_REGISTRY=$DZ_FEED_REGISTRY does not exist on this host. It names a path read *inside* the container; without a matching file here to bind-mount, the bridge would start looking for a file that was never copied in and refuse to start (a File registry source is fatal on failure). Fix the path, or unset DZ_FEED_REGISTRY to use the built-in registry."
+  [ -f "$DZ_FEED_REGISTRY" ] || die "DZ_FEED_REGISTRY=$DZ_FEED_REGISTRY does not exist on this host. It names a path read *inside* the container; without a matching file here to bind-mount, the bridge would start looking for a file that was never copied in and refuse to start (a File registry origin is fatal on failure). Fix the path, or unset DZ_FEED_REGISTRY to use the built-in registry."
   REGISTRY_MOUNT=(-v "$DZ_FEED_REGISTRY":"$DZ_FEED_REGISTRY":"$MNT_OPT")
   info "Bind-mounting feed registry: $DZ_FEED_REGISTRY (read-only)"
 fi
 
 # The image bakes in a default DZ_FEED_REGISTRY_URL (the hosted document — see the Dockerfile),
 # and the bridge tries that URL before ever looking at DZ_FEED_REGISTRY (ingest/registry.rs:
-# Source::from_flags takes the URL whenever it is non-empty). An operator who set DZ_FEED_REGISTRY
+# Origin::from_flags takes the URL whenever it is non-empty). An operator who set DZ_FEED_REGISTRY
 # almost certainly wants the file to win — that's the whole point of the air-gapped/locked-down
 # path — so if they didn't also set DZ_FEED_REGISTRY_URL themselves, clear it explicitly on the
 # container; otherwise the bind-mounted file would be silently ignored in favor of the image's
