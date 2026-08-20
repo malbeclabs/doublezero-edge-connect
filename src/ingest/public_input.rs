@@ -61,7 +61,7 @@ pub trait PublicVenue {
     fn subscribe_msgs(&self) -> Vec<String>;
     /// Decode one text frame and emit any resulting message through the arbiter. Unknown channels and
     /// malformed payloads must be ignored (best-effort feed); decode errors should increment
-    /// `ws_feeder_decode_errors[venue]`.
+    /// `ws_input_decode_errors[venue]`.
     fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot);
 }
 
@@ -82,7 +82,7 @@ pub async fn run(venue: impl PublicVenue, arbiter: SharedArbiter, instruments: I
         match connect_async(&url).await {
             Ok((ws, _resp)) => {
                 info!(venue = %v, %url, "public WS input connected");
-                m.ws_feeder_up.with_label_values(&[&v]).set(1);
+                m.ws_input_up.with_label_values(&[&v]).set(1);
                 let started = Instant::now();
                 match stream(ws, &venue, &subs, &arbiter, &instruments).await {
                     Ok(()) => info!(venue = %v, "public WS input closed; reconnecting"),
@@ -90,7 +90,7 @@ pub async fn run(venue: impl PublicVenue, arbiter: SharedArbiter, instruments: I
                         warn!(venue = %v, error = %e, "public WS input session error; reconnecting")
                     }
                 }
-                m.ws_feeder_up.with_label_values(&[&v]).set(0);
+                m.ws_input_up.with_label_values(&[&v]).set(0);
                 // Reset the backoff only after a *stable* session; a connect-then-immediate-drop
                 // keeps escalating so a flapping endpoint isn't hammered (see `STABLE_SESSION`).
                 backoff = if started.elapsed() >= STABLE_SESSION {
@@ -101,13 +101,13 @@ pub async fn run(venue: impl PublicVenue, arbiter: SharedArbiter, instruments: I
             }
             Err(e) => {
                 warn!(venue = %v, error = %e, %url, "public WS input connect failed; retrying");
-                m.ws_feeder_up.with_label_values(&[&v]).set(0);
+                m.ws_input_up.with_label_values(&[&v]).set(0);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
         // Each loop iteration past the initial connect is one reconnect cycle (a drop or a failed
         // attempt, now backing off to retry).
-        m.ws_feeder_reconnects.with_label_values(&[&v]).inc();
+        m.ws_input_reconnects.with_label_values(&[&v]).inc();
         tokio::time::sleep(backoff).await;
     }
 }

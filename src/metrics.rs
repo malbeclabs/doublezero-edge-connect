@@ -300,15 +300,15 @@ pub struct Metrics {
     // --- Public WS inputs (per-venue backstops; off by default) ---
     /// Input health per `venue`: 1 while the public WebSocket session is connected, 0 while
     /// down/reconnecting.
-    pub ws_feeder_up: IntGaugeVec,
+    pub ws_input_up: IntGaugeVec,
     /// Public WS (re)connect cycles per `venue` — incremented each time a session ends or a connect
     /// attempt fails and the input backs off to retry.
-    pub ws_feeder_reconnects: IntCounterVec,
+    pub ws_input_reconnects: IntCounterVec,
     /// Public WS frames that failed to decode (undecodable envelope; dropped best-effort), by `venue`.
-    pub ws_feeder_decode_errors: IntCounterVec,
+    pub ws_input_decode_errors: IntCounterVec,
     /// Business messages decoded from the public WS and emitted through the arbiter, by `venue` and
     /// `kind` (quote/trade).
-    pub ws_feeder_messages: IntCounterVec,
+    pub ws_input_messages: IntCounterVec,
 
     // --- Shred forwarder ---
     /// Shred datagrams received per source `group`.
@@ -353,7 +353,7 @@ pub struct Metrics {
     /// Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached.
     pub unregistered_source_labels_capped: IntCounter,
 
-    // --- Query API history feeder (`ingest::reconcile::feed_history`) ---
+    // --- Query API history writer (`ingest::reconcile::feed_history`) ---
     /// Trades dropped rather than stored because the catalog carries no `instrument` for the exact
     /// `(venue, channel, instrument_id)` the message names - a definition race (or, on an
     /// unauthenticated wire, a forged identity). Belt-and-braces: keying `history::Key` straight off
@@ -362,7 +362,7 @@ pub struct Metrics {
     /// venue quietly losing history the way the defect this metric was added for did, invisible
     /// anywhere else.
     pub history_unattributable_trades: IntCounterVec,
-    /// Times the history feeder fell behind the post-arbiter broadcast and dropped messages
+    /// Times the history writer fell behind the post-arbiter broadcast and dropped messages
     /// (`Lagged`) - the history-store counterpart of `dz_ws_serializer_lagged_total`. A gap here is a
     /// hole in the rolling window, not a crash.
     pub history_feed_lagged: IntCounter,
@@ -903,27 +903,27 @@ impl Metrics {
                 "dz_hl_sink_folds_total",
                 "Market price-folds performed by the Hyperliquid-compatible sink",
             ),
-            ws_feeder_up: gauge_vec(
+            ws_input_up: gauge_vec(
                 &registry,
-                "dz_ws_feeder_up",
+                "dz_ws_input_up",
                 "Public WS input health: 1 while connected, 0 while down/reconnecting",
                 &["venue"],
             ),
-            ws_feeder_reconnects: counter_vec(
+            ws_input_reconnects: counter_vec(
                 &registry,
-                "dz_ws_feeder_reconnects_total",
+                "dz_ws_input_reconnects_total",
                 "Public WS (re)connect cycles (session ended or connect attempt failed)",
                 &["venue"],
             ),
-            ws_feeder_decode_errors: counter_vec(
+            ws_input_decode_errors: counter_vec(
                 &registry,
-                "dz_ws_feeder_decode_errors_total",
+                "dz_ws_input_decode_errors_total",
                 "Public WS frames that failed to decode (dropped best-effort)",
                 &["venue"],
             ),
-            ws_feeder_messages: counter_vec(
+            ws_input_messages: counter_vec(
                 &registry,
-                "dz_ws_feeder_messages_total",
+                "dz_ws_input_messages_total",
                 "Business messages decoded from the public WS and emitted, by venue and kind",
                 &["venue", "kind"],
             ),
@@ -1032,7 +1032,7 @@ impl Metrics {
             history_feed_lagged: counter(
                 &registry,
                 "dz_history_feed_lagged_total",
-                "Times the query API's history feeder fell behind the post-arbiter broadcast and \
+                "Times the query API's history writer fell behind the post-arbiter broadcast and \
                  dropped messages (a hole in the rolling window, not a crash)",
             ),
             registry,

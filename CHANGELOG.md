@@ -36,12 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The wire `channel` is a `u8` throughout, matching every codec's decode and the edge-feed-spec glossary. Emitted JSON is unchanged; a `subscribe` filter carrying a `channel` above 255 is now answered with the sink's error frame instead of being accepted as a filter that matches nothing.
-- ⚠️ **Metrics: eight series renamed, one label renamed, seven series moved to a new label.** Cutover,
+- ⚠️ **Metrics: twelve series renamed, one label renamed, seven series moved to a new label.** Cutover,
   no dual-publishing — a renamed series reads as a feed that went quiet, so retire or repoint any
   dashboard and alert on the old names. The repo now uses the
   [edge-feed-spec glossary](https://github.com/malbeclabs/edge-feed-spec/blob/main/GLOSSARY.md)'s
-  vocabulary, which bans `arm` in every sense (a redundant publisher is a `path`) and bans bare
-  `source`.
+  vocabulary, which bans `arm` in every sense (a redundant publisher is a `path`), bans `feeder`
+  (an ingest input is an `input`) and bans bare `source`.
 
   | Before | After |
   |---|---|
@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `dz_tape_arm_dropped_total` | `dz_tape_path_dropped_total` |
   | `dz_unregistered_sources_total` | `dz_unregistered_source_ids_total` |
   | `dz_unregistered_source_labels_capped_total` | `dz_unregistered_source_id_labels_capped_total` |
+  | `dz_ws_feeder_up` | `dz_ws_input_up` |
+  | `dz_ws_feeder_reconnects_total` | `dz_ws_input_reconnects_total` |
+  | `dz_ws_feeder_decode_errors_total` | `dz_ws_input_decode_errors_total` |
+  | `dz_ws_feeder_messages_total` | `dz_ws_input_messages_total` |
 
   The `arm` label becomes `path`, and its values `arm0`..`arm7` become `path0`..`path7`.
 
@@ -366,7 +370,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--publisher-port` combined with `--channels` could narrow an enabled feed to zero publishers
   with no warning (a channel-filter clause can be individually valid against the whole registry
   while naming a channel `--publisher-port` already excluded), silently taking the WS sink, query
-  API and history feeder down. Startup now refuses that combination.
+  API and history writer down. Startup now refuses that combination.
 - The same combination via `POST /admin/channels` returned `200` and emptied the feed on the
   reconciler's next tick. It now returns `400` and leaves the prior channel filter in force.
 - `POST /admin/channels` accepted a bodyless request with a query string, which a plain HTML
@@ -455,13 +459,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace member rather than a bin in the bridge crate.
 
 ### Fixed
-- The query API's history feeder resolved a `trade`'s product by matching `(venue, symbol)` against
+- The query API's history writer resolved a `trade`'s product by matching `(venue, symbol)` against
   the instrument catalog, dropping any trade whose symbol matched more than one market. On a
   price-aggregated venue whose redundant publisher paths carry an identical instrument set under
   distinct channel ids, *every* symbol matches twice, so every trade was silently dropped: zero
   candles and zero ticker history for that venue's whole product set, indistinguishable from a
   market that simply had not traded. `trade` now carries its own `channel`/`instrument_id` (see
-  Added, below), so the feeder keys straight off the message instead of guessing from a
+  Added, below), so the writer keys straight off the message instead of guessing from a
   possibly-ambiguous symbol; the lookup this replaces is removed entirely.
 - A trade's venue-supplied `source_ts_ns` more than a few seconds ahead of its own receive time, or
   older than the history window, is no longer trusted into the query API's rolling store. The store's
@@ -501,7 +505,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dz_history_unattributable_trades_total{venue}` counts a trade the query API's history store
   dropped because its declared `(venue, channel, instrument_id)` names no known instrument — a
   definition race, belt-and-braces alongside the fix above. Should stay flat at zero.
-- `dz_history_feed_lagged_total` counts the query API's history feeder falling behind the broadcast
+- `dz_history_feed_lagged_total` counts the query API's history writer falling behind the broadcast
   and dropping messages (`Lagged`) — a hole in the rolling window, not a crash.
 
 ### Changed
@@ -926,8 +930,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sink (`dz_ws_clients`, `dz_ws_connections_total`, `dz_ws_messages_sent_total`,
   `dz_ws_bytes_sent_total`, `dz_ws_client_lagged_total`, `dz_ws_inbound_total`,
   `dz_ws_rate_limited_total`, `dz_ws_idle_timeout_total`), the public WS input
-  (`dz_ws_feeder_up`, `dz_ws_feeder_reconnects_total`, `dz_ws_feeder_decode_errors_total`,
-  `dz_ws_feeder_messages_total`), and the shred forwarder (`dz_shred_*` —
+  (`dz_ws_input_up`, `dz_ws_input_reconnects_total`, `dz_ws_input_decode_errors_total`,
+  `dz_ws_input_messages_total`), and the shred forwarder (`dz_shred_*` —
   datagrams and bytes received per group, processed/parsed/unparsed/forwarded/dropped, verify-ok,
   no-leader, dedup tracked slots, per-destination sends and bytes sent), plus the standard Linux
   process metrics. Both the ingest and client-output paths expose message **and** byte counters
@@ -1116,7 +1120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`sudo ufw allow in on doublezero1`). Mirrored in `README.md` / `scripts/README.md`.
 - Public-input transport scaffolding extracted into a venue-generic `ingest::public_input`
   (a `PublicVenue` trait + one reconnecting run loop + shared decode helpers); Hyperliquid
-  (`ingest::ws_input`) is the first implementor (#53). The four `dz_ws_feeder_*` metrics are now
+  (`ingest::ws_input`) is the first implementor (#53). The four `dz_ws_input_*` metrics are now
   labelled by `venue` so a second venue's series don't collide.
 - Container logs can no longer fill the host disk, and the default is quieter:
   - The installer's `docker run` (`scripts/connect.sh`) now pins the `json-file` log driver with

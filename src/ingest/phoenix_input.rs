@@ -70,7 +70,7 @@ const PHOENIX_CATEGORY: &str = "spot";
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
 /// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
 /// no `channel` key at all) is ignored without counting as a decode error — so
-/// `dz_ws_feeder_decode_errors_total{venue=Phoenix}` stays a real health signal on a chatty control
+/// `dz_ws_input_decode_errors_total{venue=Phoenix}` stays a real health signal on a chatty control
 /// channel. Fills are decoded **per element** (as raw JSON here, then one-by-one in `handle_text`) so
 /// a single malformed fill can't fail the whole batch — the backstop matters most during bursts, when
 /// `trades` arrays are largest.
@@ -224,7 +224,7 @@ impl PhoenixVenue {
             ws_send_ts_ns: 0,
         };
         metrics()
-            .ws_feeder_messages
+            .ws_input_messages
             .with_label_values(&[phoenix_venue(), "trade"])
             .inc();
         lock(arbiter).emit(
@@ -236,7 +236,7 @@ impl PhoenixVenue {
 
     fn decode_error(&self) {
         metrics()
-            .ws_feeder_decode_errors
+            .ws_input_decode_errors
             .with_label_values(&[phoenix_venue()])
             .inc();
     }

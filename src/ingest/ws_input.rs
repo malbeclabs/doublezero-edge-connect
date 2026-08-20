@@ -167,7 +167,7 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
         Ok(e) => e,
         Err(e) => {
             metrics()
-                .ws_feeder_decode_errors
+                .ws_input_decode_errors
                 .with_label_values(&[hl_venue()])
                 .inc();
             tracing::debug!(error = %e, "public WS: undecodable frame ignored");
@@ -248,7 +248,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
     };
     metrics()
-        .ws_feeder_messages
+        .ws_input_messages
         .with_label_values(&[hl_venue(), "quote"])
         .inc();
     lock(arbiter).emit(FeedMessage::Quote(quote), Transport::PublicWs, HL_CATEGORY);
@@ -292,7 +292,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         ws_send_ts_ns: 0,
     };
     metrics()
-        .ws_feeder_messages
+        .ws_input_messages
         .with_label_values(&[hl_venue(), "trade"])
         .inc();
     lock(arbiter).emit(FeedMessage::Trade(trade), Transport::PublicWs, HL_CATEGORY);

@@ -1111,7 +1111,7 @@ fn channels_block(state: &ApiState) -> Value {
     let filter = crate::model::lock(&state.filter).clone();
     // Computed before taking `history`'s lock, not after: `channel_symbol_prefixes` locks
     // `instruments` and walks the whole catalog, and holding `history` across that walk would block
-    // the history feeder (which appends under the same lock) for as long as the walk takes,
+    // the history writer (which appends under the same lock) for as long as the walk takes,
     // punching a hole in the rolling window `/v1` serves.
     let prefixes = channel_symbol_prefixes(state);
     let history = crate::model::lock(&state.history);
@@ -4185,7 +4185,7 @@ mod tests {
 
     /// `channels_block` must compute `channel_symbol_prefixes` (which locks `instruments`) *before*
     /// taking `history`'s lock. Locking `history` first and walking the catalog while still holding
-    /// it (the bug) blocks the history feeder — which appends under that same lock — for as long as
+    /// it (the bug) blocks the history writer — which appends under that same lock — for as long as
     /// the walk takes, punching a hole in the rolling window `/v1` serves.
     ///
     /// Proven with a forced, deterministic block rather than timing: this thread holds

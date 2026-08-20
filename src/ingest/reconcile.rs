@@ -213,7 +213,7 @@ pub struct ReconcilerConfig {
     /// Query API bind address; empty disables the sink outright (never activated) - mirrors
     /// `ws_bind`.
     pub api_bind: String,
-    /// The shared rolling trade history the reconciler's history feeder writes into and the query
+    /// The shared rolling trade history the reconciler's history writer writes into and the query
     /// API reads from. Built once in `main` (like `instruments`/`depth`/`books`) so the window
     /// survives the sink's own activate/deactivate cycles.
     pub history: Arc<Mutex<Store>>,
@@ -259,12 +259,12 @@ pub struct Reconciler {
     /// missing either leaks a flag for a receiver that is gone.
     active: HashMap<FeedKey, (JoinHandle<Result<()>>, TapeOwner)>,
     ws_task: Option<JoinHandle<Result<()>>>,
-    /// The query API sink task and the history feeder that keeps its store fed, treated as one
+    /// The query API sink task and the history writer that keeps its store fed, treated as one
     /// coupled unit by `apply_api`/`reap_finished`: both come up and go down together, since running
     /// one without the other either buffers history nobody can query or serves a query API with a
     /// stalled window.
     api_task: Option<JoinHandle<Result<()>>>,
-    history_feeder: Option<JoinHandle<()>>,
+    history_writer: Option<JoinHandle<()>>,
     /// The running shred forwarder plus the (sorted) source set it was started with, so a changed
     /// set triggers a restart.
     shred_task: Option<(Vec<SocketAddrV4>, JoinHandle<Result<()>>)>,
@@ -334,7 +334,7 @@ impl Reconciler {
             active: HashMap::new(),
             ws_task: None,
             api_task: None,
-            history_feeder: None,
+            history_writer: None,
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
@@ -643,20 +643,20 @@ impl Reconciler {
             warn!("WebSocket sink task exited; will re-activate if still desired");
             self.ws_task = None;
         }
-        // Reaped as one pair: if either the API sink or its history feeder exited on its own, tear
+        // Reaped as one pair: if either the API sink or its history writer exited on its own, tear
         // both down so the next `apply_api` respawns a fresh matched pair instead of layering a new
-        // feeder alongside one that's still running (which would double-count every trade).
+        // writer alongside one that's still running (which would double-count every trade).
         if self.api_task.as_ref().is_some_and(|h| h.is_finished())
             || self
-                .history_feeder
+                .history_writer
                 .as_ref()
                 .is_some_and(|h| h.is_finished())
         {
-            warn!("query API (or its history feeder) exited; will re-activate if still desired");
+            warn!("query API (or its history writer) exited; will re-activate if still desired");
             if let Some(h) = self.api_task.take() {
                 h.abort();
             }
-            if let Some(h) = self.history_feeder.take() {
+            if let Some(h) = self.history_writer.take() {
                 h.abort();
             }
         }
@@ -952,7 +952,7 @@ impl Reconciler {
     }
 
     /// Mirrors `apply_ws`: bind first so a taken port is non-fatal (staying off rather than taking
-    /// the tunnel down), then spawn the serve loop *and* the history feeder together - the feeder
+    /// the tunnel down), then spawn the serve loop *and* the history writer together - the writer
     /// exists only to keep this sink's store fed, so it has no reason to run without it, and running
     /// it without the sink would silently buffer history nobody can reach.
     async fn apply_api(&mut self, on: bool) {
@@ -970,7 +970,7 @@ impl Reconciler {
                         self.cfg.filter.clone(),
                         self.cfg.enabled.clone(),
                     )));
-                    self.history_feeder = Some(tokio::spawn(feed_history(
+                    self.history_writer = Some(tokio::spawn(feed_history(
                         self.cfg.tx.subscribe(),
                         self.cfg.history.clone(),
                         self.cfg.instruments.clone(),
@@ -983,7 +983,7 @@ impl Reconciler {
                 if let Some(h) = self.api_task.take() {
                     h.abort();
                 }
-                if let Some(h) = self.history_feeder.take() {
+                if let Some(h) = self.history_writer.take() {
                     h.abort();
                 }
                 info!("deactivating query API (no market-data feed subscribed)");
@@ -1036,7 +1036,7 @@ fn plan<K: Eq + Hash + Clone>(current: &HashSet<K>, desired: &HashSet<K>) -> (Ve
 /// low milliseconds) while still catching a stamp that is seconds, minutes, or years ahead.
 const MAX_PLAUSIBLE_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 
-/// Resolve one trade's bucket timestamp, clamping an implausible venue time at this feeder seam
+/// Resolve one trade's bucket timestamp, clamping an implausible venue time at this writer's seam
 /// rather than trusting it into `history::Store` - the same seam that already resolves the
 /// `source_ts_ns == 0` sentinel, and for the same reason `history.rs` refuses to know about clocks
 /// (see its module doc): that decision belongs to the caller, which knows what a plausible time looks
@@ -1127,15 +1127,15 @@ async fn feed_history(
                     crate::model::lock(&history).ingest(key, print);
                 }
             }
-            // A slow feeder can fall behind the broadcast; the window is a best-effort rolling one,
+            // A slow writer can fall behind the broadcast; the window is a best-effort rolling one,
             // not a promise of every print, so skip the gap rather than exit over it - but count it,
-            // like every other broadcast consumer in this bridge (see `sinks::ws`), so a feeder that
+            // like every other broadcast consumer in this bridge (see `sinks::ws`), so a writer that
             // is punching holes in the window is visible rather than silently thinner.
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 metrics().history_feed_lagged.inc();
                 warn!(
                     skipped = n,
-                    "history feeder lagged the broadcast; window has a gap"
+                    "history writer lagged the broadcast; window has a gap"
                 );
                 continue;
             }
@@ -2372,7 +2372,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // History feeder + query API activation
+    // History writer + query API activation
     // ---------------------------------------------------------------------------------------------
 
     fn test_instrument(
@@ -2468,8 +2468,8 @@ mod tests {
     /// reports the raw print ring with no time-window filtering, so this test is purely about the
     /// trade reaching the store, not about bucket/window timing).
     ///
-    /// Revert-verify: commenting out this feeder's `history.ingest(...)` call (a no-op stand-in for
-    /// "forgot to wire the feeder into the store") makes this test hang the polling loop and fail —
+    /// Revert-verify: commenting out the writer's `history.ingest(...)` call (a no-op stand-in for
+    /// "forgot to wire the writer into the store") makes this test hang the polling loop and fail —
     /// confirmed by hand before landing this test.
     #[tokio::test]
     async fn a_trade_on_the_broadcast_reaches_the_store_and_is_queryable_through_the_api() {
@@ -2535,7 +2535,7 @@ mod tests {
     /// vanish from every window query. Checked directly against the stored `Print`, which is why
     /// this doesn't need an API round-trip: `recent_trades` returns the raw ring, ts_ns included.
     ///
-    /// Revert-verify: replacing the feeder's `if t.source_ts_ns != 0 { .. } else { .. }` with a bare
+    /// Revert-verify: replacing the writer's `if t.source_ts_ns != 0 { .. } else { .. }` with a bare
     /// `t.source_ts_ns` (always trusting the wire value, sentinel included) makes this test fail —
     /// confirmed by hand before landing this test.
     #[tokio::test]
@@ -2838,25 +2838,25 @@ mod tests {
             "bind failure must not activate the sink"
         );
         assert!(
-            r.history_feeder.is_none(),
-            "the feeder must not run without its sink"
+            r.history_writer.is_none(),
+            "the writer must not run without its sink"
         );
         drop(occupied);
     }
 
-    /// `apply_api` treats the sink and its feeder as one unit: both come up together, and
+    /// `apply_api` treats the sink and its writer as one unit: both come up together, and
     /// `reap_finished` tears both down if either exits on its own (see the doc comment there) so a
-    /// later reconcile never layers a second feeder onto a store an old one is still writing to.
+    /// later reconcile never layers a second writer onto a store an old one is still writing to.
     #[tokio::test]
-    async fn activating_the_api_starts_both_the_sink_and_its_feeder() {
+    async fn activating_the_api_starts_both_the_sink_and_its_writer() {
         let mut r = test_reconciler(vec![]);
         r.cfg.api_bind = "127.0.0.1:0".into();
         r.apply_api(true).await;
         assert!(r.api_task.is_some());
-        assert!(r.history_feeder.is_some());
+        assert!(r.history_writer.is_some());
 
         r.apply_api(false).await;
         assert!(r.api_task.is_none());
-        assert!(r.history_feeder.is_none());
+        assert!(r.history_writer.is_none());
     }
 }

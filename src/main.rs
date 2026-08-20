@@ -518,7 +518,7 @@ fn join_ports(ports: &[u16]) -> String {
 /// this call only warns when a clause's *code* is absent from `enabled` entirely — it says nothing
 /// when the code is present but every one of its admitted ids was narrowed away by
 /// `--publisher-port`. The result is a feed silently left with no publisher, which takes the WS
-/// sink, query API and history feeder down with it if it was the only market-data feed running —
+/// sink, query API and history writer down with it if it was the only market-data feed running —
 /// with no warning at all. A channel filter that silently admits nothing is worse than one that
 /// refuses to start.
 fn check_channel_filter_covers_enabled(
