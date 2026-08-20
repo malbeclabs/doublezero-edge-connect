@@ -368,6 +368,12 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
         "source_name": i.source_name.as_ref(),
+        // The pre-rename key, kept for one release with the identical value. Unlike a `quote`, a
+        // product entry carries no `venue` to fall back on, and the CLI is packaged and installed
+        // independently of the container it queries — `scripts/connect.sh` offers the CLI *after* the
+        // container is healthy, so the installer's own flow produces an old CLI against a new bridge.
+        // Dropping it outright makes `products list` fail there with a missing-field error.
+        "source": i.source_name.as_ref(),
         "symbol": i.symbol.as_ref(),
         "channel": i.channel,
         "instrument_id": i.instrument_id,
@@ -1483,6 +1489,8 @@ mod tests {
         assert_eq!(p["product_id"], "HYPERLIQUID:BTC");
         assert_eq!(p["source_id"], 1);
         assert_eq!(p["source_name"], "HYPERLIQUID");
+        // The deprecated alias a pre-rename CLI reads, with the identical value.
+        assert_eq!(p["source"], "HYPERLIQUID");
         assert_eq!(p["symbol"], "BTC");
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 41);

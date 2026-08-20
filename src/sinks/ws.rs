@@ -142,7 +142,12 @@ struct SubFilter {
     /// Alias for `venue`, the preferred spelling. Both are accepted for the deprecation window; if
     /// a client sends both they are ANDed, so a disagreeing pair matches nothing rather than
     /// silently honouring one.
-    #[serde(default)]
+    ///
+    /// The retired `source` spelling is still *accepted* here, deserialize-side only, exactly as
+    /// `doublezero-edge`'s own types accept it: an unknown filter key is ignored, so dropping it
+    /// outright would widen a client that narrowed on `source` alone to the firehose — and the
+    /// sink's drop-oldest backpressure would then cost it the messages it did ask for.
+    #[serde(default, alias = "source")]
     source_name: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
@@ -1878,18 +1883,18 @@ mod tests {
         assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 
-    /// The retired `source` key is now an unknown field, and `SubFilter` ignores unknown fields —
-    /// so a filter naming only it degrades to the rest of the filter, here `{}`, the firehose. That
-    /// widening is the break: a client filtering on `source` must move to `source_name` or `venue`.
+    /// The pre-rename `source` key still narrows, through the deserialize-side alias. Dropping it
+    /// outright would have made a filter naming only it an unknown field, and an unknown field is
+    /// ignored — so that client would have been *widened* to the firehose, then lost the messages it
+    /// did ask for to the sink's drop-oldest backpressure.
     #[test]
-    fn the_retired_source_key_is_ignored_not_honoured() {
+    fn the_retired_source_key_still_narrows_through_the_alias() {
         let retired: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
-        assert_eq!(retired, serde_json::from_str::<SubFilter>("{}").unwrap());
-        assert!(retired.matches("PHOENIX", Some("SOL"), None, "quote"));
-        // Paired with a live dimension it narrows on that dimension alone.
-        let with_symbol: SubFilter =
-            serde_json::from_str(r#"{"source":"HYPERLIQUID","symbol":"SOL"}"#).unwrap();
-        assert!(with_symbol.matches("PHOENIX", Some("SOL"), None, "quote"));
-        assert!(!with_symbol.matches("HYPERLIQUID", Some("BTC"), None, "quote"));
+        assert_eq!(
+            retired,
+            serde_json::from_str::<SubFilter>(r#"{"source_name":"HYPERLIQUID"}"#).unwrap()
+        );
+        assert!(retired.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!retired.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 }

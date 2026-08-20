@@ -27,9 +27,9 @@ The consumer-equality net:
 - `one_markets_feed_leaves_another_on_the_same_channel_alone`
 - `a_single_paths_feed_reaches_the_consumer_exactly`
 - `two_paths_in_lockstep_publish_each_event_once`
-- `an_path_behind_in_arrival_only_does_not_drift_the_consumer`
+- `a_path_behind_in_arrival_only_does_not_drift_the_consumer`
 - `paths_synced_from_different_snapshot_anchors_keep_the_consumer_exact`
-- `an_path_that_departs_and_returns_keeps_the_consumer_exact`
+- `a_path_that_departs_and_returns_keeps_the_consumer_exact`
 - `a_permanently_slower_path_never_stops_the_market_being_served`
 - `a_peers_rebaseline_does_not_displace_a_served_book`
 - `the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling`
@@ -39,7 +39,7 @@ The two clocks, and the frontier's own scenarios:
 - `a_published_batch_carries_the_stamps_it_was_given` — the harness's venue and arrival stamps reach the wire as they were set, without which the whole split is unfalsifiable.
 - `a_venue_time_skew_alone_does_not_drift_the_consumer`
 - `a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy`
-- `an_path_that_never_held_the_removed_orders_does_not_darken_the_market`
+- `a_path_that_never_held_the_removed_orders_does_not_darken_the_market`
 - `a_returning_links_contiguous_backlog_reaches_no_consumer`
 - `a_whole_channel_gap_past_the_forward_bound_resumes`
 - `a_cold_start_market_stamped_zero_still_bootstraps`
@@ -77,7 +77,7 @@ Collapse, refusal and re-baseline suppression, all decided on the broadcast:
 The forced re-baseline a size disagreement raises, and what the republished view may claim:
 
 - `a_size_disagreement_forces_a_rebaseline_rather_than_a_guess` (also asserts `dz_mbo_path_disagreement_total` and the forced-re-baseline counter)
-- `a_forced_rebaseline_republishes_the_wire_not_an_paths_own_book`
+- `a_forced_rebaseline_republishes_the_wire_not_a_paths_own_book`
 - `the_path_that_discharges_a_rebaseline_does_not_own_the_floor_it_seeds`
 - `a_rebaseline_seeds_the_guard_with_its_own_orders` (the drop is the assertion; the counter confirms *why* it was dropped)
 
@@ -118,7 +118,7 @@ Whatever bounds a later change puts on the state that replaces these needs an eq
 
 ## What the venue-time frontier dropped
 
-The consensus mechanism produced one consumer-visible property that no longer exists, and its tests went with it: a market the paths could not settle was **disowned** — it went dark, was told so exactly once as a bare `Clear`, and nothing but a producer's own re-baseline ended the outage (`an_unanswerable_guard_does_not_republish_our_own_view`, `evicting_an_unpassed_tombstone_invalidates_the_market`, `a_market_disowned_by_the_ceiling_is_announced_without_waiting_for_a_batch`, `evicting_a_disowned_market_does_not_let_it_resume_serving_deltas`, `a_bare_clear_ends_a_disowned_markets_outage_even_after_eviction`). Deliberate: one publisher synced from an older snapshot anchor can never report removals for orders it never held, so under consensus the ordinary case walked a market to a blackout every consumer paid for. `dz_mbo_market_invalidations_total` is gone with it, and `an_path_that_never_held_the_removed_orders_does_not_darken_the_market` now asserts the opposite property.
+The consensus mechanism produced one consumer-visible property that no longer exists, and its tests went with it: a market the paths could not settle was **disowned** — it went dark, was told so exactly once as a bare `Clear`, and nothing but a producer's own re-baseline ended the outage (`an_unanswerable_guard_does_not_republish_our_own_view`, `evicting_an_unpassed_tombstone_invalidates_the_market`, `a_market_disowned_by_the_ceiling_is_announced_without_waiting_for_a_batch`, `evicting_a_disowned_market_does_not_let_it_resume_serving_deltas`, `a_bare_clear_ends_a_disowned_markets_outage_even_after_eviction`). Deliberate: one publisher synced from an older snapshot anchor can never report removals for orders it never held, so under consensus the ordinary case walked a market to a blackout every consumer paid for. `dz_mbo_market_invalidations_total` is gone with it, and `a_path_that_never_held_the_removed_orders_does_not_darken_the_market` now asserts the opposite property.
 
 Two more went for the same reason — refusal held open by a *count* of removals rather than by how far behind the event is (`an_unreported_removal_keeps_refusing_the_resurrection_it_is_held_for`, `a_rebaseline_larger_than_the_cap_keeps_the_resurrection_guard`) — and one because it pinned re-seating the high-water gauge on *retirement*, which no longer happens (`the_high_water_re_seats_when_the_market_holding_it_retires_rather_than_reading_zero`; the gauge and its re-seat survive against the frontier's forgetting).
 
@@ -128,6 +128,6 @@ Nothing else was dropped: the forced re-baseline and the guard's other consumer-
 
 Two waits are measured on a monotonic clock inside the arbiter, with no seam an integration test can drive.
 
-`PEER_SERVING_NS` silence — a path going quiet for 30 s — is why `an_path_that_departs_and_returns_keeps_the_consumer_exact` uses `Arbiter::forget_publisher_books`, the signal a receiver's registration sends as it exits and the authoritative one, with the timer as its backstop. Same consumer-visible property; the timer itself is not covered.
+`PEER_SERVING_NS` silence — a path going quiet for 30 s — is why `a_path_that_departs_and_returns_keeps_the_consumer_exact` uses `Arbiter::forget_publisher_books`, the signal a receiver's registration sends as it exits and the authoritative one, with the timer as its backstop. Same consumer-visible property; the timer itself is not covered.
 
 The frontier's **re-seat wait** has the same limitation, and the scenarios that need it (`a_whole_channel_gap_past_the_forward_bound_resumes`, `a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market`, and in-crate `a_crawling_clock_does_not_starve_the_reseat`) reach it by configuring a `BookGuardConfig` with a short `reseat_after_ns` and sleeping real time against it. ⚠️ The emit-altitude crawling-clock one can **false-pass on a slow host**: its pacing keeps the movement-keyed wait fresh only while a round costs less than that wait, and past that the movement trigger fires by itself and it passes with the mechanism deleted. It is the population check; `a_crawling_advance_keeps_only_the_movement_wait_fresh` drives `ChannelClock` directly and is what isolates the trigger. That is a real sleep in the test suite, and the only alternative is injecting a clock into the emit path; it buys coverage of the one hatch that keeps a survivor behind a dead leader's frontier from being dark for the life of the process.

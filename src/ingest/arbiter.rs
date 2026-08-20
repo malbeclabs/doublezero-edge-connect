@@ -5048,7 +5048,7 @@ mod tests {
     /// source IP address — must not spend one of the universe's eight admission slots through the metrics path.
     /// Once they are gone a real mirror path is ineligible and the venue can never fail over.
     #[test]
-    fn an_untracked_trade_publisher_never_becomes_an_path() {
+    fn an_untracked_trade_publisher_never_becomes_a_path() {
         let venue = "BookForgedTradeSource";
         let (mut a, _rx) = gated(venue, sticky_cfg());
         for n in 20..40u8 {
@@ -5296,7 +5296,7 @@ mod tests {
     /// competing for one tape, so neither may mute the other — a venue-wide gate drops the
     /// loser's prints forever, since a continuously-printing incumbent never goes silent.
     #[test]
-    fn an_path_on_another_category_does_not_take_the_tape() {
+    fn a_path_on_another_category_does_not_take_the_tape() {
         let mut a = arbiter();
         tape_print_in(&mut a, "KALSHI", "perps", path(1), 1, 1_000);
         let admitted = tape_print_in(&mut a, "KALSHI", "sports", path(2), 2, 1_001);
@@ -6253,7 +6253,7 @@ mod tests {
     /// path's own book — otherwise the cheapest input on the wire buys wholesale replacement of a
     /// market's book with a fabricated one.
     #[test]
-    fn a_forced_rebaseline_republishes_the_wire_not_an_paths_own_book() {
+    fn a_forced_rebaseline_republishes_the_wire_not_a_paths_own_book() {
         const VENUE: &str = "BookForgedInjection";
         let (mut a, mut rx) = racing(VENUE, &[path(1), path(2)]);
         a.emit(
@@ -6973,8 +6973,10 @@ mod tests {
             );
         }
         let _ = drain_books(&mut rx);
-        assert!(a.channel_clocks.len() <= MAX_CHANNEL_CLOCKS);
-        assert!(a.channel_clock_order.len() <= MAX_CHANNEL_CLOCKS);
+        // Equality, not `<=`: the loop overflows the cap, so anything short of it means the batches
+        // stopped reaching the clock at all and the bound is no longer under test.
+        assert_eq!(a.channel_clocks.len(), MAX_CHANNEL_CLOCKS);
+        assert_eq!(a.channel_clock_order.len(), MAX_CHANNEL_CLOCKS);
     }
 
     /// A batch the **anchor** refused leaves the clock unset, so there is no newest stamp to hold it

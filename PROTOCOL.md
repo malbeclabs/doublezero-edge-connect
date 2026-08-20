@@ -421,8 +421,9 @@ it has >=1 active subscription, it receives only matching messages.
 A subscription filter is `{ "source_name"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint8, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source_name` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
 
 `source_name` and `venue` are aliases and are matched case-insensitively. Supplying both ANDs them,
-so a disagreeing pair matches nothing; supply one. The retired `source` key is an unknown field and
-is **ignored**, so a filter that still names it is widened to whatever its remaining keys select.
+so a disagreeing pair matches nothing; supply one. The pre-rename `source` key is still accepted as a
+third spelling of `source_name`, because an unknown filter key is *ignored* and dropping it would have
+widened a client that narrowed on `source` alone to the firehose rather than telling it anything.
 
 `venue`, `symbol` and `channel` are **scope** dimensions - which markets - and `type` is a **kind** dimension: which messages. The two behave differently on purpose.
 

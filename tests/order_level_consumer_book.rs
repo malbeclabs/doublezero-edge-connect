@@ -896,7 +896,7 @@ fn the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling() {
 /// The trailing path is late in arrival and stamps the leader's venue times. Whichever path leads,
 /// the consumer ends holding the venue's book.
 #[test]
-fn an_path_behind_in_arrival_only_does_not_drift_the_consumer() {
+fn a_path_behind_in_arrival_only_does_not_drift_the_consumer() {
     let lag = Lag::arrival(5_000_000);
     for leader_is_first_path in [true, false] {
         let (_a, _rx, consumer, venue) =
@@ -1039,7 +1039,7 @@ fn paths_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
 /// and the departure is load-bearing here — without it the peer's re-baseline stays suppressed and
 /// the consumer holds a book the venue has left, for the life of the process.
 #[test]
-fn an_path_that_departs_and_returns_keeps_the_consumer_exact() {
+fn a_path_that_departs_and_returns_keeps_the_consumer_exact() {
     let (mut a, mut rx, staying, leaving) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
@@ -1226,7 +1226,7 @@ fn wait_for_reseat() {
 /// consensus rule the population grows with the market's whole history until a cap gives way and the
 /// market goes dark — one publisher's anchor blacking out a market every consumer is watching.
 #[test]
-fn an_path_that_never_held_the_removed_orders_does_not_darken_the_market() {
+fn a_path_that_never_held_the_removed_orders_does_not_darken_the_market() {
     let (mut a, mut rx, leader, quiet) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 

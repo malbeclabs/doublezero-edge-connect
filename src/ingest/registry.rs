@@ -176,9 +176,11 @@ impl std::fmt::Display for RegistryError {
             }
             RegistryError::BadSourceName { id, name } => write!(
                 f,
-                "source id {id}: `{name}` is not a usable registry name; it must be non-empty and \
-                 uppercase, which is the form that reaches consumers as `venue`, as every `venue=` \
-                 metric label value and as the `SOURCE:SYMBOL` product identifier"
+                "source id {id}: `{name}` is not a usable assignment. The id must be non-zero (`0` \
+                 is the wire's \"names no registry row\" sentinel), and the name non-empty, \
+                 uppercase — the form that reaches consumers as `venue`, as every `venue=` metric \
+                 label value and as the `SOURCE:SYMBOL` product identifier — and neither \
+                 `UNREGISTERED` nor `SOURCE_<id>`, which are synthesized for an unassigned id"
             ),
             RegistryError::DuplicateSource { id, name } => write!(
                 f,
@@ -697,6 +699,15 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
     })
 }
 
+/// Names `sources::source_label` synthesizes for an unassigned Source ID, so a block may not claim
+/// one.
+fn reserved(name: &str) -> bool {
+    name == "UNREGISTERED"
+        || name
+            .strip_prefix("SOURCE_")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Validate and leak the document's `sources` block, or `None` if it carried none.
 ///
 /// Leaked like every other `'static` field a document produces, so a resolved name stays a
@@ -709,7 +720,12 @@ fn source_assignments(
     }
     let mut out: Vec<SourceAssignment> = Vec::with_capacity(rows.len());
     for r in rows {
-        if r.name.is_empty() || r.name != r.name.to_uppercase() {
+        // `0` is the wire's "names no registry row" sentinel (see `NormalizedQuote::source_id`), and
+        // `SOURCE_<id>`/`UNREGISTERED` are the labels `sources::source_label` synthesizes for an id
+        // this block does not assign — a row claiming either collides with an unregistered source in
+        // the arbiter's `(venue, symbol)` dedup key, the collision `DuplicateSource` refuses one
+        // level in.
+        if r.id == 0 || r.name.is_empty() || r.name != r.name.to_uppercase() || reserved(&r.name) {
             return Err(RegistryError::BadSourceName {
                 id: r.id,
                 name: r.name.clone(),
@@ -1881,6 +1897,33 @@ mod tests {
                 "{block}"
             );
         }
+    }
+
+    /// The synthesized-label namespace and the `0` sentinel are reserved: a block claiming either
+    /// would collapse an assigned source with an unregistered one in the arbiter's `(venue, symbol)`
+    /// dedup key, merging unrelated markets.
+    #[test]
+    fn a_reserved_source_name_or_a_zero_id_is_fatal() {
+        for block in [
+            r#"{"id":3,"name":"SOURCE_7"}"#,
+            r#"{"id":3,"name":"UNREGISTERED"}"#,
+            r#"{"id":0,"name":"KALSHI"}"#,
+        ] {
+            assert!(
+                matches!(
+                    build(&doc_with_sources(block, SPORTS_ROW), "test"),
+                    Err(RegistryError::BadSourceName { .. })
+                ),
+                "{block}"
+            );
+        }
+        // `SOURCE_` with a non-numeric tail is an ordinary name, not a synthesized label.
+        let row = SPORTS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"SOURCE_OF_TRADES""#);
+        assert!(build(
+            &doc_with_sources(r#"{"id":3,"name":"SOURCE_OF_TRADES"}"#, &row),
+            "test"
+        )
+        .is_ok());
     }
 
     /// A malformed block under a `Url` origin degrades to the built-in document like every other

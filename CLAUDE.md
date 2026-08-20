@@ -244,7 +244,11 @@ Modules are grouped by role under `src/`:
   Source ID is authoritative and a publisher stamping the wrong one is a publisher defect fixed
   upstream, never remapped here. The mapping is **data, delivered with the feed registry document**
   (`registry.json`'s optional `sources` block, installed by `feeds::init` alongside the rows), so
-  assigning a venue is a document republish rather than a code change and a release; `BUILT_IN` is
+  assigning a venue is a document republish rather than a code change and a release — ⚠️ but only
+  once every deployed binary reads the block, because one that predates it ignores `$.sources`,
+  validates the row against its own compiled-in table, fails `UnknownVenue`, and under a `Url` origin
+  degrades the **whole** document to the built-in copy, losing every other change in that republish
+  (`docs/self-hosting.md` states the ordering). `BUILT_IN` is
   the compiled-in fallback for a document that carries no block, which is not hypothetical — adding
   the block bumps no `SUPPORTED_VERSION`, so an older document is legal, and a `Url` failure degrades
   to it like any other. `registry.rs`'s per-row `venue` check inverts with the mapping: it validates

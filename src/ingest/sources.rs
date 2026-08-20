@@ -6,7 +6,8 @@
 //! a publisher defect fixed at the publisher, reported here as-is and never substituted.
 //!
 //! The mapping arrives with the **feed registry document** (`registry.rs`'s optional `sources`
-//! block), so assigning a venue is a document republish rather than a code change and a release.
+//! block), so assigning a venue is a document republish rather than a code change and a release —
+//! but only once the fleet runs a binary that reads the block; see `docs/self-hosting.md`.
 //! [`BUILT_IN`] is the compiled-in fallback for a document that carries no block — which is not
 //! hypothetical, since adding the block bumps no schema version and an older document is legal.
 
@@ -151,6 +152,28 @@ pub fn source_label(source_id: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two hand-maintained copies of one allocation must agree.
+    ///
+    /// [`BUILT_IN`] is what resolves whenever the document in force carries no `sources` block — the
+    /// hosted document's state until it is republished — so drift means the same host resolves a
+    /// different Source ID -> name mapping depending on which document won a startup race, with no
+    /// signal. A *renamed* source is worse than an added one: it splits the fleet's wire identity
+    /// across the URL-failure boundary, one host emitting a venue its neighbour does not, and a
+    /// consumer joining `SOURCE:SYMBOL` across hosts sees two products for one market.
+    #[test]
+    fn the_compiled_in_table_matches_the_built_in_document() {
+        let doc = crate::ingest::registry::load_built_in()
+            .expect("the built-in feed registry document is valid");
+        let mut from_doc = doc
+            .sources
+            .expect("the built-in document carries a `sources` block")
+            .to_vec();
+        from_doc.sort_by_key(|a| a.id);
+        let mut compiled = BUILT_IN.to_vec();
+        compiled.sort_by_key(|a| a.id);
+        assert_eq!(compiled, from_doc);
+    }
 
     #[test]
     fn registered_ids_map_to_their_names() {

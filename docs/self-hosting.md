@@ -93,3 +93,11 @@ label value, so it must be uppercase, and an id or a name may appear only once. 
 loads and resolves against the copy compiled into the binary. A Source ID the block does not assign
 is not an error — the wire value is authoritative and gets a distinct synthesized `SOURCE_<id>`
 label. Assigning a venue is therefore a republish of this document rather than a new release.
+
+⚠️ **With one ordering constraint.** A binary that predates the block has no `sources` field, so it
+warns about `$.sources` and ignores it — and then validates the rows against its own compiled-in
+table, where the new venue does not resolve. Under a URL origin that rejection degrades the **whole**
+document to the built-in copy, so that host loses every other feed-row change in the same republish,
+not just the new source. Until the fleet is upgraded, a `sources` block may only name sources every
+deployed binary already resolves; assigning a genuinely new venue is a release *and* a republish, in
+that order.

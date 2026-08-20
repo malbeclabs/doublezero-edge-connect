@@ -265,7 +265,11 @@ pub async fn init(origin: registry::Origin) -> Result<(), registry::RegistryErro
         // leave its Source ID mapping in force over the winner's rows, and a document with no block
         // leaves `sources.rs`'s compiled-in table alone rather than replacing it with an empty one.
         if let Some(a) = loaded.sources {
-            sources::install(a);
+            if !sources::install(a) {
+                warn!(
+                    "Source ID assignments were already installed; this document's were discarded"
+                );
+            }
         }
         let _ = REGISTRY_INFO.set(info);
         loaded.log_resolved();
@@ -287,7 +291,11 @@ pub fn init_built_in() {
         let loaded =
             registry::load_built_in().expect("the built-in feed registry document is valid");
         if let Some(a) = loaded.sources {
-            sources::install(a);
+            if !sources::install(a) {
+                warn!(
+                    "Source ID assignments were already installed; this document's were discarded"
+                );
+            }
         }
         let _ = REGISTRY_INFO.set(loaded.info());
         loaded.rows

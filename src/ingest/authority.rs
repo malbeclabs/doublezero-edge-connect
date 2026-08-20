@@ -881,7 +881,7 @@ mod tests {
     /// Past the cap a path is not merely unlabelled — it is never authoritative and enters no map, so
     /// a forged-publisher flood can neither displace a real path nor grow the per-path state.
     #[test]
-    fn an_path_past_the_cap_is_never_authoritative() {
+    fn a_path_past_the_cap_is_never_authoritative() {
         let mut a = StickyAuthority::new(no_window_cfg());
         for n in 1..=8 {
             a.path_ordinal(&scope(), path(n));
@@ -927,7 +927,7 @@ mod tests {
     /// A label lookup must not admit: the metrics path sees every publisher that sent a trade, so
     /// minting there would spend the venue's eight admission slots on sources that never serve a book.
     #[test]
-    fn path_label_never_registers_an_path() {
+    fn path_label_never_registers_a_path() {
         let mut a = StickyAuthority::new(no_window_cfg());
         assert_eq!(a.path_label(&scope(), path(9)), OTHER_PATH);
         assert_eq!(
