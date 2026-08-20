@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   - **`DZ_CHANNELS` keys on the code**, so `lashay-4=10,11` becomes `edge-kalshi-sports-mbp=10,11`.
     An unknown code is fatal at startup and names itself, so a stale spec stops the process rather
-    than silently filtering nothing — but a process that will not start is still an outage. The old →
-    new mapping is the table above.
+    than silently filtering nothing — but a process that will not start is still an outage. The
+    mapping is `lashay-1` → `edge-kalshi-perps-tob`, `lashay-2` → `edge-kalshi-perps-mbp`,
+    `lashay-4` → `edge-kalshi-sports-mbp`.
   - **The hosted feed-registry document must carry the same three codes.** The image bakes
     `DZ_FEED_REGISTRY_URL` in and a URL origin wins over the compiled-in copy, so a container running
     the published image stays blind to Kalshi until that document is republished. To un-break one host
@@ -98,6 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removal rate rather than by how far the publishers lag.
 
 ### Added
+- The feed registry document carries a **`sources` block** — the Source ID → registry-name allocation,
+  generated from `edge-feed-spec/sources/spec.md`, which stays the authority for it. Assigning a venue
+  is now a republish of that document rather than a code change and a release. It rides the existing
+  URL → bind-mounted file → compiled-in precedence with no new machinery, and it is **optional**:
+  adding it bumps no schema version, so a document written before it existed still loads and resolves
+  against the table compiled into the binary — which is what the hosted document does until it is
+  republished. A Source ID the block does not assign is not an error; the wire value is authoritative
+  and still gets a distinct synthesized `SOURCE_<id>` label. The loader refuses a lowercase name, a
+  duplicate id and a duplicate name, since a name is emitted verbatim as `venue`/`source_name` and as
+  every `venue=` metric label value, and two sources sharing either would collapse to one dedup
+  identity. See [Self-hosting](docs/self-hosting.md#feed-registry).
 - The frontier is anchored against the **host** clock as well as against its own newest stamp: a venue
   stamp implausibly ahead of the host neither samples nor advances anything, the same check the quote and
   depth floors already apply to this field. The per-step jump bound caps one advance; a stream of in-bound
