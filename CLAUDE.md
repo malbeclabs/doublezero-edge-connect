@@ -239,18 +239,25 @@ Modules are grouped by role under `src/`:
   `Arc<Mutex<ChannelFilter>>`; `sinks::admin`'s `POST /admin/channels` can replace it at runtime
   through the identical `ChannelFilter::parse`, so nothing reachable after startup can admit a row
   startup itself would have refused.
-- **`ingest/sources.rs`** — the only mirror of the upstream **Source ID registry**
-  (`edge-feed-spec/sources/spec.md`), which is what names a venue: the wire Source ID is
-  authoritative and a publisher stamping the wrong one is a publisher defect fixed upstream, never
-  remapped here. Three production IDs are assigned. Names are **uppercase** because that is the form
-  that reaches consumers — `venue`/`source` on the WebSocket, every `venue=` metric label value, and
-  the `SOURCE:SYMBOL` product identifier a consumer composes from them. `source_name` is the one
-  emitted name per ID and `source_id_of` is its exact inverse. ID 3's pre-launch codename used to be
-  accepted on input as well; it was dropped once the ledger re-registered the Kalshi groups under
-  their `edge-kalshi-*` codes and nothing fed the old name in. A `venue` in `FEEDS`
-  **must** be a name
-  `source_id_of` resolves, or `receiver::record_revealed` silently drops it and the row's `status`
-  feed goes unrecorded. An unassigned ID gets a stable synthesized `SOURCE_<id>` (distinct per ID,
+- **`ingest/sources.rs`** — the **registry mirror** for the upstream **Source ID registry**
+  (`edge-feed-spec/sources/spec.md`), which is the sole authority for what names a venue: the wire
+  Source ID is authoritative and a publisher stamping the wrong one is a publisher defect fixed
+  upstream, never remapped here. The mapping is **data, delivered with the feed registry document**
+  (`registry.json`'s optional `sources` block, installed by `feeds::init` alongside the rows), so
+  assigning a venue is a document republish rather than a code change and a release; `BUILT_IN` is
+  the compiled-in fallback for a document that carries no block, which is not hypothetical — adding
+  the block bumps no `SUPPORTED_VERSION`, so an older document is legal, and a `Url` failure degrades
+  to it like any other. `registry.rs`'s per-row `venue` check inverts with the mapping: it validates
+  against **that document's own** block when one is present, so a row and the block naming its venue
+  always travel together. Names are **uppercase** because that is the form that reaches consumers —
+  `venue`/`source_name` on the WebSocket, every `venue=` metric label value, and the `SOURCE:SYMBOL`
+  product identifier a consumer composes from them — and the loader refuses a lowercase name, a
+  duplicate id and a duplicate name for that reason. `source_name` is the one emitted name per ID and
+  `source_id_of` is its exact inverse. ID 3's pre-launch codename used to be accepted on input as
+  well; it was dropped once the ledger re-registered the Kalshi groups under their `edge-kalshi-*`
+  codes and nothing fed the old name in. A `venue` in the document **must** be a name that resolves,
+  or `receiver::record_revealed` silently drops it and the row's `status` feed goes unrecorded. An
+  unassigned ID is **not** an error: it gets a stable synthesized `SOURCE_<id>` (distinct per ID,
   since the arbiter keys dedup on `(venue, symbol)`), bounded by `MAX_UNREGISTERED_SOURCES`.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`

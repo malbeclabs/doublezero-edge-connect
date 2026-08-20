@@ -75,3 +75,21 @@ bridge tries the URL first when it's non-empty, so pass an empty `--feed-registr
 the file if you've also set a URL. A URL that can't be reached or fails validation falls back to
 the built-in document silently by design; check `sudo docker logs <container> | grep 'feed
 registry resolved'` (or the equivalent for a bare process) to see which source actually loaded.
+
+The document also carries the **`sources` block** — the Source ID → registry-name allocation,
+generated from `edge-feed-spec/sources/spec.md`, which stays the authority for it:
+
+```json
+"sources": [
+  { "id": 1, "name": "HYPERLIQUID" },
+  { "id": 2, "name": "PHOENIX" },
+  { "id": 3, "name": "KALSHI" }
+]
+```
+
+A name is emitted verbatim as `venue`/`source_name` on the WebSocket and as every `venue=` metric
+label value, so it must be uppercase, and an id or a name may appear only once. The block is
+**optional**: adding it bumps no schema version, so a document written before it existed still
+loads and resolves against the copy compiled into the binary. A Source ID the block does not assign
+is not an error — the wire value is authoritative and gets a distinct synthesized `SOURCE_<id>`
+label. Assigning a venue is therefore a republish of this document rather than a new release.

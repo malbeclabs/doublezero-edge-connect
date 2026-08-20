@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::ingest::{
     feeds::{ArbitrationMode, Feed, FeedKind, FeedPorts, FeedPublisher},
-    sources,
+    sources::{self, SourceAssignment},
 };
 
 /// The document compiled in, so the container runs standalone and always has a fallback.
@@ -82,6 +82,17 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
+    /// A `sources` row carries no `name`, or a name that is not the uppercase form consumers see.
+    BadSourceName {
+        id: u16,
+        name: String,
+    },
+    /// Two `sources` rows claim the same `id`, or the same `name`. Either way one venue's messages
+    /// would resolve to the other's identity, and the arbiter keys dedup on `(venue, symbol)`.
+    DuplicateSource {
+        id: u16,
+        name: String,
+    },
     EmptyPublishedSet {
         venue: String,
         category: String,
@@ -163,6 +174,18 @@ impl std::fmt::Display for RegistryError {
             RegistryError::EmptyField { venue, field } => {
                 write!(f, "{venue}: `{field}` is empty")
             }
+            RegistryError::BadSourceName { id, name } => write!(
+                f,
+                "source id {id}: `{name}` is not a usable registry name; it must be non-empty and \
+                 uppercase, which is the form that reaches consumers as `venue`, as every `venue=` \
+                 metric label value and as the `SOURCE:SYMBOL` product identifier"
+            ),
+            RegistryError::DuplicateSource { id, name } => write!(
+                f,
+                "source id {id} (`{name}`) is assigned twice, or shares a name with another id; \
+                 either way two sources would collapse to one identity and the arbiter keys dedup \
+                 on (venue, symbol)"
+            ),
             RegistryError::UnknownVenue(v) => write!(
                 f,
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
@@ -289,7 +312,24 @@ struct Document {
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
+    /// The `Source ID` -> registry-name allocation, generated from `edge-feed-spec/sources/spec.md`.
+    ///
+    /// Optional: adding it bumps no [`SUPPORTED_VERSION`], so a document written before it existed
+    /// is legal and resolves against the compiled-in table in `sources.rs` instead.
+    #[serde(default)]
+    sources: Vec<SourceRow>,
     feeds: Vec<FeedRow>,
+    #[serde(flatten)]
+    unknown: Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceRow {
+    id: u16,
+    name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    notes: serde_json::Value,
     #[serde(flatten)]
     unknown: Unknown,
 }
@@ -455,6 +495,9 @@ struct PortBases {
 /// that was then discarded is precisely the breadcrumb a drift investigation must not be given.
 pub struct Loaded {
     pub rows: &'static [Feed],
+    /// The document's `Source ID` assignments, or `None` when it carried no `sources` block — in
+    /// which case `sources.rs`'s compiled-in table stays in force.
+    pub sources: Option<&'static [SourceAssignment]>,
     origin: String,
     version: u32,
 }
@@ -639,22 +682,59 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
     }
     report_unknown_keys(&doc);
 
+    let sources = source_assignments(&doc.sources)?;
     let mut rows = Vec::with_capacity(doc.feeds.len());
     for row in &doc.feeds {
-        rows.push(feed_from(row)?);
+        rows.push(feed_from(row, sources)?);
     }
     check_cross_row_invariants(&rows)?;
 
     Ok(Loaded {
         rows: Box::leak(rows.into_boxed_slice()),
+        sources,
         origin: origin.to_string(),
         version: doc.version,
     })
 }
 
+/// Validate and leak the document's `sources` block, or `None` if it carried none.
+///
+/// Leaked like every other `'static` field a document produces, so a resolved name stays a
+/// `&'static str` all the way to the metric labels and the wire.
+fn source_assignments(
+    rows: &[SourceRow],
+) -> Result<Option<&'static [SourceAssignment]>, RegistryError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut out: Vec<SourceAssignment> = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.name.is_empty() || r.name != r.name.to_uppercase() {
+            return Err(RegistryError::BadSourceName {
+                id: r.id,
+                name: r.name.clone(),
+            });
+        }
+        if out.iter().any(|a| a.id == r.id || a.name == r.name) {
+            return Err(RegistryError::DuplicateSource {
+                id: r.id,
+                name: r.name.clone(),
+            });
+        }
+        out.push(SourceAssignment {
+            id: r.id,
+            name: leak(&r.name),
+        });
+    }
+    Ok(Some(Box::leak(out.into_boxed_slice())))
+}
+
 /// Walk the document warning about every key the schema did not claim.
 fn report_unknown_keys(doc: &Document) {
     warn_unknown("$", &doc.unknown);
+    for (i, s) in doc.sources.iter().enumerate() {
+        warn_unknown(&format!("$.sources[{i}]"), &s.unknown);
+    }
     for (i, row) in doc.feeds.iter().enumerate() {
         let at = format!("$.feeds[{i}]");
         warn_unknown(&at, &row.unknown);
@@ -812,7 +892,10 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     Ok(())
 }
 
-fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
+fn feed_from(
+    row: &FeedRow,
+    sources: Option<&'static [SourceAssignment]>,
+) -> Result<Feed, RegistryError> {
     for (field, value) in [
         ("venue", &row.venue),
         ("category", &row.category),
@@ -825,11 +908,18 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
             });
         }
     }
-    // A venue `source_id_of` does not resolve is dropped by `receiver::record_revealed`, so its
-    // `status` feed goes unrecorded — a row that ingests but never reports. Resolution is exact,
-    // so a near-miss spelling is refused here rather than splitting every downstream lookup that
-    // keys on the venue string (arbitration mode, the channel-filter purge, `--feed` selection).
-    if sources::source_id_of(&row.venue).is_none() {
+    // A venue that resolves to no Source ID is dropped by `receiver::record_revealed`, so its
+    // `status` feed goes unrecorded — a row that ingests but never reports. Checked against **this
+    // document's own** `sources` block, falling back to the compiled-in table only when it carries
+    // none: the document supplies the mapping now rather than being validated against code, so a
+    // row and the block that names its venue always travel together. Resolution is exact, so a
+    // near-miss spelling is refused here rather than splitting every downstream lookup that keys on
+    // the venue string (arbitration mode, the channel-filter purge, `--feed` selection).
+    let resolves = match sources {
+        Some(a) => a.iter().any(|s| s.name == row.venue),
+        None => sources::source_id_of(&row.venue).is_some(),
+    };
+    if !resolves {
         return Err(RegistryError::UnknownVenue(row.venue.clone()));
     }
 
@@ -1710,6 +1800,106 @@ mod tests {
             build(&doc_with(&row), "test"),
             Err(RegistryError::UnknownVenue(v)) if v == "LASHAY"
         ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The `sources` block
+    // ---------------------------------------------------------------------------------------
+
+    /// Build a document carrying an explicit `sources` block.
+    fn doc_with_sources(sources: &str, feeds: &str) -> String {
+        format!(r#"{{"version":1,"sources":[{sources}],"feeds":[{feeds}]}}"#)
+    }
+
+    /// The point of moving the mapping into the document: a venue the compiled-in table has never
+    /// heard of resolves because the block assigns it, with no code change and no version bump.
+    #[test]
+    fn a_source_the_document_assigns_resolves_without_a_code_change() {
+        let row = SPORTS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"NEWVENUE""#);
+        let loaded = build(
+            &doc_with_sources(r#"{"id":9,"name":"NEWVENUE"}"#, &row),
+            "test",
+        )
+        .expect("a document that assigns its own venue must load");
+        assert_eq!(
+            loaded.sources.expect("the block must be installed"),
+            &[SourceAssignment {
+                id: 9,
+                name: "NEWVENUE"
+            }]
+        );
+        assert!(sources::source_id_of("NEWVENUE").is_none(), "not installed");
+    }
+
+    /// A document with no block is legal (adding it bumps no `SUPPORTED_VERSION`), so its rows are
+    /// validated against the compiled-in table and nothing is installed over it. The hosted document
+    /// will take exactly this path until it is republished.
+    #[test]
+    fn a_document_with_no_sources_block_falls_back_to_the_compiled_in_table() {
+        let loaded = build(&doc_with(SPORTS_ROW), "test").expect("legal without the block");
+        assert!(loaded.sources.is_none());
+        assert_eq!(sources::source_id_of("KALSHI"), Some(3));
+    }
+
+    /// The validation inverts with the mapping: once a document carries the block, a `venue` that
+    /// block does not assign is refused even if the compiled-in table would have resolved it.
+    #[test]
+    fn a_venue_the_block_does_not_assign_is_fatal() {
+        assert!(matches!(
+            build(&doc_with_sources(r#"{"id":1,"name":"HYPERLIQUID"}"#, SPORTS_ROW), "test"),
+            Err(RegistryError::UnknownVenue(v)) if v == "KALSHI"
+        ));
+    }
+
+    /// A name that is not the uppercase form consumers see is refused: it is emitted verbatim as
+    /// `venue` and as every `venue=` metric label value, so a lowercase row would split a consumer's
+    /// `SOURCE:SYMBOL` join against the same source seen from another host.
+    #[test]
+    fn a_non_uppercase_source_name_is_fatal() {
+        assert!(matches!(
+            build(
+                &doc_with_sources(r#"{"id":3,"name":"Kalshi"}"#, SPORTS_ROW),
+                "test"
+            ),
+            Err(RegistryError::BadSourceName { id: 3, .. })
+        ));
+    }
+
+    /// Two rows sharing an id or a name would collapse two sources to one identity, and the arbiter
+    /// keys dedup on `(venue, symbol)` — unrelated markets would merge into one bucket.
+    #[test]
+    fn a_duplicate_source_id_or_name_is_fatal() {
+        for block in [
+            r#"{"id":3,"name":"KALSHI"},{"id":3,"name":"OTHER"}"#,
+            r#"{"id":3,"name":"KALSHI"},{"id":4,"name":"KALSHI"}"#,
+        ] {
+            assert!(
+                matches!(
+                    build(&doc_with_sources(block, SPORTS_ROW), "test"),
+                    Err(RegistryError::DuplicateSource { .. })
+                ),
+                "{block}"
+            );
+        }
+    }
+
+    /// A malformed block under a `Url` source degrades to the built-in document like every other
+    /// rejection there, rather than killing a fleet at its next reschedule.
+    #[tokio::test]
+    async fn a_url_document_with_a_bad_sources_block_degrades() {
+        let url = serve(
+            r#"{"version":1,"sources":[{"id":3,"name":"kalshi"}],
+                "feeds":[{"venue":"KALSHI","category":"perps","code":"d","kind":"TopOfBook",
+                "group":"233.84.178.3","emit_trades":true,"arbitration":"Sticky",
+                "publishers":{"explicit":[{"mktdata":7576,"refdata":7577}]}}]}"#,
+        )
+        .await;
+        let loaded = load(Source::Url(url)).await.expect("must degrade, not die");
+        assert!(
+            loaded.origin().starts_with("built-in ("),
+            "{}",
+            loaded.origin()
+        );
     }
 
     // ---------------------------------------------------------------------------------------

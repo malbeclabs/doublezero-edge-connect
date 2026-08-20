@@ -1,31 +1,69 @@
-//! A **registry mirror** of the `Source ID` allocation. `edge-feed-spec/sources/spec.md` is the
-//! sole authority; this file is a copy of it and never a second source of truth.
+//! The `Source ID` -> registry-name mirror.
 //!
-//! A Source ID identifies the source whose order book a price was derived from. IDs are stable and
-//! are never reused. This module is the **only** place that registry is mirrored; add a row here
-//! when upstream assigns a new production ID (1-1023).
+//! `edge-feed-spec/sources/spec.md` is the sole authority for this allocation; nothing here decides
+//! it. A Source ID identifies the source whose order book a price was derived from, IDs are stable
+//! and are never reused, and the wire value is authoritative — a publisher stamping the wrong ID is
+//! a publisher defect fixed at the publisher, reported here as-is and never substituted.
+//!
+//! The mapping arrives with the **feed registry document** (`registry.rs`'s optional `sources`
+//! block), so assigning a venue is a document republish rather than a code change and a release.
+//! [`BUILT_IN`] is the compiled-in fallback for a document that carries no block — which is not
+//! hypothetical, since adding the block bumps no schema version and an older document is legal.
 
 use std::{
     collections::HashMap,
     sync::{OnceLock, RwLock},
 };
 
+/// One `Source ID` -> registry-name assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceAssignment {
+    pub id: u16,
+    pub name: &'static str,
+}
+
+/// The compiled-in mirror, used when the resolved document carries no `sources` block.
+const BUILT_IN: [SourceAssignment; 3] = [
+    SourceAssignment {
+        id: 1,
+        name: "HYPERLIQUID",
+    },
+    SourceAssignment {
+        id: 2,
+        name: "PHOENIX",
+    },
+    SourceAssignment {
+        id: 3,
+        name: KALSHI,
+    },
+];
+
+/// The assignments in force, installed once by `ingest::feeds::init` alongside the feed rows.
+static INSTALLED: OnceLock<&'static [SourceAssignment]> = OnceLock::new();
+
+/// Install the document's assignments. Called once from `feeds::init`, before any receiver spawns;
+/// a repeat call is ignored for the same reason the feed rows' is — a venue name that changed under
+/// a running receiver would leave books and reference data keyed to a mapping no longer in effect.
+pub fn install(assignments: &'static [SourceAssignment]) -> bool {
+    INSTALLED.set(assignments).is_ok()
+}
+
+/// The assignments to resolve against: the document's if it carried a block, else [`BUILT_IN`].
+pub fn assignments() -> &'static [SourceAssignment] {
+    INSTALLED.get().copied().unwrap_or(&BUILT_IN)
+}
+
 /// Map a wire `Source ID` to its registered source name.
 ///
-/// Returns `None` only for IDs with no registry row. The wire value is authoritative: a publisher
-/// stamping the wrong ID is a publisher defect, fixed at the publisher, and is reported here as-is
-/// and never substituted. Exactly three production IDs are assigned.
-///
-/// Names are **uppercase**, which is the form that reaches consumers: this is what `venue`/`source`
-/// carry on the WebSocket and what every `venue=` metric label holds, so it is also the form a
-/// product identifier like `HYPERLIQUID:BTC` composes from.
+/// Returns `None` only for IDs the document assigns no row. Names are **uppercase**, which is the
+/// form that reaches consumers: this is what `venue`/`source` carry on the WebSocket and what every
+/// `venue=` metric label holds, so it is also the form a product identifier like `HYPERLIQUID:BTC`
+/// composes from.
 pub fn source_name(source_id: u16) -> Option<&'static str> {
-    match source_id {
-        1 => Some("HYPERLIQUID"),
-        2 => Some("PHOENIX"),
-        3 => Some(KALSHI),
-        _ => None,
-    }
+    assignments()
+        .iter()
+        .find(|a| a.id == source_id)
+        .map(|a| a.name)
 }
 
 /// Source ID 3's registry name. The pre-launch codename it used to also answer to is gone: the
@@ -38,12 +76,10 @@ const KALSHI: &str = "KALSHI";
 /// This is what lets a resolved source carry a numeric identity a consumer can join against the
 /// registry, and what `receiver::record_revealed` tests a wire venue against before recording it.
 pub fn source_id_of(source: &str) -> Option<u16> {
-    match source {
-        "HYPERLIQUID" => Some(1),
-        "PHOENIX" => Some(2),
-        KALSHI => Some(3),
-        _ => None,
-    }
+    assignments()
+        .iter()
+        .find(|a| a.name == source)
+        .map(|a| a.id)
 }
 
 /// Cap on distinct synthesized labels for unregistered Source IDs. Bounded like every other

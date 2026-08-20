@@ -12,7 +12,7 @@ use std::{net::Ipv4Addr, sync::OnceLock};
 
 use tracing::warn;
 
-use crate::ingest::registry;
+use crate::ingest::{registry, sources};
 
 /// Which edge-feed-spec protocol a feed speaks. Selects the datagram magic + decoder + receiver
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
@@ -261,6 +261,12 @@ pub async fn init(source: registry::Source) -> Result<(), registry::RegistryErro
     let loaded = registry::load(source).await?;
     let info = loaded.info();
     if FEEDS.set(loaded.rows).is_ok() {
+        // Installed only by the winning document, and only if it carried a block: a loser must not
+        // leave its Source ID mapping in force over the winner's rows, and a document with no block
+        // leaves `sources.rs`'s compiled-in table alone rather than replacing it with an empty one.
+        if let Some(a) = loaded.sources {
+            sources::install(a);
+        }
         let _ = REGISTRY_INFO.set(info);
         loaded.log_resolved();
     } else {
@@ -280,6 +286,9 @@ pub fn init_built_in() {
     let _ = FEEDS.get_or_init(|| {
         let loaded =
             registry::load_built_in().expect("the built-in feed registry document is valid");
+        if let Some(a) = loaded.sources {
+            sources::install(a);
+        }
         let _ = REGISTRY_INFO.set(loaded.info());
         loaded.rows
     });

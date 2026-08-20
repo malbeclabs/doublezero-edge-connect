@@ -21,6 +21,17 @@
     "no match, the reconciler never activates the row, and there is no warning and no failed bind -",
     "just a receiver that never starts. A wrong port fails the same way, one layer down.",
     "",
+    "`sources` is the Source ID -> registry-name allocation, generated from",
+    "edge-feed-spec/sources/spec.md, which stays the sole authority for it. Assigning a venue is a",
+    "republish of this document rather than a code change and a release. The block is optional: a",
+    "document written before it existed is legal and resolves against the compiled-in table in",
+    "sources.rs instead, which is also the fallback when a URL fetch degrades. A name is emitted",
+    "verbatim as `venue`/`source_name` on the wire and as every `venue=` metric label value, so it",
+    "must be uppercase, and an id or a name may appear only once - two sources sharing either would",
+    "collapse to one identity and the arbiter keys dedup on (venue, symbol). An id this block does",
+    "not assign is NOT an error: the wire Source ID is authoritative and gets a distinct synthesized",
+    "SOURCE_<id> label, bounded by MAX_UNREGISTERED_SOURCES.",
+    "",
     "`publishers` is a tagged union. `explicit` carries port blocks verbatim; `derived` carries a",
     "published set of channels plus per-role bases and expands to `base + id` per channel, one",
     "publisher per channel.",
@@ -30,6 +41,15 @@
     "a rebuild - which is what every caller depends on. `version` bumps only for a change that",
     "reinterprets what an existing field MEANS, since that is what an older binary would read",
     "wrongly. A missing REQUIRED field stays fatal, so a typo cannot quietly default."
+  ],
+  "sources": [
+    { "id": 1, "name": "HYPERLIQUID" },
+    { "id": 2, "name": "PHOENIX" },
+    {
+      "id": 3,
+      "name": "KALSHI",
+      "notes": "Upstream's sources/spec.md still writes the pre-launch codename for this id. The glossary's rule is registry-first and the ledger has already re-registered the groups, so the registry name ships here and upstream is the last holdout."
+    }
   ],
   "feeds": [
     {
