@@ -1,6 +1,6 @@
 //! Decoder for the DoubleZero Edge **Market-by-Order** feed (datagram magic `0x4444`).
 //!
-//! A sibling protocol carrying the full L3 resting-order population per instrument, with in-band
+//! A feed carrying the full L3 resting-order population per instrument, with in-band
 //! snapshot+delta recovery. It shares the 24-byte datagram header / 4-byte message header / generic
 //! datagram-walker in [`crate::ingest::codec_common`]; only the magic and message bodies differ. It reuses
 //! the 80-byte Top-of-Book `InstrumentDefinition` layout for reference data, and adds order

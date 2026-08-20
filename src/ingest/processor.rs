@@ -658,7 +658,7 @@ impl DatagramProcessor for TobProcessor {
 
 /// Midpoint processor: drives the reference-data state machine on the refdata feed and emits a
 /// normalized mid price (gated per-instrument on a known definition) on the market-data feed.
-/// Structurally parallel to [`TobProcessor`] but for the `0x4D44` sibling protocol.
+/// Structurally parallel to [`TobProcessor`] but for the `0x4D44` feed.
 pub struct MidpointProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
     state: PerPublisher<codec_midpoint::InstrumentDefinition>,
@@ -1076,10 +1076,10 @@ impl MboProcessor {
     }
 
     /// Clear the depth floor (and its WS-replay entries) for every `(wire venue, symbol)` this
-    /// processor has ever latched. The old single-venue sweep (`ctx.venue`) assumed one feed serves
+    /// processor has ever latched. The old single-venue clear (`ctx.venue`) assumed one feed serves
     /// exactly one venue; it no longer does; a receiver's instruments can carry distinct wire Source
     /// IDs (one registry id is a superset spanning builder DEXs alongside the primary market), so
-    /// there is no longer one venue string to sweep by. `emitted_symbol` is exactly the set of keys
+    /// there is no longer one venue string to clear by. `emitted_symbol` is exactly the set of keys
     /// whose depth actually latched the floor, each resolved to its own last-known wire venue.
     /// This is a superset of `ctx.venue`'s old reach, not a subset: still a safe over-approximation
     /// (a spurious clear self-heals via full-state depth), same as the call sites it replaces.
@@ -1630,7 +1630,7 @@ impl DatagramProcessor for MboProcessor {
                             .map(|(_, id)| *id)
                             .collect::<Vec<_>>(),
                     );
-                    // Sweep every (wire venue, symbol) this processor has latched — not a single
+                    // Clear every (wire venue, symbol) this processor has latched — not a single
                     // `ctx.venue` (see `reset_all_known_depth_floors`) — BEFORE clearing the memo
                     // that supplies it.
                     self.reset_all_known_depth_floors(ctx, "end_of_session");
@@ -1835,7 +1835,7 @@ impl DatagramProcessor for MboProcessor {
                     //      and a missing definition must not silently skip the clear: fall back to
                     //      the safe over-approximation (a spurious clear self-heals; a skipped one
                     //      can leave the exact permanent wedge this hatch exists to remove). There is
-                    //      no longer one "venue-wide" sweep to fall back to (see
+                    //      no longer one "venue-wide" clear to fall back to (see
                     //      `reset_all_known_depth_floors`), since this feed's instruments can carry
                     //      distinct wire Source IDs.
                     let latched_symbol = self.emitted_symbol.get(&key).cloned().or_else(|| {
@@ -2008,7 +2008,7 @@ pub struct MbpProcessor {
     /// Insertion order of the `last_reset`/`open` keys, for the [`MAX_CHANNEL_KEYS`] eviction.
     channel_order: VecDeque<(IpAddr, u8)>,
     /// Deltas buffered across every book, kept in step by [`Self::with_book`] so the budget check is
-    /// O(1) rather than a sweep over `books` per datagram — which would cost most during exactly the
+    /// O(1) rather than a scan over `books` per datagram — which would cost most during exactly the
     /// cold start the budget exists for.
     buffered_total: usize,
     /// Last `Ready`-ness reported per book, so health reaches the authority on transitions only.
@@ -2221,7 +2221,7 @@ impl MbpProcessor {
         }
         self.books_order.retain(|(p, _, _)| *p != publisher);
         // `forget_book` only clears an `open` group whose instrument matches the book it dropped; a
-        // group open for an instrument that never got a book needs this sweep.
+        // group open for an instrument that never got a book needs this purge.
         self.open.retain(|(p, _), _| *p != publisher);
         self.last_reset.retain(|(p, _), _| *p != publisher);
         self.channel_order.retain(|(p, _)| *p != publisher);
@@ -2527,7 +2527,7 @@ impl DatagramProcessor for MbpProcessor {
         // ascending-id order across a multi-instrument datagram, matching `MboProcessor`'s `BTreeSet`.
         let mut accum: BTreeMap<u32, Vec<BookChange>> = BTreeMap::new();
         // Instruments touched since the previous `BatchBoundary`, and since the datagram started (for
-        // the health sweep). Both are datagram-scoped: the publisher and channel are fixed per datagram.
+        // the health report). Both are datagram-scoped: the publisher and channel are fixed per datagram.
         let mut since_boundary: BTreeSet<u32> = BTreeSet::new();
         let mut touched: BTreeSet<u32> = BTreeSet::new();
         // Instruments that revealed their Source ID for the FIRST time this datagram. Decided once,
@@ -2844,14 +2844,14 @@ impl DatagramProcessor for MbpProcessor {
                         .unwrap_or(false);
                     if installed {
                         // The re-baseline replaces everything accumulated for this instrument so
-                        // far, and goes out here (not deferred to the end-of-datagram sweep below) so a
+                        // far, and goes out here (not deferred to the end-of-datagram emit pass below) so a
                         // delta later in the same datagram follows it as an incremental batch. Also
                         // clears `revealed_this_datagram` for it: an earlier message this same datagram
                         // may have already revealed this instrument, but the "needs a full
                         // re-baseline because it was just revealed" need is satisfied by the
                         // unconditional full re-baseline right here — leaving the entry would make
-                        // the end-of-datagram sweep either double-emit an identical re-baseline (nothing
-                        // else touches this instrument again this datagram) or turn a later delta's
+                        // the end-of-datagram emit pass either double-emit an identical re-baseline
+                        // (nothing else touches this instrument again this datagram) or turn a later delta's
                         // legitimate incremental batch into a second, redundant full one.
                         accum.remove(&e.instrument_id);
                         revealed_this_datagram.remove(&e.instrument_id);
@@ -2926,7 +2926,7 @@ impl DatagramProcessor for MbpProcessor {
                     let (price_exponent, qty_exponent) = (def.price_exponent, def.qty_exponent);
                     // A Trade doesn't touch the book, but the book may already hold real content
                     // from an earlier (silently applied) snapshot — if this is the reveal, the
-                    // end-of-datagram sweep below forces a full re-baseline so that content isn't
+                    // end-of-datagram emit pass below forces a full re-baseline so that content isn't
                     // left permanently unshown, even though this message never touches `accum`.
                     // Routed through `ensure_book` (not a bare key tuple) so `revealed` never holds
                     // an entry `books` doesn't also hold — the same lockstep every other revealing
@@ -5636,7 +5636,8 @@ mod tests {
     /// Round-3 review, finding 5: `SnapshotEnd`'s inline re-baseline (fired immediately so a later
     /// delta in the same datagram follows it incrementally) must also clear `revealed_this_datagram` for
     /// the instrument it just re-baselined — an earlier message in the SAME datagram may have already
-    /// revealed it, and leaving the entry behind makes the end-of-datagram sweep double-emit an identical,
+    /// revealed it, and leaving the entry behind makes the end-of-datagram emit pass double-emit an
+    /// identical,
     /// redundant second `book` for it. Reproduced with a `Trade` that reveals instrument 41 (routed
     /// through `ensure_book` per finding 1, so the book exists but stays `AwaitingSnapshot`) followed,
     /// in the SAME datagram, by a complete snapshot rotation for the same instrument — only reachable via
@@ -6908,7 +6909,7 @@ mod tests {
         // defers the health report too (`report_health` skips a not-yet-revealed key, since there
         // is no `MarketKey` yet for the authority to know about). Reveal via a `LevelUpdate` (not
         // the no-op `mbp_reveal` Trade): it also marks the instrument `touched`, which is what
-        // triggers this datagram's own end-of-datagram health-report sweep, so the book's `Ready` status
+        // triggers this datagram's own end-of-datagram health report, so the book's `Ready` status
         // actually reaches the authority in this same call.
         proc.on_datagram(
             &mbp_wire::datagram(

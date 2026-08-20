@@ -52,7 +52,7 @@ The **scenario sizes** of several of them are derived from private constants mir
 
 `a_venue_time_skew_alone_does_not_drift_the_consumer` is **still unfalsifiable**, and its own doc comment says so: the trailing path's copies collapse as duplicates before any rule reads a stamp, so swapping the venue stamp for the arrival stamp leaves it green. `a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy` is the scenario that actually measures venue time — verified by mutation, since swapping the two stamps and deleting the stale-copy rule each kill it while leaving the older test green. Keep the older one for the contrast it draws; do not read it as coverage.
 
-`the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling` asserts through `arrival_lagged_feed`, which compares after **every** arrival. It replaces a sweep that compared only at the end of the run, where a trailer replaying the venue's whole life in order has converged on its own — that form passed with the racing guard removed outright and was evidence of nothing. Assert per arrival; do not add another terminal comparison.
+`the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling` asserts through `arrival_lagged_feed`, which compares after **every** arrival. It replaces a ladder that compared only at the end of the run, where a trailer replaying the venue's whole life in order has converged on its own — that form passed with the racing guard removed outright and was evidence of nothing. Assert per arrival; do not add another terminal comparison.
 
 ### `src/ingest/arbiter.rs`
 

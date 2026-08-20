@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(a.last_admitted(&key()), Some(path(2)));
     }
 
-    /// The gauge sweep reports every known path, including one serving nothing — a displaced path whose
+    /// The gauge refresh reports every known path, including one serving nothing — a displaced path whose
     /// series simply stopped being written would read as still holding its pre-transfer markets.
     #[test]
     fn markets_held_all_reports_idle_paths_as_zero() {

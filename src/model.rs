@@ -187,7 +187,7 @@ pub struct NormalizedTrade {
     pub ws_send_ts_ns: u64,
 }
 
-/// A normalized derived mid price for an instrument (from the Midpoint sibling feed). Like a
+/// A normalized derived mid price for an instrument (from the Midpoint feed). Like a
 /// quote it is full state per instrument (the latest mid), so it self-heals on the next message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedMidpoint {

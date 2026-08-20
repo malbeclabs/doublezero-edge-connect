@@ -339,7 +339,7 @@ mod tests {
         }
     }
 
-    /// A sports port is exactly `base + channel_id` on all three planes. This is the property the
+    /// A sports port is exactly `base + channel_id` on all three port roles. This is the property the
     /// publisher's own `validate_port_scheme` asserts, and the one a subscriber must match exactly
     /// or it joins the right group and hears silence.
     ///
@@ -677,7 +677,7 @@ mod tests {
     /// when it was written, because both sides come from the same transcription.
     ///
     /// That distinction is not theoretical. On 2026-08-09 **all three** rows in this registry were
-    /// found provisioned on ports no publisher sends to — each authored one lane off, carrying a
+    /// found provisioned on ports no publisher sends to — each authored one port block off, carrying a
     /// sibling row's ports — and this test passed throughout, green, under its old name and its old
     /// claim. Two of the three errors predated the branch entirely.
     ///

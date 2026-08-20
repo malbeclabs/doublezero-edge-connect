@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `doublezero-edge-connect` ingests one or more DoubleZero (DZ) Edge **binary multicast** feeds,
 decodes them, runs the reference-data subscriber state machine, and re-serves normalized market
 data over a **WebSocket** in an engine-agnostic JSON protocol. It speaks four edge-feed-spec
-sibling protocols, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
+feeds, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 **Top-of-Book & Trades** (magic `0x445A` -> `quote`/`trade`), **Midpoint** (magic `0x4D44` ->
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it both as full-state `depth` and as the order-level incremental **`order_book`**, carrying
@@ -152,7 +152,8 @@ Modules are grouped by role under `src/`:
   Validation covers the structural per-row rules (non-empty `code`/`category`, a `venue` that
   `sources::source_id_of` resolves, base ports unique within a row, a non-empty published set, no port
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
-  planes, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key from a
+  port roles, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key
+  from a
   silently two-port block whose book never syncs into a startup error) **and the five cross-row
   invariants** — `(venue, category, kind)` uniqueness,
   one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
@@ -165,7 +166,8 @@ Modules are grouped by role under `src/`:
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
   `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a published
-  set of channels plus per-plane bases and expands to `base + channel_id` on every plane (one channel is an
+  set of channels plus per-role bases and expands to `base + channel_id` on every port role (one
+  channel is an
   independent state machine — its own `Reset Count`, sequence series, manifest seq and snapshot cycle
   — so one channel is one `FeedPublisher` and one receiver task); a published set that repeats an id
   collapses it and says so. There is **no hot reload**: books and reference data are keyed to the
@@ -181,7 +183,7 @@ Modules are grouped by role under `src/`:
   identity is its **base port** (`FeedPublisher::base_port()`, the block's mktdata port) — the
   `publisher` metric label, the log field and the reconciler/health task-key component; there are
   deliberately no host names in the registry. Add a row to the **document** to ingest another venue
-  (sibling-protocol rows are added once their live endpoints are known). `--feed
+  (rows for the other feeds are added once their live endpoints are known). `--feed
   <venue>` selects a subset of venues and `--publisher-port <port>` narrows the publishers within
   each (base ports are unique per feed, **not** across feeds); consumers then filter by venue over
   the WS. `emit_trades` is a static **capability** claim only — which claiming row actually serves a

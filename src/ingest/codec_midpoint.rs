@@ -1,6 +1,6 @@
 //! Decoder for the DoubleZero Edge **Midpoint** feed (datagram magic `0x4D44`).
 //!
-//! A sibling protocol to Top-of-Book that carries a single derived mid price per instrument. It
+//! A feed alongside Top-of-Book that carries a single derived mid price per instrument. It
 //! shares the 24-byte datagram header / 4-byte message header / generic datagram-walker in
 //! [`crate::ingest::codec_common`]; only the magic and the message bodies differ. Its
 //! `InstrumentDefinition` is a distinct 64-byte layout (a `Default Method` byte where Top-of-Book

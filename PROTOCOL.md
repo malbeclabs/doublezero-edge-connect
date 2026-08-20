@@ -186,7 +186,7 @@ more than one `channel`.
  "ws_send_ts_ns":1781019263715600440}
 ```
 
-A single **derived mid price** for a symbol, from the DZ Edge Midpoint sibling feed. Like a
+A single **derived mid price** for a symbol, from the DZ Edge Midpoint feed. Like a
 `quote` it is **full state** per instrument (the latest mid), so it self-heals on the next message;
 a consumer that connects partway through sees the matching `instrument` (for precision) first.
 

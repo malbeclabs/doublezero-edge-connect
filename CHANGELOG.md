@@ -139,13 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (617 µs held on the 44,598-order market) and the price fold (8.9 ms) ran per client on the mutex
   the ingest emit path takes on every published batch: 64 clients meant roughly 39 ms of stall per
   batch, for every feed. `dz_hl_sink_folds_total`, `dz_hl_sink_dropped_total{reason}`.
-- The resurrection guard's out-of-queue sweep is scheduled rather than triggered on every batch. The
+- The resurrection guard's out-of-queue retirement is scheduled rather than triggered on every batch. The
   threshold was clamped to half the per-market tombstone cap, so above that population it sat *below*
   the population itself and the comparison was true forever: a full scan of the market's tombstone map
   per datagram, held under the one arbiter mutex every receiver on every feed takes to emit. Measured
   synthetically at 141 µs a batch with 36,768 tombstones held, against 6.9 µs on a market in step —
   and one datagram from a source the market has never seen is enough to start the population climbing.
-  The clamp's other, undocumented job was keeping a sweep ahead of the eviction that disowns a market,
+  The clamp's other, undocumented job was keeping retirement ahead of the eviction that disowns a market,
   which is now explicit at that eviction and holds for a batch large enough to cross the cap on its
   own. After: 3.7 µs at 36,768 and 5.5 µs at the cap.
 - `dz_mbo_guarded_tombstones_max` no longer reads zero while a market holds the real maximum. It
@@ -163,8 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   head-of-queue over the removal order, so a path whose snapshot anchor post-dates a removal — it
   never held that order, so it never reports it — blocked every tombstone behind it for the life of
   the market, and the population reverted from the paths' lag spread to the market's whole history,
-  exiting only at the per-market cap where the market is disowned. Retirement now also sweeps out of
-  queue order, on a threshold that doubles after each sweep so it costs O(1) amortized per tombstone
+  exiting only at the per-market cap where the market is disowned. Retirement now also runs out of
+  queue order, on a threshold that doubles after each pass so it costs O(1) amortized per tombstone
   and nothing at all while the paths keep up. **What counts as evidence is unchanged** — every path
   still reaching the market must have reported the removal — so a forged datagram buys exactly what
   it bought before: one path's bit on the one order it names.
@@ -192,7 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a consumer that ended 994 orders wrong at 300 ms of inter-path lag, permanently, now holds the venue's
   book exactly, and the guard's eviction never fires at any lag tested. With the wider dedup window
   below, first divergence on that capture moves from **153 ms to 2 s** — exact at every step through
-  1 s. The synthetic sweep in `tests/order_level_consumer_book.rs` now partially fills every order, so
+  1 s. The synthetic lag ladder in `tests/order_level_consumer_book.rs` now partially fills every order, so
   it can produce the size disagreement the real capture shows, and it runs at the flagship's measured
   ~890 changes/s rather than a stress rate, so its figure is comparable to the capture's. It holds to
   1 s and is 223 orders wrong at 1.2 s — the ceiling being `seen`'s 1024-event cap (1.15 s at that

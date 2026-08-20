@@ -1089,7 +1089,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Extend the exact-length sweep to the price-keyed types.
+    /// Extend the exact-length checks to the price-keyed types.
     #[test]
     fn wrong_body_length_does_not_decode_price_types() {
         for (ty, correct) in [

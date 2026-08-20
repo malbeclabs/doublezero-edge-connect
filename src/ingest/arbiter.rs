@@ -1753,13 +1753,13 @@ impl Arbiter {
     /// market wedges for the life of the process.
     ///
     /// Scoped to the **category**, and to the sync claims only. One publisher host serves several
-    /// protocols from one source IP (the tape-path gate rests on that), so an unscoped sweep would let
+    /// protocols from one source IP (the tape-path gate rests on that), so an unscoped clear would let
     /// an exiting Market-by-Order receiver tear down the same host's live Market-by-Price state. The
     /// category is what the exiting receiver and the `MarketKey` provably agree on — both take it
     /// verbatim from the registry row (`DatagramCtx::category`). Its **venue** does not: every key here
     /// is filed under the *wire* venue (`MboProcessor::wire_venue`), and one registry row can carry
     /// instruments whose Source IDs resolve elsewhere — the same superset case that made
-    /// `reset_all_known_depth_floors` stop sweeping by `ctx.venue`. Filtered by the row's venue this
+    /// `reset_all_known_depth_floors` stop clearing by `ctx.venue`. Filtered by the row's venue this
     /// matched nothing for exactly those markets, which is the wedge it exists to close.
     ///
     /// A category is not unique across venues in general (`perps` already names rows on two of them),
@@ -5552,7 +5552,7 @@ mod tests {
         }
         // Peer 1: a different **category**, same venue/channel/instrument_id as the first doomed
         // market — the exact collision this crate's docs warn about. Deleting the category term
-        // from `forget_channel_books`'s filter would wrongly sweep this one up too.
+        // from `forget_channel_books`'s filter would wrongly purge this one too.
         a.emit(
             book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000),
             path(1),
@@ -5564,7 +5564,7 @@ mod tests {
             "perps",
         );
         // Peer 2: a different **channel**, same venue/category as the doomed markets. Deleting the
-        // channel term from the filter would wrongly sweep this still-running sibling channel up
+        // channel term from the filter would wrongly purge this still-running sibling channel
         // too — the failure mode a single-channel fixture cannot express.
         a.emit(
             book_on_channel(OTHER_CHANNEL, BOOK_INSTRUMENT, vec![clear_both()]),
@@ -7415,7 +7415,7 @@ mod tests {
 
     /// A stamp the forward bound refused is still served, so it can be unboundedly above the
     /// channel's newest — and recorded unclamped it pins the head of the forgetting queue, which
-    /// holds every entry behind it too. The old design's out-of-queue sweep was what covered this
+    /// holds every entry behind it too. The old design's out-of-queue retirement was what covered this
     /// case; the clamp is what replaces it.
     #[test]
     fn a_bounded_far_future_removal_does_not_pin_the_forgetting_queue() {

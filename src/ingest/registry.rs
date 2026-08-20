@@ -2,8 +2,8 @@
 //!
 //! Which group carries which feed, on which ports, with which published set of channels, is the
 //! publisher's to decide and it changes without our involvement — upstream reallocated it four
-//! times in dated specs, each reversing the last. Compiling those numbers in makes every such change a rebuild,
-//! and makes a stale copy invisible: a wrong port binds a socket that stays silent, and a wrong
+//! times in dated specs, each reversing the last. Compiling those numbers in makes every such
+//! change a rebuild, and makes a stale copy invisible: a wrong port binds a socket that stays silent, and a wrong
 //! group code activates nothing, with no warning either way.
 //!
 //! So the document is supplied to the container at runtime, from one of three sources, in
@@ -140,7 +140,7 @@ pub enum RegistryError {
         group: Ipv4Addr,
         port: u16,
     },
-    /// A publisher's port block does not match the plane count its protocol binds.
+    /// A publisher's port block does not match the port-role count its protocol binds.
     PortShape {
         venue: String,
         category: String,
@@ -363,7 +363,7 @@ impl From<WireArbitration> for ArbitrationMode {
 enum Publishers {
     /// One entry per publisher, ports written out.
     Explicit(Vec<PortBlock>),
-    /// A published set of channels plus per-plane bases; one publisher per channel at `base + id`.
+    /// A published set of channels plus per-role bases; one publisher per channel at `base + id`.
     Derived(Derived),
 }
 
@@ -372,7 +372,7 @@ struct PortBlock {
     mktdata: u16,
     refdata: u16,
     /// Present only for the protocols with an in-band snapshot feed (market-by-order and
-    /// market-by-price). A two-port block leaves it out rather than repeating a plane.
+    /// market-by-price). A two-port block leaves it out rather than repeating a port role.
     #[serde(default)]
     snapshot: Option<u16>,
     #[serde(default)]
@@ -435,7 +435,7 @@ enum ChannelSpec {
 struct PortBases {
     mktdata: u16,
     refdata: u16,
-    /// Optional because the top-of-book plane binds a **pair** of ports — there is no in-band
+    /// Optional because top-of-book binds a **pair** of ports — there is no in-band
     /// snapshot feed on it, and the `5xxxx` slot is left unallocated rather than reused so the
     /// leading digit keeps naming the traffic class.
     #[serde(default)]
@@ -696,7 +696,7 @@ fn report_unknown_keys(doc: &Document) {
 /// recover their books from an **in-band snapshot feed** on a dedicated port, and top-of-book and
 /// midpoint have no such feed — which is why the `5xxxx` slot is left unallocated for them rather
 /// than reused, so the leading digit keeps naming the traffic class.
-fn planes_for(kind: FeedKind) -> u8 {
+fn port_roles_for(kind: FeedKind) -> u8 {
     match kind {
         FeedKind::TopOfBook | FeedKind::Midpoint => 2,
         FeedKind::MarketByOrder | FeedKind::MarketByPrice => 3,
@@ -771,22 +771,22 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
             }
         }
 
-        let expected_planes = planes_for(f.kind);
+        let expected_roles = port_roles_for(f.kind);
         for p in f.publishers {
-            // The plane count is a property of the protocol, so a block that does not match it is a
+            // The port-role count is a property of the protocol, so a block that does not match it is a
             // wrong block. This is also what keeps a *typo* in an optional key from failing silently:
             // with no `deny_unknown_fields`, a misspelled `snapshot` is absorbed into the unknown map
             // and the block quietly becomes two-port — a market-by-price row that then binds no
             // snapshot socket, never syncs its book, and serves nothing while reading healthy. That
             // is the exact silent failure this registry exists to eliminate, so it dies at startup.
             let found = if p.ports.snapshot().is_some() { 3 } else { 2 };
-            if found != expected_planes {
+            if found != expected_roles {
                 return Err(RegistryError::PortShape {
                     venue: f.venue.to_string(),
                     category: f.category.to_string(),
                     kind: f.kind.label(),
                     base_port: p.base_port(),
-                    expected: expected_planes,
+                    expected: expected_roles,
                     found,
                 });
             }
@@ -905,7 +905,8 @@ fn ports(mktdata: u16, refdata: u16, snapshot: Option<u16>) -> FeedPorts {
 ///
 /// A channel is an independent state machine (its own `Reset Count`, sequence series, manifest seq
 /// and snapshot cycle), so one channel is one receiver task with its own processor state and books
-/// — the same shape a mirrored publisher already has. Ports are `base + id` on every plane, which
+/// — the same shape a mirrored publisher already has. Ports are `base + id` on every port role,
+/// which
 /// is the arithmetic the publisher itself asserts; a subscriber that computes it differently joins
 /// the right group and hears silence.
 fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryError> {
@@ -916,7 +917,7 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
         .map(|e| {
             let id = e.id;
             let off = u16::from(id);
-            let plane = |base: u16| {
+            let role = |base: u16| {
                 base.checked_add(off).ok_or(RegistryError::PortOverflow {
                     venue: row.venue.clone(),
                     base,
@@ -925,9 +926,9 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
             };
             Ok(FeedPublisher {
                 ports: ports(
-                    plane(p.mktdata)?,
-                    plane(p.refdata)?,
-                    p.snapshot.map(plane).transpose()?,
+                    role(p.mktdata)?,
+                    role(p.refdata)?,
+                    p.snapshot.map(role).transpose()?,
                 ),
                 // Recorded, not recomputed downstream: this is the one place the id and the block
                 // are both in hand, and it is what lets the channel filter decline a channel by
@@ -1141,7 +1142,7 @@ mod tests {
         assert!(!loaded.rows.is_empty());
     }
 
-    /// Ranges and singletons flatten to one ascending, deduped list, and every plane is offset by
+    /// Ranges and singletons flatten to one ascending, deduped list, and every port role is offset by
     /// the id — the property the whole derived form exists for.
     #[test]
     fn derived_rows_expand_to_base_plus_id() {
@@ -1263,9 +1264,10 @@ mod tests {
         );
     }
 
-    /// No snapshot base means a two-port block, not a snapshot plane silently aliased onto another.
+    /// No snapshot base means a two-port block, not a snapshot port role silently aliased onto
+    /// another.
     ///
-    /// On a **top-of-book** row, because that is the protocol the two-plane shape is legal for — the
+    /// On a **top-of-book** row, because that is the protocol the two-role shape is legal for — the
     /// derived form has to support it for the sibling row that arrives with its own publisher.
     #[test]
     fn a_derived_row_without_a_snapshot_base_binds_two_ports() {

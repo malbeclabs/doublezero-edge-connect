@@ -1,7 +1,7 @@
 //! Shared primitives for the DoubleZero Edge family of binary protocols.
 //!
 //! Top-of-Book (`codec`), Midpoint (`codec_midpoint`) and Market-by-Order (`codec_mbo`) are
-//! sibling protocols that share the same little-endian **24-byte datagram header** and **4-byte
+//! feeds that share the same little-endian **24-byte datagram header** and **4-byte
 //! application message header**, differing only by the datagram `magic` and the set of message
 //! bodies they carry. This module holds those shared pieces plus a generic datagram-walker each
 //! codec parameterizes with its own per-type body decoder, so the header parse + length-walk
@@ -72,7 +72,7 @@ pub fn i64le(b: &[u8], o: usize) -> Option<i64> {
 }
 
 /// Apply a raw price/qty integer's implied decimal exponent (e.g. `6788`, `-2` -> `67.88`).
-/// Shared by every protocol's normalization.
+/// Shared by every protocol's decode.
 pub fn apply_exponent(raw: i64, exponent: i8) -> f64 {
     raw as f64 * 10f64.powi(exponent as i32)
 }

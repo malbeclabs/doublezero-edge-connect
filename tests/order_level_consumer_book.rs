@@ -859,10 +859,10 @@ fn arrival_lagged_feed(
     (a, rx, consumer, venue)
 }
 
-/// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
+/// The lag ladder: how far the two publishers can drift apart before the merge point stops being able
 /// to keep a consumer's book identical to the venue's.
 ///
-/// It replaces a sweep that stopped at 1 s, and the two tests it replaces both compared only at the
+/// It replaces a ladder that stopped at 1 s, and the two tests it replaces both compared only at the
 /// **end** of the run — where a trailer replaying the venue's whole life in order has converged on
 /// its own, so they passed with the racing guard removed outright. This one goes through
 /// `arrival_lagged_feed`, which asserts after every arrival.

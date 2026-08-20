@@ -675,7 +675,7 @@ async fn main() -> Result<()> {
 
     // The path sampler: closes each elapsed re-election window (a margin transfer moves venue
     // authority here), refreshes the O(markets × paths) gauges and drains the matcher's unmatched
-    // counts. Off the emit path entirely, so a slow sweep never touches ingest latency.
+    // counts. Off the emit path entirely, so a slow refresh never touches ingest latency.
     let sampler = {
         let arbiter = arbiter.clone();
         // A fraction of the window, not the window itself: the authority closes a window only once

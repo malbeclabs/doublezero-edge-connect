@@ -3,7 +3,7 @@
 //! Little-endian, fixed-size binary datagrams, defined by the edge-feed-spec
 //! (https://github.com/malbeclabs/edge-feed-spec). The datagram
 //! header, message header, little-endian readers and the generic datagram-walker are shared with
-//! the sibling protocols in [`crate::ingest::codec_common`].
+//! the other feeds in [`crate::ingest::codec_common`].
 
 use anyhow::Result;
 

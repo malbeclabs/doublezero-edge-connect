@@ -405,7 +405,7 @@ Record the source IP, capture date, datagram counts and observed `depth_bound` a
 
 Cut 2026-08-11 from the mainnet capture warehouse
 (`s3://malbeclabs-multicast-pcap-warehouse/mainnet-beta/aws-cmh-mn-recorder1-16.59.144.33/2026/08/11/18/`),
-refdata plane only, ~12 KB each:
+refdata port role only, ~12 KB each:
 
 | fixture | group | port | datagrams | sources |
 |---|---|---|---|---|

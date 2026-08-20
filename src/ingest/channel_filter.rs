@@ -26,8 +26,8 @@
 //!
 //! - **Keyed by group code, never global.** `--channels edge-kalshi-sports-mbp=10,11` narrows that feed and no
 //!   other; an unmentioned feed ingests every channel. One global flag would let an operator filter
-//!   down to a league and silently half-blind an unrelated mirrored feed, since the two planes give
-//!   `channel_id` different meanings.
+//!   down to a league and silently half-blind an unrelated mirrored feed, since the two deployment
+//!   shapes give `channel_id` different meanings.
 //! - **Ids are the contract; names are not.** Channel *names* live in the publisher's inventory by
 //!   design — they have already moved once, and a copy here would drift exactly as four superseded
 //!   port allocations did. The channel filter takes numeric ids and validates them against the
@@ -371,7 +371,8 @@ mod tests {
     }
 
     /// The channel filter is scoped per group code. Narrowing one feed must not narrow another —
-    /// the two planes give `channel_id` different meanings and a global filter would conflate them.
+    /// the two deployment shapes give `channel_id` different meanings and a global filter would
+    /// conflate them.
     #[test]
     fn a_filter_on_one_feed_does_not_narrow_another() {
         let f = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
