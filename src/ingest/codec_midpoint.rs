@@ -154,11 +154,11 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ingest::codec_common::{apply_exponent, DATAGRAM_HEADER_SIZE};
 
-    fn datagram(body: Vec<u8>, msg_count: u8) -> Vec<u8> {
+    pub(crate) fn datagram(body: Vec<u8>, msg_count: u8) -> Vec<u8> {
         let datagram_len = (DATAGRAM_HEADER_SIZE + body.len()) as u16;
         let mut f = Vec::new();
         f.extend_from_slice(&MAGIC.to_le_bytes());
@@ -173,7 +173,7 @@ mod tests {
         f
     }
 
-    fn encode_midpoint(m: &Midpoint) -> Vec<u8> {
+    pub(crate) fn encode_midpoint(m: &Midpoint) -> Vec<u8> {
         let mut b = vec![MSG_MIDPOINT, MIDPOINT_SIZE, 0, 0]; // header: type, len, flags
         b.extend_from_slice(&m.instrument_id.to_le_bytes());
         b.extend_from_slice(&m.source_id.to_le_bytes());
@@ -186,7 +186,7 @@ mod tests {
         b
     }
 
-    fn encode_instrument(d: &InstrumentDefinition) -> Vec<u8> {
+    pub(crate) fn encode_instrument(d: &InstrumentDefinition) -> Vec<u8> {
         let mut b = vec![MSG_INSTRUMENT_DEFINITION, INSTRUMENT_DEFINITION_SIZE, 0, 0];
         b.extend_from_slice(&d.instrument_id.to_le_bytes()); // @4
         let mut sym = [0u8; 16];

@@ -3052,8 +3052,8 @@ mod tests {
     use std::net::IpAddr;
 
     use super::{
-        upsert_instrument, MboProcessor, MbpProcessor, TobProcessor, WarnRateLimit,
-        MAX_BUFFERED_DELTAS_ACROSS_BOOKS, MAX_CHANNEL_KEYS, MAX_PRICE_BOOKS,
+        upsert_instrument, MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor,
+        WarnRateLimit, MAX_BUFFERED_DELTAS_ACROSS_BOOKS, MAX_CHANNEL_KEYS, MAX_PRICE_BOOKS,
     };
     use crate::{
         ingest::{
@@ -3067,6 +3067,7 @@ mod tests {
                 MSG_INSTRUMENT_DEFINITION, MSG_MANIFEST_SUMMARY, SIDE_ASK, SIDE_BID,
             },
             codec_mbp::{self, tests as mbp_wire, SIDE_ASK as MBP_ASK, SIDE_BID as MBP_BID},
+            codec_midpoint::{self, tests as midpoint_wire},
             pricebook::{BookDelta, DeltaOp as PriceDeltaOp, Status as BookStatus},
             receiver::{DatagramCtx, DatagramProcessor, PortRole},
         },
@@ -3385,6 +3386,21 @@ mod tests {
         f
     }
 
+    /// [`codec_mbo::tests::datagram`] on a chosen channel — that helper hardcodes channel 0.
+    fn mbo_datagram_on_channel(channel: u8, messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = datagram(messages);
+        f[3] = channel;
+        f
+    }
+
+    /// [`codec_midpoint::tests::datagram`] on a chosen channel, taking the message list the sibling
+    /// helpers take rather than one pre-concatenated body.
+    fn midpoint_datagram_on_channel(channel: u8, messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = midpoint_wire::datagram(messages.concat(), messages.len() as u8);
+        f[3] = channel;
+        f
+    }
+
     /// [`tob_datagram`], but stamped with Schema Version 3 — for the tests exercising a v3
     /// `InstrumentDefinition`'s own Source ID.
     fn tob_datagram_v3(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
@@ -3562,6 +3578,88 @@ mod tests {
         assert!(
             channels.iter().all(|c| *c == 10),
             "every emitted channel must be canonical, got {channels:?}"
+        );
+    }
+
+    /// **The mirror finding, midpoint.** The same canonicalization
+    /// `tob_mirror_offset_collapses_catalog_identity` pins, on the one processor that had no test of
+    /// any kind. No `Midpoint` row carries a `publisher_offset` today, so this closes a coverage gap
+    /// rather than a live bug — the point is that the first mirrored midpoint row must not be what
+    /// discovers this half was never exercised.
+    ///
+    /// Both bursts come from the same source IP address on purpose: the registry's `MIRROR` note
+    /// keys the two paths apart by `channel_id`, never by host, so a fix that canonicalized only the
+    /// publisher axis would pass a two-address test and still fail this one.
+    #[test]
+    fn midpoint_mirror_offset_collapses_catalog_identity() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MidpointProcessor::new();
+        let ctx = || {
+            let mut c = make_ctx(&arbiter, &instruments, PortRole::Combined);
+            c.mirror_offset = Some(100);
+            c
+        };
+        let defs = |channel| {
+            midpoint_datagram_on_channel(
+                channel,
+                &[
+                    enc_manifest_summary(1, 1),
+                    midpoint_wire::encode_instrument(&codec_midpoint::InstrumentDefinition {
+                        instrument_id: 41,
+                        symbol: "MARKET-X".into(),
+                        price_exponent: 0,
+                        default_method: 0,
+                        manifest_seq: 1,
+                    }),
+                ],
+            )
+        };
+        proc.on_datagram(&defs(10), &ctx());
+        proc.on_datagram(&defs(110), &ctx());
+        // A `Midpoint` is what reveals the instrument, so it is what emits the deferred definition.
+        proc.on_datagram(
+            &midpoint_datagram_on_channel(
+                10,
+                &[midpoint_wire::encode_midpoint(&codec_midpoint::Midpoint {
+                    instrument_id: 41,
+                    source_id: 1,
+                    method: 0,
+                    quality_flags: 0,
+                    book_ts: 1,
+                    compute_ts: 1,
+                    mid_price_raw: 1_000,
+                })],
+            ),
+            &ctx(),
+        );
+
+        {
+            let cat = instruments.lock().unwrap();
+            let keys: Vec<_> = cat.keys().cloned().collect();
+            assert_eq!(
+                cat.len(),
+                1,
+                "the mirror must not mint a second catalog entry: {keys:?}"
+            );
+            assert!(
+                cat.contains_key(&("HYPERLIQUID".into(), "testcategory".into(), 10u8, 41u32)),
+                "the single entry must live under the canonical channel: {keys:?}"
+            );
+        }
+
+        // A `midpoint` carries no channel of its own, so the `Instrument` is the whole
+        // channel-bearing surface of this feed.
+        let channels: Vec<u8> = drain_all(&mut rx)
+            .iter()
+            .filter_map(|m| match m {
+                FeedMessage::Instrument(i) => Some(i.channel),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            vec![10],
+            "the reveal must ride the canonical channel, never the mirror's N + offset"
         );
     }
 
@@ -4016,6 +4114,75 @@ mod tests {
         assert!(
             seen.iter().any(|m| matches!(m, FeedMessage::Instrument(_))),
             "the first delta reveals it, as before"
+        );
+    }
+
+    /// **The mirror finding, market-by-order.** The fourth and last processor to canonicalize its
+    /// consumer-facing channel, and the other one that had no mirror test. No `MarketByOrder` row
+    /// carries a `publisher_offset` today, so this closes a coverage gap rather than a live bug.
+    ///
+    /// Both bursts come from the same source IP address on purpose: the registry's `MIRROR` note
+    /// keys the two paths apart by `channel_id`, never by host, so a fix that canonicalized only the
+    /// publisher axis would pass a two-address test and still fail this one.
+    ///
+    /// Unlike `mbp_mirror_offset_collapses_catalog_identity_but_keeps_paths_separate`, there is no
+    /// producer-side separation to assert here: MBO keys `books`/`revealed`/`pending_channel` on
+    /// `(publisher, instrument)` with no channel dimension at all, so two mirror paths on one source
+    /// IP address already share every piece of state. Widening those keys is what a mirrored MBO row
+    /// would need first; canonicalizing the emitted channel neither creates nor closes that.
+    #[test]
+    fn mbo_mirror_offset_collapses_catalog_identity() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, tape(true));
+        let ctx = |role| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.mirror_offset = Some(100);
+            c
+        };
+        let defs = |channel| {
+            mbo_datagram_on_channel(
+                channel,
+                &[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(41, "MARKET-X", 1),
+                ],
+            )
+        };
+        proc.on_datagram(&defs(10), &ctx(PortRole::Refdata));
+        proc.on_datagram(&defs(110), &ctx(PortRole::Refdata));
+        // A v1 definition carries no Source ID; a `Trade` is what reveals the instrument and so what
+        // emits the deferred definition.
+        proc.on_datagram(
+            &mbo_datagram_on_channel(10, &[enc_mbo_trade(41, 1)]),
+            &ctx(PortRole::Mktdata),
+        );
+
+        {
+            let cat = instruments.lock().unwrap();
+            let keys: Vec<_> = cat.keys().cloned().collect();
+            assert_eq!(
+                cat.len(),
+                1,
+                "the mirror must not mint a second catalog entry: {keys:?}"
+            );
+            assert!(
+                cat.contains_key(&("HYPERLIQUID".into(), "testcategory".into(), 10u8, 41u32)),
+                "the single entry must live under the canonical channel: {keys:?}"
+            );
+        }
+
+        let channels: Vec<u8> = drain_all(&mut rx)
+            .iter()
+            .filter_map(|m| match m {
+                FeedMessage::Instrument(i) => Some(i.channel),
+                FeedMessage::Trade(t) => Some(t.channel),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !channels.is_empty() && channels.iter().all(|c| *c == 10),
+            "every emitted channel must be canonical, got {channels:?}"
         );
     }
 
