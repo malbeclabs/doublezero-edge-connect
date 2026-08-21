@@ -33,11 +33,15 @@ pub struct ProductResponse {
 pub struct Product {
     pub product_id: String,
     pub source_id: u32,
-    /// A CLI is installed independently of the container it queries, so one build must parse an
-    /// old server's `source` and a new server's `source_name`. The alias belongs on this side
-    /// alone: producer-side aliasing would defeat the rename.
-    #[serde(alias = "source")]
-    pub source_name: String,
+    /// Two slots for one value. A CLI is installed independently of the container it queries, so one
+    /// build must parse an old server's `source`, a new server's `source_name`, **and** the release
+    /// that renamed it, which emits both for the old CLI's sake. `#[serde(alias)]` cannot: an alias
+    /// shares one field slot, so both keys present is a `duplicate field` error that fails the whole
+    /// response. Read through [`Product::source_name`].
+    #[serde(default)]
+    source_name: Option<String>,
+    #[serde(default, rename = "source")]
+    deprecated_source_name: Option<String>,
     pub symbol: String,
     pub channel: u8,
     pub instrument_id: u32,
@@ -45,6 +49,16 @@ pub struct Product {
     pub base_increment: String,
     pub status: String,
     pub feed_kind: String,
+}
+
+impl Product {
+    /// The upstream source's registry name, from whichever key the server sent.
+    pub fn source_name(&self) -> &str {
+        self.source_name
+            .as_deref()
+            .or(self.deprecated_source_name.as_deref())
+            .unwrap_or("")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -305,7 +319,8 @@ pub struct ProcessBlock {
 /// predates this field, rendered as a blank line rather than a guess — see [`crate::render`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RegistryBlock {
-    /// `source` on a server predating the rename — see [`Product::source_name`].
+    /// `source` on a server predating the rename. A `serde(alias)` is safe here, unlike on
+    /// [`Product`]: this block never carried both keys at once.
     #[serde(default, alias = "source")]
     pub origin: String,
     #[serde(default)]

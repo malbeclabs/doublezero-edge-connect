@@ -185,16 +185,26 @@ fn an_error_envelope_round_trips_through_json_output_untouched() {
 // generation's body identically (`types.rs`'s deserialize-side `serde(alias)`).
 // -------------------------------------------------------------------------------------------
 
+/// Three server generations, one rendering. The middle fixture is the shape **this release's**
+/// bridge serves — both keys, identical value, so a pre-rename CLI still parses `/v1/products`. That
+/// is the shape a `#[serde(alias)]` would reject as a duplicate field, failing the whole response on
+/// the very pairing `scripts/connect.sh` produces.
 #[test]
-fn a_product_list_renders_the_same_from_either_server_generation() {
+fn a_product_list_renders_the_same_from_every_server_generation() {
     let new = render::render_table(Endpoint::ProductsList, &fixture("products_list.json")).unwrap();
     let old = render::render_table(
         Endpoint::ProductsList,
         &fixture("products_list_legacy_source.json"),
     )
     .unwrap();
+    let both = render::render_table(
+        Endpoint::ProductsList,
+        &fixture("products_list_both_keys.json"),
+    )
+    .unwrap();
     assert!(new.contains("Hyperliquid"), "{new}");
     assert_eq!(old, new, "\n--- old server ---\n{old}\n--- new ---\n{new}");
+    assert_eq!(both, new, "\n--- both keys ---\n{both}\n--- new ---\n{new}");
 }
 
 #[test]

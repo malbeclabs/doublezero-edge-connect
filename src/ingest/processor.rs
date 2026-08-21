@@ -287,6 +287,13 @@ pub struct TobProcessor {
     /// reveals the instrument, is built outside that definition's own datagram and so no longer has
     /// its `header.channel_id` in scope. Refreshed on every definition burst (last-definition-wins,
     /// matching how `RefDataState.defs` itself already treats a same-`instrument_id` redefinition).
+    ///
+    /// Stored **canonical** (`DatagramCtx::canonical_channel`), not raw: every read of this map is a
+    /// consumer-facing identity — the emitted `channel`, the `InstrumentSnapshot` key, the trade's
+    /// own `channel` — so a mirror publisher's `N + offset` must collapse onto the base publisher's
+    /// `N` before it is stored, or the same market appears twice in the catalog. Canonicalizing here
+    /// rather than at each read is what makes that impossible to miss. This map holds no
+    /// producer-side state; the raw wire channel stays with the sequence and reset-count memos.
     /// Also what a Source ID change purges the stale `InstrumentSnapshot` entry by: the identity
     /// key is `(old_venue, channel, instrument_id)`, and `channel`/`instrument_id` don't change
     /// with the Source ID, so no separate "what was it last announced under" memo is needed the
@@ -512,7 +519,8 @@ impl DatagramProcessor for TobProcessor {
                     // under the STALE id, would make correctness rest on the arbiter incidentally
                     // deduping a redundant broadcast rather than on this decision.
                     let key = (ctx.publisher, d.instrument_id);
-                    self.pending_channel.insert(key, header.channel_id);
+                    let channel = ctx.canonical_channel(header.channel_id);
+                    self.pending_channel.insert(key, channel);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
                             let source = venue_arc(source_label(source_id));
@@ -521,7 +529,7 @@ impl DatagramProcessor for TobProcessor {
                                 source_name: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
-                                channel: header.channel_id,
+                                channel,
                                 instrument_id: d.instrument_id,
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
@@ -670,9 +678,10 @@ pub struct MidpointProcessor {
     /// The wire Source ID revealed for `(publisher, instrument)` — absent until the first
     /// `Midpoint` for the key. See [`MboProcessor::revealed`] for the full deferral design.
     revealed: HashMap<(IpAddr, u32), u16>,
-    /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)` —
-    /// see [`TobProcessor::pending_channel`], including why a Source ID change's
-    /// `InstrumentSnapshot` purge reads its current value directly rather than a separate memo.
+    /// The channel `InstrumentDefinition` most recently arrived on for `(publisher, instrument)`,
+    /// stored canonical — see [`TobProcessor::pending_channel`], including why a mirror publisher's
+    /// offset is subtracted before it is stored and why a Source ID change's `InstrumentSnapshot`
+    /// purge reads its current value directly rather than a separate memo.
     pending_channel: HashMap<(IpAddr, u32), u8>,
 }
 
@@ -805,7 +814,8 @@ impl DatagramProcessor for MidpointProcessor {
                     // that later emission, and re-announce now if already revealed by an earlier
                     // burst (the periodic reannounce this feed's manifest bursts already drive).
                     let key = (ctx.publisher, d.instrument_id);
-                    self.pending_channel.insert(key, header.channel_id);
+                    let channel = ctx.canonical_channel(header.channel_id);
+                    self.pending_channel.insert(key, channel);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         let source = venue_arc(source_label(source_id));
                         let inst = NormalizedInstrument {
@@ -813,7 +823,7 @@ impl DatagramProcessor for MidpointProcessor {
                             source_name: source.clone(),
                             source_id,
                             symbol: d.symbol.clone(),
-                            channel: header.channel_id,
+                            channel,
                             instrument_id: d.instrument_id,
                             category: category_arc(ctx.category),
                             price_exponent: d.price_exponent,
@@ -925,8 +935,9 @@ pub struct MboProcessor {
     /// remembered because MBO's book key carries no channel dimension, so it isn't otherwise in
     /// scope when a market-data message reveals the instrument. Refreshed on every definition burst
     /// (last-definition-wins, matching `RefDataState.defs`'s own per-`instrument_id` semantics).
-    /// Same bound reasoning as `revealed` above. Also what a Source ID change's `InstrumentSnapshot`
-    /// purge reads its current value from directly — see [`TobProcessor::pending_channel`].
+    /// Same bound reasoning as `revealed` above. Stored canonical, and also what a Source ID
+    /// change's `InstrumentSnapshot` purge reads its current value from directly — see
+    /// [`TobProcessor::pending_channel`].
     pending_channel: HashMap<(IpAddr, u32), u8>,
     /// Order-level changes the current datagram's applied deltas produced, tagged with the instrument they
     /// touched. Reused across datagrams (cleared at the top of each) so the hot path allocates nothing per
@@ -1557,7 +1568,8 @@ impl DatagramProcessor for MboProcessor {
                     // already revealed, skip this and let the eager `reveal_if_needed` call below
                     // handle it: see `TobProcessor`'s definition path for why.
                     let key = (ctx.publisher, d.instrument_id);
-                    self.pending_channel.insert(key, header.channel_id);
+                    let channel = ctx.canonical_channel(header.channel_id);
+                    self.pending_channel.insert(key, channel);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
                             let source = venue_arc(source_label(source_id));
@@ -1566,7 +1578,7 @@ impl DatagramProcessor for MboProcessor {
                                 source_name: source.clone(),
                                 source_id,
                                 symbol: d.symbol.clone(),
-                                channel: header.channel_id,
+                                channel,
                                 instrument_id: d.instrument_id,
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
@@ -3366,6 +3378,13 @@ mod tests {
         f
     }
 
+    /// [`tob_datagram`] on a chosen channel, for the mirror-offset tests.
+    fn tob_datagram_on_channel(channel: u8, sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = tob_datagram(sequence, messages);
+        f[3] = channel;
+        f
+    }
+
     /// [`tob_datagram`], but stamped with Schema Version 3 — for the tests exercising a v3
     /// `InstrumentDefinition`'s own Source ID.
     fn tob_datagram_v3(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
@@ -3474,6 +3493,69 @@ mod tests {
                 .get(),
             before + 1,
             "the change is counted, labelled by the NEW venue"
+        );
+    }
+
+    /// **The mirror finding, top-of-book.** `edge-kalshi-perps-tob` is a `TopOfBook` row carrying
+    /// `publisher_offset: 100`, so one receiver decodes datagrams stamped both channel `N` and
+    /// `N + 100` for the identical market. Every consumer-facing channel this processor stamps must
+    /// be canonical or the catalog holds each market twice, `products::resolve` reports a bare
+    /// `KALSHI:KXBTCPERP` as ambiguous, and `history::Key` splits the tape into two series.
+    ///
+    /// The mirror is the same source IP address here on purpose: the registry's `MIRROR` note keys
+    /// the two paths apart by `channel_id`, never by host, so a fix that canonicalized only the
+    /// publisher axis would pass a two-address test and still fail this one.
+    #[test]
+    fn tob_mirror_offset_collapses_catalog_identity() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = TobProcessor::new(tape(false));
+        let ctx = |role| {
+            let mut c = tob_ctx(&arbiter, &instruments, role, TEST_PUB);
+            c.mirror_offset = Some(100);
+            c
+        };
+        let defs = |channel| {
+            tob_datagram_on_channel(
+                channel,
+                0,
+                &[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(41, "MARKET-X", 1),
+                ],
+            )
+        };
+        proc.on_datagram(&defs(10), &ctx(PortRole::Refdata));
+        proc.on_datagram(&defs(110), &ctx(PortRole::Refdata));
+        proc.on_datagram(
+            &tob_datagram_on_channel(10, 1, &[enc_tob_quote(41, 1, 1_000)]),
+            &ctx(PortRole::Mktdata),
+        );
+
+        {
+            let cat = instruments.lock().unwrap();
+            let keys: Vec<_> = cat.keys().cloned().collect();
+            assert_eq!(
+                cat.len(),
+                1,
+                "the mirror must not mint a second catalog entry: {keys:?}"
+            );
+            assert!(
+                cat.contains_key(&("HYPERLIQUID".into(), "testcategory".into(), 10u8, 41u32)),
+                "the single entry must live under the canonical channel: {keys:?}"
+            );
+        }
+
+        let mut channels = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            match &*m {
+                FeedMessage::Instrument(i) => channels.push(i.channel),
+                FeedMessage::Trade(t) => channels.push(t.channel),
+                _ => {}
+            }
+        }
+        assert!(
+            channels.iter().all(|c| *c == 10),
+            "every emitted channel must be canonical, got {channels:?}"
         );
     }
 

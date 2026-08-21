@@ -108,7 +108,7 @@ fn render_products_list(body: &Value) -> Result<String, String> {
         .map(|p| {
             vec![
                 p.product_id.clone(),
-                p.source_name.clone(),
+                p.source_name().to_string(),
                 p.status.clone(),
                 p.feed_kind.clone(),
                 p.price_increment.clone(),
@@ -122,9 +122,10 @@ fn render_products_list(body: &Value) -> Result<String, String> {
 fn render_product_get(body: &Value) -> Result<String, String> {
     let parsed: ProductResponse = parse(body)?;
     let p = parsed.product;
+    let source_name = p.source_name().to_string();
     let rows = vec![
         vec!["product_id".to_string(), p.product_id],
-        vec!["source_name".to_string(), p.source_name],
+        vec!["source_name".to_string(), source_name],
         vec!["symbol".to_string(), p.symbol],
         vec!["channel".to_string(), p.channel.to_string()],
         vec!["instrument_id".to_string(), p.instrument_id.to_string()],

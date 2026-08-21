@@ -143,12 +143,15 @@ struct SubFilter {
     /// a client sends both they are ANDed, so a disagreeing pair matches nothing rather than
     /// silently honouring one.
     ///
-    /// The retired `source` spelling is still *accepted* here, deserialize-side only, exactly as
-    /// `doublezero-edge`'s own types accept it: an unknown filter key is ignored, so dropping it
-    /// outright would widen a client that narrowed on `source` alone to the firehose — and the
-    /// sink's drop-oldest backpressure would then cost it the messages it did ask for.
-    #[serde(default, alias = "source")]
+    #[serde(default)]
     source_name: Option<String>,
+    /// The pre-rename spelling, still accepted. Its own slot rather than a `serde(alias)` on
+    /// `source_name`: an alias shares one field slot, so a client sending both spellings — the
+    /// natural way to straddle a rename — would get `duplicate field` and have the whole `subscribe`
+    /// refused, registering no filter at all and landing on the firehose. That is the failure this
+    /// key exists to prevent. ANDed like `venue`, so all three spellings compose.
+    #[serde(default, rename = "source")]
+    deprecated_source_name: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
     /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
@@ -176,6 +179,10 @@ impl SubFilter {
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
             && self
                 .source_name
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(venue))
+            && self
+                .deprecated_source_name
                 .as_deref()
                 .is_none_or(|s| s.eq_ignore_ascii_case(venue))
             // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
@@ -1883,18 +1890,25 @@ mod tests {
         assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 
-    /// The pre-rename `source` key still narrows, through the deserialize-side alias. Dropping it
-    /// outright would have made a filter naming only it an unknown field, and an unknown field is
-    /// ignored — so that client would have been *widened* to the firehose, then lost the messages it
-    /// did ask for to the sink's drop-oldest backpressure.
+    /// The pre-rename `source` key still narrows, and — the reason it is its own field rather than a
+    /// `serde(alias)` — a client sending **both** spellings is accepted rather than having the whole
+    /// `subscribe` refused as a duplicate field, which would have registered no filter at all and
+    /// left it on the firehose, then cost it the messages it did ask for to drop-oldest backpressure.
     #[test]
-    fn the_retired_source_key_still_narrows_through_the_alias() {
+    fn the_retired_source_key_narrows_and_composes_with_the_new_one() {
         let retired: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
-        assert_eq!(
-            retired,
-            serde_json::from_str::<SubFilter>(r#"{"source_name":"HYPERLIQUID"}"#).unwrap()
-        );
         assert!(retired.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
         assert!(!retired.matches("PHOENIX", Some("SOL"), None, "quote"));
+
+        let both: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"HYPERLIQUID"}"#)
+                .expect("both spellings must parse, not collide");
+        assert!(both.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+
+        // ANDed like `venue`, so a disagreeing pair matches nothing rather than honouring one.
+        let disagreeing: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
+        assert!(!disagreeing.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!disagreeing.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 }
