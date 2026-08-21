@@ -3439,7 +3439,13 @@ mod tests {
     /// under the new id (not silently pinned to the first one seen), and counted. Without this, a
     /// venue's precision-before-price guarantee breaks for whichever id shows up second: no
     /// `Instrument` for it anywhere (not the wire, not `InstrumentSnapshot`, not the WS replay map).
+    ///
+    /// `#[serial]` because the exact-count assertion reads a process-global Prometheus child
+    /// (`dz_source_id_changed_total{venue="PHOENIX"}`) that every other 1 -> 2 change in this binary
+    /// also increments — see `metrics::metrics`'s test-isolation note. A relative baseline is not
+    /// enough on its own when a sibling can increment between the read and the assert.
     #[test]
+    #[serial_test::serial]
     fn tob_source_id_change_reannounces_and_is_counted() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = TobProcessor::new(tape(false));
@@ -3567,7 +3573,12 @@ mod tests {
     /// Price-triggered (the general path every Source ID change goes through, predating and
     /// independent of the v3 eager reveal), so this pins the fix in `reveal_if_needed` itself
     /// rather than in a definition handler.
+    ///
+    /// `#[serial]` for its sibling's sake, not its own: this test asserts no counter, but it drives
+    /// the same 1 -> 2 change and so increments the child
+    /// `tob_source_id_change_reannounces_and_is_counted` measures exactly.
     #[test]
+    #[serial_test::serial]
     fn tob_source_id_change_purges_the_stale_instrument_snapshot_entry() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = TobProcessor::new(tape(false));
