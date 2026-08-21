@@ -1,5 +1,5 @@
 //! Backstop-arbitrage E2E: drive the real bridge with **both** the DZ Edge multicast replayer and
-//! the mock Hyperliquid public WS input feeder, and assert the shared arbiter races them correctly.
+//! the mock Hyperliquid public WS input, and assert the shared arbiter races them correctly.
 //!
 //! Two cases, both over the unchanged WS output contract (`ws_client` + `assertions`):
 //!   1. **edge leads in steady state** — the edge feed advances the per-(venue, symbol) floor first,
@@ -8,7 +8,7 @@
 //!   2. **edge gap → public fills in** — the edge feed prints its real quotes first (revealing BTC's
 //!      Source ID and advancing the floor to the golden's last tick — see `ingest::processor`'s
 //!      per-instrument deferral, which holds prices back until the edge has revealed the instrument
-//!      at least once; a cold start with no edge price at all isn't backstoppable, only a mid-stream
+//!      at least once; a cold start with no edge price at all isn't backstoppable, only a gap partway
 //!      gap is), THEN goes quiet; the public feed opens each tick after that and is emitted, so a
 //!      consumer keeps seeing top-of-book through the gap.
 //!
@@ -29,13 +29,13 @@ use std::collections::BTreeSet;
 const EDGE_ONLY_QUOTES: usize = 41;
 
 fn refdata() -> Vec<Vec<u8>> {
-    replay::split_frames(
+    replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     )
 }
 fn mktdata() -> Vec<Vec<u8>> {
-    replay::split_frames(
+    replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     )
@@ -46,7 +46,7 @@ fn mktdata() -> Vec<Vec<u8>> {
 fn edge_quote_ticks() -> Vec<u64> {
     let mut ticks = BTreeSet::new();
     for f in mktdata() {
-        if let Ok((_h, msgs)) = codec::decode_frame(&f) {
+        if let Ok((_h, msgs)) = codec::decode_datagram(&f) {
             for m in &msgs {
                 if let codec::Message::Quote(q) = m {
                     ticks.insert(q.source_ts);
@@ -65,7 +65,7 @@ fn edge_quote_ticks() -> Vec<u64> {
 /// edge's, content dedup is *not* what drops them; only the floor's leader/stale logic is. The emitted
 /// count therefore equals the edge-only count. Falsifiable: bypass the floor's leader rule and the
 /// distinctive public copy at the high-water tick re-emits, pushing the count past `EDGE_ONLY_QUOTES`.
-/// The test also pins the load-bearing `source_ts = block_time_ms × 1_000_000` identity (the feeder
+/// The test also pins the load-bearing `source_ts = block_time_ms × 1_000_000` identity (the input
 /// reverses it) by asserting every edge tick is an exact ms multiple.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -86,14 +86,14 @@ async fn edge_leads_steady_state_public_dropped() {
 
     // Replay the full edge feed first, in wire order (refdata then mktdata).
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();
 
-    // Let the edge mktdata be fully processed (floor advanced to the max edge tick) and the feeder
+    // Let the edge mktdata be fully processed (floor advanced to the max edge tick) and the input
     // connect/subscribe.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -106,7 +106,7 @@ async fn edge_leads_steady_state_public_dropped() {
     let mut public_bids = Vec::new();
     for (i, &ts) in ticks.iter().enumerate() {
         // The edge derives source_ts = block_time_ms × 1_000_000, so each tick is an exact ms
-        // multiple; pin that identity (the feeder reverses it) and mirror onto the SAME tick.
+        // multiple; pin that identity (the input reverses it) and mirror onto the SAME tick.
         assert_eq!(
             ts % 1_000_000,
             0,
@@ -144,10 +144,10 @@ async fn edge_leads_steady_state_public_dropped() {
 /// quiet and the public feed opens ticks after that — the consumer keeps seeing top-of-book through
 /// the gap, with no health check anywhere in the path.
 ///
-/// This is a mid-stream gap, not a cold start: `ingest::processor`'s per-instrument deferral holds
+/// This is a gap partway through, not a cold start: `ingest::processor`'s per-instrument deferral holds
 /// `NormalizedInstrument`/prices back until the edge has revealed an instrument's Source ID at least
 /// once (refdata alone never does), so an edge that never once goes live for an instrument gives the
-/// public feeder's precision gate nothing to key against either — that is a feed that was never live
+/// public input's precision gate nothing to key against either — that is a feed that was never live
 /// for the instrument, not a gap in one that was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -175,16 +175,16 @@ async fn edge_gap_public_fills_in() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Edge refdata AND mktdata: BTC prints real quotes (revealing its Source ID and advancing the
-    // floor), before the edge goes quiet — the gap that follows is mid-stream.
+    // floor), before the edge goes quiet — the gap that follows opens partway through.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata()).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata()).unwrap();
     })
     .await
     .unwrap();
     // Let the edge mktdata be fully processed (BTC revealed, floor advanced to the max edge tick)
-    // and the feeder connect.
+    // and the input connect.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Public feed opens two successive ticks AFTER the edge's last real tick (well clear of the

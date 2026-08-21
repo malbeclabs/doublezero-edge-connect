@@ -14,11 +14,11 @@ mod common;
 use common::{assertions, replay as replay_helper};
 use doublezero_edge_connect::{
     ingest::{
-        arbiter::{Arbiter, Publisher, SharedArbiter, TRADE_DEDUP_WINDOW},
+        arbiter::{Arbiter, SharedArbiter, Transport, TRADE_DEDUP_WINDOW},
         codec, codec_mbo,
         feeds::{feeds, init_built_in, FeedKind},
         processor::{MboProcessor, TobProcessor},
-        receiver::{FrameCtx, FrameProcessor, PortRole},
+        receiver::{DatagramCtx, DatagramProcessor, PortRole},
     },
     model::{
         BookAccumulator, BookAction, BookChange, BookSide, FeedMessage, NormalizedBook, ReplayScope,
@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 
 /// Map a combined-record role byte to its `PortRole`. MBO adds a third role over TOB's two:
 /// `0 = refdata`, `1 = mktdata`, `2 = snapshot` (the converter's `--combined-with --protocol mbo`
-/// encoding; see `examples/pcap2frames.rs`).
+/// encoding; see `examples/pcap2datagrams.rs`).
 fn port_role(role: u8) -> PortRole {
     match role {
         0 => PortRole::Refdata,
@@ -45,7 +45,7 @@ fn port_role(role: u8) -> PortRole {
 
 /// Replay combined MBO records through a single re-keyed `MboProcessor` feeding the shared `Arbiter`
 /// in capture order, collecting the emitted WS messages as JSON. The production demux+dedup path:
-/// each record's source IP becomes `FrameCtx.publisher`, so the processor reconstructs an independent
+/// each record's source IP address becomes `DatagramCtx.publisher`, so the processor reconstructs an independent
 /// book per `(publisher, instrument)` and the cross-publisher latch-to-leader depth floor runs in the
 /// arbiter — exactly as in the binary.
 fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
@@ -56,8 +56,8 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     // Trades off, as the live MBO row is (`feeds::FEEDS`): its `OrderExecute` prints carry no venue
     // trade id, so they bypass the arbiter's dedup window — see `mbo_prints_carry_no_venue_trade_id`.
     let mut p = MboProcessor::new(depth, Arc::new(AtomicBool::new(false)));
-    for (ip, role, frame) in recs {
-        let ctx = FrameCtx {
+    for (ip, role, datagram) in recs {
+        let ctx = DatagramCtx {
             venue: "HYPERLIQUID",
             category: "perps",
             arbiter: &arbiter,
@@ -68,7 +68,7 @@ fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
             publisher: *ip,
             mirror_offset: None,
         };
-        p.on_datagram(frame, &ctx);
+        p.on_datagram(datagram, &ctx);
     }
     let mut msgs = Vec::new();
     while let Ok(m) = rx.try_recv() {
@@ -94,7 +94,7 @@ fn empty_anchor_depths(msgs: &[Value]) -> usize {
         .count()
 }
 
-/// Combined fixture record: `[u32 len LE][4B src_ip octets][1B role: 0=refdata,1=mktdata][frame]`.
+/// Combined fixture record: `[u32 len LE][4B src_ip octets][1B role: 0=refdata,1=mktdata][datagram]`.
 fn read_combined(path: &str) -> Vec<(IpAddr, u8, Vec<u8>)> {
     let b = std::fs::read(path).unwrap();
     let mut out = Vec::new();
@@ -114,7 +114,7 @@ fn read_combined(path: &str) -> Vec<(IpAddr, u8, Vec<u8>)> {
 
 /// Replay combined records through a single `TobProcessor` feeding the shared `Arbiter` in capture
 /// order and collect the emitted WS messages as JSON. This is the production demux+dedup path: each
-/// record's source IP becomes `FrameCtx.publisher`, so the per-publisher SeqTracker runs in the
+/// record's source IP address becomes `DatagramCtx.publisher`, so the per-publisher SeqTracker runs in the
 /// processor and the cross-publisher latch-to-leader floor + trade dedup run in the arbiter, exactly
 /// as in the binary (where the arbiter is the one process-wide emit stage).
 fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
@@ -122,8 +122,8 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
     let instruments = Arc::new(Mutex::new(HashMap::new()));
     let mut p = TobProcessor::new(Arc::new(AtomicBool::new(true)));
-    for (ip, role, frame) in recs {
-        let ctx = FrameCtx {
+    for (ip, role, datagram) in recs {
+        let ctx = DatagramCtx {
             venue: "HYPERLIQUID",
             category: "perps",
             arbiter: &arbiter,
@@ -138,7 +138,7 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
             publisher: *ip,
             mirror_offset: None,
         };
-        p.on_datagram(frame, &ctx);
+        p.on_datagram(datagram, &ctx);
     }
     let mut msgs = Vec::new();
     while let Ok(m) = rx.try_recv() {
@@ -147,12 +147,12 @@ fn replay(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     msgs
 }
 
-/// Decode every refdata frame's instrument definitions into `instrument_id -> symbol`. Built from
+/// Decode every refdata datagram's instrument definitions into `instrument_id -> symbol`. Built from
 /// all definitions in the fixture so per-symbol counts can be keyed by the human symbol.
 fn symbol_by_id(recs: &[(IpAddr, u8, Vec<u8>)]) -> HashMap<u32, String> {
     let mut map = HashMap::new();
-    for (_ip, _role, frame) in recs {
-        if let Ok((_h, msgs)) = codec::decode_frame(frame) {
+    for (_ip, _role, datagram) in recs {
+        if let Ok((_h, msgs)) = codec::decode_datagram(datagram) {
             for m in &msgs {
                 if let codec::Message::InstrumentDefinition(d) = m {
                     map.insert(d.instrument_id, d.symbol.to_string());
@@ -163,16 +163,16 @@ fn symbol_by_id(recs: &[(IpAddr, u8, Vec<u8>)]) -> HashMap<u32, String> {
     map
 }
 
-/// Raw (pre-dedup) quote-message count per symbol across the mktdata frames — the baseline the
+/// Raw (pre-dedup) quote-message count per symbol across the mktdata datagrams — the baseline the
 /// emitted counts must drop below for dedup to have done anything.
 fn raw_quotes_by_symbol(recs: &[(IpAddr, u8, Vec<u8>)]) -> HashMap<String, usize> {
     let by_id = symbol_by_id(recs);
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (_ip, role, frame) in recs {
+    for (_ip, role, datagram) in recs {
         if *role != 1 {
             continue; // mktdata only
         }
-        if let Ok((_h, msgs)) = codec::decode_frame(frame) {
+        if let Ok((_h, msgs)) = codec::decode_datagram(datagram) {
             for m in &msgs {
                 if let codec::Message::Quote(q) = m {
                     if let Some(sym) = by_id.get(&q.instrument_id) {
@@ -250,11 +250,11 @@ fn two_publishers_latch_to_leader_no_stale_or_dupes() {
     // real defect in the second publisher, not a decode issue: it is misreporting its own identity on
     // every quote in this capture. Under the old `unwrap_or(ctx.venue)` fallback, id 3 was unmapped, so
     // BOTH publishers' quotes fell back to this feed's static venue ("HYPERLIQUID") and competed on ONE
-    // dedup floor, silently merging the mislabeled arm into the correct one — exactly the "name it
+    // dedup floor, silently merging the mislabeled path into the correct one — exactly the "name it
     // after the multicast group it arrived on" workaround the plan reversal exists to remove. With the
-    // fallback gone, the two arms are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
-    // for the other venue = 7508) and no longer share a floor, so the cross-arm duplication this
-    // fixture's two mirrors actually represent is no longer collapsed — each arm now only dedups
+    // fallback gone, the two paths are honestly reported as different venues (4508 "HYPERLIQUID" + 3000
+    // for the other venue = 7508) and no longer share a floor, so the cross-path duplication this
+    // fixture's two mirrors actually represent is no longer collapsed — each path now only dedups
     // against itself (4699 -> 4508, 4133 -> 3000). This is the correct, intended behavior of the new
     // rule: the output is visibly wrong about which publisher this is, which is what surfaces the
     // second publisher's defect instead of hiding it. The fix belongs at that publisher, not here.
@@ -282,7 +282,7 @@ fn per_symbol_dedup_is_independent() {
     let recs = read_combined("tests/fixtures/tob_multi_dual.combined.bin");
     let msgs = replay(&recs);
 
-    // (1) the dedup contract holds across the whole multi-symbol stream.
+    // (1) the dedup contract holds across the whole multi-symbol feed.
     assertions::no_business_duplicates(&msgs);
     assertions::quotes_well_formed(&msgs);
     // Staleness-floor non-decreasing monotonicity holds per (venue, symbol) across all symbols.
@@ -315,7 +315,7 @@ fn per_symbol_dedup_is_independent() {
         "fixture volume spread too small: BTC raw {btc_raw} vs DOGE raw {doge_raw}"
     );
 
-    // (3) Independence: replay ONLY DOGE's frames (all refdata kept so precision resolves; mktdata
+    // (3) Independence: replay ONLY DOGE's datagrams (all refdata kept so precision resolves; mktdata
     // restricted to DOGE) and confirm DOGE's emitted count is identical. DOGE has its own floor and
     // latched leader, so BTC/SOL traffic interleaved in the full run never advances or perturbs it;
     // the quiet symbol emits exactly the same set whether or not the busy symbols are present.
@@ -326,8 +326,8 @@ fn per_symbol_dedup_is_independent() {
         .0;
     let doge_only: Vec<_> = recs
         .iter()
-        .filter(|(_ip, role, frame)| {
-            *role == 0 || frame_carries(frame, doge_id) // keep all refdata + DOGE-bearing mktdata
+        .filter(|(_ip, role, datagram)| {
+            *role == 0 || datagram_carries(datagram, doge_id) // keep all refdata + DOGE-bearing mktdata
         })
         .cloned()
         .collect();
@@ -343,8 +343,8 @@ fn per_symbol_dedup_is_independent() {
     );
 }
 
-/// The literal duplicate-multicast-packet case for quotes: replay one publisher's stream, then
-/// replay it again with **every mktdata frame delivered twice** (byte-for-byte, same frame
+/// The literal duplicate-multicast-packet case for quotes: replay one publisher's feed, then
+/// replay it again with **every mktdata datagram delivered twice** (byte-for-byte, same datagram
 /// sequence — exactly what a redundant multicast delivery looks like). The emitted quote set must be
 /// identical. The duplicate datagram is *not* rejected at the sequence gate — an equal sequence is
 /// an accepted idempotent full-state update (`SeqTracker::duplicate_of_last_is_not_stale`) — so this
@@ -365,7 +365,7 @@ fn duplicate_multicast_quote_packet_collapses() {
         .cloned()
         .collect();
 
-    // Variant: each mktdata datagram is delivered a second time, immediately, from the same source.
+    // Variant: each mktdata datagram is delivered a second time, immediately, from the same publisher.
     let mut doubled = Vec::new();
     for r in &baseline {
         doubled.push(r.clone());
@@ -386,7 +386,7 @@ fn duplicate_multicast_quote_packet_collapses() {
     );
 }
 
-/// Cross-source duplicate at the packet level: replay one publisher, then replay it with each
+/// Cross-publisher duplicate at the packet level: replay one publisher, then replay it with each
 /// mktdata datagram **also** delivered from a second publisher IP (a mirror of the same feed). The
 /// leader (first to open each tick) wins and the mirror is a non-leader no-op, so the emitted quote
 /// set is unchanged — the multi-publisher dedup collapses the redundant feed.
@@ -426,7 +426,7 @@ fn duplicate_packet_from_second_publisher_collapses() {
 }
 
 /// The duplicate-packet case for trades: replay the single-publisher TOB golden, then replay it with
-/// every mktdata frame duplicated. Trades dedup by `trade_id` in the arbiter's windowed dedup, so
+/// every mktdata datagram duplicated. Trades dedup by `trade_id` in the arbiter's windowed dedup, so
 /// the emitted trade set is unchanged. Guarded so a trade-less fixture fails loud rather than
 /// passing vacuously.
 #[test]
@@ -435,20 +435,20 @@ fn duplicate_multicast_trade_packet_collapses() {
     let ref_bytes = std::fs::read("tests/fixtures/tob_refdata.bin").expect("read tob_refdata.bin");
     let mkt_bytes =
         std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
-    let ref_frames = replay_helper::split_frames(&ref_bytes, replay_helper::TOB_MAGIC);
-    let mkt_frames = replay_helper::split_frames(&mkt_bytes, replay_helper::TOB_MAGIC);
+    let ref_datagrams = replay_helper::split_datagrams(&ref_bytes, replay_helper::TOB_MAGIC);
+    let mkt_datagrams = replay_helper::split_datagrams(&mkt_bytes, replay_helper::TOB_MAGIC);
 
     // Refdata first (instrument definitions before prices), then mktdata, all from one publisher.
     let mut baseline: Vec<(IpAddr, u8, Vec<u8>)> = Vec::new();
-    for f in &ref_frames {
+    for f in &ref_datagrams {
         baseline.push((ip, 0, f.clone()));
     }
-    for f in &mkt_frames {
+    for f in &mkt_datagrams {
         baseline.push((ip, 1, f.clone()));
     }
 
     let mut doubled = baseline.clone();
-    for f in &mkt_frames {
+    for f in &mkt_datagrams {
         doubled.push((ip, 1, f.clone())); // each mktdata datagram delivered a second time
     }
 
@@ -466,7 +466,7 @@ fn duplicate_multicast_trade_packet_collapses() {
 
 /// Two-publisher **Market-by-Order** depth dedup over the real combined golden: two live HL
 /// publishers' interleaved BTC capture, each reconstructing its own book from a synthetic empty
-/// anchor + its independent delta stream. The cross-publisher contract:
+/// anchor + its independent delta feed. The cross-publisher contract:
 ///   1. `no_business_duplicates` on the emitted `depth` (content-inclusive identity).
 ///   2. Neither publisher's empty-book anchor (`source_ts == 0`) ever reaches the wire at all — an
 ///      instrument is deferred (see `ingest::processor`) until a delta-carrying message reveals its
@@ -481,7 +481,7 @@ fn duplicate_multicast_trade_packet_collapses() {
 ///      registry resolves to a different registered venue, not Hyperliquid. Honestly reported (no
 ///      `ctx.venue` fallback), they are two different venues and never share a depth floor, so
 ///      nothing here collapses across them — this is the intended visible symptom of the second
-///      publisher's defect, not a regression. (Real cross-publisher collapse — two arms honestly sharing one
+///      publisher's defect, not a regression. (Real cross-publisher collapse — two paths honestly sharing one
 ///      Source ID — is proven separately by `mbo_depth_mirror_from_second_publisher_collapses`,
 ///      whose synthetic mirror is a byte-for-byte copy and so shares the original's id.)
 ///
@@ -589,8 +589,8 @@ fn mbo_depth_mirror_from_second_publisher_collapses() {
 fn mbo_prints_carry_no_venue_trade_id() {
     let recs = read_combined("tests/fixtures/mbo_btc_dual.combined.bin");
     let mut prints = 0;
-    for (_ip, _role, frame) in &recs {
-        let Ok((_h, msgs)) = codec_mbo::decode_frame(frame) else {
+    for (_ip, _role, datagram) in &recs {
+        let Ok((_h, msgs)) = codec_mbo::decode_datagram(datagram) else {
             continue;
         };
         for m in &msgs {
@@ -611,7 +611,7 @@ fn mbo_prints_carry_no_venue_trade_id() {
         "golden carried no prints — the fact is unpinned"
     );
 
-    // Scoped to the venue this golden was captured from: another venue's MBO stream may well stamp
+    // Scoped to the venue this golden was captured from: another venue's MBO feed may well stamp
     // real trade ids, and that is its own row's call.
     init_built_in();
     for f in feeds()
@@ -640,13 +640,13 @@ fn depth_identities(msgs: &[Value]) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-const BOOK_VENUE: &str = "BookArmsInterleave";
+const BOOK_VENUE: &str = "BookPathsInterleave";
 const BOOK_CATEGORY: &str = "perps";
-const BOOK_CHANNEL: u32 = 2;
+const BOOK_CHANNEL: u8 = 2;
 const BOOK_INSTRUMENT: u32 = 41;
 
-fn arm(n: u8) -> Publisher {
-    Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+fn path(n: u8) -> Transport {
+    Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
 }
 
 fn level(side: BookSide, price: f64, size: f64) -> BookChange {
@@ -663,7 +663,7 @@ fn level(side: BookSide, price: f64, size: f64) -> BookChange {
 fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: BOOK_VENUE.into(),
-        source: BOOK_VENUE.into(),
+        source_name: BOOK_VENUE.into(),
         source_id: 0,
         symbol: "BTC-PERP".into(),
         channel: BOOK_CHANNEL,
@@ -681,9 +681,9 @@ fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage
     })
 }
 
-/// One arm's `(changes, last)` batch stream, parametrized on the arm's price/size base so two arms
+/// One path's sequence of `(changes, last)` batches, parametrized on the path's price/size base so two paths
 /// built from it publish divergent level sets. Batches 2 and 3 are one logical event.
-fn arm_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
+fn path_batches(px: f64, sz: f64) -> Vec<(Vec<BookChange>, bool)> {
     vec![
         (
             vec![
@@ -720,15 +720,15 @@ fn drain_books(rx: &mut broadcast::Receiver<Arc<FeedMessage>>) -> Vec<Normalized
     out
 }
 
-/// The single-arm authority gate for the incremental `book` product. Two arms mirror one venue and
+/// The single-path authority gate for the incremental `book` product. Two paths mirror one venue and
 /// their per-instrument delta series are unrelated by construction, so interleaving both on one wire
-/// stream corrupts a consumer's book while every per-arm sequence check the producer ran still passes.
-/// Pinned: only the elected arm's batches reach the wire, and a `BookAccumulator` fed from the drained
-/// wire messages alone reproduces that arm's level set exactly. Against the pre-gate undeduped
+/// feed corrupts a consumer's book while every per-path sequence check the producer ran still passes.
+/// Pinned: only the elected path's batches reach the wire, and a `BookAccumulator` fed from the drained
+/// wire messages alone reproduces that path's level set exactly. Against the pre-gate undeduped
 /// passthrough both fail — all eight batches go out, the challenger's levels enter the consumer's book,
 /// and its `last: false` batch folds into the leader's logical event.
 #[test]
-fn interleaved_book_arms_publish_one_coherent_stream() {
+fn interleaved_book_paths_publish_one_coherent_feed() {
     fn clear_both() -> BookChange {
         BookChange {
             action: BookAction::Clear,
@@ -741,26 +741,26 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
 
     let (tx, mut rx) = broadcast::channel(64);
     let mut arb = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
-    let (leader, challenger) = (arm_batches(100.0, 5.0), arm_batches(200.0, 50.0));
+    let (leader, challenger) = (path_batches(100.0, 5.0), path_batches(200.0, 50.0));
     assert_ne!(
         leader, challenger,
-        "identical arms would pass with the gate removed"
+        "identical paths would pass with the gate removed"
     );
 
-    // Arm-by-arm, arrivals microseconds apart: past the 2s `leader_timeout_ns` authority would
+    // Path-by-path, arrivals microseconds apart: past the 2s `leader_timeout_ns` authority would
     // legitimately transfer on silence.
     for (i, (l, c)) in leader.iter().zip(&challenger).enumerate() {
         let t = 1_000 + i as u64 * 2_000;
-        arb.emit(book_batch(l.0.clone(), l.1, t), arm(1), BOOK_CATEGORY);
+        arb.emit(book_batch(l.0.clone(), l.1, t), path(1), BOOK_CATEGORY);
         arb.emit(
             book_batch(c.0.clone(), c.1, t + 1_000),
-            arm(2),
+            path(2),
             BOOK_CATEGORY,
         );
     }
 
-    // The market's first admitted batch re-baselines the consumer, and this arm has sent no producer
-    // re-baseline, so a bare `clear` leads the stream. Everything after it is the leader's, verbatim.
+    // The market's first admitted batch re-baselines the consumer, and this path has sent no producer
+    // re-baseline, so a bare `clear` leads the feed. Everything after it is the leader's, verbatim.
     let published = drain_books(&mut rx);
     let (first, rest) = published.split_first().expect("the re-baseline");
     assert_eq!(first.changes, vec![clear_both()]);
@@ -769,7 +769,7 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
             .map(|b| (b.changes.clone(), b.last))
             .collect::<Vec<_>>(),
         leader,
-        "the wire must carry the elected arm's batches verbatim and none of the challenger's"
+        "the wire must carry the elected path's batches verbatim and none of the challenger's"
     );
 
     let mut acc = BookAccumulator::new(published[0].symbol.clone());
@@ -792,15 +792,15 @@ fn interleaved_book_arms_publish_one_coherent_stream() {
             level(BookSide::Ask, 101.0, 7.0),
             level(BookSide::Ask, 101.5, 2.0),
         ],
-        "a consumer applying only what we published must hold the elected arm's book"
+        "a consumer applying only what we published must hold the elected path's book"
     );
 }
 
-/// True if the frame carries a quote for `id` (used to build the DOGE-only subset; a TOB frame
-/// batches several instruments, so a DOGE-bearing frame may also carry others — kept whole, exactly
+/// True if the datagram carries a quote for `id` (used to build the DOGE-only subset; a TOB datagram
+/// batches several instruments, so a DOGE-bearing datagram may also carry others — kept whole, exactly
 /// as the full run sees it).
-fn frame_carries(frame: &[u8], id: u32) -> bool {
-    match codec::decode_frame(frame) {
+fn datagram_carries(datagram: &[u8], id: u32) -> bool {
+    match codec::decode_datagram(datagram) {
         Ok((_h, msgs)) => msgs
             .iter()
             .any(|m| matches!(m, codec::Message::Quote(q) if q.instrument_id == id)),

@@ -29,7 +29,7 @@ const MAX_ORDERS_PER_BOOK: usize = 1 << 18;
 const MAX_PENDING_DELTAS: usize = 1 << 18;
 
 /// Cap on remembered removed order ids. This set is **defence in depth, not the cross-publisher
-/// guard**: one book sees one publisher's stream, where the sequence check already rejects a repeat, so
+/// guard**: one book sees one publisher's feed, where the sequence check already rejects a repeat, so
 /// what it actually catches is a forged `Add` re-using a dead id at a contiguous sequence. The
 /// cross-publisher case — a lagging peer's only copy of an `Add` for an order another publisher already
 /// killed — is invisible here and is refused at the merge point (`ingest::arbiter`). Sized well below
@@ -62,7 +62,7 @@ struct RestingOrder {
 }
 
 /// What a delta does to the book. `seq` is the per-instrument delta sequence; `mktdata_seq` the
-/// frame-level `mktdata`-port sequence that carried it (the anchor the spec keys snapshot replay on);
+/// datagram-level `mktdata`-port sequence that carried it (the anchor the spec keys snapshot replay on);
 /// `ts` the event time.
 #[derive(Debug, Clone)]
 pub struct DeltaOp {
@@ -546,7 +546,7 @@ mod tests {
     use super::*;
 
     /// An `Add` delta whose per-instrument seq and `mktdata_seq` are aligned (the steady-state case:
-    /// one delta per mktdata frame). Tests that need them to differ build the `DeltaOp` directly.
+    /// one delta per mktdata datagram). Tests that need them to differ build the `DeltaOp` directly.
     fn add(seq: u32, order_id: u64, is_bid: bool, price: i64, qty: u64) -> DeltaOp {
         DeltaOp {
             seq,

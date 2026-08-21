@@ -1,14 +1,14 @@
 //! The feed registry as **data**, not code.
 //!
-//! Which group carries which feed, on which ports, with which channel roster, is the publisher's
-//! to decide and it changes without our involvement — upstream reallocated it four times in dated
-//! specs, each reversing the last. Compiling those numbers in makes every such change a rebuild,
-//! and makes a stale copy invisible: a wrong port binds a socket that stays silent, and a wrong
+//! Which group carries which feed, on which ports, with which published set of channels, is the
+//! publisher's to decide and it changes without our involvement — upstream reallocated it four
+//! times in dated specs, each reversing the last. Compiling those numbers in makes every such
+//! change a rebuild, and makes a stale copy invisible: a wrong port binds a socket that stays silent, and a wrong
 //! group code activates nothing, with no warning either way.
 //!
 //! So the document is supplied to the container at runtime, from one of three sources, in
 //! precedence order. This is also the seam the DoubleZero ledger drops into: it becomes a fourth
-//! [`Source`] and nothing else here changes.
+//! [`Origin`] and nothing else here changes.
 //!
 //! The parsed document is **leaked once into `'static`** at startup. The registry is immutable and
 //! process-lived, so this allocates once and never grows, and it is what keeps the seam free
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::ingest::{
     feeds::{ArbitrationMode, Feed, FeedKind, FeedPorts, FeedPublisher},
-    sources,
+    sources::{self, SourceAssignment},
 };
 
 /// The document compiled in, so the container runs standalone and always has a fallback.
@@ -34,7 +34,7 @@ const BUILT_IN: &str = include_str!("registry.json");
 /// This is for a change that reinterprets what a field *means*, not for one that adds a field —
 /// additive changes are handled by ignoring and reporting unknown keys, so they never bump this and
 /// never reach a rejection. A document whose version this build does not know is one whose existing
-/// fields it may read wrongly, which is why it is refused rather than applied: under a URL source
+/// fields it may read wrongly, which is why it is refused rather than applied: under a URL origin
 /// that refusal degrades to the built-in copy, under a file it is fatal (see [`load`]).
 const SUPPORTED_VERSION: u32 = 1;
 
@@ -44,7 +44,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where the registry document comes from, in precedence order.
 #[derive(Debug, Clone)]
-pub enum Source {
+pub enum Origin {
     /// `--feed-registry-url` — fetched once at startup. The precursor to reading the ledger.
     Url(String),
     /// `--feed-registry <path>` — a bind-mounted document.
@@ -53,15 +53,15 @@ pub enum Source {
     BuiltIn,
 }
 
-impl Source {
-    /// Resolve the two CLI flags to a source. A URL wins over a path; neither set means built-in.
-    pub fn from_flags(url: &str, path: &str) -> Source {
+impl Origin {
+    /// Resolve the two CLI flags to an origin. A URL wins over a path; neither set means built-in.
+    pub fn from_flags(url: &str, path: &str) -> Origin {
         if !url.is_empty() {
-            Source::Url(url.to_string())
+            Origin::Url(url.to_string())
         } else if !path.is_empty() {
-            Source::File(PathBuf::from(path))
+            Origin::File(PathBuf::from(path))
         } else {
-            Source::BuiltIn
+            Origin::BuiltIn
         }
     }
 }
@@ -82,14 +82,18 @@ pub enum RegistryError {
         field: &'static str,
     },
     UnknownVenue(String),
-    /// `venue` resolves to a Source ID, but not under this exact name — a legacy alias that only
-    /// ever reaches this loader, never the wire, so a document naming it would split every
-    /// downstream lookup that keys on the venue string.
-    NonCanonicalVenue {
-        venue: String,
-        canonical: &'static str,
+    /// A `sources` row carries no `name`, or a name that is not the uppercase form consumers see.
+    BadSourceName {
+        id: u16,
+        name: String,
     },
-    EmptyRoster {
+    /// Two `sources` rows claim the same `id`, or the same `name`. Either way one venue's messages
+    /// would resolve to the other's identity, and the arbiter keys dedup on `(venue, symbol)`.
+    DuplicateSource {
+        id: u16,
+        name: String,
+    },
+    EmptyPublishedSet {
         venue: String,
         category: String,
     },
@@ -99,7 +103,7 @@ pub enum RegistryError {
         venue: String,
         category: String,
     },
-    /// A `--feed-registry` file could not be read. Unlike a `Url` source, this is an operator's
+    /// A `--feed-registry` file could not be read. Unlike a `Url` origin, this is an operator's
     /// explicit instruction about this one container, so it must not silently degrade.
     ReadFailed {
         path: PathBuf,
@@ -147,7 +151,7 @@ pub enum RegistryError {
         group: Ipv4Addr,
         port: u16,
     },
-    /// A publisher's port block does not match the plane count its protocol binds.
+    /// A publisher's port block does not match the port-role count its protocol binds.
     PortShape {
         venue: String,
         category: String,
@@ -170,20 +174,27 @@ impl std::fmt::Display for RegistryError {
             RegistryError::EmptyField { venue, field } => {
                 write!(f, "{venue}: `{field}` is empty")
             }
+            RegistryError::BadSourceName { id, name } => write!(
+                f,
+                "source id {id}: `{name}` is not a usable assignment. The id must be non-zero (`0` \
+                 is the wire's \"names no registry row\" sentinel), and the name non-empty, \
+                 uppercase — the form that reaches consumers as `venue`, as every `venue=` metric \
+                 label value and as the `SOURCE:SYMBOL` product identifier — and neither \
+                 `UNREGISTERED` nor `SOURCE_<id>`, which are synthesized for an unassigned id"
+            ),
+            RegistryError::DuplicateSource { id, name } => write!(
+                f,
+                "source id {id} (`{name}`) is assigned twice, or shares a name with another id; \
+                 either way two sources would collapse to one identity and the arbiter keys dedup \
+                 on (venue, symbol)"
+            ),
             RegistryError::UnknownVenue(v) => write!(
                 f,
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
-                 status stream would go unrecorded"
+                 status feed would go unrecorded"
             ),
-            RegistryError::NonCanonicalVenue { venue, canonical } => write!(
-                f,
-                "venue `{venue}` resolves to Source ID for `{canonical}`, but is not that exact \
-                 name; only `{canonical}` ever reaches the wire, and every downstream lookup keyed \
-                 on the venue string (arbitration mode, channel-filter purge, `--feed` selection) \
-                 would silently miss"
-            ),
-            RegistryError::EmptyRoster { venue, category } => {
-                write!(f, "{venue}/{category}: derived roster is empty")
+            RegistryError::EmptyPublishedSet { venue, category } => {
+                write!(f, "{venue}/{category}: derived published set is empty")
             }
             RegistryError::EmptyPublishers { venue, category } => write!(
                 f,
@@ -234,7 +245,7 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "market-by-order rows on `{}` and `{}` share category `{category}`; a departing \
                  receiver releases its publishers' book standing by category, so each exit would \
-                 release the other venue's live arms",
+                 release the other venue's live paths",
                 venues[0], venues[1]
             ),
             RegistryError::DuplicateGroupPort { venue, group, port } => write!(
@@ -303,7 +314,24 @@ struct Document {
     #[serde(default)]
     #[allow(dead_code)]
     notes: serde_json::Value,
+    /// The `Source ID` -> registry-name allocation, generated from `edge-feed-spec/sources/spec.md`.
+    ///
+    /// Optional: adding it bumps no [`SUPPORTED_VERSION`], so a document written before it existed
+    /// is legal and resolves against the compiled-in table in `sources.rs` instead.
+    #[serde(default)]
+    sources: Vec<SourceRow>,
     feeds: Vec<FeedRow>,
+    #[serde(flatten)]
+    unknown: Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceRow {
+    id: u16,
+    name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    notes: serde_json::Value,
     #[serde(flatten)]
     unknown: Unknown,
 }
@@ -319,11 +347,11 @@ struct FeedRow {
     emit_trades: bool,
     arbitration: WireArbitration,
     publishers: Publishers,
-    /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
+    /// A second publisher mirrors this row's whole published set on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount — so a socket bound for channel `N` also receives
-    /// frames stamped `N + publisher_offset`. Row-level, not shape-specific: which mirror scheme
+    /// datagrams stamped `N + publisher_offset`. Row-level, not shape-specific: which mirror scheme
     /// (if any) a deployment runs is a property of the *feed*, not of whether the document happens
-    /// to write its ports out explicitly or derive them from a roster — an `explicit` row is
+    /// to write its ports out explicitly or derive them from a published set — an `explicit` row is
     /// exactly as capable of being mirrored as a `derived` one (confirmed live: two publishers
     /// sharing one explicit port block, separated only by `channel_id`). `None` (the default)
     /// means no such mirror. See [`crate::ingest::feeds::Feed::mirror_offset`] for what this
@@ -371,13 +399,13 @@ impl From<WireArbitration> for ArbitrationMode {
     }
 }
 
-/// How a row lists its publishers: port blocks verbatim, or a channel roster to expand.
+/// How a row lists its publishers: port blocks verbatim, or a published set of channels to expand.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Publishers {
     /// One entry per publisher, ports written out.
     Explicit(Vec<PortBlock>),
-    /// A channel roster plus per-plane bases; one publisher per channel at `base + id`.
+    /// A published set of channels plus per-role bases; one publisher per channel at `base + id`.
     Derived(Derived),
 }
 
@@ -385,8 +413,8 @@ enum Publishers {
 struct PortBlock {
     mktdata: u16,
     refdata: u16,
-    /// Present only for the protocols with an in-band snapshot stream (market-by-order and
-    /// market-by-price). A two-port block leaves it out rather than repeating a plane.
+    /// Present only for the protocols with an in-band snapshot feed (market-by-order and
+    /// market-by-price). A two-port block leaves it out rather than repeating a port role.
     #[serde(default)]
     snapshot: Option<u16>,
     #[serde(default)]
@@ -411,7 +439,7 @@ struct Derived {
     unknown: Unknown,
 }
 
-/// One entry of a `derived.channels` roster: either an inclusive `[lo, hi]` span, or a single
+/// One entry of a `derived.channels` published set: either an inclusive `[lo, hi]` span, or a single
 /// channel id optionally carrying a display `label`.
 ///
 /// **Untagged, not the externally-tagged form the rest of this module uses**, and deliberately so:
@@ -449,8 +477,8 @@ enum ChannelSpec {
 struct PortBases {
     mktdata: u16,
     refdata: u16,
-    /// Optional because the top-of-book plane binds a **pair** of ports — there is no in-band
-    /// snapshot stream on it, and the `5xxxx` slot is left unallocated rather than reused so the
+    /// Optional because top-of-book binds a **pair** of ports — there is no in-band
+    /// snapshot feed on it, and the `5xxxx` slot is left unallocated rather than reused so the
     /// leading digit keeps naming the traffic class.
     #[serde(default)]
     snapshot: Option<u16>,
@@ -469,6 +497,9 @@ struct PortBases {
 /// that was then discarded is precisely the breadcrumb a drift investigation must not be given.
 pub struct Loaded {
     pub rows: &'static [Feed],
+    /// The document's `Source ID` assignments, or `None` when it carried no `sources` block — in
+    /// which case `sources.rs`'s compiled-in table stays in force.
+    pub sources: Option<&'static [SourceAssignment]>,
     origin: String,
     version: u32,
 }
@@ -503,7 +534,7 @@ impl Loaded {
     pub fn log_resolved(&self) {
         let snap = self.info();
         info!(
-            source = snap.origin,
+            origin = snap.origin,
             version = snap.version,
             rows = snap.rows,
             receivers = snap.receivers,
@@ -519,25 +550,25 @@ impl Loaded {
 
 /// Resolve and validate the registry, leaking the rows into `'static`.
 ///
-/// Async only because the URL source fetches; the file and built-in sources never await.
+/// Async only because the `Url` origin fetches; the file and built-in ones never await.
 ///
 /// **A rejected document degrades or refuses depending on where it came from, and the asymmetry is
 /// the whole point:**
 ///
-/// - [`Source::Url`] — *any* failure (unreachable host, malformed body, a `version` this build
+/// - [`Origin::Url`] — *any* failure (unreachable host, malformed body, a `version` this build
 ///   predates, a validation error) warns and falls back to the built-in copy. A remote registry is
 ///   infrastructure that moves underneath a running fleet, and because resolution happens only at
 ///   startup, refusing would not kill the fleet when the document changed — it would kill each
 ///   process at its next reschedule, hours later and far from the cause. A host that is *up* and
 ///   serving one new field must not be worse than a host that is down.
-/// - [`Source::File`] and [`Source::BuiltIn`] — fatal. A bind-mounted file is an operator's explicit
+/// - [`Origin::File`] and [`Origin::BuiltIn`] — fatal. A bind-mounted file is an operator's explicit
 ///   instruction about this one container, so a wrong one must not run; and a built-in copy that
 ///   does not load is a build defect.
 ///
 /// The built-in copy is by construction last-known-good, which is what makes the fallback safe.
-pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
-    match &source {
-        Source::Url(url) => {
+pub async fn load(origin: Origin) -> Result<Loaded, RegistryError> {
+    match &origin {
+        Origin::Url(url) => {
             let fallback = |reason: &str| {
                 build(BUILT_IN, &format!("built-in ({reason})"))
                     .expect("the built-in feed registry document is valid")
@@ -559,7 +590,7 @@ pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
                 },
             }
         }
-        Source::File(path) => match std::fs::read_to_string(path) {
+        Origin::File(path) => match std::fs::read_to_string(path) {
             // Fatal, like the parse errors beside it: a bind-mounted file is an operator's
             // explicit instruction about this one container, and a wrong or missing one (an
             // unmounted volume, a typo'd path) must not silently start on the built-in copy — that
@@ -570,7 +601,7 @@ pub async fn load(source: Source) -> Result<Loaded, RegistryError> {
             }),
             Ok(text) => build(&text, &format!("file {}", path.display())),
         },
-        Source::BuiltIn => load_built_in(),
+        Origin::BuiltIn => load_built_in(),
     }
 }
 
@@ -653,22 +684,73 @@ fn build(text: &str, origin: &str) -> Result<Loaded, RegistryError> {
     }
     report_unknown_keys(&doc);
 
+    let sources = source_assignments(&doc.sources)?;
     let mut rows = Vec::with_capacity(doc.feeds.len());
     for row in &doc.feeds {
-        rows.push(feed_from(row)?);
+        rows.push(feed_from(row, sources)?);
     }
     check_cross_row_invariants(&rows)?;
 
     Ok(Loaded {
         rows: Box::leak(rows.into_boxed_slice()),
+        sources,
         origin: origin.to_string(),
         version: doc.version,
     })
 }
 
+/// Names `sources::source_label` synthesizes for an unassigned Source ID, so a block may not claim
+/// one.
+fn reserved(name: &str) -> bool {
+    name == "UNREGISTERED"
+        || name
+            .strip_prefix("SOURCE_")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Validate and leak the document's `sources` block, or `None` if it carried none.
+///
+/// Leaked like every other `'static` field a document produces, so a resolved name stays a
+/// `&'static str` all the way to the metric labels and the wire.
+fn source_assignments(
+    rows: &[SourceRow],
+) -> Result<Option<&'static [SourceAssignment]>, RegistryError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut out: Vec<SourceAssignment> = Vec::with_capacity(rows.len());
+    for r in rows {
+        // `0` is the wire's "names no registry row" sentinel (see `NormalizedQuote::source_id`), and
+        // `SOURCE_<id>`/`UNREGISTERED` are the labels `sources::source_label` synthesizes for an id
+        // this block does not assign — a row claiming either collides with an unregistered source in
+        // the arbiter's `(venue, symbol)` dedup key, the collision `DuplicateSource` refuses one
+        // level in.
+        if r.id == 0 || r.name.is_empty() || r.name != r.name.to_uppercase() || reserved(&r.name) {
+            return Err(RegistryError::BadSourceName {
+                id: r.id,
+                name: r.name.clone(),
+            });
+        }
+        if out.iter().any(|a| a.id == r.id || a.name == r.name) {
+            return Err(RegistryError::DuplicateSource {
+                id: r.id,
+                name: r.name.clone(),
+            });
+        }
+        out.push(SourceAssignment {
+            id: r.id,
+            name: leak(&r.name),
+        });
+    }
+    Ok(Some(Box::leak(out.into_boxed_slice())))
+}
+
 /// Walk the document warning about every key the schema did not claim.
 fn report_unknown_keys(doc: &Document) {
     warn_unknown("$", &doc.unknown);
+    for (i, s) in doc.sources.iter().enumerate() {
+        warn_unknown(&format!("$.sources[{i}]"), &s.unknown);
+    }
     for (i, row) in doc.feeds.iter().enumerate() {
         let at = format!("$.feeds[{i}]");
         warn_unknown(&at, &row.unknown);
@@ -707,10 +789,10 @@ fn report_unknown_keys(doc: &Document) {
 /// How many ports one publisher of this protocol binds.
 ///
 /// A real property of the protocols rather than a convention: market-by-order and market-by-price
-/// recover their books from an **in-band snapshot stream** on a dedicated port, and top-of-book and
-/// midpoint have no such stream — which is why the `5xxxx` slot is left unallocated for them rather
+/// recover their books from an **in-band snapshot feed** on a dedicated port, and top-of-book and
+/// midpoint have no such feed — which is why the `5xxxx` slot is left unallocated for them rather
 /// than reused, so the leading digit keeps naming the traffic class.
-fn planes_for(kind: FeedKind) -> u8 {
+fn port_roles_for(kind: FeedKind) -> u8 {
     match kind {
         FeedKind::TopOfBook | FeedKind::Midpoint => 2,
         FeedKind::MarketByOrder | FeedKind::MarketByPrice => 3,
@@ -769,7 +851,7 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
         // agree on, since the key is filed under the *wire* venue and the row's venue can differ.
         // That is exact only while one venue's rows own the category: two Market-by-Order rows on
         // different venues, served by one publisher host, would have each exit release the other's
-        // live arms, and a recovering arm can then wipe a book a healthy peer is serving.
+        // live paths, and a recovering path can then wipe a book a healthy peer is serving.
         if f.kind == FeedKind::MarketByOrder {
             match mbo_categories.entry(f.category) {
                 std::collections::hash_map::Entry::Occupied(e) if *e.get() != f.venue => {
@@ -785,22 +867,22 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
             }
         }
 
-        let expected_planes = planes_for(f.kind);
+        let expected_roles = port_roles_for(f.kind);
         for p in f.publishers {
-            // The plane count is a property of the protocol, so a block that does not match it is a
+            // The port-role count is a property of the protocol, so a block that does not match it is a
             // wrong block. This is also what keeps a *typo* in an optional key from failing silently:
             // with no `deny_unknown_fields`, a misspelled `snapshot` is absorbed into the unknown map
             // and the block quietly becomes two-port — a market-by-price row that then binds no
             // snapshot socket, never syncs its book, and serves nothing while reading healthy. That
             // is the exact silent failure this registry exists to eliminate, so it dies at startup.
             let found = if p.ports.snapshot().is_some() { 3 } else { 2 };
-            if found != expected_planes {
+            if found != expected_roles {
                 return Err(RegistryError::PortShape {
                     venue: f.venue.to_string(),
                     category: f.category.to_string(),
                     kind: f.kind.label(),
                     base_port: p.base_port(),
-                    expected: expected_planes,
+                    expected: expected_roles,
                     found,
                 });
             }
@@ -826,7 +908,10 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     Ok(())
 }
 
-fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
+fn feed_from(
+    row: &FeedRow,
+    sources: Option<&'static [SourceAssignment]>,
+) -> Result<Feed, RegistryError> {
     for (field, value) in [
         ("venue", &row.venue),
         ("category", &row.category),
@@ -839,24 +924,19 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
             });
         }
     }
-    // A venue `source_id_of` does not resolve is dropped by `receiver::record_revealed`, so its
-    // `status` stream goes unrecorded — a row that ingests but never reports. But resolvability
-    // alone is not enough: `source_id_of` deliberately also accepts a legacy alias for one Source
-    // ID (see the codename constant in `sources.rs`), and only the canonical name ever reaches the
-    // wire. A document naming the alias would validate here and then split every place downstream
-    // that keys on the venue string — `main.rs` sets the arbitration mode under the alias while
-    // `arbiter.rs` reads it under the canonical name and falls back to `Coordinated`, dropping the
-    // tape gate; `forget_departing_channel`'s purge never matches; and `--feed <canonical>` selects
-    // nothing. So the venue must round-trip through the canonical name, not merely resolve.
-    match sources::source_id_of(&row.venue).and_then(sources::source_name) {
-        Some(canonical) if canonical == row.venue => {}
-        Some(canonical) => {
-            return Err(RegistryError::NonCanonicalVenue {
-                venue: row.venue.clone(),
-                canonical,
-            })
-        }
-        None => return Err(RegistryError::UnknownVenue(row.venue.clone())),
+    // A venue that resolves to no Source ID is dropped by `receiver::record_revealed`, so its
+    // `status` feed goes unrecorded — a row that ingests but never reports. Checked against **this
+    // document's own** `sources` block, falling back to the compiled-in table only when it carries
+    // none: the document supplies the mapping now rather than being validated against code, so a
+    // row and the block that names its venue always travel together. Resolution is exact, so a
+    // near-miss spelling is refused here rather than splitting every downstream lookup that keys on
+    // the venue string (arbitration mode, the channel-filter purge, `--feed` selection).
+    let resolves = match sources {
+        Some(a) => a.iter().any(|s| s.name == row.venue),
+        None => sources::source_id_of(&row.venue).is_some(),
+    };
+    if !resolves {
+        return Err(RegistryError::UnknownVenue(row.venue.clone()));
     }
 
     // Row-level: which mirror scheme (if any) a deployment runs is a property of the feed, not of
@@ -870,8 +950,8 @@ fn feed_from(row: &FeedRow) -> Result<Feed, RegistryError> {
     };
 
     // A row with no publishers binds nothing and serves nothing, but validates cleanly and reads
-    // healthy — the desired feed set is simply empty. `Derived` already refuses an empty roster
-    // (`EmptyRoster`, above), but `explicit` had no equivalent check; this catches both shapes,
+    // healthy — the desired feed set is simply empty. `Derived` already refuses an empty published set
+    // (`EmptyPublishedSet`, above), but `explicit` had no equivalent check; this catches both shapes,
     // whichever produced the empty list.
     if publishers.is_empty() {
         return Err(RegistryError::EmptyPublishers {
@@ -927,22 +1007,23 @@ fn ports(mktdata: u16, refdata: u16, snapshot: Option<u16>) -> FeedPorts {
     }
 }
 
-/// Expand a derived roster into one [`FeedPublisher`] per channel, ascending.
+/// Expand a derived published set into one [`FeedPublisher`] per channel, ascending.
 ///
 /// A channel is an independent state machine (its own `Reset Count`, sequence series, manifest seq
 /// and snapshot cycle), so one channel is one receiver task with its own processor state and books
-/// — the same shape a mirrored publisher already has. Ports are `base + id` on every plane, which
+/// — the same shape a mirrored publisher already has. Ports are `base + id` on every port role,
+/// which
 /// is the arithmetic the publisher itself asserts; a subscriber that computes it differently joins
 /// the right group and hears silence.
 fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryError> {
-    let entries = roster_entries(row, &d.channels)?;
+    let entries = published_set_entries(row, &d.channels)?;
     let p = &d.ports;
     entries
         .iter()
         .map(|e| {
             let id = e.id;
             let off = u16::from(id);
-            let plane = |base: u16| {
+            let role = |base: u16| {
                 base.checked_add(off).ok_or(RegistryError::PortOverflow {
                     venue: row.venue.clone(),
                     base,
@@ -951,9 +1032,9 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
             };
             Ok(FeedPublisher {
                 ports: ports(
-                    plane(p.mktdata)?,
-                    plane(p.refdata)?,
-                    p.snapshot.map(plane).transpose()?,
+                    role(p.mktdata)?,
+                    role(p.refdata)?,
+                    p.snapshot.map(role).transpose()?,
                 ),
                 // Recorded, not recomputed downstream: this is the one place the id and the block
                 // are both in hand, and it is what lets the channel filter decline a channel by
@@ -967,9 +1048,9 @@ fn expand(row: &FeedRow, d: &Derived) -> Result<Vec<FeedPublisher>, RegistryErro
         .collect()
 }
 
-/// One resolved roster id, with its label if the document supplied one (always `None` for an id
-/// that came from a `range` — see [`ChannelSpec`]).
-struct RosterEntry {
+/// One published set id, with its label if the document supplied one (always `None` for an id that
+/// came from a `range` — see [`ChannelSpec`]).
+struct PublishedSetEntry {
     id: u8,
     label: Option<String>,
 }
@@ -977,7 +1058,7 @@ struct RosterEntry {
 /// Flatten ranges and singletons into a deduped, ascending list of ids with their labels.
 ///
 /// Deduped rather than rejected on repeat: the same id reaching the expander twice would produce two
-/// publishers on one port block, and the roster is a human-edited list where a singleton overlapping
+/// publishers on one port block, and the published set is a human-edited list where a singleton overlapping
 /// a range is a plausible edit, not a corrupt document. The dedup is **reported** rather than
 /// swallowed — silently accepting it would hide the one case where it is not benign, an author who
 /// wrote the id twice meaning two different channels and got one.
@@ -986,10 +1067,10 @@ struct RosterEntry {
 /// singleton's label seen earlier or later for the same id) — dedup is about the id, not about
 /// picking a winning label, and the ordering is document order via a stable merge rather than an
 /// artifact of sort order.
-fn roster_entries(
+fn published_set_entries(
     row: &FeedRow,
     channels: &[ChannelSpec],
-) -> Result<Vec<RosterEntry>, RegistryError> {
+) -> Result<Vec<PublishedSetEntry>, RegistryError> {
     let mut merged: std::collections::BTreeMap<u8, Option<String>> =
         std::collections::BTreeMap::new();
     let mut listed = 0usize;
@@ -1016,7 +1097,7 @@ fn roster_entries(
                 merged
                     .entry(*id)
                     .and_modify(|existing| match (existing.as_deref(), label.as_deref()) {
-                        // Two labels for one id: the roster disagrees with itself about what this
+                        // Two labels for one id: the published set disagrees with itself about what this
                         // channel is called. Keeping the first silently would show an operator a
                         // name the document does not unambiguously assign — and the duplicate-id
                         // case already warns, so saying nothing here is the inconsistent choice.
@@ -1043,18 +1124,18 @@ fn roster_entries(
             category = row.category,
             listed,
             distinct,
-            "feed registry: channel roster repeats ids; the duplicates were collapsed"
+            "feed registry: the published set repeats channel ids; the duplicates were collapsed"
         );
     }
     if merged.is_empty() {
-        return Err(RegistryError::EmptyRoster {
+        return Err(RegistryError::EmptyPublishedSet {
             venue: row.venue.clone(),
             category: row.category.clone(),
         });
     }
     Ok(merged
         .into_iter()
-        .map(|(id, label)| RosterEntry { id, label })
+        .map(|(id, label)| PublishedSetEntry { id, label })
         .collect())
 }
 
@@ -1063,9 +1144,10 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
-/// The sports channel roster, read from the **document** rather than from the expanded rows.
+/// The sports row's published set of channels, read from the **document** rather than from the
+/// expanded rows.
 ///
-/// A test helper, not a source of truth: reading the document is what lets the port tests assert
+/// A test helper, not the authority: reading the document is what lets the port tests assert
 /// the `base + id` derivation instead of merely echoing whatever the expander produced.
 #[cfg(test)]
 pub(crate) fn sports_channel_ids() -> Vec<u8> {
@@ -1076,19 +1158,19 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
         .find(|f| f.category == "sports")
         .expect("built-in document has no sports row");
     match &row.publishers {
-        Publishers::Derived(d) => roster_entries(row, &d.channels)
-            .expect("sports roster")
+        Publishers::Derived(d) => published_set_entries(row, &d.channels)
+            .expect("sports published set")
             .into_iter()
             .map(|e| e.id)
             .collect(),
-        Publishers::Explicit(_) => panic!("the sports row must carry a derived roster"),
+        Publishers::Explicit(_) => panic!("the sports row must carry a derived published set"),
     }
 }
 
 /// Parse a single feed row (wrapped in a one-row document) and return the resulting [`Feed`].
 ///
 /// A cross-module test helper: `processor.rs`'s mirror tests want a `Feed::mirror_offset` that
-/// actually came from parsing a document — not one poked directly onto a hand-built `FrameCtx` —
+/// actually came from parsing a document — not one poked directly onto a hand-built `DatagramCtx` —
 /// so the registry's own parsing is what is under test, exactly like the live defect was.
 #[cfg(test)]
 pub(crate) fn parse_one_row(feed_json: &str) -> Feed {
@@ -1166,7 +1248,7 @@ mod tests {
         assert!(!loaded.rows.is_empty());
     }
 
-    /// Ranges and singletons flatten to one ascending, deduped list, and every plane is offset by
+    /// Ranges and singletons flatten to one ascending, deduped list, and every port role is offset by
     /// the id — the property the whole derived form exists for.
     #[test]
     fn derived_rows_expand_to_base_plus_id() {
@@ -1288,9 +1370,10 @@ mod tests {
         );
     }
 
-    /// No snapshot base means a two-port block, not a snapshot plane silently aliased onto another.
+    /// No snapshot base means a two-port block, not a snapshot port role silently aliased onto
+    /// another.
     ///
-    /// On a **top-of-book** row, because that is the protocol the two-plane shape is legal for — the
+    /// On a **top-of-book** row, because that is the protocol the two-role shape is legal for — the
     /// derived form has to support it for the sibling row that arrives with its own publisher.
     #[test]
     fn a_derived_row_without_a_snapshot_base_binds_two_ports() {
@@ -1347,7 +1430,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_url_document_falls_back() {
         let url = serve("this is not json").await;
-        let loaded = load(Source::Url(url))
+        let loaded = load(Origin::Url(url))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1358,7 +1441,7 @@ mod tests {
     #[tokio::test]
     async fn a_future_version_from_a_url_falls_back() {
         let url = serve(r#"{"version":99,"feeds":[]}"#).await;
-        let loaded = load(Source::Url(url))
+        let loaded = load(Origin::Url(url))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1368,7 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_url_document_falls_back() {
         let url = serve(r#"{"version":1,"feeds":[]}"#).await;
-        let loaded = load(Source::Url(url))
+        let loaded = load(Origin::Url(url))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1384,40 +1467,40 @@ mod tests {
                 "publishers":{"explicit":[{"mktdata":9201,"refdata":9202}]}}]}"#,
         )
         .await;
-        let loaded = load(Source::Url(url)).await.expect("valid document");
+        let loaded = load(Origin::Url(url)).await.expect("valid document");
         assert!(loaded.origin().starts_with("url "), "{}", loaded.origin());
         assert_eq!(loaded.rows.len(), 1);
     }
 
     /// A bind-mounted file is an operator's explicit instruction about this one container, so a
-    /// wrong one must **not** run — the asymmetry with the URL source is the whole point.
+    /// wrong one must **not** run — the asymmetry with the URL origin is the whole point.
     #[tokio::test]
     async fn an_unparseable_file_document_is_fatal() {
         let path = std::env::temp_dir().join("dz-registry-bad.json");
         std::fs::write(&path, "this is not json").unwrap();
-        let err = load(Source::File(path.clone())).await;
+        let err = load(Origin::File(path.clone())).await;
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, Err(RegistryError::Parse(_))));
     }
 
     /// A file that cannot be *read* is fatal, like the parse errors beside it — it is an operator's
     /// explicit instruction about this one container (an unmounted volume, a typo'd path), and must
-    /// not silently start on the built-in copy the way the `Url` source does.
+    /// not silently start on the built-in copy the way the `Url` origin does.
     #[tokio::test]
     async fn an_unreadable_file_is_fatal() {
-        let err = load(Source::File(PathBuf::from("/nonexistent/registry.json")))
+        let err = load(Origin::File(PathBuf::from("/nonexistent/registry.json")))
             .await
             .map(|_| ())
             .expect_err("an unreadable file must not fall back");
         assert!(matches!(err, RegistryError::ReadFailed { .. }), "{err:?}");
     }
 
-    /// The `Url` source's degrade-on-failure behavior is unchanged: a fetch failure (as opposed to
+    /// The `Url` origin's degrade-on-failure behavior is unchanged: a fetch failure (as opposed to
     /// the file case above, now fatal) still falls back to the built-in document.
     #[tokio::test]
     async fn an_unreachable_url_still_falls_back() {
         // Nothing listens on this loopback port: the connection is refused.
-        let loaded = load(Source::Url("http://127.0.0.1:1".to_string()))
+        let loaded = load(Origin::Url("http://127.0.0.1:1".to_string()))
             .await
             .expect("fallback, not an error");
         assert_fell_back(&loaded);
@@ -1457,11 +1540,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_roster_is_fatal() {
+    fn an_empty_published_set_is_fatal() {
         let row = SPORTS_ROW.replace(r#"{"range":[10,12]},{"id":49}"#, "");
         assert!(matches!(
             build(&doc_with(&row), "test"),
-            Err(RegistryError::EmptyRoster { .. })
+            Err(RegistryError::EmptyPublishedSet { .. })
         ));
     }
 
@@ -1500,7 +1583,7 @@ mod tests {
 
     /// A singleton that also falls inside a range yields one publisher, not two on one port block.
     #[test]
-    fn overlapping_roster_entries_dedup() {
+    fn overlapping_published_set_entries_dedup() {
         let row = SPORTS_ROW.replace(r#"{"id":49}"#, r#"{"id":11}"#);
         let loaded = build(&doc_with(&row), "test").unwrap();
         assert_eq!(loaded.rows[0].publishers.len(), 3);
@@ -1510,10 +1593,10 @@ mod tests {
     // Channel labels
     // ---------------------------------------------------------------------------------------
 
-    /// A single-channel roster entry may carry a `label`; a sibling entry with none must report the
-    /// field **absent**, not `null` — the field is display-only and its absence is the normal case
-    /// (the built-in document ships with none at all), so a spurious `null` would be a regression a
-    /// bare "no error" check could not catch.
+    /// A single-channel published-set entry may carry a `label`; a sibling entry with none must
+    /// report the field **absent**, not `null` — the field is display-only and its absence is the
+    /// normal case (the built-in document ships with none at all), so a spurious `null` would be a
+    /// regression a bare "no error" check could not catch.
     #[test]
     fn a_channel_label_is_carried_and_an_unlabelled_sibling_has_none() {
         let row = SPORTS_ROW.replace(r#"{"id":49}"#, r#"{"id":49,"label":"sports.catchall"}"#);
@@ -1529,7 +1612,7 @@ mod tests {
         assert_eq!(
             by_channel(10).label,
             None,
-            "an unlabelled roster entry must carry no label, not an empty one"
+            "an unlabelled published set entry must carry no label, not an empty one"
         );
     }
 
@@ -1601,7 +1684,7 @@ mod tests {
 
     /// Two venues' Market-by-Order rows must not share a `category`. A departing receiver releases
     /// its publishers' book standing by category — the one scope it and the `MarketKey` provably
-    /// agree on — so each venue's exit would release the other's live arms, and a recovering arm can
+    /// agree on — so each venue's exit would release the other's live paths, and a recovering path can
     /// then wipe a book a healthy peer is serving. Nothing downstream notices; the invariant is the
     /// only thing that says so, and it is written where whoever adds the second row will read it.
     #[test]
@@ -1682,7 +1765,7 @@ mod tests {
         ));
     }
 
-    /// And the same typo the other way: a top-of-book row carries no in-band snapshot stream, so a
+    /// And the same typo the other way: a top-of-book row carries no in-band snapshot feed, so a
     /// third port would bind a socket the protocol never fills.
     #[test]
     fn a_top_of_book_row_with_a_snapshot_port_is_fatal() {
@@ -1711,40 +1794,163 @@ mod tests {
 
     #[test]
     fn flags_resolve_in_precedence_order() {
-        assert!(matches!(Source::from_flags("", ""), Source::BuiltIn));
-        assert!(matches!(Source::from_flags("", "/p"), Source::File(_)));
+        assert!(matches!(Origin::from_flags("", ""), Origin::BuiltIn));
+        assert!(matches!(Origin::from_flags("", "/p"), Origin::File(_)));
         assert!(matches!(
-            Source::from_flags("http://x", "/p"),
-            Source::Url(_)
+            Origin::from_flags("http://x", "/p"),
+            Origin::Url(_)
         ));
     }
 
     // ---------------------------------------------------------------------------------------
-    // Venue canonicality
+    // Venue resolution
     // ---------------------------------------------------------------------------------------
 
-    /// `source_id_of` deliberately still resolves the legacy pre-launch codename for one Source ID
-    /// (only its registry name is ever emitted), so a document naming the alias specifically —
-    /// not merely an unresolvable venue — must be what this test exercises; a wrong-but-unresolvable
-    /// venue would already be caught by `UnknownVenue` and would pass against the old code too.
+    /// The retired pre-launch codename now resolves to nothing, so a document still naming it is
+    /// refused outright rather than validating and then splitting every downstream lookup that keys
+    /// on the venue string.
     #[test]
-    fn a_legacy_venue_alias_is_fatal() {
+    fn the_retired_venue_codename_is_fatal() {
         let row = PERPS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"LASHAY""#);
         assert!(matches!(
             build(&doc_with(&row), "test"),
-            Err(RegistryError::NonCanonicalVenue {
-                canonical: "KALSHI",
-                ..
-            })
+            Err(RegistryError::UnknownVenue(v)) if v == "LASHAY"
         ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The `sources` block
+    // ---------------------------------------------------------------------------------------
+
+    /// Build a document carrying an explicit `sources` block.
+    fn doc_with_sources(sources: &str, feeds: &str) -> String {
+        format!(r#"{{"version":1,"sources":[{sources}],"feeds":[{feeds}]}}"#)
+    }
+
+    /// The point of moving the mapping into the document: a venue the compiled-in table has never
+    /// heard of resolves because the block assigns it, with no code change and no version bump.
+    #[test]
+    fn a_source_the_document_assigns_resolves_without_a_code_change() {
+        let row = SPORTS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"NEWVENUE""#);
+        let loaded = build(
+            &doc_with_sources(r#"{"id":9,"name":"NEWVENUE"}"#, &row),
+            "test",
+        )
+        .expect("a document that assigns its own venue must load");
+        assert_eq!(
+            loaded.sources.expect("the block must be installed"),
+            &[SourceAssignment {
+                id: 9,
+                name: "NEWVENUE"
+            }]
+        );
+        assert!(sources::source_id_of("NEWVENUE").is_none(), "not installed");
+    }
+
+    /// A document with no block is legal (adding it bumps no `SUPPORTED_VERSION`), so its rows are
+    /// validated against the compiled-in table and nothing is installed over it. The hosted document
+    /// will take exactly this path until it is republished.
+    #[test]
+    fn a_document_with_no_sources_block_falls_back_to_the_compiled_in_table() {
+        let loaded = build(&doc_with(SPORTS_ROW), "test").expect("legal without the block");
+        assert!(loaded.sources.is_none());
+        assert_eq!(sources::source_id_of("KALSHI"), Some(3));
+    }
+
+    /// The validation inverts with the mapping: once a document carries the block, a `venue` that
+    /// block does not assign is refused even if the compiled-in table would have resolved it.
+    #[test]
+    fn a_venue_the_block_does_not_assign_is_fatal() {
+        assert!(matches!(
+            build(&doc_with_sources(r#"{"id":1,"name":"HYPERLIQUID"}"#, SPORTS_ROW), "test"),
+            Err(RegistryError::UnknownVenue(v)) if v == "KALSHI"
+        ));
+    }
+
+    /// A name that is not the uppercase form consumers see is refused: it is emitted verbatim as
+    /// `venue` and as every `venue=` metric label value, so a lowercase row would split a consumer's
+    /// `SOURCE:SYMBOL` join against the same upstream source seen from another host.
+    #[test]
+    fn a_non_uppercase_source_name_is_fatal() {
+        assert!(matches!(
+            build(
+                &doc_with_sources(r#"{"id":3,"name":"Kalshi"}"#, SPORTS_ROW),
+                "test"
+            ),
+            Err(RegistryError::BadSourceName { id: 3, .. })
+        ));
+    }
+
+    /// Two rows sharing an id or a name would collapse two sources to one identity, and the arbiter
+    /// keys dedup on `(venue, symbol)` — unrelated markets would merge into one bucket.
+    #[test]
+    fn a_duplicate_source_id_or_name_is_fatal() {
+        for block in [
+            r#"{"id":3,"name":"KALSHI"},{"id":3,"name":"OTHER"}"#,
+            r#"{"id":3,"name":"KALSHI"},{"id":4,"name":"KALSHI"}"#,
+        ] {
+            assert!(
+                matches!(
+                    build(&doc_with_sources(block, SPORTS_ROW), "test"),
+                    Err(RegistryError::DuplicateSource { .. })
+                ),
+                "{block}"
+            );
+        }
+    }
+
+    /// The synthesized-label namespace and the `0` sentinel are reserved: a block claiming either
+    /// would collapse an assigned source with an unregistered one in the arbiter's `(venue, symbol)`
+    /// dedup key, merging unrelated markets.
+    #[test]
+    fn a_reserved_source_name_or_a_zero_id_is_fatal() {
+        for block in [
+            r#"{"id":3,"name":"SOURCE_7"}"#,
+            r#"{"id":3,"name":"UNREGISTERED"}"#,
+            r#"{"id":0,"name":"KALSHI"}"#,
+        ] {
+            assert!(
+                matches!(
+                    build(&doc_with_sources(block, SPORTS_ROW), "test"),
+                    Err(RegistryError::BadSourceName { .. })
+                ),
+                "{block}"
+            );
+        }
+        // `SOURCE_` with a non-numeric tail is an ordinary name, not a synthesized label.
+        let row = SPORTS_ROW.replace(r#""venue":"KALSHI""#, r#""venue":"SOURCE_OF_TRADES""#);
+        assert!(build(
+            &doc_with_sources(r#"{"id":3,"name":"SOURCE_OF_TRADES"}"#, &row),
+            "test"
+        )
+        .is_ok());
+    }
+
+    /// A malformed block under a `Url` origin degrades to the built-in document like every other
+    /// rejection there, rather than killing a fleet at its next reschedule.
+    #[tokio::test]
+    async fn a_url_document_with_a_bad_sources_block_degrades() {
+        let url = serve(
+            r#"{"version":1,"sources":[{"id":3,"name":"kalshi"}],
+                "feeds":[{"venue":"KALSHI","category":"perps","code":"d","kind":"TopOfBook",
+                "group":"233.84.178.3","emit_trades":true,"arbitration":"Sticky",
+                "publishers":{"explicit":[{"mktdata":7576,"refdata":7577}]}}]}"#,
+        )
+        .await;
+        let loaded = load(Origin::Url(url)).await.expect("must degrade, not die");
+        assert!(
+            loaded.origin().starts_with("built-in ("),
+            "{}",
+            loaded.origin()
+        );
     }
 
     // ---------------------------------------------------------------------------------------
     // Empty publisher lists
     // ---------------------------------------------------------------------------------------
 
-    /// An empty `explicit` list has no roster to reject the way `derived` does (see
-    /// `an_empty_roster_is_fatal` above, which covers the derived shape) — it must be checked on
+    /// An empty `explicit` list has no published set to reject the way `derived` does (see
+    /// `an_empty_published_set_is_fatal` above, which covers the derived shape) — it must be checked on
     /// the resulting publisher list itself, whichever shape produced it.
     #[test]
     fn an_empty_explicit_publisher_list_is_fatal() {

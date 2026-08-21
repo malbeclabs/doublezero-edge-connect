@@ -37,7 +37,7 @@ pub const TRADE_RING: usize = 1_000;
 /// `MAX_PRODUCTS * TRADE_RING * size_of::<Print>()` is 8,192 * 1,000 * 24 B = 187.5 MiB.
 ///
 /// 1,024 was sized against nothing in particular and sat below even one real venue: a single
-/// perps venue alone carries on the order of 1,300 live markets (`ingest::public_feeder`'s own
+/// perps venue alone carries on the order of 1,300 live markets (`ingest::public_input`'s own
 /// `instrument_known` doc), so that venue *alone* was already thrashing this cap before a second
 /// feed's channels were counted. Raised 8x to 8,192 — proportionate to a handful of concurrently
 /// admitted venues/channels rather than to the sports feed's own tens-of-thousands universe, which
@@ -76,7 +76,7 @@ const BYTES_PER_BUCKET: usize = 93;
 pub struct Key {
     pub source_id: u16,
     pub category: Arc<str>,
-    pub channel: u32,
+    pub channel: u8,
     pub instrument_id: u32,
 }
 
@@ -243,7 +243,7 @@ impl Store {
         self.products.is_empty()
     }
 
-    /// Whether the store currently tracks `key` at all — the single source of truth
+    /// Whether the store currently tracks `key` at all — the single authority
     /// [`Retention::held`] reports. `true` even for a product whose current window is empty (it
     /// stopped trading within the hour, or simply hasn't yet); `false` for one this store has never
     /// seen, or has evicted for capacity. See [`Retention::held`]'s doc for why this distinction
@@ -302,7 +302,7 @@ impl Store {
     /// occupancy to this one). Used by the `/v1/status` `channels` block to answer, per channel,
     /// "how much of the store does an admitted channel actually hold" — the number that turns a
     /// flat RSS reading into an answer to "is my channel filter narrow enough."
-    pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
+    pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u8) -> usize {
         self.products
             .keys()
             .filter(|k| k.source_id == source_id && k.category == *category && k.channel == channel)
@@ -553,7 +553,7 @@ impl Store {
     ///
     /// Keeps `buckets_total` in step (subtracting exactly the removed products' own bucket counts),
     /// the same discipline every other removal path in this module follows — see that field's doc.
-    pub fn forget_channel(&mut self, source_id: u16, category: &Arc<str>, channel: u32) -> usize {
+    pub fn forget_channel(&mut self, source_id: u16, category: &Arc<str>, channel: u8) -> usize {
         let doomed: Vec<Key> = self
             .products
             .keys()
@@ -1280,7 +1280,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------------
-    // stats / products_for — the `/v1/status` `history` and `channels` blocks' data source
+    // stats / products_for — the `/v1/status` `history` and `channels` blocks' backing data
     // -------------------------------------------------------------------------------------------
 
     /// The signal an over-wide channel filter produces is products at cap with a rising eviction count —

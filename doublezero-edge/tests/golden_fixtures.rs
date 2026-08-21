@@ -1,5 +1,5 @@
 //! Golden-fixture tests over committed sample response bodies — the `tests/codec_*_fixtures.rs`
-//! convention, applied to this crate's JSON responses instead of binary wire frames: parse a
+//! convention, applied to this crate's JSON responses instead of binary wire datagrams: parse a
 //! recorded body, render it, assert the output.
 //!
 //! There is no live edge-connect container to record these fixtures from in this crate's own test
@@ -26,11 +26,11 @@ fn products_list_renders_a_row_per_product() {
     let body = fixture("products_list.json");
     let out = render::render_table(Endpoint::ProductsList, &body).unwrap();
     let expected = "\
-PRODUCT_ID                        SOURCE       STATUS   FEED_KIND        PRICE_INCR  BASE_INCR
+PRODUCT_ID                        SOURCE_NAME  STATUS   FEED_KIND        PRICE_INCR  BASE_INCR
 --------------------------------  -----------  -------  ---------------  ----------  ---------
 HYPERLIQUID:BTC                   Hyperliquid  online   top_of_book      0.01        0.00001
 HYPERLIQUID:ETH                   Hyperliquid  offline  top_of_book      0.001       0.0001
-LASHAY:EAVE-27JAN01-YES#120.1165  Lashay       online   market_by_price  0.01        1";
+KALSHI:EAVE-27JAN01-YES#120.1165  Kalshi       online   market_by_price  0.01        1";
     assert_eq!(
         out, expected,
         "\n--- actual ---\n{out}\n--- expected ---\n{expected}"
@@ -45,7 +45,7 @@ fn product_get_renders_as_a_field_value_table() {
 FIELD            VALUE
 ---------------  ---------------
 product_id       HYPERLIQUID:BTC
-source           Hyperliquid
+source_name      Hyperliquid
 symbol           BTC
 channel          0
 instrument_id    41
@@ -132,7 +132,7 @@ fn status_table_lists_venues_and_the_history_summary() {
 fn status_table_shows_the_channels_block_with_the_servers_label() {
     let body = fixture("status.json");
     let out = render::render_table(Endpoint::Status, &body).unwrap();
-    assert!(out.contains("lashay-4"), "{out}");
+    assert!(out.contains("edge-kalshi-sports-mbp"), "{out}");
     assert!(out.contains("sports.nfl"), "{out}");
     assert!(out.contains("412"), "{out}");
     assert!(
@@ -177,4 +177,47 @@ fn an_error_envelope_round_trips_through_json_output_untouched() {
     let reparsed: Value = serde_json::from_str(&printed).unwrap();
     assert_eq!(reparsed, body);
     assert_eq!(reparsed["candidates"].as_array().unwrap().len(), 2);
+}
+
+// -------------------------------------------------------------------------------------------
+// The `source` -> `source_name` / `registry.source` -> `registry.origin` rename: this CLI is
+// installed independently of the container it queries, so one build must render either
+// generation's body identically (`types.rs`'s deserialize-side `serde(alias)`).
+// -------------------------------------------------------------------------------------------
+
+/// Three server generations, one rendering. The middle fixture is the shape **this release's**
+/// bridge serves — both keys, identical value, so a pre-rename CLI still parses `/v1/products`. That
+/// is the shape a `#[serde(alias)]` would reject as a duplicate field, failing the whole response on
+/// the very pairing `scripts/connect.sh` produces.
+#[test]
+fn a_product_list_renders_the_same_from_every_server_generation() {
+    let new = render::render_table(Endpoint::ProductsList, &fixture("products_list.json")).unwrap();
+    let old = render::render_table(
+        Endpoint::ProductsList,
+        &fixture("products_list_legacy_source.json"),
+    )
+    .unwrap();
+    let both = render::render_table(
+        Endpoint::ProductsList,
+        &fixture("products_list_both_keys.json"),
+    )
+    .unwrap();
+    assert!(new.contains("Hyperliquid"), "{new}");
+    assert_eq!(old, new, "\n--- old server ---\n{old}\n--- new ---\n{new}");
+    assert_eq!(both, new, "\n--- both keys ---\n{both}\n--- new ---\n{new}");
+}
+
+#[test]
+fn the_registry_line_renders_the_same_from_either_server_generation() {
+    let new = render::render_table(Endpoint::Status, &fixture("status_registry.json")).unwrap();
+    let old = render::render_table(
+        Endpoint::Status,
+        &fixture("status_registry_legacy_source.json"),
+    )
+    .unwrap();
+    assert!(
+        new.contains("registry: origin=url https://get.doublezero.xyz"),
+        "{new}"
+    );
+    assert_eq!(old, new, "\n--- old server ---\n{old}\n--- new ---\n{new}");
 }

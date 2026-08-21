@@ -1,15 +1,15 @@
-//! Phoenix **public-API** WebSocket trade feeder — a [`PublicVenue`] backstop for the edge Phoenix
-//! multicast TRADE stream, off by default.
+//! Phoenix **public-API** WebSocket trade input — a [`PublicVenue`] backstop for the edge Phoenix
+//! multicast TRADE feed, off by default.
 //!
 //! It connects to Phoenix's public `wss://perp-api.phoenix.trade/v1/ws`, subscribes the `trades`
 //! channel per configured market, decodes each fill into a `NormalizedTrade`, and emits it through
-//! the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. The arbiter dedups trades
+//! the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. The arbiter dedups trades
 //! per `(venue, symbol)` on `trade_id` (= the public `tradeSequenceNumber`), so a public trade races
 //! the edge copy and only fills in when the edge gaps — no arbiter change needed.
 //!
 //! **Trades only.** We deliberately do NOT emit quotes: the edge Quote is a spline-blended BBO, while
 //! Phoenix's public orderbook channel is resting-only — a different quantity. A BBO backstop is
-//! deferred until a comparable public blended source is identified.
+//! deferred until a comparable public blended feed is identified.
 //!
 //! Validated against a concurrent edge+public capture (2026-06-30, `edge-pcaps/phoenix-capture-20260630`),
 //! on the 257 fills shared by both feeds: the public `tradeSequenceNumber` equals the edge on-chain
@@ -18,7 +18,7 @@
 //! `bid -> buy` / `ask -> sell`; and the fill's `baseAmount` (size) and `quoteAmount / baseAmount`
 //! (price) equal the edge's size and trade price (every shared fill had `numFills == 1`). So a public
 //! fill tagged `(venue="PHOENIX", symbol, trade_id)` lines up 1:1 with the edge copy and dedups. No
-//! `FEEDS` row depends on this feeder; it stays off until explicitly enabled with
+//! `FEEDS` row depends on this input; it stays off until explicitly enabled with
 //! `--phoenix-ws-input-markets`.
 
 use std::collections::BTreeSet;
@@ -27,8 +27,8 @@ use serde::Deserialize;
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, finite_non_negative, resolve_instrument, PublicVenue},
+        arbiter::{lock, SharedArbiter, Transport},
+        public_input::{self, finite_non_negative, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
@@ -60,7 +60,7 @@ fn phoenix_venue() -> &'static str {
 /// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
 /// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
 /// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
-/// backstop its own universe rather than another arm of the same one, and the gate would stop
+/// backstop its own universe rather than another path of the same one, and the gate would stop
 /// collapsing the two copies of one fill. Here the `trade_id` window is the only thing left holding
 /// that line, and it holds only because the public `tradeSequenceNumber` matches the edge id on this
 /// venue (validated 2026-06-30); a venue where it did not would double-print.
@@ -70,7 +70,7 @@ const PHOENIX_CATEGORY: &str = "spot";
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
 /// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
 /// no `channel` key at all) is ignored without counting as a decode error — so
-/// `dz_ws_feeder_decode_errors_total{venue=Phoenix}` stays a real health signal on a chatty control
+/// `dz_ws_input_decode_errors_total{venue=Phoenix}` stays a real health signal on a chatty control
 /// channel. Fills are decoded **per element** (as raw JSON here, then one-by-one in `handle_text`) so
 /// a single malformed fill can't fail the whole batch — the backstop matters most during bursts, when
 /// `trades` arrays are largest.
@@ -199,7 +199,7 @@ impl PhoenixVenue {
         let source_ts_ns = unix_seconds_to_ns(&fill.timestamp);
         let trade = NormalizedTrade {
             venue: venue_arc(phoenix_venue()),
-            source: venue_arc(phoenix_venue()),
+            source_name: venue_arc(phoenix_venue()),
             source_id: PHOENIX_SOURCE_ID,
             symbol: symbol.into(),
             channel,
@@ -224,19 +224,19 @@ impl PhoenixVenue {
             ws_send_ts_ns: 0,
         };
         metrics()
-            .ws_feeder_messages
+            .ws_input_messages
             .with_label_values(&[phoenix_venue(), "trade"])
             .inc();
         lock(arbiter).emit(
             FeedMessage::Trade(trade),
-            Publisher::PublicWs,
+            Transport::PublicWs,
             PHOENIX_CATEGORY,
         );
     }
 
     fn decode_error(&self) {
         metrics()
-            .ws_feeder_decode_errors
+            .ws_input_decode_errors
             .with_label_values(&[phoenix_venue()])
             .inc();
     }
@@ -280,9 +280,9 @@ fn unix_seconds_to_ns(ts: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Run the Phoenix public-API trade feeder forever (reconnecting on any failure). Returns
-/// immediately as a no-op when `markets` is empty (the feeder is off by default). Thin wrapper over
-/// the venue-generic [`public_feeder::run`].
+/// Run the Phoenix public-API trade input forever (reconnecting on any failure). Returns
+/// immediately as a no-op when `markets` is empty (the input is off by default). Thin wrapper over
+/// the venue-generic [`public_input::run`].
 pub async fn run(
     url: String,
     markets: Vec<String>,
@@ -296,10 +296,10 @@ pub async fn run(
         tracing::info!(
             venue = phoenix_venue(),
             markets = ?markets,
-            "Phoenix public trade feeder backing markets (must match the edge Phoenix symbols verbatim)"
+            "Phoenix public trade input backing markets (must match the edge Phoenix symbols verbatim)"
         );
     }
-    public_feeder::run(PhoenixVenue::new(url, markets), arbiter, instruments).await
+    public_input::run(PhoenixVenue::new(url, markets), arbiter, instruments).await
 }
 
 #[cfg(test)]
@@ -339,10 +339,10 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u32, 1u32),
+            (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
                 venue: phoenix_venue().into(),
-                source: phoenix_venue().into(),
+                source_name: phoenix_venue().into(),
                 source_id: 0,
                 symbol: symbol.into(),
                 channel: 0,
@@ -571,7 +571,7 @@ mod tests {
     /// The backstop must name itself the way the edge does, or one market becomes two keys in the
     /// arbiter's `(venue, symbol)` dedup floor and both copies reach the wire.
     #[test]
-    fn a_public_feeder_labels_itself_from_the_registry() {
+    fn a_public_input_labels_itself_from_the_registry() {
         let v = venue(&["SOL"]);
         assert_eq!(
             v.venue(),

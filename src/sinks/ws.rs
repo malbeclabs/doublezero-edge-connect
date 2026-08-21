@@ -48,7 +48,7 @@ struct PreparedFrame {
     symbol: Option<Arc<str>>,
     /// The message's `channel_id`, or `None` for a type that carries none. Populated when the
     /// incremental `book` message lands; every current type is `None`.
-    channel: Option<u32>,
+    channel: Option<u8>,
 }
 
 /// Serialize one backbone message once: clone it, stamp the shared `ws_send_ts_ns`, render the JSON,
@@ -93,7 +93,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
     };
     // An order-level batch renders under its own `type`. Only the tag differs — the body is the same
     // `NormalizedBook` — and the wrap is local to serialization, so the filter fields below are still
-    // read off the original message and no other `match` on `FeedMessage` grows an arm.
+    // read off the original message and no other `match` on `FeedMessage` grows a path.
     let payload: Utf8Bytes = match &m {
         FeedMessage::Book(b) if b.order_level => {
             serde_json::to_string(&FeedMessage::OrderBook(b.clone())).ok()?
@@ -142,14 +142,22 @@ struct SubFilter {
     /// Alias for `venue`, the preferred spelling. Both are accepted for the deprecation window; if
     /// a client sends both they are ANDed, so a disagreeing pair matches nothing rather than
     /// silently honouring one.
+    ///
     #[serde(default)]
-    source: Option<String>,
+    source_name: Option<String>,
+    /// The pre-rename spelling, still accepted. Its own slot rather than a `serde(alias)` on
+    /// `source_name`: an alias shares one field slot, so a client sending both spellings — the
+    /// natural way to straddle a rename — would get `duplicate field` and have the whole `subscribe`
+    /// refused, registering no filter at all and landing on the firehose. That is the failure this
+    /// key exists to prevent. ANDed like `venue`, so all three spellings compose.
+    #[serde(default, rename = "source")]
+    deprecated_source_name: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
-    /// The wire `channel_id` — the competition, not the arm. Arm identity is deliberately not
+    /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
     /// client-selectable: exactly one arbitrated book per market reaches the wire.
     #[serde(default)]
-    channel: Option<u32>,
+    channel: Option<u8>,
     /// Message `type` (`quote`/`trade`/`book`/...). Named `msg_type` in Rust because `type` is a
     /// keyword; the wire name is `type`.
     #[serde(rename = "type", default)]
@@ -157,12 +165,12 @@ struct SubFilter {
 }
 
 impl SubFilter {
-    /// The single match path. `venue`/`source` are aliases and are ANDed. `symbol`/`channel` are
+    /// The single match path. `venue`/`source_name` are aliases and are ANDed. `symbol`/`channel` are
     /// `None` for a venue-level message (today only `status`), and a `None` on the *message* side
     /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
     /// symbol- or channel-scoped subscriber must still receive it. A filter dimension the message
     /// *does* carry is matched normally.
-    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u32>, kind: &str) -> bool {
+    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u8>, kind: &str) -> bool {
         // Venue codes are registry identifiers, not free text - match case-insensitively so a
         // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol and
         // type stay exact (venues name symbols precisely; types are a closed protocol set).
@@ -170,7 +178,11 @@ impl SubFilter {
             .as_deref()
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
             && self
-                .source
+                .source_name
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(venue))
+            && self
+                .deprecated_source_name
                 .as_deref()
                 .is_none_or(|s| s.eq_ignore_ascii_case(venue))
             // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
@@ -319,14 +331,14 @@ fn text(value: serde_json::Value) -> WsMessage {
 
 /// The scope to bootstrap one market at: **the market's own granularity, always**.
 ///
-/// It is not a client choice. A bootstrap and a stream of different granularity cannot be reconciled
+/// It is not a client choice. A bootstrap and a feed of different granularity cannot be reconciled
 /// — an order-level change carries one *order's* absolute size, and a client handed price levels has
 /// no order state to apply it to — so the only consumer a fold could serve is one folding the live
-/// stream itself, which needs every resting order's size and is exactly what the fold discards. The
+/// feed itself, which needs every resting order's size and is exactly what the fold discards. The
 /// `book_scope` subscription field offered that choice and is withdrawn; it never shipped in a
 /// release.
 /// The wire `type` one market's book is served under — the same market property `book_scope` reads,
-/// and for the same reason: the bootstrap and the live stream must agree.
+/// and for the same reason: the bootstrap and the live feed must agree.
 fn book_kind(acc: &BookAccumulator) -> &'static str {
     if acc.is_order_level() {
         "order_book"
@@ -363,7 +375,7 @@ where
 {
     // Each kind passes its own channel: a channel-bearing kind that passed `None` would leave a
     // `{"channel":N}` client with no bootstrap at all.
-    let pass = |venue: &str, symbol: &str, channel: Option<u32>, kind: &str| {
+    let pass = |venue: &str, symbol: &str, channel: Option<u8>, kind: &str| {
         subs.is_empty()
             || subs
                 .iter()
@@ -393,13 +405,13 @@ where
         let guard = crate::model::lock(books);
         guard
             .iter()
-            // A market accumulated mid-stream holds only the levels that have moved since, so
+            // A market accumulated partway through holds only the levels that have moved since, so
             // replaying it as full state would tell the client to discard the ones it never saw.
             .filter(|(_, acc)| acc.baselined())
             // The key's second element is the producer-side arbitration scope (`Feed::category`,
             // which keeps two universes' colliding instrument ids apart in the map); it is not a
             // filter dimension and never reaches the wire.
-            // Filtered and tagged under the market's *own* type, matching the live stream it
+            // Filtered and tagged under the market's *own* type, matching the live feed it
             // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and one
             // subscribed to `book` alone must not be handed a market it cannot apply.
             .filter(|((venue, _, channel, _), acc)| {
@@ -437,7 +449,7 @@ async fn serve_client(
     // Per-client state. Empty `subs` = firehose (receive every venue/symbol).
     let mut subs: Vec<SubFilter> = Vec::new();
 
-    // Replay definitions (precision first) then current book state, so a mid-stream consumer is
+    // Replay definitions (precision first) then current book state, so a consumer joining partway is
     // bootstrapped immediately instead of waiting for the next periodic book. (Quotes/trades are not
     // replayed - the next quote is itself full state.) `subs` is empty here, so this connect-time
     // replay is unfiltered.
@@ -529,7 +541,7 @@ async fn serve_client(
             msg = rx.recv() => match msg {
                 Ok(frame) => {
                     // One match path for every kind, venue-level included: a dimension added to
-                    // `matches` cannot silently exempt half the stream.
+                    // `matches` cannot silently exempt half the feed.
                     let pass = subs.is_empty()
                         || subs.iter().any(|f| {
                             f.matches(
@@ -685,7 +697,7 @@ mod tests {
         use super::prepare;
         let b = FeedMessage::Book(NormalizedBook {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -720,7 +732,7 @@ mod tests {
         );
         let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -765,7 +777,7 @@ mod tests {
     fn sample_quote() -> NormalizedQuote {
         NormalizedQuote {
             venue: "HYPERLIQUID".into(),
-            source: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
             source_id: 0,
             symbol: "BTC".into(),
             bid: 1.0,
@@ -938,12 +950,12 @@ mod tests {
                 (
                     Arc::<str>::from("HYPERLIQUID"),
                     Arc::<str>::from("default"),
-                    0u32,
+                    0u8,
                     n as u32,
                 ),
                 NormalizedInstrument {
                     venue: "HYPERLIQUID".into(),
-                    source: "HYPERLIQUID".into(),
+                    source_name: "HYPERLIQUID".into(),
                     source_id: 0,
                     symbol: arc,
                     channel: 0,
@@ -1058,7 +1070,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
 
         let mut defs = HashMap::new();
-        for (sym, channel) in [("KXBTCPERP", 2u32), ("KXETHPERP", 3)] {
+        for (sym, channel) in [("KXBTCPERP", 2u8), ("KXETHPERP", 3)] {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
@@ -1069,7 +1081,7 @@ mod tests {
                 ),
                 NormalizedInstrument {
                     venue: "KALSHI".into(),
-                    source: "KALSHI".into(),
+                    source_name: "KALSHI".into(),
                     source_id: 0,
                     symbol: arc,
                     channel,
@@ -1169,7 +1181,7 @@ mod tests {
     fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: symbol.into(),
             channel: 0,
@@ -1215,7 +1227,7 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>,
+        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
         books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1290,7 +1302,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1392,7 +1404,7 @@ mod tests {
     }
 
     /// **The compatibility guarantee.** A consumer that subscribes to `type: book` must receive
-    /// neither the bootstrap nor the live stream of an order-level market: keying those changes by
+    /// neither the bootstrap nor the live feed of an order-level market: keying those changes by
     /// price collapses two orders resting at one price to the last one's size. A distinct type is the
     /// mechanism PROTOCOL.md's forward-compatibility rule already promises, which is what makes this
     /// additive rather than breaking.
@@ -1410,7 +1422,7 @@ mod tests {
             (
                 Arc::<str>::from("HYPERLIQUID"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             order_level_accumulator("BTC"),
@@ -1421,7 +1433,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1460,7 +1472,7 @@ mod tests {
             "the order-level market must not be bootstrapped for a `book` subscription"
         );
 
-        // And the live stream is filtered by the same one `SubFilter::matches` path.
+        // And the live feed is filtered by the same one `SubFilter::matches` path.
         let mut order = book_batch("BTC", vec![level_update(BookSide::Bid, 100.0, 5.0)], true);
         order.order_level = true;
         order.changes[0].order_id = 9;
@@ -1474,7 +1486,7 @@ mod tests {
         srv.abort();
     }
 
-    /// An order-level market bootstraps as **orders**, matching the stream the client is about to
+    /// An order-level market bootstraps as **orders**, matching the feed the client is about to
     /// receive: a level bootstrap followed by order-level changes cannot be reconciled, and no
     /// subscription can ask for one.
     #[tokio::test]
@@ -1513,7 +1525,7 @@ mod tests {
             (
                 Arc::<str>::from("HYPERLIQUID"),
                 Arc::<str>::from("perps"),
-                0u32,
+                0u8,
                 1u32,
             ),
             acc,
@@ -1529,7 +1541,7 @@ mod tests {
         assert_eq!(
             book_type(&frame),
             "order_book",
-            "the bootstrap must carry the same type as the stream it precedes"
+            "the bootstrap must carry the same type as the feed it precedes"
         );
         let b = parse_book(&frame);
         assert_eq!(
@@ -1539,11 +1551,11 @@ mod tests {
                 .map(|c| c.order_id)
                 .collect::<Vec<_>>(),
             vec![7, 8],
-            "the default bootstrap must carry the order ids the stream carries"
+            "the default bootstrap must carry the order ids the feed carries"
         );
 
         // A subscription cannot ask for anything else. `book_scope: "levels"` used to fold the
-        // bootstrap while the live stream stayed order-level, which is unusable: an order-level
+        // bootstrap while the live feed stayed order-level, which is unusable: an order-level
         // change carries one *order's* absolute size, and a client handed price levels holds no
         // order state to apply it to. The field is gone, and an unknown key is ignored, so a client
         // still sending it is bootstrapped at the market's own granularity.
@@ -1586,7 +1598,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1595,7 +1607,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                3u32,
+                3u8,
                 7u32,
             ),
             accumulator("KXETHPERP", 0.41, 0.43),
@@ -1638,6 +1650,43 @@ mod tests {
         srv.abort();
     }
 
+    /// A `channel` past the wire's width is refused as a malformed frame, not accepted as a filter
+    /// that then matches nothing for the life of the client. The frame is refused, the connection is
+    /// not.
+    #[tokio::test]
+    #[serial]
+    async fn a_subscribe_channel_above_the_wire_width_is_answered_with_an_error() {
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), BookReplay::default()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":300}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("error frame");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("frame parses");
+        assert_eq!(v["channel"], "error", "got {frame}");
+        assert_eq!(v["error"], "unrecognized message", "got {frame}");
+
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":3}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+
+        srv.abort();
+    }
+
     /// Precision before price: the `instrument` definition is replayed ahead of the market's `book`.
     #[tokio::test]
     #[serial]
@@ -1647,12 +1696,12 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 0,
                 symbol: "KXBTCPERP".into(),
                 channel: 2,
@@ -1667,7 +1716,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1692,36 +1741,36 @@ mod tests {
         srv.abort();
     }
 
-    /// Only a re-baselined market is bootstrapped. One accumulated mid-stream holds just the levels
+    /// Only a re-baselined market is bootstrapped. One accumulated partway through holds just the levels
     /// that have moved since, and `to_book` stamps `snapshot: true` — replaying it would tell the
     /// client to discard the rest of the book. Such a client waits for the producer's next
     /// re-baseline, as it did before the book replay existed.
     #[tokio::test]
     #[serial]
-    async fn mid_stream_markets_are_not_replayed() {
-        let mut mid_stream = BookAccumulator::new("KXETHPERP".into());
-        mid_stream.apply(&book_batch(
+    async fn markets_accumulated_partway_are_not_replayed() {
+        let mut accumulated_partway = BookAccumulator::new("KXETHPERP".into());
+        accumulated_partway.apply(&book_batch(
             "KXETHPERP",
             vec![level_update(BookSide::Bid, 0.41, 5.0)],
             true,
         ));
-        assert!(!mid_stream.baselined(), "no Clear was folded in");
+        assert!(!accumulated_partway.baselined(), "no Clear was folded in");
 
         let mut books = BookReplay::default();
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                3u32,
+                3u8,
                 7u32,
             ),
-            mid_stream,
+            accumulated_partway,
         );
         books.insert(
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1766,7 +1815,7 @@ mod tests {
             (
                 Arc::<str>::from("KALSHI"),
                 Arc::<str>::from("perps"),
-                2u32,
+                2u8,
                 41u32,
             ),
             accumulator("KXBTCPERP", 0.61, 0.63),
@@ -1811,9 +1860,10 @@ mod tests {
     }
 
     #[test]
-    fn a_source_filter_selects_the_same_messages_as_a_venue_filter() {
+    fn a_source_name_filter_selects_the_same_messages_as_a_venue_filter() {
         let by_venue: SubFilter = serde_json::from_str(r#"{"venue":"HYPERLIQUID"}"#).unwrap();
-        let by_source: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+        let by_source: SubFilter =
+            serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
         for kind in ["quote", "trade", "status"] {
             assert_eq!(
                 by_venue.matches("HYPERLIQUID", Some("SOL"), None, kind),
@@ -1825,18 +1875,40 @@ mod tests {
 
     /// The alias keeps the case-insensitivity the venue key already had.
     #[test]
-    fn a_source_filter_is_case_insensitive() {
-        let f: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+    fn a_source_name_filter_is_case_insensitive() {
+        let f: SubFilter = serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
         assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
     }
 
     /// Both keys present and disagreeing must match nothing — silently honouring one would make a
     /// client's filter mean something it did not ask for.
     #[test]
-    fn disagreeing_source_and_venue_keys_match_nothing() {
+    fn disagreeing_source_name_and_venue_keys_match_nothing() {
         let f: SubFilter =
-            serde_json::from_str(r#"{"venue":"HYPERLIQUID","source":"PHOENIX"}"#).unwrap();
+            serde_json::from_str(r#"{"venue":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
         assert!(!f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
         assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
+    }
+
+    /// The pre-rename `source` key still narrows, and — the reason it is its own field rather than a
+    /// `serde(alias)` — a client sending **both** spellings is accepted rather than having the whole
+    /// `subscribe` refused as a duplicate field, which would have registered no filter at all and
+    /// left it on the firehose, then cost it the messages it did ask for to drop-oldest backpressure.
+    #[test]
+    fn the_retired_source_key_narrows_and_composes_with_the_new_one() {
+        let retired: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+        assert!(retired.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!retired.matches("PHOENIX", Some("SOL"), None, "quote"));
+
+        let both: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"HYPERLIQUID"}"#)
+                .expect("both spellings must parse, not collide");
+        assert!(both.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+
+        // ANDed like `venue`, so a disagreeing pair matches nothing rather than honouring one.
+        let disagreeing: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
+        assert!(!disagreeing.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!disagreeing.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 }

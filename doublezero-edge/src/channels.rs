@@ -89,7 +89,7 @@ pub struct DropRow {
     pub venue: String,
     pub category: String,
     pub code: String,
-    pub channel: u32,
+    pub channel: u8,
     pub name: String,
     pub products: u64,
 }
@@ -177,27 +177,27 @@ mod tests {
 
     #[test]
     fn a_mentioned_code_admits_only_its_listed_ids() {
-        let f = FilterSpec::parse("lashay-4=10,11");
-        assert!(f.admits("lashay-4", 10));
-        assert!(f.admits("lashay-4", 11));
-        assert!(!f.admits("lashay-4", 12));
+        let f = FilterSpec::parse("edge-kalshi-sports-mbp=10,11");
+        assert!(f.admits("edge-kalshi-sports-mbp", 10));
+        assert!(f.admits("edge-kalshi-sports-mbp", 11));
+        assert!(!f.admits("edge-kalshi-sports-mbp", 12));
     }
 
     /// The semantic this whole preview leans on: a code the spec never names admits everything,
     /// exactly like `ChannelFilter::parse`'s own documented behaviour for an unmentioned row.
     #[test]
     fn an_unmentioned_code_admits_everything() {
-        let f = FilterSpec::parse("lashay-4=10,11");
-        assert!(f.admits("lashay-2", 999));
+        let f = FilterSpec::parse("edge-kalshi-sports-mbp=10,11");
+        assert!(f.admits("edge-kalshi-perps-mbp", 999));
     }
 
     #[test]
     fn multiple_clauses_are_each_scoped_to_their_own_code() {
-        let f = FilterSpec::parse("lashay-4=10,11;lashay-2=5");
-        assert!(f.admits("lashay-4", 10));
-        assert!(!f.admits("lashay-4", 5));
-        assert!(f.admits("lashay-2", 5));
-        assert!(!f.admits("lashay-2", 10));
+        let f = FilterSpec::parse("edge-kalshi-sports-mbp=10,11;edge-kalshi-perps-mbp=5");
+        assert!(f.admits("edge-kalshi-sports-mbp", 10));
+        assert!(!f.admits("edge-kalshi-sports-mbp", 5));
+        assert!(f.admits("edge-kalshi-perps-mbp", 5));
+        assert!(!f.admits("edge-kalshi-perps-mbp", 10));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -210,7 +210,7 @@ mod tests {
                 "rows": [{
                     "venue": "KALSHI",
                     "category": "sports",
-                    "code": "lashay-4",
+                    "code": "edge-kalshi-sports-mbp",
                     "excluded": 29,
                     "channels": [
                         {"channel": 10, "allowed": true, "bound": true, "products": 412},
@@ -228,18 +228,18 @@ mod tests {
     /// (already excluded, holds nothing — there is nothing left to lose there).
     #[test]
     fn a_channel_losing_admission_with_products_is_reported_as_a_drop() {
-        let drops = compute_drops(&status_fixture(), "lashay-4=10").unwrap();
+        let drops = compute_drops(&status_fixture(), "edge-kalshi-sports-mbp=10").unwrap();
         assert_eq!(drops.len(), 1, "{drops:?}");
         assert_eq!(drops[0].channel, 11);
         assert_eq!(drops[0].products, 287);
-        assert_eq!(drops[0].code, "lashay-4");
+        assert_eq!(drops[0].code, "edge-kalshi-sports-mbp");
     }
 
     /// A row whose code the new spec never mentions is untouched (admit-all), so nothing under it
     /// is ever reported as a drop, however wide its current occupancy.
     #[test]
     fn a_row_whose_code_is_absent_from_the_new_spec_drops_nothing() {
-        let drops = compute_drops(&status_fixture(), "lashay-2=1").unwrap();
+        let drops = compute_drops(&status_fixture(), "edge-kalshi-perps-mbp=1").unwrap();
         assert!(drops.is_empty(), "{drops:?}");
     }
 
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn a_status_body_with_no_channels_key_defaults_to_no_drops() {
         let status_body = serde_json::json!({});
-        let drops = compute_drops(&status_body, "lashay-4=10").unwrap();
+        let drops = compute_drops(&status_body, "edge-kalshi-sports-mbp=10").unwrap();
         assert!(drops.is_empty(), "{drops:?}");
     }
 
@@ -277,14 +277,14 @@ mod tests {
         let drops = vec![DropRow {
             venue: "KALSHI".to_string(),
             category: "sports".to_string(),
-            code: "lashay-4".to_string(),
+            code: "edge-kalshi-sports-mbp".to_string(),
             channel: 11,
             name: "11".to_string(),
             products: 287,
         }];
         let out = render_drop_preview(&drops);
         assert!(out.contains("DROPPED"), "{out}");
-        assert!(out.contains("lashay-4"), "{out}");
+        assert!(out.contains("edge-kalshi-sports-mbp"), "{out}");
         assert!(out.contains("287"), "{out}");
     }
 
@@ -295,12 +295,15 @@ mod tests {
     #[test]
     fn channels_list_shows_the_filter_summary_and_the_channel_table() {
         let body = serde_json::json!({
-            "admin": {"summary": ["lashay-4=2 of 31"]},
+            "admin": {"summary": ["edge-kalshi-sports-mbp=2 of 31"]},
             "status": status_fixture(),
         });
         let out = render_channels_list(&body).unwrap();
-        assert!(out.contains("channel filter: lashay-4=2 of 31"), "{out}");
-        assert!(out.contains("lashay-4"), "{out}");
+        assert!(
+            out.contains("channel filter: edge-kalshi-sports-mbp=2 of 31"),
+            "{out}"
+        );
+        assert!(out.contains("edge-kalshi-sports-mbp"), "{out}");
         assert!(out.contains("412"), "{out}");
     }
 

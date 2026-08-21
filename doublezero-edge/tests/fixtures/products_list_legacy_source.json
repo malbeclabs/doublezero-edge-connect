@@ -3,7 +3,7 @@
     {
       "product_id": "HYPERLIQUID:BTC",
       "source_id": 1,
-      "source_name": "Hyperliquid",
+      "source": "Hyperliquid",
       "symbol": "BTC",
       "channel": 0,
       "instrument_id": 41,
@@ -15,7 +15,7 @@
     {
       "product_id": "HYPERLIQUID:ETH",
       "source_id": 1,
-      "source_name": "Hyperliquid",
+      "source": "Hyperliquid",
       "symbol": "ETH",
       "channel": 0,
       "instrument_id": 42,
@@ -27,7 +27,7 @@
     {
       "product_id": "KALSHI:EAVE-27JAN01-YES#120.1165",
       "source_id": 3,
-      "source_name": "Kalshi",
+      "source": "Kalshi",
       "symbol": "EAVE-27JAN01-YES",
       "channel": 120,
       "instrument_id": 1165,

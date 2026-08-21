@@ -1,7 +1,7 @@
 //! doublezero-edge-connect - DoubleZero Edge multicast -> normalized WebSocket bridge.
 //!
 //! Binds each configured DZ Edge feed's multicast group, decodes the binary Top-of-Book
-//! frames, and re-serves normalized quotes over a WebSocket that any trading engine can
+//! datagrams, and re-serves normalized quotes over a WebSocket that any trading engine can
 //! subscribe to. One feed maps to one venue (see `ingest/feeds.rs`); the bridge ingests every
 //! selected feed at once and consumers filter by venue over the WebSocket (PROTOCOL.md).
 //! Run it on a host connected to DZ Edge (the `doublezero1` interface) so consumers never
@@ -48,9 +48,9 @@ struct Args {
     )]
     publisher_ports: Vec<u16>,
 
-    /// Channels to ingest, scoped per group code: `lashay-4=10,11;lashay-1=2`. An unmentioned
+    /// Channels to ingest, scoped per group code: `edge-kalshi-sports-mbp=10,11;edge-kalshi-perps-tob=2`. An unmentioned
     /// feed ingests every channel. Ids are the contract and are validated against the feed's
-    /// roster at startup; channel *names* are not mirrored here — they live in the publisher's
+    /// published set at startup; channel *names* are not mirrored here — they live in the publisher's
     /// inventory by design and have already moved once. Use `doublezero-edge channels list` to
     /// see what a bound channel actually contains.
     ///
@@ -177,16 +177,16 @@ struct Args {
     )]
     shred_dedup_window_slots: u64,
 
-    /// Coins to subscribe on the Hyperliquid **public** WebSocket input feeder, repeatable/
-    /// comma-separated (e.g. `--ws-input-coins BTC,ETH`). This is the backstop arbitrage source: it
+    /// Coins to subscribe on the Hyperliquid **public** WebSocket input, repeatable/
+    /// comma-separated (e.g. `--ws-input-coins BTC,ETH`). This is the backstop arbitrage input: it
     /// races the public feed against the DZ Edge multicast in the shared arbiter, so the edge wins in
     /// steady state and the public copy fills in only when the edge gaps. Empty (the default) leaves
-    /// the feeder off.
+    /// the input off.
     #[arg(long = "ws-input-coins", env = "WS_INPUT_COINS", value_delimiter = ',')]
     ws_input_coins: Vec<String>,
 
-    /// URL for the public WS input feeder. Defaults to Hyperliquid's public endpoint; override to
-    /// point the feeder at a local mock (e.g. in tests).
+    /// URL for the public WS input. Defaults to Hyperliquid's public endpoint; override to
+    /// point the input at a local mock (e.g. in tests).
     #[arg(
         long = "ws-input-url",
         env = "WS_INPUT_URL",
@@ -194,13 +194,13 @@ struct Args {
     )]
     ws_input_url: String,
 
-    /// Phoenix market symbols to back on the **public-API** trade feeder, repeatable/comma-separated
+    /// Phoenix market symbols to back on the **public-API** trade input, repeatable/comma-separated
     /// (bare tickers, e.g. `--phoenix-ws-input-markets SOL,BTC`). Phoenix uses the same symbol on the
     /// edge and public feeds (edge `instrument_id == public assetId`), so these are both the public
     /// subscribe symbols and the edge symbols. This backstop races Phoenix's public trades against the
     /// DZ Edge Phoenix multicast in the shared arbiter (deduped on trade_id), so the edge wins in
     /// steady state and the public copy fills in only when the edge gaps. Trades only — no quote
-    /// backstop. Empty (the default) leaves the feeder off.
+    /// backstop. Empty (the default) leaves the input off.
     #[arg(
         long = "phoenix-ws-input-markets",
         env = "PHOENIX_WS_INPUT_MARKETS",
@@ -208,8 +208,8 @@ struct Args {
     )]
     phoenix_ws_input_markets: Vec<String>,
 
-    /// URL for the Phoenix public WS trade feeder. Defaults to Phoenix's public endpoint; override to
-    /// point the feeder at a local mock (e.g. in tests).
+    /// URL for the Phoenix public WS trade input. Defaults to Phoenix's public endpoint; override to
+    /// point the input at a local mock (e.g. in tests).
     #[arg(
         long = "phoenix-ws-input-url",
         env = "PHOENIX_WS_INPUT_URL",
@@ -283,7 +283,7 @@ struct Args {
     )]
     subscription_gating_disable: bool,
 
-    /// Seconds between arm re-election samples for `Sticky` venues. Longer holds a slower arm
+    /// Seconds between path re-election samples for `Sticky` venues. Longer holds a slower path
     /// longer; shorter risks flapping authority, which re-baselines every consumer's book.
     #[arg(
         long = "arb-sample-interval-secs",
@@ -292,7 +292,7 @@ struct Args {
     )]
     arb_sample_interval_secs: u64,
 
-    /// Microseconds a challenger must beat the authoritative arm by, on median, to take authority.
+    /// Microseconds a challenger must beat the authoritative path by, on median, to take authority.
     #[arg(
         long = "arb-transfer-margin-us",
         env = "DZ_ARB_TRANSFER_MARGIN_US",
@@ -320,7 +320,7 @@ struct Args {
     )]
     arb_leader_timeout_secs: u64,
 
-    /// Matched cross-arm samples an arm needs in a window before its speed is judged at all. Below
+    /// Matched cross-path samples a path needs in a window before its speed is judged at all. Below
     /// this the window is ignored, so a handful of lucky matches cannot move a venue.
     #[arg(
         long = "arb-min-window-samples",
@@ -330,8 +330,8 @@ struct Args {
     )]
     arb_min_window_samples: u64,
 
-    /// Seconds an arm's trade waits for the peer arm's copy of the same print before it counts as
-    /// unmatched. Must exceed the worst plausible inter-arm lead and stay well under the interval
+    /// Seconds a path's trade waits for the peer path's copy of the same print before it counts as
+    /// unmatched. Must exceed the worst plausible inter-path lead and stay well under the interval
     /// between repeats of one identical trade.
     #[arg(
         long = "arb-match-window-secs",
@@ -343,7 +343,7 @@ struct Args {
 
     /// Milliseconds a delivered order-level book event is remembered so a slower publisher's copy is
     /// recognized as a duplicate. A removed order id is never re-added regardless (`ingest::book`),
-    /// so this does not gate resurrection — but set below the arms' separation it turns a lagging
+    /// so this does not gate resurrection — but set below the paths' separation it turns a lagging
     /// copy of a partially-filled order into a false size disagreement, which costs a forced
     /// re-baseline and the batches withheld behind it. A per-market count cap of 1024 events bounds
     /// the reach independently, so values much above a second are inert on a busy market.
@@ -357,7 +357,7 @@ struct Args {
 
     /// Seconds of venue time behind a channel's newest stamp an order-level book event may be and
     /// still be admitted — and, by the same value, how long a removed order is remembered so a
-    /// lagging publisher's stale add for it can be refused. Set below the arms' worst separation and
+    /// lagging publisher's stale add for it can be refused. Set below the paths' worst separation and
     /// a returning link's backlog is published as live; set far above it and every removal inside the
     /// window is held (~4,000/s per publisher on the flagship channel, against a process-wide ceiling
     /// of 1,048,576 entries).
@@ -382,9 +382,9 @@ struct Args {
     arb_book_ts_jump_secs: u64,
 
     /// Seconds a channel's newest venue stamp may fail to **move** before it is re-seated from the
-    /// batches actually arriving. A real tradeoff: below the arms' worst separation (2.77 s measured
+    /// batches actually arriving. A real tradeoff: below the paths' worst separation (2.77 s measured
     /// at p99.99) it fires on ordinary jitter, and above it, it bounds both how long a stuck frontier
-    /// grows the removed population unforgotten and how long a market whose only surviving arm is
+    /// grows the removed population unforgotten and how long a market whose only surviving path is
     /// behind that frontier can be dark.
     #[arg(
         long = "arb-book-reseat-secs",
@@ -395,7 +395,7 @@ struct Args {
     arb_book_reseat_secs: u64,
 }
 
-/// The single source of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
+/// The single origin of the `--arb-*` defaults, so the values a test-built arbiter arbitrates on and
 /// the ones `--help` advertises cannot drift apart.
 const ARB: ingest::authority::AuthorityConfig = ingest::authority::AuthorityConfig::DEFAULT;
 
@@ -518,7 +518,7 @@ fn join_ports(ports: &[u16]) -> String {
 /// this call only warns when a clause's *code* is absent from `enabled` entirely — it says nothing
 /// when the code is present but every one of its admitted ids was narrowed away by
 /// `--publisher-port`. The result is a feed silently left with no publisher, which takes the WS
-/// sink, query API and history feeder down with it if it was the only market-data feed running —
+/// sink, query API and history writer down with it if it was the only market-data feed running —
 /// with no warning at all. A channel filter that silently admits nothing is worse than one that
 /// refuses to start.
 fn check_channel_filter_covers_enabled(
@@ -567,7 +567,7 @@ async fn main() -> Result<()> {
     // only at startup, refusing would not kill the fleet when the document changed but each process
     // at its next reschedule, far from the cause. A `--feed-registry` file is an operator's explicit
     // instruction about this one container, so a document that was read but rejected is fatal here.
-    feeds::init(ingest::registry::Source::from_flags(
+    feeds::init(ingest::registry::Origin::from_flags(
         &args.feed_registry_url,
         &args.feed_registry,
     ))
@@ -622,8 +622,8 @@ async fn main() -> Result<()> {
     // The backbone carries `Arc<FeedMessage>`: a per-subscriber delivery is a refcount bump, not a
     // deep clone of the message's owned `String`/`Vec` fields (see `arbiter`/`sinks::ws`).
     let (tx, _rx) = broadcast::channel::<Arc<model::FeedMessage>>(args.ws_broadcast_capacity);
-    // The shared pre-broadcast arbiter: every ingest source (each multicast receiver and the WS
-    // feeder) emits through this one instance, so cross-source duplicates collapse on one
+    // The shared pre-broadcast arbiter: every ingest input (each multicast receiver and the WS
+    // input) emits through this one instance, so cross-transport duplicates collapse on one
     // per-(venue, symbol) floor before fan-out. Output sinks subscribe to `tx` directly.
     let instruments: model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
     let depth: model::DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
@@ -633,7 +633,7 @@ async fn main() -> Result<()> {
     // subscription blip that briefly takes the sink down must not reset the window it comes back up
     // to. The reconciler owns feeding it (only while the sink is up) and reading it (the API sink).
     let history: Arc<Mutex<history::Store>> = Arc::new(Mutex::new(history::Store::new()));
-    // Single-arm authority tunables for `Sticky` venues, plus the cross-arm matcher's pairing window,
+    // Single-path authority tunables for `Sticky` venues, plus the cross-path matcher's pairing window,
     // validated here at startup and handed to the arbiter.
     let authority_cfg = ingest::authority::AuthorityConfig {
         leader_timeout_ns: args.arb_leader_timeout_secs.saturating_mul(1_000_000_000),
@@ -673,9 +673,9 @@ async fn main() -> Result<()> {
         Arc::new(Mutex::new(a))
     };
 
-    // The arm sampler: closes each elapsed re-election window (a margin transfer moves venue
-    // authority here), refreshes the O(markets × arms) gauges and drains the matcher's unmatched
-    // counts. Off the emit path entirely, so a slow sweep never touches ingest latency.
+    // The path sampler: closes each elapsed re-election window (a margin transfer moves venue
+    // authority here), refreshes the O(markets × paths) gauges and drains the matcher's unmatched
+    // counts. Off the emit path entirely, so a slow refresh never touches ingest latency.
     let sampler = {
         let arbiter = arbiter.clone();
         // A fraction of the window, not the window itself: the authority closes a window only once
@@ -745,7 +745,7 @@ async fn main() -> Result<()> {
     let shred_explicit_sources = shred::parse_sources(&args.shred_sources)?;
     if !args.shred_disable {
         let mode = args.shred_dedup_mode;
-        // The mode is the single source of truth: sigverify needs an RPC URL, and an RPC URL set in
+        // The mode is the single authority: sigverify needs an RPC URL, and an RPC URL set in
         // any other mode is ignored (warn rather than silently promote — the user chose the mode).
         if mode == shred::DedupMode::Sigverify && args.shred_rpc_url.is_none() {
             bail!("--shred-dedup-mode sigverify requires --shred-rpc-url (DZ_SHRED_RPC_URL)");
@@ -773,17 +773,17 @@ async fn main() -> Result<()> {
         dedup_window_slots: args.shred_dedup_window_slots,
     };
 
-    // Public WS input feeder: off unless `--ws-input-coins` is non-empty (the source/sink activation
+    // Public WS input: off unless `--ws-input-coins` is non-empty (the input/sink activation
     // convention). It emits through the same shared arbiter as the multicast receivers, so the public
     // feed races the edge per (venue, symbol) tick and backstops it. Failure-isolated: it reconnects
     // internally and never returns, so its churn can't touch the multicast hot path.
     let ws_input = if args.ws_input_coins.is_empty() {
-        info!("public WS input feeder disabled (no --ws-input-coins)");
+        info!("public WS input disabled (no --ws-input-coins)");
         None
     } else {
         info!(coins = ?args.ws_input_coins, url = %args.ws_input_url,
-              "starting public WS input feeder");
-        Some(tokio::spawn(ingest::ws_feeder::run(
+              "starting public WS input");
+        Some(tokio::spawn(ingest::ws_input::run(
             args.ws_input_url.clone(),
             args.ws_input_coins.clone(),
             arbiter.clone(),
@@ -791,16 +791,16 @@ async fn main() -> Result<()> {
         )))
     };
 
-    // Phoenix public-API trade feeder: off unless `--phoenix-ws-input-markets` is non-empty. Same
-    // shape as the HL feeder — its own failure-isolated task emitting through the shared arbiter, so
+    // Phoenix public-API trade input: off unless `--phoenix-ws-input-markets` is non-empty. Same
+    // shape as the HL input — its own failure-isolated task emitting through the shared arbiter, so
     // public trades race the edge Phoenix multicast (deduped on trade_id) and backstop it.
     let phoenix_ws_input = if args.phoenix_ws_input_markets.is_empty() {
-        info!("Phoenix public WS trade feeder disabled (no --phoenix-ws-input-markets)");
+        info!("Phoenix public WS trade input disabled (no --phoenix-ws-input-markets)");
         None
     } else {
         info!(markets = ?args.phoenix_ws_input_markets, url = %args.phoenix_ws_input_url,
-              "starting Phoenix public WS trade feeder");
-        Some(tokio::spawn(ingest::phoenix_feeder::run(
+              "starting Phoenix public WS trade input");
+        Some(tokio::spawn(ingest::phoenix_input::run(
             args.phoenix_ws_input_url.clone(),
             args.phoenix_ws_input_markets.clone(),
             arbiter.clone(),
@@ -856,7 +856,7 @@ async fn main() -> Result<()> {
     // The subscription reconciler owns market-data receivers, the WebSocket sink, and the shred
     // forwarder: it polls `doublezero status` and activates/deactivates them as the host's
     // subscriptions change (default-on with fail-open; `--subscription-gating-disable` forces the
-    // static always-on model). It loops forever, so its arm resolves only on a task panic.
+    // static always-on model). It loops forever, so its path resolves only on a task panic.
     let reconciler = tokio::spawn(
         ingest::reconcile::Reconciler::new(ingest::reconcile::ReconcilerConfig {
             tx: tx.clone(),
@@ -880,7 +880,7 @@ async fn main() -> Result<()> {
         .run(),
     );
 
-    // The reconciler, the arm sampler and the (independent, config-gated) public feeders + metrics
+    // The reconciler, the path sampler and the (independent, config-gated) public inputs + metrics
     // endpoint all loop forever; the process exits only if one of them panics or the metrics server
     // fails to bind.
     tokio::select! {
@@ -898,13 +898,13 @@ async fn main() -> Result<()> {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
-        // The metrics endpoint (when enabled) loops forever; its arm resolves only on a bind/accept
+        // The metrics endpoint (when enabled) loops forever; its path resolves only on a bind/accept
         // failure or a task panic.
         r = async { match metrics_srv {
             Some(handle) => handle.await,
             None => std::future::pending().await,
         } } => r??,
-        // The admin surface (when enabled) loops forever; its arm resolves only on a task panic or a
+        // The admin surface (when enabled) loops forever; its path resolves only on a task panic or a
         // fatal accept error (a bind failure was already handled non-fatally above).
         r = async { match admin_srv {
             Some(handle) => handle.await,
@@ -1080,8 +1080,8 @@ mod tests {
 
     /// The regression this pins: a `--publisher-port` + `--channels` combination that empties an
     /// enabled feed while both, taken alone, are valid against the whole registry. `--publisher-port`
-    /// keeps only the sports (`lashay-4`) feed's channel-10 publisher; `--channels lashay-4=11` is a
-    /// perfectly valid clause against the full 31-channel roster, but channel 11's publisher was
+    /// keeps only the sports (`edge-kalshi-sports-mbp`) feed's channel-10 publisher; `--channels edge-kalshi-sports-mbp=11` is a
+    /// perfectly valid clause against the full 31-channel published set, but channel 11's publisher was
     /// never in the narrowed `enabled` set to begin with, so it admits nothing.
     #[test]
     fn a_publisher_port_and_channel_filter_combo_that_empties_a_feed_is_refused() {
@@ -1094,7 +1094,7 @@ mod tests {
             .publishers
             .iter()
             .find(|p| p.channel == Some(10))
-            .expect("channel 10 is in the sports roster")
+            .expect("channel 10 is in the sports published set")
             .base_port();
 
         let enabled = filter_publishers(
@@ -1108,14 +1108,15 @@ mod tests {
             "only the sports feed's channel-10 publisher should remain"
         );
 
-        // Individually valid against the whole registry (11 is in the sports roster), but it names
+        // Individually valid against the whole registry (11 is in the sports published set), but it names
         // a channel that --publisher-port already excluded.
-        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=11").unwrap();
+        let filter =
+            ingest::channel_filter::ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
 
         let err = check_channel_filter_covers_enabled(&enabled, &filter)
             .expect_err("a feed left with zero admitted publishers must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("lashay-4"), "{msg}");
+        assert!(msg.contains("edge-kalshi-sports-mbp"), "{msg}");
     }
 
     /// The same combination when the filter still admits the surviving publisher must pass.
@@ -1130,7 +1131,7 @@ mod tests {
             .publishers
             .iter()
             .find(|p| p.channel == Some(10))
-            .expect("channel 10 is in the sports roster")
+            .expect("channel 10 is in the sports published set")
             .base_port();
 
         let enabled = filter_publishers(
@@ -1139,7 +1140,8 @@ mod tests {
         )
         .unwrap();
 
-        let filter = ingest::channel_filter::ChannelFilter::parse("lashay-4=10").unwrap();
+        let filter =
+            ingest::channel_filter::ChannelFilter::parse("edge-kalshi-sports-mbp=10").unwrap();
         assert!(check_channel_filter_covers_enabled(&enabled, &filter).is_ok());
     }
 }

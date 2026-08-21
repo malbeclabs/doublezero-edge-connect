@@ -26,7 +26,7 @@
 //! - **No field is fabricated to fill out the emulated envelope.** `price_increment`/
 //!   `base_increment` are derived from the instrument's own price/qty exponent (`10^exponent`);
 //!   `volume_24h`, `price_percentage_change_24h`, `base_currency_id`/`quote_currency_id` and
-//!   `quote_increment` have no honest source in this crate's reference data or its one-hour window,
+//!   `quote_increment` have no honest basis in this crate's reference data or its one-hour window,
 //!   so they are omitted rather than guessed. An absent field is safe under PROTOCOL.md's
 //!   forward-compat rule; a fabricated one silently corrupts an agent's reasoning.
 //! - **Errors carry a remedy.** Every error body names what went wrong *and* what to do about it —
@@ -236,7 +236,7 @@ fn lookup_instrument(
     state: &ApiState,
     source_id: u16,
     category: &Arc<str>,
-    channel: u32,
+    channel: u8,
     instrument_id: u32,
 ) -> Option<NormalizedInstrument> {
     let venue = venue_arc(source_label(source_id));
@@ -354,7 +354,7 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 }
 
 /// One product's identity + registry-derived fields. Carries the discrete identity fields
-/// (`source_id`/`source`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
+/// (`source_id`/`source_name`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
 /// string — an agent joining on identity should never have to re-parse the display id.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
     let pid = products::ProductId {
@@ -367,7 +367,13 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
     json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
-        "source": i.source.as_ref(),
+        "source_name": i.source_name.as_ref(),
+        // The pre-rename key, kept for one release with the identical value. Unlike a `quote`, a
+        // product entry carries no `venue` to fall back on, and the CLI is packaged and installed
+        // independently of the container it queries — `scripts/connect.sh` offers the CLI *after* the
+        // container is healthy, so the installer's own flow produces an old CLI against a new bridge.
+        // Dropping it outright makes `products list` fail there with a missing-field error.
+        "source": i.source_name.as_ref(),
         "symbol": i.symbol.as_ref(),
         "channel": i.channel,
         "instrument_id": i.instrument_id,
@@ -379,7 +385,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
 }
 
 /// `10^exponent` rendered as a decimal string — `price_increment`/`base_increment`. Derivable from
-/// the instrument's own exponent, unlike `quote_increment` (no honest source; deliberately omitted
+/// the instrument's own exponent, unlike `quote_increment` (no honest basis; deliberately omitted
 /// — see the module docs).
 fn increment_string(exponent: i8) -> String {
     decimal_string(10f64.powi(exponent as i32), exponent)
@@ -617,7 +623,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
     };
     // Falls through on an accumulator that *answered nothing*, not merely on an absent one: a market
     // holding only a bare `clear` is present and empty, and returning its `None` would shadow the
-    // `depth` entry the same frame wrote.
+    // `depth` entry the same datagram wrote.
     if let Some(levels @ (Some(_), _) | levels @ (_, Some(_))) = from_book {
         return levels;
     }
@@ -845,7 +851,7 @@ fn book_response(
 /// channel, instrument_id)`, one universe's key (see `products::resolve`'s docs for why category
 /// must be part of it: two disjoint universes under one Source ID can share `(channel,
 /// instrument_id)`).
-type ProductKey = (u16, Arc<str>, u32, u32);
+type ProductKey = (u16, Arc<str>, u8, u32);
 
 fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
     // Same discipline as `products_list`: snapshot the catalog and drop the `instruments` lock
@@ -999,7 +1005,7 @@ fn status(state: &ApiState) -> Response {
 pub(crate) fn registry_block() -> Value {
     match crate::ingest::feeds::registry_info() {
         Some(info) => json!({
-            "source": info.origin,
+            "origin": info.origin,
             "version": info.version,
             "rows": info.rows,
             "receivers": info.receivers,
@@ -1049,11 +1055,11 @@ fn symbol_prefix(symbol: &str) -> Option<&str> {
 /// so clippy's `type_complexity` lint doesn't flag the bare tuple type at every use site. The
 /// second element of the value is the true **distinct** prefix count, not the sent (possibly
 /// capped) list's length — see `symbol_prefixes_total` on [`channels_block`].
-type ChannelPrefixes = HashMap<(Arc<str>, Arc<str>, u32), (Vec<String>, usize)>;
+type ChannelPrefixes = HashMap<(Arc<str>, Arc<str>, u8), (Vec<String>, usize)>;
 
 /// Per-channel prefix -> instrument-count accumulator, keyed the same way as [`ChannelPrefixes`]
 /// — named for the same `type_complexity` reason.
-type PrefixCounts = HashMap<(Arc<str>, Arc<str>, u32), HashMap<String, usize>>;
+type PrefixCounts = HashMap<(Arc<str>, Arc<str>, u8), HashMap<String, usize>>;
 
 fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
     let mut acc: PrefixCounts = HashMap::new();
@@ -1090,9 +1096,9 @@ fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
 
 /// The `channels` block: per enabled row that carries a channel id (i.e. every row except a flat
 /// one — see `ingest::channel_filter`'s docs for why a flat row has no channel concept to narrow), the
-/// row's full channel roster with whether the filter admits it, whether a receiver is genuinely
-/// **bound** for it, and how many products it currently holds in `history::Store` — plus a total
-/// count of channels this filter excludes.
+/// row's full published set of channels with whether the filter admits it, whether a receiver is
+/// genuinely **bound** for it, and how many products it currently holds in `history::Store` — plus
+/// a total count of channels this filter excludes.
 ///
 /// "Bound" is read off the real receiver liveness (`SharedFeedHealth::liveness`, keyed exactly as
 /// the reconciler keys its own receiver map), not off `ChannelFilter::admits` alone. Task 5's admin
@@ -1111,7 +1117,7 @@ fn channels_block(state: &ApiState) -> Value {
     let filter = crate::model::lock(&state.filter).clone();
     // Computed before taking `history`'s lock, not after: `channel_symbol_prefixes` locks
     // `instruments` and walks the whole catalog, and holding `history` across that walk would block
-    // the history feeder (which appends under the same lock) for as long as the walk takes,
+    // the history writer (which appends under the same lock) for as long as the walk takes,
     // punching a hole in the rolling window `/v1` serves.
     let prefixes = channel_symbol_prefixes(state);
     let history = crate::model::lock(&state.history);
@@ -1143,7 +1149,7 @@ fn channels_block(state: &ApiState) -> Value {
             let key: crate::ingest::health::ReceiverKey =
                 (f.venue, f.category, f.kind, p.base_port());
             let bound = matches!(state.health.liveness(&key), TapeLiveness::Up);
-            let products = history.products_for(source_id, &category, channel as u32);
+            let products = history.products_for(source_id, &category, channel);
             let mut entry = json!({
                 "channel": channel,
                 "allowed": admitted,
@@ -1153,8 +1159,7 @@ fn channels_block(state: &ApiState) -> Value {
             if let Some(label) = p.label {
                 entry["label"] = json!(label);
             }
-            if let Some((names, total)) =
-                prefixes.get(&(venue.clone(), category.clone(), channel as u32))
+            if let Some((names, total)) = prefixes.get(&(venue.clone(), category.clone(), channel))
             {
                 if !names.is_empty() {
                     entry["symbol_prefixes"] = json!(names);
@@ -1354,7 +1359,7 @@ mod tests {
             feeds::{ArbitrationMode, FeedKind, FeedPorts, FeedPublisher},
             health::FeedHealth,
             processor::MbpProcessor,
-            receiver::{FrameCtx, FrameProcessor, PortRole},
+            receiver::{DatagramCtx, DatagramProcessor, PortRole},
         },
         model::{
             BookAccumulator, BookAction, BookChange, BookSide, NormalizedBook, NormalizedDepth,
@@ -1365,7 +1370,7 @@ mod tests {
         source_id: u16,
         venue: &str,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         price_exponent: i8,
         qty_exponent: i8,
@@ -1388,14 +1393,14 @@ mod tests {
         source_id: u16,
         venue: &str,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         price_exponent: i8,
         qty_exponent: i8,
     ) -> NormalizedInstrument {
         NormalizedInstrument {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -1469,7 +1474,7 @@ mod tests {
     async fn products_list_carries_discrete_identity_fields() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "perps".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32),
             inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
@@ -1483,6 +1488,8 @@ mod tests {
         let p = &products[0];
         assert_eq!(p["product_id"], "HYPERLIQUID:BTC");
         assert_eq!(p["source_id"], 1);
+        assert_eq!(p["source_name"], "HYPERLIQUID");
+        // The deprecated alias a pre-rename CLI reads, with the identical value.
         assert_eq!(p["source"], "HYPERLIQUID");
         assert_eq!(p["symbol"], "BTC");
         assert_eq!(p["channel"], 0);
@@ -1506,11 +1513,11 @@ mod tests {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         // Insertion order deliberately does not match the expected sorted order below.
         let fixtures = [
-            ("P1", 0u32, 99u32),
-            ("P5", 2u32, 5u32),
-            ("P3", 1u32, 50u32),
-            ("P2", 0u32, 3u32),
-            ("P4", 1u32, 10u32),
+            ("P1", 0u8, 99u32),
+            ("P5", 2u8, 5u32),
+            ("P3", 1u8, 50u32),
+            ("P2", 0u8, 3u32),
+            ("P4", 1u8, 10u32),
         ];
         {
             let mut map = instruments.lock().unwrap();
@@ -1550,15 +1557,15 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 1u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u8, 1u32),
                 inst(1, "HYPERLIQUID", "AAA", 0, 1, -2, -5),
             );
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 2u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u8, 2u32),
                 inst(1, "HYPERLIQUID", "BBB", 0, 2, -2, -5),
             );
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 3u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u8, 3u32),
                 inst(1, "HYPERLIQUID", "CCC", 0, 3, -2, -5),
             );
         }
@@ -1647,7 +1654,7 @@ mod tests {
     async fn an_unknown_product_404s_with_a_remedy() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
@@ -1672,7 +1679,7 @@ mod tests {
     }
 
     /// Extract the real captured `InstrumentDefinition`s for `ids` from a Market-by-Price refdata
-    /// fixture (`[u32 LE frame length][frame bytes]` records). Reimplemented in miniature rather
+    /// fixture (`[u32 LE datagram length][datagram bytes]` records). Reimplemented in miniature rather
     /// than reused from `tests/common/replay.rs`, which lives in a separate test crate this unit
     /// test cannot reach. One definition per id (the capture's periodic reannounce repeats each one
     /// across several manifest bursts; first sighting wins, matching how the real subscriber state
@@ -1686,9 +1693,9 @@ mod tests {
                 u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
                     as usize;
             off += 4;
-            let frame = &bytes[off..off + len];
+            let datagram = &bytes[off..off + len];
             off += len;
-            let Ok((_h, msgs)) = codec_mbp::decode_frame(frame) else {
+            let Ok((_h, msgs)) = codec_mbp::decode_datagram(datagram) else {
                 continue;
             };
             for m in msgs {
@@ -1710,10 +1717,10 @@ mod tests {
     /// v3 definitions), so a bare definition never reaches `InstrumentSnapshot` on its own
     /// (`ingest::processor`'s per-instrument deferral) — and the capture's own market data covers
     /// neither id (it is filtered to a different instrument), so a minimal synthetic `Trade`
-    /// reveals each one under Lashay's registered Source ID instead.
+    /// reveals each one under Kalshi's registered Source ID instead.
     fn ingest_real_mbp_collision(instruments: &InstrumentSnapshot) {
         const CHANNEL: u8 = 120;
-        const LASHAY_SOURCE_ID: u16 = 3;
+        const KALSHI_SOURCE_ID: u16 = 3;
         let defs = real_mbp_definitions("tests/fixtures/mbp.refdata.bin", &[1165, 1403]);
         assert_eq!(
             defs.len(),
@@ -1729,8 +1736,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
         let publisher = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9));
-        let ctx = |role: PortRole| FrameCtx {
-            venue: "TestLashay",
+        let ctx = |role: PortRole| DatagramCtx {
+            venue: "TestKalshi",
             category: "testcategory",
             arbiter: &arbiter,
             instruments,
@@ -1752,16 +1759,16 @@ mod tests {
         let mut refdata_msgs = vec![manifest];
         refdata_msgs.extend(defs.iter().map(codec_mbp::tests::enc_instrument_definition));
         proc.on_datagram(
-            &codec_mbp::tests::frame(CHANNEL, 0, 0, &refdata_msgs),
+            &codec_mbp::tests::datagram(CHANNEL, 0, 0, &refdata_msgs),
             &ctx(PortRole::Refdata),
         );
 
-        // A definition alone never reaches `InstrumentSnapshot`; reveal each id under Lashay's
+        // A definition alone never reaches `InstrumentSnapshot`; reveal each id under Kalshi's
         // real Source ID via a minimal `Trade` (the capture's own mktdata does not cover either).
         for (n, id) in [1165u32, 1403u32].into_iter().enumerate() {
             let reveal = codec_mbp::tests::enc_trade(&codec_mbp::Trade {
                 instrument_id: id,
-                source_id: LASHAY_SOURCE_ID,
+                source_id: KALSHI_SOURCE_ID,
                 aggressor_side: 0,
                 trade_flags: 0,
                 source_ts: 0,
@@ -1771,7 +1778,7 @@ mod tests {
                 cumulative_volume_raw: 0,
             });
             proc.on_datagram(
-                &codec_mbp::tests::frame(CHANNEL, 0, 1 + n as u64, &[reveal]),
+                &codec_mbp::tests::datagram(CHANNEL, 0, 1 + n as u64, &[reveal]),
                 &ctx(PortRole::Mktdata),
             );
         }
@@ -1843,7 +1850,7 @@ mod tests {
     async fn candles_carry_a_retention_block() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -1940,7 +1947,7 @@ mod tests {
     async fn granularity_names_map_to_the_documented_bucket_width() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -2001,7 +2008,7 @@ mod tests {
     async fn a_granularity_coarser_than_the_window_returns_a_partial_candle() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -2045,7 +2052,7 @@ mod tests {
     async fn an_unrecognised_granularity_is_rejected_with_the_accepted_values() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
@@ -2089,7 +2096,7 @@ mod tests {
     async fn malformed_limit_is_rejected_with_a_remedy() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
 
@@ -2136,14 +2143,14 @@ mod tests {
     fn book_batch(
         venue: &str,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         changes: Vec<BookChange>,
         last: bool,
     ) -> NormalizedBook {
         NormalizedBook {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id: 3,
             symbol: symbol.into(),
             channel,
@@ -2166,12 +2173,12 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 41u32),
                 inst_in("perps", 3, "KALSHI", "BASELINED", 2, 41, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), "perps".into(), 3u32, 7u32),
-                inst_in("perps", 3, "KALSHI", "MIDSTREAM", 3, 7, -4, -2),
+                ("KALSHI".into(), "perps".into(), 3u8, 7u32),
+                inst_in("perps", 3, "KALSHI", "PARTWAY", 3, 7, -4, -2),
             );
         }
         {
@@ -2201,19 +2208,19 @@ mod tests {
             assert!(baselined.baselined());
             map.insert(("KALSHI".into(), "perps".into(), 2, 41), baselined);
 
-            // A market accumulated mid-stream: no `Clear` has ever been folded in, so this holds
+            // A market accumulated partway through: no `Clear` has ever been folded in, so this holds
             // only the levels that moved since accumulation started.
-            let mut mid_stream = BookAccumulator::new("MIDSTREAM".into());
-            mid_stream.apply(&book_batch(
+            let mut partway = BookAccumulator::new("PARTWAY".into());
+            partway.apply(&book_batch(
                 "KALSHI",
-                "MIDSTREAM",
+                "PARTWAY",
                 3,
                 7,
                 vec![level_update(BookSide::Bid, 0.41, 5.0)],
                 true,
             ));
-            assert!(!mid_stream.baselined());
-            map.insert(("KALSHI".into(), "perps".into(), 3, 7), mid_stream);
+            assert!(!partway.baselined());
+            map.insert(("KALSHI".into(), "perps".into(), 3, 7), partway);
         }
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
@@ -2231,14 +2238,14 @@ mod tests {
         assert_eq!(body["pricebook"]["bids"][0][0], "0.6100");
         assert_eq!(body["pricebook"]["asks"][0][0], "0.6300");
 
-        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:MIDSTREAM%233.7/book"))
+        let resp = reqwest::get(format!("{base}/v1/products/KALSHI:PARTWAY%233.7/book"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(
             body["coverage"]["complete"], false,
-            "a mid-stream accumulator must never claim completeness it cannot back: {body}"
+            "an accumulator seeded partway through must never claim completeness it cannot back: {body}"
         );
     }
 
@@ -2251,7 +2258,7 @@ mod tests {
     async fn book_caps_levels_per_side_and_reports_the_cap_as_incomplete() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "perps".into(), 5u32, 1u32),
+            ("KALSHI".into(), "perps".into(), 5u8, 1u32),
             inst_in("perps", 3, "KALSHI", "BIGBOOK", 5, 1, -4, -2),
         );
         {
@@ -2312,7 +2319,7 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u32, 1u32),
+            ("HUGE".into(), "perps".into(), 9u8, 1u32),
             inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2),
         );
         {
@@ -2373,7 +2380,7 @@ mod tests {
         );
     }
 
-    /// A `BookSnapshot` entry that answers *nothing* must not shadow the `depth` entry the same frame
+    /// A `BookSnapshot` entry that answers *nothing* must not shadow the `depth` entry the same datagram
     /// wrote. Returning on the accumulator's mere presence, a market re-baselined by a bare `clear` —
     /// present, baselined and empty — reports a null inside market while the top-N slice beside it
     /// holds one.
@@ -2381,7 +2388,7 @@ mod tests {
     fn an_empty_accumulator_does_not_shadow_the_depth_snapshot() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+            ("KALSHI".into(), "perps".into(), 2u8, 41u32),
             inst_in("perps", 3, "KALSHI", "EMPTYACC", 2, 41, -4, -2),
         );
         {
@@ -2413,7 +2420,7 @@ mod tests {
             ("KALSHI".into(), "EMPTYACC".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "EMPTYACC".into(),
                 bids: vec![[0.61, 100.0]],
@@ -2450,12 +2457,12 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 41u32),
                 inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 41, -4, -2),
             );
             // A second instrument the publisher's 16-byte symbol field truncated to the same label.
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 42u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 42u32),
                 inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 42, -4, -2),
             );
         }
@@ -2463,7 +2470,7 @@ mod tests {
             ("KALSHI".into(), "COLLIDE".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "COLLIDE".into(),
                 bids: vec![[0.61, 100.0]],
@@ -2508,18 +2515,18 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u32, 1u32),
+            ("HUGE".into(), "perps".into(), 9u8, 1u32),
             inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2),
         );
         depth.lock().unwrap().insert(
             ("HUGE".into(), "HUGEL3".into()),
             NormalizedDepth {
                 venue: "HUGE".into(),
-                source: "HUGE".into(),
+                source_name: "HUGE".into(),
                 source_id: 3,
                 symbol: "HUGEL3".into(),
                 // Deliberately unequal to the accumulator's own best bid (1.0) and best ask (it has
-                // none), so the assertion below says *which* source answered rather than only that
+                // none), so the assertion below says *which* book answered rather than only that
                 // some answer came back.
                 bids: vec![[0.5, 7.0]],
                 asks: vec![[2.0, 1.0]],
@@ -2605,11 +2612,11 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 9u32, 1u32),
+                ("KALSHI".into(), "perps".into(), 9u8, 1u32),
                 inst_in("perps", 3, "KALSHI", "PERPMKT", 9, 1, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), "sports".into(), 9u32, 1u32),
+                ("KALSHI".into(), "sports".into(), 9u8, 1u32),
                 inst_in("sports", 3, "KALSHI", "SPORTSMKT", 9, 1, -4, -2),
             );
         }
@@ -2713,7 +2720,7 @@ mod tests {
     async fn an_order_level_market_is_served_as_orders_not_as_an_empty_price_book() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+            ("KALSHI".into(), "perps".into(), 2u8, 41u32),
             inst_in("perps", 3, "KALSHI", "L3MKT", 2, 41, -4, -2),
         );
         // A Market-by-Order feed publishes `depth` alongside its `book`, and that top-N slice is what
@@ -2724,7 +2731,7 @@ mod tests {
             ("KALSHI".into(), "L3MKT".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "L3MKT".into(),
                 bids: vec![[0.61, 140.0], [0.60, 10.0]],
@@ -2811,14 +2818,14 @@ mod tests {
     async fn book_falls_back_to_market_by_order_depth_when_no_accumulator_exists() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         depth.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -2854,7 +2861,7 @@ mod tests {
     async fn book_market_by_order_depth_at_the_wire_cap_is_not_reported_complete() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let bids: Vec<[f64; 2]> = (0..DEPTH_LEVELS).map(|i| [100.0 - i as f64, 1.0]).collect();
@@ -2863,7 +2870,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids,
@@ -2900,7 +2907,7 @@ mod tests {
     async fn product_detail_returns_the_full_entry() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("PHOENIX".into(), "spot".into(), 0u32, 7u32),
+            ("PHOENIX".into(), "spot".into(), 0u8, 7u32),
             inst_in("spot", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
         health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
@@ -2928,7 +2935,7 @@ mod tests {
     async fn ticker_returns_recent_trades_and_best_levels() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let now = crate::model::now_ns() / 1_000_000_000;
@@ -2961,7 +2968,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[99.5, 3.0]],
@@ -2998,12 +3005,12 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 41u32),
                 inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 41, -4, -2),
             );
             // A second instrument the publisher's 16-byte symbol field truncated to the same label.
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 42u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 42u32),
                 inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 42, -4, -2),
             );
         }
@@ -3025,7 +3032,7 @@ mod tests {
             ("KALSHI".into(), "COLLIDE".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "COLLIDE".into(),
                 bids: vec![[0.61, 100.0]],
@@ -3060,28 +3067,28 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
                 inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), "default".into(), 0u32, 7u32),
+                ("PHOENIX".into(), "default".into(), 0u8, 7u32),
                 inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
             );
             map.insert(
-                ("KALSHI".into(), "perps".into(), 9u32, 1u32),
+                ("KALSHI".into(), "perps".into(), 9u8, 1u32),
                 inst_in("perps", 3, "KALSHI", "KXBTCPERP", 9, 1, -4, -2),
             );
         }
         // Hyperliquid:BTC has a depth entry (a derivable best level); Phoenix:SOL has neither a
         // book nor a depth entry, so nothing is derivable for it — it must be omitted entirely,
-        // never reported with a fabricated/zeroed level. Lashay:KXBTCPERP has a `BookAccumulator`
+        // never reported with a fabricated/zeroed level. Kalshi:KXBTCPERP has a `BookAccumulator`
         // entry instead, exercising `BookAccumulator::{best_bid, best_ask}` (not just the depth
         // fallback every other case here goes through).
         depth.lock().unwrap().insert(
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -3141,16 +3148,16 @@ mod tests {
             .expect("Hyperliquid:BTC present");
         assert_eq!(hl["bids"][0][0], "100.00");
         assert_eq!(hl["asks"][0][0], "101.00");
-        let lashay = pricebooks
+        let kalshi = pricebooks
             .iter()
             .find(|p| p["product_id"] == "KALSHI:KXBTCPERP")
-            .expect("Lashay:KXBTCPERP present");
+            .expect("Kalshi:KXBTCPERP present");
         assert_eq!(
-            lashay["bids"][0][0], "0.6100",
+            kalshi["bids"][0][0], "0.6100",
             "from BookAccumulator::best_bid, not depth"
         );
         assert_eq!(
-            lashay["asks"][0][0], "0.6300",
+            kalshi["asks"][0][0], "0.6300",
             "from BookAccumulator::best_ask, not depth"
         );
     }
@@ -3168,17 +3175,17 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 41u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 41u32),
                 inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 41, -4, -2),
             );
             // A second instrument the publisher's 16-byte symbol field truncated to the same label.
             map.insert(
-                ("KALSHI".into(), "perps".into(), 2u32, 42u32),
+                ("KALSHI".into(), "perps".into(), 2u8, 42u32),
                 inst_in("perps", 3, "KALSHI", "COLLIDE", 2, 42, -4, -2),
             );
             // An unambiguous third product, so an empty `pricebooks` cannot pass this by accident.
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
                 inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
             );
         }
@@ -3186,7 +3193,7 @@ mod tests {
             ("KALSHI".into(), "COLLIDE".into()),
             NormalizedDepth {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "COLLIDE".into(),
                 bids: vec![[0.61, 100.0]],
@@ -3201,7 +3208,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -3239,11 +3246,11 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+                ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
                 inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), "default".into(), 0u32, 7u32),
+                ("PHOENIX".into(), "default".into(), 0u8, 7u32),
                 inst(2, "PHOENIX", "SOL", 0, 7, -3, -4),
             );
         }
@@ -3251,7 +3258,7 @@ mod tests {
             ("HYPERLIQUID".into(), "BTC".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "BTC".into(),
                 bids: vec![[100.0, 1.0]],
@@ -3266,7 +3273,7 @@ mod tests {
             ("PHOENIX".into(), "SOL".into()),
             NormalizedDepth {
                 venue: "PHOENIX".into(),
-                source: "PHOENIX".into(),
+                source_name: "PHOENIX".into(),
                 source_id: 2,
                 symbol: "SOL".into(),
                 bids: vec![[10.0, 1.0]],
@@ -3407,7 +3414,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         let r = &body["registry"];
-        assert_eq!(r["source"], expected.origin);
+        assert_eq!(r["origin"], expected.origin);
         assert_eq!(r["version"], expected.version);
         assert_eq!(r["rows"], expected.rows);
         assert_eq!(r["receivers"], expected.receivers);
@@ -3415,12 +3422,12 @@ mod tests {
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
-    /// registry rung filtered by `(venue, category)` — Lashay's `sports` category carries exactly
+    /// registry rung filtered by `(venue, category)` — Kalshi's `sports` category carries exactly
     /// one `FEEDS` kind and resolves it, same as Phoenix's single-category venue; and `"unknown"`
-    /// — never a guess — for Lashay's `perps` category, which genuinely carries two (Top-of-Book +
+    /// — never a guess — for Kalshi's `perps` category, which genuinely carries two (Top-of-Book +
     /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
     /// category per venue could not express the difference the `(venue, category)` filter makes:
-    /// a venue-wide filter would see Lashay's four rows together (three kinds across two
+    /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
     /// categories) and report `"unknown"` for `sports` too, which would be a false negative for
     /// the very venue this fix targets.
     #[tokio::test]
@@ -3429,23 +3436,23 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 9u32, 1u32),
+                ("KALSHI".into(), "perps".into(), 9u8, 1u32),
                 inst_in("perps", 3, "KALSHI", "BOOKED", 9, 1, -4, -2),
             );
             map.insert(
-                ("HYPERLIQUID".into(), "perps".into(), 0u32, 2u32),
+                ("HYPERLIQUID".into(), "perps".into(), 0u8, 2u32),
                 inst_in("perps", 1, "HYPERLIQUID", "DEPTHED", 0, 2, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), "spot".into(), 0u32, 3u32),
+                ("PHOENIX".into(), "spot".into(), 0u8, 3u32),
                 inst_in("spot", 2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
             );
             map.insert(
-                ("KALSHI".into(), "perps".into(), 9u32, 4u32),
+                ("KALSHI".into(), "perps".into(), 9u8, 4u32),
                 inst_in("perps", 3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), "sports".into(), 20u32, 5u32),
+                ("KALSHI".into(), "sports".into(), 20u8, 5u32),
                 inst_in("sports", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
             );
         }
@@ -3457,7 +3464,7 @@ mod tests {
             ("HYPERLIQUID".into(), "DEPTHED".into()),
             NormalizedDepth {
                 venue: "HYPERLIQUID".into(),
-                source: "HYPERLIQUID".into(),
+                source_name: "HYPERLIQUID".into(),
                 source_id: 1,
                 symbol: "DEPTHED".into(),
                 bids: Vec::new(),
@@ -3500,13 +3507,13 @@ mod tests {
         assert_eq!(
             kind_of("UNRESOLVED"),
             "unknown",
-            "Lashay's perps category genuinely has two FEEDS kinds and no evidence yet for this \
+            "Kalshi's perps category genuinely has two FEEDS kinds and no evidence yet for this \
              identity — never guess"
         );
         assert_eq!(
             kind_of("SINGLE_CATEGORY"),
             "market_by_price",
-            "Lashay's sports category has exactly one FEEDS kind, distinct from its ambiguous \
+            "Kalshi's sports category has exactly one FEEDS kind, distinct from its ambiguous \
              perps category on the same venue"
         );
     }
@@ -3532,7 +3539,7 @@ mod tests {
     async fn unknown_subresource_404s_with_a_remedy() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             inst(1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
         );
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
@@ -3560,11 +3567,11 @@ mod tests {
     fn colliding_snapshot() -> InstrumentSnapshot {
         let mut map = HashMap::new();
         map.insert(
-            ("KALSHI".into(), "default".into(), 2u32, 41u32),
+            ("KALSHI".into(), "default".into(), 2u8, 41u32),
             inst(3, "KALSHI", "KXBTCPERP", 2, 41, -4, -2),
         );
         map.insert(
-            ("KALSHI".into(), "default".into(), 3u32, 99u32),
+            ("KALSHI".into(), "default".into(), 3u8, 99u32),
             inst(3, "KALSHI", "KXBTCPERP", 3, 99, -4, -2),
         );
         Arc::new(Mutex::new(map))
@@ -3654,7 +3661,7 @@ mod tests {
     // /v1/status: history, channels and process blocks (Task 6)
     // -----------------------------------------------------------------------------------------
 
-    /// The real built-in "sports" row (group code `lashay-4`) — a genuinely derived, multi-channel
+    /// The real built-in "sports" row (group code `edge-kalshi-sports-mbp`) — a genuinely derived, multi-channel
     /// row, matching `sinks::admin`'s and `ingest::channel_filter`'s own tests. Using the real row (rather
     /// than a hand-built one) is what lets a real `ChannelFilter::parse` spec actually narrow it.
     fn sports_row() -> Feed {
@@ -3758,9 +3765,11 @@ mod tests {
     async fn status_channels_block_distinguishes_admission_from_real_liveness() {
         let (instruments, depth, books, history, health, _filter, _enabled) = empty_state();
         let row = sports_row();
-        // Admits channels 10 and 11 of the sports row's 31-channel roster; every other channel
+        // Admits channels 10 and 11 of the sports row's 31-channel published set; every other channel
         // (12 included) is excluded by the filter.
-        let filter = Arc::new(Mutex::new(ChannelFilter::parse("lashay-4=10,11").unwrap()));
+        let filter = Arc::new(Mutex::new(
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
+        ));
         let enabled = vec![row];
 
         // Channel 10: admitted AND a receiver has genuinely registered up.
@@ -3817,7 +3826,7 @@ mod tests {
         let row_json = &rows[0];
         assert_eq!(row_json["venue"], "KALSHI");
         assert_eq!(row_json["category"], "sports");
-        assert_eq!(row_json["code"], "lashay-4");
+        assert_eq!(row_json["code"], "edge-kalshi-sports-mbp");
 
         let channels = row_json["channels"].as_array().unwrap();
         let find = |id: u64| -> &Value {
@@ -3850,7 +3859,7 @@ mod tests {
 
         assert_eq!(
             row_json["excluded"], 29,
-            "31-channel roster minus the 2 admitted: {row_json}"
+            "31-channel published set minus the 2 admitted: {row_json}"
         );
         assert_eq!(
             body["channels"]["excluded_by_filter"], 29,
@@ -3874,8 +3883,8 @@ mod tests {
             p["resident_memory_bytes"].as_f64().unwrap_or(0.0) > 0.0,
             "a running process must report positive resident memory: {p}"
         );
-        // A bare `is_number()` type check passes even if `process_metric`'s `COUNTER` arm were
-        // hardcoded to `Some(0.0)` — only the `GAUGE` arm above was ever revert-tested. By the time
+        // A bare `is_number()` type check passes even if `process_metric`'s `COUNTER` branch were
+        // hardcoded to `Some(0.0)` — only the `GAUGE` branch above was ever revert-tested. By the time
         // this test runs the process has executed the harness plus every test ahead of it in this
         // binary, so its cumulative CPU time is a real, positive sample, not a granularity artifact.
         assert!(
@@ -3890,7 +3899,7 @@ mod tests {
 
     /// One `derived`-shaped publisher for a test `Feed` row, carrying a channel id and (optionally)
     /// a display label — the server-side counterpart of what `ingest::registry::expand` produces
-    /// from a document roster.
+    /// from a document published set.
     fn channel_pub(base: u16, channel: u8, label: Option<&'static str>) -> FeedPublisher {
         FeedPublisher {
             ports: FeedPorts::ThreePort {
@@ -3956,7 +3965,7 @@ mod tests {
         {
             let mut map = instruments.lock().unwrap();
             map.insert(
-                ("KALSHI".into(), "perps".into(), 10u32, 1u32),
+                ("KALSHI".into(), "perps".into(), 10u8, 1u32),
                 inst_in(
                     "perps",
                     3,
@@ -3969,7 +3978,7 @@ mod tests {
                 ),
             );
             map.insert(
-                ("KALSHI".into(), "perps".into(), 10u32, 2u32),
+                ("KALSHI".into(), "perps".into(), 10u8, 2u32),
                 inst_in(
                     "perps",
                     3,
@@ -3982,7 +3991,7 @@ mod tests {
                 ),
             );
             map.insert(
-                ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+                ("KALSHI".into(), "sports".into(), 10u8, 1u32),
                 inst_in("sports", 3, "KALSHI", "KXUFC-300", 10, 1, -4, -2),
             );
         }
@@ -4062,7 +4071,7 @@ mod tests {
             // The dominant prefix: 50 instruments, sorts alphabetically last.
             for i in 0..50u32 {
                 map.insert(
-                    ("KALSHI".into(), "perps".into(), 20u32, i),
+                    ("KALSHI".into(), "perps".into(), 20u8, i),
                     inst_in(
                         "perps",
                         3,
@@ -4079,7 +4088,7 @@ mod tests {
             // the dominant one.
             for i in 0..8u32 {
                 map.insert(
-                    ("KALSHI".into(), "perps".into(), 20u32, 100 + i),
+                    ("KALSHI".into(), "perps".into(), 20u8, 100 + i),
                     inst_in(
                         "perps",
                         3,
@@ -4149,7 +4158,7 @@ mod tests {
             let mut map = instruments.lock().unwrap();
             for i in 0..3u32 {
                 map.insert(
-                    ("KALSHI".into(), "perps".into(), 21u32, i),
+                    ("KALSHI".into(), "perps".into(), 21u8, i),
                     inst_in("perps", 3, "KALSHI", &format!("Q{i}-X"), 21, i, -4, -2),
                 );
             }
@@ -4184,7 +4193,7 @@ mod tests {
 
     /// `channels_block` must compute `channel_symbol_prefixes` (which locks `instruments`) *before*
     /// taking `history`'s lock. Locking `history` first and walking the catalog while still holding
-    /// it (the bug) blocks the history feeder — which appends under that same lock — for as long as
+    /// it (the bug) blocks the history writer — which appends under that same lock — for as long as
     /// the walk takes, punching a hole in the rolling window `/v1` serves.
     ///
     /// Proven with a forced, deterministic block rather than timing: this thread holds

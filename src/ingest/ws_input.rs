@@ -1,19 +1,19 @@
-//! Hyperliquid **public** WebSocket input feeder — the first [`PublicVenue`] backstop, off by
+//! Hyperliquid **public** WebSocket input — the first [`PublicVenue`] backstop, off by
 //! default.
 //!
 //! It connects to Hyperliquid's own `wss://api.hyperliquid.xyz/ws`, subscribes `bbo` + `trades` per
 //! configured coin, decodes the JSON into the same `FeedMessage`s the multicast pipeline produces,
-//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. The
-//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_feeder`];
+//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. The
+//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_input`];
 //! this module owns only the Hyperliquid wire decode.
 //!
 //! **Precision before price.** Each public quote/trade is gated on its `(venue, symbol)` instrument
-//! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata stream).
+//! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata feed).
 //! The realistic backstop scenario is edge refdata healthy while mktdata stalls; a standalone public
 //! feed with no edge refdata ever is a documented limitation (it would emit nothing).
 //!
 //! ⚠️ Decimal-string px/sz are parsed straight to real-unit `f64`s — the same unit space the edge
-//! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-source
+//! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-transport
 //! dedup is decided by publisher leadership per tick, never by content equality (see the arbiter).
 
 use serde::Deserialize;
@@ -21,8 +21,8 @@ use tracing::warn;
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
+        arbiter::{lock, SharedArbiter, Transport},
+        public_input::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
@@ -54,7 +54,7 @@ fn hl_venue() -> &'static str {
 /// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
 /// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
 /// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
-/// backstop its own universe rather than another arm of the same one, and the gate would stop
+/// backstop its own universe rather than another path of the same one, and the gate would stop
 /// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
 /// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
 /// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.
@@ -94,7 +94,7 @@ struct Level {
 }
 
 /// A `trades` payload element. `tid` is Hyperliquid's trade id — the same value the edge feed carries
-/// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-source copies on it.
+/// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-transport copies on it.
 #[derive(Deserialize)]
 struct TradeData {
     coin: String,
@@ -138,9 +138,9 @@ impl PublicVenue for HyperliquidVenue {
     }
 }
 
-/// Run the Hyperliquid public WS input feeder forever (reconnecting on any failure). Returns
-/// immediately as a no-op when `coins` is empty (the feeder is off by default). Thin wrapper over the
-/// venue-generic [`public_feeder::run`].
+/// Run the Hyperliquid public WS input forever (reconnecting on any failure). Returns
+/// immediately as a no-op when `coins` is empty (the input is off by default). Thin wrapper over the
+/// venue-generic [`public_input::run`].
 pub async fn run(
     url: String,
     coins: Vec<String>,
@@ -157,7 +157,7 @@ pub async fn run(
              some subscriptions may be rejected"
         );
     }
-    public_feeder::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
+    public_input::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
 }
 
 /// Decode one text frame and emit any resulting quote/trade. Unknown channels (e.g.
@@ -167,7 +167,7 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
         Ok(e) => e,
         Err(e) => {
             metrics()
-                .ws_feeder_decode_errors
+                .ws_input_decode_errors
                 .with_label_values(&[hl_venue()])
                 .inc();
             tracing::debug!(error = %e, "public WS: undecodable frame ignored");
@@ -233,7 +233,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     };
     let quote = NormalizedQuote {
         venue: venue_arc(hl_venue()),
-        source: venue_arc(hl_venue()),
+        source_name: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: d.coin.into(),
         bid: bid_px,
@@ -248,10 +248,10 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
     };
     metrics()
-        .ws_feeder_messages
+        .ws_input_messages
         .with_label_values(&[hl_venue(), "quote"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs, HL_CATEGORY);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Transport::PublicWs, HL_CATEGORY);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
@@ -270,7 +270,7 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
     };
     let trade = NormalizedTrade {
         venue: venue_arc(hl_venue()),
-        source: venue_arc(hl_venue()),
+        source_name: venue_arc(hl_venue()),
         source_id: HL_SOURCE_ID,
         symbol: t.coin.into(),
         channel,
@@ -292,10 +292,10 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         ws_send_ts_ns: 0,
     };
     metrics()
-        .ws_feeder_messages
+        .ws_input_messages
         .with_label_values(&[hl_venue(), "trade"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs, HL_CATEGORY);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Transport::PublicWs, HL_CATEGORY);
 }
 
 #[cfg(test)]
@@ -310,7 +310,7 @@ mod tests {
     use super::*;
 
     /// [`HL_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
-    /// venue's top-of-book row, the source of both the quotes and the prints it emits.
+    /// venue's top-of-book row, the row that carries both the quotes and the prints it emits.
     ///
     /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
     /// universes is the case `Feed::category` exists to express, so that assertion would fail a
@@ -335,10 +335,10 @@ mod tests {
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (hl_venue().into(), HL_CATEGORY.into(), 0u32, 1u32),
+            (hl_venue().into(), HL_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
                 venue: hl_venue().into(),
-                source: hl_venue().into(),
+                source_name: hl_venue().into(),
                 source_id: 0,
                 symbol: symbol.into(),
                 channel: 0,
@@ -516,7 +516,7 @@ mod tests {
     /// The backstop must name itself the way the edge does, or one market becomes two keys in the
     /// arbiter's `(venue, symbol)` dedup floor and both copies reach the wire.
     #[test]
-    fn a_public_feeder_labels_itself_from_the_registry() {
+    fn a_public_input_labels_itself_from_the_registry() {
         let hl = HyperliquidVenue {
             url: DEFAULT_WS_INPUT_URL.to_string(),
             coins: vec!["BTC".to_string()],

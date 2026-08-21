@@ -10,7 +10,8 @@
       "price_increment": "0.01",
       "base_increment": "0.00001",
       "status": "online",
-      "feed_kind": "top_of_book"
+      "feed_kind": "top_of_book",
+      "source": "Hyperliquid"
     },
     {
       "product_id": "HYPERLIQUID:ETH",
@@ -22,7 +23,8 @@
       "price_increment": "0.001",
       "base_increment": "0.0001",
       "status": "offline",
-      "feed_kind": "top_of_book"
+      "feed_kind": "top_of_book",
+      "source": "Hyperliquid"
     },
     {
       "product_id": "KALSHI:EAVE-27JAN01-YES#120.1165",
@@ -34,7 +36,8 @@
       "price_increment": "0.01",
       "base_increment": "1",
       "status": "online",
-      "feed_kind": "market_by_price"
+      "feed_kind": "market_by_price",
+      "source": "Kalshi"
     }
   ]
 }

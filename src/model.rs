@@ -75,15 +75,15 @@ fn intern_static(
         .clone()
 }
 
-/// Serde default for `source` on payloads written before the field existed. `Arc<str>` has no
+/// Serde default for `source_name` on payloads written before the field existed. `Arc<str>` has no
 /// `Default`, so the field needs an explicit default function rather than `#[serde(default)]`.
-pub fn empty_source() -> Arc<str> {
+pub fn empty_source_name() -> Arc<str> {
     Arc::from("")
 }
 
 /// Default for the producer-side-only `category` field carried by [`NormalizedInstrument`] and
 /// [`NormalizedTrade`] (`#[serde(skip)]` — see their docs for why it must never reach the wire).
-/// `Arc<str>` has no `Default`, so this needs the same explicit function [`empty_source`] does.
+/// `Arc<str>` has no `Default`, so this needs the same explicit function [`empty_source_name`] does.
 pub fn empty_category() -> Arc<str> {
     Arc::from("")
 }
@@ -92,12 +92,12 @@ pub fn empty_category() -> Arc<str> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedQuote {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -105,17 +105,17 @@ pub struct NormalizedQuote {
     pub ask: f64,
     pub bid_size: f64,
     pub ask_size: f64,
-    /// Orders/sources at the best bid/ask ("Bid/Ask Source Count" in the edge-feed-spec TOB; the
+    /// The count at the best bid/ask ("Bid/Ask Source Count" in the edge-feed-spec TOB; the
     /// canonical `bbo_hash` `bid_n`/`ask_n`). 0 when the venue does not report it. Part of the
     /// top-of-book identity, so a change here is a distinct quote even at an unchanged price/size.
     #[serde(default)]
     pub bid_n: u16,
     #[serde(default)]
     pub ask_n: u16,
-    /// Venue/source timestamp (nanoseconds since epoch), 0 if unknown.
+    /// Venue timestamp (nanoseconds since epoch), 0 if unknown.
     pub source_ts_ns: u64,
     /// When the bridge received it (user-space wall clock, nanoseconds since epoch).
-    /// Taken *after* frame decode - kept for the kernel-vs-userspace jitter comparison.
+    /// Taken *after* datagram decode - kept for the kernel-vs-userspace jitter comparison.
     pub recv_ts_ns: u64,
     /// Kernel software RX timestamp from `SO_TIMESTAMPNS` (CLOCK_REALTIME nanoseconds),
     /// captured in the driver softirq *before* user-space. 0 when unavailable (e.g. the
@@ -136,29 +136,29 @@ pub struct NormalizedQuote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedTrade {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this feed carries. Filterable. `0` for a
-    /// source whose wire has no channel concept of its own (the public WS backstops) — see
-    /// `ingest::public_feeder::resolve_instrument`, which resolves the real value from the edge
+    /// upstream source whose wire has no channel concept of its own (the public WS backstops) — see
+    /// `ingest::public_input::resolve_instrument`, which resolves the real value from the edge
     /// catalog instead where one exists.
     #[serde(default)]
-    pub channel: u32,
+    pub channel: u8,
     /// Instrument id, unique within `channel`. Additive alongside `channel` (see its doc): together
     /// they are the identity `history::Key` groups on, closing the gap that let a price-aggregated
-    /// venue's mirrored arms (identical instrument set, distinct `channel`) drop every trade rather
-    /// than risk misattributing one to the wrong arm.
+    /// venue's mirrored paths (identical instrument set, distinct `channel`) drop every trade rather
+    /// than risk misattributing one to the wrong path.
     #[serde(default)]
     pub instrument_id: u32,
     /// The instrument **universe** this trade's row carries (`ingest::feeds::Feed::category`),
-    /// stamped by the emitting processor from its `FrameCtx::category` and read back by
+    /// stamped by the emitting processor from its `DatagramCtx::category` and read back by
     /// `ingest::reconcile::feed_history` to key `history::Key` on the same grain
     /// `model::BookKey`/`authority::MarketKey` already use. Producer-side only: two disjoint
     /// universes under one Source ID can share `(channel, instrument_id)`, so without this a
@@ -175,9 +175,9 @@ pub struct NormalizedTrade {
     pub trade_id: u64,
     /// Session cumulative traded volume reported by the venue (decimal), 0 if not provided.
     pub cumulative_volume: f64,
-    /// Venue/source timestamp (nanoseconds since epoch), 0 if unknown.
+    /// Venue timestamp (nanoseconds since epoch), 0 if unknown.
     pub source_ts_ns: u64,
-    /// When the bridge received it (user-space wall clock, ns since epoch), after frame decode.
+    /// When the bridge received it (user-space wall clock, ns since epoch), after datagram decode.
     pub recv_ts_ns: u64,
     /// Kernel software RX timestamp from `SO_TIMESTAMPNS` (CLOCK_REALTIME ns), 0 when unavailable.
     #[serde(default)]
@@ -187,17 +187,17 @@ pub struct NormalizedTrade {
     pub ws_send_ts_ns: u64,
 }
 
-/// A normalized derived mid price for an instrument (from the Midpoint sibling feed). Like a
+/// A normalized derived mid price for an instrument (from the Midpoint feed). Like a
 /// quote it is full state per instrument (the latest mid), so it self-heals on the next message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedMidpoint {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -210,7 +210,7 @@ pub struct NormalizedMidpoint {
     pub book_ts_ns: u64,
     /// When the publisher computed the mid (ns since epoch), 0 if unknown.
     pub compute_ts_ns: u64,
-    /// When the bridge received it (user-space wall clock, ns since epoch), after frame decode.
+    /// When the bridge received it (user-space wall clock, ns since epoch), after datagram decode.
     pub recv_ts_ns: u64,
     /// Kernel software RX timestamp from `SO_TIMESTAMPNS` (CLOCK_REALTIME ns), 0 when unavailable.
     #[serde(default)]
@@ -227,12 +227,12 @@ pub struct NormalizedMidpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedDepth {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
@@ -293,7 +293,7 @@ pub struct BookChange {
 }
 
 /// A batch of price-level changes for one instrument — the incremental order-book product, derived
-/// in the bridge from the Market-by-Price feed's snapshot+delta stream.
+/// in the bridge from the Market-by-Price feed's snapshots and deltas.
 ///
 /// **`(venue, channel, instrument_id)` is the identity; `symbol` is a display label.** The wire
 /// `symbol` is a fixed 16-byte field the publisher fills by keeping the rightmost 16 bytes of the
@@ -302,22 +302,22 @@ pub struct BookChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedBook {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     /// Display label. Not unique in general — see the type docs.
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this feed carries. Filterable.
-    pub channel: u32,
+    pub channel: u8,
     /// Instrument id, unique within `channel`.
     pub instrument_id: u32,
     /// The instrument **universe** this batch's row carries, stamped by the emitting processor from
-    /// its `FrameCtx::category` — the same field, for the same reason, as
+    /// its `DatagramCtx::category` — the same field, for the same reason, as
     /// [`NormalizedInstrument::category`]: it completes the [`BookKey`] a sink needs to resolve this
     /// batch's market in [`BookSnapshot`]. Never serialized.
     #[serde(skip, default = "empty_category")]
@@ -357,24 +357,24 @@ pub struct NormalizedBook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedInstrument {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     pub symbol: Arc<str>,
     /// The publisher's `channel_id`: the instrument set this definition came from. Filterable.
     #[serde(default)]
-    pub channel: u32,
+    pub channel: u8,
     /// Instrument id, unique within `channel`.
     #[serde(default)]
     pub instrument_id: u32,
     /// The instrument **universe** this definition's row carries
     /// (`ingest::feeds::Feed::category`), stamped by the emitting processor from its
-    /// `FrameCtx::category`. Part of `InstrumentSnapshot`'s key (see there) for the same reason
+    /// `DatagramCtx::category`. Part of `InstrumentSnapshot`'s key (see there) for the same reason
     /// `BookKey` already carries it: two disjoint universes under one Source ID can share
     /// `(channel, instrument_id)`, and a category-blind catalog either overwrites one universe's
     /// definition with the other's or, on lookup, resolves the wrong one. Never serialized —
@@ -388,17 +388,17 @@ pub struct NormalizedInstrument {
 
 /// A venue-level feed-health status (the PROTOCOL.md `status` candidate extension). Emitted when
 /// the bridge's quote (mktdata) multicast for a venue goes silent past the idle watchdog, and
-/// again when quotes recover - so consumers can gray out / restore that source. Carries no symbol
+/// again when quotes recover - so consumers can gray out / restore that upstream source. Carries no symbol
 /// (it is about the whole venue feed); consumers ignoring unknown `type`s skip it harmlessly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedStatus {
     pub venue: Arc<str>,
-    /// The source this message came from — the registry name for `source_id`. Always equal to
+    /// The upstream source this message came from — the registry name for `source_id`. Always equal to
     /// `venue`, which it replaces; `venue` is deprecated and removed at a future break.
-    #[serde(default = "empty_source")]
-    pub source: Arc<str>,
+    #[serde(default = "empty_source_name")]
+    pub source_name: Arc<str>,
     /// The wire Source ID, verbatim — passed through unmodified from what the publisher stamped,
-    /// or `0` when the feed names no registry row. `source` is that ID's registry name.
+    /// or `0` when the feed names no registry row. `source_name` is that ID's registry name.
     #[serde(default)]
     pub source_id: u16,
     /// `"down"` when the quote feed has gone silent, `"ok"` once quotes flow again.
@@ -452,7 +452,7 @@ impl FeedMessage {
     /// The `channel_id` this message is about, for per-channel subscription filtering. The
     /// incremental `book` product and the `instrument` definition that scales it carry one; every
     /// other type is venue/symbol-scoped.
-    pub fn channel(&self) -> Option<u32> {
+    pub fn channel(&self) -> Option<u8> {
         match self {
             FeedMessage::Book(b) | FeedMessage::OrderBook(b) => Some(b.channel),
             FeedMessage::Instrument(i) => Some(i.channel),
@@ -464,7 +464,7 @@ impl FeedMessage {
 /// Latest known instrument definitions, keyed by `(venue, category, channel, instrument_id)`,
 /// shared between the receivers (which update it) and the WebSocket server (which replays it to
 /// each new subscriber so reference data arrives before quotes - otherwise a client that connects
-/// mid-stream sees a quote first and has to guess the price/qty precision).
+/// partway through sees a quote first and has to guess the price/qty precision).
 ///
 /// The key is [`NormalizedBook`]/[`NormalizedInstrument`]'s wire identity triple **prefixed with
 /// the arbitration scope** (`category`), exactly [`BookKey`]/`ingest::authority::MarketKey` —
@@ -488,7 +488,7 @@ impl FeedMessage {
 /// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
 /// diverge.
 pub type InstrumentSnapshot =
-    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u32, u32), NormalizedInstrument>>>;
+    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
@@ -535,10 +535,10 @@ pub type CountedLevel = (f64, f64, u32);
 /// How much detail a replayed `book` re-baseline carries.
 ///
 /// **Unset follows the market**, which is what a consumer needs by default: a bootstrap of price levels
-/// followed by a live stream of order-level changes cannot be reconciled at all — each change carries one
+/// followed by a live feed of order-level changes cannot be reconciled at all — each change carries one
 /// *order's* absolute size, and applying it as a level's size corrupts the book — so the granularity has
 /// to match what the market streams. Asking for `Levels` on an order-level market is therefore only
-/// useful to a consumer that folds the stream itself.
+/// useful to a consumer that folds the feed itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplayScope {
@@ -549,7 +549,7 @@ pub enum ReplayScope {
 }
 
 /// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
-/// datagram source, so a stream that never sets `last` must not grow this without limit; the cap sits
+/// datagram publisher, so a feed that never sets `last` must not grow this without limit; the cap sits
 /// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
 /// rather than silently dropping changes from a book still claimed to be complete.
 const MAX_PENDING_CHANGES: usize = 8192;
@@ -580,7 +580,7 @@ impl BookAccumulator {
 
     /// Whether these levels are the market's complete book, so materializing them as a re-baseline is
     /// honest. False until a producer re-baseline (a `Clear` of both sides) has been folded in: an
-    /// accumulator seeded mid-stream holds only the levels that have moved since, and publishing that
+    /// accumulator seeded partway through holds only the levels that have moved since, and publishing that
     /// as `snapshot: true` would tell a consumer to discard the levels it is missing.
     pub fn baselined(&self) -> bool {
         self.baselined
@@ -647,7 +647,7 @@ impl BookAccumulator {
                             .insert(c.order_id, (is_bid, key, c.price, c.size));
                     }
                     // A `Clear` carrying an order id is a producer bug: it names a side, and acting on
-                    // one order would clear neither side. Fall through to the side-scoped arms below.
+                    // one order would clear neither side. Fall through to the side-scoped paths below.
                     BookAction::Clear => self.clear_side(c.side, &mut cleared),
                 }
                 continue;
@@ -842,7 +842,7 @@ impl BookAccumulator {
         let (venue, category, channel, instrument_id) = key;
         NormalizedBook {
             venue: venue.clone(),
-            source: venue.clone(),
+            source_name: venue.clone(),
             source_id: self.source_id,
             symbol: self.symbol.clone(),
             channel: *channel,
@@ -867,8 +867,8 @@ impl BookAccumulator {
 }
 
 /// Accumulated book state per market, replayed on connect and on each subscribe. Written by the
-/// arbiter on the authority gate's admit decision, so it always holds the authoritative arm's book
-/// rather than a discarded arm's copy.
+/// arbiter on the authority gate's admit decision, so it always holds the authoritative path's book
+/// rather than a discarded path's copy.
 ///
 /// Keyed identically to `ingest::authority::MarketKey` — `(venue, category, channel, instrument_id)`
 /// — and that shared grain is load-bearing, not incidental. The gate's own per-market state
@@ -889,7 +889,7 @@ pub type BookSnapshot = Arc<Mutex<BookReplay>>;
 
 /// A market's replay key: the arbitration scope plus the wire identity. Structurally
 /// `ingest::authority::MarketKey`, and required to stay so — see [`BookSnapshot`].
-pub type BookKey = (Arc<str>, Arc<str>, u32, u32);
+pub type BookKey = (Arc<str>, Arc<str>, u8, u32);
 
 /// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
 pub type BookMap = HashMap<BookKey, BookAccumulator>;
@@ -956,7 +956,7 @@ impl BookReplay {
     // arbiter can drop all three together. `Arbiter::reset_book_for_market` /
     // `Arbiter::forget_channel_books` are the seams; a caller reaching in here directly (as an
     // earlier version of the channel-departure purge did) leaves `last_admitted` behind, so a
-    // restored channel whose arm is unchanged never re-baselines and a market silently stays
+    // restored channel whose path is unchanged never re-baselines and a market silently stays
     // hidden from every new client. See those methods' docs.
 }
 
@@ -965,8 +965,8 @@ impl BookReplay {
 /// Every shared mutex in the ingest path (`InstrumentSnapshot`, `DepthSnapshot`, the arbiter) is
 /// held only across panic-free critical sections (`HashMap`/`HashSet` work), so the protected state
 /// is always left consistent. Recovering from poisoning rather than `.lock().unwrap()` keeps an
-/// **unrelated** panic in one ingest task (e.g. the WS feeder) from cascading into every other
-/// source the moment it next takes the lock — the failure-isolation contract.
+/// **unrelated** panic in one ingest task (e.g. the WS input) from cascading into every other
+/// input the moment it next takes the lock — the failure-isolation contract.
 pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1023,14 +1023,14 @@ mod tests {
     const TEST_CATEGORY: &str = "testcategory";
 
     /// The replay key a test's accumulator materializes under.
-    fn bkey(venue: &Arc<str>, channel: u32, instrument_id: u32) -> BookKey {
+    fn bkey(venue: &Arc<str>, channel: u8, instrument_id: u32) -> BookKey {
         (venue.clone(), TEST_CATEGORY.into(), channel, instrument_id)
     }
 
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             symbol: "KXBTCPERP".into(),
             channel: 2,
@@ -1076,6 +1076,10 @@ mod tests {
         assert_eq!(v["venue"], "KALSHI");
         assert_eq!(v["symbol"], "KXBTCPERP");
         assert_eq!(v["channel"], 2);
+        // A `u8` `channel` still renders as a bare JSON number: JSON carries no integer width.
+        assert!(serde_json::to_string(&m)
+            .unwrap()
+            .contains(r#""channel":2"#));
         assert_eq!(v["instrument_id"], 41);
         assert_eq!(v["snapshot"], false);
         assert_eq!(v["last"], true);
@@ -1170,7 +1174,7 @@ mod tests {
         assert_eq!(b.channel(), Some(2));
         let q = FeedMessage::Status(FeedStatus {
             venue: "KALSHI".into(),
-            source: "KALSHI".into(),
+            source_name: "KALSHI".into(),
             source_id: 0,
             state: "ok".into(),
             stale_ms: 0,
@@ -1439,11 +1443,13 @@ mod tests {
         );
     }
 
+    /// `venue` is the compatibility alias and carries the identical string; the bare `source` key
+    /// the glossary bans must be gone from the wire, not merely deprecated.
     #[test]
-    fn a_quote_serializes_both_the_new_and_the_deprecated_source_fields() {
+    fn a_quote_serializes_source_name_and_the_deprecated_venue_but_no_bare_source() {
         let q = NormalizedQuote {
             venue: Arc::from("HYPERLIQUID"),
-            source: Arc::from("HYPERLIQUID"),
+            source_name: Arc::from("HYPERLIQUID"),
             source_id: 1,
             symbol: Arc::from("SOL"),
             bid: 1.0,
@@ -1458,9 +1464,13 @@ mod tests {
             ws_send_ts_ns: 0,
         };
         let v: serde_json::Value = serde_json::to_value(&q).unwrap();
-        assert_eq!(v["venue"], "HYPERLIQUID");
-        assert_eq!(v["source"], "HYPERLIQUID");
+        assert_eq!(v["source_name"], "HYPERLIQUID");
+        assert_eq!(v["venue"], v["source_name"]);
         assert_eq!(v["source_id"], 1);
+        assert!(
+            v.get("source").is_none(),
+            "bare `source` still emitted: {v}"
+        );
     }
 
     /// A payload written before these fields existed must still deserialize, or every committed
@@ -1471,7 +1481,7 @@ mod tests {
             "bid_size":3.0,"ask_size":4.0,"source_ts_ns":0,"recv_ts_ns":0}"#;
         let q: NormalizedQuote = serde_json::from_str(json).unwrap();
         assert_eq!(&*q.venue, "PHOENIX");
-        assert_eq!(&*q.source, "");
+        assert_eq!(&*q.source_name, "");
         assert_eq!(q.source_id, 0);
     }
 
@@ -1484,7 +1494,7 @@ mod tests {
         let mut acc = BookAccumulator::new(Arc::from("SOL"));
         acc.apply(&NormalizedBook {
             venue: venue.clone(),
-            source: venue.clone(),
+            source_name: venue.clone(),
             source_id: 1,
             symbol: Arc::from("SOL"),
             channel: 0,
@@ -1520,7 +1530,7 @@ mod tests {
             out.source_id, 1,
             "the id the producer resolved, not a placeholder"
         );
-        assert_eq!(out.source, venue);
+        assert_eq!(out.source_name, venue);
     }
 
     // ---- order-level (L3) accumulation ----
@@ -1677,7 +1687,7 @@ mod tests {
         assert_eq!(acc.price_fold().0.len(), n);
     }
 
-    /// An event still waiting for its `last` is what the cap bounds: an unterminated stream past it is
+    /// An event still waiting for its `last` is what the cap bounds: one unterminated past it is
     /// abandoned rather than folded as a book claiming to be complete.
     #[test]
     fn an_unterminated_event_past_the_cap_is_abandoned() {

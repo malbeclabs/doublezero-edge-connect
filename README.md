@@ -9,7 +9,7 @@ curl -fsSL https://get.doublezero.xyz/connect | bash
 `doublezero-edge-connect` is the bridge an operator runs to turn the DoubleZero (DZ) Edge
 **binary multicast** feeds into something a trading engine can read. It connects to the
 [DoubleZero Edge](https://doublezero.xyz/dz-edge) sources you're authorized for, decodes their
-little-endian fixed-size frames, drives the reference-data subscriber state machine (so every
+little-endian fixed-size datagrams, drives the reference-data subscriber state machine (so every
 quote carries the precision needed to interpret it), and re-serves the result as one normalized,
 **engine-agnostic JSON WebSocket** — venue + symbol tagged on every message, with four latency
 timestamps for end-to-end measurement.
@@ -98,9 +98,9 @@ DZ_SECRET=DZ_… DZ_NAME=Custom-Container-Name curl -fsSL https://get.doublezero
 | `DZ_NAME` | `doublezero-edge-connect` | Container name. |
 | `DZ_FEEDS` | *(all)* | Comma-separated venues to narrow ingestion. Does **not** affect Solana shred forwarding. |
 | `DZ_PUBLISHER_PORTS` | *(all)* | Comma-separated publisher **base ports** (the market-data port of each block, e.g. `9201`) to narrow which mirrors of each selected feed are ingested. One receiver runs per publisher, so this caps ingest cost on a multi-publisher venue. Base ports are unique within a feed but not across feeds — pair with `DZ_FEEDS` to scope to one venue. |
-| `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `lashay-4=10,11`). An unmentioned feed ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a feed whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
-| `DZ_FEED_REGISTRY_URL` | hosted URL (**image default**) | URL to fetch the feed registry document from at startup — the image sets this to `https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used instead and a warning is logged — never fatal. See [Feed registry](#feed-registry) below for how to tell which source actually loaded. |
-| `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, for an air-gapped/locked-down host. The bridge tries `DZ_FEED_REGISTRY_URL` first when it's non-empty, so the installer clears the image's default URL for you whenever you set this without also setting a URL of your own — otherwise the file would be silently shadowed. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL source, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
+| `DZ_CHANNELS` | *(all)* | Channels to ingest, scoped per group code (`code=id,id;code=id`, e.g. `edge-kalshi-sports-mbp=10,11`). An unmentioned feed ingests every channel. Only applies to a feed whose publisher derives a port per channel — an excluded channel's socket is never bound, so its traffic never reaches userspace. Ids are validated against the loaded registry at startup; an unknown id or code, or a narrowing of a feed whose publishers share one base port, is refused rather than silently filtering nothing. Can also be changed at runtime — see the admin surface below. |
+| `DZ_FEED_REGISTRY_URL` | hosted URL (**image default**) | URL to fetch the feed registry document from at startup — the image sets this to `https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`. On any failure (unreachable, malformed, an unsupported `version`, a validation error) the built-in document is used instead and a warning is logged — never fatal. See [Feed registry](#feed-registry) below for how to tell which document actually loaded. |
+| `DZ_FEED_REGISTRY` | *(built-in)* | Path to a feed registry document, for an air-gapped/locked-down host. The bridge tries `DZ_FEED_REGISTRY_URL` first when it's non-empty, so the installer clears the image's default URL for you whenever you set this without also setting a URL of your own — otherwise the file would be silently shadowed. **This path is read inside the container**, so the installer only forwards it when it can also bind-mount the same file from the host at the identical path (read-only); if the host path doesn't exist it aborts before starting the container rather than passing a path that would silently resolve to nothing. Unlike the URL origin, a bad or missing document here is **fatal** at container startup — it is an explicit operator instruction. |
 | `DZ_ADMIN_BIND` | `127.0.0.1:9098` | Bind address for the **admin surface** — the runtime-mutation path (`DZ_CHANNELS` replaced without a restart, `doublezero connect`/`disconnect` re-run) plus `GET /admin/diagnostics`, the one surface that answers when nothing is subscribed (see [Admin surface](#admin-surface) below). On by default, at loopback; **this surface has no authentication**, and under the container's host networking a wildcard bind is genuinely reachable off the host, so if you override this, stay on loopback — never a bare wildcard. Set empty to disable it outright. Loopback alone does not stop a browser page on the same host from POSTing here, so every `POST` also requires an `X-DZ-Admin-Request` header (any value); the `doublezero-edge` commands send it automatically. |
 | `DZ_SHRED_*` | *(auto)* | Solana shred forwarder config (`DZ_SHRED_DEDUP_MODE`, `DZ_SHRED_FORWARD`, `DZ_SHRED_RPC_URL`, …). Forwarding activates on discovery of `edge-solana-*` groups; these tune it. See [shred forwarding](docs/shred-forwarding.md). |
 | `DZ_ASSUME_YES` | `0` | Skip confirmation prompts (e.g. the Docker install prompt) and imply "yes" to the `doublezero-edge` CLI install offer too. |
@@ -133,7 +133,7 @@ the `Args` struct in [`src/main.rs`](src/main.rs); per-feature config lives in t
 > A venue whose feeds ride separate groups is gated per group, and its `trade` tape **follows
 > whichever of them is active** — so a host subscribed only to a venue's depth feed still gets a tape,
 > and the pick moves without restarting the receiver that keeps it. See
-> [Input sources](docs/input-sources.md).
+> [Inputs](docs/input-sources.md).
 
 > **Logging defaults.** Unset, `RUST_LOG` defaults to `warn,doublezero_edge_connect=info`: the
 > bridge's own startup/operational lines stay at `info` while noisy dependency chatter is held to
@@ -213,10 +213,10 @@ served fresh at every container start — no rebuild needed to pick up a new ven
 with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY` (the
 installer clears the default URL for you in that case — see the table above). A host that can't
 reach the URL falls back to the built-in copy **silently by design**; the bridge's own startup log
-says which source actually won, and the one-liner echoes it for you:
+says which document actually won, and the one-liner echoes it for you:
 
 ```
-==> Feed registry: source="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
+==> Feed registry: origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
 ```
 
 That line only appears at startup, so `/v1/status` reports it too — which is how you check a
@@ -224,24 +224,24 @@ running process, or compare a fleet, without reading logs on each box:
 
 ```bash
 doublezero-edge status --jq '.registry'
-# {"source":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
+# {"origin":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
 #  "version":1,"rows":3,"receivers":33}
 ```
 
-A `source` of `built-in` on a host you expected to be using the hosted document means the fetch
+An `origin` of `built-in` on a host you expected to be using the hosted document means the fetch
 failed and it fell back — the string says which.
 
 ## Consume Edge Feeds
 _For Edge Feeds (not solana-shreds)_
 
 Open a WebSocket to `ws://<host>:8081` and read JSON. You receive only the venues you're authorized
-for; an optional `subscribe` control frame narrows the stream further:
+for; an optional `subscribe` control frame narrows the feed further:
 
 ```json
 {"method":"subscribe","subscription":{"venue":"<venue-name>","symbol":"SOL"}}
 ```
 
-On connect you first get the current instrument definitions (precision), then a stream of quotes.
+On connect you first get the current instrument definitions (precision), then quotes as they arrive.
 Any engine that speaks WebSocket + JSON consumes it with a thin (~50-100 line) adapter. The full
 wire contract is in **[PROTOCOL.md](PROTOCOL.md)** (see
 [Consuming the feed](PROTOCOL.md#consuming-the-feed-any-engine)).
@@ -254,7 +254,7 @@ deliver.
 
 ## Query market data (the `doublezero-edge` CLI)
 
-Prefer polling a candle or the current book over consuming the WebSocket stream? The bridge also
+Prefer polling a candle or the current book over consuming the WebSocket feed? The bridge also
 serves a read-only `/v1` HTTP API (on by default at `127.0.0.1:9099`, activated whenever a
 market-data feed is — see [Output sinks](docs/output-sinks.md#query-api-v1)), and
 **[`doublezero-edge`](doublezero-edge/)** is a small CLI client for it, built for scripting and for
@@ -345,7 +345,7 @@ stays provably read-only.
 ```bash
 ./target/release/doublezero-edge-connect --iface doublezero1 --admin-bind 127.0.0.1:9098
 doublezero-edge channels list
-doublezero-edge channels set 'lashay-4=10,11'
+doublezero-edge channels set 'edge-kalshi-sports-mbp=10,11'
 ```
 
 `GET /admin/channels` reports the channel filter in force and, per feed, which publishers/channels it admits (not
@@ -423,7 +423,7 @@ It reuses this crate's shred forwarder directly; see **[shred-proxy/README.md](s
   [Self-hosting](docs/self-hosting.md) ·
   [Output sinks](docs/output-sinks.md) ·
   [Metrics](docs/metrics.md) ·
-  [Input sources](docs/input-sources.md) ·
+  [Inputs](docs/input-sources.md) ·
   [Shred forwarding](docs/shred-forwarding.md)
 - **[PROTOCOL.md](PROTOCOL.md)** — the WebSocket JSON contract (v1).
 - **[scripts/README.md](scripts/README.md)** — the installer scripts and full env-var reference.

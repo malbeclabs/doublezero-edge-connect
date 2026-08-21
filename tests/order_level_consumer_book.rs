@@ -1,5 +1,5 @@
 //! The load-bearing property test the Market-by-Order design named: drive a synthetic two-publisher
-//! order-level stream through the arbiter, apply what it publishes with a naive consumer that does
+//! order-level feed through the arbiter, apply what it publishes with a naive consumer that does
 //! exactly what PROTOCOL.md tells a consumer to do, and assert that book equals the venue's at every
 //! re-baseline boundary and at the end.
 //!
@@ -10,7 +10,7 @@
 
 use doublezero_edge_connect::{
     ingest::{
-        arbiter::{Arbiter, BookGuardConfig, Publisher, TRADE_DEDUP_WINDOW},
+        arbiter::{Arbiter, BookGuardConfig, Transport, TRADE_DEDUP_WINDOW},
         feeds::ArbitrationMode,
     },
     model::{
@@ -25,7 +25,7 @@ use std::{
 use tokio::sync::broadcast;
 
 const VENUE: &str = "HYPERLIQUID";
-const CHANNEL: u32 = 1;
+const CHANNEL: u8 = 1;
 const INSTRUMENT: u32 = 7;
 /// A second market on the **same channel**, for a scenario that has to show one market's traffic
 /// leaving another's alone.
@@ -36,8 +36,8 @@ const DEDUP_WINDOW_NS: u64 = 1_000;
 /// One order's resting state: which side, at what price, in what quantity.
 type Book = BTreeMap<u64, (BookSide, f64, f64)>;
 
-fn arm(n: u8) -> Publisher {
-    Publisher::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+fn path(n: u8) -> Transport {
+    Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
 }
 
 fn change(order_id: u64, side: BookSide, price: f64, size: f64) -> BookChange {
@@ -80,7 +80,7 @@ fn symbol_of(instrument_id: u32) -> &'static str {
 
 /// The venue's own stamp and our arrival stamp are **different quantities** and every helper here
 /// takes them apart: the real publishers stamp identical `source_ts_ns` on an event they both saw,
-/// and a lagging arm is late in `recv_ts_ns` alone.
+/// and a lagging path is late in `recv_ts_ns` alone.
 fn batch(changes: Vec<BookChange>, source_ts_ns: u64, recv_ts_ns: u64) -> FeedMessage {
     batch_for(INSTRUMENT, changes, source_ts_ns, recv_ts_ns)
 }
@@ -93,7 +93,7 @@ fn batch_for(
 ) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
         venue: VENUE.into(),
-        source: VENUE.into(),
+        source_name: VENUE.into(),
         source_id: 1,
         symbol: symbol_of(instrument_id).into(),
         channel: CHANNEL,
@@ -158,7 +158,7 @@ fn a_naive_consumers_book_matches_the_venue_across_gaps_and_races() {
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
     a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
     let market = market(INSTRUMENT);
-    let (fast, slow) = (arm(1), arm(2));
+    let (fast, slow) = (path(1), path(2));
     a.set_book_synced(&market, fast, true);
     a.set_book_synced(&market, slow, true);
 
@@ -305,7 +305,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
     a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
     let market = market(INSTRUMENT);
-    let (fast, drifted) = (arm(1), arm(2));
+    let (fast, drifted) = (path(1), path(2));
     a.set_book_synced(&market, fast, true);
     a.set_book_synced(&market, drifted, true);
 
@@ -329,7 +329,7 @@ fn a_drifted_publisher_cannot_walk_a_consumers_order_backwards() {
         CATEGORY,
     );
 
-    // Whatever comes next re-baselines the market rather than resuming either arm's deltas.
+    // Whatever comes next re-baselines the market rather than resuming either path's deltas.
     venue.insert(2, (BookSide::Ask, 101.0, 4.0));
     a.emit(
         batch(vec![change(2, BookSide::Ask, 101.0, 4.0)], 1_300, 1_300),
@@ -359,13 +359,13 @@ const MARKET_TOMBSTONES: u64 = 65_536;
 /// wrong.
 const RETENTION_NS: u64 = 30_000_000_000;
 
-/// The wiring every scenario shares: one order-level market on a two-publisher venue, both arms
+/// The wiring every scenario shares: one order-level market on a two-publisher venue, both paths
 /// synced, racing exactly as the Market-by-Order processor drives it.
 fn harness() -> (
     Arbiter,
     broadcast::Receiver<Arc<FeedMessage>>,
-    Publisher,
-    Publisher,
+    Transport,
+    Transport,
 ) {
     harness_over(&[INSTRUMENT])
 }
@@ -377,15 +377,15 @@ fn harness_over(
 ) -> (
     Arbiter,
     broadcast::Receiver<Arc<FeedMessage>>,
-    Publisher,
-    Publisher,
+    Transport,
+    Transport,
 ) {
     let (tx, rx) = broadcast::channel(4096);
     let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
     a.set_mode(VENUE, ArbitrationMode::Coordinated);
     a.set_book_dedup_window(DEDUP_WINDOW_NS);
     a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
-    let (fast, slow) = (arm(1), arm(2));
+    let (fast, slow) = (path(1), path(2));
     for &instrument_id in instruments {
         let key = market(instrument_id);
         a.set_book_synced(&key, fast, true);
@@ -416,11 +416,11 @@ fn drain_markets(
     }
 }
 
-/// Two markets on one channel, carrying **colliding order ids**: what one market's stream does to
+/// Two markets on one channel, carrying **colliding order ids**: what one market's feed does to
 /// an order must not reach the other's. Every state the merge point keeps is per market, and one
 /// kept per channel would cross them.
 #[test]
-fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
+fn one_markets_feed_leaves_another_on_the_same_channel_alone() {
     let (mut a, mut rx, fast, slow) = harness_over(&[INSTRUMENT, INSTRUMENT_B]);
     let (mut venue_a, mut venue_b) = (Book::new(), Book::new());
     let mut markets: BTreeMap<u32, Book> = BTreeMap::new();
@@ -465,7 +465,7 @@ fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
         CATEGORY,
     );
 
-    // And the lagging arm's first and only copy of A's add for that id, which is dead there and
+    // And the lagging path's first and only copy of A's add for that id, which is dead there and
     // must not come back on either market.
     a.emit(
         batch_for(
@@ -483,11 +483,11 @@ fn one_markets_stream_leaves_another_on_the_same_channel_alone() {
     assert_eq!(markets.remove(&INSTRUMENT_B).unwrap_or_default(), venue_b);
 }
 
-/// A forced re-baseline republishes the view no single arm owns. If the arm whose batch discharged
-/// the flag is stamped as owning the floors it seeds, that arm is exempt from the size gate and
+/// A forced re-baseline republishes the view no single path owns. If the path whose batch discharged
+/// the flag is stamped as owning the floors it seeds, that path is exempt from the size gate and
 /// simply repeats the stale claim the re-baseline was called to correct.
 #[test]
-fn a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim() {
+fn a_discharged_rebaseline_does_not_let_the_raising_path_repeat_its_claim() {
     let (mut a, mut rx, fast, drifted) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
@@ -500,7 +500,7 @@ fn a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim() {
         fast,
         CATEGORY,
     );
-    // The drifted arm missed the fill, claims 5, and is withheld — then discharges the flag with an
+    // The drifted path missed the fill, claims 5, and is withheld — then discharges the flag with an
     // unrelated event and repeats the claim.
     a.emit(
         batch(vec![change(1, BookSide::Bid, 100.0, 5.0)], 1_200, 1_200),
@@ -524,7 +524,7 @@ fn a_discharged_rebaseline_does_not_let_the_raising_arm_repeat_its_claim() {
 }
 
 /// A market with more live orders than the guard's cap must not spend the guard on them: nothing
-/// re-seeds a tombstone, and losing one lets a lagging arm's only copy of the add resurrect an order
+/// re-seeds a tombstone, and losing one lets a lagging path's only copy of the add resurrect an order
 /// the venue removed.
 #[test]
 fn a_book_larger_than_the_guard_does_not_resurrect_a_removed_order() {
@@ -556,7 +556,7 @@ fn a_book_larger_than_the_guard_does_not_resurrect_a_removed_order() {
         drain_into(&mut rx, &mut consumer);
     }
 
-    // The lagging arm's first and only copy of the add for the order that is already gone.
+    // The lagging path's first and only copy of the add for the order that is already gone.
     a.emit(batch(vec![dead], 90_000_000, 90_000_000), slow, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
@@ -577,7 +577,7 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
         CATEGORY,
     );
 
-    // The fast arm gaps and recovers with a book far larger than the cap, containing no order 7.
+    // The fast path gaps and recovers with a book far larger than the cap, containing no order 7.
     for i in 0..(GUARD_CAP + 77) {
         let id = 100 + i;
         venue.insert(id, (BookSide::Ask, 200.0 + i as f64, 1.0));
@@ -585,7 +585,7 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     a.emit(snapshot(&venue, 1_200, 1_200), fast, CATEGORY);
     drain_into(&mut rx, &mut consumer);
 
-    // Twice, either side of a fast-arm event: a guard the seeding spent would withhold the first
+    // Twice, either side of a fast-path event: a guard the seeding spent would withhold the first
     // copy behind a forced re-baseline and then publish the second onto the market it just healed.
     a.emit(batch(vec![dead], 90_000_000, 90_000_000), slow, CATEGORY);
     venue.insert(9, (BookSide::Bid, 50.0, 2.0));
@@ -603,14 +603,14 @@ fn a_rebaseline_larger_than_the_guard_does_not_resurrect_a_removed_order() {
     assert_eq!(consumer, venue);
 }
 
-/// How far the slow arm trails the leader, in the two clocks that move independently.
+/// How far the slow path trails the leader, in the two clocks that move independently.
 #[derive(Clone, Copy)]
 struct Lag {
     /// The datagram reaches us late. This is the lag the wire actually shows: on 271,455 paired
-    /// events the two publishers stamp **identical** venue times, so a real lagging arm is late
+    /// events the two publishers stamp **identical** venue times, so a real lagging path is late
     /// here and nowhere else.
     arrival_ns: u64,
-    /// The arm's own `source_ts_ns` reads older than the leader's for the same event. A separate
+    /// The path's own `source_ts_ns` reads older than the leader's for the same event. A separate
     /// quantity from arrival, and only the skew scenarios drive it.
     venue_ns: u64,
 }
@@ -637,7 +637,7 @@ fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
     a.emit(snapshot(&venue, 1_000, 1_000), fast, CATEGORY);
     a.emit(snapshot(&venue, 1_001, 1_001), drifted, CATEGORY);
 
-    // Order 1 is filled down to 2. The drifted arm misses that fill.
+    // Order 1 is filled down to 2. The drifted path misses that fill.
     venue.insert(1, (BookSide::Bid, 100.0, 2.0));
     a.emit(
         batch(vec![change(1, BookSide::Bid, 100.0, 2.0)], 1_100, 1_100),
@@ -674,7 +674,7 @@ fn a_batch_that_both_removes_and_disagrees_does_not_strand_the_removal() {
 
 // ---------------------------------------------------------------------------------------------
 // The consumer-visible contract, at behavioural altitude. Nothing below reaches into the arbiter's
-// internals: each scenario drives batches from N arms through the real `Arbiter`, reads what
+// internals: each scenario drives batches from N paths through the real `Arbiter`, reads what
 // reaches the broadcast, rebuilds a book exactly as PROTOCOL.md tells a consumer to, and compares
 // it to the venue's. That is what makes them survive a replacement of the mechanism underneath.
 // ---------------------------------------------------------------------------------------------
@@ -696,8 +696,8 @@ const LIFECYCLE: [Event; 8] = [
 ];
 
 /// `rounds` copies of [`LIFECYCLE`], each on its own order ids and prices, so a scenario can run
-/// long enough for a lagging arm to stay behind for the whole of it.
-fn lifecycle_stream(rounds: u64) -> Vec<Event> {
+/// long enough for a lagging path to stay behind for the whole of it.
+fn lifecycle_events(rounds: u64) -> Vec<Event> {
     (0..rounds)
         .flat_map(|r| {
             LIFECYCLE
@@ -754,7 +754,7 @@ fn a_published_batch_carries_the_stamps_it_was_given() {
     assert_eq!(published[0].recv_ts_ns, 7_000, "arrival time");
 }
 
-/// Venue-time skew on its own: the trailing arm stamps `source_ts_ns` 5 ms older than the leader's
+/// Venue-time skew on its own: the trailing path stamps `source_ts_ns` 5 ms older than the leader's
 /// for the same event and arrives in lockstep with it. The order-level path reads only arrival
 /// today, so this changes nothing — which is the before-picture a design keying on venue time is
 /// measured against, and the one caller that drives [`Lag::venue_ns`].
@@ -765,19 +765,19 @@ fn a_venue_time_skew_alone_does_not_drift_the_consumer() {
         venue_ns: 5_000_000,
     };
     let (_a, _rx, consumer, venue) =
-        arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, skew, true);
+        arrival_lagged_feed(&lifecycle_events(1), 1_000_000, skew, true);
     assert_eq!(consumer, venue);
 }
 
 /// A single publisher streaming a market's whole life. Nothing races, so the consumer's book has to
 /// equal the venue's after **every** event, not merely at the end.
 #[test]
-fn a_single_arms_stream_reaches_the_consumer_exactly() {
+fn a_single_paths_feed_reaches_the_consumer_exactly() {
     let (mut a, mut rx, only, peer) = harness();
     a.forget_publisher_books(CATEGORY, peer);
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    for (i, &e) in lifecycle_stream(1).iter().enumerate() {
+    for (i, &e) in lifecycle_events(1).iter().enumerate() {
         let t = 1_000 + i as u64 * 100;
         venue_apply(&mut venue, e);
         a.emit(batch(vec![ev_change(e)], t, t), only, CATEGORY);
@@ -786,16 +786,16 @@ fn a_single_arms_stream_reaches_the_consumer_exactly() {
     }
 }
 
-/// Both arms deliver every event, a nanosecond apart. The consumer sees each event **once**: a
+/// Both paths deliver every event, a nanosecond apart. The consumer sees each event **once**: a
 /// second copy carries the order's absolute quantity again, so republishing it after the wire has
 /// moved on walks the consumer back to a size the venue already reduced.
 #[test]
-fn two_arms_in_lockstep_publish_each_event_once() {
+fn two_paths_in_lockstep_publish_each_event_once() {
     let (mut a, mut rx, one, two) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
     let (mut published, mut expected) = (Vec::new(), Vec::new());
 
-    for (i, &e) in lifecycle_stream(1).iter().enumerate() {
+    for (i, &e) in lifecycle_events(1).iter().enumerate() {
         let t = 1_000 + i as u64 * 100;
         venue_apply(&mut venue, e);
         expected.push(ev_change(e));
@@ -809,7 +809,7 @@ fn two_arms_in_lockstep_publish_each_event_once() {
     assert_eq!(consumer, venue);
 }
 
-/// Drive `events` through two arms, the trailing one `lag_ns` late **in arrival only** — its
+/// Drive `events` through two paths, the trailing one `lag_ns` late **in arrival only** — its
 /// `source_ts_ns` is the leader's, which is what the wire shows on 271,455 paired events. One venue
 /// event every `spacing_ns`, so a lag wider than the spacing leaves the trailer permanently behind.
 ///
@@ -818,24 +818,24 @@ fn two_arms_in_lockstep_publish_each_event_once() {
 /// by its own next copy, so a terminal comparison alone passes even with the racing guard removed
 /// outright. Step by step it does not — under correct behaviour every trailer copy is collapsed and
 /// publishes nothing, so the consumer never leaves the venue's state as of the last leader arrival.
-fn arrival_lagged_stream(
+fn arrival_lagged_feed(
     events: &[Event],
     spacing_ns: u64,
     lag: Lag,
-    leader_is_first_arm: bool,
+    leader_is_first_path: bool,
 ) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>, Book, Book) {
     let (mut a, mut rx, one, two) = harness();
     a.set_book_dedup_window(1_000_000_000); // the shipped --arb-book-dedup-window-ms
-    let (leader, trailer) = if leader_is_first_arm {
+    let (leader, trailer) = if leader_is_first_path {
         (one, two)
     } else {
         (two, one)
     };
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    // (arrival, the venue's own stamp — identical on both arms' copies, arm, change, and the venue
+    // (arrival, the venue's own stamp — identical on both paths' copies, path, change, and the venue
     // event the leader's copy advances; `None` on the trailer's, which advances nothing).
-    let mut arrivals: Vec<(u64, u64, Publisher, BookChange, Option<Event>)> = Vec::new();
+    let mut arrivals: Vec<(u64, u64, Transport, BookChange, Option<Event>)> = Vec::new();
     for (i, &e) in events.iter().enumerate() {
         let t = 1_000 + i as u64 * spacing_ns;
         arrivals.push((t, t, leader, ev_change(e), Some(e)));
@@ -859,15 +859,15 @@ fn arrival_lagged_stream(
     (a, rx, consumer, venue)
 }
 
-/// The lag sweep: how far the two publishers can drift apart before the merge point stops being able
+/// The lag ladder: how far the two publishers can drift apart before the merge point stops being able
 /// to keep a consumer's book identical to the venue's.
 ///
-/// It replaces a sweep that stopped at 1 s, and the two tests it replaces both compared only at the
+/// It replaces a ladder that stopped at 1 s, and the two tests it replaces both compared only at the
 /// **end** of the run — where a trailer replaying the venue's whole life in order has converged on
 /// its own, so they passed with the racing guard removed outright. This one goes through
-/// `arrival_lagged_stream`, which asserts after every arrival.
+/// `arrival_lagged_feed`, which asserts after every arrival.
 ///
-/// What set the old 1 s ceiling was the per-market **event count** (1,024): past it a trailing arm's
+/// What set the old 1 s ceiling was the per-market **event count** (1,024): past it a trailing path's
 /// copy of an add for an order the leader had since partially filled stopped reading as a duplicate
 /// and read as a second publisher claiming a larger resting size — a false
 /// `dz_mbo_path_disagreement_total`, and the batches withheld behind the re-baseline it forced were
@@ -881,31 +881,34 @@ fn arrival_lagged_stream(
 fn the_consumer_book_matches_the_venue_far_past_the_old_lag_ceiling() {
     // 320 events at 400 ms spans 128 s of venue time, so the widest lag below is still inside the
     // run rather than arriving after it has ended.
-    let events = lifecycle_stream(40);
+    let events = lifecycle_events(40);
     for lag_s in [0u64, 1, 10, 30, 60] {
-        let (_a, _rx, consumer, venue) = arrival_lagged_stream(
+        let (_a, _rx, consumer, venue) = arrival_lagged_feed(
             &events,
             400_000_000,
             Lag::arrival(lag_s * 1_000_000_000),
             true,
         );
-        assert_eq!(consumer, venue, "diverged at {lag_s}s of inter-arm lag");
+        assert_eq!(consumer, venue, "diverged at {lag_s}s of inter-path lag");
     }
 }
 
-/// The trailing arm is late in arrival and stamps the leader's venue times. Whichever arm leads,
+/// The trailing path is late in arrival and stamps the leader's venue times. Whichever path leads,
 /// the consumer ends holding the venue's book.
 #[test]
-fn an_arm_behind_in_arrival_only_does_not_drift_the_consumer() {
+fn a_path_behind_in_arrival_only_does_not_drift_the_consumer() {
     let lag = Lag::arrival(5_000_000);
-    for leader_is_first_arm in [true, false] {
+    for leader_is_first_path in [true, false] {
         let (_a, _rx, consumer, venue) =
-            arrival_lagged_stream(&lifecycle_stream(1), 1_000_000, lag, leader_is_first_arm);
-        assert_eq!(consumer, venue, "leader_is_first_arm={leader_is_first_arm}");
+            arrival_lagged_feed(&lifecycle_events(1), 1_000_000, lag, leader_is_first_path);
+        assert_eq!(
+            consumer, venue,
+            "leader_is_first_path={leader_is_first_path}"
+        );
     }
 }
 
-/// A venue-time skew wide enough, and a dedup window narrow enough, that the trailing arm's copies
+/// A venue-time skew wide enough, and a dedup window narrow enough, that the trailing path's copies
 /// reach the frontier's rules instead of collapsing as duplicates first.
 ///
 /// ⚠️ `a_venue_time_skew_alone_does_not_drift_the_consumer` above cannot do this and is **still**
@@ -953,7 +956,7 @@ fn a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy() {
     // And it is refused as *stale*, not as a size disagreement. The two are indistinguishable from
     // what was published — both suppress the copy — but a disagreement forces a re-baseline, which the
     // next batch discharges as a `Clear`. That `Clear` is the difference, and it is what the venue
-    // stamp buys: read the arrival clock here instead and this arm's copy reads as drift.
+    // stamp buys: read the arrival clock here instead and this path's copy reads as drift.
     venue.insert(2, (BookSide::Ask, 101.0, 4.0));
     a.emit(
         batch(
@@ -973,23 +976,23 @@ fn a_venue_time_skew_past_the_dedup_window_refuses_the_stale_copy() {
     assert_eq!(consumer, venue);
 }
 
-/// Two arms recovered from **different snapshot anchors**: the first holds an order the venue
-/// killed before the second's newer snapshot was taken. The arm that holds it is the only one
+/// Two paths recovered from **different snapshot anchors**: the first holds an order the venue
+/// killed before the second's newer snapshot was taken. The path that holds it is the only one
 /// that can remove it, and the market must go on being served either way.
 #[test]
-fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
+fn paths_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
     let (mut a, mut rx, early, late) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    // The early arm's anchor, taken while order 2 still rested.
+    // The early path's anchor, taken while order 2 still rested.
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
     venue.insert(2, (BookSide::Ask, 101.0, 7.0));
     a.emit(snapshot(&venue, 1_000, 1_000), early, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
 
-    // The venue removes order 2; the late arm's anchor is taken after that, so it never held it and
-    // can never report its removal. Its re-baseline is dropped — the early arm is serving.
+    // The venue removes order 2; the late path's anchor is taken after that, so it never held it and
+    // can never report its removal. Its re-baseline is dropped — the early path is serving.
     let served = venue.clone();
     venue.remove(&2);
     a.emit(snapshot(&venue, 2_000, 2_000), late, CATEGORY);
@@ -999,7 +1002,7 @@ fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
         "a peer's re-baseline must not displace a served book"
     );
 
-    // Only the arm that held order 2 reports its removal, and it has to reach the consumer.
+    // Only the path that held order 2 reports its removal, and it has to reach the consumer.
     a.emit(
         batch(vec![change(2, BookSide::Ask, 101.0, 0.0)], 3_000, 3_000),
         early,
@@ -1008,7 +1011,7 @@ fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue, "the holder's removal must reach the wire");
 
-    // And the market keeps being served, from either arm.
+    // And the market keeps being served, from either path.
     venue.insert(3, (BookSide::Bid, 98.0, 4.0));
     a.emit(
         batch(vec![change(3, BookSide::Bid, 98.0, 4.0)], 4_000, 4_000),
@@ -1025,7 +1028,7 @@ fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
     assert_eq!(consumer, venue);
 }
 
-/// The arm that is **serving** a market leaves, and the peer recovering behind it has to be able to
+/// The path that is **serving** a market leaves, and the peer recovering behind it has to be able to
 /// re-baseline the consumer. Then it comes back, and neither its stale anchor nor its first deltas
 /// may walk that consumer back.
 ///
@@ -1036,18 +1039,18 @@ fn arms_synced_from_different_snapshot_anchors_keep_the_consumer_exact() {
 /// and the departure is load-bearing here — without it the peer's re-baseline stays suppressed and
 /// the consumer holds a book the venue has left, for the life of the process.
 #[test]
-fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
+fn a_path_that_departs_and_returns_keeps_the_consumer_exact() {
     let (mut a, mut rx, staying, leaving) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    // The arm about to leave is the one serving the market.
+    // The path about to leave is the one serving the market.
     venue.insert(1, (BookSide::Bid, 100.0, 5.0));
     a.emit(snapshot(&venue, 1_000, 1_000), leaving, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue);
 
     // The venue moves on. The peer gapped and recovered, and its re-baseline is dropped: the serving
-    // arm is healthy, so a recovering peer must not wipe a book that is correct.
+    // path is healthy, so a recovering peer must not wipe a book that is correct.
     venue.insert(1, (BookSide::Bid, 100.0, 2.0));
     venue.insert(2, (BookSide::Ask, 101.0, 3.0));
     a.emit(snapshot(&venue, 2_000, 2_000), staying, CATEGORY);
@@ -1058,14 +1061,14 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
         "a recovering peer must not displace a served book"
     );
 
-    // The serving arm's receiver exits, ending its claim. Nobody is serving now, so the peer's next
+    // The serving path's receiver exits, ending its claim. Nobody is serving now, so the peer's next
     // re-baseline is the consumer's only route back to the venue's book.
     a.forget_publisher_books(CATEGORY, leaving);
     a.emit(snapshot(&venue, 2_100, 2_100), staying, CATEGORY);
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue, "a departure must release the suppression");
 
-    // The venue moves on again while the departed arm is still away.
+    // The venue moves on again while the departed path is still away.
     venue.insert(2, (BookSide::Ask, 101.0, 1.0));
     a.emit(
         batch(vec![change(2, BookSide::Ask, 101.0, 1.0)], 2_200, 2_200),
@@ -1077,7 +1080,7 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
 
     // It comes back the only way a restarted receiver can: synced first, then the re-baseline its
     // snapshot install produced. That anchor is one the venue has already moved past, and it is
-    // dropped rather than published — the arm that stayed is serving this market correctly now.
+    // dropped rather than published — the path that stayed is serving this market correctly now.
     a.set_book_synced(&market(INSTRUMENT), leaving, true);
     let anchor = Book::from([
         (1, (BookSide::Bid, 100.0, 2.0)),
@@ -1087,10 +1090,10 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
     drain_into(&mut rx, &mut consumer);
     assert_eq!(
         consumer, venue,
-        "a returning arm must not displace the book"
+        "a returning path must not displace the book"
     );
 
-    // Its first deltas off that anchor are copies of events the serving arm has already published,
+    // Its first deltas off that anchor are copies of events the serving path has already published,
     // and they claim a size the venue has since reduced. Neither may walk the consumer back.
     a.emit(
         batch(vec![change(2, BookSide::Ask, 101.0, 3.0)], 3_100, 3_100),
@@ -1100,7 +1103,7 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
     drain_into(&mut rx, &mut consumer);
     assert_eq!(consumer, venue, "a stale copy must not walk an order back");
 
-    // And the market goes on being served, from both arms.
+    // And the market goes on being served, from both paths.
     venue.insert(3, (BookSide::Bid, 97.0, 8.0));
     a.emit(
         batch(vec![change(3, BookSide::Bid, 97.0, 8.0)], 4_000, 4_000),
@@ -1117,19 +1120,19 @@ fn an_arm_that_departs_and_returns_keeps_the_consumer_exact() {
     assert_eq!(consumer, venue);
 }
 
-/// One arm trails the other for the **whole run** — 25 events behind, never catching up. It must
-/// not drift the consumer, and it must not stop the market being served: both arms still reach
+/// One path trails the other for the **whole run** — 25 events behind, never catching up. It must
+/// not drift the consumer, and it must not stop the market being served: both paths still reach
 /// the wire afterwards.
 #[test]
-fn a_permanently_slower_arm_never_stops_the_market_being_served() {
-    let events = lifecycle_stream(5);
+fn a_permanently_slower_path_never_stops_the_market_being_served() {
+    let events = lifecycle_events(5);
     let (mut a, mut rx, mut consumer, mut venue) =
-        arrival_lagged_stream(&events, 10_000_000, Lag::arrival(250_000_000), true);
+        arrival_lagged_feed(&events, 10_000_000, Lag::arrival(250_000_000), true);
     assert_eq!(consumer, venue, "a permanent lag must not drift the book");
 
-    // Each arm in turn, on a fresh order: the market is still being served from both.
+    // Each path in turn, on a fresh order: the market is still being served from both.
     let after = 1_000 + events.len() as u64 * 10_000_000 + 250_000_000;
-    for (i, p) in [arm(1), arm(2)].into_iter().enumerate() {
+    for (i, p) in [path(1), path(2)].into_iter().enumerate() {
         let (id, t) = (900 + i as u64, after + i as u64 * 10_000_000);
         venue.insert(id, (BookSide::Bid, 10.0, 1.0));
         a.emit(
@@ -1142,9 +1145,9 @@ fn a_permanently_slower_arm_never_stops_the_market_being_served() {
     }
 }
 
-/// While one arm is serving a market, a peer's `Clear`-led re-baseline is **dropped**, not
+/// While one path is serving a market, a peer's `Clear`-led re-baseline is **dropped**, not
 /// published: it would tell the consumer to discard a book that is correct and replace it with the
-/// peer's, which on a recovering arm is older. Exactly one `Clear` reaches the wire.
+/// peer's, which on a recovering path is older. Exactly one `Clear` reaches the wire.
 #[test]
 fn a_peers_rebaseline_does_not_displace_a_served_book() {
     let (mut a, mut rx, serving, peer) = harness();
@@ -1178,13 +1181,13 @@ fn a_peers_rebaseline_does_not_displace_a_served_book() {
         .count();
     assert_eq!(
         clears, 1,
-        "only the serving arm's re-baseline reaches the wire"
+        "only the serving path's re-baseline reaches the wire"
     );
 }
 
 // ---------------------------------------------------------------------------------------------
 // The venue-time frontier, at consumer altitude. What the merge point forgets is decided by how
-// far behind the channel's newest venue stamp an event is — not by agreement between the arms —
+// far behind the channel's newest venue stamp an event is — not by agreement between the paths —
 // so every scenario below drives `source_ts_ns` and reads the broadcast.
 // ---------------------------------------------------------------------------------------------
 
@@ -1218,17 +1221,17 @@ fn wait_for_reseat() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 }
 
-/// A peer synced from a different snapshot anchor never held the orders the serving arm is
+/// A peer synced from a different snapshot anchor never held the orders the serving path is
 /// removing, so it can never report those removals. It must not cost the market anything: under a
 /// consensus rule the population grows with the market's whole history until a cap gives way and the
 /// market goes dark — one publisher's anchor blacking out a market every consumer is watching.
 #[test]
-fn an_arm_that_never_held_the_removed_orders_does_not_darken_the_market() {
+fn a_path_that_never_held_the_removed_orders_does_not_darken_the_market() {
     let (mut a, mut rx, leader, quiet) = harness();
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
-    // Both arms install. The quiet arm's copy is dropped — the leader is serving — but that dropped
-    // batch is still the moment it starts counting as an arm of this market, and it reports nothing
+    // Both paths install. The quiet path's copy is dropped — the leader is serving — but that dropped
+    // batch is still the moment it starts counting as a path of this market, and it reports nothing
     // from here on.
     venue.insert(1, (BookSide::Bid, 90.0, 1.0));
     a.emit(snapshot(&venue, 1_000, 1_000), leader, CATEGORY);
@@ -1290,8 +1293,8 @@ fn a_returning_links_contiguous_backlog_reaches_no_consumer() {
     let (mut venue, mut consumer) = (Book::new(), Book::new());
 
     // The leader streams a market's life across two retention windows of venue time while the
-    // returning arm's link is down.
-    let events = lifecycle_stream(60);
+    // returning path's link is down.
+    let events = lifecycle_events(60);
     let spacing = 2 * RETENTION_NS / events.len() as u64;
     let stamps: Vec<u64> = (0..events.len() as u64)
         .map(|i| 1_000 + i * spacing)
@@ -1335,7 +1338,7 @@ fn a_returning_links_contiguous_backlog_reaches_no_consumer() {
     );
 }
 
-/// A gap that takes the **whole channel** away: every arm returns with stamps far past anything the
+/// A gap that takes the **whole channel** away: every path returns with stamps far past anything the
 /// frontier has seen. The forward bound refuses the advance — it cannot tell "the publisher jumped"
 /// from "we were away" — but the batches themselves must still be processed, or the channel wedges
 /// permanently: the frontier only advances from what it accepts, so after one legitimate jump every
@@ -1470,8 +1473,8 @@ fn a_cold_start_market_stamped_zero_still_bootstraps() {
     assert_eq!(markets.get(&INSTRUMENT).cloned().unwrap_or_default(), busy);
 }
 
-/// The arm carrying a channel's clock dies while the survivor is minutes behind it. Everything the
-/// survivor has to send is older than the frontier the dead arm left, so without a way to re-seat
+/// The path carrying a channel's clock dies while the survivor is minutes behind it. Everything the
+/// survivor has to send is older than the frontier the dead path left, so without a way to re-seat
 /// that frontier the market is dark for the life of the process.
 #[test]
 fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
@@ -1491,7 +1494,7 @@ fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
     assert_eq!(consumer, venue);
 
     // The leader's host is drained. The survivor is 100 s of venue time behind it — far past the
-    // retention window — and is now the only arm there is.
+    // retention window — and is now the only path there is.
     a.forget_publisher_books(CATEGORY, leader);
     wait_for_reseat();
     let behind = ahead - 100_000_000_000;
@@ -1516,7 +1519,7 @@ fn a_survivor_behind_the_dead_leaders_frontier_still_serves_the_market() {
 /// frontier arbitrarily far ahead of real venue time. Past that point every honest publisher on the
 /// channel is refused, the whole removed population ages out at once, and the forger's own stamps are
 /// the only ones left inside the window — a channel-wide blackout and a blind guard from one spoofed
-/// source. The absolute anchor against the host clock is what stops it, and it is the same check the
+/// publisher. The absolute anchor against the host clock is what stops it, and it is the same check the
 /// quote and depth floors already apply to this field.
 #[test]
 fn a_stream_of_in_bound_stamps_cannot_ratchet_the_frontier_past_the_host_clock() {
@@ -1551,7 +1554,7 @@ fn a_stream_of_in_bound_stamps_cannot_ratchet_the_frontier_past_the_host_clock()
 
     // Two hundred batches, each one step inside the per-step forward bound. Nothing but an absolute
     // anchor refuses these. They carry the forger's own order, which legitimately reaches the wire —
-    // this is an unauthenticated wire and nothing here stops a source publishing.
+    // this is an unauthenticated wire and nothing here stops a forged publisher.
     for i in 1..=200u64 {
         let t = base + i * 4_900_000_000;
         a.emit(

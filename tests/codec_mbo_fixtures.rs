@@ -1,6 +1,6 @@
 //! Empirical offset validation: decode the committed MBO fixtures — a **real two-sided TYO
 //! recorder capture** of the HL publisher (#36; `tests/fixtures/mbo_*.bin`, see
-//! `fixtures/PROVENANCE.md`) — through the real `codec_mbo::decode_frame` and assert the decoded
+//! `fixtures/PROVENANCE.md`) — through the real `codec_mbo::decode_datagram` and assert the decoded
 //! values against the capture's real content and per-field invariants. This is the ground-truth
 //! counterpart to the offset-independent unit tests in `codec_mbo.rs`: a wrong field offset that
 //! the symmetric round-trip cannot catch (as with the side-mapping bug in #2) shows up here as an
@@ -12,13 +12,13 @@ mod common;
 use common::replay;
 use doublezero_edge_connect::ingest::{
     codec,
-    codec_mbo::{decode_frame, Message, MAGIC, SIDE_ASK, SIDE_BID},
+    codec_mbo::{decode_datagram, Message, MAGIC, SIDE_ASK, SIDE_BID},
 };
 use std::collections::BTreeSet;
 
-/// Build a single-message frame with the given `magic` (24B codec_common header + one message).
+/// Build a single-message datagram with the given `magic` (24B codec_common header + one message).
 /// Both codecs share the header layout, so the same builder feeds each codec by magic.
-fn one_msg_frame(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
+fn one_msg_datagram(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&magic.to_le_bytes());
     f.push(1); // schema_version
@@ -27,8 +27,8 @@ fn one_msg_frame(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> 
     f.extend_from_slice(&0u64.to_le_bytes()); // send_ts
     f.push(1); // msg_count
     f.push(0); // reset_count
-    let frame_len = (24 + 4 + body.len()) as u16;
-    f.extend_from_slice(&frame_len.to_le_bytes());
+    let datagram_len = (24 + 4 + body.len()) as u16;
+    f.extend_from_slice(&datagram_len.to_le_bytes());
     f.extend_from_slice(&[msg_type, msg_len, 0, 0]); // msg header: type, len, flags:u16
     f.extend_from_slice(body);
     f
@@ -36,7 +36,7 @@ fn one_msg_frame(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> 
 
 /// The MBO `InstrumentDefinition`, `Trade` and `ManifestSummary` layouts are documented as
 /// identical to the **byte-validated** TOB `codec.rs`. Make that self-enforcing rather than
-/// eyeballed: decode the *same* body bytes through both codecs (only the frame magic differs) and
+/// eyeballed: decode the *same* body bytes through both codecs (only the datagram magic differs) and
 /// assert the shared fields match. If a future edit drifts one decoder's offsets from the other,
 /// this fails — closing the gap that `Trade` has no MBO golden fixture and `InstrumentDefinition`/
 /// `ManifestSummary` are validated transitively.
@@ -49,10 +49,10 @@ fn tob_shared_layouts_decode_identically() {
     def[37] = (-1i8) as u8;
     def[38] = (-8i8) as u8;
     def[74..76].copy_from_slice(&13u16.to_le_bytes());
-    let tob = codec::decode_frame(&one_msg_frame(codec::MAGIC, 0x02, 80, &def))
+    let tob = codec::decode_datagram(&one_msg_datagram(codec::MAGIC, 0x02, 80, &def))
         .unwrap()
         .1;
-    let mbo = decode_frame(&one_msg_frame(MAGIC, 0x02, 80, &def))
+    let mbo = decode_datagram(&one_msg_datagram(MAGIC, 0x02, 80, &def))
         .unwrap()
         .1;
     match (&tob[0], &mbo[0]) {
@@ -77,10 +77,10 @@ fn tob_shared_layouts_decode_identically() {
     tr[24..32].copy_from_slice(&1_500u64.to_le_bytes()); // qty
     tr[32..40].copy_from_slice(&99u64.to_le_bytes()); // trade_id
     tr[40..48].copy_from_slice(&5u64.to_le_bytes()); // cumulative_volume
-    let tob = codec::decode_frame(&one_msg_frame(codec::MAGIC, 0x04, 52, &tr))
+    let tob = codec::decode_datagram(&one_msg_datagram(codec::MAGIC, 0x04, 52, &tr))
         .unwrap()
         .1;
-    let mbo = decode_frame(&one_msg_frame(MAGIC, 0x04, 52, &tr))
+    let mbo = decode_datagram(&one_msg_datagram(MAGIC, 0x04, 52, &tr))
         .unwrap()
         .1;
     match (&tob[0], &mbo[0]) {
@@ -104,10 +104,10 @@ fn tob_shared_layouts_decode_identically() {
     ms[4..6].copy_from_slice(&13u16.to_le_bytes());
     ms[8..12].copy_from_slice(&786u32.to_le_bytes());
     ms[12..20].copy_from_slice(&1_780u64.to_le_bytes());
-    let tob = codec::decode_frame(&one_msg_frame(codec::MAGIC, 0x07, 24, &ms))
+    let tob = codec::decode_datagram(&one_msg_datagram(codec::MAGIC, 0x07, 24, &ms))
         .unwrap()
         .1;
-    let mbo = decode_frame(&one_msg_frame(MAGIC, 0x07, 24, &ms))
+    let mbo = decode_datagram(&one_msg_datagram(MAGIC, 0x07, 24, &ms))
         .unwrap()
         .1;
     match (&tob[0], &mbo[0]) {
@@ -141,16 +141,16 @@ fn variant_name(m: &Message) -> &'static str {
     }
 }
 
-fn frames(path: &str) -> Vec<Vec<u8>> {
+fn datagrams(path: &str) -> Vec<Vec<u8>> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    replay::split_frames(&bytes, MAGIC)
+    replay::split_datagrams(&bytes, MAGIC)
 }
 
 /// Collect the instrument ids carried by every `InstrumentDefinition` in the refdata fixture.
 fn defined_instrument_ids() -> BTreeSet<u32> {
     let mut ids = BTreeSet::new();
-    for f in frames("tests/fixtures/mbo_refdata.bin") {
-        for m in decode_frame(&f).unwrap().1 {
+    for f in datagrams("tests/fixtures/mbo_refdata.bin") {
+        for m in decode_datagram(&f).unwrap().1 {
             if let Message::InstrumentDefinition(d) = m {
                 ids.insert(d.instrument_id);
             }
@@ -159,7 +159,7 @@ fn defined_instrument_ids() -> BTreeSet<u32> {
     ids
 }
 
-/// Every committed real frame must decode without a framing error, and every decoded field must
+/// Every committed real datagram must decode without a framing error, and every decoded field must
 /// satisfy the invariants that only hold when its offset is correct. The MBO trio is a real
 /// two-sided TYO recorder capture (#36, PROVENANCE.md): refdata defines ~640 instruments, the
 /// snapshot is BTC's full two-sided book, and mktdata carries post-anchor deltas across many
@@ -182,10 +182,10 @@ fn committed_mbo_fixtures_decode_cleanly() {
         "tests/fixtures/mbo_snapshot.bin",
         "tests/fixtures/mbo_mktdata.bin",
     ] {
-        let fs = frames(path);
-        assert!(!fs.is_empty(), "no frames in {path}");
+        let fs = datagrams(path);
+        assert!(!fs.is_empty(), "no datagrams in {path}");
         for f in &fs {
-            let (_h, msgs) = decode_frame(f).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let (_h, msgs) = decode_datagram(f).unwrap_or_else(|e| panic!("{path}: {e}"));
             for m in &msgs {
                 seen.insert(variant_name(m));
                 match m {
@@ -270,8 +270,8 @@ fn committed_mbo_fixtures_decode_cleanly() {
 fn refdata_fixture_matches_btc_definition() {
     let mut def = None;
     let mut manifest = None;
-    for f in frames("tests/fixtures/mbo_refdata.bin") {
-        for m in decode_frame(&f).unwrap().1 {
+    for f in datagrams("tests/fixtures/mbo_refdata.bin") {
+        for m in decode_datagram(&f).unwrap().1 {
             match m {
                 Message::InstrumentDefinition(d) if d.instrument_id == 0 => def = Some(d),
                 Message::ManifestSummary(s) => manifest = Some(s),
@@ -308,8 +308,8 @@ fn snapshot_fixture_matches_real_two_sided_book() {
     let mut begin = None;
     let mut end = None;
     let (mut bids, mut asks) = (0u32, 0u32);
-    for f in frames("tests/fixtures/mbo_snapshot.bin") {
-        for m in decode_frame(&f).unwrap().1 {
+    for f in datagrams("tests/fixtures/mbo_snapshot.bin") {
+        for m in decode_datagram(&f).unwrap().1 {
             match m {
                 Message::SnapshotBegin(b) => begin = Some(b),
                 Message::SnapshotEnd(e) => end = Some(e),

@@ -81,7 +81,7 @@ fn channels_set_names_dz_admin_bind_when_the_admin_surface_is_unreachable() {
             &status_url,
             "channels",
             "set",
-            "lashay-4=10",
+            "edge-kalshi-sports-mbp=10",
             "--admin-url",
             &admin_url,
             "--force",
@@ -104,12 +104,12 @@ fn channels_set_names_dz_admin_bind_when_the_admin_surface_is_unreachable() {
 fn channels_list_merges_the_admin_filter_summary_with_status_liveness() {
     let admin_url = mock_server(
         "200 OK",
-        r#"{"summary":["lashay-4=2 of 31"],"rows":[],"note":"..."}"#,
+        r#"{"summary":["edge-kalshi-sports-mbp=2 of 31"],"rows":[],"note":"..."}"#,
     );
     let status_url = mock_server(
         "200 OK",
         r#"{"venues":[],"history":{"products":2,"products_at_cap":false,"buckets":2,"bucket_budget":100,"est_bytes":10,"window_seconds":3600,"evicted":0,"late_drops":0},
-            "channels":{"rows":[{"venue":"KALSHI","category":"sports","code":"lashay-4","excluded":29,
+            "channels":{"rows":[{"venue":"KALSHI","category":"sports","code":"edge-kalshi-sports-mbp","excluded":29,
             "channels":[{"channel":10,"allowed":true,"bound":true,"products":412,"label":"sports.nfl"},
                         {"channel":11,"allowed":true,"bound":false,"products":0}]}],"excluded_by_filter":29}}"#,
     );
@@ -127,7 +127,11 @@ fn channels_list_merges_the_admin_filter_summary_with_status_liveness() {
         "",
     );
     assert_eq!(r.status, 0, "stdout: {} stderr: {}", r.stdout, r.stderr);
-    assert!(r.stdout.contains("lashay-4=2 of 31"), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("edge-kalshi-sports-mbp=2 of 31"),
+        "{}",
+        r.stdout
+    );
     assert!(r.stdout.contains("sports.nfl"), "{}", r.stdout);
     assert!(r.stdout.contains("412"), "{}", r.stdout);
 }
@@ -146,7 +150,7 @@ fn channels_set_aborts_without_force_and_never_posts() {
     let status_url = mock_server(
         "200 OK",
         r#"{"venues":[],"history":{"products":1,"products_at_cap":false,"buckets":1,"bucket_budget":100,"est_bytes":10,"window_seconds":3600,"evicted":0,"late_drops":0},
-            "channels":{"rows":[{"venue":"KALSHI","category":"sports","code":"lashay-4","excluded":29,
+            "channels":{"rows":[{"venue":"KALSHI","category":"sports","code":"edge-kalshi-sports-mbp","excluded":29,
             "channels":[{"channel":11,"allowed":true,"bound":true,"products":287}]}],"excluded_by_filter":29}}"#,
     );
     let admin_url = unreachable_url();
@@ -156,7 +160,7 @@ fn channels_set_aborts_without_force_and_never_posts() {
             &status_url,
             "channels",
             "set",
-            "lashay-4=10",
+            "edge-kalshi-sports-mbp=10",
             "--admin-url",
             &admin_url,
         ],
@@ -185,14 +189,17 @@ fn channels_set_with_force_skips_confirmation_and_applies() {
         r#"{"venues":[],"history":{"products":1,"products_at_cap":false,"buckets":1,"bucket_budget":100,"est_bytes":10,"window_seconds":3600,"evicted":0,"late_drops":0},
             "channels":{"rows":[],"excluded_by_filter":0}}"#,
     );
-    let admin_url = mock_server("200 OK", r#"{"applied":["lashay-4=1 of 31"]}"#);
+    let admin_url = mock_server(
+        "200 OK",
+        r#"{"applied":["edge-kalshi-sports-mbp=1 of 31"]}"#,
+    );
     let r = run_with_stdin(
         &[
             "--url",
             &status_url,
             "channels",
             "set",
-            "lashay-4=10",
+            "edge-kalshi-sports-mbp=10",
             "--admin-url",
             &admin_url,
             "--force",
@@ -200,7 +207,11 @@ fn channels_set_with_force_skips_confirmation_and_applies() {
         "",
     );
     assert_eq!(r.status, 0, "stdout: {} stderr: {}", r.stdout, r.stderr);
-    assert!(r.stdout.contains("lashay-4=1 of 31"), "{}", r.stdout);
+    assert!(
+        r.stdout.contains("edge-kalshi-sports-mbp=1 of 31"),
+        "{}",
+        r.stdout
+    );
 }
 
 /// A `400` from the admin `POST` (e.g. the flat-row refusal) is surfaced verbatim, never
@@ -214,7 +225,7 @@ fn channels_set_surfaces_a_400_from_the_admin_surface_verbatim() {
     );
     let admin_url = mock_server(
         "400 Bad Request",
-        r#"{"error":"invalid_channel_filter","message":"channel filter narrows `perps1` (LASHAY/perps), whose publishers bind one base port flat.","remediation":"..."}"#,
+        r#"{"error":"invalid_channel_filter","message":"channel filter narrows `perps1` (KALSHI/perps), whose publishers bind one base port flat.","remediation":"..."}"#,
     );
     let r = run_with_stdin(
         &[

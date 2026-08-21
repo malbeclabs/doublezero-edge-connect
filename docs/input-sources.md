@@ -1,4 +1,4 @@
-# Input sources
+# Inputs
 
 The DZ Edge **multicast** feeds are always-on inputs. A second, optional input for some feeds are a
 **public** WebSocket feed which acts as a **backstop**: the edge feed should win essentially always, 
@@ -11,11 +11,11 @@ dropped as a no-op; when the edge gaps, the public copy is the first to cross th
 in. The backstop needs no health check, and the WebSocket output is identical regardless of which
 input delivered a given update.
 
-| Input source | Default | Enable / disable | Config flags (env) |
+| Input | Default | Enable / disable | Config flags (env) |
 |--------------|---------|------------------|--------------------|
 | **DZ Edge multicast** | **on** | always on | `--feed` selects feed rows by venue · `--publisher-port` narrows the publishers within them by base port (default: every publisher of every selected feed) · `--iface`/`--recv-buf` |
-| **Hyperliquid public WS** (`ingest::ws_feeder`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
-| **Phoenix public WS** (`ingest::phoenix_feeder`) | **off** | on when `--phoenix-ws-input-markets` is non-empty | `--phoenix-ws-input-markets` (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) · `--phoenix-ws-input-url` (`PHOENIX_WS_INPUT_URL`, default `wss://perp-api.phoenix.trade/v1/ws`) |
+| **Hyperliquid public WS** (`ingest::ws_input`) | **off** | on when `--ws-input-coins` is non-empty | `--ws-input-coins` (`WS_INPUT_COINS`, e.g. `BTC,ETH`) · `--ws-input-url` (`WS_INPUT_URL`, default `wss://api.hyperliquid.xyz/ws`) |
+| **Phoenix public WS** (`ingest::phoenix_input`) | **off** | on when `--phoenix-ws-input-markets` is non-empty | `--phoenix-ws-input-markets` (`PHOENIX_WS_INPUT_MARKETS`, bare tickers e.g. `SOL,BTC`) · `--phoenix-ws-input-url` (`PHOENIX_WS_INPUT_URL`, default `wss://perp-api.phoenix.trade/v1/ws`) |
 
 One receiver task runs per `(venue, protocol, publisher)`, so an eleven-publisher venue runs eleven
 receivers per protocol. Each is a full receiver — and for Market-by-Order a full independent book —
@@ -27,7 +27,7 @@ the narrowing to one venue.
 > **Size `--recv-buf` against the socket count, not one socket.** Every port of every publisher is
 > its own socket requesting `--recv-buf` (default 8 MiB): the eleven-publisher Hyperliquid fleet
 > binds 55 sockets (11 × 2 Top-of-Book + 11 × 3 Market-by-Order), 57 with Phoenix and 62 with
-> Lashay's two single-publisher rows (2 Top-of-Book + 3 Market-by-Price), so the requested
+> Kalshi's two single-publisher rows (2 Top-of-Book + 3 Market-by-Price), so the requested
 > `SO_RCVBUF` total is ~456 MiB where a single-publisher deployment requested ~40 MiB.
 > `net.core.rmem_max` clamps each socket individually and will not catch the aggregate — and the
 > value every installer sets (`268435456`) is a per-socket ceiling well above the 8 MiB default, so
@@ -35,9 +35,9 @@ the narrowing to one venue.
 > host's or container's memory budget. Market-by-Order additionally holds one independent L3 book set
 > per publisher, so book memory also scales with the publisher count.
 
-**Market-by-Order** (frame magic `0x4444`) serves **both** book products from the one reconstructed L3 book: the full-state top-10 `depth` it has always served, and — new — the order-level **`order_book`**, carrying the venue's own `order_id` on every change. The two are arbitrated differently because the wire allows it. `depth` races on its content, per publisher; `order_book` races on the **venue event identity** every publisher stamps identically, so each event is published once from whichever publisher was fastest for *that event*, rather than one publisher being elected to serve the market. What makes that safe is a per-order guard at the merge point rather than the dedup window (`--arb-book-dedup-window-ms`, 1 s): a change for an order already published as gone is refused, and so is one older than the last change published for that order or older than the channel's retention window (`--arb-book-retention-secs`, 30 s). A late copy therefore costs a redundant emission at worst, and a link returning with minutes of buffered backlog reaches no consumer at all. Watch `dz_book_resurrections_dropped_total` (the guard working, rising with how far one publisher lags) and `dz_mbo_path_disagreement_total` (a book that has drifted) — see [Metrics](metrics.md).
+**Market-by-Order** (datagram magic `0x4444`) serves **both** book products from the one reconstructed L3 book: the full-state top-10 `depth` it has always served, and — new — the order-level **`order_book`**, carrying the venue's own `order_id` on every change. The two are arbitrated differently because the wire allows it. `depth` races on its content, per publisher; `order_book` races on the **venue event identity** every publisher stamps identically, so each event is published once from whichever publisher was fastest for *that event*, rather than one publisher being elected to serve the market. What makes that safe is a per-order guard at the merge point rather than the dedup window (`--arb-book-dedup-window-ms`, 1 s): a change for an order already published as gone is refused, and so is one older than the last change published for that order or older than the channel's retention window (`--arb-book-retention-secs`, 30 s). A late copy therefore costs a redundant emission at worst, and a link returning with minutes of buffered backlog reaches no consumer at all. Watch `dz_book_resurrections_dropped_total` (the guard working, rising with how far one publisher lags) and `dz_mbo_path_disagreement_total` (a book that has drifted) — see [Metrics](metrics.md).
 
-**Market-by-Price** (frame magic `0x4442`) is a further multicast protocol alongside Top-of-Book, Midpoint and Market-by-Order. Like Market-by-Order it binds three ports per publisher — mktdata (level deltas + trade prints), refdata (instrument definitions), and a snapshot port for recovery — and the bridge reconstructs the book internally, re-serving it as the **incremental `book`** product rather than full-state `depth`. It keeps one reconstructed book per `(publisher, channel, instrument)`: two arms mirror one feed but their per-instrument delta sequences are unrelated by construction, and a single group can be sharded across channels, so nothing below that triple identifies a book. The Lashay perps row (`lashay-2`) selects this kind, on a group that is **live and activated** — so a host subscribed to that code starts ingesting it on upgrade. A `code` that does not match its live group activates nothing and says nothing: no warning, no failed bind, just a permanently-zero `dz_receiver_up`.
+**Market-by-Price** (datagram magic `0x4442`) is a further multicast protocol alongside Top-of-Book, Midpoint and Market-by-Order. Like Market-by-Order it binds three ports per publisher — mktdata (level deltas + trade prints), refdata (instrument definitions), and a snapshot port for recovery — and the bridge reconstructs the book internally, re-serving it as the **incremental `book`** product rather than full-state `depth`. It keeps one reconstructed book per `(publisher, channel, instrument)`: two paths mirror one feed but their per-instrument delta sequences are unrelated by construction, and a single group can be sharded across channels, so nothing below that triple identifies a book. The Kalshi perps row (`edge-kalshi-perps-mbp`) selects this kind, on a group that is **live and activated** — so a host subscribed to that code starts ingesting it on upgrade. A `code` that does not match its live group activates nothing and says nothing: no warning, no failed bind, just a permanently-zero `dz_receiver_up`.
 
 > **The Market-by-Price memory caps are per receiver task, not per process.** One task holds at most 4096 books, 256 `(publisher, channel)` reset/snapshot-routing keys, and 2^20 buffered deltas across every book it tracks. N publishers on separate port blocks are N tasks and so hold N times each bound; publishers sharing one port block share a single task's. On crossing the delta budget the processor drops the **largest** instrument's buffer and marks that instrument `Gap` — it recovers on its next snapshot and every other instrument keeps streaming. Sustained `dz_mbp_buffer_overflows_total` means the publisher's snapshot period is too long for this host, not that anything is broken; the other two caps are anti-forgery bounds on unauthenticated wire fields and should never bind in normal operation.
 
@@ -49,15 +49,15 @@ the narrowing to one venue.
 WS_INPUT_COINS=BTC,ETH curl -fsSL https://get.doublezero.xyz/connect | bash
 ```
 
-Every public feeder is failure-isolated (its own task with reconnect + exponential backoff;
+Every public input is failure-isolated (its own task with reconnect + exponential backoff;
 decode/socket errors are logged and never touch the multicast hot path) and relies on the edge
 reference data for precision — it emits a public quote/trade only once that `(venue, symbol)`
 instrument is known. That gate opens only after the edge has revealed the instrument's wire Source
-ID at least once (refdata alone does not populate it), so the backstop covers a mid-stream edge gap
-but not a cold start where the edge has never gone live for that instrument. The outbound `wss://`
-client is the one place TLS is used (rustls + bundled webpki roots).
+ID at least once (refdata alone does not populate it), so the backstop covers an edge gap that
+opens partway through but not a cold start where the edge has never gone live for that instrument.
+The outbound `wss://` client is the one place TLS is used (rustls + bundled webpki roots).
 
-The **Phoenix** feeder is **trades only** — it does not backstop quotes, because the edge Phoenix
+The **Phoenix** input is **trades only** — it does not backstop quotes, because the edge Phoenix
 Quote is a spline-blended BBO while Phoenix's public orderbook channel is resting-only (a different
 quantity). Phoenix names each market with the same bare ticker on the edge and public feeds (the edge
 `instrument_id` equals the public `assetId`), so the configured symbol is used verbatim — to subscribe
@@ -65,7 +65,7 @@ the public feed and to tag the emitted trade — and trade dedup keys on the pub
 Validated against a concurrent edge+public capture (2026-06-30): the public `tradeSequenceNumber`
 equals the edge `trade_id` on every shared fill (257/257) and `side` maps `bid -> buy` / `ask -> sell`.
 
-> **Caveat — trade dedup window vs. reconnect lag.** Cross-source trade dedup is a fixed-size
+> **Caveat — trade dedup window vs. reconnect lag.** Cross-transport trade dedup is a fixed-size
 > windowed `trade_id` cache. A long public reconnect can deliver trades whose ids have aged out of
 > the window during a high-volume burst, which would re-emit a duplicate trade. Sizing the window
 > against the public feed's unbounded-lag failure mode is tracked separately (window-sizing issue);
@@ -74,7 +74,7 @@ equals the edge `trade_id` on every shared fill (257/257) and `side` maps `bid -
 ## Where a venue's `trade` tape comes from
 
 A venue's feed rows can ride **separate multicast groups with separate subscription codes**, as
-Lashay's do (`lashay-1` top of book, `lashay-2` market-by-price). A host may hold one and not the
+Kalshi's do (`edge-kalshi-perps-tob` top of book, `edge-kalshi-perps-mbp` market-by-price). A host may hold one and not the
 other, and its WebSocket output must carry a tape either way — so both rows claim trades and the
 reconciler decides which one serves them: top of book when both are up, market-by-price when it is
 alone. The pick moves **without respawning** the receiver that keeps it, so the surviving publisher's
@@ -82,6 +82,6 @@ books and reference data survive the flip. `dz_tape_owner_changes_total` counts 
 
 Exactly one emitter per venue at any moment is what licenses forwarding a `trade_id == 0` print
 unkeyed: a FIX-sourced print carries no venue trade id, so two simultaneous emitters would duplicate
-every print with nothing to collapse them. Within the owning row, a `Sticky` venue's two arms are
-gated the same way one level down — one arm serves, the peer's prints are dropped
-(`dz_tape_arm_transfers_total`).
+every print with nothing to collapse them. Within the owning row, a `Sticky` venue's two paths are
+gated the same way one level down — one path serves, the peer's prints are dropped
+(`dz_tape_path_transfers_total`).

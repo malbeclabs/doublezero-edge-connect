@@ -1,56 +1,86 @@
-//! Transcription of the upstream source registry
-//! (`edge-feed-spec/sources/spec.md`) — the canonical `Source ID` allocation.
+//! The `Source ID` -> registry-name mirror.
 //!
-//! A Source ID identifies the source whose order book a price was derived from. IDs are stable and
-//! are never reused. This module is the **only** place the registry is mirrored; add a row here when
-//! upstream assigns a new production ID (1-1023).
+//! `edge-feed-spec/sources/spec.md` is the sole authority for this allocation; nothing here decides
+//! it. A Source ID identifies the upstream source whose order book a price was derived from, IDs are stable
+//! and are never reused, and the wire value is authoritative — a publisher stamping the wrong ID is
+//! a publisher defect fixed at the publisher, reported here as-is and never substituted.
+//!
+//! The mapping arrives with the **feed registry document** (`registry.rs`'s optional `sources`
+//! block), so assigning a venue is a document republish rather than a code change and a release —
+//! but only once the fleet runs a binary that reads the block; see `docs/self-hosting.md`.
+//! [`BUILT_IN`] is the compiled-in fallback for a document that carries no block — which is not
+//! hypothetical, since adding the block bumps no schema version and an older document is legal.
 
 use std::{
     collections::HashMap,
     sync::{OnceLock, RwLock},
 };
 
-/// Map a wire `Source ID` to its registered source name.
-///
-/// Returns `None` only for IDs with no registry row. The wire value is authoritative: a publisher
-/// stamping the wrong ID is a publisher defect, fixed at the publisher, and is reported here as-is
-/// and never substituted. Exactly three production IDs are assigned.
-///
-/// Names are **uppercase**, which is the form that reaches consumers: this is what `venue`/`source`
-/// carry on the WebSocket and what every `venue=` metric label holds, so it is also the form a
-/// product identifier like `HYPERLIQUID:BTC` composes from.
-pub fn source_name(source_id: u16) -> Option<&'static str> {
-    match source_id {
-        1 => Some("HYPERLIQUID"),
-        2 => Some("PHOENIX"),
-        3 => Some(KALSHI),
-        _ => None,
-    }
+/// One `Source ID` -> registry-name assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceAssignment {
+    pub id: u16,
+    pub name: &'static str,
 }
 
-/// Source ID 3's registry name, and the pre-launch codename the same row also answers to.
-///
-/// Only [`KALSHI`] is ever emitted — it is what `venue`/`source` carry on the wire and what every
-/// `venue=` metric label value holds. [`KALSHI_CODENAME`] is accepted on **input** alone: it is
-/// still what the DoubleZero ledger registers the groups under (the `code` values in `feeds.rs`),
-/// so operator- and ledger-facing strings keep resolving to this ID instead of falling through to
-/// `None`. Drop the alias once the ledger rename lands and nothing feeds the old name in.
-const KALSHI: &str = "KALSHI";
-const KALSHI_CODENAME: &str = "LASHAY";
+/// The compiled-in mirror, used when the resolved document carries no `sources` block.
+const BUILT_IN: [SourceAssignment; 3] = [
+    SourceAssignment {
+        id: 1,
+        name: "HYPERLIQUID",
+    },
+    SourceAssignment {
+        id: 2,
+        name: "PHOENIX",
+    },
+    SourceAssignment {
+        id: 3,
+        name: KALSHI,
+    },
+];
 
-/// Map a registry source *name* back to its `Source ID`.
+/// The assignments in force, installed once by `ingest::feeds::init` alongside the feed rows.
+static INSTALLED: OnceLock<&'static [SourceAssignment]> = OnceLock::new();
+
+/// Install the document's assignments. Called once from `feeds::init`, before any receiver spawns;
+/// a repeat call is ignored for the same reason the feed rows' is — a venue name that changed under
+/// a running receiver would leave books and reference data keyed to a mapping no longer in effect.
+pub fn install(assignments: &'static [SourceAssignment]) -> bool {
+    INSTALLED.set(assignments).is_ok()
+}
+
+/// The assignments to resolve against: the document's if it carried a block, else [`BUILT_IN`].
+pub fn assignments() -> &'static [SourceAssignment] {
+    INSTALLED.get().copied().unwrap_or(&BUILT_IN)
+}
+
+/// Map a wire `Source ID` to its registered source name.
 ///
-/// Unlike [`source_name`], this covers every name an assigned row answers to, not just the one that
-/// is emitted — see [`KALSHI_CODENAME`]. This is what lets a resolved source carry a numeric identity
-/// a consumer can join against the registry, and what `receiver::record_revealed` tests a wire venue
-/// against before recording it.
+/// Returns `None` only for IDs the document assigns no row. Names are **uppercase**, which is the
+/// form that reaches consumers: this is what `venue`/`source_name` carry on the WebSocket and what every
+/// `venue=` metric label holds, so it is also the form a product identifier like `HYPERLIQUID:BTC`
+/// composes from.
+pub fn source_name(source_id: u16) -> Option<&'static str> {
+    assignments()
+        .iter()
+        .find(|a| a.id == source_id)
+        .map(|a| a.name)
+}
+
+/// Source ID 3's registry name. The pre-launch codename it used to also answer to is gone: the
+/// ledger re-registered the groups under their `edge-kalshi-*` codes, so nothing feeds the old name
+/// in on input either.
+const KALSHI: &str = "KALSHI";
+
+/// Map a registry source *name* back to its `Source ID`, exactly — the inverse of [`source_name`].
+///
+/// This is what lets a resolved source name carry a numeric identity a consumer can join against the
+/// registry, and what `receiver::record_revealed` tests a wire venue against before recording it.
 pub fn source_id_of(source: &str) -> Option<u16> {
-    match source {
-        "HYPERLIQUID" => Some(1),
-        "PHOENIX" => Some(2),
-        KALSHI | KALSHI_CODENAME => Some(3),
-        _ => None,
-    }
+    assignments()
+        .iter()
+        .find(|a| a.name == source)
+        .map(|a| a.id)
 }
 
 /// Cap on distinct synthesized labels for unregistered Source IDs. Bounded like every other
@@ -82,7 +112,7 @@ pub(crate) fn label_in(
     (leaked, LabelOutcome::New)
 }
 
-/// The label to stamp as `source`/`venue` for a Source ID. Total — `venue` is never blank.
+/// The label to stamp as `source_name`/`venue` for a Source ID. Total — `venue` is never blank.
 ///
 /// A registered ID yields its registry name. An unregistered one yields a stable synthesized
 /// `SOURCE_<id>`, distinct per ID: the arbiter keys dedup on `(venue, symbol)`, so collapsing
@@ -123,6 +153,28 @@ pub fn source_label(source_id: u16) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The two hand-maintained copies of one allocation must agree.
+    ///
+    /// [`BUILT_IN`] is what resolves whenever the document in force carries no `sources` block — the
+    /// hosted document's state until it is republished — so drift means the same host resolves a
+    /// different Source ID -> name mapping depending on which document won a startup race, with no
+    /// signal. A *renamed* source is worse than an added one: it splits the fleet's wire identity
+    /// across the URL-failure boundary, one host emitting a venue its neighbour does not, and a
+    /// consumer joining `SOURCE:SYMBOL` across hosts sees two products for one market.
+    #[test]
+    fn the_compiled_in_table_matches_the_built_in_document() {
+        let doc = crate::ingest::registry::load_built_in()
+            .expect("the built-in feed registry document is valid");
+        let mut from_doc = doc
+            .sources
+            .expect("the built-in document carries a `sources` block")
+            .to_vec();
+        from_doc.sort_by_key(|a| a.id);
+        let mut compiled = BUILT_IN.to_vec();
+        compiled.sort_by_key(|a| a.id);
+        assert_eq!(compiled, from_doc);
+    }
+
     #[test]
     fn registered_ids_map_to_their_names() {
         assert_eq!(source_name(1), Some("HYPERLIQUID"));
@@ -159,18 +211,13 @@ mod tests {
         assert_eq!(source_label(3), KALSHI);
     }
 
-    /// ID 3 answers to its pre-launch codename as well as its registry name, so operator- and
-    /// ledger-facing strings keep resolving to the same ID rather than falling through to `None`.
-    /// Only the registry name is ever *emitted*.
+    /// The pre-launch codename resolves to nothing now that the ledger no longer serves it, so a
+    /// document or operator string still carrying it is refused rather than silently accepted under
+    /// a second name for the same ID.
     #[test]
-    fn the_id_3_codename_resolves_to_the_same_id() {
+    fn only_the_registry_name_resolves_to_id_3() {
         assert_eq!(source_id_of(KALSHI), Some(3));
-        assert_eq!(source_id_of(KALSHI_CODENAME), Some(3));
-        assert_eq!(
-            source_name(3),
-            Some(KALSHI),
-            "the codename is accepted on input, never the emitted name"
-        );
+        assert_eq!(source_id_of("LASHAY"), None);
     }
 
     /// The public entry point's unregistered branch: read-lock miss, write-lock re-check,

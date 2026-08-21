@@ -91,7 +91,7 @@ Two consequences to document rather than discover:
 - The container now makes an outbound HTTPS call at startup. Locked-down hosts should override with a
   bind-mounted file (`DZ_FEED_REGISTRY`), which the installer already supports and mounts.
 - A host that cannot reach the URL falls back to the built-in copy **silently by design**. The log
-  line naming the resolved source is the only signal, so `connect.sh` should surface it after startup.
+  line naming the resolved document is the only signal, so `connect.sh` should surface it after startup.
 
 ## Version skew
 
@@ -108,7 +108,7 @@ fields it does not know and a newer CLI falls back when a field is absent. This 
 - **Upgrades and removal:** `apt upgrade` / `dnf upgrade` for the CLI, image pull for the bridge, and
   what uninstalling each does and does not remove.
 - **Feed registry:** where the document is served, that it is the default, how to override with a URL
-  or a file, and how to tell from the logs which source actually loaded.
+  or a file, and how to tell from the logs which document actually loaded.
 - **CLAUDE.md:** the packaging and release path, so the next change to it does not reinvent this.
 
 ## Testing
@@ -123,4 +123,4 @@ fields it does not know and a newer CLI falls back when a field is absent. This 
   accept, decline, already-installed, repo-already-configured, and package-manager-failure. Each must
   leave the container running.
 - The baked URL asserted from the built image (`docker inspect`), and a startup log check that the
-  resolved source is the URL and not the built-in fallback.
+  resolved document is the URL and not the built-in fallback.

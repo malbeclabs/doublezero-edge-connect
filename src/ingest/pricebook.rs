@@ -35,7 +35,7 @@ const ACTION_DELETE: u8 = 3;
 pub(crate) const MAX_BUFFERED_DELTAS: usize = 1 << 18;
 
 /// Cap on price levels held per book — both the live sides and the snapshot under assembly. The
-/// multicast source is unauthenticated, so a forged stream of level updates at distinct prices would
+/// multicast wire is unauthenticated, so a forged feed of level updates at distinct prices would
 /// otherwise grow both maps without limit; ~50x the spec's own worst-case per-instrument sizing.
 /// Matches `book.rs`'s `MAX_ORDERS_PER_BOOK`.
 const MAX_LEVELS_PER_BOOK: usize = 1 << 18;
@@ -111,7 +111,7 @@ pub enum DeltaOutcome {
     Gap,
     /// The level cap was hit, so the book and buffer were discarded and `status` is
     /// [`Status::AwaitingSnapshot`] — nothing was missed, we refused to grow. Distinct from [`Self::Gap`]
-    /// because the cause (a malformed or forged stream, never packet loss) and the resulting `status`
+    /// because the cause (a malformed or forged feed, never packet loss) and the resulting `status`
     /// both differ; a caller counting one as the other would read a hostile book as a lossy network.
     Overflow,
     Applied {
@@ -398,7 +398,7 @@ impl PriceBook {
     ///
     /// This is also the **only** escape from a per-instrument sequence that restarted (a publisher
     /// crash, or a garbage `last_instrument_seq` installed by a snapshot): every delta below the
-    /// baseline reads as a duplicate and every snapshot as current, so the frame header's changed
+    /// baseline reads as a duplicate and every snapshot as current, so the datagram header's changed
     /// `Reset Count` must route here for every book of that publisher.
     pub fn on_end_of_session(&mut self) {
         self.bids.clear();
@@ -582,7 +582,7 @@ fn clear_side_levels(
 mod tests {
     use super::*;
     // Only the tests name the from-price scope now: the apply path derives its behaviour from the
-    // whole-side one so that every unrecognized byte is refused (see the `Clear` arm of `on_delta`).
+    // whole-side one so that every unrecognized byte is refused (see the `Clear` branch of `on_delta`).
     use crate::ingest::codec_mbp::SCOPE_FROM_PRICE;
 
     /// Action values from the spec's enum: 1=New, 2=Change, 3=Delete, 0=Unknown.
@@ -893,7 +893,7 @@ mod tests {
     }
 
     /// **The trap this test exists for.** `Anchor Seq` is a channel-wide mktdata sequence while
-    /// our own baseline advances only on this instrument's own deltas — every frame for
+    /// our own baseline advances only on this instrument's own deltas — every datagram for
     /// every other instrument, and every heartbeat, moves one and not the other. Comparing them
     /// makes "we are behind" true for nearly every instrument on nearly every rotation, so a
     /// subscriber would discard and rebuild a perfectly good book every cycle.
@@ -939,7 +939,7 @@ mod tests {
     }
 
     /// A group is only ever opened from `Ready` once `K` proves we are behind, so the live book is
-    /// already known-stale. Failing to replace it must stop us serving it — otherwise this arm keeps
+    /// already known-stale. Failing to replace it must stop us serving it — otherwise this path keeps
     /// claiming a market it knows it cannot serve, and the authority gate never fails over.
     #[test]
     fn a_failed_snapshot_end_from_ready_discards_the_stale_book() {
@@ -1412,7 +1412,7 @@ mod tests {
 
     // ---- Level bound ----
 
-    /// The multicast source is unauthenticated, so a forged stream of level updates at distinct
+    /// The multicast wire is unauthenticated, so a forged feed of level updates at distinct
     /// prices must not grow the book without limit. At the cap the book *and* the buffer are
     /// discarded — leaving the buffer would just relocate the flood — and the instrument awaits a
     /// snapshot rather than declaring a gap it never had.

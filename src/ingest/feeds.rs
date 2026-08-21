@@ -12,22 +12,22 @@ use std::{net::Ipv4Addr, sync::OnceLock};
 
 use tracing::warn;
 
-use crate::ingest::registry;
+use crate::ingest::{registry, sources};
 
-/// Which edge-feed-spec protocol a feed speaks. Selects the frame magic + decoder + receiver
+/// Which edge-feed-spec protocol a feed speaks. Selects the datagram magic + decoder + receiver
 /// processor the bridge uses for it. See https://github.com/malbeclabs/edge-feed-spec.
 // `Midpoint`/`MarketByOrder`/`MarketByPrice` are matched on by the receiver but only *constructed*
 // by FEEDS rows, added once their live multicast endpoints are known - hence the dead_code allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FeedKind {
-    /// Top-of-Book & Trades (frame magic `0x445A`): best bid/ask quotes + trade prints.
+    /// Top-of-Book & Trades (datagram magic `0x445A`): best bid/ask quotes + trade prints.
     TopOfBook,
-    /// Midpoint (frame magic `0x4D44`): a single derived mid price per instrument.
+    /// Midpoint (datagram magic `0x4D44`): a single derived mid price per instrument.
     Midpoint,
-    /// Market-by-Order (frame magic `0x4444`): full L3 order book with snapshot+delta recovery.
+    /// Market-by-Order (datagram magic `0x4444`): full L3 order book with snapshot+delta recovery.
     MarketByOrder,
-    /// Market-by-Price (frame magic `0x4442`): the price-aggregated book with snapshot+delta
+    /// Market-by-Price (datagram magic `0x4442`): the price-aggregated book with snapshot+delta
     /// recovery, re-served as the incremental `book` product.
     MarketByPrice,
 }
@@ -45,7 +45,7 @@ impl FeedKind {
 }
 
 /// The multicast ports a feed splits its messages across. Every protocol uses a `mktdata` port
-/// (the data stream the liveness watchdog tracks) and a `refdata` port (instrument defs +
+/// (the data feed the liveness watchdog tracks) and a `refdata` port (instrument defs +
 /// manifest); Market-by-Order adds a dedicated `snapshot` port for its in-band book recovery.
 /// A loopback demo that carries everything on one port is expressed as `mktdata == refdata`.
 // `ThreePort` is constructed by Market-by-Order FEEDS rows (added with their endpoints).
@@ -54,7 +54,7 @@ impl FeedKind {
 pub enum FeedPorts {
     /// Top-of-Book and Midpoint: market data + reference data.
     TwoPort { mktdata: u16, refdata: u16 },
-    /// Market-by-Order: market data (deltas/trades) + reference data + snapshot recovery stream.
+    /// Market-by-Order: market data (deltas/trades) + reference data + snapshot recovery feed.
     ThreePort {
         mktdata: u16,
         refdata: u16,
@@ -87,16 +87,16 @@ impl FeedPorts {
 
 /// One publisher mirroring a feed: the port block it publishes on.
 ///
-/// Independent publishers mirror one venue's stream so subscribers can race them (see
+/// Independent publishers mirror one venue's feed so subscribers can race them (see
 /// `ingest::arbiter`). Two deployment models exist and both are supported:
 ///
 /// - **Distinct port blocks per publisher** (what the live Hyperliquid fleet does, on arbitrary
 ///   base ports — see the `FEEDS` docs): one `FeedPublisher` row per publisher, one receiver task
-///   each, and each task sees exactly one source IP.
+///   each, and each task sees exactly one source IP address.
 /// - **Shared port block** (all publishers to one `(group, port)`): a single `FeedPublisher` row,
-///   one receiver task, and that task sees N source IPs.
+///   one receiver task, and that task sees N source IP addresses.
 ///
-/// Either way the *publisher identity* the arbiter races on is the datagram source IP, never the
+/// Either way the *publisher identity* the arbiter races on is the datagram source IP address, never the
 /// port — so the dedup path is identical. The operator-facing identity is the
 /// [`base port`](FeedPublisher::base_port): what `--publisher-port` selects and what the
 /// `publisher` metric label carries. Deliberately a port and not a host name — the port block is
@@ -134,15 +134,15 @@ pub struct FeedPublisher {
     /// row too — turning the coincidence above into a guarantee of being wrong.
     pub channel: Option<u8>,
     /// A short human label for this channel (e.g. `"sports.nfl"`), carried verbatim from the
-    /// document's `derived.channels` roster when that entry supplied one. `None` for every publisher
+    /// document's `derived.channels` published set when that entry supplied one. `None` for every publisher
     /// today: the built-in document ships with no labels (the upstream inventory that owns them is
     /// still being made reachable at runtime), and an `explicit` block has no channel concept to
     /// label at all.
     ///
     /// **Display only.** It is never used for lookup, matching or identity — the channel **id** is
-    /// the only contract — and it is not accepted anywhere a channel id is expected. A `range` roster
+    /// the only contract — and it is not accepted anywhere a channel id is expected. A `range`
     /// entry may never carry one (a range names many channels, not one), which the schema enforces
-    /// structurally: only the single-id roster shape has a `label` field at all, so a `label`
+    /// structurally: only the single-id shape has a `label` field at all, so a `label`
     /// written on a `range` entry lands in that entry's unknown-keys map and is warned about like any
     /// other unrecognised key, never applied.
     pub label: Option<&'static str>,
@@ -160,7 +160,7 @@ impl FeedPublisher {
 ///
 /// Both modes hold exactly one authoritative publisher per key; what differs is when authority
 /// transfers. `Coordinated` re-latches every tick, because the publishers stamp a venue clock that
-/// is comparable between them. `Sticky` cannot: its arms carry no shared coordinate — no stable
+/// is comparable between them. `Sticky` cannot: its paths carry no shared coordinate — no stable
 /// entry id, no per-entry venue timestamp, and the transport's own send time is not the venue's —
 /// and a content hash is no substitute, since a level oscillating 100 -> 0 -> 100 emits
 /// byte-identical updates and collapsing those leaves a subscriber holding 0 at a price that has
@@ -169,7 +169,7 @@ impl FeedPublisher {
 pub enum ArbitrationMode {
     /// Comparable venue clock: latch to the tick's leader, re-latch every tick.
     Coordinated,
-    /// No comparable coordinate: elect one arm and hold it, transferring only on a health verdict,
+    /// No comparable coordinate: elect one path and hold it, transferring only on a health verdict,
     /// on silence, or on a sustained speed margin.
     Sticky,
 }
@@ -213,18 +213,18 @@ pub struct Feed {
     /// How this venue's mirrored publishers are arbitrated. Declared per row but consumed per
     /// venue, so a venue's rows must agree (pinned by `arbitration_mode_agrees_across_a_venues_rows`).
     pub arbitration: ArbitrationMode,
-    /// A second publisher mirrors this row's whole roster on the **same ports**, stamping every
+    /// A second publisher mirrors this row's whole published set on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount (`publisher_offset` in the document, a row-level
     /// field — an `explicit` row can declare it exactly like a `derived` one) — so the socket
-    /// bound for channel `N` also receives frames stamped `N + offset`. `None` for every row with
+    /// bound for channel `N` also receives datagrams stamped `N + offset`. `None` for every row with
     /// no such mirror.
     ///
     /// **Consumer-facing identity only.** Ingest subtracts this from a wire channel id at the
-    /// point a message becomes catalog/history/book identity (`FrameCtx::canonical_channel`), so
+    /// point a message becomes catalog/history/book identity (`DatagramCtx::canonical_channel`), so
     /// the mirror's `N + offset` and the base publisher's `N` are one market — one catalog entry,
     /// one book, one history series — to everything downstream of that point. It must **never**
     /// be applied to producer-side state (books, sequence tracking, reset counts, snapshot
-    /// cycles): those stay keyed on the raw wire channel id precisely because the two arms are
+    /// cycles): those stay keyed on the raw wire channel id precisely because the two paths are
     /// separately sequenced, and collapsing that would corrupt book recovery.
     ///
     /// Ports are unaffected: the mirror sends to the identical port block, so this never factors
@@ -240,14 +240,14 @@ pub struct Feed {
 /// compile error and leaves [`feeds()`] the one entry point.
 static FEEDS: OnceLock<&'static [Feed]> = OnceLock::new();
 
-/// The winning install's provenance (source/version/row+receiver counts) — the same figures
+/// The winning install's provenance (origin/version/row+receiver counts) — the same figures
 /// [`registry::Loaded::log_resolved`] logs once at startup, kept here so a running process can
 /// report them (`/v1/status`'s `registry` block) without re-reading logs. Set alongside [`FEEDS`]
 /// and never afterward, for the identical reason: a losing install must not overwrite the winner's
 /// provenance any more than it overwrites its rows.
 static REGISTRY_INFO: OnceLock<registry::RegistryInfo> = OnceLock::new();
 
-/// Resolve the registry document from `source` and install it.
+/// Resolve the registry document from `origin` and install it.
 ///
 /// Called once from `main` before any receiver spawns. A repeat call is ignored rather than
 /// swapping the set under running receivers — books and reference data are keyed to the topology
@@ -257,15 +257,25 @@ static REGISTRY_INFO: OnceLock<registry::RegistryInfo> = OnceLock::new();
 /// that had already logged "feed registry resolved" would leave a breadcrumb naming a document the
 /// process then discarded, which is worse than no breadcrumb at all. A loser's rows stay leaked —
 /// a one-off in a case that should not happen, and cheaper than making the install fallible.
-pub async fn init(source: registry::Source) -> Result<(), registry::RegistryError> {
-    let loaded = registry::load(source).await?;
+pub async fn init(origin: registry::Origin) -> Result<(), registry::RegistryError> {
+    let loaded = registry::load(origin).await?;
     let info = loaded.info();
     if FEEDS.set(loaded.rows).is_ok() {
+        // Installed only by the winning document, and only if it carried a block: a loser must not
+        // leave its Source ID mapping in force over the winner's rows, and a document with no block
+        // leaves `sources.rs`'s compiled-in table alone rather than replacing it with an empty one.
+        if let Some(a) = loaded.sources {
+            if !sources::install(a) {
+                warn!(
+                    "Source ID assignments were already installed; this document's were discarded"
+                );
+            }
+        }
         let _ = REGISTRY_INFO.set(info);
         loaded.log_resolved();
     } else {
         warn!(
-            source = loaded.origin(),
+            origin = loaded.origin(),
             "feed registry was already installed; this document was discarded"
         );
     }
@@ -280,6 +290,13 @@ pub fn init_built_in() {
     let _ = FEEDS.get_or_init(|| {
         let loaded =
             registry::load_built_in().expect("the built-in feed registry document is valid");
+        if let Some(a) = loaded.sources {
+            if !sources::install(a) {
+                warn!(
+                    "Source ID assignments were already installed; this document's were discarded"
+                );
+            }
+        }
         let _ = REGISTRY_INFO.set(loaded.info());
         loaded.rows
     });
@@ -323,9 +340,9 @@ mod tests {
     /// retired on 2026-08-08 and are never reissued. An id here that the publisher does not
     /// send binds a socket that stays silent, which reads as a dead publisher.
     #[test]
-    fn the_sports_roster_is_the_published_thirty_one() {
+    fn the_sports_published_set_is_thirty_one_channels() {
         let ids = sports_channel_ids();
-        assert_eq!(ids.len(), 31, "roster size changed: {ids:?}");
+        assert_eq!(ids.len(), 31, "published set size changed: {ids:?}");
         assert_eq!(ids.first().copied(), Some(10));
         assert_eq!(ids.last().copied(), Some(49));
         for reserved in 30..=38 {
@@ -339,7 +356,7 @@ mod tests {
         }
     }
 
-    /// A sports port is exactly `base + channel_id` on all three planes. This is the property the
+    /// A sports port is exactly `base + channel_id` on all three port roles. This is the property the
     /// publisher's own `validate_port_scheme` asserts, and the one a subscriber must match exactly
     /// or it joins the right group and hears silence.
     ///
@@ -353,7 +370,7 @@ mod tests {
             .iter()
             .find(|f| f.venue == "KALSHI" && f.category == "sports")
             .expect("no sports row");
-        assert_eq!(row.code, "lashay-4");
+        assert_eq!(row.code, "edge-kalshi-sports-mbp");
         assert_eq!(row.group, Ipv4Addr::new(233, 84, 178, 20));
         assert_eq!(row.kind, FeedKind::MarketByPrice);
         assert_eq!(row.publishers.len(), 31);
@@ -429,7 +446,7 @@ mod tests {
         for f in feeds() {
             assert!(!f.code.is_empty(), "{} {:?} has no code", f.venue, f.kind);
         }
-        // Keyed on `(venue, category, kind)` and not on venue alone: Lashay's two rows ride
+        // Keyed on `(venue, category, kind)` and not on venue alone: Kalshi's two rows ride
         // *different* groups, which is what makes tape ownership a runtime decision in the first
         // place.
         for f in feeds() {
@@ -438,9 +455,9 @@ mod tests {
                     "tiredsolid"
                 }
                 ("PHOENIX", "spot", FeedKind::TopOfBook) => "scottsdale",
-                ("KALSHI", "perps", FeedKind::TopOfBook) => "lashay-1",
-                ("KALSHI", "perps", FeedKind::MarketByPrice) => "lashay-2",
-                ("KALSHI", "sports", FeedKind::MarketByPrice) => "lashay-4",
+                ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
+                ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
+                ("KALSHI", "sports", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
@@ -478,8 +495,8 @@ mod tests {
     ///
     /// The invariant itself — at most one tape emitter per venue at any moment, which is what
     /// licenses the `trade_id == 0` bypass in `arbiter::emit` — is enforced at runtime by
-    /// `tape_owners` (one row per venue) and the arbiter's per-venue tape leader (one arm within it),
-    /// with `dz_tape_owner_changes_total` / `dz_tape_arm_transfers_total` reporting the moves.
+    /// `tape_owners` (one row per venue) and the arbiter's per-venue tape leader (one path within it),
+    /// with `dz_tape_owner_changes_total` / `dz_tape_path_transfers_total` reporting the moves.
     #[test]
     fn emit_trades_agrees_with_the_tape_ownership_rule() {
         for f in feeds() {
@@ -493,7 +510,7 @@ mod tests {
         }
     }
 
-    /// A venue's arms are the same hosts whatever protocol they speak, so every row for a venue
+    /// A venue's paths are the same hosts whatever protocol they speak, so every row for a venue
     /// must declare the same arbitration mode. Disagreement would make the arbiter's per-venue mode
     /// depend on which row registered last.
     #[test]
@@ -512,7 +529,7 @@ mod tests {
 
     /// The venues that predate arbitration modes race on a comparable venue clock and must keep
     /// doing so — the mode is a seam, not a behavior change. Scoped by exclusion rather than
-    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose arms carry
+    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose paths carry
     /// no shared clock can declare it; a new such venue is the feature working, not a regression.
     #[test]
     fn existing_venues_are_coordinated() {
@@ -631,15 +648,15 @@ mod tests {
     }
 
     /// Within a publisher's block the offsets follow the publisher implementation: `+1`/`+2` on every
-    /// Hyperliquid and Phoenix block and on `lashay-1`, `+10000`/`+20000` on `lashay-2` (and on the
+    /// Hyperliquid and Phoenix block and on `edge-kalshi-perps-tob`, `+10000`/`+20000` on `edge-kalshi-perps-mbp` (and on the
     /// sports market-by-price feed: 33010/43010/53010). The base port is free-form since v0.7, so this
     /// spacing is the only structural rule left — it is what an unseen block may be derived from
     /// (10901/10903 were derived this way from 10902), and a row that breaks *both* schemes is a
     /// transcription error rather than a new layout.
     ///
-    /// Scoped **per row**, not per venue: Lashay's two rows legitimately use different schemes, and
-    /// framing it by scheme rather than by a venue carve-out is what keeps `lashay-3`/`lashay-4` from
-    /// re-tripping it. Lashay's exact blocks are pinned by `the_lashay_rows_expand_consistently_with_the_document`, so
+    /// Scoped **per row**, not per venue: Kalshi's two rows legitimately use different schemes, and
+    /// framing it by scheme rather than by a venue carve-out is what keeps a later Kalshi row from
+    /// re-tripping it. Kalshi's exact blocks are pinned by `the_kalshi_rows_expand_consistently_with_the_document`, so
     /// widening this one loses nothing.
     #[test]
     fn publisher_blocks_use_a_known_layout() {
@@ -677,7 +694,7 @@ mod tests {
     /// when it was written, because both sides come from the same transcription.
     ///
     /// That distinction is not theoretical. On 2026-08-09 **all three** rows in this registry were
-    /// found provisioned on ports no publisher sends to — each authored one lane off, carrying a
+    /// found provisioned on ports no publisher sends to — each authored one port block off, carrying a
     /// sibling row's ports — and this test passed throughout, green, under its old name and its old
     /// claim. Two of the three errors predated the branch entirely.
     ///
@@ -690,7 +707,7 @@ mod tests {
     /// unit test cannot reach the wire, so this one is deliberately modest about what it pins:
     /// document → expansion consistency, nothing more.
     #[test]
-    fn the_lashay_rows_expand_consistently_with_the_document() {
+    fn the_kalshi_rows_expand_consistently_with_the_document() {
         // Scoped by category as well as kind: the venue now carries two market-by-price rows on
         // disjoint universes, so `find` on the kind alone would silently pick whichever the
         // document happens to list first.
@@ -700,16 +717,16 @@ mod tests {
                 .find(|f| f.venue == "KALSHI" && f.category == "perps" && f.kind == kind)
         };
 
-        let tob = row(FeedKind::TopOfBook).expect("Lashay top-of-book row");
-        assert_eq!(tob.code, "lashay-1");
+        let tob = row(FeedKind::TopOfBook).expect("Kalshi top-of-book row");
+        assert_eq!(tob.code, "edge-kalshi-perps-tob");
         assert_eq!(tob.group, Ipv4Addr::new(233, 84, 178, 3));
         assert_eq!(tob.publishers.len(), 1);
         assert_eq!(tob.publishers[0].ports.mktdata(), 31000);
         assert_eq!(tob.publishers[0].ports.refdata(), 41000);
         assert_eq!(tob.publishers[0].ports.snapshot(), None);
 
-        let mbp = row(FeedKind::MarketByPrice).expect("Lashay market-by-price row");
-        assert_eq!(mbp.code, "lashay-2");
+        let mbp = row(FeedKind::MarketByPrice).expect("Kalshi market-by-price row");
+        assert_eq!(mbp.code, "edge-kalshi-perps-mbp");
         assert_eq!(mbp.group, Ipv4Addr::new(233, 84, 178, 4));
         assert_eq!(mbp.publishers.len(), 1);
         assert_eq!(mbp.publishers[0].ports.mktdata(), 32000);

@@ -1,8 +1,8 @@
-//! Decoder for the DoubleZero Edge **Market-by-Price** feed (frame magic `0x4442`).
+//! Decoder for the DoubleZero Edge **Market-by-Price** feed (datagram magic `0x4442`).
 //!
 //! Price-aggregated L2: each `LevelUpdate` states the complete resulting state of one price level,
-//! with in-band snapshot+delta recovery on a third port. Shares the 24-byte frame header, 4-byte
-//! message header and generic frame-walker in [`crate::ingest::codec_common`]; only the magic and
+//! with in-band snapshot+delta recovery on a third port. Shares the 24-byte datagram header, 4-byte
+//! message header and generic datagram-walker in [`crate::ingest::codec_common`]; only the magic and
 //! the bodies differ.
 //!
 //! **Validated field-for-field against `go/marketbyprice-parser`** (edge-multicast-ref, merged
@@ -12,7 +12,7 @@
 //! * **Exact body-length equality per type, not `>=`, paired with a `SCHEMA_VERSION` gate.** The
 //!   forward-compatibility rule that a decoder ignores trailing bytes applies across a Schema
 //!   Version bump; within v1 an unexpected length is malformed. The two rules are one decision: a v2
-//!   frame whose bodies legally grew fails the length rule for every message, and the version gate is
+//!   datagram whose bodies legally grew fails the length rule for every message, and the version gate is
 //!   what turns that from a silent feed of `Other` into a decode error. Either way a bumped schema
 //!   goes dark — the gate is what makes it visible. The length rule is load-bearing because
 //!   `SnapshotBegin` is a prefix-superset of
@@ -35,8 +35,8 @@
 //! so remain offset-test-only; see `tests/fixtures/PROVENANCE.md`, which also records the publisher
 //! deviations those captures contain.
 //!
-//! Oracle parity is per-*body*. The shared frame walker stays looser than the oracle on two header
-//! checks it does not make — a `frame_length` disagreeing with the datagram (the walker clamps) and
+//! Oracle parity is per-*body*. The shared datagram walker stays looser than the oracle on two header
+//! checks it does not make — a `datagram_length` disagreeing with the datagram (the walker clamps) and
 //! a zero message count (an empty message list) — which is pre-existing and shared by all four
 //! codecs. The third, schema version, is checked here rather than left to the walker, because only
 //! this codec's body rule depends on it.
@@ -45,7 +45,7 @@ use anyhow::Result;
 
 pub use crate::ingest::codec_common::InstrumentDefinition;
 use crate::ingest::codec_common::{
-    decode_frame_with, i64le, instrument_definition, u16le, u32le, u64le, u8le, FrameHeader,
+    decode_datagram_with, i64le, instrument_definition, u16le, u32le, u64le, u8le, DatagramHeader,
     MSG_HEADER_SIZE, SCHEMA_V1, SCHEMA_V3,
 };
 
@@ -53,7 +53,7 @@ pub const MAGIC: u16 = 0x4442; // "BD"
 
 /// Wire generations this feed implements. `2` is deliberately absent — see [`SCHEMA_V1`].
 ///
-/// This gate used to live in [`decode_frame`] because it was the only codec that had one; it now
+/// This gate used to live in [`decode_datagram`] because it was the only codec that had one; it now
 /// rides the shared walker with its siblings, so a codec cannot ship without it.
 const SUPPORTED_VERSIONS: &[u8] = &[SCHEMA_V1, SCHEMA_V3];
 
@@ -116,7 +116,7 @@ pub mod sizes {
     pub const SNAPSHOT_LEVEL: usize = 32;
 }
 
-/// 52-byte trade print. `trade_id == 0` means the upstream had no venue trade id (a FIX source has
+/// 52-byte trade print. `trade_id == 0` means the upstream had no venue trade id (a FIX publisher has
 /// none); the arbiter bypasses its dedup window on that sentinel rather than keying on it.
 #[derive(Debug, Clone)]
 pub struct Trade {
@@ -243,13 +243,13 @@ pub enum Message {
 }
 
 /// Decode one datagram. Two rules make this stricter than the sibling codecs, and they depend on
-/// each other: a frame declaring an unimplemented [`SCHEMA_VERSION`] is rejected whole, and within
+/// each other: a datagram declaring an unimplemented [`SCHEMA_VERSION`] is rejected whole, and within
 /// v1 `msg_len` must equal the type's declared size exactly before any field is read, so a mis-sized
 /// body becomes [`Message::Other`] rather than decoding garbage into a field that has semantics (the
 /// module doc's `Depth Bound` case). Without the version gate the length rule would apply v1 sizes
-/// to a v2 frame whose bodies legally grew, and the whole feed would decode to `Other` in silence.
-pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, SUPPORTED_VERSIONS, |ty, _flags, b, off, ver| {
+/// to a v2 datagram whose bodies legally grew, and the whole feed would decode to `Other` in silence.
+pub fn decode_datagram(buf: &[u8]) -> Result<(DatagramHeader, Vec<Message>)> {
+    decode_datagram_with(buf, MAGIC, SUPPORTED_VERSIONS, |ty, _flags, b, off, ver| {
         // In bounds: the walker breaks before calling this unless `off + MSG_HEADER_SIZE` fits.
         let msg_len = b[off + 1] as usize;
         let body = off + MSG_HEADER_SIZE;
@@ -291,7 +291,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
             MSG_INSTRUMENT_RESET if exact(sizes::INSTRUMENT_RESET) => {
                 decode_instrument_reset(b, body).unwrap_or(Message::Other(ty))
             }
-            // `0x03`/`0x05` are reserved to stop a misrouted sibling frame cross-decoding, and
+            // `0x03`/`0x05` are reserved to stop a misrouted sibling datagram cross-decoding, and
             // `MSG_LIQUIDATION` carries nothing this bridge re-serves. Both fall through here.
             _ => Message::Other(ty),
         }
@@ -352,7 +352,7 @@ fn decode_book_clear(b: &[u8], o: usize) -> Option<Message> {
     let clear_side = u8le(b, o + 6)?;
     let scope = u8le(b, o + 7)?;
     // Malformed by spec: one price cannot bound both sides. Dropping it here rather than in the
-    // book logic means a bad frame can never clear both sides from a single bound.
+    // book logic means a bad datagram can never clear both sides from a single bound.
     //
     // Tested against the recognized **whole-side** scope, never against `SCOPE_FROM_PRICE`: enums
     // decode permissively by design, so an unassigned `2..=255` reaches here intact, and
@@ -426,8 +426,8 @@ fn decode_instrument_reset(b: &[u8], o: usize) -> Option<Message> {
 pub(crate) mod tests {
     use super::*;
 
-    /// Build a whole frame around `messages`, exposing the header fields a subscriber keys state on.
-    pub(crate) fn frame(
+    /// Build a whole datagram around `messages`, exposing the header fields a subscriber keys state on.
+    pub(crate) fn datagram(
         channel_id: u8,
         reset_count: u8,
         sequence: u64,
@@ -577,8 +577,8 @@ pub(crate) mod tests {
         msg(MSG_END_OF_SESSION, 0, &ts.to_le_bytes())
     }
 
-    /// Build a 24-byte MBP frame header carrying `msg_count` messages and `body_len` body bytes.
-    fn frame_header(msg_count: u8, reset_count: u8, body_len: usize) -> Vec<u8> {
+    /// Build a 24-byte MBP datagram header carrying `msg_count` messages and `body_len` body bytes.
+    fn datagram_header(msg_count: u8, reset_count: u8, body_len: usize) -> Vec<u8> {
         let mut h = vec![0u8; 24];
         h[0..2].copy_from_slice(&MAGIC.to_le_bytes());
         h[2] = 1; // schema version
@@ -601,7 +601,7 @@ pub(crate) mod tests {
 
     fn one(ty: u8, flags: u16, body: &[u8]) -> Vec<u8> {
         let m = msg(ty, flags, body);
-        let mut f = frame_header(1, 0, m.len());
+        let mut f = datagram_header(1, 0, m.len());
         f.extend_from_slice(&m);
         f
     }
@@ -610,22 +610,22 @@ pub(crate) mod tests {
     fn rejects_a_sibling_protocols_magic() {
         let mut f = one(MSG_HEARTBEAT, 0, &[0u8; 12]);
         f[0..2].copy_from_slice(&0x4444u16.to_le_bytes()); // market-by-order
-        assert!(decode_frame(&f).is_err());
+        assert!(decode_datagram(&f).is_err());
     }
 
-    /// A frame declaring a schema this decoder does not implement is discarded whole. Without this
-    /// the exact-length rule would apply v1 sizes to a v2 frame whose bodies legally grew, and the
+    /// A datagram declaring a schema this decoder does not implement is discarded whole. Without this
+    /// the exact-length rule would apply v1 sizes to a v2 datagram whose bodies legally grew, and the
     /// whole feed would decode to `Other` with no error to see.
     #[test]
     fn rejects_an_unimplemented_schema_version() {
         let mut f = one(MSG_HEARTBEAT, 0, &[0u8; 12]);
         f[2] = SCHEMA_V1 + 1;
-        assert!(decode_frame(&f).is_err());
+        assert!(decode_datagram(&f).is_err());
     }
 
     #[test]
-    fn frame_header_fields_decode() {
-        let (h, _) = decode_frame(&one(MSG_HEARTBEAT, 0, &[0u8; 12])).unwrap();
+    fn datagram_header_fields_decode() {
+        let (h, _) = decode_datagram(&one(MSG_HEARTBEAT, 0, &[0u8; 12])).unwrap();
         assert_eq!(h.schema_version, 1);
         assert_eq!(h.channel_id, 2);
         assert_eq!(h.sequence, 7);
@@ -638,7 +638,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 12];
         b[0] = 2;
         b[4..12].copy_from_slice(&99u64.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_HEARTBEAT, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_HEARTBEAT, 0, &b)).unwrap();
         assert!(matches!(m[0], Message::Heartbeat(99)));
     }
 
@@ -652,7 +652,7 @@ pub(crate) mod tests {
         b[37] = (-4i8) as u8;
         b[38] = 0;
         b[74..76].copy_from_slice(&3u16.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_DEFINITION, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_INSTRUMENT_DEFINITION, 0, &b)).unwrap();
         let Message::InstrumentDefinition(d) = &m[0] else {
             panic!("{:?}", m[0])
         };
@@ -663,7 +663,7 @@ pub(crate) mod tests {
         assert_eq!(d.manifest_seq, 3);
     }
 
-    /// spec: Trade 0x04, 52 bytes. Body: id @0, source @4, aggressor @6, flags @7, ts @8,
+    /// spec: Trade 0x04, 52 bytes. Body: id @0, source_id @4, aggressor @6, flags @7, ts @8,
     /// price i64 @16, qty @24, trade_id @32, cumulative @40.
     ///
     /// NOTE the aggressor encoding is 1=Buy / 2=Sell / 0=Unknown — a DIFFERENT value space from
@@ -678,7 +678,7 @@ pub(crate) mod tests {
         b[16..24].copy_from_slice(&6200i64.to_le_bytes());
         b[24..32].copy_from_slice(&150u64.to_le_bytes());
         b[32..40].copy_from_slice(&0u64.to_le_bytes()); // FIX-sourced: no venue trade id
-        let (_, m) = decode_frame(&one(MSG_TRADE, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_TRADE, 0, &b)).unwrap();
         let Message::Trade(t) = &m[0] else { panic!() };
         assert_eq!(t.instrument_id, 41);
         assert_eq!(t.aggressor_side, AGGRESSOR_SELL);
@@ -695,7 +695,7 @@ pub(crate) mod tests {
         b[1] = 1;
         b[4..6].copy_from_slice(&3u16.to_le_bytes());
         b[8..12].copy_from_slice(&13u32.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_MANIFEST_SUMMARY, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_MANIFEST_SUMMARY, 0, &b)).unwrap();
         let Message::ManifestSummary(s) = &m[0] else {
             panic!()
         };
@@ -710,7 +710,7 @@ pub(crate) mod tests {
     fn manifest_summary_valid_is_any_non_zero() {
         let mut b = vec![0u8; 20];
         b[1] = 2;
-        let (_, m) = decode_frame(&one(MSG_MANIFEST_SUMMARY, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_MANIFEST_SUMMARY, 0, &b)).unwrap();
         let Message::ManifestSummary(s) = &m[0] else {
             panic!()
         };
@@ -720,16 +720,16 @@ pub(crate) mod tests {
     /// spec: EndOfSession 0x06, 12 bytes. Body: ts @0.
     #[test]
     fn end_of_session_decodes() {
-        let (_, m) = decode_frame(&one(MSG_END_OF_SESSION, 0, &42u64.to_le_bytes())).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_END_OF_SESSION, 0, &42u64.to_le_bytes())).unwrap();
         assert!(matches!(m[0], Message::EndOfSession(42)));
     }
 
     /// `0x03` (Quote in the top-of-book feed) and `0x05` are reserved here **specifically** so a
-    /// misrouted sibling frame cannot cross-decode. They must skip by length, never decode.
+    /// misrouted sibling datagram cannot cross-decode. They must skip by length, never decode.
     #[test]
     fn reserved_types_do_not_decode() {
         for ty in [0x03u8, 0x05] {
-            let (_, m) = decode_frame(&one(ty, 0, &[0u8; 20])).unwrap();
+            let (_, m) = decode_datagram(&one(ty, 0, &[0u8; 20])).unwrap();
             assert!(
                 matches!(m[0], Message::Other(t) if t == ty),
                 "type {ty:#04x} decoded"
@@ -747,10 +747,10 @@ pub(crate) mod tests {
             b[4..12].copy_from_slice(&77u64.to_le_bytes());
             msg(MSG_HEARTBEAT, 0, &b)
         };
-        let mut f = frame_header(2, 0, unknown.len() + hb.len());
+        let mut f = datagram_header(2, 0, unknown.len() + hb.len());
         f.extend_from_slice(&unknown);
         f.extend_from_slice(&hb);
-        let (_, m) = decode_frame(&f).unwrap();
+        let (_, m) = decode_datagram(&f).unwrap();
         assert!(matches!(m[0], Message::Other(0x7F)));
         assert!(matches!(m[1], Message::Heartbeat(77)));
     }
@@ -773,7 +773,7 @@ pub(crate) mod tests {
             (MSG_MANIFEST_SUMMARY, 20),
         ] {
             for len in [correct - 1, correct + 1] {
-                let (_, m) = decode_frame(&one(ty, 0, &vec![0u8; len])).unwrap();
+                let (_, m) = decode_datagram(&one(ty, 0, &vec![0u8; len])).unwrap();
                 assert!(
                     matches!(m[0], Message::Other(t) if t == ty),
                     "type {ty:#04x} len {len} decoded"
@@ -792,7 +792,7 @@ pub(crate) mod tests {
     fn an_over_long_instrument_definition_still_decodes() {
         let mut long = vec![0u8; 76 + 8];
         long[0..4].copy_from_slice(&41u32.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_DEFINITION, 0, &long)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_INSTRUMENT_DEFINITION, 0, &long)).unwrap();
         assert!(
             matches!(&m[0], Message::InstrumentDefinition(d) if d.instrument_id == 41),
             "a v1 definition with trailing bytes must still decode: {:?}",
@@ -800,7 +800,7 @@ pub(crate) mod tests {
         );
 
         let short = vec![0u8; 75];
-        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_DEFINITION, 0, &short)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_INSTRUMENT_DEFINITION, 0, &short)).unwrap();
         assert!(
             matches!(m[0], Message::Other(MSG_INSTRUMENT_DEFINITION)),
             "a short definition is still rejected: {:?}",
@@ -808,7 +808,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// spec: LevelUpdate 0x40, 48 bytes. Body: id @0, source @4, side @6, action @7, seq @8,
+    /// spec: LevelUpdate 0x40, 48 bytes. Body: id @0, source_id @4, side @6, action @7, seq @8,
     /// price i64 @12, qty u64 @20, ts @28, order_count @36, level_index @38, reason @40, flags @41.
     #[test]
     fn level_update_decodes() {
@@ -825,7 +825,7 @@ pub(crate) mod tests {
         b[38..40].copy_from_slice(&1u16.to_le_bytes());
         b[40] = 1; // Trade
         b[41] = 0b10; // AMM-synthetic
-        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
         let Message::LevelUpdate(u) = &m[0] else {
             panic!("{:?}", m[0])
         };
@@ -850,14 +850,14 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 44];
         b[36..38].copy_from_slice(&0xFFFFu16.to_le_bytes());
         b[38..40].copy_from_slice(&0xFFFFu16.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
         let Message::LevelUpdate(u) = &m[0] else {
             panic!()
         };
         assert_eq!(u.order_count, None);
         assert_eq!(u.level_index, None);
 
-        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &[0u8; 44])).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_LEVEL_UPDATE, 0, &[0u8; 44])).unwrap();
         let Message::LevelUpdate(u) = &m[0] else {
             panic!()
         };
@@ -870,7 +870,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 44];
         b[12..20].copy_from_slice(&6300i64.to_le_bytes());
         b[20..28].copy_from_slice(&0u64.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
         let Message::LevelUpdate(u) = &m[0] else {
             panic!()
         };
@@ -886,14 +886,14 @@ pub(crate) mod tests {
         b[6] = 200; // side
         b[7] = 200; // action
         b[40] = 200; // update reason
-        let (_, m) = decode_frame(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_LEVEL_UPDATE, 0, &b)).unwrap();
         let Message::LevelUpdate(u) = &m[0] else {
             panic!()
         };
         assert_eq!((u.side, u.action, u.update_reason), (200, 200, 200));
     }
 
-    /// spec: BookClear 0x41, 36 bytes. Body: id @0, source @4, clear_side @6, scope @7, seq @8,
+    /// spec: BookClear 0x41, 36 bytes. Body: id @0, source_id @4, clear_side @6, scope @7, seq @8,
     /// from_price i64 @12, ts @20, clear_reason @28.
     #[test]
     fn book_clear_decodes() {
@@ -905,7 +905,7 @@ pub(crate) mod tests {
         b[12..20].copy_from_slice(&6100i64.to_le_bytes());
         b[20..28].copy_from_slice(&1_234u64.to_le_bytes());
         b[28] = 1; // Halt
-        let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
         let Message::BookClear(c) = &m[0] else {
             panic!("{:?}", m[0])
         };
@@ -924,7 +924,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 32];
         b[6] = CLEAR_SIDE_BOTH;
         b[7] = SCOPE_FROM_PRICE;
-        let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
         assert!(
             matches!(m[0], Message::Other(MSG_BOOK_CLEAR)),
             "must not decode as a clear"
@@ -943,7 +943,7 @@ pub(crate) mod tests {
             let mut b = vec![0u8; 32];
             b[6] = CLEAR_SIDE_BOTH;
             b[7] = scope;
-            let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+            let (_, m) = decode_datagram(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
             assert!(
                 matches!(m[0], Message::Other(MSG_BOOK_CLEAR)),
                 "scope {scope} with Clear Side = 2 must not decode as a clear"
@@ -957,7 +957,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 32];
         b[6] = CLEAR_SIDE_BOTH;
         b[7] = SCOPE_ENTIRE_SIDE;
-        let (_, m) = decode_frame(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
         assert!(matches!(m[0], Message::BookClear(_)));
     }
 
@@ -973,7 +973,7 @@ pub(crate) mod tests {
         b[20..22].copy_from_slice(&2u16.to_le_bytes());
         b[22] = SIDE_BID;
         b[23] = 1;
-        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_LEVEL, 1, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_SNAPSHOT_LEVEL, 1, &b)).unwrap();
         let Message::SnapshotLevel(l) = &m[0] else {
             panic!("{:?}", m[0])
         };
@@ -986,7 +986,7 @@ pub(crate) mod tests {
 
         // Same `0xFFFF` sentinel rule as LevelUpdate: never a count of 65535.
         b[20..22].copy_from_slice(&0xFFFFu16.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_LEVEL, 1, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_SNAPSHOT_LEVEL, 1, &b)).unwrap();
         let Message::SnapshotLevel(l) = &m[0] else {
             panic!()
         };
@@ -1008,7 +1008,7 @@ pub(crate) mod tests {
         b[20..24].copy_from_slice(&16u32.to_le_bytes());
         b[24..32].copy_from_slice(&7_777u64.to_le_bytes());
         b[32..36].copy_from_slice(&0u32.to_le_bytes()); // 0 = complete book
-        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_SNAPSHOT_BEGIN, 1, &b)).unwrap();
         let Message::SnapshotBegin(s) = &m[0] else {
             panic!("{:?}", m[0])
         };
@@ -1026,7 +1026,7 @@ pub(crate) mod tests {
     /// publisher claim of a complete book that no publisher made.
     #[test]
     fn snapshot_begin_rejects_the_short_sibling_layout() {
-        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &[0u8; 32])).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_SNAPSHOT_BEGIN, 1, &[0u8; 32])).unwrap();
         assert!(matches!(m[0], Message::Other(MSG_SNAPSHOT_BEGIN)));
     }
 
@@ -1034,7 +1034,7 @@ pub(crate) mod tests {
     fn snapshot_begin_bounded_depth_decodes() {
         let mut b = vec![0u8; 36];
         b[32..36].copy_from_slice(&25u32.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_BEGIN, 1, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_SNAPSHOT_BEGIN, 1, &b)).unwrap();
         let Message::SnapshotBegin(s) = &m[0] else {
             panic!()
         };
@@ -1048,7 +1048,7 @@ pub(crate) mod tests {
         b[0..4].copy_from_slice(&41u32.to_le_bytes());
         b[4..12].copy_from_slice(&900u64.to_le_bytes());
         b[12..16].copy_from_slice(&5u32.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_SNAPSHOT_END, 1, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_SNAPSHOT_END, 1, &b)).unwrap();
         let Message::SnapshotEnd(e) = &m[0] else {
             panic!()
         };
@@ -1062,7 +1062,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 12];
         b[0..4].copy_from_slice(&123u32.to_le_bytes());
         b[4..12].copy_from_slice(&456u64.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_BATCH_BOUNDARY, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_BATCH_BOUNDARY, 0, &b)).unwrap();
         let Message::BatchBoundary(bb) = &m[0] else {
             panic!()
         };
@@ -1079,7 +1079,7 @@ pub(crate) mod tests {
         b[4] = 3; // UpstreamGap
         b[8..16].copy_from_slice(&1_000u64.to_le_bytes());
         b[16..24].copy_from_slice(&2_000u64.to_le_bytes());
-        let (_, m) = decode_frame(&one(MSG_INSTRUMENT_RESET, 0, &b)).unwrap();
+        let (_, m) = decode_datagram(&one(MSG_INSTRUMENT_RESET, 0, &b)).unwrap();
         let Message::InstrumentReset(r) = &m[0] else {
             panic!()
         };
@@ -1089,7 +1089,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Extend the exact-length sweep to the price-keyed types.
+    /// Extend the exact-length checks to the price-keyed types.
     #[test]
     fn wrong_body_length_does_not_decode_price_types() {
         for (ty, correct) in [
@@ -1102,7 +1102,7 @@ pub(crate) mod tests {
             (MSG_SNAPSHOT_LEVEL, 28),
         ] {
             for len in [correct - 1, correct + 1] {
-                let (_, m) = decode_frame(&one(ty, 0, &vec![0u8; len])).unwrap();
+                let (_, m) = decode_datagram(&one(ty, 0, &vec![0u8; len])).unwrap();
                 assert!(
                     matches!(m[0], Message::Other(t) if t == ty),
                     "type {ty:#04x} len {len} decoded"
@@ -1229,7 +1229,7 @@ pub(crate) mod tests {
             assert_eq!(m.len(), want, "type {:#04x} wrong length", m[0]);
         }
 
-        let (h, m) = decode_frame(&frame(4, 9, 12_345, &built)).unwrap();
+        let (h, m) = decode_datagram(&datagram(4, 9, 12_345, &built)).unwrap();
         assert_eq!((h.channel_id, h.reset_count, h.sequence), (4, 9, 12_345));
         assert_eq!(m.len(), 12);
 
@@ -1364,7 +1364,7 @@ pub(crate) mod tests {
     #[test]
     fn index_addressing_range_is_skipped() {
         for ty in 0x50u8..=0x5F {
-            let (_, m) = decode_frame(&one(ty, 0, &[0u8; 20])).unwrap();
+            let (_, m) = decode_datagram(&one(ty, 0, &[0u8; 20])).unwrap();
             assert!(
                 matches!(m[0], Message::Other(t) if t == ty),
                 "type {ty:#04x} decoded"

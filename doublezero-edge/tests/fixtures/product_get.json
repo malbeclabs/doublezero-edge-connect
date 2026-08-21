@@ -2,7 +2,7 @@
   "product": {
     "product_id": "HYPERLIQUID:BTC",
     "source_id": 1,
-    "source": "Hyperliquid",
+    "source_name": "Hyperliquid",
     "symbol": "BTC",
     "channel": 0,
     "instrument_id": 41,

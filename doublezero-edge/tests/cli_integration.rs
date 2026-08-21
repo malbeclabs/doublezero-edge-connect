@@ -37,7 +37,7 @@ fn run(args: &[&str]) -> Run {
 fn a_successful_response_exits_zero_with_json_on_stdout() {
     let url = mock_server(
         "200 OK",
-        r#"{"products":[{"product_id":"HYPERLIQUID:BTC","source_id":1,"source":"Hyperliquid","symbol":"BTC","channel":0,"instrument_id":41,"price_increment":"0.01","base_increment":"0.00001","status":"online","feed_kind":"top_of_book"}]}"#,
+        r#"{"products":[{"product_id":"HYPERLIQUID:BTC","source_id":1,"source_name":"Hyperliquid","symbol":"BTC","channel":0,"instrument_id":41,"price_increment":"0.01","base_increment":"0.00001","status":"online","feed_kind":"top_of_book"}]}"#,
     );
     let r = run(&["--url", &url, "products", "list"]);
     assert_eq!(r.status, 0, "stderr: {}", r.stderr);
@@ -90,7 +90,7 @@ fn a_409_ambiguous_response_exits_1() {
         "409 Conflict",
         r#"{"error":"ambiguous_product","message":"matches more than one market","remediation":"Disambiguate using one of the listed candidates.","candidates":["A#1.1","A#1.2"]}"#,
     );
-    let r = run(&["--url", &url, "products", "get", "LASHAY:EAVE-27JAN01-YES"]);
+    let r = run(&["--url", &url, "products", "get", "KALSHI:EAVE-27JAN01-YES"]);
     assert_eq!(r.status, 1, "stdout: {} stderr: {}", r.stdout, r.stderr);
     assert!(r.stderr.contains("ambiguous_product"), "{}", r.stderr);
 }
@@ -160,7 +160,7 @@ fn jq_extracts_a_nested_field_from_a_real_response() {
 fn jq_streams_one_line_per_element_on_an_iterate() {
     let url = mock_server(
         "200 OK",
-        r#"{"products":[{"product_id":"A:X","source_id":1,"source":"A","symbol":"X","channel":0,"instrument_id":1,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"},{"product_id":"A:Y","source_id":1,"source":"A","symbol":"Y","channel":0,"instrument_id":2,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}]}"#,
+        r#"{"products":[{"product_id":"A:X","source_id":1,"source_name":"A","symbol":"X","channel":0,"instrument_id":1,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"},{"product_id":"A:Y","source_id":1,"source_name":"A","symbol":"Y","channel":0,"instrument_id":2,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}]}"#,
     );
     let r = run(&[
         "--url",
@@ -251,11 +251,11 @@ fn best_bid_ask_sends_a_bare_positional_as_product_ids() {
 #[test]
 fn paginate_follows_the_cursor_and_accumulates_every_page() {
     let page1 = r#"{"products":[
-        {"product_id":"A:X","source_id":1,"source":"A","symbol":"X","channel":0,"instrument_id":1,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"},
-        {"product_id":"A:Y","source_id":1,"source":"A","symbol":"Y","channel":0,"instrument_id":2,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}
+        {"product_id":"A:X","source_id":1,"source_name":"A","symbol":"X","channel":0,"instrument_id":1,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"},
+        {"product_id":"A:Y","source_id":1,"source_name":"A","symbol":"Y","channel":0,"instrument_id":2,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}
     ],"cursor":"2"}"#;
     let page2 = r#"{"products":[
-        {"product_id":"A:Z","source_id":1,"source":"A","symbol":"Z","channel":0,"instrument_id":3,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}
+        {"product_id":"A:Z","source_id":1,"source_name":"A","symbol":"Z","channel":0,"instrument_id":3,"price_increment":"1","base_increment":"1","status":"online","feed_kind":"top_of_book"}
     ]}"#;
     let (url, served) = mock_server_sequence(vec![("200 OK", page1), ("200 OK", page2)]);
 

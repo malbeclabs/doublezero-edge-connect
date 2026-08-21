@@ -77,7 +77,7 @@ pub type TapeOwner = Arc<AtomicBool>;
 /// group and not the top-of-book one. Both rows claim the tape ([`Feed::emit_trades`]); this ranking
 /// is what makes exactly one of them serve it at any moment — the invariant the arbiter's
 /// `trade_id == 0` bypass rests on. Top-of-book wins when both are up: it is the venue's primary
-/// tape, and market-by-price carries prints only as a by-product of the book stream.
+/// tape, and market-by-price carries prints only as a by-product of the book feed.
 fn tape_rank(kind: FeedKind) -> Option<u8> {
     match kind {
         FeedKind::TopOfBook => Some(0),
@@ -213,7 +213,7 @@ pub struct ReconcilerConfig {
     /// Query API bind address; empty disables the sink outright (never activated) - mirrors
     /// `ws_bind`.
     pub api_bind: String,
-    /// The shared rolling trade history the reconciler's history feeder writes into and the query
+    /// The shared rolling trade history the reconciler's history writer writes into and the query
     /// API reads from. Built once in `main` (like `instruments`/`depth`/`books`) so the window
     /// survives the sink's own activate/deactivate cycles.
     pub history: Arc<Mutex<Store>>,
@@ -259,12 +259,12 @@ pub struct Reconciler {
     /// missing either leaks a flag for a receiver that is gone.
     active: HashMap<FeedKey, (JoinHandle<Result<()>>, TapeOwner)>,
     ws_task: Option<JoinHandle<Result<()>>>,
-    /// The query API sink task and the history feeder that keeps its store fed, treated as one
+    /// The query API sink task and the history writer that keeps its store fed, treated as one
     /// coupled unit by `apply_api`/`reap_finished`: both come up and go down together, since running
     /// one without the other either buffers history nobody can query or serves a query API with a
     /// stalled window.
     api_task: Option<JoinHandle<Result<()>>>,
-    history_feeder: Option<JoinHandle<()>>,
+    history_writer: Option<JoinHandle<()>>,
     /// The running shred forwarder plus the (sorted) source set it was started with, so a changed
     /// set triggers a restart.
     shred_task: Option<(Vec<SocketAddrV4>, JoinHandle<Result<()>>)>,
@@ -334,7 +334,7 @@ impl Reconciler {
             active: HashMap::new(),
             ws_task: None,
             api_task: None,
-            history_feeder: None,
+            history_writer: None,
             shred_task: None,
             health: std::sync::Arc::new(FeedHealth::new()),
             cli_missing_logged: false,
@@ -643,20 +643,20 @@ impl Reconciler {
             warn!("WebSocket sink task exited; will re-activate if still desired");
             self.ws_task = None;
         }
-        // Reaped as one pair: if either the API sink or its history feeder exited on its own, tear
+        // Reaped as one pair: if either the API sink or its history writer exited on its own, tear
         // both down so the next `apply_api` respawns a fresh matched pair instead of layering a new
-        // feeder alongside one that's still running (which would double-count every trade).
+        // writer alongside one that's still running (which would double-count every trade).
         if self.api_task.as_ref().is_some_and(|h| h.is_finished())
             || self
-                .history_feeder
+                .history_writer
                 .as_ref()
                 .is_some_and(|h| h.is_finished())
         {
-            warn!("query API (or its history feeder) exited; will re-activate if still desired");
+            warn!("query API (or its history writer) exited; will re-activate if still desired");
             if let Some(h) = self.api_task.take() {
                 h.abort();
             }
-            if let Some(h) = self.history_feeder.take() {
+            if let Some(h) = self.history_writer.take() {
                 h.abort();
             }
         }
@@ -850,7 +850,6 @@ impl Reconciler {
         let Some(channel) = publisher.channel else {
             return;
         };
-        let channel = u32::from(channel);
 
         // N1's invariant, made loud rather than merely documented: by the time this runs, `tick`
         // must have already aborted this key's receiver (if it was running at all) — otherwise a
@@ -953,7 +952,7 @@ impl Reconciler {
     }
 
     /// Mirrors `apply_ws`: bind first so a taken port is non-fatal (staying off rather than taking
-    /// the tunnel down), then spawn the serve loop *and* the history feeder together - the feeder
+    /// the tunnel down), then spawn the serve loop *and* the history writer together - the writer
     /// exists only to keep this sink's store fed, so it has no reason to run without it, and running
     /// it without the sink would silently buffer history nobody can reach.
     async fn apply_api(&mut self, on: bool) {
@@ -971,7 +970,7 @@ impl Reconciler {
                         self.cfg.filter.clone(),
                         self.cfg.enabled.clone(),
                     )));
-                    self.history_feeder = Some(tokio::spawn(feed_history(
+                    self.history_writer = Some(tokio::spawn(feed_history(
                         self.cfg.tx.subscribe(),
                         self.cfg.history.clone(),
                         self.cfg.instruments.clone(),
@@ -984,7 +983,7 @@ impl Reconciler {
                 if let Some(h) = self.api_task.take() {
                     h.abort();
                 }
-                if let Some(h) = self.history_feeder.take() {
+                if let Some(h) = self.history_writer.take() {
                     h.abort();
                 }
                 info!("deactivating query API (no market-data feed subscribed)");
@@ -1037,7 +1036,7 @@ fn plan<K: Eq + Hash + Clone>(current: &HashSet<K>, desired: &HashSet<K>) -> (Ve
 /// low milliseconds) while still catching a stamp that is seconds, minutes, or years ahead.
 const MAX_PLAUSIBLE_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 
-/// Resolve one trade's bucket timestamp, clamping an implausible venue time at this feeder seam
+/// Resolve one trade's bucket timestamp, clamping an implausible venue time at this writer's seam
 /// rather than trusting it into `history::Store` - the same seam that already resolves the
 /// `source_ts_ns == 0` sentinel, and for the same reason `history.rs` refuses to know about clocks
 /// (see its module doc): that decision belongs to the caller, which knows what a plausible time looks
@@ -1057,7 +1056,7 @@ const MAX_PLAUSIBLE_FUTURE_SKEW_NS: u64 = 5_000_000_000; // 5s
 /// than trusting an implausible venue clock).
 fn resolve_ts_ns(source_ts_ns: u64, recv_ts_ns: u64) -> u64 {
     if source_ts_ns == 0 {
-        return recv_ts_ns; // the "not available" sentinel - never a real epoch time
+        return recv_ts_ns; // the "not available" sentinel - never a real wall-clock time
     }
     let too_far_future = source_ts_ns > recv_ts_ns.saturating_add(MAX_PLAUSIBLE_FUTURE_SKEW_NS);
     let window_ns = history::WINDOW_SECS.saturating_mul(1_000_000_000);
@@ -1077,9 +1076,9 @@ fn resolve_ts_ns(source_ts_ns: u64, recv_ts_ns: u64) -> u64 {
 ///
 /// Keys straight off the message: `NormalizedTrade` now carries `channel`/`instrument_id` *and*
 /// `category` itself (the identity `history::Key` groups on), populated at every emission site
-/// alongside the `symbol` a price-aggregated venue's mirrored arms can share. There is
+/// alongside the `symbol` a price-aggregated venue's mirrored paths can share. There is
 /// deliberately no symbol lookup here anymore - matching by `(venue, symbol)` against the
-/// instrument catalog is exactly what dropped every trade on a venue whose two arms carry an
+/// instrument catalog is exactly what dropped every trade on a venue whose two paths carry an
 /// identical instrument set under distinct `channel`s (see `history::Key`'s docs), because every
 /// symbol on such a venue matched more than once. `category` closes the companion gap: two
 /// disjoint universes under one Source ID can share `(channel, instrument_id)`, and without it
@@ -1128,15 +1127,15 @@ async fn feed_history(
                     crate::model::lock(&history).ingest(key, print);
                 }
             }
-            // A slow feeder can fall behind the broadcast; the window is a best-effort rolling one,
+            // A slow writer can fall behind the broadcast; the window is a best-effort rolling one,
             // not a promise of every print, so skip the gap rather than exit over it - but count it,
-            // like every other broadcast consumer in this bridge (see `sinks::ws`), so a feeder that
+            // like every other broadcast consumer in this bridge (see `sinks::ws`), so a writer that
             // is punching holes in the window is visible rather than silently thinner.
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 metrics().history_feed_lagged.inc();
                 warn!(
                     skipped = n,
-                    "history feeder lagged the broadcast; window has a gap"
+                    "history writer lagged the broadcast; window has a gap"
                 );
                 continue;
             }
@@ -1524,7 +1523,7 @@ mod tests {
             .iter()
             .find(|f| f.category == "sports")
             .expect("the built-in registry has a sports row");
-        let filter = ChannelFilter::parse("lashay-4=10,11").unwrap();
+        let filter = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
 
         let narrowed = test_reconciler_with_filter(vec![sports], filter);
         let mut ports: Vec<u16> = narrowed
@@ -1544,7 +1543,7 @@ mod tests {
         );
     }
 
-    /// The real "sports" row (group code `lashay-4`), for tests that need genuine channel-filter
+    /// The real "sports" row (group code `edge-kalshi-sports-mbp`), for tests that need genuine channel-filter
     /// narrowing — `ChannelFilter::parse` validates against the loaded registry, so a custom `Feed`
     /// with a made-up code cannot be narrowed at all.
     fn sports_row() -> Feed {
@@ -1560,14 +1559,14 @@ mod tests {
         venue: &str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         category: &str,
         changes: Vec<crate::model::BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(crate::model::NormalizedBook {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -1593,11 +1592,11 @@ mod tests {
         source_id: u16,
         symbol: &str,
         category: &'static str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) {
         let mut a = crate::ingest::arbiter::lock(&r.cfg.arbiter);
-        let publisher = crate::ingest::arbiter::Publisher::Edge(std::net::IpAddr::V4(
+        let publisher = crate::ingest::arbiter::Transport::Edge(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(10, 0, 0, 1),
         ));
         a.emit(
@@ -1648,7 +1647,7 @@ mod tests {
     /// `active` entirely, is what still catches it.
     ///
     /// Drives the real `tick()` across two ticks with a genuinely **narrowing channel filter** on
-    /// the real `lashay-4` sports row (`ChannelFilter::parse` validates against the loaded
+    /// the real `edge-kalshi-sports-mbp` sports row (`ChannelFilter::parse` validates against the loaded
     /// registry, so a custom `Feed`'s made-up code cannot be narrowed — see `sports_row`). Channel
     /// 10 departs; channel 11 stays admitted, so `cfg.enabled` is never emptied and the row stays
     /// resolvable.
@@ -1656,7 +1655,7 @@ mod tests {
     async fn a_self_exited_receivers_channel_is_still_forgotten_when_it_leaves_the_desired_set() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
 
@@ -1703,7 +1702,7 @@ mod tests {
         // Tick 2: narrow the channel filter to channel 11 only. `active` no longer holds channel
         // 10's key at all, so a diff against `active` (the pre-fix behaviour) would find nothing
         // to forget.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
         r.tick().await;
 
         assert!(
@@ -1884,11 +1883,11 @@ mod tests {
         let key_perps = ("KALSHI", "perps", FeedKind::MarketByPrice, 33030u16);
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "perps".into(), 10u32, 1u32),
+            ("KALSHI".into(), "perps".into(), 10u8, 1u32),
             test_instrument_in("perps", "KALSHI", 3, "KXBTCPERP", 10, 1),
         );
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32),
             test_instrument_in("sports", "KALSHI", 3, "LAKERSWIN", 10, 1),
         );
 
@@ -1896,11 +1895,11 @@ mod tests {
 
         let map = r.cfg.instruments.lock().unwrap();
         assert!(
-            !map.contains_key(&("KALSHI".into(), "perps".into(), 10u32, 1u32)),
+            !map.contains_key(&("KALSHI".into(), "perps".into(), 10u8, 1u32)),
             "the departing perps row's own catalog entry must be purged"
         );
         let peer = map
-            .get(&("KALSHI".into(), "sports".into(), 10u32, 1u32))
+            .get(&("KALSHI".into(), "sports".into(), 10u8, 1u32))
             .expect(
                 "the sports row's catalog entry, sharing channel 10 under the same venue, must \
                  survive — a category-blind filter would have dropped it too",
@@ -1919,14 +1918,14 @@ mod tests {
     async fn a_departed_channels_product_is_invisible_to_the_query_surface() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32),
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "DEPARTED".into(),
                 channel: 10,
@@ -1997,7 +1996,7 @@ mod tests {
         // itself is now deferred until the aborted receiver is confirmed stopped (`drain_departed`);
         // drive `MAX_DRAIN_TICKS` further ticks so the bound forces it regardless of whether this
         // test's spawned receiver ever gets polled to completion on its own.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
         r.tick().await;
         for _ in 0..MAX_DRAIN_TICKS {
             r.tick().await;
@@ -2015,7 +2014,7 @@ mod tests {
     }
 
     /// N1 + N2 + N3, the deliverable: drives the real `tick()` (not a hand-called helper) across two
-    /// ticks with a genuinely **narrowing channel filter** (the real `lashay-4` sports row, via
+    /// ticks with a genuinely **narrowing channel filter** (the real `edge-kalshi-sports-mbp` sports row, via
     /// `ChannelFilter::parse`), seeding all three maps a departure purges — the catalog, the book
     /// (through the real arbiter, not a hand-built `BookReplay`), and history.
     ///
@@ -2037,11 +2036,11 @@ mod tests {
         let feed = sports_row();
         let mut r = test_reconciler_with_filter(
             vec![feed],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
         let book_key: crate::ingest::authority::MarketKey =
             (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
         let hist_key = history::Key {
@@ -2063,7 +2062,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "NARROWED".into(),
                 channel: 10,
@@ -2095,7 +2094,7 @@ mod tests {
             .is_empty());
 
         // Narrow the channel filter: channel 10 departs, channel 11 stays admitted.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
 
         // Tick 2: the real `tick()` aborts the receiver and queues it in `draining`. Its spawned
         // task is never polled in this harness, so it never reports finished on its own; drive
@@ -2145,11 +2144,11 @@ mod tests {
     async fn a_subscription_loss_stops_the_receiver_without_purging_its_state() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
         let book_key: crate::ingest::authority::MarketKey =
             (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
         let hist_key = history::Key {
@@ -2178,7 +2177,7 @@ mod tests {
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
                 venue: "KALSHI".into(),
-                source: "KALSHI".into(),
+                source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "STILLHERE".into(),
                 channel: 10,
@@ -2258,11 +2257,11 @@ mod tests {
     async fn a_write_that_lands_after_abort_is_still_purged_once_the_receiver_finishes() {
         let mut r = test_reconciler_with_filter(
             vec![sports_row()],
-            ChannelFilter::parse("lashay-4=10,11").unwrap(),
+            ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
         let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u32, u32) =
-            ("KALSHI".into(), "sports".into(), 10u32, 1u32);
+        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
+            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
 
         // Tick 1: both channels admitted (spawns real, never-polled receivers).
         r.tick().await;
@@ -2288,7 +2287,7 @@ mod tests {
 
         // Narrow the filter: channel 10 departs. Tick 2 aborts the stand-in and queues it in
         // `draining` rather than purging right away.
-        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("lashay-4=11").unwrap();
+        *r.cfg.filter.lock().unwrap() = ChannelFilter::parse("edge-kalshi-sports-mbp=11").unwrap();
         r.tick().await;
         assert!(
             !r.active.contains_key(&key10),
@@ -2373,14 +2372,14 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // History feeder + query API activation
+    // History writer + query API activation
     // ---------------------------------------------------------------------------------------------
 
     fn test_instrument(
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
         test_instrument_in("default", venue, source_id, symbol, channel, instrument_id)
@@ -2392,12 +2391,12 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -2413,7 +2412,7 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         price: f64,
         source_ts_ns: u64,
@@ -2438,7 +2437,7 @@ mod tests {
         venue: &'static str,
         source_id: u16,
         symbol: &str,
-        channel: u32,
+        channel: u8,
         instrument_id: u32,
         price: f64,
         source_ts_ns: u64,
@@ -2446,7 +2445,7 @@ mod tests {
     ) -> NormalizedTrade {
         NormalizedTrade {
             venue: venue.into(),
-            source: venue.into(),
+            source_name: venue.into(),
             source_id,
             symbol: symbol.into(),
             channel,
@@ -2469,15 +2468,15 @@ mod tests {
     /// reports the raw print ring with no time-window filtering, so this test is purely about the
     /// trade reaching the store, not about bucket/window timing).
     ///
-    /// Revert-verify: commenting out this feeder's `history.ingest(...)` call (a no-op stand-in for
-    /// "forgot to wire the feeder into the store") makes this test hang the polling loop and fail —
+    /// Revert-verify: commenting out the writer's `history.ingest(...)` call (a no-op stand-in for
+    /// "forgot to wire the writer into the store") makes this test hang the polling loop and fail —
     /// confirmed by hand before landing this test.
     #[tokio::test]
     async fn a_trade_on_the_broadcast_reaches_the_store_and_is_queryable_through_the_api() {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -2532,11 +2531,11 @@ mod tests {
     }
 
     /// The sentinel case Task 4/5's docs call out by name: `source_ts_ns == 0` must bucket by
-    /// `recv_ts_ns`, never by the sentinel itself — a print bucketed at the epoch would silently
+    /// `recv_ts_ns`, never by the sentinel itself — a print bucketed at 1970 would silently
     /// vanish from every window query. Checked directly against the stored `Print`, which is why
     /// this doesn't need an API round-trip: `recent_trades` returns the raw ring, ts_ns included.
     ///
-    /// Revert-verify: replacing the feeder's `if t.source_ts_ns != 0 { .. } else { .. }` with a bare
+    /// Revert-verify: replacing the writer's `if t.source_ts_ns != 0 { .. } else { .. }` with a bare
     /// `t.source_ts_ns` (always trusting the wire value, sentinel included) makes this test fail —
     /// confirmed by hand before landing this test.
     #[tokio::test]
@@ -2544,7 +2543,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -2589,31 +2588,31 @@ mod tests {
     }
 
     /// The headline test, and the inverse of the defect: a price-aggregated venue's two mirrored
-    /// arms carry an identical instrument set (same symbol, same `instrument_id`) under distinct
+    /// paths carry an identical instrument set (same symbol, same `instrument_id`) under distinct
     /// `channel`s. Before this fix, `feed_history` resolved a trade's identity by matching
-    /// `(venue, symbol)` against the catalog, and a mirrored-arm symbol always matched twice - so
+    /// `(venue, symbol)` against the catalog, and a mirrored-path symbol always matched twice - so
     /// every trade on such a venue was silently dropped as ambiguous. Keying straight off the
-    /// message's own `channel`/`instrument_id` instead means a trade for one arm lands only in that
-    /// arm's product, never merged with (or blocked by) its mirror.
+    /// message's own `channel`/`instrument_id` instead means a trade for one path lands only in that
+    /// path's product, never merged with (or blocked by) its mirror.
     ///
     /// Revert-verify: reintroducing a `(venue, symbol)` catalog match in place of reading
     /// `t.channel`/`t.instrument_id` directly (i.e. restoring the deleted `trade_identity`) makes
     /// this test fail — both catalog entries match the trade's symbol, so it is dropped instead of
-    /// reaching either arm's product. Confirmed by hand before landing this test.
+    /// reaching either path's product. Confirmed by hand before landing this test.
     #[tokio::test]
-    async fn a_mirrored_arm_trade_is_attributed_to_its_own_product() {
+    async fn a_mirrored_path_trade_is_attributed_to_its_own_product() {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         {
             let mut map = instruments.lock().unwrap();
-            // Two arms of one price-aggregated venue: identical symbol and instrument_id, distinct
+            // Two paths of one price-aggregated venue: identical symbol and instrument_id, distinct
             // channel - exactly the shape `tests/fixtures/PROVENANCE.md` records for the live feed.
             map.insert(
-                ("KALSHI".into(), "default".into(), 1u32, 99u32),
+                ("KALSHI".into(), "default".into(), 1u8, 99u32),
                 test_instrument("KALSHI", 3, "KXBTCPERP", 1, 99),
             );
             map.insert(
-                ("KALSHI".into(), "default".into(), 2u32, 99u32),
+                ("KALSHI".into(), "default".into(), 2u8, 99u32),
                 test_instrument("KALSHI", 3, "KXBTCPERP", 2, 99),
             );
         }
@@ -2638,7 +2637,7 @@ mod tests {
             instruments.clone(),
         ));
 
-        // A trade for arm 2 only.
+        // A trade for path 2 only.
         let now = crate::model::now_ns();
         tx.send(Arc::new(FeedMessage::Trade(test_trade(
             "KALSHI",
@@ -2661,7 +2660,7 @@ mod tests {
             if let Some(trades) = body["trades"].as_array() {
                 if !trades.is_empty() {
                     assert_eq!(trades[0]["price"], "0.62");
-                    // The mirror arm's own product must stay empty - the trade landed in exactly
+                    // The mirror path's own product must stay empty - the trade landed in exactly
                     // one product, not both and not neither.
                     let other =
                         reqwest::get(format!("{base}/v1/products/KALSHI:KXBTCPERP%231.99/ticker"))
@@ -2672,14 +2671,14 @@ mod tests {
                         other_body["trades"]
                             .as_array()
                             .is_some_and(|t| t.is_empty()),
-                        "the peer arm's product must not also see this trade"
+                        "the peer path's product must not also see this trade"
                     );
                     return;
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("the mirrored-arm trade never reached its product via the API");
+        panic!("the mirrored-path trade never reached its product via the API");
     }
 
     /// An implausible venue clock must not permanently wedge a product's history. Without the clamp,
@@ -2697,7 +2696,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<Arc<FeedMessage>>(16);
         let instruments: InstrumentSnapshot = Default::default();
         instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "default".into(), 0u32, 41u32),
+            ("HYPERLIQUID".into(), "default".into(), 0u8, 41u32),
             test_instrument("HYPERLIQUID", 1, "BTC", 0, 41),
         );
         let history = Arc::new(Mutex::new(Store::new()));
@@ -2823,7 +2822,7 @@ mod tests {
     /// The bind failure contract `apply_api` shares with `apply_ws`: a port already in use must
     /// leave the API off (and the process alive) rather than propagating an error.
     ///
-    /// Revert-verify: changing `apply_api`'s `Err(e) => warn!(..)` arm to `Err(e) => panic!(..)`
+    /// Revert-verify: changing `apply_api`'s `Err(e) => warn!(..)` path to `Err(e) => panic!(..)`
     /// makes this test fail — confirmed by hand before landing this test.
     #[tokio::test]
     async fn an_occupied_port_disables_the_api_without_crashing() {
@@ -2839,25 +2838,25 @@ mod tests {
             "bind failure must not activate the sink"
         );
         assert!(
-            r.history_feeder.is_none(),
-            "the feeder must not run without its sink"
+            r.history_writer.is_none(),
+            "the writer must not run without its sink"
         );
         drop(occupied);
     }
 
-    /// `apply_api` treats the sink and its feeder as one unit: both come up together, and
+    /// `apply_api` treats the sink and its writer as one unit: both come up together, and
     /// `reap_finished` tears both down if either exits on its own (see the doc comment there) so a
-    /// later reconcile never layers a second feeder onto a store an old one is still writing to.
+    /// later reconcile never layers a second writer onto a store an old one is still writing to.
     #[tokio::test]
-    async fn activating_the_api_starts_both_the_sink_and_its_feeder() {
+    async fn activating_the_api_starts_both_the_sink_and_its_writer() {
         let mut r = test_reconciler(vec![]);
         r.cfg.api_bind = "127.0.0.1:0".into();
         r.apply_api(true).await;
         assert!(r.api_task.is_some());
-        assert!(r.history_feeder.is_some());
+        assert!(r.history_writer.is_some());
 
         r.apply_api(false).await;
         assert!(r.api_task.is_none());
-        assert!(r.history_feeder.is_none());
+        assert!(r.history_writer.is_none());
     }
 }

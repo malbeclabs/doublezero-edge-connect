@@ -76,7 +76,7 @@ than guessed: `side` is the one field on that channel a consumer acts on directi
 Hyperliquid's schema has no "unknown", so the compat tape can be shorter than the normalized one.
 
 `l2Book` publishes a market only once the bridge holds its **complete** book: it replaces a
-consumer's book wholesale on every frame, so a market accumulated mid-stream — before a producer
+consumer's book wholesale on every frame, so a market accumulated partway through — before a producer
 re-baseline — is withheld rather than published as if it were whole. An `l4Book` **re-baseline is
 rendered from the batch itself**, which is the complete book by construction, and never from the
 shared accumulator: the arbiter advances that accumulator *before* broadcasting, so a client with a
@@ -130,8 +130,8 @@ enabled; the flag only controls whether they can be scraped. There is **no TLS**
 of the service surface) — terminate at a reverse proxy if you expose it beyond a trusted network.
 
 Exported series (all prefixed `dz_` / `dz_ws_` / `dz_shred_`, plus the standard Linux `process_*`):
-ingest reception per feed (datagrams, bytes, socket errors, idle rejoins, feed up/stale, frame
-sequence events); the arbiter emit stage (messages broadcast, quotes/trades dropped by dedup,
+ingest reception per feed (datagrams, bytes, socket errors, idle rejoins, feed up/stale,
+datagram-sequence events); the arbiter emit stage (messages broadcast, quotes/trades dropped by dedup,
 future/zero-timestamp quotes); the WebSocket sink (connected clients, connections accepted/rejected,
 messages sent, slow-client lags, inbound control messages, rate-limit/idle disconnects); and the
 shred forwarder (received/dropped per group, processed/parsed/forwarded/dropped, sigverify outcomes,
@@ -187,10 +187,10 @@ a `coverage` block with the same honesty (`complete: false` rather than a guess 
 levels might not be all of them).
 
 **The catalog is not necessarily every instrument the feed defines.** A product is listed in
-`/v1/products` once its source is known: immediately, for a publisher whose reference data carries
+`/v1/products` once its Source ID is known: immediately, for a publisher whose reference data carries
 its own Source ID; only after its first price, for a publisher whose reference data carries no Source
-ID of its own (see PROTOCOL.md's [*A symbol appears only once its source is
-known*](../PROTOCOL.md#a-symbol-appears-only-once-its-source-is-known)). Both publisher generations
+ID of its own (see PROTOCOL.md's [*A symbol appears only once its Source ID is
+known*](../PROTOCOL.md#a-symbol-appears-only-once-its-source-id-is-known)). Both publisher generations
 can be live on the same host at once, so a defined-but-never-traded instrument on the latter kind of
 publisher is legitimately absent from the catalog while every instrument from the former kind appears
 up front.

@@ -9,7 +9,7 @@ Reference docs for operating and extending `doublezero-edge-connect`. Start at t
   outside the installer one-liner (CLI flags, image tags).
 - **[Output sinks](output-sinks.md)** — the WebSocket output and how sinks are enabled.
 - **[Metrics](metrics.md)** — the Prometheus endpoint and the full metric catalog.
-- **[Input sources](input-sources.md)** — the always-on DZ Edge multicast feeds and the optional
+- **[Inputs](input-sources.md)** — the always-on DZ Edge multicast feeds and the optional
   Hyperliquid public WebSocket backstop.
 - **[Solana shred forwarding](shred-forwarding.md)** — the optional `edge-solana-*` shred
   forwarder, its dedup/sigverify modes, and configuration.

@@ -1,11 +1,11 @@
-//! Empirical validation of the market-by-price decoder against **real captured frames**, plus the
+//! Empirical validation of the market-by-price decoder against **real captured datagrams**, plus the
 //! cross-codec pinning of the types it inherits from top-of-book.
 //!
-//! Two fixture sets, both real captures of the Lashay publisher (`tests/fixtures/mbp*.bin`, see
+//! Two fixture sets, both real captures of the Kalshi publisher (`tests/fixtures/mbp*.bin`, see
 //! `fixtures/PROVENANCE.md`), because they cover different things:
 //!
 //! * `mbp_*` — the **sharded** feed: three `Channel ID`s on one group, so it is the only sample that
-//!   exercises per-channel snapshot grouping. Thin delta stream.
+//!   exercises per-channel snapshot grouping. Thin delta feed.
 //! * `mbp_perps_*` — the **dense** feed: one channel, thousands of contiguous per-instrument deltas,
 //!   which is what pins sequence handling. From the older publisher (see PROVENANCE).
 //!
@@ -21,20 +21,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use common::replay;
 use doublezero_edge_connect::ingest::{codec, codec_mbp};
 
-/// Read one fixture's frames, asserting each carries the market-by-price magic.
-fn frames(path: &str) -> Vec<Vec<u8>> {
+/// Read one fixture's datagrams, asserting each carries the market-by-price magic.
+fn datagrams(path: &str) -> Vec<Vec<u8>> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    replay::split_frames(&bytes, codec_mbp::MAGIC)
+    replay::split_datagrams(&bytes, codec_mbp::MAGIC)
 }
 
-/// Every message of every frame in a fixture set's three port roles, paired with its frame's
+/// Every message of every datagram in a fixture set's three port roles, paired with its datagram's
 /// `channel_id` — the key the spec scopes a snapshot group to.
 fn decode_all(prefix: &str) -> Vec<(u8, codec_mbp::Message)> {
     let mut out = Vec::new();
     for role in ["refdata", "snapshot", "mktdata"] {
-        for frame in frames(&format!("tests/fixtures/{prefix}.{role}.bin")) {
-            let (h, msgs) = codec_mbp::decode_frame(&frame).unwrap_or_else(|e| {
-                panic!("{prefix}.{role}: real captured frame failed to decode: {e}")
+        for datagram in datagrams(&format!("tests/fixtures/{prefix}.{role}.bin")) {
+            let (h, msgs) = codec_mbp::decode_datagram(&datagram).unwrap_or_else(|e| {
+                panic!("{prefix}.{role}: real captured datagram failed to decode: {e}")
             });
             out.extend(msgs.into_iter().map(|m| (h.channel_id, m)));
         }
@@ -42,12 +42,12 @@ fn decode_all(prefix: &str) -> Vec<(u8, codec_mbp::Message)> {
     out
 }
 
-/// **The assertion the exact-length discipline lives or dies on.** Every message of every real frame
+/// **The assertion the exact-length discipline lives or dies on.** Every message of every real datagram
 /// must decode to a known variant: `Message::Other` here means either a body length that disagrees
 /// with the type's declared size, or a type this decoder does not implement. Neither is acceptable on
-/// a live feed we intend to ingest, and a decode *error* would mean the frame walk itself broke.
+/// a live feed we intend to ingest, and a decode *error* would mean the datagram walk itself broke.
 #[test]
-fn every_real_frame_decodes_with_no_unroutable_message() {
+fn every_real_datagram_decodes_with_no_unroutable_message() {
     for prefix in ["mbp", "mbp_perps"] {
         let msgs = decode_all(prefix);
         assert!(!msgs.is_empty(), "{prefix}: fixture carried no messages");
@@ -232,9 +232,9 @@ fn the_sharded_fixture_really_carries_several_channels() {
     );
 }
 
-/// Build a single-message frame with the given `magic` (24B codec_common header + one message).
+/// Build a single-message datagram with the given `magic` (24B codec_common header + one message).
 /// Both codecs share the header layout, so the same builder feeds each codec by magic.
-fn one_msg_frame(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
+fn one_msg_datagram(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&magic.to_le_bytes());
     f.push(1); // schema_version
@@ -243,8 +243,8 @@ fn one_msg_frame(magic: u16, msg_type: u8, msg_len: u8, body: &[u8]) -> Vec<u8> 
     f.extend_from_slice(&0u64.to_le_bytes()); // send_ts
     f.push(1); // msg_count
     f.push(0); // reset_count
-    let frame_len = (24 + 4 + body.len()) as u16;
-    f.extend_from_slice(&frame_len.to_le_bytes());
+    let datagram_len = (24 + 4 + body.len()) as u16;
+    f.extend_from_slice(&datagram_len.to_le_bytes());
     f.extend_from_slice(&[msg_type, msg_len, 0, 0]); // msg header: type, len, flags:u16
     f.extend_from_slice(body);
     f
@@ -263,10 +263,10 @@ fn tob_shared_layouts_decode_identically() {
     def[37] = (-4i8) as u8;
     def[38] = (-2i8) as u8;
     def[74..76].copy_from_slice(&9u16.to_le_bytes());
-    let tob = codec::decode_frame(&one_msg_frame(codec::MAGIC, 0x02, 80, &def))
+    let tob = codec::decode_datagram(&one_msg_datagram(codec::MAGIC, 0x02, 80, &def))
         .unwrap()
         .1;
-    let mbp = codec_mbp::decode_frame(&one_msg_frame(codec_mbp::MAGIC, 0x02, 80, &def))
+    let mbp = codec_mbp::decode_datagram(&one_msg_datagram(codec_mbp::MAGIC, 0x02, 80, &def))
         .unwrap()
         .1;
     match (&tob[0], &mbp[0]) {
@@ -291,10 +291,10 @@ fn tob_shared_layouts_decode_identically() {
     tr[24..32].copy_from_slice(&1_500u64.to_le_bytes()); // qty
     tr[32..40].copy_from_slice(&0u64.to_le_bytes()); // trade_id
     tr[40..48].copy_from_slice(&5u64.to_le_bytes()); // cumulative_volume
-    let tob = codec::decode_frame(&one_msg_frame(codec::MAGIC, 0x04, 52, &tr))
+    let tob = codec::decode_datagram(&one_msg_datagram(codec::MAGIC, 0x04, 52, &tr))
         .unwrap()
         .1;
-    let mbp = codec_mbp::decode_frame(&one_msg_frame(codec_mbp::MAGIC, 0x04, 52, &tr))
+    let mbp = codec_mbp::decode_datagram(&one_msg_datagram(codec_mbp::MAGIC, 0x04, 52, &tr))
         .unwrap()
         .1;
     match (&tob[0], &mbp[0]) {
@@ -318,10 +318,10 @@ fn tob_shared_layouts_decode_identically() {
     ms[4..6].copy_from_slice(&13u16.to_le_bytes());
     ms[8..12].copy_from_slice(&786u32.to_le_bytes());
     ms[12..20].copy_from_slice(&1_780u64.to_le_bytes());
-    let tob = codec::decode_frame(&one_msg_frame(codec::MAGIC, 0x07, 24, &ms))
+    let tob = codec::decode_datagram(&one_msg_datagram(codec::MAGIC, 0x07, 24, &ms))
         .unwrap()
         .1;
-    let mbp = codec_mbp::decode_frame(&one_msg_frame(codec_mbp::MAGIC, 0x07, 24, &ms))
+    let mbp = codec_mbp::decode_datagram(&one_msg_datagram(codec_mbp::MAGIC, 0x07, 24, &ms))
         .unwrap()
         .1;
     match (&tob[0], &mbp[0]) {

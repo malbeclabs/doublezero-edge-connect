@@ -87,11 +87,11 @@ already-installed, repo-already-present, manager-fails. Each asserts the contain
 **Files:** `Dockerfile`, `README.md`, `docs/self-hosting.md`, `CLAUDE.md`
 
 - `ENV DZ_FEED_REGISTRY_URL=https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`.
-- `connect.sh` surfaces which registry source actually resolved, since falling back to the built-in
+- `connect.sh` surfaces which registry document actually resolved, since falling back to the built-in
   copy is silent by design.
 - Docs: what the one-liner installs, how to decline, CLI-only install for hosts that query a remote
   bridge over `--url`, upgrade and removal for both halves, and how to override the registry with a
   URL or a file.
 
 Verify: `docker inspect` shows the ENV, and a container started without overrides logs the URL as
-the resolved source.
+the resolved document.

@@ -1,22 +1,22 @@
 //! Replay golden `.bin` captures as loopback UDP multicast.
 
-/// Top-of-Book & Trades frame magic (ASCII "ZD" little-endian).
+/// Top-of-Book & Trades datagram magic (ASCII "ZD" little-endian).
 pub const TOB_MAGIC: u16 = 0x445A;
-/// Market-by-Order frame magic.
+/// Market-by-Order datagram magic.
 pub const MBO_MAGIC: u16 = 0x4444;
 
-/// Split a captured `.bin` (length-prefixed packet log) into individual frame byte-slices.
+/// Split a captured `.bin` (length-prefixed packet log) into individual datagram byte-slices.
 ///
-/// The file format is a sequence of `[u32 LE length][frame bytes]` records, as produced
+/// The file format is a sequence of `[u32 LE length][datagram bytes]` records, as produced
 /// by the publisher's `encode_packets` function. The splitter walks by the 4-byte u32 LE
-/// length prefix to find each frame boundary, then checks that the frame's first two bytes
+/// length prefix to find each datagram boundary, then checks that the datagram's first two bytes
 /// match the expected protocol magic. Both checks double as fixture format validation.
 ///
 /// The `assert!`/`assert_eq!` panics here are intentional — vendored goldens should fail
 /// loud on corruption; switch to `Result` only if fixtures ever come from a less-trusted
 /// generator.
-pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
+pub fn split_datagrams(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
+    let mut datagrams = Vec::new();
     let mut off = 0usize;
     while off < bytes.len() {
         assert!(
@@ -24,13 +24,13 @@ pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
             "fixture truncated: expected length prefix at offset {off}, only {} bytes remain",
             bytes.len() - off
         );
-        let frame_len =
+        let datagram_len =
             u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
                 as usize;
         off += 4;
         assert!(
-            frame_len >= 24 && off + frame_len <= bytes.len(),
-            "frame at offset {}: bad frame_length {frame_len} (remaining {})",
+            datagram_len >= 24 && off + datagram_len <= bytes.len(),
+            "datagram at offset {}: bad datagram_length {datagram_len} (remaining {})",
             off - 4,
             bytes.len() - off
         );
@@ -38,13 +38,13 @@ pub fn split_frames(bytes: &[u8], magic: u16) -> Vec<Vec<u8>> {
         assert_eq!(
             got,
             magic,
-            "frame at offset {}: magic 0x{got:04X} != 0x{magic:04X}",
+            "datagram at offset {}: magic 0x{got:04X} != 0x{magic:04X}",
             off - 4
         );
-        frames.push(bytes[off..off + frame_len].to_vec());
-        off += frame_len;
+        datagrams.push(bytes[off..off + datagram_len].to_vec());
+        off += datagram_len;
     }
-    frames
+    datagrams
 }
 
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -70,19 +70,19 @@ fn multicast_sender() -> std::io::Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_multicast_loop_v4(true)?;
     sock.set_multicast_ttl_v4(1)?;
-    // TODO(#3): multi-source replay needs distinct src IPs + a re-sequenced fixture; all
-    // datagrams here share one source IP, so independent-publisher MBO demux can't be
+    // TODO(#3): multi-publisher replay needs distinct src IPs + a re-sequenced fixture; all
+    // datagrams here share one source IP address, so independent-publisher MBO demux can't be
     // exercised yet.
     sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
     Ok(sock)
 }
 
-/// Send each frame as one UDP datagram to `(group, port)`, with a tiny inter-packet gap so
+/// Send each record as one UDP datagram to `(group, port)`, with a tiny inter-packet gap so
 /// the bridge's single-threaded decode keeps up.
-pub fn send_frames(group: Ipv4Addr, port: u16, frames: &[Vec<u8>]) -> std::io::Result<()> {
+pub fn send_datagrams(group: Ipv4Addr, port: u16, datagrams: &[Vec<u8>]) -> std::io::Result<()> {
     let sock = multicast_sender()?;
     let dst: socket2::SockAddr = SocketAddrV4::new(group, port).into();
-    for f in frames {
+    for f in datagrams {
         sock.send_to(f, &dst)?;
         std::thread::sleep(std::time::Duration::from_micros(200));
     }

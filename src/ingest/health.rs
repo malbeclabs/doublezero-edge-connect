@@ -50,7 +50,7 @@ pub enum TapeLiveness {
 
 /// Whether a receiver of this protocol counts toward the venue-level `status` / `dz_feed_up`.
 ///
-/// PROTOCOL.md's `status` is the health of the venue's **quote** stream (`stale_ms` is documented as
+/// PROTOCOL.md's `status` is the health of the venue's **quote** feed (`stale_ms` is documented as
 /// "milliseconds the quote feed had been silent"), which Top-of-Book carries and the two book
 /// protocols do not — Market-by-Order is re-served as `depth`, Market-by-Price as `book`. Counting
 /// either would break the contract in both directions: a wedged book mirror would report a venue

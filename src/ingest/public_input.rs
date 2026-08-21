@@ -1,10 +1,10 @@
-//! Venue-generic **public WebSocket input feeder** scaffolding — the transport half shared by every
-//! public backstop source (Hyperliquid, Phoenix, …).
+//! Venue-generic **public WebSocket input** scaffolding — the transport half shared by every
+//! public backstop venue (Hyperliquid, Phoenix, …).
 //!
-//! A public feeder is a second ingest source, off by default, that connects to a venue's own public
+//! A public input is off by default and connects to a venue's own public
 //! `wss://`, decodes its JSON into the same [`FeedMessage`]s the multicast pipeline produces, and
-//! emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. It is a
-//! different transport from the multicast receiver — it never touches the `FrameProcessor` /
+//! emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. It is a
+//! different transport from the multicast receiver — it never touches the `DatagramProcessor` /
 //! `recv_any` machinery — but it converges on the *same* per-`(venue, symbol)` arbiter dedup state,
 //! so a public copy of an update the edge already emitted collapses into a no-op, and when the edge
 //! gaps the public copy is the first to cross and fills in. That backstop falls out of the arbiter
@@ -13,7 +13,7 @@
 //! **The backstop needs the edge to have gone live at least once.** Each venue's `instrument_known`
 //! gate reads the shared `InstrumentSnapshot`, which `ingest::processor` populates only once the edge
 //! has revealed an instrument's wire Source ID (see that module's per-instrument deferral) — refdata
-//! alone never populates it. A mid-stream gap (the edge was live, then goes quiet) is backstopped
+//! alone never populates it. A gap partway through (the edge was live, then goes quiet) is backstopped
 //! normally; a cold start with no edge price at all for that instrument leaves this gate permanently
 //! closed for it, since there is no wire-derived precision/venue to key it by.
 //!
@@ -57,16 +57,16 @@ pub trait PublicVenue {
     /// The public `wss://` (or `ws://` in tests) endpoint to connect to.
     fn url(&self) -> &str;
     /// The subscribe frames to send once connected, one per channel/market. An empty list means the
-    /// feeder is off ([`run`] returns immediately).
+    /// input is off ([`run`] returns immediately).
     fn subscribe_msgs(&self) -> Vec<String>;
     /// Decode one text frame and emit any resulting message through the arbiter. Unknown channels and
     /// malformed payloads must be ignored (best-effort feed); decode errors should increment
-    /// `ws_feeder_decode_errors[venue]`.
+    /// `ws_input_decode_errors[venue]`.
     fn handle_text(&self, txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot);
 }
 
-/// Run a public WS input feeder forever (reconnecting on any failure). Returns immediately as a
-/// no-op when the venue has no subscriptions (the feeder is off by default). Spawned as its own
+/// Run a public WS input forever (reconnecting on any failure). Returns immediately as a
+/// no-op when the venue has no subscriptions (the input is off by default). Spawned as its own
 /// task; it never propagates an error, so the multicast hot path is unaffected by its churn.
 pub async fn run(venue: impl PublicVenue, arbiter: SharedArbiter, instruments: InstrumentSnapshot) {
     let subs = venue.subscribe_msgs();
@@ -81,16 +81,16 @@ pub async fn run(venue: impl PublicVenue, arbiter: SharedArbiter, instruments: I
     loop {
         match connect_async(&url).await {
             Ok((ws, _resp)) => {
-                info!(venue = %v, %url, "public WS input feeder connected");
-                m.ws_feeder_up.with_label_values(&[&v]).set(1);
+                info!(venue = %v, %url, "public WS input connected");
+                m.ws_input_up.with_label_values(&[&v]).set(1);
                 let started = Instant::now();
                 match stream(ws, &venue, &subs, &arbiter, &instruments).await {
-                    Ok(()) => info!(venue = %v, "public WS input feeder closed; reconnecting"),
+                    Ok(()) => info!(venue = %v, "public WS input closed; reconnecting"),
                     Err(e) => {
-                        warn!(venue = %v, error = %e, "public WS input feeder session error; reconnecting")
+                        warn!(venue = %v, error = %e, "public WS input session error; reconnecting")
                     }
                 }
-                m.ws_feeder_up.with_label_values(&[&v]).set(0);
+                m.ws_input_up.with_label_values(&[&v]).set(0);
                 // Reset the backoff only after a *stable* session; a connect-then-immediate-drop
                 // keeps escalating so a flapping endpoint isn't hammered (see `STABLE_SESSION`).
                 backoff = if started.elapsed() >= STABLE_SESSION {
@@ -100,14 +100,14 @@ pub async fn run(venue: impl PublicVenue, arbiter: SharedArbiter, instruments: I
                 };
             }
             Err(e) => {
-                warn!(venue = %v, error = %e, %url, "public WS input feeder connect failed; retrying");
-                m.ws_feeder_up.with_label_values(&[&v]).set(0);
+                warn!(venue = %v, error = %e, %url, "public WS input connect failed; retrying");
+                m.ws_input_up.with_label_values(&[&v]).set(0);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
         }
         // Each loop iteration past the initial connect is one reconnect cycle (a drop or a failed
         // attempt, now backing off to retry).
-        m.ws_feeder_reconnects.with_label_values(&[&v]).inc();
+        m.ws_input_reconnects.with_label_values(&[&v]).inc();
         tokio::time::sleep(backoff).await;
     }
 }
@@ -164,7 +164,7 @@ where
 /// their public WS instruments by symbol, not by the edge's channel/instrument_id), so this is a
 /// scan over the shared catalog's *values* rather than a map lookup. Measured (release build,
 /// worst case — no match, so every call scans the whole map) against a synthetic 2,000-entry
-/// catalog — above any real deployment's instrument count, Lashay's ~1,300 real markets included:
+/// catalog — above any real deployment's instrument count, Kalshi's ~1,300 real markets included:
 /// 100,000 calls in ~339ms, ~3.4µs/call. That is negligible next to this caller's own per-frame
 /// JSON decode (called once per public WS text frame, for two venues), so no secondary
 /// `HashSet<(venue, symbol)>` is added.
@@ -175,10 +175,10 @@ pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &
 }
 
 /// Resolve the `(channel, instrument_id)` identity a trade built here must carry, from the same
-/// shared catalog [`instrument_known`] gates on. The public JSON these feeders decode has no
+/// shared catalog [`instrument_known`] gates on. The public JSON these inputs decode has no
 /// channel/instrument_id of its own — only a bare symbol — so a `NormalizedTrade` built at this
 /// seam needs this lookup to carry the identity `history::Key` groups trades on downstream; without
-/// it every symbol from a given public feeder would collapse onto one history product the moment its
+/// it every symbol from a given public input would collapse onto one history product the moment its
 /// trade won a floor tick.
 ///
 /// Same scan, same cost, same gate as `instrument_known` (`None` until the edge has revealed this
@@ -188,14 +188,14 @@ pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &
 /// separately-maintained symbol→identity map would.
 ///
 /// First match wins. Safe here because neither venue this module backstops presents one symbol under
-/// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored arms
-/// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-arm venue of its own,
+/// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored paths
+/// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-path venue of its own,
 /// this would need the same disambiguation `products::resolve` applies instead of a bare first match.
 pub fn resolve_instrument(
     instruments: &InstrumentSnapshot,
     venue: &str,
     symbol: &str,
-) -> Option<(u32, u32)> {
+) -> Option<(u8, u32)> {
     crate::model::lock(instruments)
         .values()
         .find(|i| i.venue.as_ref() == venue && i.symbol.as_ref() == symbol)

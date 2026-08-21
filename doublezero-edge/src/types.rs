@@ -33,14 +33,32 @@ pub struct ProductResponse {
 pub struct Product {
     pub product_id: String,
     pub source_id: u32,
-    pub source: String,
+    /// Two slots for one value. A CLI is installed independently of the container it queries, so one
+    /// build must parse an old server's `source`, a new server's `source_name`, **and** the release
+    /// that renamed it, which emits both for the old CLI's sake. `#[serde(alias)]` cannot: an alias
+    /// shares one field slot, so both keys present is a `duplicate field` error that fails the whole
+    /// response. Read through [`Product::source_name`].
+    #[serde(default)]
+    source_name: Option<String>,
+    #[serde(default, rename = "source")]
+    deprecated_source_name: Option<String>,
     pub symbol: String,
-    pub channel: u32,
+    pub channel: u8,
     pub instrument_id: u32,
     pub price_increment: String,
     pub base_increment: String,
     pub status: String,
     pub feed_kind: String,
+}
+
+impl Product {
+    /// The upstream source's registry name, from whichever key the server sent.
+    pub fn source_name(&self) -> &str {
+        self.source_name
+            .as_deref()
+            .or(self.deprecated_source_name.as_deref())
+            .unwrap_or("")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -212,7 +230,7 @@ pub struct ChannelRow {
 /// send one or both — this type must keep parsing regardless.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelEntry {
-    pub channel: u32,
+    pub channel: u8,
     pub allowed: bool,
     pub bound: bool,
     pub products: u64,
@@ -297,12 +315,14 @@ pub struct ProcessBlock {
 /// The `registry` block of `/v1/status`: which feed-registry document this process resolved (a
 /// URL, a bind-mounted file path, or `"built-in"`), its `version`, and how many rows/receivers it
 /// carries — the same figures the bridge logs once at startup as "feed registry resolved," so a
-/// fleet-wide check doesn't need log access. Empty `source` (the `Default`) on an older server that
+/// fleet-wide check doesn't need log access. Empty `origin` (the `Default`) on an older server that
 /// predates this field, rendered as a blank line rather than a guess — see [`crate::render`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RegistryBlock {
-    #[serde(default)]
-    pub source: String,
+    /// `source` on a server predating the rename. A `serde(alias)` is safe here, unlike on
+    /// [`Product`]: this block never carried both keys at once.
+    #[serde(default, alias = "source")]
+    pub origin: String,
     #[serde(default)]
     pub version: u32,
     #[serde(default)]
@@ -490,7 +510,7 @@ mod tests {
         let body = r#"{
             "product_id": "HYPERLIQUID:BTC",
             "source_id": 1,
-            "source": "Hyperliquid",
+            "source_name": "Hyperliquid",
             "symbol": "BTC",
             "channel": 0,
             "instrument_id": 41,
@@ -520,8 +540,8 @@ mod tests {
 
         let future: DiagnosticsResponse = serde_json::from_str(
             r#"{"diagnosis":{"code":"ok","summary":"s","remediation":"r"},
-                "activation":{"receivers":[{"venue":"LASHAY","kind":"market_by_price",
-                                            "publisher":32000,"liveness":"up","arm":"a"}],
+                "activation":{"receivers":[{"venue":"KALSHI","kind":"market_by_price",
+                                            "publisher":32000,"liveness":"up","unheard_of":"a"}],
                               "ws_on":true,"api_on":true},
                 "peering":{"nothing":"this build knows"}}"#,
         )
