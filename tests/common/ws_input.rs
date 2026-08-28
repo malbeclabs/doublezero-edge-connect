@@ -1,6 +1,6 @@
 //! Mock public WebSocket **input** server for E2E tests (Hyperliquid and Phoenix shapes).
 //!
-//! Stands in for a venue's public `wss://`: it accepts the bridge's WS-feeder connection, drains its
+//! Stands in for a venue's public `wss://`: it accepts the bridge's WS-input connection, drains its
 //! `subscribe` frames, and emits scripted JSON on demand (the test pushes frames through a channel,
 //! so it controls exactly when each public update lands relative to the multicast replay). It speaks
 //! both the Hyperliquid `bbo`/`trades` shape ([`Self::send_bbo`]/[`Self::send_trade`]) and the
@@ -22,8 +22,8 @@ pub struct MockWsInput {
 
 impl MockWsInput {
     /// Bind a loopback port and start accepting WS connections. Each accepted connection drains the
-    /// feeder's subscribe frames and then forwards any JSON pushed via [`Self::send_raw`] to the
-    /// socket, reconnecting (re-accepting) if the feeder's connection drops.
+    /// input's subscribe frames and then forwards any JSON pushed via [`Self::send_raw`] to the
+    /// socket, reconnecting (re-accepting) if the input's connection drops.
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -76,7 +76,7 @@ impl MockWsInput {
         format!("ws://{}", self.addr)
     }
 
-    /// Queue a raw JSON frame to be sent to the connected feeder.
+    /// Queue a raw JSON frame to be sent to the connected input.
     pub fn send_raw(&self, json: String) {
         let _ = self.tx.send(json);
     }
@@ -109,7 +109,7 @@ impl MockWsInput {
     /// Queue a one-element Phoenix `trades` frame, exactly as `perp-api.phoenix.trade/v1/ws` encodes
     /// it. `side` is `"bid"` (aggressing buy) or `"ask"` (aggressing sell); `seq` is the public
     /// `tradeSequenceNumber` (= the edge `trade_id`); `ts_secs` is the Unix-seconds timestamp string.
-    /// The feeder derives price as `quote / base`.
+    /// The input derives price as `quote / base`.
     pub fn send_phoenix_trade(
         &self,
         symbol: &str,

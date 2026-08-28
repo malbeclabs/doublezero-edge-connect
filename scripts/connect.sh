@@ -25,13 +25,34 @@
 #   DZ_IMAGE=ghcr.io/malbeclabs/doublezero-edge-connect:mainnet-beta
 #   DZ_NAME=doublezero-edge-connect      container name
 #   DZ_FEEDS=<venue,venue>               optional: narrow ingested venues (default: all)
-#   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install)
+#   DZ_ASSUME_YES=1                      skip confirmation prompts (e.g. Docker install) -- also
+#                                        implies "yes" to the doublezero-edge CLI offer below
+#   DZ_INSTALL_CLI=1|0                   answer the doublezero-edge CLI install prompt
+#                                        non-interactively (1=install, 0=skip)
+#   DZ_STOP_HOST_DAEMON=1|0              answer the "stop the host doublezerod" prompt
+#                                        non-interactively (1=stop it, 0=leave it and abort)
 #   DZ_CLIENT_IP=<ipv4>                  override the public IP used by the access-pass pre-check
 #   DZ_LEDGER_RPC_URL=<url>              override the DoubleZero ledger RPC used by the pre-check
 #
 # Any other bridge env var set in the environment is relayed straight to the container
-# (WS_*, DZ_IFACE, DZ_SHRED_*, RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
+# (WS_*, DZ_IFACE, DZ_SHRED_*, METRICS_BIND, DZ_CHANNELS, DZ_ADMIN_BIND, DZ_FEED_REGISTRY[_URL],
+# RUST_LOG, ...), so every binary feature can be tuned from the one-liner, e.g.:
 #   WS_BIND=0.0.0.0:9000 curl -fsSL https://get.doublezero.xyz/connect | bash
+#
+# Two of those need a second look before you set them:
+#   DZ_FEED_REGISTRY=<path>  is read INSIDE the container. This script requires an absolute path
+#                            that also exists on THIS host, and bind-mounts it read-only at that
+#                            identical container-side path -- an unreadable path aborts before any
+#                            container starts, rather than being passed through to silently resolve
+#                            to nothing.
+#   DZ_ADMIN_BIND=<host:port> the bridge binds GET/POST /admin/channels -- the one runtime-MUTATION
+#                            path in the bridge (lets DZ_CHANNELS be replaced without a restart) --
+#                            at 127.0.0.1:9098 by default; set this only to override that address or
+#                            to disable it (empty). It has NO authentication, and under this
+#                            container's --network host a wildcard bind is genuinely reachable from
+#                            the network, so if you override the default, stay on loopback, e.g.
+#                            DZ_ADMIN_BIND=127.0.0.1:9099; a non-loopback value is only warned about,
+#                            never blocked.
 #
 # A DZ_-token-derived keypair is injected straight into the container and is never
 # written to the host disk; a keypair supplied as a file path is bind-mounted
@@ -52,10 +73,15 @@ DZ_ENV="${DZ_ENV:-mainnet-beta}"
 DZ_SECRET="${DZ_SECRET:-}"
 DZ_FEEDS="${DZ_FEEDS:-}"
 DZ_ASSUME_YES="${DZ_ASSUME_YES:-0}"
+DZ_INSTALL_CLI="${DZ_INSTALL_CLI:-}"
+DZ_STOP_HOST_DAEMON="${DZ_STOP_HOST_DAEMON:-}"
 KEYPAIR_DEST="/root/.config/doublezero/id.json"   # client's default keypair path (container runs as root)
 LIVENESS_UDP_PORT=44880
 WS_PORT=8081                                       # bridge WebSocket (PROTOCOL.md)
 RECV_BUF_MAX=268435456                             # recommended net.core.rmem_max for bursty feeds
+CONNECT_BACKOFF=(15 30 45)                         # seconds between `doublezero connect` tries
+CONNECT_ATTEMPTS=$(( ${#CONNECT_BACKOFF[@]} + 1 )) # one more try than gaps (a cold daemon loses the first)
+SESSION_POLL_TRIES=20                              # ~1s-apart probes; a session can come up seconds after connect returns
 
 # ----------------------------------------------------------------------------
 # pretty output + prompts (read from the terminal, not the curl pipe)
@@ -515,6 +541,131 @@ preflight_ws_port() {
 preflight_ws_port
 
 # ----------------------------------------------------------------------------
+# 4c. feed registry bind-mount (host-side)
+# ----------------------------------------------------------------------------
+# DZ_FEED_REGISTRY names a path the BRIDGE reads *inside the container* (--feed-registry). Passing
+# the env var through with no matching mount would have the bridge look for a file that was never
+# copied in -- it resolves to nothing, and the bridge treats a missing/unreadable File origin as
+# FATAL (an operator's explicit instruction about this one container), so the container would just
+# crash-loop. Wire the mount here instead: require an absolute path (the only kind `docker -v` can
+# bind at an identical container-side path) and bind-mount it read-only at that exact path, so the
+# value the bridge sees is always backed by a real file. Fail fast, before any Docker pull.
+REGISTRY_MOUNT=()
+if [ -n "${DZ_FEED_REGISTRY:-}" ]; then
+  case "$DZ_FEED_REGISTRY" in
+    /*) : ;;
+    *) die "DZ_FEED_REGISTRY must be an absolute path (it is read INSIDE the container at this exact path, bind-mounted from the same path on this host). Got: $DZ_FEED_REGISTRY" ;;
+  esac
+  [ -f "$DZ_FEED_REGISTRY" ] || die "DZ_FEED_REGISTRY=$DZ_FEED_REGISTRY does not exist on this host. It names a path read *inside* the container; without a matching file here to bind-mount, the bridge would start looking for a file that was never copied in and refuse to start (a File registry origin is fatal on failure). Fix the path, or unset DZ_FEED_REGISTRY to use the built-in registry."
+  REGISTRY_MOUNT=(-v "$DZ_FEED_REGISTRY":"$DZ_FEED_REGISTRY":"$MNT_OPT")
+  info "Bind-mounting feed registry: $DZ_FEED_REGISTRY (read-only)"
+fi
+
+# The image bakes in a default DZ_FEED_REGISTRY_URL (the hosted document — see the Dockerfile),
+# and the bridge tries that URL before ever looking at DZ_FEED_REGISTRY (ingest/registry.rs:
+# Origin::from_flags takes the URL whenever it is non-empty). An operator who set DZ_FEED_REGISTRY
+# almost certainly wants the file to win — that's the whole point of the air-gapped/locked-down
+# path — so if they didn't also set DZ_FEED_REGISTRY_URL themselves, clear it explicitly on the
+# container; otherwise the bind-mounted file would be silently ignored in favor of the image's
+# baked-in URL.
+CLEAR_REGISTRY_URL=0
+if [ -n "${DZ_FEED_REGISTRY:-}" ] && [ -z "${DZ_FEED_REGISTRY_URL:-}" ]; then
+  CLEAR_REGISTRY_URL=1
+  info "DZ_FEED_REGISTRY is set; clearing the image's default DZ_FEED_REGISTRY_URL so the bind-mounted file is what actually loads."
+fi
+
+# ----------------------------------------------------------------------------
+# 4d. admin surface warning (host-side)
+# ----------------------------------------------------------------------------
+# GET/POST /admin/channels (DZ_ADMIN_BIND) is the one runtime-MUTATION path in the bridge, and it
+# carries NO authentication. The bridge itself defaults this to 127.0.0.1:9098 (loopback), so this
+# check only fires when DZ_ADMIN_BIND is explicitly overridden on the host -- under this container's
+# --network host, a wildcard bind is genuinely reachable from the network -- warn loudly (the script
+# can't enforce a bind choice, only flag one).
+if [ -n "${DZ_ADMIN_BIND:-}" ]; then
+  case "$DZ_ADMIN_BIND" in
+    127.*|localhost:*) : ;;
+    *) warn "DZ_ADMIN_BIND=$DZ_ADMIN_BIND is not a loopback address. The admin surface has NO authentication -- under --network host this bind is reachable from the network. POST /admin/channels can change what this process ingests, and GET /admin/diagnostics reports this host's device/metro, subscribed group codes and their multicast IPs, every configured bind and the feed-registry URL. Recommended: DZ_ADMIN_BIND=127.0.0.1:9098 (or another loopback port), unless you have your own network-level access control in front of it." ;;
+  esac
+fi
+
+# ----------------------------------------------------------------------------
+# 4e. host doublezerod / liveness-port precondition (host-side)
+# ----------------------------------------------------------------------------
+# The container runs its OWN doublezerod under --network host, whose liveness manager binds
+# UDP $LIVENESS_UDP_PORT. If the host already has something bound there, the container's daemon
+# fails that bind and the container exits within seconds -- a "successful" install followed by a
+# dead container. The bound port is the actual conflict (whatever put it there breaks the
+# container), so detection checks the port itself; `systemctl is-active` only decides what
+# remediation to OFFER, never whether a conflict exists.
+udp_port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    $SUDO ss -H -lun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  elif command -v netstat >/dev/null 2>&1; then
+    $SUDO netstat -lun 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+  else
+    return 2
+  fi
+}
+
+check_host_daemon_port() {
+  local rc=0
+  udp_port_in_use "$LIVENESS_UDP_PORT" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    warn "Can't check whether UDP port $LIVENESS_UDP_PORT is free (no ss/netstat installed); if a host daemon already holds it, the container's own doublezerod will fail to bind it and exit right after starting."
+    return 0
+  fi
+  [ "$rc" -ne 0 ] && return 0   # free
+
+  local svc_active=0
+  if command -v systemctl >/dev/null 2>&1 && $SUDO systemctl is-active --quiet doublezerod 2>/dev/null; then
+    svc_active=1
+  fi
+
+  # Not (visibly) the doublezerod service -- there's no safe remediation to offer, so stop here
+  # rather than tell the operator to stop a service that has nothing to do with the conflict.
+  if [ "$svc_active" -ne 1 ]; then
+    die "UDP port $LIVENESS_UDP_PORT is already in use, but systemctl doesn't show doublezerod active, so stopping it would not free the port. Find what's bound there and stop that instead (e.g. sudo ss -lunp | grep ':$LIVENESS_UDP_PORT'), then re-run."
+  fi
+
+  warn "UDP port $LIVENESS_UDP_PORT is already bound (the host's doublezerod is active)."
+  info "The container runs its own doublezerod, and the two can't share that port -- it will exit right after starting."
+  warn "Stopping the host doublezerod disconnects any DoubleZero tunnel it currently holds."
+
+  local accept=0
+  case "$DZ_STOP_HOST_DAEMON" in
+    1) accept=1 ;;
+    0) accept=0 ;;
+    *)
+      if [ "$DZ_ASSUME_YES" = 1 ]; then
+        accept=1
+      # confirm()'s own '[ -r "$TTY" ]' check isn't enough (see the reinstall_existing_instance
+      # note above): a readable /dev/tty inode can still fail to OPEN with no controlling terminal,
+      # and confirm() would then read into an unset 'ans' and abort under 'set -u'. Probe an
+      # actual open first; no controlling terminal means no answer, so this defaults to
+      # declining rather than crashing.
+      elif { : <"$TTY"; } 2>/dev/null; then
+        confirm "Stop and disable the host doublezerod so the container can bind UDP $LIVENESS_UDP_PORT?" && accept=1
+      fi
+      ;;
+  esac
+
+  # Decline, or no way to ask (non-interactive with no explicit answer): refuse rather than start
+  # a container that will just die. Disabling is bundled into the one "stop it" decision below
+  # (not a separate prompt) -- a stop-but-still-enabled daemon would resurrect the same conflict
+  # on the next reboot, which defeats the point of stopping it now.
+  [ "$accept" -eq 1 ] || die "Not stopping the host doublezerod: the container's own doublezerod would still fail to bind UDP $LIVENESS_UDP_PORT and exit right after starting. Stop it yourself, then re-run:
+   sudo systemctl stop doublezerod
+   sudo systemctl disable doublezerod"
+
+  info "Stopping the host doublezerod (disabling it too, so a reboot doesn't resurrect the conflict)..."
+  $SUDO systemctl stop doublezerod    || die "Could not stop the host doublezerod; free UDP $LIVENESS_UDP_PORT manually and re-run."
+  $SUDO systemctl disable doublezerod || warn "Stopped the host doublezerod but could not disable it; it may restart on reboot and re-conflict."
+}
+check_host_daemon_port
+
+# ----------------------------------------------------------------------------
 # 5. cloud detection -> warn about provider-level firewall (script can't fix)
 # ----------------------------------------------------------------------------
 detect_cloud() {
@@ -538,7 +689,13 @@ esac
 # 6. run the container (detached, long-lived: daemon + bridge)
 # ----------------------------------------------------------------------------
 info "Pulling $DZ_IMAGE ..."
-$SUDO docker pull -q "$DZ_IMAGE" >/dev/null
+# A locally built image — testing a branch before it is published — has no registry to pull from,
+# so a failed pull is only fatal when there is also nothing local to run.
+if ! $SUDO docker pull -q "$DZ_IMAGE" >/dev/null 2>&1; then
+  $SUDO docker image inspect "$DZ_IMAGE" >/dev/null 2>&1 \
+    || die "Could not pull $DZ_IMAGE, and no local image by that name. Check the tag, or build it first: docker build -t $DZ_IMAGE ."
+  warn "Could not pull $DZ_IMAGE; using the local image of that name already present."
+fi
 
 info "Starting edge-connect bridge (env=$DZ_ENV)..."
 $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
@@ -549,13 +706,20 @@ $SUDO docker rm -f "$DZ_NAME" >/dev/null 2>&1 || true
 # independent of the host daemon's default driver — and `docker logs` still works.
 mount_args=()
 [ "$KEY_SRC" = file ] && mount_args=(-v "$KEYFILE":"$KEYPAIR_DEST":"$MNT_OPT")
+# Feed registry, if DZ_FEED_REGISTRY was set (see 4c above): bind-mounted read-only at the
+# identical container-side path the bridge was told to read.
+mount_args+=("${REGISTRY_MOUNT[@]}")
 # Relay bridge env vars to the container. The bridge reads every flag from an env var, so this is
 # the only wiring needed to tune the WS sink, narrow feeds, or raise log level — no per-feature
 # logic here. Only non-empty values are forwarded, with one exception (WS_BIND, below).
+# This is an allowlist, not a wildcard: a bridge env var absent from it is silently NOT relayed,
+# and the bridge falls back to its compiled default. Add new ones here.
 PASSTHROUGH=(
   DZ_FEEDS DZ_IFACE DZ_RECV_BUF
   WS_HEARTBEAT_SECS WS_IDLE_TIMEOUT_SECS WS_MAX_CLIENTS
   WS_MAX_SUBS WS_MAX_INBOUND_PER_MIN WS_BROADCAST_CAPACITY
+  DZ_API_BIND METRICS_BIND
+  DZ_CHANNELS DZ_ADMIN_BIND DZ_FEED_REGISTRY DZ_FEED_REGISTRY_URL
   DZ_SHRED_DEDUP_MODE DZ_SHRED_RPC_URL DZ_SHRED_FORWARD DZ_SHRED_SOURCES
   DZ_SHRED_CODE_PREFIX DZ_SHRED_PORT DZ_SHRED_DEDUP_WINDOW_SLOTS
   RUST_LOG
@@ -564,6 +728,9 @@ env_args=()
 for v in "${PASSTHROUGH[@]}"; do
   [ -n "${!v:-}" ] && env_args+=(-e "$v=${!v}")
 done
+# See 4c above: force DZ_FEED_REGISTRY_URL empty on the container so the bind-mounted file wins
+# over the image's baked-in default, rather than being silently shadowed by it.
+[ "$CLEAR_REGISTRY_URL" = 1 ] && env_args+=(-e "DZ_FEED_REGISTRY_URL=")
 # WS_BIND is the one var forwarded whenever it is *set* — including set-but-empty (WS_BIND="") —
 # so the WS sink can be disabled straight from the one-liner (an empty --ws-bind turns the sink
 # off in the bridge). The preflight above may also have set/cleared it in response to a conflict.
@@ -600,11 +767,43 @@ if [ "$KEY_SRC" = token ]; then
 fi
 
 # ----------------------------------------------------------------------------
-# 7. connect (always `doublezero connect multicast`)
+# 7. connect (`doublezero connect multicast`, retried until the tunnel is up)
 # ----------------------------------------------------------------------------
-# Give a cold daemon a head start on device probing before connect (see spin_sleep).
+# True iff the daemon reports a live session. `doublezero status --json` carries
+# response.doublezero_status.session_status, whose live values END in "Up" ("BGP
+# Session Up", "PIM Adjacency Up") while every failure value ("BGP Session Down",
+# "Network Unreachable", the CLI's synthesized "disconnected") does not -- so match
+# the suffix, never one literal. Grepping the JSON key rather than the human table
+# avoids depending on column layout, and on jq, which the image doesn't ship.
+# `timeout`, when present, bounds each probe against a wedged daemon -- the same 5s the
+# container's own probe uses (docker-entrypoint.sh), since this path adds `docker exec`
+# overhead on top and a probe that gives up early would report a live tunnel as absent.
+DZ_PROBE=()
+if command -v timeout >/dev/null 2>&1; then DZ_PROBE=(timeout 5); fi
+dz_connected() {
+  # Capture, then match in-shell: piping into `grep -q` under `set -o pipefail` can
+  # report the probe as failed when grep's early exit SIGPIPEs the writer (cf. #70).
+  local json
+  json="$($SUDO "${DZ_PROBE[@]}" docker exec "$DZ_NAME" doublezero status --json 2>/dev/null || true)"
+  [[ "$json" =~ \"session_status\"[[:space:]]*:[[:space:]]*\"[^\"]*[Uu]p\" ]]
+}
+
+# The session comes up some seconds AFTER `connect` returns, so poll rather than guess.
+wait_for_session() {
+  local n
+  info "Waiting for the daemon to report a live session..."
+  for n in $(seq 1 "$1"); do
+    dz_connected && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Give a cold daemon a head start on device probing before the first attempt (see
+# spin_sleep). The head start is not itself the fix: the CLI already waits up to 60s
+# for daemon readiness internally and can still lose the race, so a failed attempt is
+# retried and the closing message reports what actually happened (#132).
 spin_sleep 30 "Letting the daemon finish bootstrapping"
-info "Connecting: doublezero connect multicast"
 # Allocate a pseudo-TTY when our stdout is a terminal so the CLI streams its
 # normal output to the screen (without -t, docker exec gives it no TTY and the
 # command's output is suppressed).
@@ -613,7 +812,31 @@ EXEC_TTY=""; [ -t 1 ] && EXEC_TTY="-t"
 # user onchain for $DZ_ENV. If this errors with an access-pass message, that
 # provisioning step still needs to happen. Once the tunnel is up, the bridge
 # self-heals onto the doublezero1 interface within ~30s and quotes begin flowing.
-$SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast || warn "connect failed (often: no access pass for this IP; provider firewall/NAT; or a default-deny host firewall dropping the decapsulated inner multicast on doublezero1). See the firewall notes above."
+# Re-attempting is safe: `connect multicast` re-activates an existing user account
+# rather than rejecting it (only `--device`, which we never pass, can clash).
+CONNECT_STATE=failed
+attempt=1
+while :; do
+  # From the second attempt on the tunnel may already be up: a client-side timeout
+  # can outlive a connect the daemon went on to complete.
+  if [ "$attempt" -gt 1 ] && dz_connected; then CONNECT_STATE=connected; break; fi
+  info "Connecting: doublezero connect multicast (attempt $attempt/$CONNECT_ATTEMPTS)"
+  if $SUDO docker exec $EXEC_TTY "$DZ_NAME" doublezero connect multicast; then
+    # Exit 0 is not a live tunnel: the CLI also returns 0 after printing "Tunnel
+    # provisioning in progress" when its own provisioning poll times out.
+    if wait_for_session "$SESSION_POLL_TRIES"; then CONNECT_STATE=connected; else CONNECT_STATE=pending; fi
+    break
+  fi
+  warn "connect attempt $attempt/$CONNECT_ATTEMPTS failed (on a cold daemon it is still probing devices; also common: no access pass for this IP; provider firewall/NAT; or a default-deny host firewall dropping the decapsulated inner multicast on doublezero1). See the firewall notes above."
+  if [ "$attempt" -ge "$CONNECT_ATTEMPTS" ]; then break; fi
+  spin_sleep "${CONNECT_BACKOFF[$((attempt - 1))]}" "Waiting before connect attempt $((attempt + 1))/$CONNECT_ATTEMPTS"
+  attempt=$((attempt + 1))
+done
+# The last attempt's error can likewise outlive a connect that landed, so ask the
+# daemon before declaring a failure.
+if [ "$CONNECT_STATE" = failed ] && wait_for_session "$SESSION_POLL_TRIES"; then
+  CONNECT_STATE=connected
+fi
 
 # ----------------------------------------------------------------------------
 # 8. status + management hints
@@ -626,7 +849,73 @@ echo
 spin_sleep 5 "Waiting for the tunnel to settle"
 $SUDO docker exec "$DZ_NAME" doublezero status || true
 echo
-if ws_disabled; then
+
+# The image bakes in DZ_FEED_REGISTRY_URL (the hosted feeds document); a host that can't reach
+# it falls back to the built-in copy SILENTLY BY DESIGN (see ingest/registry.rs), so the bridge's
+# own "feed registry resolved" startup log line is the only signal of which one actually loaded.
+# Surface it here rather than leaving the operator to go find it. The resolve happens at process
+# start (well before this point in the script), so one look back over the log is enough; retry
+# briefly only to cover a slow container start.
+registry_line=""
+for _ in $(seq 1 10); do
+  # `tracing`'s formatter colours this line, and `docker logs` passes those ANSI escapes straight
+  # through -- strip them (a bare CSI-sequence match) so the operator sees plain text, not
+  # "^[[3morigin^[[0m^[[2m=^[[0m...".
+  registry_line="$($SUDO docker logs "$DZ_NAME" 2>&1 | grep "feed registry resolved" | tail -1 | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' || true)"
+  [ -n "$registry_line" ] && break
+  sleep 1
+done
+if [ -n "$registry_line" ]; then
+  info "Feed registry: ${registry_line#*feed registry resolved }"
+else
+  warn "Could not find the 'feed registry resolved' startup log line yet. Check: sudo docker logs $DZ_NAME | grep 'feed registry'"
+fi
+# Never claim a connection the daemon doesn't report (#132): this banner is the last
+# thing a new user reads, and a container with no tunnel ingests nothing. The reverse
+# matters as much -- everything between the verdict and here (the settle, the status
+# print, the log poll) is time a mid-provisioning tunnel can come up in -- so re-probe
+# rather than print a stale verdict over a session the table above just showed as live.
+if [ "$CONNECT_STATE" != connected ] && dz_connected; then CONNECT_STATE=connected; fi
+
+report_no_tunnel() {
+  # A container that died after the readiness wait (a port bind, a crash loop) fails
+  # every probe too; pointing that operator at access passes and firewalls sends them
+  # after the wrong fault, so name what is actually down.
+  local container_up=""
+  $SUDO docker ps -q --filter "name=^${DZ_NAME}$" 2>/dev/null | grep -q . && container_up=1
+  if [ -z "$container_up" ]; then
+    warn "NOT CONNECTED, and the bridge container is no longer running -- the tunnel never came up because the container itself is down (it may be restarting or exiting on start)."
+    echo
+    echo "  Find out why:"
+    echo "    sudo docker logs $DZ_NAME"
+    echo "    sudo docker ps -a --filter name=$DZ_NAME"
+    return 0
+  fi
+  if [ "$CONNECT_STATE" = pending ]; then
+    warn "Not connected yet: connect was accepted but the daemon still reports no live session -- the tunnel may be mid-provisioning."
+    echo
+    echo "  Give it a minute, then check -- it may come up on its own:"
+    echo "    sudo docker exec -it $DZ_NAME doublezero status"
+    echo "  Only if it stays down, connect again:"
+    echo "    sudo docker exec -it $DZ_NAME doublezero connect multicast"
+    echo "  Logs:"
+    echo "    sudo docker logs $DZ_NAME"
+    return 0
+  fi
+  warn "NOT CONNECTED: all $CONNECT_ATTEMPTS connect attempts failed and the daemon reports no session. The bridge container is running, but with no tunnel it ingests no market data -- the WebSocket sink and shred forwarder stay idle."
+  echo
+  echo "  Try again by hand (a warm daemon usually connects immediately):"
+  echo "    sudo docker exec -it $DZ_NAME doublezero connect multicast"
+  echo "  Check the tunnel:"
+  echo "    sudo docker exec -it $DZ_NAME doublezero status"
+  echo "  Logs:"
+  echo "    sudo docker logs $DZ_NAME"
+  echo "  If it keeps failing: confirm an access pass covers this host's public IP, and that GRE (IP protocol 47) is permitted by the provider and the host firewall."
+}
+
+if [ "$CONNECT_STATE" != connected ]; then
+  report_no_tunnel
+elif ws_disabled; then
   info "Done. The WebSocket sink is disabled (WS_BIND=\"\"); the bridge ingests DZ Edge and (if configured) forwards shreds, but serves no WebSocket."
 else
   # The WS sink and the shred forwarder are activated independently by the subscription reconciler
@@ -657,8 +946,14 @@ else
     info "Done. Forwarding shreds. The WebSocket quote sink is idle -- it activates once this host is subscribed to a market-data feed."
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # activates once >=1 market-data feed is subscribed"
   else
-    info "Done. Connected. The WebSocket sink and shred forwarder each activate automatically once this host is subscribed to a group (a market-data feed for WS; an edge-solana-* group for shreds) -- allow up to one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s). Check: sudo docker logs $DZ_NAME"
+    info "Done. Connected."
+    echo
+    echo "  The WebSocket sink and shred forwarder activate once this host is subscribed to a"
+    echo "  group -- a market-data feed for WS, an edge-solana-* group for shreds. Allow up to"
+    echo "  one refresh interval (DZ_SUBSCRIPTION_REFRESH_SECS, default 30s)."
+    echo
     echo "  WebSocket : ws://${HOST_IP}:${WS_PORT}            # once >=1 market-data feed is subscribed"
+    echo "  Logs      : sudo docker logs $DZ_NAME"
   fi
 fi
 echo
@@ -667,3 +962,114 @@ echo "  sudo docker logs -f $DZ_NAME                            # bridge + daemo
 echo "  sudo docker exec -it $DZ_NAME doublezero status         # tunnel status"
 echo "  sudo docker exec -it $DZ_NAME doublezero latency        # device latencies"
 echo "  sudo docker stop $DZ_NAME && sudo docker rm $DZ_NAME    # disconnect, stop & remove"
+
+# ----------------------------------------------------------------------------
+# 9. offer the doublezero-edge CLI (host-side; a convenience, never load-bearing)
+# ----------------------------------------------------------------------------
+# doublezero-edge is a small agent-facing CLI over this container's /v1 (and, if enabled,
+# /admin) HTTP API, packaged as a signed, dependency-free deb/rpm with no maintainer scripts (see
+# release/.goreleaser.*.edge-cli.yaml). The bridge above is already up; nothing here can affect
+# it -- declining, or any package-manager failure, only warns and moves on. Never `die`.
+echo
+offer_cli_package() {
+  if command -v doublezero-edge >/dev/null 2>&1; then
+    info "doublezero-edge CLI already installed ($(doublezero-edge --version 2>/dev/null || echo 'version unknown'))."
+    return 0
+  fi
+
+  local pm=""
+  if command -v apt-get >/dev/null 2>&1; then pm=apt
+  elif command -v dnf >/dev/null 2>&1; then pm=dnf
+  elif command -v yum >/dev/null 2>&1; then pm=yum
+  fi
+
+  # One repo for every environment: the CLI has no ledger coupling, so both overlays publish here,
+  # and it is the repo a host running the DoubleZero client already trusts — no second key, no
+  # second source file. Per-environment names were tried first and nothing subscribes to them.
+  local cs_repo="doublezero"
+
+  if [ -z "$pm" ]; then
+    warn "No supported package manager (apt/dnf/yum) found; skipping the doublezero-edge CLI. Install it later: https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.<deb|rpm>.sh"
+    return 0
+  fi
+
+  local manual="curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.deb.sh | sudo -E bash && sudo apt install doublezero-edge"
+  [ "$pm" = apt ] || manual="curl -1sLf https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.rpm.sh | sudo -E bash && sudo $pm install doublezero-edge"
+
+  case "$DZ_INSTALL_CLI" in
+    0) info "Skipping the doublezero-edge CLI (DZ_INSTALL_CLI=0). Install it later: $manual"; return 0 ;;
+    1) : ;;
+    *)
+      # confirm()'s own '[ -r "$TTY" ]' check isn't enough: a readable /dev/tty inode can still
+      # fail to OPEN with no controlling terminal (the same headless curl|bash / container case
+      # section 3b already works around), and confirm() would then read into an unset 'ans' and
+      # abort the whole script under 'set -u'. Probe an actual open first; no controlling
+      # terminal means no answer, so this is attendantless: skip rather than crash.
+      local want_cli=1
+      if [ "$DZ_ASSUME_YES" != 1 ]; then
+        if { : <"$TTY"; } 2>/dev/null; then
+          # Break the offer across lines: it follows the bridge's own multi-line "Done" block, and
+          # a single long sentence there reads as a wall of text rather than a question.
+          printf '\n' >"$TTY"
+          info "The doublezero-edge CLI is a read-only client for the Edge container."
+          info "It provides an interface to view feed status, the product catalog,"
+          info "candles and order books."
+          printf '\n' >"$TTY"
+          confirm "Also install it? Adds the malbeclabs/$cs_repo package repository if it isn't already configured." || want_cli=0
+        else
+          want_cli=0
+        fi
+      fi
+      if [ "$want_cli" != 1 ]; then
+        info "Skipping the doublezero-edge CLI. Install it later: $manual"
+        return 0
+      fi
+      ;;
+  esac
+
+  local repo_configured=0
+  case "$pm" in
+    apt) apt-cache policy doublezero-edge 2>/dev/null | grep -q "Candidate:" \
+           && ! apt-cache policy doublezero-edge 2>/dev/null | grep -q "Candidate: (none)" \
+           && repo_configured=1 ;;
+    dnf) dnf list --available doublezero-edge >/dev/null 2>&1 && repo_configured=1 ;;
+    yum) yum list available doublezero-edge >/dev/null 2>&1 && repo_configured=1 ;;
+  esac
+
+  if [ "$repo_configured" = 1 ]; then
+    info "The malbeclabs/$cs_repo repository is already configured; installing doublezero-edge directly."
+  else
+    info "Configuring the malbeclabs/$cs_repo Cloudsmith repository..."
+    case "$pm" in
+      apt)     local setup_url="https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.deb.sh" ;;
+      dnf|yum) local setup_url="https://dl.cloudsmith.io/public/malbeclabs/$cs_repo/setup.rpm.sh" ;;
+    esac
+    # "$SUDO -E bash" only makes sense when $SUDO is non-empty; when we're already root (the
+    # common container case) $SUDO is "" and a bare "-E" would be run as a command.
+    local setup_runner=(bash)
+    [ -n "$SUDO" ] && setup_runner=("$SUDO" -E bash)
+    if ! curl -1sLf "$setup_url" | "${setup_runner[@]}"; then
+      warn "Could not configure the malbeclabs/$cs_repo repository; skipping the doublezero-edge CLI. Install it later: $manual"
+      return 0
+    fi
+  fi
+
+  info "Installing doublezero-edge..."
+  case "$pm" in
+    apt)     $SUDO apt-get install -y doublezero-edge ;;
+    dnf|yum) $SUDO "$pm" install -y doublezero-edge ;;
+  esac || {
+    warn "Installing doublezero-edge failed; continuing without it. Retry later: sudo $([ "$pm" = apt ] && echo "apt install" || echo "$pm install") doublezero-edge"
+    return 0
+  }
+  info "Installed doublezero-edge CLI ($(doublezero-edge --version 2>/dev/null || echo 'version unknown'))."
+}
+offer_cli_package
+
+# The CLI offer owns the last screenful, and the tunnel's state is what the operator
+# has to act on -- restate it rather than let "Installed doublezero-edge CLI" close a
+# run that never connected.
+if [ "$CONNECT_STATE" != connected ]; then
+  echo
+  warn "Reminder: this host is NOT connected to DoubleZero (see above) -- no market data flows until 'sudo docker exec -it $DZ_NAME doublezero connect multicast' succeeds."
+fi

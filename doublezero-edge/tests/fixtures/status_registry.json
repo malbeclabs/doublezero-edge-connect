@@ -1,0 +1,20 @@
+{
+  "venues": [{ "venue": "Hyperliquid", "status": "online" }],
+  "history": {
+    "products_tracked": 1,
+    "products": 1,
+    "products_at_cap": false,
+    "buckets": 10,
+    "bucket_budget": 100,
+    "est_bytes": 1024,
+    "late_drops": 0,
+    "evicted": 0,
+    "window_seconds": 3600
+  },
+  "registry": {
+    "origin": "url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
+    "version": 1,
+    "rows": 6,
+    "receivers": 56
+  }
+}

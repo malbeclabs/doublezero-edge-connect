@@ -6,6 +6,10 @@
 //! The state machine is identical across the edge-feed-spec protocols (Top-of-Book, Midpoint,
 //! Market-by-Order), which differ only in their instrument-definition *layout*, so it is generic
 //! over any definition type that implements [`InstrumentDef`] (its key + manifest sequence).
+//!
+//! One instance tracks **one publisher**: `reset_count` and the manifest era are scoped to
+//! `(source_ip, group, port)`. The per-publisher map lives in the processors
+//! (`processor::PerPublisher`), which keeps this state machine single-publisher and unit-testable.
 
 use std::collections::HashMap;
 
@@ -50,7 +54,7 @@ impl<D: InstrumentDef> RefDataState<D> {
         }
     }
 
-    pub fn on_frame(&mut self, reset_count: u8) {
+    pub fn on_datagram(&mut self, reset_count: u8) {
         if reset_count != self.last_reset_count {
             self.valid = false;
             self.latest_seq = 0;
@@ -82,7 +86,7 @@ impl<D: InstrumentDef> RefDataState<D> {
         }
     }
 
-    /// True once the *whole* instrument set for the current manifest epoch is known. Quote
+    /// True once the *whole* instrument set for the current manifest era is known. Quote
     /// emission no longer gates on this (it gates per instrument via [`Self::definition`]); kept
     /// as the documented "full set complete" invariant and exercised by the tests.
     #[allow(dead_code)]
@@ -103,6 +107,7 @@ mod tests {
     fn defn(iid: u32, seq: u16) -> InstrumentDefinition {
         InstrumentDefinition {
             instrument_id: iid,
+            source_id: None,
             symbol: format!("SYM{iid}").into(),
             price_exponent: -2,
             qty_exponent: -2,
@@ -142,7 +147,7 @@ mod tests {
         s.on_manifest(true, 1, 1);
         s.on_instrument_definition(defn(10, 1));
         assert!(s.ready());
-        s.on_frame(1);
+        s.on_datagram(1);
         assert!(!s.valid);
     }
 

@@ -1,8 +1,8 @@
-//! Real-frame validation of the committed **Phoenix** TOB fixtures — a clean Phoenix-only slice
+//! Real-datagram validation of the committed **Phoenix** TOB fixtures — a clean Phoenix-only slice
 //! (publisher `148.51.122.75`, `source_id=2`) of a concurrent edge+public capture (2026-06-30; see
-//! `fixtures/PROVENANCE.md`) decoded through the real `codec::decode_frame`.
+//! `fixtures/PROVENANCE.md`) decoded through the real `codec::decode_datagram`.
 //!
-//! This is the ground truth behind the Phoenix public-trade backstop (`ingest::phoenix_feeder`,
+//! This is the ground truth behind the Phoenix public-trade backstop (`ingest::phoenix_input`,
 //! #53): the same capture proved the dedup key — the public `tradeSequenceNumber` equals the edge
 //! on-chain `trade_id` on 257/257 shared fills, and Phoenix names each market with the same bare
 //! ticker on both feeds (edge `instrument_id == public assetId`). The exact `(instrument_id ->
@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use common::replay;
 use doublezero_edge_connect::ingest::codec::{self, Message};
 
-fn frames(path: &str) -> Vec<Vec<u8>> {
-    replay::split_frames(
+fn datagrams(path: &str) -> Vec<Vec<u8>> {
+    replay::split_datagrams(
         &std::fs::read(path).expect("read fixture"),
         replay::TOB_MAGIC,
     )
@@ -25,8 +25,11 @@ fn frames(path: &str) -> Vec<Vec<u8>> {
 
 fn definitions() -> BTreeMap<u32, codec::InstrumentDefinition> {
     let mut defs = BTreeMap::new();
-    for f in frames("tests/fixtures/phoenix_tob_refdata.bin") {
-        for m in codec::decode_frame(&f).expect("decode refdata frame").1 {
+    for f in datagrams("tests/fixtures/phoenix_tob_refdata.bin") {
+        for m in codec::decode_datagram(&f)
+            .expect("decode refdata datagram")
+            .1
+        {
             if let Message::InstrumentDefinition(d) = m {
                 defs.insert(d.instrument_id, d);
             }
@@ -35,16 +38,16 @@ fn definitions() -> BTreeMap<u32, codec::InstrumentDefinition> {
     defs
 }
 
-/// The refdata fixture is a single complete manifest epoch (`seq=11`, 51 instruments). The replay
+/// The refdata fixture is a single complete manifest era (`seq=11`, 51 instruments). The replay
 /// relies on the `ManifestSummary` preceding the definitions — the subscriber drops a definition
 /// whose `manifest_seq` doesn't match the latest manifest, so a def-before-manifest fixture would
-/// silently define nothing. Pin that the first frame leads with the manifest.
+/// silently define nothing. Pin that the first datagram leads with the manifest.
 #[test]
-fn phoenix_refdata_fixture_is_a_complete_manifest_epoch() {
-    let fs = frames("tests/fixtures/phoenix_tob_refdata.bin");
+fn phoenix_refdata_fixture_is_a_complete_manifest_era() {
+    let fs = datagrams("tests/fixtures/phoenix_tob_refdata.bin");
     assert!(!fs.is_empty(), "refdata fixture is empty");
-    match codec::decode_frame(&fs[0])
-        .expect("decode frame 0")
+    match codec::decode_datagram(&fs[0])
+        .expect("decode datagram 0")
         .1
         .first()
     {
@@ -63,7 +66,7 @@ fn phoenix_refdata_fixture_is_a_complete_manifest_epoch() {
         "the manifest declares 51 instruments; all must be defined (so RefDataState reaches ready())"
     );
     for d in defs.values() {
-        assert_eq!(d.manifest_seq, 11, "every def shares the manifest epoch");
+        assert_eq!(d.manifest_seq, 11, "every def shares the manifest era");
         assert!(
             !d.symbol.is_empty() && d.symbol.is_ascii(),
             "instrument {} has an implausible symbol {:?}",
@@ -98,19 +101,22 @@ fn phoenix_refdata_fixture_is_a_complete_manifest_epoch() {
 /// Every fixture trade is a real Phoenix (`source_id=2`) fill referencing a defined instrument, and
 /// carries the on-chain `trade_id` that the public feed reported as `tradeSequenceNumber` for the
 /// same fill. Pinning the exact `(instrument_id, trade_id)` pairs anchors the dedup key the
-/// `phoenix_feeder` relies on.
+/// `phoenix_input` relies on.
 #[test]
 fn phoenix_mktdata_fixture_trades_validate() {
     let defined: BTreeSet<u32> = definitions().into_keys().collect();
     let mut by_id: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
-    for f in frames("tests/fixtures/phoenix_tob_marketdata.bin") {
-        for m in codec::decode_frame(&f).expect("decode mktdata frame").1 {
+    for f in datagrams("tests/fixtures/phoenix_tob_marketdata.bin") {
+        for m in codec::decode_datagram(&f)
+            .expect("decode mktdata datagram")
+            .1
+        {
             if let Message::Trade(t) = m {
                 assert_eq!(
                     t.source_id, 2,
                     "every fixture trade must be Phoenix (source_id 2)"
                 );
-                assert_eq!(codec::source_name(t.source_id), Some("Phoenix"));
+                assert_eq!(codec::source_name(t.source_id), Some("PHOENIX"));
                 assert!(
                     t.trade_id > 0,
                     "trade_id (= public tradeSequenceNumber) must be real"

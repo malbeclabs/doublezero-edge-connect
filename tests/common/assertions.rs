@@ -19,7 +19,7 @@ fn ty(m: &Value) -> &str {
 }
 
 /// Every quote/trade/depth references a symbol that was already declared by an
-/// `instrument` message earlier in the stream (precision before price). The bridge
+/// `instrument` message earlier in the feed (precision before price). The bridge
 /// gates all price-carrying emissions on a known instrument definition, so trades
 /// must also be preceded by their instrument.
 pub fn instrument_before_price(msgs: &[Value]) {
@@ -47,26 +47,26 @@ pub fn instrument_before_price(msgs: &[Value]) {
 ///
 /// **Key design — business-content only, BY DESIGN.** Per-receipt timestamps
 /// (`recv_ts_ns`, `kernel_rx_ts_ns`, `ws_send_ts_ns`) are deliberately excluded.
-/// Duplicate frames from competing publishers carry identical business fields but
+/// Duplicate datagrams from competing publishers carry identical business fields but
 /// different receipt timestamps; a business-content key collapses them so this
-/// assertion catches missing dedup. Do NOT add `recv_ts_ns` to any key arm — that
+/// assertion catches missing dedup. Do NOT add `recv_ts_ns` to any key path — that
 /// gives each copy a distinct key and defeats the oracle.
 ///
-/// **Quote arm:** `source_ts_ns` is venue-assigned content (identical across publishers
+/// **Quote branch:** `source_ts_ns` is venue-assigned content (identical across publishers
 /// for the same update); the transport sequence number is NOT, which is why
 /// content + source_ts is the right cross-publisher identity and a seqnum would not be.
 /// Content includes `bid_n`/`ask_n` (the source counts) — they are part of the canonical
 /// BBO identity (`bbo_hash`), so two quotes that differ only in count are NOT duplicates.
 ///
-/// **Trade arm:** `trade_id` is treated as globally unique for the run. A real
+/// **Trade branch:** `trade_id` is treated as globally unique for the run. A real
 /// multi-publisher trade deduper will be WINDOWED (bounded memory) and can only collapse
 /// copies within the window, so this oracle assumes window >= worst-case inter-publisher
 /// lag.
 ///
-/// **Depth arm:** identity is content-inclusive (venue + symbol + source_ts_ns + bids +
+/// **Depth path:** identity is content-inclusive (venue + symbol + source_ts_ns + bids +
 /// asks). Keying on source_ts_ns alone would false-fail when two publishers emit the
 /// same snapshot at the same event timestamp but with different book content (a valid
-/// divergence), and would false-collapse snapshots from a batch split across frames.
+/// divergence), and would false-collapse snapshots from a batch split across datagrams.
 /// Including the book content means identical state → true duplicate (correctly flagged)
 /// and different state → different key (no false fail).
 ///
@@ -74,7 +74,7 @@ pub fn instrument_before_price(msgs: &[Value]) {
 /// quotes that both have `source_ts_ns == 0` (the "unknown" sentinel) and identical
 /// bid/ask/sizes share the same key and produce a false-positive duplicate failure.
 /// This does not occur in the current single-publisher fixtures. Future multi-publisher
-/// dedup work must define duplicate identity precisely (e.g. by frame channel + sequence
+/// dedup work must define duplicate identity precisely (e.g. by datagram channel + sequence
 /// number at ingest) rather than relying on this heuristic.
 pub fn no_business_duplicates(msgs: &[Value]) {
     let mut seen: HashSet<String> = HashSet::new();

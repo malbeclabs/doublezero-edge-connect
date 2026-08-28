@@ -9,7 +9,7 @@
 //! sibling codecs (`codec_midpoint`/`codec_mbo`). The round-trip tests below pin *self-consistency*
 //! only (build a shred the way agave does, recompute its root, verify); they cannot catch a wrong
 //! constant that both construction and verification share. Before trusting sigverify in production,
-//! confirm these offsets against a captured frame. The forwarder logs a one-time warning and a
+//! confirm these offsets against a captured datagram. The forwarder logs a one-time warning and a
 //! periodic valid/invalid tally so a systematic misparse (≈100% "invalid") is visible immediately.
 
 use sha2::{Digest, Sha256};

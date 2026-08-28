@@ -155,7 +155,7 @@ pub struct ShredConfig {
     pub sources: Vec<SocketAddrV4>,
     /// Local destinations every datagram is fanned out to.
     pub forward: Vec<SocketAddr>,
-    /// Deduplication mode. The single source of truth for forwarder behaviour.
+    /// Deduplication mode. The single authority for forwarder behaviour.
     pub mode: DedupMode,
     /// Solana JSON-RPC endpoint for the leader schedule. Consumed only when `mode` is
     /// [`DedupMode::Sigverify`] (and required there); ignored otherwise.
@@ -201,7 +201,7 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-    // The mode is the single source of truth. Sigverify builds a leader schedule (and requires an
+    // The mode is the single authority. Sigverify builds a leader schedule (and requires an
     // RPC URL — main rejects `Sigverify` without one before we get here); dedup-only and bare run
     // with no schedule, distinguished by the `dedup` bool passed to the forwarder below.
     let schedule = match cfg.mode {
@@ -212,7 +212,7 @@ pub async fn run(cfg: ShredConfig) -> Result<()> {
             warn!(
                 "shred sigverify enabled: shred/merkle offsets are transcribed from the agave \
                  layout and NOT validated against a live edge-solana hexdump — watch the periodic \
-                 verify tally and confirm against a captured frame before trusting it"
+                 verify tally and confirm against a captured datagram before trusting it"
             );
             let sched = Arc::new(LeaderSchedule::new(url));
             let refresher = Arc::clone(&sched);
@@ -367,7 +367,7 @@ async fn receiver_task(
                     warn!(%group, %e, "shred recv error; rejoining");
                     continue 'rejoin;
                 }
-                // The socket was not actually ready (spurious wakeup): re-arm readability.
+                // The socket was not actually ready (spurious wakeup): wait for readability again.
                 Err(_would_block) => continue,
             }
         }
@@ -1031,10 +1031,10 @@ mod tests {
     }
 
     /// End-to-end cross-group de-dup win metrics: the *same* shred arriving from two distinct source
-    /// groups forwards exactly one copy, and the `Action::DropDuplicate` arm in `forwarder_task`
+    /// groups forwards exactly one copy, and the `Action::DropDuplicate` branch in `forwarder_task`
     /// reaches `dz_shred_wins_total{winner}` + `dz_shred_lead_ns{winner}` (not just the plain-drop
     /// counter). This closes the gap the `From<Vec<u8>>` (sentinel-group) helper leaves: with one
-    /// group every duplicate is a same-group plain drop, so that arm was never exercised end-to-end.
+    /// group every duplicate is a same-group plain drop, so that branch was never exercised end-to-end.
     /// Uses source groups unique to this test and asserts on the metric *delta* (the registry is a
     /// process-global shared across the bin's tests), so it holds without `#[serial]`.
     #[tokio::test]

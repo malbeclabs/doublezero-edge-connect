@@ -23,20 +23,42 @@ use std::{
 
 use crate::ingest::feeds::FeedKind;
 
-/// Identity of one receiver: `(venue, kind, base port)`. Same shape as `reconcile::FeedKey`.
-pub type ReceiverKey = (&'static str, FeedKind, u16);
+/// Identity of one receiver: `(venue, category, kind, base port)`. **The same tuple** as
+/// `reconcile::FeedKey`, which is what lets the reconciler pass its own keys to [`FeedHealth::liveness`]
+/// directly. The category rides along because `(venue, kind)` is no longer unique: one Source ID can
+/// carry disjoint instrument universes, and two rows of the same kind under one venue would otherwise
+/// share a liveness entry and report each other's health.
+pub type ReceiverKey = (&'static str, &'static str, FeedKind, u16);
+
+/// A receiver's liveness for the purpose of tape ownership, **ordered best first**: the derived
+/// `Ord` is what `reconcile::tape_owners` sorts on ahead of feed-kind rank, so the variant order
+/// here is load-bearing and not cosmetic.
+///
+/// `Unregistered` sits between the two on purpose. It is not `Up` — a row that never binds must not
+/// outrank the peer that is streaming — and it is not `Down` either, or a cold start (where nothing
+/// has bound yet) would demote every row at once and the fallback to rank would never happen. See
+/// [`FeedHealth::liveness`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TapeLiveness {
+    /// Registered and delivering.
+    Up,
+    /// Never registered: spawned but its sockets have not bound yet, or they never will.
+    Unregistered,
+    /// Registered and known silent.
+    Down,
+}
 
 /// Whether a receiver of this protocol counts toward the venue-level `status` / `dz_feed_up`.
 ///
-/// PROTOCOL.md's `status` is the health of the venue's **quote** stream (`stale_ms` is documented as
-/// "milliseconds the quote feed had been silent"), which Top-of-Book carries and Market-by-Order
-/// does not — MBO is re-served as `depth`. Counting MBO would break the contract in both
-/// directions: a wedged depth mirror would report a venue outage while quotes flow, and a live one
-/// would mask a total quote outage.
+/// PROTOCOL.md's `status` is the health of the venue's **quote** feed (`stale_ms` is documented as
+/// "milliseconds the quote feed had been silent"), which Top-of-Book carries and the two book
+/// protocols do not — Market-by-Order is re-served as `depth`, Market-by-Price as `book`. Counting
+/// either would break the contract in both directions: a wedged book mirror would report a venue
+/// outage while quotes flow, and a live one would mask a total quote outage.
 fn carries_venue_status(kind: FeedKind) -> bool {
     match kind {
         FeedKind::TopOfBook | FeedKind::Midpoint => true,
-        FeedKind::MarketByOrder => false,
+        FeedKind::MarketByOrder | FeedKind::MarketByPrice => false,
     }
 }
 
@@ -72,7 +94,7 @@ pub type SharedFeedHealth = Arc<FeedHealth>;
 /// *stopped* must keep the venue honest rather than hand the aggregate to a depth-only peer.
 fn venue_up_in(state: &State, venue: &str) -> bool {
     let (mut carrier_up, mut any_up) = (false, false);
-    for ((v, kind, _), up) in state.up.iter() {
+    for ((v, _, kind, _), up) in state.up.iter() {
         if *v != venue {
             continue;
         }
@@ -123,7 +145,7 @@ impl FeedHealth {
             key.0,
             |s| {
                 s.up.insert(key, true);
-                if carries_venue_status(key.1) {
+                if carries_venue_status(key.2) {
                     s.carrier_venues.insert(key.0);
                 }
             },
@@ -150,6 +172,24 @@ impl FeedHealth {
         venue_up_in(&self.lock(), venue)
     }
 
+    /// This receiver's liveness as the reconciler's tape ownership orders it — a **three**-state
+    /// answer, because "registered and down" and "never registered" are different facts and
+    /// collapsing either into the other breaks a different case.
+    ///
+    /// Folding `Unregistered` into `Up` (what a plain `is_down` did) lets a receiver that never
+    /// binds hold rank 0 forever: it returns `Err`, is reaped and respawned every tick without ever
+    /// registering, so its key never becomes `Some(false)` while it outranks the peer that is
+    /// actually streaming — and the venue's tape goes silent indefinitely. Folding it into `Down`
+    /// instead bounces the tape on every activation, and leaves a cold start — where no row has
+    /// bound yet — with no owner at all.
+    pub fn liveness(&self, key: &ReceiverKey) -> TapeLiveness {
+        match self.lock().up.get(key) {
+            Some(true) => TapeLiveness::Up,
+            Some(false) => TapeLiveness::Down,
+            None => TapeLiveness::Unregistered,
+        }
+    }
+
     /// Record `key`'s liveness, publishing the venue edge if the aggregate flipped — so one
     /// `status` transition fires per venue change rather than one per receiver.
     pub fn set(&self, key: ReceiverKey, up: bool, on_edge: impl FnOnce(bool)) {
@@ -169,8 +209,11 @@ mod tests {
     use std::cell::Cell;
 
     const V: &str = "TestVenue";
+    /// One category throughout: these tests are about the venue aggregate, which the category does
+    /// not enter into — it is only there to keep two rows of one kind under a venue distinct.
+    const C: &str = "testcategory";
     fn key(base_port: u16) -> ReceiverKey {
-        (V, FeedKind::TopOfBook, base_port)
+        (V, C, FeedKind::TopOfBook, base_port)
     }
 
     /// `Some(venue_up)` if the mutation flipped the venue aggregate, else `None` — the shape the
@@ -289,7 +332,7 @@ mod tests {
     fn venues_are_isolated() {
         let h = FeedHealth::new();
         register(&h, key(9101));
-        register(&h, ("Other", FeedKind::TopOfBook, 9101));
+        register(&h, ("Other", C, FeedKind::TopOfBook, 9101));
         assert_eq!(set(&h, key(9101), false), Some(false));
         assert!(h.venue_up("Other"), "other venue unaffected");
     }
@@ -298,7 +341,7 @@ mod tests {
     /// down on its own nor mask a total outage of the venue's quote publishers.
     #[test]
     fn depth_only_receivers_are_excluded_from_the_venue_aggregate() {
-        let mbo = (V, FeedKind::MarketByOrder, 10101);
+        let mbo = (V, C, FeedKind::MarketByOrder, 10101);
         let h = FeedHealth::new();
         register(&h, key(9101));
         assert_eq!(
@@ -327,7 +370,7 @@ mod tests {
     /// with zero quotes flowing.
     #[test]
     fn a_deregistered_carrier_does_not_let_depth_mask_a_quote_outage() {
-        let mbo = (V, FeedKind::MarketByOrder, 10101);
+        let mbo = (V, C, FeedKind::MarketByOrder, 10101);
         let h = FeedHealth::new();
         register(&h, key(9101));
         register(&h, mbo);
@@ -349,7 +392,7 @@ mod tests {
     #[test]
     fn a_depth_only_venue_falls_back_to_its_registered_receivers() {
         let h = FeedHealth::new();
-        let mbo = ("DepthOnly", FeedKind::MarketByOrder, 10101);
+        let mbo = ("DepthOnly", C, FeedKind::MarketByOrder, 10101);
         assert_eq!(register(&h, mbo), Some(true));
         assert!(h.venue_up("DepthOnly"));
         assert_eq!(set(&h, mbo, false), Some(false));

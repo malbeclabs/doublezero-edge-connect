@@ -36,7 +36,7 @@ impl Bridge {
     }
 
     /// Like [`Self::spawn`] but appends `extra_args` to the binary's argv — used to point the WS
-    /// **input** feeder at a mock (`--ws-input-url` / `--ws-input-coins`) for the arbitrage E2E.
+    /// **input** at a mock (`--ws-input-url` / `--ws-input-coins`) for the arbitrage E2E.
     pub fn spawn_with_args(venue: &str, ws_port: u16, extra_args: &[&str]) -> Self {
         let bin = env!("CARGO_BIN_EXE_doublezero-edge-connect");
         let ws_addr = format!("127.0.0.1:{ws_port}");
@@ -53,6 +53,16 @@ impl Bridge {
             "--ws-bind",
             &ws_addr,
             "--subscription-gating-disable",
+            // Both off, because their defaults are *fixed* loopback ports (9099 and 9098) while
+            // `--ws-bind` is per test. `--test-threads=1` serializes within one test binary but not
+            // across them, and cargo runs the binaries concurrently, so any two spawned bridges —
+            // in `e2e`, `ws_input_arbitrage`, `phoenix_arbitrage` — race for those two ports and
+            // whichever loses reports a bind failure. No test here drives either surface; a test
+            // that wants one should pass its own bind on a port it owns.
+            "--api-bind",
+            "",
+            "--admin-bind",
+            "",
         ];
         args.extend_from_slice(extra_args);
         let mut child = Command::new(bin)

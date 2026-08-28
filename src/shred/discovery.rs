@@ -19,7 +19,7 @@ use tracing::warn;
 /// One row of `doublezero multicast group list --json-compact`. Only the fields we act on are
 /// declared; serde ignores the rest (`account`, `max_bandwidth`, `publishers`, …). `multicast_ip`
 /// is parsed straight into `Ipv4Addr`, so a malformed address fails deserialization (→ empty list)
-/// rather than yielding a bad source.
+/// rather than yielding a bad source group.
 #[derive(Debug, Deserialize)]
 struct GroupRow {
     code: String,
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn malformed_ip_fails_the_whole_parse() {
         // A bad `multicast_ip` fails deserialization of the array → empty (fail-safe, never a bad
-        // source). serde aborts the whole parse, which is fine: we'd rather have no map.
+        // source group). serde aborts the whole parse, which is fine: we'd rather have no map.
         let json =
             r#"[{"code":"edge-solana-shreds","multicast_ip":"not-an-ip","status":"activated"}]"#;
         assert!(parse_group_code_ips(json.as_bytes()).is_empty());

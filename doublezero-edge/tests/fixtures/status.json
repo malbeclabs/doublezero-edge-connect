@@ -1,0 +1,37 @@
+{
+  "venues": [
+    { "venue": "Hyperliquid", "status": "online" },
+    { "venue": "Kalshi", "status": "online" },
+    { "venue": "Phoenix", "status": "offline" }
+  ],
+  "history": {
+    "products_tracked": 128,
+    "products": 128,
+    "products_at_cap": false,
+    "buckets": 612440,
+    "bucket_budget": 1048576,
+    "est_bytes": 57623897,
+    "late_drops": 4,
+    "evicted": 0,
+    "window_seconds": 3600
+  },
+  "channels": {
+    "rows": [
+      {
+        "venue": "KALSHI",
+        "category": "sports",
+        "code": "edge-kalshi-sports-mbp",
+        "excluded": 29,
+        "channels": [
+          { "channel": 10, "allowed": true, "bound": true, "products": 412, "label": "sports.nfl" },
+          { "channel": 11, "allowed": true, "bound": false, "products": 0 }
+        ]
+      }
+    ],
+    "excluded_by_filter": 29
+  },
+  "process": {
+    "resident_memory_bytes": 193200128.0,
+    "cpu_seconds_total": 412.7
+  }
+}

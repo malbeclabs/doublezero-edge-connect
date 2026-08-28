@@ -54,7 +54,7 @@ jobs:
         run: |
           # Keep this variant list in sync with the sibling case blocks:
           # poll.yml's scan `case` and build.yml's `cfg` case (the single source
-          # of truth — its default arm hard-fails). Adding a variant means all three.
+          # of truth — its default branch hard-fails). Adding a variant means all three.
           case "$PAYLOAD_ENV" in
             testnet|mainnet-beta|devnet)
               echo "env=$PAYLOAD_ENV" >> "$GITHUB_OUTPUT"
