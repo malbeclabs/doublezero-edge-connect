@@ -4,8 +4,9 @@ An **engine-agnostic** WebSocket protocol for streaming normalized two-sided top
 (best bid / best ask) market data. It carries the venue and symbol in every message, uses
 plain JSON, and is independent of any trading framework.
 
-`doublezero-edge-connect` is the **reference producer** (it ingests the DoubleZero Edge binary multicast feed
-and re-serves it in this format) - but it is not part of the protocol. Any engine that can open a WebSocket and parse JSON can
+`doublezero-edge-connect` — **the bridge** — is the reference implementation of this protocol's
+producer side (it ingests the DoubleZero Edge binary multicast feed and re-serves it in this format),
+but it is not part of the protocol. Any engine that can open a WebSocket and parse JSON can
 consume it by writing a thin (~50-100 line) adapter to its own internal types. The producer's
 *input* (multicast, binary, etc.) is an implementation detail; only the *output* below is the
 contract.
@@ -16,7 +17,7 @@ contract.
   (no TLS - this service is intended for a trusted/local network; terminate TLS at a reverse
   proxy if you must expose it).
 - The server **pushes** market data. A consumer may optionally **subscribe** to narrow the
-  stream to specific venues/symbols; with no subscription it receives everything
+  feed to specific venues/symbols; with no subscription it receives everything
   (see [Subscriptions](#subscriptions--filtering)).
 - **Liveness**: the server sends periodic WebSocket Pings and closes a client that is silent
   past an idle timeout; clients may also send an app-level ping
@@ -26,18 +27,25 @@ contract.
 
 On each new connection the producer:
 
-1. **Replays the current instrument definitions** - one `instrument` message per known symbol -
-   so the consumer knows precision **before** the first quote/depth.
-2. **Replays the latest `depth`** per symbol (full-state order book), if any.
-3. **Streams** `quote`/`trade`/`midpoint`/`depth` messages as they arrive, fanned out to all
+1. **Replays the current instrument definitions** - one `instrument` message per symbol whose
+   Source ID is known, so the consumer knows precision **before** the first quote/depth. For a
+   publisher whose reference data carries no Source ID of its own, that means **known and priced
+   at least once** - a symbol it defines but has not yet priced is not replayed. For a publisher
+   whose reference data carries its own Source ID, every symbol it defines is replayed, priced or
+   not (see [*A symbol appears only once its Source ID is
+   known*](#a-symbol-appears-only-once-its-source-id-is-known)).
+2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and a
+   `book` re-baseline (a `clear` plus the complete book) for every market that has one, at the
+   market's own granularity.
+3. **Streams** `quote`/`trade`/`midpoint`/`depth`/`book`/`order_book` messages as they arrive, fanned out to all
    connected consumers.
 
 ```
 connect -> instrument (xN) -> depth (xM, current books) -> quote -> trade -> depth -> ...
 ```
 
-A consumer that connects mid-stream is therefore always able to build instruments first. New or
-changed instrument definitions may also arrive at any later point in the stream.
+A consumer that connects partway through is therefore always able to build instruments first. New or
+changed instrument definitions may also arrive at any later point in the feed.
 
 ## Message envelope
 
@@ -50,6 +58,8 @@ Every message is a JSON object tagged by a `type` field (`snake_case`):
 | `trade`      | A trade print (last sale).               |
 | `midpoint`   | A single derived mid price.              |
 | `depth`      | A full order-book depth snapshot.        |
+| `book`       | A batch of incremental **price-aggregated** order-book changes. |
+| `order_book` | The same batch shape, **order-level**: each change is one order's state, keyed by the venue's `order_id`. |
 | `status`     | A venue-level feed-health transition.    |
 
 Consumers **must ignore unknown `type` values and unknown fields** (forward compatibility).
@@ -57,16 +67,22 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 ### `instrument`
 
 ```json
-{"type":"instrument","venue":"Hyperliquid","symbol":"SOL","price_exponent":-2,"qty_exponent":-2}
+{"type":"instrument","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL","channel":0,"instrument_id":1,"price_exponent":-2,"qty_exponent":-2}
 ```
 
 | Field            | Type   | Meaning                                                              |
 |------------------|--------|----------------------------------------------------------------------|
 | `type`           | string | `"instrument"`.                                                      |
-| `venue`          | string | Venue code (e.g. `Hyperliquid`, `Phoenix`).                         |
+| `venue`          | string | **Deprecated.** Always identical to `source_name`. See [`source_name`, `source_id`, and the deprecated `venue`](#source_name-source_id-and-the-deprecated-venue). |
+| `source_name`    | string | The upstream source's registry name (e.g. `Hyperliquid`, `Phoenix`). **Preferred.** |
+| `source_id`      | number | The wire Source ID, verbatim.                                        |
 | `symbol`         | string | Instrument symbol as the venue names it (e.g. `SOL`, `SOL-PERP`).   |
+| `channel`        | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
+| `instrument_id`  | uint32 | Instrument id, unique within `channel`.                              |
 | `price_exponent` | int8   | Price increment exponent: tick size = `10^price_exponent` (e.g. `-2` -> `0.01`). |
 | `qty_exponent`   | int8   | Size increment exponent: step = `10^qty_exponent`.                  |
+
+`channel` and `instrument_id` are the identity a consumer joins a [`book`](#book) to its definition on, rather than the colliding `symbol`.
 
 `price_exponent` / `qty_exponent` give the venue's **precision**; `quote` prices/sizes are
 already decimal values (below), so the exponents are used to set tick size / decimal places, not
@@ -75,7 +91,7 @@ to rescale integers.
 ### `quote`
 
 ```json
-{"type":"quote","venue":"Hyperliquid","symbol":"SOL",
+{"type":"quote","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL",
  "bid":184.20,"ask":184.21,"bid_size":12.5,"ask_size":8.0,"bid_n":3,"ask_n":2,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -84,15 +100,17 @@ to rescale integers.
 | Field             | Type    | Meaning                                                                 |
 |-------------------|---------|-------------------------------------------------------------------------|
 | `type`            | string  | `"quote"`.                                                              |
-| `venue`           | string  | Venue code.                                                             |
+| `venue`           | string  | **Deprecated.** Always identical to `source_name`.                      |
+| `source_name`     | string  | The upstream source's registry name. **Preferred.**                              |
+| `source_id`       | number  | The wire Source ID, verbatim.                                           |
 | `symbol`          | string  | Symbol (matches an `instrument`'s `symbol`).                            |
 | `bid`             | number  | Best bid price (decimal).                                               |
 | `ask`             | number  | Best ask price (decimal).                                               |
 | `bid_size`        | number  | Size at best bid (decimal).                                             |
 | `ask_size`        | number  | Size at best ask (decimal).                                             |
-| `bid_n`           | uint16  | Orders/sources at best bid (`0` if the venue does not report it). Part of the top-of-book identity: a change here is a distinct quote even at an unchanged price/size. |
-| `ask_n`           | uint16  | Orders/sources at best ask (`0` if unavailable).                        |
-| `source_ts_ns`    | uint64  | Venue/source timestamp, ns since Unix epoch. `0` if unknown.            |
+| `bid_n`           | uint16  | Count at best bid (`0` if the venue does not report it). Part of the top-of-book identity: a change here is a distinct quote even at an unchanged price/size. |
+| `ask_n`           | uint16  | Count at best ask (`0` if unavailable).                        |
+| `source_ts_ns`    | uint64  | Venue timestamp, ns since Unix epoch. `0` if unknown.            |
 | `recv_ts_ns`      | uint64  | Producer user-space receive time (after decode), ns since epoch.        |
 | `kernel_rx_ts_ns` | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`, `CLOCK_REALTIME`) captured in the driver softirq, before user space. `0` if unavailable. |
 | `ws_send_ts_ns`   | uint64  | Wall clock sampled the instant this quote is serialized for the consumers. A single value shared by all consumers of this message (the producer serializes once and fans the identical frame out), not a per-connection send time. `0` if not stamped. |
@@ -119,7 +137,8 @@ source_ts_ns --> kernel_rx_ts_ns --> recv_ts_ns --> ws_send_ts_ns --> (consumer 
 ### `trade`
 
 ```json
-{"type":"trade","venue":"Hyperliquid","symbol":"SOL",
+{"type":"trade","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL",
+ "channel":0,"instrument_id":1234,
  "price":184.20,"size":3.5,"aggressor_side":"buy","trade_id":987654,"cumulative_volume":12500.0,
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -131,14 +150,18 @@ venue precision, same convention as `quote`).
 | Field               | Type    | Meaning                                                              |
 |---------------------|---------|----------------------------------------------------------------------|
 | `type`              | string  | `"trade"`.                                                           |
-| `venue`             | string  | Venue code.                                                          |
+| `venue`             | string  | **Deprecated.** Always identical to `source_name`.                   |
+| `source_name`       | string  | The upstream source's registry name. **Preferred.**                           |
+| `source_id`         | number  | The wire Source ID, verbatim.                                        |
 | `symbol`            | string  | Symbol (matches an `instrument`'s `symbol`).                         |
+| `channel`           | uint8   | The publisher's channel id: the instrument set this feed carries. `0` for an upstream source with no channel concept of its own. Filterable. |
+| `instrument_id`     | uint32  | Instrument id, unique within `channel`.                              |
 | `price`             | number  | Trade price (decimal).                                               |
 | `size`              | number  | Trade size (decimal).                                                |
 | `aggressor_side`    | string  | `"buy"`, `"sell"`, or `"unknown"` - the aggressor (taker) side.      |
 | `trade_id`          | uint64  | Venue-assigned trade identifier.                                     |
 | `cumulative_volume` | number  | Session cumulative traded volume (decimal); `0` if not provided.     |
-| `source_ts_ns`      | uint64  | Venue/source timestamp, ns since epoch. `0` if unknown.              |
+| `source_ts_ns`      | uint64  | Venue timestamp, ns since epoch. `0` if unknown.              |
 | `recv_ts_ns`        | uint64  | Producer user-space receive time (after decode), ns since epoch.     |
 | `kernel_rx_ts_ns`   | uint64  | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable.          |
 | `ws_send_ts_ns`     | uint64  | Wall clock the instant this trade is serialized; shared by all consumers of this message (serialized once, not per-connection). `0` if unset.|
@@ -148,24 +171,32 @@ a trade is a **point-in-time event, not full state**: it is not replayed on conn
 dropped under backpressure is simply a missed print (it does not leave a stale book). A consumer
 that only wants top-of-book may ignore `trade` per the forward-compatibility rule.
 
+`channel`/`instrument_id` are additive (forward-compatible: an older consumer that ignores unknown
+fields is unaffected) and carry the same identity `instrument`/`book` do — see *Identity* under
+[`book`](#book). They exist so a consumer can join a trade to its market on the identity rather than
+`symbol` alone, which is not unique on a venue whose publisher shards the same instrument set across
+more than one `channel`.
+
 ### `midpoint`
 
 ```json
-{"type":"midpoint","venue":"MidpointVenue","symbol":"SOL","mid":184.205,
+{"type":"midpoint","venue":"MidpointVenue","source_name":"MidpointVenue","source_id":0,"symbol":"SOL","mid":184.205,
  "method":0,"quality_flags":0,
  "book_ts_ns":1781019263715344015,"compute_ts_ns":1781019263715350000,
  "recv_ts_ns":1781019263715501230,"kernel_rx_ts_ns":1781019263715300010,
  "ws_send_ts_ns":1781019263715600440}
 ```
 
-A single **derived mid price** for a symbol, from the DZ Edge Midpoint sibling feed. Like a
+A single **derived mid price** for a symbol, from the DZ Edge Midpoint feed. Like a
 `quote` it is **full state** per instrument (the latest mid), so it self-heals on the next message;
-a consumer that connects mid-stream sees the matching `instrument` (for precision) first.
+a consumer that connects partway through sees the matching `instrument` (for precision) first.
 
 | Field            | Type   | Meaning                                                                |
 |------------------|--------|------------------------------------------------------------------------|
 | `type`           | string | `"midpoint"`.                                                          |
-| `venue`          | string | Venue code (a Midpoint feed maps to its own venue).                    |
+| `venue`          | string | **Deprecated.** Always identical to `source_name` (a Midpoint feed maps to its own venue). |
+| `source_name`    | string | The upstream source's registry name. **Preferred.**                             |
+| `source_id`      | number | The wire Source ID, verbatim (`0` when the feed names no registry row). |
 | `symbol`         | string | Symbol (matches an `instrument`'s `symbol`).                           |
 | `mid`            | number | Mid price (decimal).                                                   |
 | `method`         | uint8  | How the mid was computed (`0` = the instrument's default method).      |
@@ -182,7 +213,7 @@ for mids). A consumer that only wants quotes/trades may ignore `midpoint` per fo
 ### `depth`
 
 ```json
-{"type":"depth","venue":"MboVenue","symbol":"SOL",
+{"type":"depth","venue":"MboVenue","source_name":"MboVenue","source_id":0,"symbol":"SOL",
  "bids":[[184.20,12.5],[184.19,4.0]],"asks":[[184.21,8.0],[184.22,6.5]],
  "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
  "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
@@ -195,7 +226,9 @@ first** (bids high→low, asks low→high).
 | Field            | Type     | Meaning                                                              |
 |------------------|----------|----------------------------------------------------------------------|
 | `type`           | string   | `"depth"`.                                                           |
-| `venue`          | string   | Venue code (a Market-by-Order feed maps to its own venue).           |
+| `venue`          | string   | **Deprecated.** Always identical to `source_name` (a Market-by-Order feed maps to its own venue). |
+| `source_name`    | string   | The upstream source's registry name. **Preferred.**                           |
+| `source_id`      | number   | The wire Source ID, verbatim (`0` when the feed names no registry row). |
 | `symbol`         | string   | Symbol (matches an `instrument`'s `symbol`).                         |
 | `bids`           | number[][] | `[price, size]` pairs, highest price first.                        |
 | `asks`           | number[][] | `[price, size]` pairs, lowest price first.                         |
@@ -206,56 +239,201 @@ first** (bids high→low, asks low→high).
 
 **Each `depth` message is full state** (the complete top *N*, not a delta), so - like `quote` - it
 **self-heals**: a consumer that drops one under backpressure recovers on the next snapshot, and a
-client that connects mid-stream is replayed the latest `depth` per symbol on connect (after the
+client that connects partway through is replayed the latest `depth` per symbol on connect (after the
 `instrument` definitions).
 
-> **Why the producer reconstructs the book.** The Market-by-Order feed is an order-by-order *delta*
-> stream with its own snapshot+delta recovery. Re-serving those raw deltas would break this
-> protocol's central guarantee that every message is full state and self-heals. So the producer
-> runs the L3 book reconstruction and recovery **internally** and exposes only the derived,
-> full-state `depth` (and `trade`) product. Raw order add/cancel/execute events are intentionally
-> **not** on the wire.
+> **Market-by-Order produces `depth` *and* `book`.** The producer runs that feed's snapshot+delta
+> recovery internally and derives both products from the same reconstructed L3 book: this full-state
+> top-*N* `depth`, and the order-level [`order_book`](#book) carrying the venue's own `order_id`. Neither
+> re-serves the upstream's raw add/cancel/execute events — a `book` change is the *resulting state* of
+> one order, so a consumer needs no delta arithmetic, and a recovery still surfaces only as a
+> re-baseline.
+
+### `book`
+
+```json
+{"type":"book","venue":"BookVenue","source_name":"BookVenue","source_id":0,"symbol":"SOL","channel":2,"instrument_id":41,
+ "changes":[{"action":"update","side":"bid","price":0.6200,"size":150,"order_id":0},
+            {"action":"delete","side":"ask","price":0.6300,"size":0,"order_id":0}],
+ "snapshot":false,"last":true,
+ "source_ts_ns":1781019263715344015,"recv_ts_ns":1781019263715501230,
+ "kernel_rx_ts_ns":1781019263715300010,"ws_send_ts_ns":1781019263715600440}
+```
+
+A batch of **incremental** book changes for one instrument, derived in the producer from a DZ Edge order-book feed. Unlike `depth`, a `book` message is not full state: apply the changes in order to the book you already hold.
+
+The two granularities are **two message types**, not one type with a flag. `book` is price-aggregated: every change is a price level's resulting size and `order_id` is `0`. `order_book` is order-level: every change is one *order's* resulting size, keyed by the venue's own `order_id`, and several orders may rest at one price. The envelope and every field are otherwise identical, so a consumer that handles both shares one parser and routes on `type`; one that handles only `book` ignores `order_book` under the forward-compatibility rule and is unaffected. A market is served under exactly one of the two, never both — a Market-by-Price feed produces `book`, a Market-by-Order feed `order_book`.
+
+**They are separate types because they cannot be mixed by accident.** Applying an order-level change as if it were price-aggregated is silent corruption, not degraded output: two orders resting at one price collapse to the last one's size, and deleting either removes a level the other still occupies. Had order-level changes ridden `book` with a new `order_id` field, a consumer written before that field existed — and correctly ignoring it, exactly as this document tells it to — would have corrupted its own book. The type is what the forward-compatibility rule can actually protect.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `type` | string | `"book"` when price-aggregated, `"order_book"` when order-level. |
+| `venue` | string | **Deprecated.** Always identical to `source_name`. |
+| `source_name` | string | The upstream source's registry name. **Preferred.** |
+| `source_id` | number | The wire Source ID, verbatim. |
+| `symbol` | string | **Display label.** Not guaranteed unique — see *Identity* below. |
+| `channel` | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
+| `instrument_id` | uint32 | Instrument id, unique within `channel`. |
+| `changes` | object[] | Book changes, in order. `{ "action", "side", "price", "size", "order_id" }`. |
+| `changes[].action` | string | `"clear"`, `"update"`, or `"delete"`. |
+| `changes[].side` | string | `"bid"`, `"ask"`, or `"both"` (`"both"` only on a `clear`). |
+| `changes[].price` | number | Price of the level or order (decimal). Ignored for a `clear`. |
+| `changes[].size` | number | The **absolute** resulting size (decimal), not a delta — of the level for a price-aggregated change, of the order for an order-level one. `0` on a `delete`. |
+| `changes[].order_id` | uint64 | The venue's order id for an order-level change, or `0` when the change is price-aggregated and carries no order identity. |
+| `snapshot` | bool | Advisory: this batch is part of a rebuild. **Not** what re-baselines you. |
+| `last` | bool | This is the final batch of a logical book event. |
+| `source_ts_ns` | uint64 | Timestamp of the latest applied book event; `0` if unknown. |
+| `recv_ts_ns` | uint64 | When the producer built this batch, ns since epoch. |
+| `kernel_rx_ts_ns` | uint64 | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable. |
+| `ws_send_ts_ns` | uint64 | Wall clock the instant this batch is serialized; shared by all consumers of this message. `0` if unset. |
+
+**Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
+
+**Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative path changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
+
+**`last` is mandatory and must be honored.** A consumer that buffers a logical event until its final batch will wait forever if it is dropped — including on a re-baseline whose only change is the `clear`.
+
+**Gap detection is the producer's job.** The producer runs the upstream feed's snapshot+delta recovery internally, per publisher, and re-serves only sequences it has verified as contiguous. There are no sequence numbers on the wire and a consumer needs no gap machinery of its own: a recovery surfaces as a re-baseline.
+
+**One book per market, whichever upstream publisher wins.** Several independent publishers mirror each feed, and a consumer sees one coherent book from them, never two to merge. How that happens depends on whether the changes carry an `order_id`, but the consumer contract is the same either way and it is never told which publisher it is reading.
+
+- **Price-aggregated.** The producer elects one authoritative publisher per market and republishes only its feed. A failover surfaces as a re-baseline: that market's next batch is a `clear` followed by the complete level set as the newly authoritative publisher holds it, or — when that publisher's own book is not yet complete — the `clear` alone, with the level set rebuilt by the batches that follow.
+- **Order-level.** Every publisher stamps the venue's own `order_id`, so the producer instead publishes each venue event's first arrival and collapses the rest: a consumer gets each event once, from whichever publisher was fastest for *that* event. A change for an order the producer has already published as gone is refused, so a lagging publisher cannot resurrect it. A publisher recovering by snapshot republishes its whole book only when no peer is both healthy and currently serving the market, so a recovery cannot wipe a book another publisher is keeping current — while a publisher that stops reaching the producer cannot block the recovery either.
+
+Either way a consumer that honors `clear` needs nothing else.
+
+**The bootstrap matches the market, always.** An order-level market is replayed as orders and a price-aggregated one as levels, so a consumer never has to reconcile a bootstrap against a feed of different granularity. There is no way to ask for anything else: an order-level change carries one *order's* absolute size, so a client bootstrapped with price levels holds no order state to apply the live feed to.
 
 ### `status`
 
 ```json
-{"type":"status","venue":"Hyperliquid","state":"down","stale_ms":30000,"ts_ns":1781019263715344015}
+{"type":"status","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"state":"down","stale_ms":30000,"ts_ns":1781019263715344015}
 ```
 
 A **venue-level feed-health** transition. The producer emits one when a venue's **quote**
 (market-data) multicast goes silent past the idle watchdog (`state:"down"`), and again when quotes
 recover (`state:"ok"`). It is emitted only on the **edge** (not repeatedly while silent), so a
-consumer can gray out / restore that source. Unlike `quote`/`instrument` it carries **no `symbol`**
+consumer can gray out / restore that upstream source. Unlike `quote`/`instrument` it carries **no `symbol`**
 - it is about the whole venue feed - so the server matches it against a subscription **by venue
 alone** (a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status).
 
 A venue is reported `down` only when **every** publisher mirroring its quote feed has gone silent
 past the idle window; a single wedged publisher does not produce a `status` transition, because the
 remaining publishers still deliver full-state updates for that venue. `status` stays what it has
-always been — the health of the venue's *quote* stream — so a depth-only (Market-by-Order) publisher
+always been — the health of the venue's *quote* feed — so a depth-only (Market-by-Order) publisher
 going silent is not reported here, and a healthy one does not suppress a quote outage.
 
-| Field      | Type   | Meaning                                                         |
-|------------|--------|-----------------------------------------------------------------|
-| `type`     | string | `"status"`.                                                     |
-| `venue`    | string | Venue code whose quote feed changed health.                     |
-| `state`    | string | `"down"` (quote multicast silent) or `"ok"` (quotes recovered). |
-| `stale_ms` | uint64 | Milliseconds the quote feed had been silent (`0` when `"ok"`).  |
-| `ts_ns`    | uint64 | Wall clock (ns since epoch) the status was emitted.             |
+**An upstream source whose receivers have revealed no Source ID may never produce a `status` message at
+all.** The naming this message carries — like every other message's — depends on a Source ID
+observed on the wire (see [*A symbol appears only once its Source ID is
+known*](#a-symbol-appears-only-once-its-source-id-is-known)); an upstream source that never reveals its
+identity this way has no name to emit `status` under, healthy or not. A consumer should not infer
+"up" from the absence of a `status` message for an upstream source it expects to hear from.
+
+For a publisher whose reference data carries no Source ID of its own, revealing requires a decoded
+price, so in practice this is the "no market data decoded" case its name suggests. For a publisher
+whose reference data carries its own Source ID, reference data alone reveals it — `status` can
+still be emitted for an upstream source whose receivers have decoded reference data but never a single
+quote or trade.
+
+| Field       | Type   | Meaning                                                         |
+|-------------|--------|-------------------------------------------------------------------|
+| `type`      | string | `"status"`.                                                     |
+| `venue`     | string | **Deprecated.** Always identical to `source_name`.              |
+| `source_name` | string | The upstream source's registry name whose quote feed changed health. **Preferred.** |
+| `source_id` | number | The wire Source ID, verbatim.                                   |
+| `state`     | string | `"down"` (quote multicast silent) or `"ok"` (quotes recovered). |
+| `stale_ms`  | uint64 | Milliseconds the quote feed had been silent (`0` when `"ok"`).  |
+| `ts_ns`     | uint64 | Wall clock (ns since epoch) the status was emitted.             |
 
 Quote delivery is **not gated** on status - it is advisory health, and because every `quote` is
 full state the feed self-heals on the next quote regardless. A consumer that ignores `status`
 (per the forward-compatibility rule) simply forgoes the gray-out.
 
+### `source_name`, `source_id`, and the deprecated `venue`
+
+Every message carries three fields naming where the data came from:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `source_name` | string | The upstream source's registry name. **Preferred.** |
+| `source_id` | number | The wire Source ID, verbatim. |
+| `venue` | string | **Deprecated.** Always identical to `source_name`. |
+
+**This release renames `source` to `source_name`, and changes what `venue` contains.** The bare
+`source` key is gone — the edge-feed-spec glossary bans it, since `source` always takes a qualifier.
+`source_id` is now the Source ID the publisher stamped on the wire, passed through unmodified, and
+`source_name`/`venue` are both that ID's registry name. Previously the bridge substituted its own
+configured label when it did not recognise an ID. It no longer does: a publisher stamping an
+incorrect Source ID now produces messages named for the upstream source that ID identifies, because the
+Source ID is the contract and a wrong one is a publisher defect to fix at the publisher.
+
+`venue` remains the compatibility alias and carries the identical value, so a consumer reading
+`source` today either reads `venue` (no work) or moves to `source_name`. If you filter or key on
+`venue`, re-check your values against a live feed rather than assuming they are unchanged; new
+consumers should read `source_name`, or `source_id` for a stable numeric identity that needs no
+string matching.
+
+An unregistered Source ID yields a stable synthesized name (`SOURCE_<id>`) rather than being dropped,
+so data always flows and an unrecognised Source ID is visible rather than silent.
+
+**Planned for v2: `venue` names a matching engine, not a venue.** The edge-feed-spec glossary is explicit that a Source ID identifies one matching engine and that a venue may hold several IDs, so the field is misnamed as well as redundant. Retiring it — rather than merely deprecating it, which this release does — is a v2 change, and upstream's own `sources/spec.md` still describes the field the old way.
+
+### A symbol appears only once its Source ID is known
+
+A message is emitted for an instrument only after that instrument's Source ID has been observed —
+but *when* that happens depends on the publisher's reference-data generation.
+
+The original edge feed spec carried a Source ID only on price messages, never on reference data or
+book snapshots. A publisher of that generation still works this way: an instrument that has
+received reference data but no price yet produces **nothing** — no `instrument`, no `quote`, no
+`book`, no `depth` — until a price names it. **Midpoint stays on this generation permanently**: its
+reference-data message is a distinct, narrower definition with no Source ID field, so a `midpoint`
+instrument is always deferred until priced, independent of any other feed's generation.
+
+A newer publisher generation adds a Source ID to reference data itself. For a publisher of that
+generation, an instrument is named the moment its definition is decoded — `instrument` reaches the
+wire with no price required at all, even for a symbol that never trades.
+
+Consequences for a consumer:
+
+- The connect-time replay contains one `instrument` per symbol whose Source ID is known — every
+  symbol a newer-generation publisher defines, but only the priced ones for a publisher (or
+  Midpoint) still on the original generation.
+- For a publisher still on the original generation, a `status` message may never appear for an
+  upstream source whose receivers have decoded no market data at all (see [`status`](#status)); a
+  newer-generation publisher's reference data alone is enough to reveal it.
+- Both generations can be live at once — a host may hold publishers of either kind for different
+  venues, or for different rows of the same venue — so a consumer should not assume the deferral
+  rule observed for one upstream source holds for every one on the feed.
+
+The deferral itself is deliberate, for whichever generation still needs it. The alternative is
+announcing an instrument under a name the bridge guessed, which is what the previous behaviour
+did.
+
 ## Subscriptions & filtering
 
-A consumer may send control messages (JSON text frames) to filter the stream. **Subscriptions
+A consumer may send control messages (JSON text frames) to filter the feed. **Subscriptions
 are optional**: a client that never subscribes receives **all** venues/symbols (firehose). Once
 it has >=1 active subscription, it receives only matching messages.
 
-A subscription filter is `{ "venue"?: string, "symbol"?: string }` - an **omitted field matches
-any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue). `venue` is matched
-**case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol` is matched exactly.
+A subscription filter is `{ "source_name"?: string, "venue"?: string, "symbol"?: string, "channel"?: uint8, "type"?: string }` - an **omitted field matches any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue, `{"type":"book"}` = price-aggregated book updates only, `{"type":"order_book"}` = order-level ones). `venue`/`source_name` are matched **case-insensitively** (`PHOENIX` selects `Phoenix`); `symbol`, `channel` and `type` are matched exactly.
+
+`source_name` and `venue` are aliases and are matched case-insensitively. The pre-rename `source` key
+is still accepted as a third spelling. All three are **ANDed**, so supplying any two that disagree
+matches nothing; supply one. Sending the same value under two spellings is fine — it is the natural
+way to straddle the rename, and no combination is a protocol error. (`source` is still accepted
+because an unknown filter key is *ignored*: dropping it would have widened a client that narrowed on
+`source` alone to the firehose rather than telling it anything.)
+
+`venue`, `symbol` and `channel` are **scope** dimensions - which markets - and `type` is a **kind** dimension: which messages. The two behave differently on purpose.
+
+A scope dimension never excludes a message that is not about one market. A message type that carries no channel (everything except `book` and `instrument`) is excluded by an explicit `channel` filter, so `{"channel":2}` selects channel 2's book updates and channel 2's instrument definitions - enough to scale those books - and nothing else. The one carve-out is a venue-level message (`status`), which carries neither symbol nor channel and is matched on `venue` and `type` alone, so a `{"venue":"Hyperliquid","symbol":"SOL"}` subscriber still receives Hyperliquid status.
+
+A `type` filter is **absolute**: it delivers that message type and nothing else, including no `instrument` and no `status`. Filters are a union, so a consumer that wants books plus reference data and health subscribes to each - `{"type":"book"}`, `{"type":"order_book"}`, `{"type":"instrument"}`, `{"type":"status"}` - or omits `type` and scopes by `venue`/`symbol`/`channel` instead. A client that sets `type` and never asks for `instrument` gets the connect-time replay of the definitions that exist then, and no later ones; that is the filter it asked for.
+
+`symbol` cannot select a single `book` market where a venue's tickers collide under truncation (see *Identity* under [`book`](#book)); such a subscription delivers every colliding market's book. Filtering `book` down to one market is not expressible in v1.
 
 **Client -> server:**
 
@@ -274,8 +452,11 @@ any value** (so `{}` = everything, `{"symbol":"SOL"}` = SOL on every venue). `ve
 ```
 
 Unknown/malformed control messages get `{"channel":"error","error":"unrecognized message"}` and
-are otherwise ignored. Instrument definitions are always replayed on connect regardless of
-subscriptions.
+are otherwise ignored.
+
+Instrument definitions and current book state are replayed on connect (unfiltered, since a client has no subscriptions yet) and again on each `subscribe`, scoped to the filter just added — so a client that narrows after connecting is bootstrapped for its new scope instead of waiting for the next event. Replay is idempotent full state, so the overlap is harmless.
+
+**The granularity of that replay is the market's, not the subscription's.** An order-level market is bootstrapped as every resting order with its `order_id`, under `order_book`; a price-aggregated one as price levels carrying `order_id: 0`, under `book` — see [*The bootstrap matches the market*](#book). The bootstrap therefore carries the same `type` as the feed it precedes, so a `{"type":"book"}` subscriber is never bootstrapped with a market it could not then apply.
 
 ## Heartbeat & liveness
 
@@ -319,6 +500,15 @@ on connect:
       "depth":                                       # full snapshot each message (self-healing)
         inst = instrument(msg.venue, msg.symbol)
         replace_book(inst, msg.bids, msg.asks)       # overwrite, don't merge
+      "book" | "order_book":                         # incremental; apply in order
+        # One handler covers both: the envelope is identical and the type says how to key.
+        # "book" -> key by c.price. "order_book" -> key by c.order_id (several orders may rest
+        # at one price, so keying an order_book change by price collapses them). A consumer that
+        # only implements "book" simply omits the second label and ignores those messages.
+        book = book_for(msg.venue, msg.channel, msg.instrument_id)
+        for c in msg.changes:                        # "clear" re-baselines, not msg.snapshot
+          apply(book, c.action, c.side, c.price, c.size, c.order_id)
+        if msg.last: publish(book)                   # honor `last` or you wedge
       _: ignore        # unknown type
     # ignore unknown fields throughout
   reply Pong to Ping; reconnect on close.
@@ -341,13 +531,29 @@ on connect:
 
 ## Versioning & compatibility
 
-- This document defines **v1**, which includes: the `instrument`/`quote`/`trade`/`midpoint`/`depth`
-  data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
+- This document defines **v1**, which includes: the `instrument`/`quote`/`trade`/`midpoint`/`depth`/
+  `book`/`order_book` data messages, the venue-level `status` feed-health message, optional **subscribe/unsubscribe**
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
+- **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; the incremental pair supersedes it with the complete book — `book` on a Market-by-Price feed, [`order_book`](#book) on a Market-by-Order one. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement whichever of the two their markets are served under.
+- **Additive in this revision, so still v1:** the [`order_book`](#book) message type, carrying the Market-by-Order feed's order-level book, and `order_id` on a book change. An existing consumer subscribed to `book` is served exactly the price-aggregated markets it was served before; `order_book` is a type it does not know and ignores. Deliberately a **new type** rather than a new field on `book` — see [*They are separate types*](#book) for why a field would have corrupted such a consumer instead.
+- **Breaking within v1: `source` is now `source_name`**, both on every message and as a subscription
+  filter key. The forward-compatibility rule below covers the *arrival* of `source_name`, not the
+  *departure* of `source`; `venue` still carries the identical value, so the migration is to read
+  `venue` or to read `source_name`.
+- **Breaking within v1: what `venue` contains changed**, and emission is now gated on a Source ID
+  having been observed on the wire. Both are additive to the *shape* of the protocol (new fields,
+  no removed ones) but change *values* an existing consumer may depend on — see [`source_name`,
+  `source_id`, and the deprecated `venue`](#source_name-source_id-and-the-deprecated-venue) and [*A
+  symbol appears only once its Source ID is
+  known*](#a-symbol-appears-only-once-its-source-id-is-known). The forward-compatibility rule below
+  covers unknown fields/types, not this.
 - There is no `v` field on the wire; the contract is this spec plus the
   **forward-compatibility rule**: consumers ignore unknown message types and unknown fields,
   so additive changes are non-breaking. A future revision may add an explicit `v` field.
+- **`trade` gained `channel`/`instrument_id`.** Purely additive - existing fields are unchanged and
+  a consumer ignoring unknown fields is unaffected - carrying the same identity `instrument`/`book`
+  already do, so a trade can be joined to its market on the identity rather than `symbol` alone.
 
 ### Not in v1 (candidate extensions)
 

@@ -1,19 +1,19 @@
-//! Hyperliquid **public** WebSocket input feeder — the first [`PublicVenue`] backstop, off by
+//! Hyperliquid **public** WebSocket input — the first [`PublicVenue`] backstop, off by
 //! default.
 //!
 //! It connects to Hyperliquid's own `wss://api.hyperliquid.xyz/ws`, subscribes `bbo` + `trades` per
 //! configured coin, decodes the JSON into the same `FeedMessage`s the multicast pipeline produces,
-//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Publisher::PublicWs`]. The
-//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_feeder`];
+//! and emits them through the **shared [`crate::ingest::arbiter`]** as [`Transport::PublicWs`]. The
+//! reconnect/backoff transport and the validation helpers live in [`crate::ingest::public_input`];
 //! this module owns only the Hyperliquid wire decode.
 //!
 //! **Precision before price.** Each public quote/trade is gated on its `(venue, symbol)` instrument
-//! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata stream).
+//! already being present in the shared [`InstrumentSnapshot`] (populated by the edge refdata feed).
 //! The realistic backstop scenario is edge refdata healthy while mktdata stalls; a standalone public
 //! feed with no edge refdata ever is a documented limitation (it would emit nothing).
 //!
 //! ⚠️ Decimal-string px/sz are parsed straight to real-unit `f64`s — the same unit space the edge
-//! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-source
+//! side produces via `apply_exponent` — so no canonical-exponent rescale is needed. Cross-transport
 //! dedup is decided by publisher leadership per tick, never by content equality (see the arbiter).
 
 use serde::Deserialize;
@@ -21,21 +21,44 @@ use tracing::warn;
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
-        public_feeder::{self, instrument_known, parse_decimal, PublicVenue},
+        arbiter::{lock, SharedArbiter, Transport},
+        public_input::{self, instrument_known, parse_decimal, resolve_instrument, PublicVenue},
     },
     metrics::metrics,
     model::{
-        now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote, NormalizedTrade, Side,
+        category_arc, now_ns, venue_arc, FeedMessage, InstrumentSnapshot, NormalizedQuote,
+        NormalizedTrade, Side,
     },
 };
 
 /// Hyperliquid's public WebSocket endpoint.
 pub const DEFAULT_WS_INPUT_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
-/// The venue every public message is tagged with (must match the edge HL feed's venue so both land
-/// in the same arbiter floor).
-const HL_VENUE: &str = "Hyperliquid";
+/// This backstop's registry Source ID (`ingest::sources`). The label is derived from it rather than
+/// written out as a separate constant, so the edge path (which names a market from the wire Source
+/// ID, see `processor.rs`) and this backstop cannot drift into naming one market two different
+/// things — a split that would fork the arbiter's `(venue, symbol)` dedup floor and emit both
+/// copies to the wire as duplicates under two names.
+const HL_SOURCE_ID: u16 = 1;
+
+/// The venue every public message is tagged with — always [`HL_SOURCE_ID`]'s registry name, so it
+/// matches whatever the edge HL feed names the same market and both land in the same arbiter floor.
+fn hl_venue() -> &'static str {
+    crate::ingest::sources::source_label(HL_SOURCE_ID)
+}
+
+/// The instrument **universe** this backstop mirrors, in the same vocabulary as `Feed::category`,
+/// handed to the arbiter on every emit.
+///
+/// **Inert on this venue today**, and the comment should not pretend otherwise: `category` is read
+/// only by the `Sticky` tape gate, and this backstop serves a `Coordinated` venue, where the value
+/// is passed and ignored. It becomes load-bearing the day this venue is declared `Sticky` — the gate
+/// keys on `(venue, category)`, so a value disagreeing with the mirrored row's would make this
+/// backstop its own universe rather than another path of the same one, and the gate would stop
+/// collapsing the two copies of one fill. What survives that is whatever the `trade_id` window
+/// cannot collapse on its own, i.e. a public copy stamped with a different id than the edge copy;
+/// those would reach the wire twice. `category_names_the_row_this_backstop_mirrors` pins the value.
+const HL_CATEGORY: &str = "perps";
 
 /// Hyperliquid documents a cap of 1000 subscriptions per WebSocket connection. We fan out two
 /// subscriptions (`bbo` + `trades`) per coin over a single connection and log if the configured coin
@@ -71,7 +94,7 @@ struct Level {
 }
 
 /// A `trades` payload element. `tid` is Hyperliquid's trade id — the same value the edge feed carries
-/// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-source copies on it.
+/// as `trade_id`, so the arbiter's windowed trade dedup collapses cross-transport copies on it.
 #[derive(Deserialize)]
 struct TradeData {
     coin: String,
@@ -91,7 +114,7 @@ struct HyperliquidVenue {
 
 impl PublicVenue for HyperliquidVenue {
     fn venue(&self) -> &str {
-        HL_VENUE
+        hl_venue()
     }
 
     fn url(&self) -> &str {
@@ -115,9 +138,9 @@ impl PublicVenue for HyperliquidVenue {
     }
 }
 
-/// Run the Hyperliquid public WS input feeder forever (reconnecting on any failure). Returns
-/// immediately as a no-op when `coins` is empty (the feeder is off by default). Thin wrapper over the
-/// venue-generic [`public_feeder::run`].
+/// Run the Hyperliquid public WS input forever (reconnecting on any failure). Returns
+/// immediately as a no-op when `coins` is empty (the input is off by default). Thin wrapper over the
+/// venue-generic [`public_input::run`].
 pub async fn run(
     url: String,
     coins: Vec<String>,
@@ -134,7 +157,7 @@ pub async fn run(
              some subscriptions may be rejected"
         );
     }
-    public_feeder::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
+    public_input::run(HyperliquidVenue { url, coins }, arbiter, instruments).await
 }
 
 /// Decode one text frame and emit any resulting quote/trade. Unknown channels (e.g.
@@ -144,8 +167,8 @@ fn handle_text(txt: &str, arbiter: &SharedArbiter, instruments: &InstrumentSnaps
         Ok(e) => e,
         Err(e) => {
             metrics()
-                .ws_feeder_decode_errors
-                .with_label_values(&[HL_VENUE])
+                .ws_input_decode_errors
+                .with_label_values(&[hl_venue()])
                 .inc();
             tracing::debug!(error = %e, "public WS: undecodable frame ignored");
             return;
@@ -195,7 +218,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     let (Some(bid), Some(ask)) = (&d.bbo[0], &d.bbo[1]) else {
         return; // one-sided book; cannot form a two-sided quote
     };
-    if !instrument_known(instruments, HL_VENUE, &d.coin) {
+    if !instrument_known(instruments, hl_venue(), &d.coin) {
         return; // precision unknown; drop until the edge refdata defines this instrument
     }
     let (Some((bid_px, bid_sz, bid_n)), Some((ask_px, ask_sz, ask_n))) =
@@ -209,7 +232,9 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         return;
     };
     let quote = NormalizedQuote {
-        venue: venue_arc(HL_VENUE),
+        venue: venue_arc(hl_venue()),
+        source_name: venue_arc(hl_venue()),
+        source_id: HL_SOURCE_ID,
         symbol: d.coin.into(),
         bid: bid_px,
         ask: ask_px,
@@ -223,17 +248,20 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
         ws_send_ts_ns: 0,   // stamped by the WS server just before send
     };
     metrics()
-        .ws_feeder_messages
-        .with_label_values(&[HL_VENUE, "quote"])
+        .ws_input_messages
+        .with_label_values(&[hl_venue(), "quote"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Quote(quote), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Quote(quote), Transport::PublicWs, HL_CATEGORY);
 }
 
 /// Build a `NormalizedTrade` from a public `trades` element and emit it through the arbiter.
 fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
-    if !instrument_known(instruments, HL_VENUE, &t.coin) {
+    // Resolves precision AND the (channel, instrument_id) identity in one scan — see
+    // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
+    let Some((channel, instrument_id)) = resolve_instrument(instruments, hl_venue(), &t.coin)
+    else {
         return;
-    }
+    };
     let (Some(price), Some(size)) = (parse_decimal(&t.px), parse_decimal(&t.sz)) else {
         return;
     };
@@ -241,8 +269,13 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         return;
     };
     let trade = NormalizedTrade {
-        venue: venue_arc(HL_VENUE),
+        venue: venue_arc(hl_venue()),
+        source_name: venue_arc(hl_venue()),
+        source_id: HL_SOURCE_ID,
         symbol: t.coin.into(),
+        channel,
+        instrument_id,
+        category: category_arc(HL_CATEGORY),
         price,
         size,
         // HL trade side: "B" = aggressing buy, "A" = aggressing sell.
@@ -259,10 +292,10 @@ fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSna
         ws_send_ts_ns: 0,
     };
     metrics()
-        .ws_feeder_messages
-        .with_label_values(&[HL_VENUE, "trade"])
+        .ws_input_messages
+        .with_label_values(&[hl_venue(), "trade"])
         .inc();
-    lock(arbiter).emit(FeedMessage::Trade(trade), Publisher::PublicWs);
+    lock(arbiter).emit(FeedMessage::Trade(trade), Transport::PublicWs, HL_CATEGORY);
 }
 
 #[cfg(test)]
@@ -275,15 +308,42 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+
+    /// [`HL_CATEGORY`] must name the universe of the row this backstop actually mirrors — the
+    /// venue's top-of-book row, the row that carries both the quotes and the prints it emits.
+    ///
+    /// Deliberately **not** "every row under this venue agrees": one venue carrying two disjoint
+    /// universes is the case `Feed::category` exists to express, so that assertion would fail a
+    /// legitimate registry change and leave deleting the test as the only fix. This one still fails
+    /// if the constant drifts, because then no row matches it.
+    #[test]
+    fn category_names_the_row_this_backstop_mirrors() {
+        let mirrored = crate::ingest::feeds::feeds().iter().find(|f| {
+            f.venue == hl_venue()
+                && f.category == HL_CATEGORY
+                && f.kind == crate::ingest::feeds::FeedKind::TopOfBook
+        });
+        assert!(
+            mirrored.is_some(),
+            "no {} top-of-book row carries category {HL_CATEGORY:?}: this backstop claims to \
+             mirror a universe the registry does not publish",
+            hl_venue()
+        );
+    }
     use crate::{ingest::arbiter::Arbiter, model::NormalizedInstrument};
 
     fn instruments_with(symbol: &str) -> InstrumentSnapshot {
         let map = Arc::new(Mutex::new(HashMap::new()));
         map.lock().unwrap().insert(
-            (HL_VENUE.into(), symbol.into()),
+            (hl_venue().into(), HL_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
-                venue: HL_VENUE.into(),
+                venue: hl_venue().into(),
+                source_name: hl_venue().into(),
+                source_id: 0,
                 symbol: symbol.into(),
+                channel: 0,
+                instrument_id: 1,
+                category: HL_CATEGORY.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
             },
@@ -309,7 +369,7 @@ mod tests {
         handle_text(frame, &arbiter, &instruments);
         match &*rx.try_recv().expect("a quote was emitted") {
             FeedMessage::Quote(q) => {
-                assert_eq!(q.venue, "Hyperliquid".into());
+                assert_eq!(q.venue, "HYPERLIQUID".into());
                 assert_eq!(q.symbol, "BTC".into());
                 assert_eq!(q.bid, 104783.0);
                 assert_eq!(q.ask, 104784.0);
@@ -317,6 +377,9 @@ mod tests {
                 assert_eq!(q.ask_size, 2.0);
                 // ms × 1e6 == ns, matching the edge's canonical source_ts.
                 assert_eq!(q.source_ts_ns, 1700000000000 * 1_000_000);
+                // The registry Source ID, not the `0` "unknown" sentinel: a consumer joining this
+                // backstop to the edge copy on `source_id` must see the same id both sides.
+                assert_eq!(q.source_id, HL_SOURCE_ID);
             }
             other => panic!("expected a quote, got {other:?}"),
         }
@@ -404,6 +467,12 @@ mod tests {
                 assert_eq!(t.size, 0.3);
                 assert_eq!(t.aggressor_side, crate::model::Side::Buy);
                 assert_eq!(t.trade_id, 42);
+                assert_eq!(t.source_id, HL_SOURCE_ID);
+                // Resolved from the edge catalog (`instruments_with`'s (channel=0, instrument_id=1)
+                // entry), not left at the zero default — this is the identity `history::Key` groups
+                // trades on downstream.
+                assert_eq!(t.channel, 0);
+                assert_eq!(t.instrument_id, 1);
             }
             other => panic!("expected a trade, got {other:?}"),
         }
@@ -442,5 +511,24 @@ mod tests {
         assert!(subs
             .iter()
             .any(|s| s.contains(r#""type":"trades""#) && s.contains(r#""coin":"ETH""#)));
+    }
+
+    /// The backstop must name itself the way the edge does, or one market becomes two keys in the
+    /// arbiter's `(venue, symbol)` dedup floor and both copies reach the wire.
+    #[test]
+    fn a_public_input_labels_itself_from_the_registry() {
+        let hl = HyperliquidVenue {
+            url: DEFAULT_WS_INPUT_URL.to_string(),
+            coins: vec!["BTC".to_string()],
+        };
+        assert_eq!(
+            hl.venue(),
+            crate::ingest::sources::source_label(HL_SOURCE_ID)
+        );
+        assert_eq!(
+            hl.venue(),
+            "HYPERLIQUID",
+            "must match what the edge emits for this id"
+        );
     }
 }

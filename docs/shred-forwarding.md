@@ -13,7 +13,7 @@ and never drops a datagram bound for a healthy one. `--shred-forward` targets sh
 local/fast sinks: sends are sequential per destination, so a slow or remote sink throttles the
 whole forwarder (and sheds load); the send sockets pin no egress interface.
 
-It **activates on subscription**: source resolution is driven by the shared subscription reconciler
+It **activates on subscription**: source-group resolution is driven by the shared subscription reconciler
 (`ingest::reconcile`, see the main README/CLAUDE.md), which reads the groups **this host is
 subscribed to** from `doublezero status` every `--subscription-refresh-secs` and picks the
 subscribed groups whose `code` starts with `--shred-code-prefix` (default `edge-solana-`), resolving
@@ -58,7 +58,7 @@ memory is bounded by `window × shreds-per-slot`.
 > validated against a live `edge-solana-*` hexdump (the same caveat as the repo's unvalidated
 > Midpoint/MBO codecs). This affects **both** dedup modes: a misparse mis-keys a shred and could
 > over- or under-deduplicate (and, in sigverify mode, mis-verify). Confirm the offsets against a
-> captured frame before relying on either in production; the forwarder logs a one-time warning
+> captured datagram before relying on either in production; the forwarder logs a one-time warning
 > when sigverify is on and a periodic tally so a systematic misparse (≈100% "invalid") is obvious.
 
 ## Flags
@@ -104,7 +104,7 @@ forwarder backpressure the **newest** datagram is shed (with a periodic drop-cou
 than blocking ingest. Discovery binds every matched group; a group this host isn't actually
 receiving on simply stays idle and periodically rejoins (harmless).
 
-Source resolution is **refreshed periodically** (every `--subscription-refresh-secs`): the bridge
+Source-group resolution is **refreshed periodically** (every `--subscription-refresh-secs`): the bridge
 starts before `doublezero connect multicast` runs, so subscriptions aren't present at boot — the
 reconciler picks them up on a later tick, and likewise reacts to a group subscribed/unsubscribed at
 runtime by restarting the forwarder with the new source set. Once a group is running, its receiver

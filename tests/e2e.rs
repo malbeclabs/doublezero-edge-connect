@@ -5,26 +5,26 @@ use serial_test::serial;
 use std::time::Duration;
 
 #[test]
-fn tob_golden_splits_into_valid_frames() {
+fn tob_golden_splits_into_valid_datagrams() {
     let bytes =
         std::fs::read("tests/fixtures/tob_marketdata.bin").expect("read tob_marketdata.bin");
-    let frames = replay::split_frames(&bytes, replay::TOB_MAGIC);
-    assert!(!frames.is_empty(), "expected at least one TOB frame");
-    for f in &frames {
+    let datagrams = replay::split_datagrams(&bytes, replay::TOB_MAGIC);
+    assert!(!datagrams.is_empty(), "expected at least one TOB datagram");
+    for f in &datagrams {
         assert!(f.len() >= 24);
         assert_eq!(u16::from_le_bytes([f[0], f[1]]), replay::TOB_MAGIC);
     }
 }
 
 #[test]
-fn tob_refdata_golden_splits_into_valid_frames() {
+fn tob_refdata_golden_splits_into_valid_datagrams() {
     let bytes = std::fs::read("tests/fixtures/tob_refdata.bin").expect("read tob_refdata.bin");
-    let frames = replay::split_frames(&bytes, replay::TOB_MAGIC);
+    let datagrams = replay::split_datagrams(&bytes, replay::TOB_MAGIC);
     assert!(
-        !frames.is_empty(),
-        "expected at least one TOB refdata frame"
+        !datagrams.is_empty(),
+        "expected at least one TOB refdata datagram"
     );
-    for f in &frames {
+    for f in &datagrams {
         assert!(f.len() >= 24);
         assert_eq!(u16::from_le_bytes([f[0], f[1]]), replay::TOB_MAGIC);
     }
@@ -33,14 +33,14 @@ fn tob_refdata_golden_splits_into_valid_frames() {
 #[test]
 #[serial]
 fn bridge_starts_and_serves_ws() {
-    let bridge = Bridge::spawn("Hyperliquid", 18090);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18090);
     assert!(std::net::TcpStream::connect(&bridge.ws_addr).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn ws_client_connects_and_times_out_clean() {
-    let bridge = Bridge::spawn("Hyperliquid", 18091);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18091);
     // No data replayed: we just prove the client connects and the timeout path returns.
     let msgs = ws_client::collect(&bridge.ws_addr, Duration::from_millis(500), |_| false).await;
     // Connection succeeded; with no input there are no quotes.
@@ -50,7 +50,7 @@ async fn ws_client_connects_and_times_out_clean() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn spike_loopback_multicast_produces_a_quote() {
-    let bridge = Bridge::spawn("Hyperliquid", 18081);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18081);
     let ws_addr = bridge.ws_addr.clone();
 
     // Connect first so we don't miss streamed quotes (quotes are not replayed on connect).
@@ -63,11 +63,11 @@ async fn spike_loopback_multicast_produces_a_quote() {
     // Let the collector connect before replay begins.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
@@ -75,9 +75,9 @@ async fn spike_loopback_multicast_produces_a_quote() {
     // Fixture is in real wire order (manifest before def), so a single refdata pass retains the
     // def and the quote precision gate resolves immediately.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
     })
     .await
     .unwrap();
@@ -87,7 +87,7 @@ async fn spike_loopback_multicast_produces_a_quote() {
     assert!(!quotes.is_empty(), "expected at least one quote on the WS");
     assert_eq!(
         quotes[0].get("venue").and_then(|v| v.as_str()),
-        Some("Hyperliquid")
+        Some("HYPERLIQUID")
     );
 }
 
@@ -96,7 +96,7 @@ async fn spike_loopback_multicast_produces_a_quote() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn tob_single_publisher_contract() {
-    let bridge = Bridge::spawn("Hyperliquid", 18082);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18082);
     let ws_addr = bridge.ws_addr.clone();
 
     // Collect for a fixed window after replay completes (we do not know the exact count
@@ -107,18 +107,18 @@ async fn tob_single_publisher_contract() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
     })
     .await
     .unwrap();
@@ -151,11 +151,11 @@ async fn tob_single_publisher_contract() {
 }
 
 #[test]
-fn mbo_goldens_split_into_valid_frames() {
+fn mbo_goldens_split_into_valid_datagrams() {
     for name in ["mbo_mktdata.bin", "mbo_refdata.bin", "mbo_snapshot.bin"] {
         let bytes = std::fs::read(format!("tests/fixtures/{name}")).unwrap();
-        let frames = replay::split_frames(&bytes, replay::MBO_MAGIC);
-        assert!(!frames.is_empty(), "{name}: no frames");
+        let datagrams = replay::split_datagrams(&bytes, replay::MBO_MAGIC);
+        assert!(!datagrams.is_empty(), "{name}: no datagrams");
     }
 }
 
@@ -169,7 +169,7 @@ fn mbo_goldens_split_into_valid_frames() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mbo_single_publisher_depth_contract() {
-    let bridge = Bridge::spawn("Hyperliquid", 18083);
+    let bridge = Bridge::spawn("HYPERLIQUID", 18083);
     let ws_addr = bridge.ws_addr.clone();
 
     let collector = tokio::spawn(async move {
@@ -177,15 +177,15 @@ async fn mbo_single_publisher_depth_contract() {
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/mbo_refdata.bin").unwrap(),
         replay::MBO_MAGIC,
     );
-    let snapshot = replay::split_frames(
+    let snapshot = replay::split_datagrams(
         &std::fs::read("tests/fixtures/mbo_snapshot.bin").unwrap(),
         replay::MBO_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/mbo_mktdata.bin").unwrap(),
         replay::MBO_MAGIC,
     );
@@ -193,11 +193,11 @@ async fn mbo_single_publisher_depth_contract() {
     // Refdata first (definitions), then snapshot (anchor the book at empty), then mktdata
     // (deltas). The book reaches `Synced` on SnapshotEnd, after which live deltas apply directly.
     tokio::task::spawn_blocking(move || {
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 10202, &refdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 10202, &refdata).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 10203, &snapshot).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 10203, &snapshot).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        replay::send_frames(replay::HYPERLIQUID_GROUP, 10201, &mktdata).unwrap();
+        replay::send_datagrams(replay::HYPERLIQUID_GROUP, 10201, &mktdata).unwrap();
     })
     .await
     .unwrap();
@@ -270,37 +270,37 @@ async fn mbo_single_publisher_depth_contract() {
 /// series. Before multi-publisher support the bridge bound only one block and the other
 /// publisher's datagrams were never received at all.
 ///
-/// Both senders share one source IP (see `tests/common/replay.rs` TODO(#3)), so the arbiter
+/// Both senders share one source IP address (see `tests/common/replay.rs` TODO(#3)), so the arbiter
 /// correctly collapses their identical content on the wire — deliberately NOT asserted here. This
-/// test is about ingest reach; per-source-IP dedup is covered by `tests/dedup.rs`.
+/// test is about ingest reach; per-publisher dedup is covered by `tests/dedup.rs`.
 #[test]
 #[serial]
 fn two_publisher_port_blocks_are_both_ingested() {
     let metrics_bind = "127.0.0.1:19231".to_string();
-    let _bridge = Bridge::spawn_with_args("Hyperliquid", 18231, &["--metrics-bind", &metrics_bind]);
+    let _bridge = Bridge::spawn_with_args("HYPERLIQUID", 18231, &["--metrics-bind", &metrics_bind]);
 
-    let refdata = replay::split_frames(
+    let refdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_refdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
-    let mktdata = replay::split_frames(
+    let mktdata = replay::split_datagrams(
         &std::fs::read("tests/fixtures/tob_marketdata.bin").unwrap(),
         replay::TOB_MAGIC,
     );
     // `Bridge::spawn` returns on the FIRST receiver-bound marker, but `--feed Hyperliquid` now
     // binds 22 receivers over 55 sockets, so a one-shot send can land before these two have joined
     // — an un-joined group silently discards the datagram. Re-send each round until both publishers
-    // register traffic (idempotent: the assertion is `> 0`, and duplicate frames are deduped).
+    // register traffic (idempotent: the assertion is `> 0`, and duplicate datagrams are deduped).
     let body = scrape_until(
         &metrics_bind,
         Duration::from_secs(20),
         |b| publisher_datagrams(b, 9101) > 0 && publisher_datagrams(b, 9201) > 0,
         || {
             // Refdata before mktdata on each block (definitions gate emission), 9101's first.
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
-            replay::send_frames(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9102, &refdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9101, &mktdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9202, &refdata).unwrap();
+            replay::send_datagrams(replay::HYPERLIQUID_GROUP, 9201, &mktdata).unwrap();
         },
     );
     assert!(

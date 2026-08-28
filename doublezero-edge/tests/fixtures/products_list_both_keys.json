@@ -1,0 +1,43 @@
+{
+  "products": [
+    {
+      "product_id": "HYPERLIQUID:BTC",
+      "source_id": 1,
+      "source_name": "Hyperliquid",
+      "symbol": "BTC",
+      "channel": 0,
+      "instrument_id": 41,
+      "price_increment": "0.01",
+      "base_increment": "0.00001",
+      "status": "online",
+      "feed_kind": "top_of_book",
+      "source": "Hyperliquid"
+    },
+    {
+      "product_id": "HYPERLIQUID:ETH",
+      "source_id": 1,
+      "source_name": "Hyperliquid",
+      "symbol": "ETH",
+      "channel": 0,
+      "instrument_id": 42,
+      "price_increment": "0.001",
+      "base_increment": "0.0001",
+      "status": "offline",
+      "feed_kind": "top_of_book",
+      "source": "Hyperliquid"
+    },
+    {
+      "product_id": "KALSHI:EAVE-27JAN01-YES#120.1165",
+      "source_id": 3,
+      "source_name": "Kalshi",
+      "symbol": "EAVE-27JAN01-YES",
+      "channel": 120,
+      "instrument_id": 1165,
+      "price_increment": "0.01",
+      "base_increment": "1",
+      "status": "online",
+      "feed_kind": "market_by_price",
+      "source": "Kalshi"
+    }
+  ]
+}

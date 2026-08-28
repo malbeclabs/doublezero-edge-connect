@@ -1,0 +1,5 @@
+{
+  "error": "product_not_found",
+  "message": "No product \"HYPERLIQUID:BTCC\".",
+  "remediation": "Run `doublezero-edge products list` to see available products."
+}

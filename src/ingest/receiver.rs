@@ -1,10 +1,10 @@
-//! DoubleZero Edge multicast receiver: bind the group's port(s), decode frames, and broadcast
+//! DoubleZero Edge multicast receiver: bind the group's port(s), decode datagrams, and broadcast
 //! normalized `FeedMessage`s.
 //!
 //! The socket plumbing here is **protocol-agnostic** and shared by every edge-feed-spec feed:
 //! interface resolution, the multicast join, kernel RX timestamps, the idle-rejoin watchdog and
-//! the venue feed-health status. The per-protocol work (which frame magic, which messages, what
-//! to emit) lives behind the [`FrameProcessor`] trait, so [`drive`] runs the same receive loop
+//! the venue feed-health status. The per-protocol work (which datagram magic, which messages, what
+//! to emit) lives behind the [`DatagramProcessor`] trait, so [`drive`] runs the same receive loop
 //! over 1, 2 or 3 ports for Top-of-Book, Midpoint or Market-by-Order alike.
 //!
 //! Socket setup follows the DoubleZero edge-multicast-ref `kernel-receiver` reference:
@@ -12,9 +12,11 @@
 //! set `SO_REUSEADDR`/`SO_REUSEPORT`, and a large `SO_RCVBUF`.
 
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     os::fd::AsRawFd,
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -54,10 +56,12 @@ const IFACE_POLL: Duration = Duration::from_millis(500);
 
 use crate::{
     ingest::{
-        arbiter::{lock, Publisher, SharedArbiter},
-        feeds::{Feed, FeedKind, FeedPorts, FeedPublisher},
+        arbiter::{lock, SharedArbiter, Transport},
+        feeds::{feeds, Feed, FeedKind, FeedPorts, FeedPublisher},
         health::{FeedHealth, ReceiverKey, SharedFeedHealth},
-        processor::{MboProcessor, MidpointProcessor, TobProcessor},
+        processor::{MboProcessor, MbpProcessor, MidpointProcessor, TobProcessor, MAX_PUBLISHERS},
+        reconcile::TapeOwner,
+        sources,
     },
     metrics::metrics,
     model::{now_ns, DepthSnapshot, FeedMessage, FeedStatus, InstrumentSnapshot},
@@ -67,7 +71,7 @@ use crate::{
 /// (`crate::shred`) can reuse [`bind_multicast`] without re-deriving the socket plumbing.
 pub type TsSocket = AsyncFd<std::net::UdpSocket>;
 
-/// The role a feed's port plays. The market-data stream is what the liveness watchdog tracks
+/// The role a feed's port plays. The market-data feed is what the liveness watchdog tracks
 /// (reference/snapshot ports keep ticking even when market data is wedged); a processor uses the
 /// role to decide which message families to act on for a given datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +80,7 @@ pub enum PortRole {
     Mktdata,
     /// Reference data: instrument definitions + manifest.
     Refdata,
-    /// Market-by-Order snapshot recovery stream. (Constructed once the MBO receiver lands.)
-    #[allow(dead_code)]
+    /// The in-band snapshot recovery feed of a book protocol (Market-by-Order/-Price).
     Snapshot,
     /// A single port carrying everything (loopback demo): both market and reference data.
     Combined,
@@ -103,14 +106,20 @@ impl PortRole {
     }
 }
 
-/// Per-datagram context handed to a [`FrameProcessor`]: the shared sinks plus the receive
+/// Per-datagram context handed to a [`DatagramProcessor`]: the shared sinks plus the receive
 /// timestamps and which port role the datagram arrived on. Borrowed for the duration of one
 /// `on_datagram` call so the processor only needs to hold its own protocol state.
-pub struct FrameCtx<'a> {
+pub struct DatagramCtx<'a> {
     /// `&'static` so the dedup key `(venue, instrument_id)` is allocation-free on the hot path; the
     /// venue ultimately comes from the `&'static` `FEEDS` registry.
     pub venue: &'static str,
-    /// The shared pre-broadcast arbiter every ingest source emits through (dedup + fan-out).
+    /// The instrument **universe** this receiver's row carries (`Feed::category`), passed straight
+    /// through to the arbiter on every emit. Carried here rather than derived from the message
+    /// because it is a property of the row, and rows sharing a venue can carry universes that
+    /// mirror nothing: without it the arbiter's tape gate elects one path across both and drops the
+    /// other universe's prints for good.
+    pub category: &'static str,
+    /// The shared pre-broadcast arbiter every ingest input emits through (dedup + fan-out).
     pub arbiter: &'a SharedArbiter,
     pub instruments: &'a InstrumentSnapshot,
     /// Kernel `SCM_TIMESTAMPNS` RX timestamp (CLOCK_REALTIME), or 0 if unavailable.
@@ -119,28 +128,148 @@ pub struct FrameCtx<'a> {
     pub recv_ts_ns: u64,
     /// Which port this datagram arrived on.
     pub role: PortRole,
-    /// Source IP of the datagram — the publisher identity. Independent publishers mirror one feed
+    /// Source IP address of the datagram — the publisher identity. Independent publishers mirror one feed
     /// onto the same group (sharing `channel_id`), so per-publisher state (sequence tracking, MBO
     /// books) keys on this rather than the port.
     pub publisher: IpAddr,
+    /// This row's [`Feed::mirror_offset`], carried per datagram so a processor can canonicalize a
+    /// wire channel id for consumer-facing identity without reaching back into the registry.
+    /// `None` for every row with no declared mirror.
+    pub mirror_offset: Option<u8>,
 }
 
-impl FrameCtx<'_> {
+impl DatagramCtx<'_> {
+    /// Canonicalize a wire channel id for **consumer-facing identity** — the catalog, history, the
+    /// book authority's `MarketKey`, and the emitted `channel` field itself. A mirror publisher
+    /// (`mirror_offset` set) stamps the same market's datagrams at `N + offset`; subtracting it here
+    /// is what makes that one market rather than two.
+    ///
+    /// **Never call this for producer-side state** (book keys, sequence trackers, reset counts,
+    /// snapshot cycles) — those must stay keyed on the raw wire channel id, because the two paths
+    /// are independently sequenced and collapsing that corrupts book recovery.
+    pub fn canonical_channel(&self, wire_channel: u8) -> u8 {
+        match self.mirror_offset {
+            Some(offset) if wire_channel >= offset => wire_channel - offset,
+            _ => wire_channel,
+        }
+    }
+
     /// Emit a normalized message through the shared arbiter, tagged with this datagram's edge
     /// publisher so the quote floor can race it against the other sources for the tick's leadership.
     /// The brief critical section is the arbiter's admit-decision-plus-send.
+    ///
+    /// Also records the message's own (wire-resolved) venue as one this feed row has revealed data
+    /// under (see [`record_revealed`]), so a later `status` for this row names what its receivers
+    /// actually emit rather than the row's static `venue`. This runs before the arbiter's own
+    /// admit decision, so a copy the arbiter goes on to drop as a cross-publisher duplicate still
+    /// counts as revealed — deliberate: revealing records what this row's wire decoded and
+    /// attempted to emit, a Source-ID fact, independent of whether the arbiter's dedup floor
+    /// later broadcasts that particular copy.
     pub fn emit(&self, msg: FeedMessage) {
-        lock(self.arbiter).emit(msg, Publisher::Edge(self.publisher));
+        let (wire_venue, _) = msg.venue_symbol();
+        record_revealed(self.venue, wire_venue);
+        lock(self.arbiter).emit(msg, Transport::Edge(self.publisher), self.category);
     }
 }
 
-/// Protocol-specific frame handling. Implementors own their decode (they know their frame magic
+/// Wire venues actually emitted under each feed row's static `venue`, tracked from every
+/// [`DatagramCtx::emit`]. `FeedStatus` (built in [`emit_status`]) must report under what consumers'
+/// quotes/trades actually carry — a publisher's wire `Source ID` can resolve
+/// (`ingest::sources::source_label`) to a different registry name than `venue`, the static identity
+/// of the row this receiver was configured from (see the module doc and `ingest::sources`).
+///
+/// Scoped to the row `venue` — the same granularity `FeedHealth`'s own up/down aggregate already
+/// uses — rather than the finer per-receiver `ReceiverKey`, because `DatagramCtx` carries no `kind`/port
+/// and is a fixed contract with `processor.rs`'s `DatagramProcessor` implementations (not this fix's to
+/// change). This is not a loss of precision where it matters: `emit_status` only ever fires from
+/// `FeedHealth::with_edge` on a genuine aggregate flip (the whole point of that gate — see
+/// `health.rs`), so whichever receiver(s) of this row caused the flip are exactly the ones whose
+/// revealed venues belong in that flip's message. `emit_status` additionally never speaks for a
+/// revealed venue that owns its own `FEEDS` row (see there) — this map only records candidates.
+///
+/// A process-wide static rather than a `DatagramCtx`/`ReceiverRegistration` field for the same reason:
+/// `DatagramCtx`'s field set is fixed. The outer key space (row venues) is the small, fixed `FEEDS`
+/// registry, never wire-controlled; the inner sets hold only registry-resolved labels (see
+/// `record_revealed`), so the whole map is bounded by the registry, never by wire input.
+///
+/// A `BTreeSet` inner value (not `HashSet`) so [`revealed_venues_for`]'s iteration order — and so
+/// the order `emit_status` sends multiple `FeedStatus` messages on a multi-venue edge — is
+/// deterministic rather than hash-order-dependent.
+type RevealedVenueMap = RwLock<HashMap<&'static str, BTreeSet<Arc<str>>>>;
+static REVEALED_VENUES: OnceLock<RevealedVenueMap> = OnceLock::new();
+
+thread_local! {
+    /// Per-OS-thread mirror of [`REVEALED_VENUES`], so `record_revealed` can skip the global lock
+    /// entirely once this thread has already recorded a `(venue, wire_venue)` pair. A receiver task
+    /// normally keeps running on the same worker thread across polls, so in steady state this makes
+    /// the hot path (every emitted message) fully lock-free; the rare cross-thread migration (or a
+    /// second receiver task sharing the worker) just falls through to the global map once per new
+    /// thread, not once per message. A plain (unsynchronized) cell is correct here because each OS
+    /// thread only ever touches its own copy.
+    static LOCAL_REVEALED: RefCell<HashMap<&'static str, HashSet<Arc<str>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Record that feed row `venue` has emitted data under wire venue `wire_venue`, unless `wire_venue`
+/// is not itself a registered [`sources::source_id_of`] name. The wire is explicitly
+/// unauthenticated and this map never decays, so recording an unregistered/synthesized label (the
+/// `SOURCE_<id>` fallback `sources::source_label` produces for an unassigned id) would let one
+/// forged burst permanently seed phantom venues that every later edge for this row would then emit
+/// a `status` for — bounded by `sources::MAX_UNREGISTERED_SOURCES`, but still real, silent
+/// corruption of the wire `status` feed. Lock-free in the steady state; see [`LOCAL_REVEALED`].
+fn record_revealed(venue: &'static str, wire_venue: &str) {
+    let already_known = LOCAL_REVEALED.with(|local| {
+        local
+            .borrow()
+            .get(venue)
+            .is_some_and(|set| set.contains(wire_venue))
+    });
+    if already_known {
+        return; // fully lock-free fast path: the steady-state common case
+    }
+    if sources::source_id_of(wire_venue).is_none() {
+        return; // not a registered name: never recorded (see the doc above)
+    }
+    let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
+    if !map
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(venue)
+        .is_some_and(|set| set.contains(wire_venue))
+    {
+        map.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(venue)
+            .or_default()
+            .insert(Arc::from(wire_venue));
+    }
+    LOCAL_REVEALED.with(|local| {
+        local
+            .borrow_mut()
+            .entry(venue)
+            .or_default()
+            .insert(Arc::from(wire_venue));
+    });
+}
+
+/// The wire venues recorded so far for feed row `venue` (see [`record_revealed`]), or an empty set
+/// if this row's receivers have not emitted any data yet.
+fn revealed_venues_for(venue: &str) -> BTreeSet<Arc<str>> {
+    let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
+    map.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(venue)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Protocol-specific datagram handling. Implementors own their decode (they know their datagram magic
 /// and message set) and their persistent state (reference-data state machine, sequence trackers,
 /// book state, warn-once flags), and emit normalized `FeedMessage`s via `ctx.emit`.
-pub trait FrameProcessor {
+pub trait DatagramProcessor {
     /// Decode and handle one received datagram. Errors are the processor's own concern (it logs
     /// and drops); the driver only deals with socket/transport errors.
-    fn on_datagram(&mut self, buf: &[u8], ctx: &FrameCtx);
+    fn on_datagram(&mut self, buf: &[u8], ctx: &DatagramCtx);
 }
 
 /// Materialize the feed-health gauges for `venue` in their at-rest state at receiver setup, so a
@@ -172,6 +301,9 @@ struct ReceiverRegistration {
     arbiter: SharedArbiter,
     key: ReceiverKey,
     up_gauge: prometheus::IntGauge,
+    /// Source IP addresses this receiver has carried, so their book standing goes with it. Only Market-by-Order
+    /// receivers produce that standing, and a publisher host uses one IP, so this stays tiny.
+    publishers: Vec<IpAddr>,
 }
 
 impl ReceiverRegistration {
@@ -189,7 +321,22 @@ impl ReceiverRegistration {
             arbiter,
             key,
             up_gauge,
+            publishers: Vec::new(),
         }
+    }
+
+    /// Note a publisher whose order-level books this receiver is feeding. Bounded like the processors'
+    /// own per-publisher state, oldest evicted first: the source IP address is spoofable, and refusing new
+    /// at the cap would let 256 forged datagrams stop a real publisher's standing being released on
+    /// exit — the wedge this exists to close.
+    fn note_publisher(&mut self, publisher: IpAddr) {
+        if self.key.2 != FeedKind::MarketByOrder || self.publishers.contains(&publisher) {
+            return;
+        }
+        if self.publishers.len() >= MAX_PUBLISHERS {
+            self.publishers.remove(0);
+        }
+        self.publishers.push(publisher);
     }
 
     /// Record this receiver's liveness. The venue-level `status` fires only when the **venue**
@@ -208,6 +355,12 @@ impl Drop for ReceiverRegistration {
     fn drop(&mut self) {
         self.up_gauge.set(0);
         let (venue, arbiter) = (self.key.0, &self.arbiter);
+        if !self.publishers.is_empty() {
+            let mut a = lock(arbiter);
+            for &ip in &self.publishers {
+                a.forget_publisher_books(self.key.1, Transport::Edge(ip));
+            }
+        }
         self.health.deregister(self.key, |venue_up| {
             emit_status(arbiter, venue, venue_up, 0)
         });
@@ -216,10 +369,26 @@ impl Drop for ReceiverRegistration {
 
 /// Broadcast a venue-level feed-health transition (PROTOCOL.md `status`): `"down"` when every one of
 /// the venue's quote publishers has gone silent past [`IDLE_REJOIN`], `"ok"` when one recovers.
-/// Consumers gray out / restore the source on these. Best-effort (ignored if no subscriber is
+/// Consumers gray out / restore the upstream source on these. Best-effort (ignored if no subscriber is
 /// connected). Called only from `FeedHealth`'s `on_edge`, i.e. only on a venue-level edge, and with
 /// that lock held — so two receivers can't publish contradictory states out of order. `stale_ms` is
 /// only meaningful on a `down` edge.
+///
+/// `venue` here is the feed **row's** static identity — used only for the health-map lookup above it
+/// and the `dz_feed_up`/`dz_feed_stale_ms` gauges, which stay keyed on the row (an operational
+/// aggregate wired to the registry, not the wire naming this fixes). The **wire** `status` message is
+/// different: it must name what this row's receivers have actually emitted quotes/trades under, since
+/// a publisher's wire Source ID can resolve to a different registry name than the row (see
+/// `record_revealed`). A row that has revealed no venue yet emits no `status` at all here — a receiver
+/// that has produced no data has nothing to declare an outage on.
+///
+/// A revealed venue that is itself the static `venue` of a **different** `FEEDS` row is skipped: that
+/// venue owns its own rows and its own independent `FeedHealth` aggregate, and reports itself through
+/// its own `emit_status` calls. Without this, a superset group whose publisher(s) also mirror another
+/// registered venue's Source ID onto this row (`feeds.rs` documents exactly this for a superset
+/// group's Source-ID-3 traffic) would make this row speak for that other venue too — on this row's `down` edge
+/// wrongly declaring the other venue down while its own rows still stream, and on this row's `ok` edge
+/// worse, silently overwriting a genuine `down` the other venue's own aggregate just published.
 fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
     let state = if up { "ok" } else { "down" };
     let stale_ms = if up { 0 } else { stale_ms };
@@ -232,17 +401,25 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
         .feed_stale_ms
         .with_label_values(&[venue])
         .set(stale_ms as i64);
-    // Status carries no business identity to dedup, so it goes straight to the broadcast sender
-    // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the `Arc`/`Arc<str>`
-    // allocation here is off the per-message hot path.
-    let _ = lock(arbiter)
-        .sender()
-        .send(std::sync::Arc::new(FeedMessage::Status(FeedStatus {
-            venue: std::sync::Arc::from(venue),
-            state: state.to_string(),
-            stale_ms,
-            ts_ns: now_ns(),
-        })));
+    for wire_venue in revealed_venues_for(venue) {
+        if wire_venue.as_ref() != venue && feeds().iter().any(|f| f.venue == wire_venue.as_ref()) {
+            continue; // that venue has its own row(s) and its own aggregate; it speaks for itself
+        }
+        let source_id = sources::source_id_of(wire_venue.as_ref()).unwrap_or(0);
+        // Status carries no business identity to dedup, so it goes straight to the broadcast sender
+        // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the allocation
+        // here is off the per-message hot path.
+        let _ = lock(arbiter)
+            .sender()
+            .send(Arc::new(FeedMessage::Status(FeedStatus {
+                venue: wire_venue.clone(),
+                source_name: wire_venue,
+                source_id,
+                state: state.to_string(),
+                stale_ms,
+                ts_ns: now_ns(),
+            })));
+    }
 }
 
 /// Receive one datagram, returning `(len, kernel_rx_ns, user_recv_ns)`.
@@ -279,7 +456,7 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
     }
 }
 
-/// The source IP of a received datagram (its `recvmsg` source address), used to demultiplex
+/// The source IP address of a received datagram (its `recvmsg` source address), used to demultiplex
 /// independent publishers that mirror one feed onto the same multicast group. Falls back to
 /// `0.0.0.0` if the kernel attached no source address.
 fn datagram_src_ip(addr: Option<SockaddrStorage>) -> IpAddr {
@@ -386,9 +563,9 @@ pub fn bind_multicast(
     Ok(AsyncFd::new(std_sock)?)
 }
 
-/// Outcome of checking a frame's header against the per-channel sequence tracker.
+/// Outcome of checking a datagram's header against the per-channel sequence tracker.
 ///
-/// Mirrors the edge-feed-spec frame-header semantics: the Sequence Number is "monotonically
+/// Mirrors the edge-feed-spec datagram-header semantics: the Sequence Number is "monotonically
 /// increasing per channel ... Resets to 0 when `Reset Count` changes", and "Subscribers detect a
 /// reset by comparing [`Reset Count`] against their last-seen value". Everything but
 /// [`Stale`](SeqCheck::Stale) is processed.
@@ -399,20 +576,20 @@ pub fn bind_multicast(
 /// *lower* sequence on the same group (a reorder/replay) is actionable.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeqCheck {
-    /// First frame seen on this channel.
+    /// First datagram seen on this channel.
     First,
-    /// Sequence at or above the last seen within the epoch (forward progress or a duplicate of
+    /// Sequence at or above the last seen within the era (forward progress or a duplicate of
     /// the last). Accepted.
     Ok,
     /// `Reset Count` changed: the publisher reset the channel and the sequence restarts. Accepted.
     Reset,
-    /// Sequence below the last seen within the same reset epoch - a reordered or duplicated
+    /// Sequence below the last seen within the same reset era - a reordered or duplicated
     /// datagram carrying a now-superseded update. Dropped, so an old message never overwrites
     /// a fresher one.
     Stale,
 }
 
-/// Per-`channel_id` frame-sequence state for gap detection and stale-frame rejection on the
+/// Per-`channel_id` datagram-sequence state for gap detection and stale-datagram rejection on the
 /// market-data feed, implementing the edge-feed-spec sequence/reset contract (see [`SeqCheck`]).
 #[derive(Default)]
 pub struct SeqTracker {
@@ -421,10 +598,10 @@ pub struct SeqTracker {
 }
 
 impl SeqTracker {
-    /// Classify a frame and advance the tracker. A reset (`reset_count` differs from the
-    /// last-seen value, per spec) re-anchors to this frame's sequence; otherwise the sequence
-    /// is compared within the epoch. The tracker is only advanced for accepted frames, so a
-    /// dropped stale frame leaves the anchor on the freshest sequence.
+    /// Classify a datagram and advance the tracker. A reset (`reset_count` differs from the
+    /// last-seen value, per spec) re-anchors to this datagram's sequence; otherwise the sequence
+    /// is compared within the era. The tracker is only advanced for accepted datagrams, so a
+    /// dropped stale datagram leaves the anchor on the freshest sequence.
     pub fn check(&mut self, channel_id: u8, reset_count: u8, sequence: u64) -> SeqCheck {
         match self.last.get_mut(&channel_id) {
             None => {
@@ -489,23 +666,25 @@ async fn recv_any(channels: &mut [Channel]) -> Result<(PortRole, usize, usize, u
     }
 }
 
-/// The shared receive loop for one feed, generic over its [`FrameProcessor`]. Binds every port in
+/// The shared receive loop for one feed, generic over its [`DatagramProcessor`]. Binds every port in
 /// `ports` on `group`, then loops receiving datagrams and handing each to `processor`. The
 /// [`IDLE_REJOIN`] watchdog tracks the **market-data** port only (reference/snapshot ports keep
 /// ticking even when market data is wedged), and breaks back out to re-resolve the interface and
 /// rebind - self-healing a join that landed on the wrong interface or a wedged socket.
 #[allow(clippy::too_many_arguments)]
-async fn drive<P: FrameProcessor>(
+async fn drive<P: DatagramProcessor>(
     group: Ipv4Addr,
     ports: Vec<(PortRole, u16)>,
     iface: String,
     recv_buf: usize,
     venue: &'static str,
+    category: &'static str,
     kind: FeedKind,
     publisher_port: u16,
     arbiter: SharedArbiter,
     instruments: InstrumentSnapshot,
     health: SharedFeedHealth,
+    mirror_offset: Option<u8>,
     mut processor: P,
 ) -> Result<()> {
     // This receiver's own liveness: true while its market-data multicast is considered down (silent
@@ -567,7 +746,7 @@ async fn drive<P: FrameProcessor>(
             ReceiverRegistration::new(
                 health.clone(),
                 arbiter.clone(),
-                (venue, kind, publisher_port),
+                (venue, category, kind, publisher_port),
                 m.receiver_up
                     .with_label_values(&[venue, kind_label, publisher_name]),
             )
@@ -575,7 +754,7 @@ async fn drive<P: FrameProcessor>(
         info!(%group, ?ports, %iface, %iface_ip, recv_buf, venue, kind = kind_label,
               publisher = publisher_name, "DZ Edge multicast receiver bound");
 
-        // Watchdog on the market-data stream specifically: rejoin when no market-data datagram has
+        // Watchdog on the market-data feed specifically: rejoin when no market-data datagram has
         // arrived for IDLE_REJOIN, regardless of refdata/snapshot (which keep ticking even when
         // market data is wedged - the exact symptom of a join on the wrong interface).
         let mut last_mkt = std::time::Instant::now();
@@ -620,7 +799,7 @@ async fn drive<P: FrameProcessor>(
             channels[idx].dgrams.inc();
             bytes_ctr.inc_by(n as u64);
 
-            // Reset the liveness watchdog only on the market-data stream; recovery clears `down`
+            // Reset the liveness watchdog only on the market-data feed; recovery clears `down`
             // and un-escalates the rejoin interval (this is the only thing that proves the block is
             // live, so it is the only thing that may reset it).
             if matches!(role, PortRole::Mktdata | PortRole::Combined) {
@@ -632,14 +811,17 @@ async fn drive<P: FrameProcessor>(
                 }
             }
 
-            let ctx = FrameCtx {
+            reg.note_publisher(publisher);
+            let ctx = DatagramCtx {
                 venue,
+                category,
                 arbiter: &arbiter,
                 instruments: &instruments,
                 kernel_rx_ts_ns: kernel_ns,
                 recv_ts_ns: recv_ns,
                 role,
                 publisher,
+                mirror_offset,
             };
             processor.on_datagram(&channels[idx].buf[..n], &ctx);
         }
@@ -658,7 +840,7 @@ fn two_port_roles(ports: FeedPorts) -> Vec<(PortRole, u16)> {
     }
 }
 
-/// Run the receiver for **one publisher** of one feed: pick the protocol's [`FrameProcessor`] and
+/// Run the receiver for **one publisher** of one feed: pick the protocol's [`DatagramProcessor`] and
 /// port roles from the feed's [`FeedKind`], then drive the shared receive loop over that
 /// publisher's port block. Returns only on a fatal bind error (it otherwise runs forever).
 #[allow(clippy::too_many_arguments)]
@@ -671,6 +853,7 @@ pub async fn run_feed(
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
     health: SharedFeedHealth,
+    tape: TapeOwner,
 ) -> Result<()> {
     let venue: &'static str = feed.venue;
     match feed.kind {
@@ -682,12 +865,14 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
-                TobProcessor::new(feed.emit_trades),
+                feed.mirror_offset,
+                TobProcessor::new(tape),
             )
             .await
         }
@@ -699,11 +884,13 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
+                feed.mirror_offset,
                 MidpointProcessor::new(),
             )
             .await
@@ -732,12 +919,49 @@ pub async fn run_feed(
                 iface,
                 recv_buf,
                 venue,
+                feed.category,
                 feed.kind,
                 publisher.base_port(),
                 arbiter,
                 instruments,
                 health,
-                MboProcessor::new(depth, feed.emit_trades),
+                feed.mirror_offset,
+                MboProcessor::new(depth, tape),
+            )
+            .await
+        }
+        FeedKind::MarketByPrice => {
+            let FeedPorts::ThreePort {
+                mktdata,
+                refdata,
+                snapshot,
+            } = publisher.ports
+            else {
+                bail!(
+                    "Market-by-Price feed '{venue}' publisher '{}' must use FeedPorts::ThreePort \
+                     (mktdata/refdata/snapshot)",
+                    publisher.base_port()
+                );
+            };
+            let ports = vec![
+                (PortRole::Mktdata, mktdata),
+                (PortRole::Refdata, refdata),
+                (PortRole::Snapshot, snapshot),
+            ];
+            drive(
+                feed.group,
+                ports,
+                iface,
+                recv_buf,
+                venue,
+                feed.category,
+                feed.kind,
+                publisher.base_port(),
+                arbiter,
+                instruments,
+                health,
+                feed.mirror_offset,
+                MbpProcessor::new(tape),
             )
             .await
         }
@@ -748,7 +972,11 @@ pub async fn run_feed(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    use super::{datagram_src_ip, init_feed_health, SeqCheck, SeqTracker, SockaddrStorage};
+    use super::{
+        datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_venues_for,
+        DatagramCtx, FeedMessage, PortRole, ReceiverRegistration, SeqCheck, SeqTracker,
+        SharedArbiter, SockaddrStorage,
+    };
     use crate::metrics::metrics;
 
     #[test]
@@ -758,12 +986,301 @@ mod tests {
         // process-global metrics registry (see `metrics()` docs).
         let venue = "FeedHealthInitTest";
         let health = FeedHealth::new();
-        health.register((venue, FeedKind::TopOfBook, 9101), |_| {});
+        health.register((venue, "testcategory", FeedKind::TopOfBook, 9101), |_| {});
         init_feed_health(&health, venue);
         // The gauge reads healthy (1) with no prior down/ok transition — the whole point of the
         // up-front init, so the `dz_feed_up == 0` alert has a series to evaluate.
         assert_eq!(metrics().feed_up.with_label_values(&[venue]).get(), 1);
         assert_eq!(metrics().feed_stale_ms.with_label_values(&[venue]).get(), 0);
+    }
+
+    fn test_arbiter() -> (
+        SharedArbiter,
+        tokio::sync::broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+    ) {
+        use crate::ingest::arbiter::Arbiter;
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        (
+            std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 8))),
+            rx,
+        )
+    }
+
+    /// A row that has revealed no wire venue yet (no receiver has emitted data) declares no status
+    /// at all — deferral, not a guess dressed up as the row's static name.
+    #[test]
+    fn emit_status_emits_nothing_when_no_venue_revealed_yet() {
+        let (arbiter, mut rx) = test_arbiter();
+        emit_status(&arbiter, "EmitStatusNoRevealRow", false, 5_000);
+        assert!(
+            rx.try_recv().is_err(),
+            "no revealed venue: nothing to declare an outage on"
+        );
+    }
+
+    /// `emit_status` reports under the revealed venue (not a hardcoded pass-through of the row
+    /// param) and resolves its registry `source_id` correctly. Row and wire are the same real
+    /// `FEEDS` venue here — the well-behaved case, where a row's own revealed identity matches
+    /// it — because every currently-registered name owns at least one `FEEDS` row, so a wire
+    /// venue that both differs from the row *and* survives `emit_status`'s ownership guard does
+    /// not exist in today's registry; see `emit_status_never_reports_a_venue_that_owns_its_own_feeds_row`
+    /// for the case where a row's revealed set contains a *different* venue.
+    #[test]
+    fn emit_status_reports_the_revealed_venue_with_its_registry_source_id() {
+        let venue = "KALSHI";
+        record_revealed(venue, venue);
+        let (arbiter, mut rx) = test_arbiter();
+        emit_status(&arbiter, venue, true, 0);
+        match &*rx.try_recv().expect("a status was emitted") {
+            FeedMessage::Status(s) => {
+                assert_eq!(s.venue.as_ref(), venue);
+                assert_eq!(s.source_name.as_ref(), venue);
+                assert_eq!(s.source_id, 3);
+                assert_eq!(s.state, "ok");
+            }
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    /// `record_revealed` is idempotent per `(venue, wire_venue)` pair and distinguishes rows.
+    #[test]
+    fn record_revealed_is_idempotent_and_scoped_per_row() {
+        let a = "RecordRevealedRowA";
+        let b = "RecordRevealedRowB";
+        record_revealed(a, "HYPERLIQUID");
+        record_revealed(a, "HYPERLIQUID");
+        record_revealed(a, "PHOENIX");
+        record_revealed(b, "KALSHI");
+        let revealed_a = revealed_venues_for(a);
+        assert_eq!(revealed_a.len(), 2);
+        assert!(revealed_a.contains("HYPERLIQUID") && revealed_a.contains("PHOENIX"));
+        let revealed_b = revealed_venues_for(b);
+        assert_eq!(revealed_b.len(), 1);
+        assert!(revealed_b.contains("KALSHI"));
+    }
+
+    /// A wire label the registry does not resolve (`sources::source_id_of` returns `None` — the
+    /// synthesized `SOURCE_<id>` fallback for an unassigned Source ID, or plain garbage) is never
+    /// recorded: the wire is unauthenticated and this map never decays, so one forged burst would
+    /// otherwise permanently seed a phantom venue that every later edge for this row emits a
+    /// `status` for.
+    #[test]
+    fn record_revealed_ignores_unregistered_wire_labels() {
+        let row = "RecordRevealedUnregisteredRow";
+        record_revealed(row, "SOURCE_54321");
+        record_revealed(row, "TotallyMadeUpVenue");
+        assert!(
+            revealed_venues_for(row).is_empty(),
+            "unregistered labels must not be recorded"
+        );
+    }
+
+    /// A superset group's Source-ID-3 traffic (`feeds.rs`) means a row can reveal a venue
+    /// that owns its own `FEEDS` rows and its own independent `FeedHealth` aggregate. That venue
+    /// speaks for itself; this row must not also report `status` under its name.
+    #[test]
+    fn emit_status_never_reports_a_venue_that_owns_its_own_feeds_row() {
+        let row = "HYPERLIQUID";
+        // This is a real `FEEDS` venue with its own rows — exactly the superset scenario
+        // `feeds.rs`/`sources.rs` document for a superset group's Source-ID-3 traffic.
+        record_revealed(row, "HYPERLIQUID");
+        record_revealed(row, "KALSHI");
+        let (arbiter, mut rx) = test_arbiter();
+        emit_status(&arbiter, row, false, 1_234);
+        match &*rx.try_recv().expect("the row's own venue still reports") {
+            FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), "HYPERLIQUID"),
+            other => panic!("expected a status, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must not also emit a status under the source name that owns its own aggregate"
+        );
+    }
+
+    /// `DatagramCtx::emit` is the hook: it must record the message's OWN venue (as `processor.rs`
+    /// resolves it from the wire Source ID), not `ctx.venue` (the feed row's static identity) —
+    /// those are exactly the two that can differ.
+    #[test]
+    fn datagram_ctx_emit_records_the_messages_own_venue() {
+        use std::collections::HashMap;
+
+        use crate::model::{InstrumentSnapshot, NormalizedQuote};
+
+        let row_venue: &'static str = "FrameCtxEmitRow";
+        // Must be a name the registry resolves: `record_revealed` (called by `ctx.emit` below)
+        // only records registered names — see `record_revealed_ignores_unregistered_wire_labels`.
+        let wire_venue: &'static str = "PHOENIX";
+        let (arbiter, _rx) = test_arbiter();
+        let instruments: InstrumentSnapshot =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ctx = DatagramCtx {
+            venue: row_venue,
+            category: "testcategory",
+            arbiter: &arbiter,
+            instruments: &instruments,
+            kernel_rx_ts_ns: 0,
+            recv_ts_ns: 0,
+            role: PortRole::Mktdata,
+            publisher: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            mirror_offset: None,
+        };
+        let quote = NormalizedQuote {
+            venue: wire_venue.into(),
+            source_name: wire_venue.into(),
+            source_id: 2,
+            symbol: "X".into(),
+            bid: 1.0,
+            ask: 1.0,
+            bid_size: 1.0,
+            ask_size: 1.0,
+            bid_n: 0,
+            ask_n: 0,
+            source_ts_ns: 1,
+            recv_ts_ns: 1,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+        };
+        ctx.emit(FeedMessage::Quote(quote));
+        let revealed = revealed_venues_for(row_venue);
+        assert!(
+            revealed.contains(wire_venue),
+            "ctx.emit must record the message's own venue, not the row's"
+        );
+        assert!(
+            !revealed.contains(row_venue),
+            "the feed row's static venue was never the message's own venue here"
+        );
+    }
+
+    /// End-to-end (through the real `ReceiverRegistration` → `FeedHealth` → `emit_status` wiring,
+    /// not just the unit-level `emit_status` call): a row whose revealed set picked up a foreign
+    /// venue's name (a superset group's Source-ID-3 superset scenario) reports `status` under its own
+    /// venue on its up edge and never under the foreign one, which owns its own `FEEDS` rows and
+    /// its own independent aggregate.
+    #[test]
+    fn a_receiver_reports_status_via_its_revealed_venue_and_suppresses_a_foreign_owned_one() {
+        use crate::ingest::{feeds::FeedKind, health::FeedHealth};
+
+        // "PHOENIX" is this row's own (real) venue; the second name mirrors the superset-group
+        // scenario (`feeds.rs`) where a row's revealed set also picks up a DIFFERENT venue's
+        // name, one with its own `FEEDS` rows and its own independent `FeedHealth` aggregate.
+        let row_venue = "PHOENIX";
+        let foreign_venue = "KALSHI";
+        // Simulates this receiver's own `ctx.emit` calls having already resolved and emitted
+        // under both wire venues.
+        record_revealed(row_venue, row_venue);
+        record_revealed(row_venue, foreign_venue);
+
+        let (arbiter, mut rx) = test_arbiter();
+        let health = FeedHealth::new();
+        let key = (row_venue, "testcategory", FeedKind::TopOfBook, 9101);
+        let up_gauge = metrics()
+            .receiver_up
+            .with_label_values(&[row_venue, "tob", "9101"]);
+        let reg = ReceiverRegistration::new(health.into(), arbiter, key, up_gauge);
+        // Registering the first (and only) receiver for this venue is an up edge, so `emit_status`
+        // fires synchronously from inside `ReceiverRegistration::new` — reporting only this row's
+        // own venue, never the foreign one that governs its own aggregate.
+        match &*rx
+            .try_recv()
+            .expect("registering the first receiver is an up edge")
+        {
+            FeedMessage::Status(s) => assert_eq!(s.venue.as_ref(), row_venue),
+            other => panic!("expected a status, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "must not also emit a status under the foreign venue's name"
+        );
+        drop(reg);
+    }
+
+    /// A Market-by-Order receiver's exit is the authoritative signal that its publisher is gone, so it
+    /// releases that publisher's book standing. Without this a departed path's stale `synced` claim
+    /// suppresses the surviving path's re-baseline until `PEER_SERVING_NS`, which a sub-second
+    /// gap-and-recover cycle outruns — and a suppressed re-baseline is never retried.
+    ///
+    /// A Top-of-Book receiver of the same publisher must not do it: one publisher host serves both
+    /// protocols from one source IP address, so its exit would drop a live Market-by-Order path's standing.
+    #[test]
+    fn an_mbo_receivers_exit_releases_its_publishers_book_standing() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Transport},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let market = ("MBODEPART".into(), "test".into(), 2u8, 41u32);
+        let registration = |kind, port| {
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let arbiter: SharedArbiter =
+                std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+            lock(&arbiter).set_book_synced(&market, Transport::Edge(ip), true);
+            let up_gauge = metrics()
+                .receiver_up
+                .with_label_values(&["MBODEPART", "test", port]);
+            let mut reg = ReceiverRegistration::new(
+                FeedHealth::new().into(),
+                arbiter.clone(),
+                ("MBODEPART", "test", kind, 9101),
+                up_gauge,
+            );
+            reg.note_publisher(ip);
+            drop(reg);
+            arbiter
+        };
+
+        let mbo = registration(FeedKind::MarketByOrder, "9101");
+        assert!(
+            !lock(&mbo).book_path_synced(&market, Transport::Edge(ip)),
+            "the departed publisher's claim must go with its receiver"
+        );
+        let tob = registration(FeedKind::TopOfBook, "9102");
+        assert!(
+            lock(&tob).book_path_synced(&market, Transport::Edge(ip)),
+            "a quote receiver's exit says nothing about its publisher's books"
+        );
+    }
+
+    /// The release above must find the market whatever the wire called its venue. Every `MarketKey`
+    /// is filed under the **wire** venue the instrument resolved to, and one registry row can carry
+    /// instruments whose Source IDs resolve elsewhere (the superset case `reset_all_known_depth_floors`
+    /// exists for), so a release filtered by the row's own `venue` matches nothing for exactly those
+    /// markets and leaves a departed path's phantom `synced` standing forever. The category is what the
+    /// exiting receiver and the key provably share.
+    #[test]
+    fn an_mbo_receivers_exit_releases_a_market_filed_under_a_different_wire_venue() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Transport},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // The row's static venue; the market below is filed under a different one, as a superset
+        // row's instruments are.
+        let row_venue = "MBOWIREVENUE";
+        let market = ("HYPERLIQUID".into(), "wiretest".into(), 2u8, 41u32);
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let arbiter: SharedArbiter =
+            std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+        lock(&arbiter).set_book_synced(&market, Transport::Edge(ip), true);
+        let up_gauge = metrics()
+            .receiver_up
+            .with_label_values(&[row_venue, "wiretest", "9103"]);
+        let mut reg = ReceiverRegistration::new(
+            FeedHealth::new().into(),
+            arbiter.clone(),
+            (row_venue, "wiretest", FeedKind::MarketByOrder, 9103),
+            up_gauge,
+        );
+        reg.note_publisher(ip);
+        drop(reg);
+        assert!(
+            !lock(&arbiter).book_path_synced(&market, Transport::Edge(ip)),
+            "the departed path's claim must go even when the wire named the venue differently"
+        );
     }
 
     /// The idle interval doubles per fruitless rejoin and stops at the cap, so a permanently-silent
@@ -810,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_on_a_channel() {
+    fn first_datagram_on_a_channel() {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 0), SeqCheck::First); // sequence starts at 0 per spec
     }
@@ -839,7 +1356,7 @@ mod tests {
         assert_eq!(s.check(0, 0, 10), SeqCheck::First);
         assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // reordered/duplicated old datagram
         assert_eq!(s.check(0, 0, 3), SeqCheck::Stale);
-        // The anchor stayed at 10 (stale frames don't advance it), so 11 is the next contiguous one.
+        // The anchor stayed at 10 (stale datagrams don't advance it), so 11 is the next contiguous one.
         assert_eq!(s.check(0, 0, 11), SeqCheck::Ok);
     }
 
@@ -855,11 +1372,11 @@ mod tests {
     fn reset_count_change_is_a_reset() {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 100), SeqCheck::First);
-        // Publisher reset the channel: reset_count bumped, sequence legitimately restarts at 0.
-        // Without the reset_count check this 0 would be misread as a stale frame.
+        // Transport reset the channel: reset_count bumped, sequence legitimately restarts at 0.
+        // Without the reset_count check this 0 would be misread as a stale datagram.
         assert_eq!(s.check(0, 1, 0), SeqCheck::Reset);
         assert_eq!(s.check(0, 1, 1), SeqCheck::Ok);
-        // Within the new epoch, lower sequences are stale again.
+        // Within the new era, lower sequences are stale again.
         assert_eq!(s.check(0, 1, 0), SeqCheck::Stale);
     }
 
@@ -868,7 +1385,7 @@ mod tests {
         let mut s = SeqTracker::default();
         assert_eq!(s.check(0, 0, 10), SeqCheck::First);
         assert_eq!(s.check(1, 0, 2), SeqCheck::First); // a different channel has its own counter
-        assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // channel 0 still drops its own stale frame
+        assert_eq!(s.check(0, 0, 9), SeqCheck::Stale); // channel 0 still drops its own stale datagram
         assert_eq!(s.check(1, 0, 3), SeqCheck::Ok);
     }
 }

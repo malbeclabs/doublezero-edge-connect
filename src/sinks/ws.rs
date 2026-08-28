@@ -26,7 +26,10 @@ use tracing::{info, warn};
 
 use crate::{
     metrics::metrics,
-    model::{now_ns, DepthSnapshot, FeedMessage, InstrumentSnapshot},
+    model::{
+        now_ns, BookAccumulator, BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot,
+        ReplayScope,
+    },
 };
 
 /// A message serialized **once** for all clients: the JSON text plus the fields the per-client
@@ -43,6 +46,9 @@ struct PreparedFrame {
     venue: Arc<str>,
     /// The message's symbol, or `None` for a venue-level `status` (matched by venue alone).
     symbol: Option<Arc<str>>,
+    /// The message's `channel_id`, or `None` for a type that carries none. Populated when the
+    /// incremental `book` message lands; every current type is `None`.
+    channel: Option<u8>,
 }
 
 /// Serialize one backbone message once: clone it, stamp the shared `ws_send_ts_ns`, render the JSON,
@@ -70,16 +76,40 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
             d.ws_send_ts_ns = now;
             "depth"
         }
+        FeedMessage::Book(b) => {
+            b.ws_send_ts_ns = now;
+            if b.order_level {
+                "order_book"
+            } else {
+                "book"
+            }
+        }
+        FeedMessage::OrderBook(b) => {
+            b.ws_send_ts_ns = now;
+            "order_book"
+        }
         FeedMessage::Instrument(_) => "instrument",
         FeedMessage::Status(_) => "status",
     };
-    let payload: Utf8Bytes = serde_json::to_string(&m).ok()?.into();
+    // An order-level batch renders under its own `type`. Only the tag differs — the body is the same
+    // `NormalizedBook` — and the wrap is local to serialization, so the filter fields below are still
+    // read off the original message and no other `match` on `FeedMessage` grows a path.
+    let payload: Utf8Bytes = match &m {
+        FeedMessage::Book(b) if b.order_level => {
+            serde_json::to_string(&FeedMessage::OrderBook(b.clone())).ok()?
+        }
+        _ => serde_json::to_string(&m).ok()?,
+    }
+    .into();
     let (venue, symbol) = match &m {
         FeedMessage::Instrument(i) => (i.venue.clone(), Some(i.symbol.clone())),
         FeedMessage::Quote(q) => (q.venue.clone(), Some(q.symbol.clone())),
         FeedMessage::Trade(t) => (t.venue.clone(), Some(t.symbol.clone())),
         FeedMessage::Midpoint(mp) => (mp.venue.clone(), Some(mp.symbol.clone())),
         FeedMessage::Depth(d) => (d.venue.clone(), Some(d.symbol.clone())),
+        FeedMessage::Book(b) | FeedMessage::OrderBook(b) => {
+            (b.venue.clone(), Some(b.symbol.clone()))
+        }
         FeedMessage::Status(s) => (s.venue.clone(), None),
     };
     Some(Arc::new(PreparedFrame {
@@ -87,6 +117,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         kind,
         venue,
         symbol,
+        channel: m.channel(),
     }))
 }
 
@@ -104,23 +135,72 @@ pub struct WsConfig {
 }
 
 /// A subscription filter: a `None` field matches any value (so `{}` = everything).
-#[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 struct SubFilter {
     #[serde(default)]
     venue: Option<String>,
+    /// Alias for `venue`, the preferred spelling. Both are accepted for the deprecation window; if
+    /// a client sends both they are ANDed, so a disagreeing pair matches nothing rather than
+    /// silently honouring one.
+    ///
+    #[serde(default)]
+    source_name: Option<String>,
+    /// The pre-rename spelling, still accepted. Its own slot rather than a `serde(alias)` on
+    /// `source_name`: an alias shares one field slot, so a client sending both spellings — the
+    /// natural way to straddle a rename — would get `duplicate field` and have the whole `subscribe`
+    /// refused, registering no filter at all and landing on the firehose. That is the failure this
+    /// key exists to prevent. ANDed like `venue`, so all three spellings compose.
+    #[serde(default, rename = "source")]
+    deprecated_source_name: Option<String>,
     #[serde(default)]
     symbol: Option<String>,
+    /// The wire `channel_id` — the competition, not the path. Path identity is deliberately not
+    /// client-selectable: exactly one arbitrated book per market reaches the wire.
+    #[serde(default)]
+    channel: Option<u8>,
+    /// Message `type` (`quote`/`trade`/`book`/...). Named `msg_type` in Rust because `type` is a
+    /// keyword; the wire name is `type`.
+    #[serde(rename = "type", default)]
+    msg_type: Option<String>,
 }
 
 impl SubFilter {
-    fn matches(&self, venue: &str, symbol: &str) -> bool {
+    /// The single match path. `venue`/`source_name` are aliases and are ANDed. `symbol`/`channel` are
+    /// `None` for a venue-level message (today only `status`), and a `None` on the *message* side
+    /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
+    /// symbol- or channel-scoped subscriber must still receive it. A filter dimension the message
+    /// *does* carry is matched normally.
+    fn matches(&self, venue: &str, symbol: Option<&str>, channel: Option<u8>, kind: &str) -> bool {
         // Venue codes are registry identifiers, not free text - match case-insensitively so a
-        // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol
-        // stays an exact match (venues name symbols precisely, e.g. `SOL-PERP`).
+        // subscription for `PHOENIX` / `phoenix` still selects the wire venue `Phoenix`. Symbol and
+        // type stay exact (venues name symbols precisely; types are a closed protocol set).
         self.venue
             .as_deref()
             .is_none_or(|v| v.eq_ignore_ascii_case(venue))
-            && self.symbol.as_deref().is_none_or(|s| s == symbol)
+            && self
+                .source_name
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(venue))
+            && self
+                .deprecated_source_name
+                .as_deref()
+                .is_none_or(|s| s.eq_ignore_ascii_case(venue))
+            // `type` is a *kind* selector and so is absolute, with no carve-out: a client that named
+            // one type asked for that type. Filters are a union, so wanting books plus definitions is
+            // two subscriptions. `venue`/`symbol`/`channel` below are *scope* selectors — which
+            // markets — and those do carve out messages that aren't about one market.
+            && self.msg_type.as_deref().is_none_or(|t| t == kind)
+            && match symbol {
+                None => true,
+                Some(s) => self.symbol.as_deref().is_none_or(|f| f == s),
+            }
+            && match channel {
+                // A venue-level message (`status`) is about no single channel, so an explicit
+                // channel filter must not exclude it; a channelless *market* message is excluded,
+                // or `{"channel":2}` would be a firehose of quotes.
+                None => self.channel.is_none() || symbol.is_none(),
+                Some(c) => self.channel.is_none_or(|f| f == c),
+            }
     }
 }
 
@@ -163,6 +243,7 @@ pub async fn serve(
     tx: broadcast::Sender<Arc<FeedMessage>>,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
+    books: BookSnapshot,
     cfg: WsConfig,
 ) -> Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
@@ -228,6 +309,7 @@ pub async fn serve(
         let rx = prepared_tx.subscribe();
         let instruments = instruments.clone();
         let depth = depth.clone();
+        let books = books.clone();
         let cfg = cfg.clone();
         // The guard releases the slot + gauge on drop, so the accounting is correct even if
         // `serve_client` panics rather than returning.
@@ -236,7 +318,7 @@ pub async fn serve(
         };
         tokio::spawn(async move {
             let _guard = guard;
-            if let Err(e) = serve_client(stream, rx, instruments, depth, cfg).await {
+            if let Err(e) = serve_client(stream, rx, instruments, depth, books, cfg).await {
                 warn!(%peer, "client ended: {e}");
             }
         });
@@ -247,46 +329,132 @@ fn text(value: serde_json::Value) -> WsMessage {
     WsMessage::Text(value.to_string().into())
 }
 
+/// The scope to bootstrap one market at: **the market's own granularity, always**.
+///
+/// It is not a client choice. A bootstrap and a feed of different granularity cannot be reconciled
+/// — an order-level change carries one *order's* absolute size, and a client handed price levels has
+/// no order state to apply it to — so the only consumer a fold could serve is one folding the live
+/// feed itself, which needs every resting order's size and is exactly what the fold discards. The
+/// `book_scope` subscription field offered that choice and is withdrawn; it never shipped in a
+/// release.
+/// The wire `type` one market's book is served under — the same market property `book_scope` reads,
+/// and for the same reason: the bootstrap and the live feed must agree.
+fn book_kind(acc: &BookAccumulator) -> &'static str {
+    if acc.is_order_level() {
+        "order_book"
+    } else {
+        "book"
+    }
+}
+
+fn book_scope(acc: &BookAccumulator) -> ReplayScope {
+    if acc.is_order_level() {
+        ReplayScope::Orders
+    } else {
+        ReplayScope::Levels
+    }
+}
+
+/// Replay current full state matching `subs` (empty = everything): instrument definitions first so
+/// precision is known before any book, then the latest `depth` per `(venue, symbol)` and a `book`
+/// re-baseline per `(venue, channel, instrument_id)`.
+///
+/// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
+/// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
+/// state, so the overlap a connect-then-subscribe client sees is harmless.
+async fn replay_scoped<W>(
+    write: &mut W,
+    instruments: &InstrumentSnapshot,
+    depth: &DepthSnapshot,
+    books: &BookSnapshot,
+    subs: &[SubFilter],
+) -> Result<()>
+where
+    W: SinkExt<WsMessage> + Unpin,
+    <W as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
+{
+    // Each kind passes its own channel: a channel-bearing kind that passed `None` would leave a
+    // `{"channel":N}` client with no bootstrap at all.
+    let pass = |venue: &str, symbol: &str, channel: Option<u8>, kind: &str| {
+        subs.is_empty()
+            || subs
+                .iter()
+                .any(|f| f.matches(venue, Some(symbol), channel, kind))
+    };
+    // Every lock is taken and released before any `await`: a `std::sync::MutexGuard` held across an
+    // await point does not compile here, and would be a latency bug regardless.
+    let snapshot: Vec<FeedMessage> = {
+        let guard = crate::model::lock(instruments);
+        guard
+            .values()
+            .filter(|i| pass(&i.venue, &i.symbol, Some(i.channel), "instrument"))
+            .cloned()
+            .map(FeedMessage::Instrument)
+            .collect()
+    };
+    let depths: Vec<FeedMessage> = {
+        let guard = crate::model::lock(depth);
+        guard
+            .values()
+            .filter(|d| pass(&d.venue, &d.symbol, None, "depth"))
+            .cloned()
+            .map(FeedMessage::Depth)
+            .collect()
+    };
+    let rebaselines: Vec<FeedMessage> = {
+        let guard = crate::model::lock(books);
+        guard
+            .iter()
+            // A market accumulated partway through holds only the levels that have moved since, so
+            // replaying it as full state would tell the client to discard the ones it never saw.
+            .filter(|(_, acc)| acc.baselined())
+            // The key's second element is the producer-side arbitration scope (`Feed::category`,
+            // which keeps two universes' colliding instrument ids apart in the map); it is not a
+            // filter dimension and never reaches the wire.
+            // Filtered and tagged under the market's *own* type, matching the live feed it
+            // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and one
+            // subscribed to `book` alone must not be handed a market it cannot apply.
+            .filter(|((venue, _, channel, _), acc)| {
+                pass(venue, acc.symbol(), Some(*channel), book_kind(acc))
+            })
+            .map(|(key, acc)| {
+                let book = acc.to_book(key, book_scope(acc));
+                if acc.is_order_level() {
+                    FeedMessage::OrderBook(book)
+                } else {
+                    FeedMessage::Book(book)
+                }
+            })
+            .collect()
+    };
+    for m in snapshot.into_iter().chain(depths).chain(rebaselines) {
+        write
+            .send(WsMessage::Text(serde_json::to_string(&m)?.into()))
+            .await?;
+    }
+    Ok(())
+}
+
 async fn serve_client(
     stream: TcpStream,
     mut rx: broadcast::Receiver<Arc<PreparedFrame>>,
     instruments: InstrumentSnapshot,
     depth: DepthSnapshot,
+    books: BookSnapshot,
     cfg: WsConfig,
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
 
-    // Replay current instrument definitions first so precision is known before any quote/depth.
-    let snapshot: Vec<FeedMessage> = {
-        let guard = instruments.lock().unwrap();
-        guard
-            .values()
-            .cloned()
-            .map(FeedMessage::Instrument)
-            .collect()
-    };
-    for inst in snapshot {
-        write
-            .send(WsMessage::Text(serde_json::to_string(&inst)?.into()))
-            .await?;
-    }
-
-    // Then replay the latest order-book `depth` per (venue, symbol): depth is full state, so one
-    // replayed snapshot bootstraps a mid-stream consumer immediately instead of waiting for the
-    // next periodic one. (Quotes/trades are not replayed - the next quote is itself full state.)
-    let depth_snapshot: Vec<FeedMessage> = {
-        let guard = depth.lock().unwrap();
-        guard.values().cloned().map(FeedMessage::Depth).collect()
-    };
-    for d in depth_snapshot {
-        write
-            .send(WsMessage::Text(serde_json::to_string(&d)?.into()))
-            .await?;
-    }
-
     // Per-client state. Empty `subs` = firehose (receive every venue/symbol).
     let mut subs: Vec<SubFilter> = Vec::new();
+
+    // Replay definitions (precision first) then current book state, so a consumer joining partway is
+    // bootstrapped immediately instead of waiting for the next periodic book. (Quotes/trades are not
+    // replayed - the next quote is itself full state.) `subs` is empty here, so this connect-time
+    // replay is unfiltered.
+    replay_scoped(&mut write, &instruments, &depth, &books, &subs).await?;
+
     let mut last_seen = Instant::now();
     let mut win_start = Instant::now();
     let mut win_count: u32 = 0;
@@ -318,13 +486,23 @@ async fn serve_client(
                             if subs.len() >= cfg.max_subs {
                                 write.send(text(json!({"channel": "error", "error": "max subscriptions reached"}))).await?;
                             } else {
-                                if !subs.contains(&subscription) {
+                                let added = !subs.contains(&subscription);
+                                if added {
                                     subs.push(subscription.clone());
                                 }
                                 write.send(text(json!({
                                     "channel": "subscription_response", "method": "subscribe",
                                     "subscription": subscription,
                                 }))).await?;
+                                // Bootstrap the newly-added scope only: not all of `subs` (else a
+                                // client subscribing to ten symbols replays the first one ten times),
+                                // and nothing at all for a duplicate — a re-subscribe adds no scope,
+                                // and replaying anyway would let a client loop O(state) snapshot work
+                                // (taken under the mutex the ingest emit path shares) at the inbound
+                                // rate limit without ever reaching `max_subs`.
+                                if added {
+                                    replay_scoped(&mut write, &instruments, &depth, &books, std::slice::from_ref(&subscription)).await?;
+                                }
                             }
                         }
                         Ok(ClientMsg::Unsubscribe { subscription }) => {
@@ -362,28 +540,30 @@ async fn serve_client(
             // upstream (see `serve`); here we only filter and write a cheap `Utf8Bytes` clone.
             msg = rx.recv() => match msg {
                 Ok(frame) => {
-                    let pass = match &frame.symbol {
-                        // A venue-level status has no symbol, so match it by venue alone - else a
-                        // symbol-scoped subscription (e.g. {venue,symbol:"SOL"}) would never see it.
-                        None => {
-                            subs.is_empty()
-                                || subs.iter().any(|f| {
-                                    f.venue
-                                        .as_deref()
-                                        .is_none_or(|v| v.eq_ignore_ascii_case(&frame.venue))
-                                })
-                        }
-                        Some(sym) => {
-                            subs.is_empty() || subs.iter().any(|f| f.matches(&frame.venue, sym))
-                        }
-                    };
+                    // One match path for every kind, venue-level included: a dimension added to
+                    // `matches` cannot silently exempt half the feed.
+                    let pass = subs.is_empty()
+                        || subs.iter().any(|f| {
+                            f.matches(
+                                &frame.venue,
+                                frame.symbol.as_deref(),
+                                frame.channel,
+                                frame.kind,
+                            )
+                        });
                     if pass {
                         metrics().ws_messages_sent.with_label_values(&[frame.kind]).inc();
                         metrics().ws_bytes_sent.with_label_values(&[frame.kind]).inc_by(frame.payload.len() as u64);
                         write.send(WsMessage::Text(frame.payload.clone())).await?;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => { metrics().ws_client_lagged.inc(); warn!("subscriber lagged, dropped {n}"); }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    metrics().ws_client_lagged.inc();
+                    warn!("subscriber lagged, dropped {n}");
+                    // `book` is incremental: a dropped batch leaves this client's book permanently
+                    // wrong, so re-baseline it. (`quote`/`depth` self-heal on the next message.)
+                    replay_scoped(&mut write, &instruments, &depth, &books, &subs).await?;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         }
@@ -406,14 +586,14 @@ mod tests {
     use super::{serve, SubFilter, WsConfig, WsMessage};
     use crate::{
         metrics::metrics,
-        model::{FeedMessage, NormalizedQuote},
+        model::{
+            BookAccumulator, BookAction, BookChange, BookReplay, BookSide, FeedMessage,
+            NormalizedBook, NormalizedInstrument, NormalizedQuote,
+        },
     };
 
-    fn filter(venue: Option<&str>, symbol: Option<&str>) -> SubFilter {
-        SubFilter {
-            venue: venue.map(str::to_string),
-            symbol: symbol.map(str::to_string),
-        }
+    fn filter(json: &str) -> SubFilter {
+        serde_json::from_str(json).expect("filter parses")
     }
 
     #[test]
@@ -421,17 +601,165 @@ mod tests {
         // The wire venue is `Phoenix`; a filter spelled any case must still select it (the
         // PROTOCOL.md example historically showed `PHOENIX`, which would silently drop the feed
         // under an exact match).
-        assert!(filter(Some("PHOENIX"), None).matches("Phoenix", "BTC"));
-        assert!(filter(Some("phoenix"), None).matches("Phoenix", "BTC"));
-        assert!(filter(Some("Phoenix"), None).matches("Phoenix", "BTC"));
-        assert!(!filter(Some("Hyperliquid"), None).matches("Phoenix", "BTC"));
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"phoenix"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(filter(r#"{"venue":"PHOENIX"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        assert!(!filter(r#"{"venue":"HYPERLIQUID"}"#).matches(
+            "PHOENIX",
+            Some("BTC"),
+            None,
+            "quote"
+        ));
     }
 
     #[test]
     fn omitted_field_matches_any_symbol_exact() {
-        assert!(filter(None, None).matches("Phoenix", "BTC")); // {} = everything
-        assert!(filter(None, Some("BTC")).matches("Phoenix", "BTC"));
-        assert!(!filter(None, Some("btc")).matches("Phoenix", "BTC")); // symbol stays exact
+        assert!(filter("{}").matches("PHOENIX", Some("BTC"), None, "quote")); // {} = everything
+        assert!(filter(r#"{"symbol":"BTC"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+        // symbol stays exact
+        assert!(!filter(r#"{"symbol":"btc"}"#).matches("PHOENIX", Some("BTC"), None, "quote"));
+    }
+
+    /// The omitted-field-matches-anything rule must survive the two new dimensions.
+    #[test]
+    fn empty_filter_still_matches_everything() {
+        let f = filter("{}");
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(f.matches("KALSHI", None, None, "status"));
+    }
+
+    #[test]
+    fn type_filter_selects_one_message_kind() {
+        let f = filter(r#"{"type":"book"}"#);
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "quote"));
+    }
+
+    /// `type` is matched exactly, like `symbol`: the wire values are a closed set the protocol
+    /// defines, so a near-miss is a client bug worth surfacing as "no data" rather than guessing.
+    #[test]
+    fn type_filter_is_exact() {
+        assert!(!filter(r#"{"type":"BOOK"}"#).matches("KALSHI", Some("X"), None, "book"));
+    }
+
+    #[test]
+    fn channel_filter_selects_one_channel() {
+        let f = filter(r#"{"channel":2}"#);
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "book"));
+        assert!(!f.matches("KALSHI", Some("KXBTCPERP"), Some(1), "book"));
+    }
+
+    /// An explicit channel filter must not pass a message that carries no channel — otherwise
+    /// `{"channel":2}` would receive every quote on every venue.
+    #[test]
+    fn channel_filter_excludes_channelless_messages() {
+        assert!(!filter(r#"{"channel":2}"#).matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+    }
+
+    /// `instrument` carries its own channel, so it is filtered like `book`: a channel-scoped client
+    /// gets the definitions it needs to scale that channel's books, and no other channel's.
+    #[test]
+    fn channel_filter_selects_one_channels_instrument_definitions() {
+        let f = filter(r#"{"channel":2}"#);
+        assert!(f.matches("KALSHI", Some("KXBTCPERP"), Some(2), "instrument"));
+        assert!(!f.matches("KALSHI", Some("KXETHPERP"), Some(1), "instrument"));
+        // `symbol` still narrows instruments independently of the channel.
+        assert!(!filter(r#"{"channel":2,"symbol":"SOL"}"#).matches(
+            "KALSHI",
+            Some("KXBTCPERP"),
+            Some(2),
+            "instrument"
+        ));
+    }
+
+    /// `status` is venue-level: no symbol and no channel, so it matches on venue and type alone —
+    /// the same carve-out `symbol` already has, extended to `channel`. Without this a
+    /// `{"venue":"KALSHI","channel":2}` subscriber would never learn its venue went down.
+    #[test]
+    fn status_matches_on_venue_despite_symbol_and_channel_filters() {
+        let f = filter(r#"{"venue":"KALSHI","symbol":"KXBTCPERP","channel":2}"#);
+        assert!(f.matches("KALSHI", None, None, "status"));
+        assert!(!f.matches("HYPERLIQUID", None, None, "status"));
+    }
+
+    /// ...but an explicit `type` filter still excludes it, so a consumer that asked for `book` only
+    /// does not get status frames it never requested.
+    #[test]
+    fn type_filter_still_excludes_status() {
+        assert!(!filter(r#"{"type":"book"}"#).matches("KALSHI", None, None, "status"));
+    }
+
+    /// `book` and `instrument` must carry their channel so an explicit channel filter can select
+    /// them; every other kind carries none, which is what the filter's exclusion rule rests on.
+    #[test]
+    fn prepare_populates_the_channel_for_book_and_instrument() {
+        use super::prepare;
+        let b = FeedMessage::Book(NormalizedBook {
+            venue: "KALSHI".into(),
+            source_name: "KALSHI".into(),
+            source_id: 0,
+            symbol: "KXBTCPERP".into(),
+            channel: 2,
+            instrument_id: 41,
+            order_level: false,
+            changes: vec![BookChange {
+                action: BookAction::Update,
+                side: BookSide::Bid,
+                price: 0.62,
+                size: 150.0,
+                order_id: 0,
+            }],
+            snapshot: false,
+            last: true,
+            source_ts_ns: 1,
+            recv_ts_ns: 2,
+            kernel_rx_ts_ns: 3,
+            ws_send_ts_ns: 0,
+            category: "default".into(),
+        });
+        let f = prepare(&b).expect("serializes");
+        assert_eq!(f.kind, "book");
+        assert_eq!(f.channel, Some(2));
+        assert!(
+            !f.payload.contains("category"),
+            "category is producer-side only and must never reach the wire"
+        );
+        assert!(f.payload.contains(r#""ws_send_ts_ns":"#));
+        assert!(
+            !f.payload.contains(r#""ws_send_ts_ns":0"#),
+            "stamped, not left at 0"
+        );
+        let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
+            venue: "KALSHI".into(),
+            source_name: "KALSHI".into(),
+            source_id: 0,
+            symbol: "KXBTCPERP".into(),
+            channel: 2,
+            instrument_id: 41,
+            category: "default".into(),
+            price_exponent: -2,
+            qty_exponent: -2,
+        }))
+        .expect("serializes");
+        assert_eq!(i.kind, "instrument");
+        assert_eq!(i.channel, Some(2));
+        assert!(
+            !i.payload.contains("category"),
+            "category is producer-side only and must never reach the wire"
+        );
+
+        assert_eq!(
+            prepare(&FeedMessage::Quote(sample_quote()))
+                .expect("serializes")
+                .channel,
+            None
+        );
+    }
+
+    #[test]
+    fn venue_stays_case_insensitive() {
+        assert!(filter(r#"{"venue":"kalshi"}"#).matches("KALSHI", Some("X"), None, "book"));
     }
 
     /// Poll `cond` until it holds, failing the test if it doesn't within ~2s. The metric updates we
@@ -448,7 +776,9 @@ mod tests {
 
     fn sample_quote() -> NormalizedQuote {
         NormalizedQuote {
-            venue: "Hyperliquid".into(),
+            venue: "HYPERLIQUID".into(),
+            source_name: "HYPERLIQUID".into(),
+            source_id: 0,
             symbol: "BTC".into(),
             bid: 1.0,
             ask: 2.0,
@@ -488,7 +818,8 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -551,7 +882,8 @@ mod tests {
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
         };
-        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, cfg));
+        let books = Arc::new(Mutex::new(BookReplay::default()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
 
         let (mut ws1, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -599,5 +931,984 @@ mod tests {
         );
 
         srv.abort();
+    }
+
+    /// A `subscribe` replays current state scoped to the filter just added, so a client that narrows
+    /// after connecting is bootstrapped for its new scope instead of waiting for the next event —
+    /// and only for that scope. `#[serial]` for the shared `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_replays_only_the_new_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+
+        let mut defs = HashMap::new();
+        for (n, sym) in ["SOL", "BTC"].into_iter().enumerate() {
+            let arc: Arc<str> = sym.into();
+            defs.insert(
+                (
+                    Arc::<str>::from("HYPERLIQUID"),
+                    Arc::<str>::from("default"),
+                    0u8,
+                    n as u32,
+                ),
+                NormalizedInstrument {
+                    venue: "HYPERLIQUID".into(),
+                    source_name: "HYPERLIQUID".into(),
+                    source_id: 0,
+                    symbol: arc,
+                    channel: 0,
+                    instrument_id: n as u32,
+                    category: "default".into(),
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                },
+            );
+        }
+        let instruments = Arc::new(Mutex::new(defs));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let books = Arc::new(Mutex::new(BookReplay::default()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        // The next text frame, skipping the server's heartbeat Pings.
+        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
+        where
+            S: futures_util::StreamExt<
+                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
+                > + Unpin,
+        {
+            timeout(within, async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                        Some(Ok(_)) => continue,
+                        other => panic!("stream ended: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .ok()
+        }
+
+        // Connect-time replay is unfiltered: both definitions arrive.
+        let mut connect_replay = Vec::new();
+        for _ in 0..2 {
+            connect_replay.push(
+                next_text(&mut ws, Duration::from_secs(2))
+                    .await
+                    .expect("replayed instrument"),
+            );
+        }
+        assert!(connect_replay.iter().any(|t| t.contains("\"SOL\"")));
+        assert!(connect_replay.iter().any(|t| t.contains("\"BTC\"")));
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"SOL"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // The ack, then a replay scoped to the filter just added: SOL only, nothing else.
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let replayed = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped replay frame");
+        assert!(replayed.contains("\"instrument\"") && replayed.contains("\"SOL\""));
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "BTC must not be replayed for a SOL subscription"
+        );
+
+        // A duplicate subscribe adds no scope, so it is acked and replays nothing — otherwise a
+        // client could loop full-state replays at the inbound rate limit without reaching max_subs.
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"SOL"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "a re-subscribe must not replay again"
+        );
+
+        srv.abort();
+    }
+
+    /// A `{"channel":N}` subscriber's replay is scoped by the instrument's own channel, so it is
+    /// bootstrapped with the definitions it can use and not another channel's. The two markets
+    /// differ by channel (the snapshot's actual identity component); distinct symbols are used too,
+    /// purely so the assertions below can tell them apart by content. `#[serial]` for the shared
+    /// `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn replay_is_scoped_to_the_subscribed_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+
+        let mut defs = HashMap::new();
+        for (sym, channel) in [("KXBTCPERP", 2u8), ("KXETHPERP", 3)] {
+            let arc: Arc<str> = sym.into();
+            defs.insert(
+                (
+                    Arc::<str>::from("KALSHI"),
+                    Arc::<str>::from("default"),
+                    channel,
+                    41u32,
+                ),
+                NormalizedInstrument {
+                    venue: "KALSHI".into(),
+                    source_name: "KALSHI".into(),
+                    source_id: 0,
+                    symbol: arc,
+                    channel,
+                    instrument_id: 41,
+                    category: "default".into(),
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                },
+            );
+        }
+        let instruments = Arc::new(Mutex::new(defs));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let srv = tokio::spawn(serve(
+            listener,
+            tx.clone(),
+            instruments,
+            depth,
+            Arc::new(Mutex::new(BookReplay::default())),
+            cfg,
+        ));
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        async fn next_text<S>(ws: &mut S, within: Duration) -> Option<String>
+        where
+            S: futures_util::StreamExt<
+                    Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
+                > + Unpin,
+        {
+            timeout(within, async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                        Some(Ok(_)) => continue,
+                        other => panic!("stream ended: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .ok()
+        }
+
+        // Connect-time replay has no subscriptions to scope by: both definitions arrive.
+        for _ in 0..2 {
+            next_text(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed instrument");
+        }
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":2}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let ack = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let replayed = next_text(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped replay frame");
+        assert!(
+            replayed.contains(r#""instrument""#) && replayed.contains(r#""KXBTCPERP""#),
+            "got {replayed}"
+        );
+        assert_eq!(
+            next_text(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "channel 3's definition must not be replayed for a channel 2 subscription"
+        );
+
+        srv.abort();
+    }
+
+    fn level_update(side: BookSide, price: f64, size: f64) -> BookChange {
+        BookChange {
+            action: BookAction::Update,
+            side,
+            price,
+            size,
+            order_id: 0,
+        }
+    }
+
+    fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
+        NormalizedBook {
+            venue: "KALSHI".into(),
+            source_name: "KALSHI".into(),
+            source_id: 0,
+            symbol: symbol.into(),
+            channel: 0,
+            instrument_id: 0,
+            order_level: changes.iter().any(|c| c.order_id != 0),
+            changes,
+            snapshot: false,
+            last,
+            source_ts_ns: 7,
+            recv_ts_ns: 0,
+            kernel_rx_ts_ns: 0,
+            ws_send_ts_ns: 0,
+            category: crate::model::empty_category(),
+        }
+    }
+
+    /// A market whose levels are its whole book: a producer re-baseline (`Clear`-led), folded from a
+    /// two-batch logical event (the first batch is not `last`, so only the pair together is replayed).
+    fn accumulator(symbol: &str, bid: f64, ask: f64) -> BookAccumulator {
+        let mut acc = BookAccumulator::new(symbol.into());
+        acc.apply(&book_batch(
+            symbol,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                },
+                level_update(BookSide::Bid, bid, 10.0),
+            ],
+            false,
+        ));
+        acc.apply(&book_batch(
+            symbol,
+            vec![level_update(BookSide::Ask, ask, 20.0)],
+            true,
+        ));
+        acc
+    }
+
+    /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
+    /// the caller for the lifetime of the test.
+    async fn spawn_server(
+        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
+        books: BookReplay,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        broadcast::Sender<std::sync::Arc<FeedMessage>>,
+        std::net::SocketAddr,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+        };
+        let srv = tokio::spawn(serve(
+            listener,
+            tx.clone(),
+            Arc::new(Mutex::new(instruments)),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(books)),
+            cfg,
+        ));
+        (srv, tx, addr)
+    }
+
+    /// The next text frame, skipping the server's heartbeat Pings.
+    async fn next_frame<S>(ws: &mut S, within: Duration) -> Option<String>
+    where
+        S: futures_util::StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        timeout(within, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(WsMessage::Text(t))) => return t.to_string(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("stream ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Accepts either book type — the granularity is the market's, and most callers here assert the
+    /// body rather than the tag. `book_type` is what pins the tag.
+    fn parse_book(frame: &str) -> NormalizedBook {
+        match serde_json::from_str(frame).expect("frame parses") {
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => b,
+            other => panic!("expected a book frame, got {other:?}"),
+        }
+    }
+
+    /// The wire `type` of a frame, verbatim.
+    fn book_type(frame: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(frame).expect("frame parses")["type"]
+            .as_str()
+            .expect("a type tag")
+            .to_string()
+    }
+
+    /// A connecting client is bootstrapped with the accumulated `book` state as a re-baseline: a
+    /// `Clear`/`Both` leading the complete level set, best-first, marked `last`.
+    #[tokio::test]
+    #[serial]
+    async fn connect_replays_the_accumulated_book_rebaseline() {
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed book");
+        let b = parse_book(&frame);
+        assert_eq!(
+            (&*b.symbol, b.channel, b.instrument_id),
+            ("KXBTCPERP", 2, 41)
+        );
+        assert!(b.snapshot && b.last, "a re-baseline is a complete event");
+        assert_eq!(b.changes[0].action, BookAction::Clear);
+        assert_eq!(b.changes[0].side, BookSide::Both);
+        assert_eq!(
+            b.changes[1..],
+            [
+                level_update(BookSide::Bid, 0.61, 10.0),
+                level_update(BookSide::Ask, 0.63, 20.0),
+            ]
+        );
+
+        srv.abort();
+    }
+
+    /// An order-level accumulator, bootstrappable: a `Clear`-led re-baseline holding two resting
+    /// orders at one price — the population a price-keyed consumer would collapse to one.
+    fn order_level_accumulator(symbol: &str) -> BookAccumulator {
+        let mut acc = BookAccumulator::new(symbol.into());
+        acc.apply(&book_batch(
+            symbol,
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 5.0,
+                    order_id: 7,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 3.0,
+                    order_id: 8,
+                },
+            ],
+            true,
+        ));
+        acc
+    }
+
+    /// The wire `type` follows the market's granularity, and **only** the tag differs: a consumer
+    /// routing on `type` never has to inspect a change to learn which product it holds.
+    #[test]
+    fn the_wire_type_follows_the_market_granularity() {
+        use super::prepare;
+        let level = book_batch(
+            "KXBTCPERP",
+            vec![level_update(BookSide::Bid, 0.62, 150.0)],
+            true,
+        );
+        let mut order = level.clone();
+        order.order_level = true;
+        order.changes[0].order_id = 7;
+
+        let plain = prepare(&FeedMessage::Book(level)).expect("serializes");
+        assert_eq!(
+            plain.kind, "book",
+            "a price-aggregated market keeps the type it always had"
+        );
+        let f = prepare(&FeedMessage::Book(order)).expect("serializes");
+        assert_eq!(f.kind, "order_book");
+        assert!(
+            f.payload.as_str().contains(r#""type":"order_book""#),
+            "the rendered tag must match the filter kind, got {}",
+            f.payload.as_str()
+        );
+        // Same envelope either way, so a consumer that does know `order_book` parses it with the body
+        // it already has.
+        assert!(f.payload.as_str().contains(r#""order_id":7"#));
+        // The filter fields are read off the original message, so re-tagging cannot disturb them —
+        // asserted against the price-aggregated frame rather than literals, since losing `channel`
+        // here would silently strip order-level markets from every `{"channel":N}` subscriber.
+        assert_eq!((f.channel, &f.symbol), (plain.channel, &plain.symbol));
+    }
+
+    /// **The compatibility guarantee.** A consumer that subscribes to `type: book` must receive
+    /// neither the bootstrap nor the live feed of an order-level market: keying those changes by
+    /// price collapses two orders resting at one price to the last one's size. A distinct type is the
+    /// mechanism PROTOCOL.md's forward-compatibility rule already promises, which is what makes this
+    /// additive rather than breaking.
+    ///
+    /// Scoped to a client that *asks*, deliberately. The connect-time replay is unfiltered — an empty
+    /// filter list is the documented firehose — so an `order_book` frame does reach a client that
+    /// subscribed to nothing, and safety there rests on it ignoring unknown types, exactly as it does
+    /// for any type added since it was written.
+    #[tokio::test]
+    #[serial]
+    async fn a_book_subscriber_is_never_served_an_order_level_market() {
+        use futures_util::SinkExt;
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("HYPERLIQUID"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            order_level_accumulator("BTC"),
+        );
+        // A price-aggregated market beside it, so "received nothing" cannot pass this by accident:
+        // the `book` subscriber must still be bootstrapped with this one.
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Drain the unfiltered connect replay (both markets) — see the note above.
+        for _ in 0..2 {
+            next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("connect replay");
+        }
+
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"type":"book"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+
+        // The scoped replay: the price-aggregated market, and only it.
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("scoped book replay");
+        assert_eq!(book_type(&frame), "book", "got {frame}");
+        assert_eq!(&*parse_book(&frame).symbol, "KXBTCPERP");
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "the order-level market must not be bootstrapped for a `book` subscription"
+        );
+
+        // And the live feed is filtered by the same one `SubFilter::matches` path.
+        let mut order = book_batch("BTC", vec![level_update(BookSide::Bid, 100.0, 5.0)], true);
+        order.order_level = true;
+        order.changes[0].order_id = 9;
+        let _ = tx.send(Arc::new(FeedMessage::Book(order)));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "a live order-level batch must not reach a `book` subscriber"
+        );
+
+        srv.abort();
+    }
+
+    /// An order-level market bootstraps as **orders**, matching the feed the client is about to
+    /// receive: a level bootstrap followed by order-level changes cannot be reconciled, and no
+    /// subscription can ask for one.
+    #[tokio::test]
+    #[serial]
+    async fn the_book_replay_scope_always_follows_the_market() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        acc.apply(&book_batch(
+            "BTC",
+            vec![
+                BookChange {
+                    action: BookAction::Clear,
+                    side: BookSide::Both,
+                    price: 0.0,
+                    size: 0.0,
+                    order_id: 0,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 5.0,
+                    order_id: 7,
+                },
+                BookChange {
+                    action: BookAction::Update,
+                    side: BookSide::Bid,
+                    price: 100.0,
+                    size: 3.0,
+                    order_id: 8,
+                },
+            ],
+            true,
+        ));
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("HYPERLIQUID"),
+                Arc::<str>::from("perps"),
+                0u8,
+                1u32,
+            ),
+            acc,
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed book");
+        assert_eq!(
+            book_type(&frame),
+            "order_book",
+            "the bootstrap must carry the same type as the feed it precedes"
+        );
+        let b = parse_book(&frame);
+        assert_eq!(
+            b.changes
+                .iter()
+                .filter(|c| c.action != BookAction::Clear)
+                .map(|c| c.order_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8],
+            "the default bootstrap must carry the order ids the feed carries"
+        );
+
+        // A subscription cannot ask for anything else. `book_scope: "levels"` used to fold the
+        // bootstrap while the live feed stayed order-level, which is unusable: an order-level
+        // change carries one *order's* absolute size, and a client handed price levels holds no
+        // order state to apply it to. The field is gone, and an unknown key is ignored, so a client
+        // still sending it is bootstrapped at the market's own granularity.
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"BTC","book_scope":"levels"}}"#
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("book replay"),
+        );
+        assert_eq!(
+            b.changes
+                .iter()
+                .filter(|c| c.action != BookAction::Clear)
+                .map(|c| c.order_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8],
+            "an order-level market is always bootstrapped as orders"
+        );
+
+        srv.abort();
+    }
+
+    /// A `{"channel":N}` subscribe replays only that channel's markets — the reason `replay_scoped`
+    /// passes each message's own channel to the filter instead of `None`.
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_scopes_the_book_replay_by_channel() {
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                3u8,
+                7u32,
+            ),
+            accumulator("KXETHPERP", 0.41, 0.43),
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Connect-time replay is unfiltered: both markets arrive.
+        for _ in 0..2 {
+            next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed book");
+        }
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":3}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("scoped book replay"),
+        );
+        assert_eq!((b.channel, b.instrument_id), (3, 7));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "channel 2 must not be replayed for a channel 3 subscription"
+        );
+
+        srv.abort();
+    }
+
+    /// A `channel` past the wire's width is refused as a malformed frame, not accepted as a filter
+    /// that then matches nothing for the life of the client. The frame is refused, the connection is
+    /// not.
+    #[tokio::test]
+    #[serial]
+    async fn a_subscribe_channel_above_the_wire_width_is_answered_with_an_error() {
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), BookReplay::default()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":300}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let frame = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("error frame");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("frame parses");
+        assert_eq!(v["channel"], "error", "got {frame}");
+        assert_eq!(v["error"], "unrecognized message", "got {frame}");
+
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"channel":3}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+
+        srv.abort();
+    }
+
+    /// Precision before price: the `instrument` definition is replayed ahead of the market's `book`.
+    #[tokio::test]
+    #[serial]
+    async fn instrument_is_replayed_before_the_book() {
+        let mut defs = HashMap::new();
+        defs.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            NormalizedInstrument {
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 0,
+                symbol: "KXBTCPERP".into(),
+                channel: 2,
+                instrument_id: 41,
+                category: "perps".into(),
+                price_exponent: -2,
+                qty_exponent: -2,
+            },
+        );
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, _tx, addr) = spawn_server(defs, books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let first = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed instrument");
+        assert!(
+            first.contains(r#""type":"instrument""#) && first.contains("KXBTCPERP"),
+            "definition must arrive first, got {first}"
+        );
+        let second = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("replayed book");
+        assert_eq!(parse_book(&second).channel, 2);
+
+        srv.abort();
+    }
+
+    /// Only a re-baselined market is bootstrapped. One accumulated partway through holds just the levels
+    /// that have moved since, and `to_book` stamps `snapshot: true` — replaying it would tell the
+    /// client to discard the rest of the book. Such a client waits for the producer's next
+    /// re-baseline, as it did before the book replay existed.
+    #[tokio::test]
+    #[serial]
+    async fn markets_accumulated_partway_are_not_replayed() {
+        let mut accumulated_partway = BookAccumulator::new("KXETHPERP".into());
+        accumulated_partway.apply(&book_batch(
+            "KXETHPERP",
+            vec![level_update(BookSide::Bid, 0.41, 5.0)],
+            true,
+        ));
+        assert!(!accumulated_partway.baselined(), "no Clear was folded in");
+
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                3u8,
+                7u32,
+            ),
+            accumulated_partway,
+        );
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let (srv, _tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("replayed book"),
+        );
+        assert_eq!((b.channel, b.instrument_id), (2, 41));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "a market with no re-baseline must not be replayed as full state"
+        );
+
+        srv.abort();
+    }
+
+    /// A client that lagged is re-baselined rather than left holding a book missing a batch. The lag
+    /// is deterministic: the receiver is overflowed before `serve_client` first polls it, so the very
+    /// first `recv` returns `Lagged`.
+    #[tokio::test]
+    async fn a_lagging_client_is_rebaselined() {
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Connect replay, the re-baseline the lag triggers, then the frame that survived the overflow.
+        for expected in ["connect replay", "re-baseline after lag"] {
+            let frame = next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect(expected);
+            assert_eq!(parse_book(&frame).instrument_id, 41, "{expected}");
+        }
+        let quote = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("surviving quote");
+        assert!(quote.contains(r#""type":"quote""#), "got {quote}");
+
+        srv.abort();
+    }
+
+    #[test]
+    fn a_source_name_filter_selects_the_same_messages_as_a_venue_filter() {
+        let by_venue: SubFilter = serde_json::from_str(r#"{"venue":"HYPERLIQUID"}"#).unwrap();
+        let by_source: SubFilter =
+            serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
+        for kind in ["quote", "trade", "status"] {
+            assert_eq!(
+                by_venue.matches("HYPERLIQUID", Some("SOL"), None, kind),
+                by_source.matches("HYPERLIQUID", Some("SOL"), None, kind),
+            );
+            assert!(!by_source.matches("PHOENIX", Some("SOL"), None, kind));
+        }
+    }
+
+    /// The alias keeps the case-insensitivity the venue key already had.
+    #[test]
+    fn a_source_name_filter_is_case_insensitive() {
+        let f: SubFilter = serde_json::from_str(r#"{"source_name":"HYPERLIQUID"}"#).unwrap();
+        assert!(f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+    }
+
+    /// Both keys present and disagreeing must match nothing — silently honouring one would make a
+    /// client's filter mean something it did not ask for.
+    #[test]
+    fn disagreeing_source_name_and_venue_keys_match_nothing() {
+        let f: SubFilter =
+            serde_json::from_str(r#"{"venue":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
+        assert!(!f.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!f.matches("PHOENIX", Some("SOL"), None, "quote"));
+    }
+
+    /// The pre-rename `source` key still narrows, and — the reason it is its own field rather than a
+    /// `serde(alias)` — a client sending **both** spellings is accepted rather than having the whole
+    /// `subscribe` refused as a duplicate field, which would have registered no filter at all and
+    /// left it on the firehose, then cost it the messages it did ask for to drop-oldest backpressure.
+    #[test]
+    fn the_retired_source_key_narrows_and_composes_with_the_new_one() {
+        let retired: SubFilter = serde_json::from_str(r#"{"source":"HYPERLIQUID"}"#).unwrap();
+        assert!(retired.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!retired.matches("PHOENIX", Some("SOL"), None, "quote"));
+
+        let both: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"HYPERLIQUID"}"#)
+                .expect("both spellings must parse, not collide");
+        assert!(both.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+
+        // ANDed like `venue`, so a disagreeing pair matches nothing rather than honouring one.
+        let disagreeing: SubFilter =
+            serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
+        assert!(!disagreeing.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
+        assert!(!disagreeing.matches("PHOENIX", Some("SOL"), None, "quote"));
     }
 }

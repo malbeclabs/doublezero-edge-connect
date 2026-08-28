@@ -1,7 +1,7 @@
-//! Decoder for the DoubleZero Edge **Midpoint** feed (frame magic `0x4D44`).
+//! Decoder for the DoubleZero Edge **Midpoint** feed (datagram magic `0x4D44`).
 //!
-//! A sibling protocol to Top-of-Book that carries a single derived mid price per instrument. It
-//! shares the 24-byte frame header / 4-byte message header / generic frame-walker in
+//! A feed alongside Top-of-Book that carries a single derived mid price per instrument. It
+//! shares the 24-byte datagram header / 4-byte message header / generic datagram-walker in
 //! [`crate::ingest::codec_common`]; only the magic and the message bodies differ. Its
 //! `InstrumentDefinition` is a distinct 64-byte layout (a `Default Method` byte where Top-of-Book
 //! has `qty_exponent`/`market_model`, and no lot/contract/settle fields), and it adds the 40-byte
@@ -9,7 +9,7 @@
 //!
 //! ⚠️ Byte offsets below come from the edge-feed-spec draft, **not** a byte-validated reference
 //! codec (unlike Top-of-Book, which is byte-validated against a reference codec). They must
-//! be confirmed against a live frame hexdump before this decoder's output is trusted in
+//! be confirmed against a live datagram hexdump before this decoder's output is trusted in
 //! production - the round-trip test here only pins internal self-consistency.
 
 use std::sync::Arc;
@@ -18,10 +18,17 @@ use anyhow::Result;
 
 pub use crate::ingest::codec_common::MSG_HEADER_SIZE;
 use crate::ingest::codec_common::{
-    cstr, decode_frame_with, i64le, u16le, u32le, u64le, u8le, FrameHeader,
+    cstr, decode_datagram_with, i64le, u16le, u32le, u64le, u8le, DatagramHeader, SCHEMA_V1,
 };
 
 pub const MAGIC: u16 = 0x4D44; // "DM"
+
+/// Wire generations this feed implements — `1` alone.
+///
+/// Midpoint kept its slimmed 64-byte `InstrumentDefinition` when its five siblings widened `Symbol`
+/// and then took `Source ID`, so it never left generation 1. The version byte is per-feed, not
+/// global: a `3` on this magic is a misrouted or misconfigured publisher, not a newer midpoint.
+const SUPPORTED_VERSIONS: &[u8] = &[SCHEMA_V1];
 
 pub const MSG_HEARTBEAT: u8 = 0x01;
 pub const MSG_INSTRUMENT_DEFINITION: u8 = 0x02;
@@ -99,10 +106,13 @@ pub enum Message {
 }
 
 /// Decode one Midpoint-feed UDP datagram into a header and its application messages.
-pub fn decode_frame(buf: &[u8]) -> Result<(FrameHeader, Vec<Message>)> {
-    decode_frame_with(buf, MAGIC, |msg_type, _flags, b, o| {
-        decode_message(msg_type, b, o)
-    })
+pub fn decode_datagram(buf: &[u8]) -> Result<(DatagramHeader, Vec<Message>)> {
+    decode_datagram_with(
+        buf,
+        MAGIC,
+        SUPPORTED_VERSIONS,
+        |msg_type, _flags, b, o, _ver| decode_message(msg_type, b, o),
+    )
 }
 
 fn decode_message(msg_type: u8, b: &[u8], o: usize) -> Message {
@@ -146,10 +156,10 @@ fn decode_body(msg_type: u8, b: &[u8], o: usize) -> Option<Message> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::ingest::codec_common::{apply_exponent, FRAME_HEADER_SIZE};
+    use crate::ingest::codec_common::{apply_exponent, DATAGRAM_HEADER_SIZE};
 
-    pub(crate) fn frame(body: Vec<u8>, msg_count: u8) -> Vec<u8> {
-        let frame_len = (FRAME_HEADER_SIZE + body.len()) as u16;
+    pub(crate) fn datagram(body: Vec<u8>, msg_count: u8) -> Vec<u8> {
+        let datagram_len = (DATAGRAM_HEADER_SIZE + body.len()) as u16;
         let mut f = Vec::new();
         f.extend_from_slice(&MAGIC.to_le_bytes());
         f.push(1); // schema version
@@ -158,24 +168,9 @@ pub(crate) mod tests {
         f.extend_from_slice(&0u64.to_le_bytes()); // send ts
         f.push(msg_count);
         f.push(0); // reset count
-        f.extend_from_slice(&frame_len.to_le_bytes());
+        f.extend_from_slice(&datagram_len.to_le_bytes());
         f.extend_from_slice(&body);
         f
-    }
-
-    /// Encode a valid ManifestSummary wire message (24 bytes total): 4-byte message header + a
-    /// 20-byte body matching the `decode_body` offsets — +0 channel_id, +1 valid, +4 manifest_seq
-    /// (u16le), +8 instrument_count (u32le), +12 ts (u64le).
-    pub(crate) fn encode_manifest(manifest_seq: u16, instrument_count: u32) -> Vec<u8> {
-        let mut b = vec![MSG_MANIFEST_SUMMARY, 24, 0, 0];
-        b.push(0); // channel_id
-        b.push(1); // valid
-        b.extend_from_slice(&[0u8; 2]); // pad
-        b.extend_from_slice(&manifest_seq.to_le_bytes());
-        b.extend_from_slice(&[0u8; 2]); // pad
-        b.extend_from_slice(&instrument_count.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes()); // ts
-        b
     }
 
     pub(crate) fn encode_midpoint(m: &Midpoint) -> Vec<u8> {
@@ -224,9 +219,9 @@ pub(crate) mod tests {
             compute_ts: 1_780_000_000_000_000_123,
             mid_price_raw: 18_420,
         };
-        let f = frame(encode_midpoint(&m), 1);
-        assert_eq!(f.len(), FRAME_HEADER_SIZE + 40);
-        let (_h, msgs) = decode_frame(&f).unwrap();
+        let f = datagram(encode_midpoint(&m), 1);
+        assert_eq!(f.len(), DATAGRAM_HEADER_SIZE + 40);
+        let (_h, msgs) = decode_datagram(&f).unwrap();
         match &msgs[0] {
             Message::Midpoint(got) => {
                 assert_eq!(got.instrument_id, 7);
@@ -251,9 +246,9 @@ pub(crate) mod tests {
             default_method: 3,
             manifest_seq: 5,
         };
-        let f = frame(encode_instrument(&d), 1);
-        assert_eq!(f.len(), FRAME_HEADER_SIZE + 64);
-        let (_h, msgs) = decode_frame(&f).unwrap();
+        let f = datagram(encode_instrument(&d), 1);
+        assert_eq!(f.len(), DATAGRAM_HEADER_SIZE + 64);
+        let (_h, msgs) = decode_datagram(&f).unwrap();
         match &msgs[0] {
             Message::InstrumentDefinition(got) => {
                 assert_eq!(got.instrument_id, 7);
@@ -268,8 +263,8 @@ pub(crate) mod tests {
 
     #[test]
     fn bad_magic_errors() {
-        // A Top-of-Book frame (magic 0x445A) must not decode as a Midpoint frame.
-        let mut f = frame(
+        // A Top-of-Book datagram (magic 0x445A) must not decode as a Midpoint datagram.
+        let mut f = datagram(
             encode_midpoint(&Midpoint {
                 instrument_id: 1,
                 source_id: 1,
@@ -283,6 +278,6 @@ pub(crate) mod tests {
         );
         f[0] = 0x5A;
         f[1] = 0x44; // overwrite magic with 0x445A
-        assert!(decode_frame(&f).is_err());
+        assert!(decode_datagram(&f).is_err());
     }
 }

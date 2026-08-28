@@ -1,5 +1,5 @@
 //! Real-traffic validation of the shred parser/verifier/dedup against a captured `edge-solana-*`
-//! frame sample. Unlike the self-consistency round-trips in `parse.rs` (which build a shred the way
+//! datagram sample. Unlike the self-consistency round-trips in `parse.rs` (which build a shred the way
 //! agave does and re-parse it — they cannot catch a constant that both sides share), these run the
 //! pipeline over **real mainnet shreds** and check the leader's ed25519 signature. A wrong offset,
 //! payload size, or variant mapping fails the signature with overwhelming probability, so a passing
