@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Fixed
+- `MidpointProcessor` held a single bare `SeqTracker` where its siblings key one per publisher.
+  Datagram sequence is scoped to `(source_ip, group, port)`, so under a shared port block two
+  mirrored publishers' independent sequence spaces interleaved onto one anchor and whichever ran
+  lower read as stale on every datagram: its mids were dropped outright while
+  `dz_seq_events_total{kind="stale"}` climbed on a perfectly healthy feed. Both the sequence
+  trackers and the reference-data state now share one bounded `PerPublisher` map rather than three
+  hand-copied eviction loops. Latent — no feed row selects `FeedKind::Midpoint`. **Enabling one now
+  also requires giving `Midpoint` a `(venue, symbol)` staleness floor in the arbiter**, where it is
+  a bare passthrough: with both mirrors unblocked, a slower one's older mid overwrites the fresher.
+  Which clock that floor latches on is undecidable until this codec's offsets are validated against
+  a live datagram, so it is recorded alongside that precondition rather than guessed at. (#109)
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it
@@ -670,12 +681,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   went live — settles at ~12 rejoins/hour. Detection is unchanged: the socket stays bound, so a
   returning publisher is picked up on its first datagram, and the first `status: down` still fires
   at 30s. The interval resets only on market data arriving, never on a successful bind. (#93)
-- `MidpointProcessor` held a single bare `SeqTracker` instead of one per publisher. Frame sequence
-  is scoped to `(source_ip, group, port)`, so under a shared port block two mirrored publishers'
-  independent sequence spaces interleaved onto one anchor and whichever ran lower read as stale on
-  every frame: its mids were dropped outright while `dz_seq_events_total{kind="stale"}` climbed on a
-  perfectly healthy feed. Now keyed by source IP and bounded by `MAX_PUBLISHERS` exactly as
-  `TobProcessor`'s already was. Latent — no `FEEDS` row uses `FeedKind::Midpoint` yet. (#109)
 
 ### Changed
 - Trade-tape ownership is now a **runtime** decision instead of the static `Feed.emit_trades` flag. A venue's feeds can ride separate multicast groups with separate subscription codes, so a host may hold one and not the other and still needs a tape on the wire; both rows now claim trades and the reconciler ranks the running receivers (top of book over market-by-price) and flips an `AtomicBool` each processor reads per print. Ownership therefore moves **without respawning** the receiver that keeps it — a respawn would drop a healthy publisher's books and reference data every time a peer feed's subscription changed. `emit_trades` survives as the static capability claim, pinned against the ranking by a new agreement test in place of `at_most_one_trade_emitting_row_per_venue`. Within the owning row, a **per-venue tape leader** gates `Sticky` venues one level down: those paths share no trade-id space (one may stamp the `trade_id == 0` sentinel while its peer stamps a real venue id, a pair neither the sentinel latch nor the dedup window collapses), so the gate is id-independent: first path to print leads, a path the authority tracks displaces one it does not, the book-elected path takes over once per election, and a silent incumbent yields after 5s so a dead trade feed never mutes the tape. Row ownership is likewise ordered liveness before rank, so a subscribed-but-dead row cannot hold the tape while its peer decodes prints and drops them. Together they preserve the invariant the sentinel bypass rests on: **at most one tape emitter per venue at any moment.** `dz_tape_owner_changes_total`, `dz_tape_path_transfers_total` and `dz_tape_path_dropped_total` report the moves and the drops. Every venue live today is `Coordinated`, so the path gate changes nothing currently running. (#106)

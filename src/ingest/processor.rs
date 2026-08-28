@@ -110,24 +110,29 @@ impl SeqEvents {
     }
 }
 
-/// Cap on the number of distinct publishers (source IP addresses) tracked by [`TobProcessor`]'s per-publisher
-/// sequence map. The source IP address comes from an *unauthenticated, spoofable* UDP datagram, so without a
-/// bound an attacker who can inject into the multicast group could mint a fresh `SeqTracker` per
-/// forged source IP address and grow the map without limit (memory-exhaustion DoS). Real deployments have a
-/// handful of mirrored publishers, so this is set far above that; once full, the least-recently-
-/// inserted publisher is evicted (it simply re-anchors its sequence on its next datagram).
+/// Cap on the number of distinct publishers (source IP addresses) any [`PerPublisher`] map tracks —
+/// every processor's reference-data state and sequence trackers alike. The source IP address comes
+/// from an *unauthenticated, spoofable* UDP datagram, so without a bound an attacker who can inject
+/// into the multicast group could mint a fresh entry per forged source IP address and grow the map
+/// without limit (memory-exhaustion DoS). Real deployments have a handful of mirrored publishers, so
+/// this is set far above that; once full, the least-recently-inserted publisher is evicted (it simply
+/// re-anchors its sequence, or re-learns its definitions, on its next datagram).
 pub(crate) const MAX_PUBLISHERS: usize = 256;
 
-/// Per-publisher reference-data state, bounded exactly like the per-publisher sequence map.
+/// A [`MAX_PUBLISHERS`]-bounded map of state that is scoped to `(source_ip, group, port)` and so
+/// cannot be shared across the publishers of one port block. Two things qualify, and both use this:
 ///
-/// `reset_count` is scoped to `(source_ip, group, port)`, so two publishers sharing a port block
-/// carry unrelated reset counters: under one shared [`RefDataState`] either path's restart clears the
-/// other's instrument set, blanking both, since every emission path gates on a resolved definition.
-/// The source IP address is spoofable, so the map takes the same [`MAX_PUBLISHERS`] least-recently-inserted
-/// eviction as the sequence map — an evicted publisher re-learns its definitions from the next
-/// reference-data burst.
-struct PerPublisher<D> {
-    states: HashMap<IpAddr, RefDataState<D>>,
+/// - The **sequence tracker**. Mirrored publishers run independent, unrelated sequence spaces, so a
+///   shared tracker leaves whichever runs lower permanently below the other's anchor: `SeqCheck::Stale`
+///   on every datagram, its market data dropped outright, `dz_seq_events_total{kind="stale"}` climbing
+///   on a healthy feed.
+/// - The **reference-data state machine**. `reset_count` is likewise per publisher, so under one
+///   shared [`RefDataState`] either path's restart clears the other's instrument set, blanking both —
+///   every emission path gates on a resolved definition.
+///
+/// The source IP address is spoofable, hence the bound and its least-recently-inserted eviction.
+struct PerPublisher<V> {
+    states: HashMap<IpAddr, V>,
     /// Insertion order of `states` keys, oldest at the front, for the [`MAX_PUBLISHERS`] eviction.
     order: VecDeque<IpAddr>,
     /// The publisher [`Self::get`] most recently evicted, if any — set only when a `get()` call
@@ -139,10 +144,10 @@ struct PerPublisher<D> {
     last_evicted: Option<IpAddr>,
 }
 
-impl<D> Default for PerPublisher<D> {
+impl<V> Default for PerPublisher<V> {
     fn default() -> Self {
-        // Not `#[derive(Default)]`: that would impose `D: Default`, which the definition types
-        // don't (and needn't) implement - only the collections need defaulting.
+        // Not `#[derive(Default)]`: that would impose `V: Default` on the type itself, which the
+        // definition types don't (and needn't) implement - only the collections need defaulting.
         Self {
             states: HashMap::new(),
             order: VecDeque::new(),
@@ -151,15 +156,17 @@ impl<D> Default for PerPublisher<D> {
     }
 }
 
-impl<D: InstrumentDef> PerPublisher<D> {
-    /// The state for `publisher`, **creating it on first sight** — reference-data writes only. A
-    /// read must use [`Self::def`]: minting an entry from the market-data path would let a forged-
-    /// publisher flood evict the real publishers' definitions without ever sending reference data.
+impl<V: Default> PerPublisher<V> {
+    /// The state for `publisher`, **creating it on first sight**.
+    ///
+    /// Which paths may call this is the holder's rule, not this map's: the sequence trackers are
+    /// minted from the market-data path by design, while the reference-data maps must be minted only
+    /// from reference data and read via [`Self::def`] — see that method for why.
     ///
     /// A `get()` on a not-yet-tracked publisher is the only place an eviction can happen (the cap is
     /// a fixed constant, so at most one pop per call); see [`Self::take_evicted`] for what a caller
     /// keeping sibling per-publisher state does with it.
-    fn get(&mut self, publisher: IpAddr) -> &mut RefDataState<D> {
+    fn get(&mut self, publisher: IpAddr) -> &mut V {
         if !self.states.contains_key(&publisher) {
             while self.states.len() >= MAX_PUBLISHERS {
                 match self.order.pop_front() {
@@ -170,12 +177,21 @@ impl<D: InstrumentDef> PerPublisher<D> {
                     None => break,
                 }
             }
-            self.states.insert(publisher, RefDataState::new());
+            self.states.insert(publisher, V::default());
             self.order.push_back(publisher);
         }
         self.states.get_mut(&publisher).expect("just inserted")
     }
 
+    /// The publisher evicted by the most recent [`Self::get`] call, if any — consumed once, so a
+    /// caller polling after every `get()` can't act twice on the same eviction (and a caller that
+    /// never polls simply never sees it, rather than it silently piling up).
+    fn take_evicted(&mut self) -> Option<IpAddr> {
+        self.last_evicted.take()
+    }
+}
+
+impl<D: InstrumentDef> PerPublisher<RefDataState<D>> {
     /// `publisher`'s definition for `instrument_id`, creating nothing. Borrows only this field, so
     /// callers keep the disjoint borrows of their other state.
     fn def(&self, publisher: IpAddr, instrument_id: u32) -> Option<&D> {
@@ -187,13 +203,6 @@ impl<D: InstrumentDef> PerPublisher<D> {
     /// publishers' definitions.
     fn state_mut(&mut self, publisher: IpAddr) -> Option<&mut RefDataState<D>> {
         self.states.get_mut(&publisher)
-    }
-
-    /// The publisher evicted by the most recent [`Self::get`] call, if any — consumed once, so a
-    /// caller polling after every `get()` can't act twice on the same eviction (and a caller that
-    /// never polls simply never sees it, rather than it silently piling up).
-    fn take_evicted(&mut self) -> Option<IpAddr> {
-        self.last_evicted.take()
     }
 }
 
@@ -259,15 +268,10 @@ fn remove_instrument(
 /// feed. Holds the per-channel sequence tracker used to drop stale/out-of-order quote datagrams.
 pub struct TobProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
-    state: PerPublisher<InstrumentDefinition>,
-    /// Per-publisher, per-channel datagram sequence tracker. Independent publishers mirror this feed
-    /// onto one group sharing `channel_id=0`, so a single tracker would mark the slower publisher's
-    /// datagrams stale and drop them before dedup; keying by source IP address keeps each publisher's sequence
-    /// state separate. Bounded to [`MAX_PUBLISHERS`] entries (the source IP address is spoofable, so the map
-    /// must not grow without limit); `seq_order` records insertion order for the eviction.
-    seq: HashMap<IpAddr, SeqTracker>,
-    /// Insertion order of `seq` keys, oldest at the front, for the [`MAX_PUBLISHERS`] eviction.
-    seq_order: VecDeque<IpAddr>,
+    state: PerPublisher<RefDataState<InstrumentDefinition>>,
+    /// Per-publisher, per-channel datagram sequence tracker (see [`PerPublisher`] for why it cannot
+    /// be one shared tracker). Minted from the market-data path, unlike `state`.
+    seq: PerPublisher<SeqTracker>,
     /// Log the manifest `Valid=0` publisher workaround once, not on every (~1/s) manifest.
     warned_invalid_manifest: bool,
     /// Rate limit for the per-datagram decode-error warning.
@@ -305,8 +309,7 @@ impl TobProcessor {
     pub fn new(tape: TapeOwner) -> Self {
         Self {
             state: PerPublisher::default(),
-            seq: HashMap::new(),
-            seq_order: VecDeque::new(),
+            seq: PerPublisher::default(),
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
             tape,
@@ -389,27 +392,6 @@ impl TobProcessor {
         self.revealed.retain(|(p, _), _| *p != publisher);
         self.pending_channel.retain(|(p, _), _| *p != publisher);
     }
-
-    /// The sequence tracker for `publisher`, creating it on first sight. The map is bounded to
-    /// [`MAX_PUBLISHERS`]: when a *new* publisher would overflow it, the least-recently-inserted one
-    /// is evicted first. Source IP addresses are spoofable, so this bound is what stops a forged-publisher flood
-    /// from growing the map without limit; a legitimate publisher evicted under such a flood simply
-    /// re-anchors (`SeqCheck::First`) on its next datagram, with no data loss beyond a stale-check reset.
-    fn seq_for(&mut self, publisher: IpAddr) -> &mut SeqTracker {
-        if !self.seq.contains_key(&publisher) {
-            while self.seq.len() >= MAX_PUBLISHERS {
-                match self.seq_order.pop_front() {
-                    Some(old) => {
-                        self.seq.remove(&old);
-                    }
-                    None => break,
-                }
-            }
-            self.seq.insert(publisher, SeqTracker::default());
-            self.seq_order.push_back(publisher);
-        }
-        self.seq.get_mut(&publisher).expect("just inserted/present")
-    }
 }
 
 impl DatagramProcessor for TobProcessor {
@@ -447,7 +429,7 @@ impl DatagramProcessor for TobProcessor {
         // jumps are accepted without comment (the channel-0 sequence is global across groups, so
         // per-group gaps are expected, not loss).
         let quotes_fresh = if handle_quotes {
-            let check = self.seq_for(ctx.publisher).check(
+            let check = self.seq.get(ctx.publisher).check(
                 header.channel_id,
                 header.reset_count,
                 header.sequence,
@@ -669,8 +651,9 @@ impl DatagramProcessor for TobProcessor {
 /// Structurally parallel to [`TobProcessor`] but for the `0x4D44` feed.
 pub struct MidpointProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
-    state: PerPublisher<codec_midpoint::InstrumentDefinition>,
-    seq: SeqTracker,
+    state: PerPublisher<RefDataState<codec_midpoint::InstrumentDefinition>>,
+    /// Per-publisher, per-channel datagram sequence tracker — see [`TobProcessor::seq`].
+    seq: PerPublisher<SeqTracker>,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
     /// Pre-resolved datagram-sequence metric children (bound lazily on the first datagram).
@@ -695,7 +678,7 @@ impl MidpointProcessor {
     pub fn new() -> Self {
         Self {
             state: PerPublisher::default(),
-            seq: SeqTracker::default(),
+            seq: PerPublisher::default(),
             decode_warn: WarnRateLimit::default(),
             seq_events: SeqEvents::default(),
             revealed: HashMap::new(),
@@ -787,9 +770,11 @@ impl DatagramProcessor for MidpointProcessor {
 
         // Same stale/out-of-order rejection as quotes: a midpoint is full state per instrument.
         let mids_fresh = if handle_mids {
-            let check = self
-                .seq
-                .check(header.channel_id, header.reset_count, header.sequence);
+            let check = self.seq.get(ctx.publisher).check(
+                header.channel_id,
+                header.reset_count,
+                header.sequence,
+            );
             self.seq_events.record(ctx.venue, &check);
             !matches!(check, SeqCheck::Stale)
         } else {
@@ -887,7 +872,7 @@ const MAX_BOOKS: usize = 4096;
 /// prints. The reconstructed book lives here so consumers never see raw deltas (PROTOCOL.md).
 pub struct MboProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
-    state: PerPublisher<codec_mbo::InstrumentDefinition>,
+    state: PerPublisher<RefDataState<codec_mbo::InstrumentDefinition>>,
     /// One independent L3 book per `(publisher, instrument)`. Two publishers mirror the same feed but
     /// reconstruct from independent, instance-scoped per-instrument delta sequences (whose sequence
     /// spaces collide), so their books CANNOT be merged — each runs its own recovery state machine.
@@ -2005,7 +1990,7 @@ struct OpenGroup {
 /// incremental `book` product plus `trade` prints.
 pub struct MbpProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
-    state: PerPublisher<codec_mbp::InstrumentDefinition>,
+    state: PerPublisher<RefDataState<codec_mbp::InstrumentDefinition>>,
     /// One independent book per `(publisher, channel, instrument)`. Two paths mirror one feed but
     /// their per-instrument delta series are unrelated by construction, so their books can never be
     /// merged — which path reaches the wire is the authority gate's decision, downstream.
@@ -3115,19 +3100,22 @@ mod tests {
         let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)); // 10.x.y.z
         let flood = (MAX_PUBLISHERS as u32) + 50;
         for i in 0..flood {
-            let _ = p.seq_for(ip(i));
+            let _ = p.seq.get(ip(i));
         }
         assert!(
-            p.seq.len() <= MAX_PUBLISHERS,
+            p.seq.states.len() <= MAX_PUBLISHERS,
             "seq map must stay bounded, got {}",
-            p.seq.len()
+            p.seq.states.len()
         );
         // The oldest publishers were evicted; the most-recent one is still tracked.
         assert!(
-            p.seq.contains_key(&ip(flood - 1)),
+            p.seq.states.contains_key(&ip(flood - 1)),
             "newest publisher retained"
         );
-        assert!(!p.seq.contains_key(&ip(0)), "oldest publisher evicted");
+        assert!(
+            !p.seq.states.contains_key(&ip(0)),
+            "oldest publisher evicted"
+        );
     }
 
     /// The per-publisher reference-data map carries a full instrument set per entry, so it needs the
@@ -3138,10 +3126,10 @@ mod tests {
     fn refdata_state_map_is_bounded_and_reads_mint_nothing() {
         use std::net::{IpAddr, Ipv4Addr};
 
-        use super::{PerPublisher, MAX_PUBLISHERS};
+        use super::{PerPublisher, RefDataState, MAX_PUBLISHERS};
         use crate::ingest::codec::InstrumentDefinition;
 
-        let mut m: PerPublisher<InstrumentDefinition> = PerPublisher::default();
+        let mut m: PerPublisher<RefDataState<InstrumentDefinition>> = PerPublisher::default();
         let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i));
         let flood = (MAX_PUBLISHERS as u32) + 50;
         for i in 0..flood {
@@ -3398,6 +3386,14 @@ mod tests {
     fn midpoint_datagram_on_channel(channel: u8, messages: &[Vec<u8>]) -> Vec<u8> {
         let mut f = midpoint_wire::datagram(messages.concat(), messages.len() as u8);
         f[3] = channel;
+        f
+    }
+
+    /// [`codec_midpoint::tests::datagram`] with an explicit sequence — that helper hardcodes `0`,
+    /// and the sequence lives at datagram-header bytes 4..12 (see `codec_common::DatagramHeader`).
+    fn midpoint_datagram_seq(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = midpoint_wire::datagram(messages.concat(), messages.len() as u8);
+        f[4..12].copy_from_slice(&sequence.to_le_bytes());
         f
     }
 
@@ -3660,6 +3656,77 @@ mod tests {
             channels,
             vec![10],
             "the reveal must ride the canonical channel, never the mirror's N + offset"
+        );
+    }
+
+    /// A shared tracker leaves the lower-numbered publisher permanently below the other's anchor, so
+    /// every one of its mids is dropped as stale. `TobProcessor` already keyed per publisher.
+    #[test]
+    fn midpoint_seq_is_tracked_per_publisher() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MidpointProcessor::new();
+        let ctx = |publisher, role| tob_ctx(&arbiter, &instruments, role, publisher);
+        let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        let mid = |raw: i64| {
+            midpoint_wire::encode_midpoint(&codec_midpoint::Midpoint {
+                instrument_id: 41,
+                source_id: 1,
+                method: 0,
+                quality_flags: 0,
+                book_ts: 1,
+                compute_ts: 1,
+                mid_price_raw: raw,
+            })
+        };
+
+        // Each publisher carries its own definitions; a definition is per-publisher state too.
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(
+                &midpoint_datagram_seq(
+                    1,
+                    &[
+                        enc_manifest_summary(1, 1),
+                        midpoint_wire::encode_instrument(&codec_midpoint::InstrumentDefinition {
+                            instrument_id: 41,
+                            symbol: "MARKET-X".into(),
+                            price_exponent: 0, // raw mid == emitted mid
+                            default_method: 0,
+                            manifest_seq: 1,
+                        }),
+                    ],
+                ),
+                &ctx(publisher, PortRole::Refdata),
+            );
+        }
+
+        // Interleaved, and far apart on purpose: independent counters have no reason to be close, so
+        // every one of B's datagrams sits below A's anchor.
+        for (publisher, sequence, raw) in [
+            (pub_a, 1000, 10),
+            (pub_b, 5, 20),
+            (pub_a, 1001, 11),
+            (pub_b, 6, 21),
+            (pub_a, 1002, 12),
+            (pub_b, 7, 22),
+        ] {
+            proc.on_datagram(
+                &midpoint_datagram_seq(sequence, &[mid(raw)]),
+                &ctx(publisher, PortRole::Mktdata),
+            );
+        }
+
+        let mids: Vec<f64> = drain_all(&mut rx)
+            .iter()
+            .filter_map(|m| match m {
+                FeedMessage::Midpoint(mp) => Some(mp.mid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mids,
+            vec![10.0, 20.0, 11.0, 21.0, 12.0, 22.0],
+            "both publishers' mids must survive; one shared tracker drops B's entirely"
         );
     }
 

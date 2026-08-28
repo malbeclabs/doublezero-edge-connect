@@ -3003,6 +3003,11 @@ impl Arbiter {
                 let _ = self.tx.send(Arc::new(msg));
             }
             FeedMessage::Midpoint(mp) => {
+                // ⚠️ Bare passthrough — no staleness floor, unlike quote/trade/depth, so two
+                // publishers mirroring one feed both reach the wire and the slower one's older mid
+                // overwrites the fresher. Which of `book_ts`/`compute_ts` a floor could latch on is
+                // undecidable until this codec's offsets are validated; both are preconditions of
+                // enabling a `FeedKind::Midpoint` row (CLAUDE.md's Midpoint note).
                 self.vm(&mp.venue).emit[EMIT_MIDPOINT].inc();
                 let _ = self.tx.send(Arc::new(msg));
             }
