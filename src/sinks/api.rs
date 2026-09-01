@@ -2907,10 +2907,10 @@ mod tests {
     async fn product_detail_returns_the_full_entry() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("PHOENIX".into(), "spot".into(), 0u8, 7u32),
-            inst_in("spot", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
+            ("PHOENIX".into(), "perps".into(), 0u8, 7u32),
+            inst_in("perps", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
-        health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
+        health.register(("PHOENIX", "perps", FeedKind::TopOfBook, 9201), |_| {});
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/PHOENIX:SOL"))
@@ -2926,7 +2926,7 @@ mod tests {
         assert_eq!(p["price_increment"], "0.001");
         assert_eq!(p["base_increment"], "0.0001");
         assert_eq!(p["status"], "online");
-        // Phoenix's spot category carries two `FEEDS` kinds (Top-of-Book + Market-by-Price) and
+        // Phoenix's perps category carries two `FEEDS` kinds (Top-of-Book + Market-by-Price) and
         // this fixture holds no book/depth evidence — the ladder must not guess.
         assert_eq!(p["feed_kind"], "unknown");
     }
@@ -3424,7 +3424,7 @@ mod tests {
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
     /// registry rung filtered by `(venue, category)` — Kalshi's `sports` category carries exactly
     /// one `FEEDS` kind and resolves it; and `"unknown"` — never a guess — for Kalshi's `perps`
-    /// and Phoenix's `spot` categories, which genuinely carry two (Top-of-Book +
+    /// and Phoenix's `perps` categories, which genuinely carry two (Top-of-Book +
     /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
     /// category per venue could not express the difference the `(venue, category)` filter makes:
     /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
@@ -3444,8 +3444,8 @@ mod tests {
                 inst_in("perps", 1, "HYPERLIQUID", "DEPTHED", 0, 2, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), "spot".into(), 0u8, 3u32),
-                inst_in("spot", 2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
+                ("PHOENIX".into(), "perps".into(), 0u8, 3u32),
+                inst_in("perps", 2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
             );
             map.insert(
                 ("KALSHI".into(), "perps".into(), 9u8, 4u32),
@@ -3502,7 +3502,7 @@ mod tests {
         assert_eq!(
             kind_of("PLAIN"),
             "unknown",
-            "Phoenix's spot category now carries two FEEDS kinds (Top-of-Book + Market-by-Price) — \
+            "Phoenix's perps category now carries two FEEDS kinds (Top-of-Book + Market-by-Price) — \
              a single-category venue is just as ambiguous as Kalshi's perps category"
         );
         assert_eq!(

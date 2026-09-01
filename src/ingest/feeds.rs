@@ -455,8 +455,8 @@ mod tests {
                 ("HYPERLIQUID", "perps", FeedKind::TopOfBook | FeedKind::MarketByOrder) => {
                     "tiredsolid"
                 }
-                ("PHOENIX", "spot", FeedKind::TopOfBook) => "edge-phoenix-tob",
-                ("PHOENIX", "spot", FeedKind::MarketByPrice) => "edge-phoenix-mbp",
+                ("PHOENIX", "perps", FeedKind::TopOfBook) => "edge-phoenix-tob",
+                ("PHOENIX", "perps", FeedKind::MarketByPrice) => "edge-phoenix-mbp",
                 ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
                 ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
                 ("KALSHI", "sports", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",

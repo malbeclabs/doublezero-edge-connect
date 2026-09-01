@@ -167,7 +167,7 @@
     },
     {
       "venue": "PHOENIX",
-      "category": "spot",
+      "category": "perps",
       "code": "edge-phoenix-tob",
       "kind": "TopOfBook",
       "group": "233.84.178.24",
@@ -194,7 +194,7 @@
     },
     {
       "venue": "PHOENIX",
-      "category": "spot",
+      "category": "perps",
       "code": "edge-phoenix-mbp",
       "kind": "MarketByPrice",
       "group": "233.84.178.25",
