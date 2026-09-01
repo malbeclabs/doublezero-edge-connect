@@ -189,7 +189,7 @@ pub struct Feed {
     /// empty candles indistinguishable from a market that did not trade.
     pub category: &'static str,
     /// The DoubleZero multicast group **code** for this feed's group (e.g. "tiredsolid",
-    /// "scottsdale") — the identifier `doublezero status`/`multicast group list` report. The
+    /// "edge-phoenix-tob") — the identifier `doublezero status`/`multicast group list` report. The
     /// subscription reconciler matches this against the host's subscribed `S:<code>` entries to
     /// decide whether to activate the feed. Multiple feeds (e.g. a venue's TOB + MBO) can share one
     /// code, since they ride the same multicast group.
@@ -442,7 +442,8 @@ mod tests {
     #[test]
     fn every_feed_has_a_group_code() {
         // The reconciler matches `code` against `doublezero status` subscriptions, so every row
-        // must carry one. Both Hyperliquid rows share the group `tiredsolid`; Phoenix is `scottsdale`.
+        // must carry one. Both Hyperliquid rows share the group `tiredsolid`; Phoenix's two rows
+        // ride separately-gated `edge-phoenix-*` groups.
         for f in feeds() {
             assert!(!f.code.is_empty(), "{} {:?} has no code", f.venue, f.kind);
         }
@@ -454,7 +455,8 @@ mod tests {
                 ("HYPERLIQUID", "perps", FeedKind::TopOfBook | FeedKind::MarketByOrder) => {
                     "tiredsolid"
                 }
-                ("PHOENIX", "spot", FeedKind::TopOfBook) => "scottsdale",
+                ("PHOENIX", "spot", FeedKind::TopOfBook) => "edge-phoenix-tob",
+                ("PHOENIX", "spot", FeedKind::MarketByPrice) => "edge-phoenix-mbp",
                 ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
                 ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
                 ("KALSHI", "sports", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",

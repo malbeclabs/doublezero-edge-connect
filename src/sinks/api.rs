@@ -2926,9 +2926,9 @@ mod tests {
         assert_eq!(p["price_increment"], "0.001");
         assert_eq!(p["base_increment"], "0.0001");
         assert_eq!(p["status"], "online");
-        // Phoenix carries exactly one `FEEDS` kind and has no book/depth entry — an unambiguous
-        // registry fallback.
-        assert_eq!(p["feed_kind"], "top_of_book");
+        // Phoenix's spot category carries two `FEEDS` kinds (Top-of-Book + Market-by-Price) and
+        // this fixture holds no book/depth evidence — the ladder must not guess.
+        assert_eq!(p["feed_kind"], "unknown");
     }
 
     #[tokio::test]
@@ -3423,8 +3423,8 @@ mod tests {
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
     /// registry rung filtered by `(venue, category)` — Kalshi's `sports` category carries exactly
-    /// one `FEEDS` kind and resolves it, same as Phoenix's single-category venue; and `"unknown"`
-    /// — never a guess — for Kalshi's `perps` category, which genuinely carries two (Top-of-Book +
+    /// one `FEEDS` kind and resolves it; and `"unknown"` — never a guess — for Kalshi's `perps`
+    /// and Phoenix's `spot` categories, which genuinely carry two (Top-of-Book +
     /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
     /// category per venue could not express the difference the `(venue, category)` filter makes:
     /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
@@ -3501,8 +3501,9 @@ mod tests {
         );
         assert_eq!(
             kind_of("PLAIN"),
-            "top_of_book",
-            "Phoenix has exactly one FEEDS kind"
+            "unknown",
+            "Phoenix's spot category now carries two FEEDS kinds (Top-of-Book + Market-by-Price) — \
+             a single-category venue is just as ambiguous as Kalshi's perps category"
         );
         assert_eq!(
             kind_of("UNRESOLVED"),

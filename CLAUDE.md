@@ -12,8 +12,8 @@ feeds, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it both as full-state `depth` and as the order-level incremental **`order_book`**, carrying
 the venue's own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
-reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `edge-kalshi-perps-mbp`
-row selects it, on a group that is live). Each feed maps to one venue. The
+reconstructs the price-aggregated book and re-serves it as the incremental `book`; the
+`edge-kalshi-perps-mbp` and `edge-phoenix-mbp` rows select it, both on live groups). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
 WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
@@ -176,7 +176,7 @@ Modules are grouped by role under `src/`:
   installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
   `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
   rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
-  venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
+  venue, with a group `code` (`tiredsolid`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
@@ -617,8 +617,8 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
-  non-negative). The only `FEEDS` row of that kind is `edge-kalshi-perps-mbp`, whose group is live, so these series
-  populate on any host subscribed to it — and report nothing on a host that is not.
+  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live, so these
+  series populate on any host subscribed to one — and report nothing on a host that is not.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -935,7 +935,7 @@ Modules are grouped by role under `src/`:
   it is honest about completeness only while `baselined` holds. The arbiter's `Book` branch is the
   single-path
   authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-path
-  accumulators; `MbpProcessor` emits `book`, and the `edge-kalshi-perps-mbp` row selects it on a live group.
+  accumulators; `MbpProcessor` emits `book`, selected by the `edge-kalshi-perps-mbp` and `edge-phoenix-mbp` rows on live groups.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.

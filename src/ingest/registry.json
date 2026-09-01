@@ -168,14 +168,41 @@
     {
       "venue": "PHOENIX",
       "category": "spot",
-      "code": "scottsdale",
+      "code": "edge-phoenix-tob",
       "kind": "TopOfBook",
-      "group": "233.84.178.18",
+      "group": "233.84.178.24",
       "emit_trades": true,
       "arbitration": "Coordinated",
-      "notes": ["A single publisher on 9201/9202."],
+      "notes": [
+        "Moved from the pre-launch scottsdale/233.84.178.18 location to the ledger-registered",
+        "edge-phoenix-tob group on 2026-09-01; the old group is dead and a row carrying it",
+        "activates nothing, silently. A single publisher on 9201/9202, from the publisher's own",
+        "deploy unit and confirmed on the live wire 2026-09-01: two 30-minute captures matched",
+        "3,518 + 3,188 fills 1:1 against the venue's public API with zero price/size/side",
+        "mismatches."
+      ],
       "publishers": {
         "explicit": [{ "mktdata": 9201, "refdata": 9202 }]
+      }
+    },
+    {
+      "venue": "PHOENIX",
+      "category": "spot",
+      "code": "edge-phoenix-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.25",
+      "emit_trades": true,
+      "arbitration": "Coordinated",
+      "notes": [
+        "Market-by-price sibling of edge-phoenix-tob: same publisher process, same manifest and",
+        "instrument ids, schema v3, Channel ID 1 on all three roles. Ports are the publisher's",
+        "--mbp-* defaults, confirmed on the live wire 2026-09-01: books synced end-to-end and",
+        "prices validated against the top-of-book quotes and the public API. Both Phoenix rows",
+        "claim the tape (this feed's mktdata role carries Trade byte-identical to top-of-book's);",
+        "the reconciler ranks TopOfBook over MarketByPrice when both run."
+      ],
+      "publishers": {
+        "explicit": [{ "mktdata": 9211, "refdata": 9212, "snapshot": 9213 }]
       }
     },
     {
