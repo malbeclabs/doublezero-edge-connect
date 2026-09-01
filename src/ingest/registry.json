@@ -211,7 +211,11 @@
         "MarketByPrice when both run, and the moment of overlap at a handover is collapsed by the",
         "trade_id dedup window - which requires Phoenix's real venue trade ids: a publisher change",
         "to the trade_id == 0 sentinel would double-print at every ownership transfer, since the",
-        "Coordinated no-id guard forwards a conflicting zero-id pair rather than dropping it."
+        "Coordinated no-id guard forwards a conflicting zero-id pair rather than dropping it.",
+        "That double-print would be entirely silent: the guard keys its owner on the datagram",
+        "source IP, and these two rows are one publisher process behind one IP, so",
+        "dz_trades_no_id_conflict_total and its one-shot warning can never fire for it. A",
+        "consumer's fill count is the only tripwire."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 9211, "refdata": 9212, "snapshot": 9213 }]

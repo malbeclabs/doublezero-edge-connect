@@ -617,9 +617,14 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
-  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live — but a
-  pair needs two paths, so these series populate only where a row's group carries two publishers (Kalshi's mirrored
-  pair; Phoenix's single publisher feeds them nothing) — and report nothing on a host subscribed to neither.
+  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live; on a
+  host subscribed to neither the matcher never engages at all. Where it does, a **single-publisher row is the
+  degenerate case and the matcher's two series diverge on it**: a pair needs two paths, so `dz_path_lead_ns`
+  populates only for Kalshi's mirrored pair and never for Phoenix, while every Phoenix print still *enters* the
+  matcher (the authority tracks its one path, so `race_eligible` holds) and expires unpaired onto
+  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate. That series'
+  alarm reading, "the paths are barely pairing," cannot apply to a row that has one path; docs/metrics.md carries
+  the same caveat, since a dashboard alerting on the ratio would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
