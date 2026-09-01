@@ -179,7 +179,14 @@
         "activates nothing, silently. A single publisher on 9201/9202, from the publisher's own",
         "deploy unit and confirmed on the live wire 2026-09-01: two 30-minute captures matched",
         "3,518 + 3,188 fills 1:1 against the venue's public API with zero price/size/side",
-        "mismatches."
+        "mismatches.",
+        "",
+        "Refdata stamps Channel ID 1 (wire-confirmed 2026-09-01; schema v3). That must agree with",
+        "the MBP sibling's refdata channel: the instrument catalog is keyed on the refdata",
+        "channel, so a divergence would list every Phoenix product twice and turn the bare",
+        "PHOENIX:SYMBOL product ids ambiguous. The 2026-06-30 fixture shows the OLD publisher",
+        "(schema v1) stamped refdata on channel 2 - re-capture both refdata roles if either feed's",
+        "channel numbering changes."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 9201, "refdata": 9202 }]
@@ -195,11 +202,16 @@
       "arbitration": "Coordinated",
       "notes": [
         "Market-by-price sibling of edge-phoenix-tob: same publisher process, same manifest and",
-        "instrument ids, schema v3, Channel ID 1 on all three roles. Ports are the publisher's",
-        "--mbp-* defaults, confirmed on the live wire 2026-09-01: books synced end-to-end and",
-        "prices validated against the top-of-book quotes and the public API. Both Phoenix rows",
-        "claim the tape (this feed's mktdata role carries Trade byte-identical to top-of-book's);",
-        "the reconciler ranks TopOfBook over MarketByPrice when both run."
+        "instrument ids, schema v3, Channel ID 1 on all three roles (wire-confirmed 2026-09-01 -",
+        "see the top-of-book row's channel note; the catalog depends on the two refdata channels",
+        "agreeing). Ports are the publisher's --mbp-* defaults, confirmed on the live wire",
+        "2026-09-01: books synced end-to-end and prices validated against the top-of-book quotes",
+        "and the public API. Both Phoenix rows claim the tape (this feed's mktdata role carries",
+        "Trade byte-identical to top-of-book's); the reconciler ranks TopOfBook over",
+        "MarketByPrice when both run, and the moment of overlap at a handover is collapsed by the",
+        "trade_id dedup window - which requires Phoenix's real venue trade ids: a publisher change",
+        "to the trade_id == 0 sentinel would double-print at every ownership transfer, since the",
+        "Coordinated no-id guard forwards a conflicting zero-id pair rather than dropping it."
       ],
       "publishers": {
         "explicit": [{ "mktdata": 9211, "refdata": 9212, "snapshot": 9213 }]

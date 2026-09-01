@@ -617,8 +617,9 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
-  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live, so these
-  series populate on any host subscribed to one — and report nothing on a host that is not.
+  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live — but a
+  pair needs two paths, so these series populate only where a row's group carries two publishers (Kalshi's mirrored
+  pair; Phoenix's single publisher feeds them nothing) — and report nothing on a host subscribed to neither.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by

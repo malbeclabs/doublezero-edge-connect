@@ -27,9 +27,10 @@ the narrowing to one venue.
 > **Size `--recv-buf` against the socket count, not one socket.** Every port of every publisher is
 > its own socket requesting `--recv-buf` (default 8 MiB): the eleven-publisher Hyperliquid fleet
 > binds 55 sockets (11 × 2 Top-of-Book + 11 × 3 Market-by-Order), 60 with Phoenix's two rows
-> (2 Top-of-Book + 3 Market-by-Price) and 65 with Kalshi's two single-publisher perps rows
-> (2 Top-of-Book + 3 Market-by-Price), so the requested
-> `SO_RCVBUF` total is ~520 MiB where a single-publisher deployment requested ~40 MiB.
+> (2 Top-of-Book + 3 Market-by-Price), 65 with Kalshi's two single-publisher perps rows
+> (2 Top-of-Book + 3 Market-by-Price), and 158 with Kalshi's derived 31-channel sports row
+> (31 × 3 Market-by-Price), so a fully-subscribed host's requested
+> `SO_RCVBUF` total is ~1.24 GiB where a single-publisher deployment requested ~40 MiB.
 > `net.core.rmem_max` clamps each socket individually and will not catch the aggregate — and the
 > value every installer sets (`268435456`) is a per-socket ceiling well above the 8 MiB default, so
 > it will not bound this either. Lower `DZ_RECV_BUF` or narrow `--publisher-port` if that exceeds the
