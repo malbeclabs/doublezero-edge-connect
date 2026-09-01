@@ -248,9 +248,13 @@ pub struct Metrics {
     /// status differ, and merging them would read a hostile book as a lossy network.
     pub mbp_level_overflows: IntCounterVec,
     /// `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups,
-    /// or a lost `SnapshotBegin`.
+    /// or a lost `SnapshotBegin`. Excludes the groups the processor itself declines to route: those
+    /// are `mbp_declined_rotation_levels` and `mbp_snapshot_levels_dropped`.
     pub mbp_orphan_snapshot_levels: IntCounterVec,
     pub mbp_declined_rotation_levels: IntCounterVec,
+    /// Levels of a group the processor deliberately did not route, by `reason`. Expected traffic,
+    /// counted apart from the orphan series so that one stays alertable.
+    pub mbp_snapshot_levels_dropped: IntCounterVec,
     /// Deltas discarded as duplicates (`seq` at or below the applied baseline). A `Ready` book
     /// emitting nothing but duplicates is the signature of a baseline installed above the
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
@@ -664,8 +668,8 @@ impl Metrics {
                 "dz_mbp_orphan_snapshot_levels_total",
                 "SnapshotLevel with no open group to route it to (interleaved groups, or a lost \
                  SnapshotBegin). An anomaly: a level that should have been attributable was not. \
-                 A rotation the book deliberately declined is NOT counted here — see \
-                 dz_mbp_declined_rotation_levels_total.",
+                 Groups the processor itself declined or dropped are NOT counted here — see \
+                 dz_mbp_declined_rotation_levels_total and dz_mbp_snapshot_levels_dropped_total.",
                 &["venue"],
             ),
             mbp_declined_rotation_levels: counter_vec(
@@ -676,6 +680,16 @@ impl Metrics {
                  in steady state this tracks the feed's whole snapshot-level rate. Counted apart \
                  from the orphan counter so a real orphan stays visible.",
                 &["venue"],
+            ),
+            mbp_snapshot_levels_dropped: counter_vec(
+                &registry,
+                "dz_mbp_snapshot_levels_dropped_total",
+                "SnapshotLevel belonging to a group the processor deliberately did not route: \
+                 reason=reset (an InstrumentReset killed the anchor it was assembling against), \
+                 stale_era (its Reset Count is the publisher's previous run), no_definition (its \
+                 instrument's definition had not resolved yet — a cold-start transient). All \
+                 expected; counted apart from the orphan counter so a real orphan stays visible.",
+                &["venue", "reason"],
             ),
             mbp_duplicate_deltas: counter_vec(
                 &registry,
@@ -1121,6 +1135,9 @@ mod tests {
         m.mbp_declined_rotation_levels
             .with_label_values(&["KALSHI"])
             .inc();
+        m.mbp_snapshot_levels_dropped
+            .with_label_values(&["KALSHI", "reset"])
+            .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
         m.mbp_divergence
@@ -1202,6 +1219,7 @@ mod tests {
             "dz_mbp_level_overflows_total",
             "dz_mbp_orphan_snapshot_levels_total",
             "dz_mbp_declined_rotation_levels_total",
+            "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",
