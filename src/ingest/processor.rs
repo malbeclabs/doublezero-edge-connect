@@ -1988,6 +1988,12 @@ type PriceBookKey = (IpAddr, u8, u32);
 struct OpenGroup {
     instrument_id: u32,
     snapshot_id: u32,
+    /// The group's `Anchor Seq`. An `InstrumentReset` discards the route only when this predates
+    /// the reset's `New Anchor Seq` — the same test `PriceBook::on_snapshot_begin` applies to a
+    /// begin. Resets ride mktdata and groups the snapshot port on independent sequence series, so
+    /// a re-admission's own recovery group is routinely processed before the reset that anchored
+    /// it, and tearing out its route strands the market until the next rotation.
+    anchor_seq: u64,
     /// Whether the book took the rotation. A **declined** one still holds the route — its levels
     /// arrive either way, and only a route makes them attributable — but they are discarded
     /// instead of applied, and counted as declined rather than as orphans.
@@ -2866,6 +2872,7 @@ impl DatagramProcessor for MbpProcessor {
                             OpenGroup {
                                 instrument_id: s.instrument_id,
                                 snapshot_id: s.snapshot_id,
+                                anchor_seq: s.anchor_seq,
                                 accepted: true,
                             },
                         );
@@ -2888,6 +2895,7 @@ impl DatagramProcessor for MbpProcessor {
                             OpenGroup {
                                 instrument_id: s.instrument_id,
                                 snapshot_id: s.snapshot_id,
+                                anchor_seq: s.anchor_seq,
                                 accepted: false,
                             },
                         );
@@ -3009,14 +3017,20 @@ impl DatagramProcessor for MbpProcessor {
                         // post-reset market is deferred again until a fresh delta reveals it.
                         self.revealed.remove(&key);
                     }
-                    // The book dropped any group it was assembling, so the route goes with it — and
-                    // a tombstone takes its place, since the group's remaining levels are still on
-                    // the wire and are the reset's doing, not an attribution failure.
-                    if let Some(group) = self
-                        .open
-                        .get(&(ctx.publisher, channel))
-                        .copied()
-                        .filter(|g| g.instrument_id == r.instrument_id)
+                    // A group anchored BEFORE this reset died with the book's assembly, so the
+                    // route goes with it — and a tombstone takes its place, since the group's
+                    // remaining levels are still on the wire and are the reset's doing, not an
+                    // attribution failure. One anchored at or after it is this reset's own
+                    // recovery group, which the book kept; taking its route would orphan the
+                    // recovery the reset asked for.
+                    if let Some(group) =
+                        self.open
+                            .get(&(ctx.publisher, channel))
+                            .copied()
+                            .filter(|g| {
+                                g.instrument_id == r.instrument_id
+                                    && g.anchor_seq < r.new_anchor_seq
+                            })
                     {
                         self.open.remove(&(ctx.publisher, channel));
                         self.note_dropped_group(
@@ -5593,6 +5607,16 @@ mod tests {
         })
     }
 
+    /// One `InstrumentReset` for `id`, re-anchoring the instrument at `anchor`.
+    fn mbp_reset(id: u32, anchor: u64) -> Vec<u8> {
+        mbp_wire::enc_instrument_reset(&codec_mbp::InstrumentReset {
+            instrument_id: id,
+            reason: 0,
+            new_anchor_seq: anchor,
+            ts: 2,
+        })
+    }
+
     /// A complete snapshot group for `id`: begin, its levels, end. `k` is the publisher's
     /// `last_instrument_seq` at capture and `anchor` the mktdata sequence it was captured at.
     fn mbp_snapshot(
@@ -7298,6 +7322,64 @@ mod tests {
             drain_books(&mut rx).is_empty(),
             "and nothing reached the wire"
         );
+    }
+
+    /// ...but the reset's OWN recovery group must survive it. A publisher withholding and then
+    /// re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin`
+    /// follows its reset by ~0.1 ms on a different port — resets ride mktdata, groups the snapshot
+    /// port, on independent sequence series — so which is processed first is a coin flip. Either
+    /// order installs exactly one recovery group. Observed live: a 713-level CRCL group anchored at
+    /// the second reset's own anchor was dropped whole, and the market waited a full rotation.
+    #[test]
+    fn mbp_a_re_admission_group_survives_its_own_reset_in_either_order() {
+        let venue = "MbpReAdmissionGroupTest";
+        for begin_first in [false, true] {
+            let (arbiter, mut rx, instruments) = mbp_harness();
+            let mut proc = MbpProcessor::new(tape(false));
+            let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+            let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+            let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            // Entering the withheld state: this anchor names a sequence from before it went dark.
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 2, &[mbp_reset(41, 10)]), &mkt);
+
+            let before = (orphan_levels(venue), dropped_levels(venue, "reset"));
+            let group = mbp_snapshot(41, 7, 20, 0, &[(MBP_BID, 6200, 10)]);
+            let re_admit = [mbp_reset(41, 20)];
+            if begin_first {
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &group[..1]), &snap);
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 4, &re_admit), &mkt);
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 5, &group[1..]), &snap);
+            } else {
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &re_admit), &mkt);
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 4, &group), &snap);
+            }
+            // A snapshot carries no Source ID, so the re-baseline reaches the wire on the first
+            // message that names the market.
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 6, &[mbp_reveal(41, 1)]), &mkt);
+
+            assert_eq!(
+                mbp_status(&proc, TEST_PUB, 0, 41),
+                Some(BookStatus::Ready),
+                "begin_first={begin_first}: the recovery group installed"
+            );
+            let books = drain_books(&mut rx);
+            assert_eq!(books.len(), 1, "begin_first={begin_first}");
+            assert_eq!(
+                shape(&books[0]),
+                vec![
+                    (BookAction::Clear, BookSide::Both, 0.0, 0.0),
+                    (BookAction::Update, BookSide::Bid, 6200.0, 10.0),
+                ],
+                "begin_first={begin_first}: one re-baseline carrying the group's levels"
+            );
+            assert_eq!(
+                (orphan_levels(venue), dropped_levels(venue, "reset")),
+                before,
+                "begin_first={begin_first}: a kept group's levels are neither orphaned nor \
+                 attributed to the reset that anchored it"
+            );
+        }
     }
 
     /// A `SnapshotBegin` for an instrument whose definition has not resolved yet takes no route —
