@@ -391,6 +391,13 @@ pub struct NormalizedInstrument {
     pub category: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
+    /// The venue's tradable price increment as `tick_size * 10^price_exponent` — the wire's `Tick
+    /// Size` in the same fixed point as every price on the feed. **`0` means the publisher stated
+    /// none**, not a zero tick, and is what a Hyperliquid definition carries today. Distinct from
+    /// `10^price_exponent`, which is only the fixed-point granularity: BTC on Phoenix is exponent
+    /// `-2` with a tick of `100`, so it moves in dollars, not cents.
+    #[serde(default)]
+    pub tick_size: i64,
 }
 
 /// A venue-level feed-health status (the PROTOCOL.md `status` candidate extension). Emitted when

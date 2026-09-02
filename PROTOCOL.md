@@ -67,7 +67,7 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 ### `instrument`
 
 ```json
-{"type":"instrument","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL","channel":0,"instrument_id":1,"price_exponent":-2,"qty_exponent":-2}
+{"type":"instrument","venue":"Hyperliquid","source_name":"Hyperliquid","source_id":1,"symbol":"SOL","channel":0,"instrument_id":1,"price_exponent":-2,"qty_exponent":-2,"tick_size":100}
 ```
 
 | Field            | Type   | Meaning                                                              |
@@ -79,14 +79,16 @@ Consumers **must ignore unknown `type` values and unknown fields** (forward comp
 | `symbol`         | string | Instrument symbol as the venue names it (e.g. `SOL`, `SOL-PERP`).   |
 | `channel`        | uint8  | The publisher's channel id: the instrument set this feed carries. Filterable. |
 | `instrument_id`  | uint32 | Instrument id, unique within `channel`.                              |
-| `price_exponent` | int8   | Price increment exponent: tick size = `10^price_exponent` (e.g. `-2` -> `0.01`). |
+| `price_exponent` | int8   | Price **fixed-point** exponent: prices are quoted to `10^price_exponent` (e.g. `-2` -> two decimals). Not the tradable tick — see `tick_size`. |
 | `qty_exponent`   | int8   | Size increment exponent: step = `10^qty_exponent`.                  |
+| `tick_size`      | int64  | The venue's tradable price increment, in the same fixed point: the real increment is `tick_size * 10^price_exponent`. `0` means the publisher states none. |
 
 `channel` and `instrument_id` are the identity a consumer joins a [`book`](#book) to its definition on, rather than the colliding `symbol`.
 
 `price_exponent` / `qty_exponent` give the venue's **precision**; `quote` prices/sizes are
-already decimal values (below), so the exponents are used to set tick size / decimal places, not
-to rescale integers.
+already decimal values (below), so the exponents set decimal places, not a rescaling of integers.
+
+**Precision is not the tick.** `10^price_exponent` is how finely prices are *expressed*; `tick_size * 10^price_exponent` is how coarsely they may *move*, and the two differ by orders of magnitude on real venues — BTC on Phoenix is exponent `-2` with `tick_size` `100`, so it trades in dollars while the fixed point is cents. A consumer sizing or rounding an order must use the product, never the exponent alone. `tick_size == 0` is the publisher declining to state one (Hyperliquid's definitions do today), and the only claim left there is the precision.
 
 ### `quote`
 
@@ -539,7 +541,7 @@ on connect:
   filtering, **app ping/pong + server heartbeat with idle timeout**, and **connection/subscription/
   rate limits with broadcast backpressure**.
 - **`depth` is deprecated.** It is the full-state top-*N* product derived from the Market-by-Order feed; the incremental pair supersedes it with the complete book — `book` on a Market-by-Price feed, [`order_book`](#book) on a Market-by-Order one. Both are served today, from every feed that has one; `depth` is removed in v2. New consumers should implement whichever of the two their markets are served under.
-- **Additive in this revision, so still v1:** `batch_id` on `book`, the venue's committed slot (see [*Same-slot comparison*](#book)) — an optional field a consumer that does not know it ignores. Also the [`order_book`](#book) message type, carrying the Market-by-Order feed's order-level book, and `order_id` on a book change. An existing consumer subscribed to `book` is served exactly the price-aggregated markets it was served before; `order_book` is a type it does not know and ignores. Deliberately a **new type** rather than a new field on `book` — see [*They are separate types*](#book) for why a field would have corrupted such a consumer instead.
+- **Additive in this revision, so still v1:** `tick_size` on `instrument`, the venue's tradable price increment — a consumer that derived a tick from `price_exponent` alone was wrong by the tick's own magnitude (100x on BTC), and this document said so; that row is corrected above. Also `batch_id` on `book`, the venue's committed slot (see [*Same-slot comparison*](#book)) — an optional field a consumer that does not know it ignores. Also the [`order_book`](#book) message type, carrying the Market-by-Order feed's order-level book, and `order_id` on a book change. An existing consumer subscribed to `book` is served exactly the price-aggregated markets it was served before; `order_book` is a type it does not know and ignores. Deliberately a **new type** rather than a new field on `book` — see [*They are separate types*](#book) for why a field would have corrupted such a consumer instead.
 - **Breaking within v1: `source` is now `source_name`**, both on every message and as a subscription
   filter key. The forward-compatibility rule below covers the *arrival* of `source_name`, not the
   *departure* of `source`; `venue` still carries the identical value, so the migration is to read

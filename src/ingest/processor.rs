@@ -371,6 +371,7 @@ impl TobProcessor {
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
+            tick_size: def.tick_size,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -534,6 +535,7 @@ impl DatagramProcessor for TobProcessor {
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
+                                tick_size: d.tick_size,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -733,6 +735,9 @@ impl MidpointProcessor {
         self.revealed.insert(key, source_id);
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
+            // The Midpoint feed keeps its own slimmed definition, which has no `Tick Size` field —
+            // 0 is the "not stated" the consumer contract already defines for it.
+            tick_size: 0,
             venue: source.clone(),
             source_name: source.clone(),
             source_id,
@@ -819,6 +824,7 @@ impl DatagramProcessor for MidpointProcessor {
                     if let Some(&source_id) = self.revealed.get(&key) {
                         let source = venue_arc(source_label(source_id));
                         let inst = NormalizedInstrument {
+                            tick_size: 0, // no `Tick Size` on the Midpoint definition — see above
                             venue: source.clone(),
                             source_name: source.clone(),
                             source_id,
@@ -1039,6 +1045,7 @@ impl MboProcessor {
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
+            tick_size: def.tick_size,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -1586,6 +1593,7 @@ impl DatagramProcessor for MboProcessor {
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
+                                tick_size: d.tick_size,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -2183,6 +2191,7 @@ impl MbpProcessor {
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
+            tick_size: def.tick_size,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -2704,6 +2713,7 @@ impl DatagramProcessor for MbpProcessor {
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
+                                tick_size: d.tick_size,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -5037,6 +5047,7 @@ mod tests {
         let instruments: crate::model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
 
         let base = NormalizedInstrument {
+            tick_size: 0,
             venue: "TestVenue".into(),
             source_name: "TestVenue".into(),
             source_id: 0,
@@ -5475,6 +5486,7 @@ mod tests {
         )];
         out.extend(ids.iter().map(|id| {
             mbp_wire::enc_instrument_definition(&codec_mbp::InstrumentDefinition {
+                tick_size: 0,
                 instrument_id: *id,
                 source_id: None,
                 symbol: format!("INST-{id}").into(),

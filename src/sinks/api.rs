@@ -23,8 +23,10 @@
 //!   backs.** An accumulator that has not folded in a producer re-baseline holds only the levels
 //!   that moved since it started accumulating; serving that as `"complete": true` would tell an
 //!   agent to treat a partial reconstruction as the whole book.
-//! - **No field is fabricated to fill out the emulated envelope.** `price_increment`/
-//!   `base_increment` are derived from the instrument's own price/qty exponent (`10^exponent`);
+//! - **No field is fabricated to fill out the emulated envelope.** `price_increment` is the
+//!   definition's own `Tick Size` at its price exponent — the tradable increment, not the
+//!   fixed-point granularity, which they are not the same thing (see [`price_increment_string`]);
+//!   `base_increment` is derived from the instrument's own qty exponent (`10^exponent`);
 //!   `volume_24h`, `price_percentage_change_24h`, `base_currency_id`/`quote_currency_id` and
 //!   `quote_increment` have no honest basis in this crate's reference data or its one-hour window,
 //!   so they are omitted rather than guessed. An absent field is safe under PROTOCOL.md's
@@ -377,18 +379,33 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "symbol": i.symbol.as_ref(),
         "channel": i.channel,
         "instrument_id": i.instrument_id,
-        "price_increment": increment_string(i.price_exponent),
+        "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
         "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
         "feed_kind": feed_kind_for(state, i),
     })
 }
 
-/// `10^exponent` rendered as a decimal string — `price_increment`/`base_increment`. Derivable from
-/// the instrument's own exponent, unlike `quote_increment` (no honest basis; deliberately omitted
-/// — see the module docs).
+/// `10^exponent` rendered as a decimal string — the fixed-point granularity, which is `base_increment`
+/// and is the fallback for `price_increment`. Derivable from the instrument's own exponent, unlike
+/// `quote_increment` (no honest basis; deliberately omitted — see the module docs).
 fn increment_string(exponent: i8) -> String {
     decimal_string(10f64.powi(exponent as i32), exponent)
+}
+
+/// The **tradable** price increment: the definition's `Tick Size` at its own price exponent. The
+/// two differ by orders of magnitude — BTC on Phoenix is exponent `-2` with a tick of `100`, so it
+/// moves in dollars while `10^-2` claims cents — and `price_increment` conventionally means the
+/// tradable one. A `tick_size` of `0` is the publisher stating none (every Hyperliquid definition
+/// does), and there the granularity is the only honest answer left.
+fn price_increment_string(tick_size: i64, price_exponent: i8) -> String {
+    if tick_size <= 0 {
+        return increment_string(price_exponent);
+    }
+    decimal_string(
+        crate::ingest::codec_common::apply_exponent(tick_size, price_exponent),
+        price_exponent,
+    )
 }
 
 /// Render `value` as a fixed-decimal string at `exponent`'s precision (never Rust's scientific/debug
@@ -1417,6 +1434,7 @@ mod tests {
         qty_exponent: i8,
     ) -> NormalizedInstrument {
         NormalizedInstrument {
+            tick_size: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,
@@ -1491,10 +1509,12 @@ mod tests {
     #[tokio::test]
     async fn products_list_carries_discrete_identity_fields() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
-        instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32),
-            inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
-        );
+        let mut btc = inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5);
+        btc.tick_size = 100; // BTC trades in dollars at a fixed point of cents
+        instruments
+            .lock()
+            .unwrap()
+            .insert(("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32), btc);
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
@@ -1512,7 +1532,10 @@ mod tests {
         assert_eq!(p["symbol"], "BTC");
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 41);
-        assert_eq!(p["price_increment"], "0.01");
+        assert_eq!(
+            p["price_increment"], "1.00",
+            "the venue's tradable tick (tick_size x 10^price_exponent), not 10^price_exponent"
+        );
         assert_eq!(p["base_increment"], "0.00001");
         assert_eq!(p["status"], "online");
         // Hyperliquid carries two `FEEDS` kinds (Top-of-Book + Market-by-Order) and this fixture
@@ -2952,7 +2975,10 @@ mod tests {
         assert_eq!(p["source_id"], 2);
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 7);
-        assert_eq!(p["price_increment"], "0.001");
+        assert_eq!(
+            p["price_increment"], "0.001",
+            "a publisher stating no tick falls back to the fixed-point granularity"
+        );
         assert_eq!(p["base_increment"], "0.0001");
         assert_eq!(p["status"], "online");
         // Phoenix's perps category carries two `FEEDS` kinds (Top-of-Book + Market-by-Price) and

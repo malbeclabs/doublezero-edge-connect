@@ -341,6 +341,7 @@ mod tests {
         map.lock().unwrap().insert(
             (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
+                tick_size: 0,
                 venue: phoenix_venue().into(),
                 source_name: phoenix_venue().into(),
                 source_id: 0,

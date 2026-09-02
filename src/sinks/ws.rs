@@ -749,6 +749,7 @@ mod tests {
             "stamped, not left at 0"
         );
         let i = prepare(&FeedMessage::Instrument(NormalizedInstrument {
+            tick_size: 0,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,
@@ -972,6 +973,7 @@ mod tests {
                     n as u32,
                 ),
                 NormalizedInstrument {
+                    tick_size: 0,
                     venue: "HYPERLIQUID".into(),
                     source_name: "HYPERLIQUID".into(),
                     source_id: 0,
@@ -1098,6 +1100,7 @@ mod tests {
                     41u32,
                 ),
                 NormalizedInstrument {
+                    tick_size: 0,
                     venue: "KALSHI".into(),
                     source_name: "KALSHI".into(),
                     source_id: 0,
@@ -1719,6 +1722,7 @@ mod tests {
                 41u32,
             ),
             NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 0,
