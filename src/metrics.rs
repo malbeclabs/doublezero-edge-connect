@@ -687,8 +687,9 @@ impl Metrics {
                 "SnapshotLevel belonging to a group the processor deliberately did not route: \
                  reason=reset (an InstrumentReset killed the anchor it was assembling against), \
                  stale_era (its Reset Count is the publisher's previous run), no_definition (its \
-                 instrument's definition had not resolved yet — a cold-start transient). All \
-                 expected; counted apart from the orphan counter so a real orphan stays visible.",
+                 instrument's definition had not resolved yet — a cold-start transient), \
+                 end_of_session (the session it belonged to ended). All expected; counted apart \
+                 from the orphan counter so a real orphan stays visible.",
                 &["venue", "reason"],
             ),
             mbp_duplicate_deltas: counter_vec(
