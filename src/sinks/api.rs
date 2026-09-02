@@ -684,7 +684,15 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // copy out for).
     enum Held {
         Fold(Box<crate::model::BookAccumulator>),
-        Top(bool, u64, Vec<(f64, f64)>, Vec<(f64, f64)>, usize, usize),
+        Top(
+            bool,
+            u64,
+            Option<u32>,
+            Vec<(f64, f64)>,
+            Vec<(f64, f64)>,
+            usize,
+            usize,
+        ),
     }
     let held = {
         let books = crate::model::lock(&state.books);
@@ -696,6 +704,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
                 Held::Top(
                     acc.baselined(),
                     acc.source_ts_ns(),
+                    acc.batch_id(),
                     bids,
                     asks,
                     bids_total,
@@ -717,18 +726,19 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             Some((
                 acc.baselined(),
                 acc.source_ts_ns(),
+                acc.batch_id(),
                 level(bids),
                 level(asks),
                 bids_total,
                 asks_total,
             ))
         }
-        Some(Held::Top(baselined, ts, bids, asks, bids_total, asks_total)) => {
-            Some((baselined, ts, bids, asks, bids_total, asks_total))
+        Some(Held::Top(baselined, ts, batch_id, bids, asks, bids_total, asks_total)) => {
+            Some((baselined, ts, batch_id, bids, asks, bids_total, asks_total))
         }
         None => None,
     };
-    if let Some((baselined, source_ts_ns, bids, asks, bids_total, asks_total)) = mbp {
+    if let Some((baselined, source_ts_ns, batch_id, bids, asks, bids_total, asks_total)) = mbp {
         // Our own serving cap, independent of `baselined()`: even a fully re-baselined book is
         // truncated here, and — unlike the market-by-order path below — we know the true pre-cap
         // count, so cutting real levels off is itself what makes the response incomplete.
@@ -743,7 +753,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            source_ts_ns,
+            (source_ts_ns, batch_id),
             (inst.price_exponent, inst.qty_exponent),
             MAX_LEVELS_PER_SIDE,
             complete,
@@ -771,7 +781,8 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            d.source_ts_ns,
+            // The market-by-order path carries no committed slot — see `NormalizedBook::batch_id`.
+            (d.source_ts_ns, None),
             (inst.price_exponent, inst.qty_exponent),
             DEPTH_LEVELS,
             complete,
@@ -784,7 +795,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         &rendered_id,
         Vec::new(),
         Vec::new(),
-        0,
+        (0, None),
         (inst.price_exponent, inst.qty_exponent),
         MAX_LEVELS_PER_SIDE,
         false,
@@ -807,7 +818,7 @@ fn book_response(
     product_id: &str,
     mut bids: Vec<(f64, f64)>,
     mut asks: Vec<(f64, f64)>,
-    time_ns: u64,
+    (time_ns, batch_id): (u64, Option<u32>),
     (price_exponent, qty_exponent): (i8, i8),
     levels_capped_at: usize,
     complete: bool,
@@ -828,13 +839,20 @@ fn book_response(
             .collect()
     };
 
+    let mut pricebook = json!({
+        "product_id": product_id,
+        "bids": render(&bids),
+        "asks": render(&asks),
+        "time": time_ns.to_string(),
+    });
+    // Omitted, never null, until a `BatchBoundary` has named one: the venue's committed slot, which
+    // is what turns a ladder comparison against a slot-stamped venue snapshot from a time-window
+    // one (measuring sampling skew) into an instantaneous one.
+    if let Some(id) = batch_id {
+        pricebook["batch_id"] = json!(id);
+    }
     ok_json(json!({
-        "pricebook": {
-            "product_id": product_id,
-            "bids": render(&bids),
-            "asks": render(&asks),
-            "time": time_ns.to_string(),
-        },
+        "pricebook": pricebook,
         "coverage": {
             "levels_returned": levels_returned,
             "levels_capped_at": levels_capped_at,
@@ -2149,6 +2167,7 @@ mod tests {
         last: bool,
     ) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 3,
@@ -2187,7 +2206,7 @@ mod tests {
             // A fully re-baselined market: a producer `Clear` was folded in, so this holds the
             // market's whole book.
             let mut baselined = BookAccumulator::new("BASELINED".into());
-            baselined.apply(&book_batch(
+            let mut batch = book_batch(
                 "KALSHI",
                 "BASELINED",
                 2,
@@ -2204,7 +2223,9 @@ mod tests {
                     level_update(BookSide::Ask, 0.63, 50.0),
                 ],
                 true,
-            ));
+            );
+            batch.batch_id = Some(900);
+            baselined.apply(&batch);
             assert!(baselined.baselined());
             map.insert(("KALSHI".into(), "perps".into(), 2, 41), baselined);
 
@@ -2237,6 +2258,10 @@ mod tests {
         assert_eq!(body["coverage"]["levels_returned"], 2);
         assert_eq!(body["pricebook"]["bids"][0][0], "0.6100");
         assert_eq!(body["pricebook"]["asks"][0][0], "0.6300");
+        assert_eq!(
+            body["pricebook"]["batch_id"], 900,
+            "the slot these levels stand at, for a same-slot comparison against the venue"
+        );
 
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:PARTWAY%233.7/book"))
             .await
@@ -2246,6 +2271,10 @@ mod tests {
         assert_eq!(
             body["coverage"]["complete"], false,
             "an accumulator seeded partway through must never claim completeness it cannot back: {body}"
+        );
+        assert!(
+            body["pricebook"]["batch_id"].is_null(),
+            "and a market whose venue has named no slot omits the field rather than sending 0"
         );
     }
 

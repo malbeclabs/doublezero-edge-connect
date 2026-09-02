@@ -690,12 +690,30 @@ mod tests {
         assert!(!filter(r#"{"type":"book"}"#).matches("KALSHI", None, None, "status"));
     }
 
+    /// The venue's committed slot is omitted while unknown, never sent as a placeholder: a consumer
+    /// keying a same-slot comparison would read `0` as a real slot.
+    #[test]
+    fn prepare_omits_an_unknown_committed_slot() {
+        use super::prepare;
+        let mut b = book_batch("SOL", vec![level_update(BookSide::Bid, 0.62, 150.0)], true);
+        let payload = |b: &NormalizedBook| {
+            prepare(&FeedMessage::Book(b.clone()))
+                .expect("serializes")
+                .payload
+                .to_string()
+        };
+        assert!(!payload(&b).contains("batch_id"));
+        b.batch_id = Some(900);
+        assert!(payload(&b).contains(r#""batch_id":900"#));
+    }
+
     /// `book` and `instrument` must carry their channel so an explicit channel filter can select
     /// them; every other kind carries none, which is what the filter's exclusion rule rests on.
     #[test]
     fn prepare_populates_the_channel_for_book_and_instrument() {
         use super::prepare;
         let b = FeedMessage::Book(NormalizedBook {
+            batch_id: None,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,
@@ -1180,6 +1198,7 @@ mod tests {
 
     fn book_batch(symbol: &str, changes: Vec<BookChange>, last: bool) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,

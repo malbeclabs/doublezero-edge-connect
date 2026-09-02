@@ -1465,6 +1465,9 @@ impl MboProcessor {
             category: category_arc(ctx.category),
             order_level: true,
             changes,
+            // The Market-by-Order wire carries a `BatchBoundary` too, but this path keeps no slot
+            // from it — see `MbpProcessor::last_batch` for the one that does.
+            batch_id: None,
             snapshot: mode != BookEmit::Delta,
             last: true,
             source_ts_ns,
@@ -2073,6 +2076,11 @@ pub struct MbpProcessor {
     /// Last `Reset Count` seen per `(publisher, channel)`, compared for inequality only (see
     /// [`Self::note_reset_count`]).
     last_reset: HashMap<(IpAddr, u8), u8>,
+    /// Last `BatchBoundary` `Batch ID` — the venue's committed slot — seen per `(publisher,
+    /// channel)`, stamped on every `book` emitted for that channel. Written only for a key
+    /// `last_reset` already holds, so its keys stay a subset of that map's and `channel_order`
+    /// bounds and evicts it with no queue of its own.
+    last_batch: HashMap<(IpAddr, u8), u32>,
     /// Insertion order of the `last_reset`/`open` keys, for the [`MAX_CHANNEL_KEYS`] eviction.
     channel_order: VecDeque<(IpAddr, u8)>,
     /// Deltas buffered across every book, kept in step by [`Self::with_book`] so the budget check is
@@ -2119,6 +2127,7 @@ impl MbpProcessor {
             dropped: HashMap::new(),
             dropped_order: VecDeque::new(),
             last_reset: HashMap::new(),
+            last_batch: HashMap::new(),
             channel_order: VecDeque::new(),
             buffered_total: 0,
             health_reported: HashMap::new(),
@@ -2208,6 +2217,7 @@ impl MbpProcessor {
                 match self.channel_order.pop_front() {
                     Some(old) => {
                         self.last_reset.remove(&old);
+                        self.last_batch.remove(&old);
                         self.open.remove(&old);
                     }
                     None => break,
@@ -2331,6 +2341,7 @@ impl MbpProcessor {
         self.dropped.retain(|(p, _), _| *p != publisher);
         self.dropped_order.retain(|(p, _)| *p != publisher);
         self.last_reset.retain(|(p, _), _| *p != publisher);
+        self.last_batch.retain(|(p, _), _| *p != publisher);
         self.channel_order.retain(|(p, _)| *p != publisher);
         // Belt and braces: `forget_book` already removed these for every key that had a book, but a
         // reveal without a surviving book must not leave an orphan behind.
@@ -2531,6 +2542,7 @@ impl MbpProcessor {
             category: category_arc(ctx.category),
             order_level: false,
             changes,
+            batch_id: self.last_batch.get(&(ctx.publisher, channel)).copied(),
             snapshot,
             last: true,
             source_ts_ns: book.last_event_ts(),
@@ -3069,7 +3081,14 @@ impl DatagramProcessor for MbpProcessor {
                         );
                     }
                 }
-                codec_mbp::Message::BatchBoundary(_) => {
+                codec_mbp::Message::BatchBoundary(b) => {
+                    // The venue's committed slot, kept for the books this channel emits (see
+                    // `last_batch`). Only for a channel `note_reset_count` already tracks — which
+                    // is every channel whose publisher we hold reference data for, and so every
+                    // one that can emit a book at all.
+                    if self.last_reset.contains_key(&(ctx.publisher, channel)) {
+                        self.last_batch.insert((ctx.publisher, channel), b.batch_id);
+                    }
                     // The crossed-book consistency point: within a batch the inside market may
                     // legitimately cross. Observability only — it must never change status or
                     // discard a book. An instrument holding corrupt state is repaired by its next
@@ -6705,6 +6724,51 @@ mod tests {
             "no price without precision"
         );
         assert!(proc.books.is_empty(), "and no book to hold it");
+    }
+
+    /// `BatchBoundary`'s `Batch ID` is the venue's committed slot, and it rides every `book` the
+    /// channel emits from then on — keying both sides of a ladder comparison on the slot is what
+    /// makes it instantaneous rather than a time-window comparison of sampling skew. Absent until a
+    /// boundary has been seen, since the alternative is claiming a slot the venue never named.
+    #[test]
+    fn mbp_emitted_books_carry_the_committed_slot() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 7, 0, &[41]);
+        let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let last_batch_id = |rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>| {
+            drain_books(rx).last().expect("a book was emitted").batch_id
+        };
+
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &ctx,
+        );
+        assert_eq!(last_batch_id(&mut rx), None, "no boundary seen yet");
+
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                7,
+                0,
+                101,
+                &[
+                    mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                        batch_id: 900,
+                        batch_time: 5,
+                    }),
+                    mbp_level(41, 2, MBP_BID, 6300, 20, 8_000),
+                ],
+            ),
+            &ctx,
+        );
+        assert_eq!(last_batch_id(&mut rx), Some(900));
+
+        // It is the channel's last committed slot, not a per-datagram field: a datagram carrying no
+        // boundary of its own reports the one the venue last committed.
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 102, &[mbp_level(41, 3, MBP_BID, 6400, 30, 9_000)]),
+            &ctx,
+        );
+        assert_eq!(last_batch_id(&mut rx), Some(900));
     }
 
     /// Only the wire `symbol` is a label; the identity triple is what rides the message.

@@ -1565,6 +1565,7 @@ mod tests {
         changes: Vec<crate::model::BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(crate::model::NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,

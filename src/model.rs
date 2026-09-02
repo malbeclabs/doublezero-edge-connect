@@ -331,6 +331,13 @@ pub struct NormalizedBook {
     #[serde(skip)]
     pub order_level: bool,
     pub changes: Vec<BookChange>,
+    /// The venue's committed slot, truncated to `u32` by the publisher: the `Batch ID` of the most
+    /// recent `BatchBoundary` seen on this market's channel when the batch was produced. Absent
+    /// until one has been seen, and on the Market-by-Order path, which does not carry it. Lets a
+    /// consumer compare this book against a slot-stamped venue snapshot at the same slot, instead
+    /// of over a time window that measures sampling skew rather than correctness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<u32>,
     /// Advisory: this batch is part of a rebuild rather than ordinary activity. Deliberately NOT
     /// what re-baselines a consumer — `changes[0].action == Clear` is.
     pub snapshot: bool,
@@ -519,6 +526,11 @@ pub struct BookAccumulator {
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
     source_ts_ns: u64,
+    pending_batch_id: Option<u32>,
+    /// The venue's committed slot the accumulated state stands at — see
+    /// [`NormalizedBook::batch_id`]. Committed with the event clock, so it names a slot whose
+    /// changes are actually folded in rather than one still waiting for its `last` batch.
+    batch_id: Option<u32>,
     /// Whether a producer re-baseline has been folded in, i.e. whether these levels are the market's
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
@@ -573,6 +585,8 @@ impl BookAccumulator {
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
+            pending_batch_id: None,
+            batch_id: None,
             baselined: false,
             source_id: 0,
         }
@@ -601,6 +615,10 @@ impl BookAccumulator {
         // last known event time on every subsequent replay.
         if b.source_ts_ns != 0 {
             self.pending_ts_ns = b.source_ts_ns;
+        }
+        // Same rule as the event clock: a batch that names no slot must not blank the last one.
+        if b.batch_id.is_some() {
+            self.pending_batch_id = b.batch_id;
         }
         // A non-finite price would saturate the fixed-point key (NaN to 0, inf to i128::MIN/MAX),
         // silently merging unrelated levels into one entry that then lives in the replay map forever.
@@ -681,6 +699,7 @@ impl BookAccumulator {
             self.baselined = false;
         }
         self.source_ts_ns = self.pending_ts_ns;
+        self.batch_id = self.pending_batch_id;
     }
 
     /// Discard one or both sides of the book, across **both** populations — a `Clear` names a side, and
@@ -740,6 +759,11 @@ impl BookAccumulator {
     /// [`Self::to_book`] — which stamps this same value — just to read it.
     pub fn source_ts_ns(&self) -> u64 {
         self.source_ts_ns
+    }
+
+    /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
+    pub fn batch_id(&self) -> Option<u32> {
+        self.batch_id
     }
 
     /// Fold the accumulated orders into price levels with the order count at each, bids best-first
@@ -856,6 +880,7 @@ impl BookAccumulator {
                 size: 0.0,
                 order_id: 0,
             }],
+            batch_id: self.batch_id,
             snapshot: true,
             last: true,
             source_ts_ns: self.source_ts_ns,
@@ -1029,6 +1054,7 @@ mod tests {
 
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,
@@ -1493,6 +1519,7 @@ mod tests {
         let venue: Arc<str> = Arc::from("HYPERLIQUID");
         let mut acc = BookAccumulator::new(Arc::from("SOL"));
         acc.apply(&NormalizedBook {
+            batch_id: None,
             venue: venue.clone(),
             source_name: venue.clone(),
             source_id: 1,

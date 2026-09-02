@@ -4585,6 +4585,7 @@ mod tests {
         recv_ns: u64,
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 0,
@@ -5519,6 +5520,7 @@ mod tests {
         const OTHER_CHANNEL: u8 = BOOK_CHANNEL + 1;
         let book_on_channel = |channel: u8, instrument_id: u32, changes: Vec<BookChange>| {
             FeedMessage::Book(NormalizedBook {
+                batch_id: None,
                 venue: venue.into(),
                 source_name: venue.into(),
                 source_id: 0,
@@ -5694,6 +5696,7 @@ mod tests {
         changes: Vec<BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 0,

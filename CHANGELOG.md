@@ -112,6 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removal rate rather than by how far the publishers lag.
 
 ### Added
+- **`batch_id` on the `book` message and on `/v1/products/{id}/book`** — the venue's committed slot, decoded from the market-by-price feed's `BatchBoundary` and previously discarded. A slot on both sides turns a comparison against a venue's slot-stamped REST orderbook from a time-window one, which measures sampling skew (observed as 1-9 tick phantom disagreements on BTC), into an instantaneous one. Optional and absent — never `0` — until a boundary has been seen for the market; the market-by-order path (`order_book`, `depth`) carries no slot and is unchanged. See [PROTOCOL.md](PROTOCOL.md) for the exact scope of the claim, including what a batch straddling a boundary reports.
 - The feed registry document carries a **`sources` block** — the Source ID → registry-name allocation,
   generated from `edge-feed-spec/sources/spec.md`, which stays the authority for it. Assigning a venue
   is now a republish of that document rather than a code change and a release. It rides the existing
