@@ -2000,6 +2000,46 @@ struct OpenGroup {
     accepted: bool,
 }
 
+/// Why a snapshot group was deliberately not routed — the fixed `reason` label of
+/// `dz_mbp_snapshot_levels_dropped_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// An `InstrumentReset` killed the anchor the group was assembling against.
+    Reset,
+    /// The group's `Reset Count` is the publisher's previous run.
+    StaleEra,
+    /// The group's instrument had no resolved definition yet — a cold-start transient.
+    NoDefinition,
+    /// The session the group belongs to ended.
+    EndOfSession,
+}
+
+impl DropReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::StaleEra => "stale_era",
+            Self::NoDefinition => "no_definition",
+            Self::EndOfSession => "end_of_session",
+        }
+    }
+}
+
+/// The last group deliberately dropped on one `(publisher, channel)`, kept only so the levels still
+/// arriving for it are attributed to their reason instead of scoring as orphans — the same trick a
+/// declined rotation's route already plays, for the groups that take no route at all.
+///
+/// Held apart from `open` rather than as another [`OpenGroup`] disposition, so a tombstone can never
+/// displace a live assembly's route: a forged `SnapshotBegin` carrying a stale era would otherwise
+/// take out the group a book is mid-way through building. A forged one can still *plant* a
+/// tombstone, which absorbs that channel's genuine orphans until the next `SnapshotBegin` clears it
+/// — metric poisoning over a near-zero window, accepted where route displacement was not.
+#[derive(Debug, Clone, Copy)]
+struct DroppedGroup {
+    snapshot_id: u32,
+    reason: DropReason,
+}
+
 /// Market-by-Price processor: drives reference data per publisher, feeds level deltas and the
 /// snapshot feed into a [`PriceBook`] per `(publisher, channel, instrument)`, and emits the
 /// incremental `book` product plus `trade` prints.
@@ -2014,6 +2054,16 @@ pub struct MbpProcessor {
     books_order: VecDeque<PriceBookKey>,
     /// The open snapshot group per `(publisher, channel)` — see [`OpenGroup`].
     open: HashMap<(IpAddr, u8), OpenGroup>,
+    /// The last deliberately-dropped group per `(publisher, channel)`, `None` once a new
+    /// `SnapshotBegin` has ended its level stream — see [`DroppedGroup`]. Accounting only: nothing
+    /// routes a level into a book through it.
+    dropped: HashMap<(IpAddr, u8), Option<DroppedGroup>>,
+    /// Insertion order of the `dropped` keys, for its own [`MAX_CHANNEL_KEYS`] eviction — the map is
+    /// written from the snapshot role, which never registers a key in `channel_order`. Must stay 1:1
+    /// with `dropped`'s key set, which is why clearing a tombstone writes `None` instead of removing
+    /// the key: a removal would leave the queue entry behind and let the next drop on that channel
+    /// push a duplicate, growing the queue without bound while the map it bounds stays capped.
+    dropped_order: VecDeque<(IpAddr, u8)>,
     /// Last `Reset Count` seen per `(publisher, channel)`, compared for inequality only (see
     /// [`Self::note_reset_count`]).
     last_reset: HashMap<(IpAddr, u8), u8>,
@@ -2060,6 +2110,8 @@ impl MbpProcessor {
             books: HashMap::new(),
             books_order: VecDeque::new(),
             open: HashMap::new(),
+            dropped: HashMap::new(),
+            dropped_order: VecDeque::new(),
             last_reset: HashMap::new(),
             channel_order: VecDeque::new(),
             buffered_total: 0,
@@ -2160,6 +2212,41 @@ impl MbpProcessor {
         self.last_reset.insert(key, reset_count)
     }
 
+    /// Record that `snapshot_id`'s group was deliberately dropped on `(publisher, channel)`, so the
+    /// levels still to arrive for it are attributed to `reason` rather than counted as orphans.
+    ///
+    /// One entry per channel, replaced by the next drop: the publisher serves one group at a time
+    /// there, exactly as the live route assumes. Bounded like [`Self::note_reset_count`], with its
+    /// own order queue — this is written from the snapshot role, which registers nothing in
+    /// `channel_order`.
+    fn note_dropped_group(
+        &mut self,
+        publisher: IpAddr,
+        channel: u8,
+        snapshot_id: u32,
+        reason: DropReason,
+    ) {
+        let key = (publisher, channel);
+        if !self.dropped.contains_key(&key) {
+            while self.dropped.len() >= MAX_CHANNEL_KEYS {
+                match self.dropped_order.pop_front() {
+                    Some(old) => {
+                        self.dropped.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            self.dropped_order.push_back(key);
+        }
+        self.dropped.insert(
+            key,
+            Some(DroppedGroup {
+                snapshot_id,
+                reason,
+            }),
+        );
+    }
+
     /// Get-or-create the book for one `(publisher, channel, instrument)`, **gated and bounded** the
     /// same way [`MboProcessor::book_for`] is: no book without a resolved definition (it could never
     /// emit, so it would be dead memory), and [`MAX_PRICE_BOOKS`] with least-recently-inserted
@@ -2235,6 +2322,8 @@ impl MbpProcessor {
         // `forget_book` only clears an `open` group whose instrument matches the book it dropped; a
         // group open for an instrument that never got a book needs this purge.
         self.open.retain(|(p, _), _| *p != publisher);
+        self.dropped.retain(|(p, _), _| *p != publisher);
+        self.dropped_order.retain(|(p, _)| *p != publisher);
         self.last_reset.retain(|(p, _), _| *p != publisher);
         self.channel_order.retain(|(p, _)| *p != publisher);
         // Belt and braces: `forget_book` already removed these for every key that had a book, but a
@@ -2724,19 +2813,38 @@ impl DatagramProcessor for MbpProcessor {
                     }
                 }
                 codec_mbp::Message::SnapshotBegin(s) => {
+                    // One group at a time per channel, so a begin ends the last tombstone's level
+                    // stream. A spent one would go on absorbing this channel's genuine orphans:
+                    // `snapshot_id` collides across instruments by construction, which is why the
+                    // live route is the open group and not the id.
+                    if let Some(tombstone) = self.dropped.get_mut(&(ctx.publisher, channel)) {
+                        *tombstone = None;
+                    }
                     // A group whose era disagrees with the market data's belongs to a different run
                     // of the publisher: the snapshot port is its own socket, so a restart leaves the
                     // previous era's rotation queued, and installing it would republish the dead
-                    // session's book as a fresh re-baseline. Its levels are then counted as orphans.
+                    // session's book as a fresh re-baseline.
                     // Before any market data the era is unknown, so the group is accepted.
                     if self
                         .last_reset
                         .get(&(ctx.publisher, channel))
                         .is_some_and(|era| *era != header.reset_count)
                     {
+                        self.note_dropped_group(
+                            ctx.publisher,
+                            channel,
+                            s.snapshot_id,
+                            DropReason::StaleEra,
+                        );
                         continue;
                     }
                     let Some(key) = self.ensure_book(ctx, channel, s.instrument_id) else {
+                        self.note_dropped_group(
+                            ctx.publisher,
+                            channel,
+                            s.snapshot_id,
+                            DropReason::NoDefinition,
+                        );
                         continue;
                     };
                     touched.insert(s.instrument_id);
@@ -2795,10 +2903,24 @@ impl DatagramProcessor for MbpProcessor {
                         .filter(|g| g.snapshot_id == l.snapshot_id)
                         .copied();
                     let Some(group) = route else {
-                        metrics()
-                            .mbp_orphan_snapshot_levels
-                            .with_label_values(&[ctx.venue])
-                            .inc();
+                        // A group this processor itself dropped is attributed to why, so the orphan
+                        // counter carries only what it is alerted on: a level that should have been
+                        // attributable and was not.
+                        match self
+                            .dropped
+                            .get(&(ctx.publisher, channel))
+                            .and_then(|d| d.as_ref())
+                            .filter(|d| d.snapshot_id == l.snapshot_id)
+                        {
+                            Some(d) => metrics()
+                                .mbp_snapshot_levels_dropped
+                                .with_label_values(&[ctx.venue, d.reason.label()])
+                                .inc(),
+                            None => metrics()
+                                .mbp_orphan_snapshot_levels
+                                .with_label_values(&[ctx.venue])
+                                .inc(),
+                        }
                         continue;
                     };
                     if !group.accepted {
@@ -2887,13 +3009,22 @@ impl DatagramProcessor for MbpProcessor {
                         // post-reset market is deferred again until a fresh delta reveals it.
                         self.revealed.remove(&key);
                     }
-                    // The book dropped any group it was assembling, so the route goes with it.
-                    if self
+                    // The book dropped any group it was assembling, so the route goes with it — and
+                    // a tombstone takes its place, since the group's remaining levels are still on
+                    // the wire and are the reset's doing, not an attribution failure.
+                    if let Some(group) = self
                         .open
                         .get(&(ctx.publisher, channel))
-                        .is_some_and(|g| g.instrument_id == r.instrument_id)
+                        .copied()
+                        .filter(|g| g.instrument_id == r.instrument_id)
                     {
                         self.open.remove(&(ctx.publisher, channel));
+                        self.note_dropped_group(
+                            ctx.publisher,
+                            channel,
+                            group.snapshot_id,
+                            DropReason::Reset,
+                        );
                     }
                 }
                 codec_mbp::Message::EndOfSession(ts) => {
@@ -2913,7 +3044,16 @@ impl DatagramProcessor for MbpProcessor {
                         self.report_health(ctx, &key, false);
                         accum.remove(&key.2);
                     }
-                    self.open.remove(&(ctx.publisher, channel));
+                    // Any group assembling belonged to the session that just ended, so it goes too
+                    // — leaving a tombstone, since its remaining levels are still on the wire.
+                    if let Some(group) = self.open.remove(&(ctx.publisher, channel)) {
+                        self.note_dropped_group(
+                            ctx.publisher,
+                            channel,
+                            group.snapshot_id,
+                            DropReason::EndOfSession,
+                        );
+                    }
                 }
                 codec_mbp::Message::BatchBoundary(_) => {
                     // The crossed-book consistency point: within a batch the inside market may
@@ -7062,6 +7202,300 @@ mod tests {
         assert!(proc.books.is_empty(), "and it built no book to hold it");
     }
 
+    /// An `InstrumentReset` arriving between a `SnapshotBegin` and its levels correctly takes the
+    /// route with it — the group is anchored at an anchor the reset just killed — so the levels
+    /// still on the wire for it are attributed to the reset, not scored as orphans. Observed live:
+    /// a double `InstrumentReset` 215 ms apart orphaned one whole 242-level recovery group.
+    #[test]
+    fn mbp_a_reset_dropped_group_is_attributed_not_orphaned() {
+        let venue = "MbpResetDroppedGroupTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+
+        // The begin alone: the group is open, and the levels are still in flight behind it.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                2,
+                &[mbp_wire::enc_snapshot_begin(&codec_mbp::SnapshotBegin {
+                    instrument_id: 41,
+                    anchor_seq: 0,
+                    total_levels: 2,
+                    snapshot_id: 7,
+                    last_instrument_seq: 0,
+                    ts: 1,
+                    depth_bound: 0,
+                })],
+            ),
+            &snap,
+        );
+
+        let before = (orphan_levels(venue), dropped_levels(venue, "reset"));
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                3,
+                &[mbp_wire::enc_instrument_reset(
+                    &codec_mbp::InstrumentReset {
+                        instrument_id: 41,
+                        reason: 0,
+                        new_anchor_seq: 10,
+                        ts: 2,
+                    },
+                )],
+            ),
+            &mkt,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[
+                    mbp_wire::enc_snapshot_level(&codec_mbp::SnapshotLevel {
+                        snapshot_id: 7,
+                        price_raw: 6200,
+                        qty_raw: 10,
+                        order_count: Some(1),
+                        side: MBP_BID,
+                        level_flags: 0,
+                    }),
+                    mbp_wire::enc_snapshot_level(&codec_mbp::SnapshotLevel {
+                        snapshot_id: 7,
+                        price_raw: 6300,
+                        qty_raw: 20,
+                        order_count: Some(1),
+                        side: MBP_ASK,
+                        level_flags: 0,
+                    }),
+                ],
+            ),
+            &snap,
+        );
+
+        assert_eq!(
+            dropped_levels(venue, "reset"),
+            before.1 + 2,
+            "both levels are attributed to the reset that dropped their route"
+        );
+        assert_eq!(
+            orphan_levels(venue),
+            before.0,
+            "and none of them to the orphan counter"
+        );
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::AwaitingSnapshot),
+            "the reset book still awaits a snapshot: nothing was applied to it"
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "and nothing reached the wire"
+        );
+    }
+
+    /// A `SnapshotBegin` for an instrument whose definition has not resolved yet takes no route —
+    /// there is no book to assemble into — so its levels are attributed to that, not orphaned. This
+    /// is a cold-start transient (tens of thousands of levels while reference data fills the
+    /// catalog), which self-resolves; it must not read as an attribution failure while it lasts.
+    #[test]
+    fn mbp_a_group_with_no_definition_is_attributed_not_orphaned() {
+        let venue = "MbpNoDefinitionGroupTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+
+        let before = (orphan_levels(venue), dropped_levels(venue, "no_definition"));
+        // No reference data has arrived, so `ensure_book` resolves nothing for instrument 41.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                1,
+                &mbp_snapshot(41, 5, 0, 0, &[(MBP_BID, 6200, 10), (MBP_ASK, 6300, 20)]),
+            ),
+            &snap,
+        );
+
+        assert_eq!(
+            dropped_levels(venue, "no_definition"),
+            before.1 + 2,
+            "both levels are attributed to the missing definition"
+        );
+        assert_eq!(
+            orphan_levels(venue),
+            before.0,
+            "and none of them to the orphan counter"
+        );
+        assert!(proc.books.is_empty(), "it built no book to hold them");
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "and nothing reached the wire"
+        );
+    }
+
+    /// A tombstone lives only for its own group's level stream: the next `SnapshotBegin` on the
+    /// channel spends it. Otherwise it goes on absorbing that channel's genuine orphans, since
+    /// `snapshot_id` collides across instruments by construction — the cold-start `no_definition`
+    /// burst leaves one at a low id, and every instrument starts its own id sequence low.
+    #[test]
+    fn mbp_a_spent_tombstone_stops_absorbing_orphans() {
+        let venue = "MbpSpentTombstoneTest";
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+
+        // Cold start: no definitions yet, so instrument 41's group at `snapshot_id` 5 is dropped.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 1, &mbp_snapshot(41, 5, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &snap,
+        );
+        assert_eq!(
+            dropped_levels(venue, "no_definition"),
+            1,
+            "precondition: the cold-start group is attributed, and leaves the tombstone"
+        );
+
+        // Reference data lands, and an unrelated instrument's rotation completes.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 2, &mbp_refdata(&[41, 99])),
+            &refdata,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 3, &mbp_snapshot(99, 9, 0, 0, &[(MBP_BID, 100, 1)])),
+            &snap,
+        );
+
+        let before = (orphan_levels(venue), dropped_levels(venue, "no_definition"));
+        // A genuinely lost `SnapshotBegin`, whose rotation happens to reuse `snapshot_id` 5.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[mbp_wire::enc_snapshot_level(&codec_mbp::SnapshotLevel {
+                    snapshot_id: 5,
+                    price_raw: 6200,
+                    qty_raw: 10,
+                    order_count: Some(1),
+                    side: MBP_BID,
+                    level_flags: 0,
+                })],
+            ),
+            &snap,
+        );
+
+        assert_eq!(
+            orphan_levels(venue),
+            before.0 + 1,
+            "the anomaly this counter exists for must still reach it"
+        );
+        assert_eq!(
+            dropped_levels(venue, "no_definition"),
+            before.1,
+            "and the spent tombstone must not claim it"
+        );
+    }
+
+    /// `EndOfSession` drops any group assembling on that path and channel along with the session's
+    /// books — its levels are still on the wire, and they are the session boundary's doing rather
+    /// than an attribution failure.
+    #[test]
+    fn mbp_an_end_of_session_dropped_group_is_attributed_not_orphaned() {
+        let venue = "MbpEndOfSessionGroupTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+
+        // The begin alone: the group is open, its levels still in flight behind it.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                2,
+                &[mbp_wire::enc_snapshot_begin(&codec_mbp::SnapshotBegin {
+                    instrument_id: 41,
+                    anchor_seq: 0,
+                    total_levels: 1,
+                    snapshot_id: 7,
+                    last_instrument_seq: 0,
+                    ts: 1,
+                    depth_bound: 0,
+                })],
+            ),
+            &snap,
+        );
+
+        let before = (
+            orphan_levels(venue),
+            dropped_levels(venue, "end_of_session"),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 3, &[mbp_wire::enc_end_of_session(9_000)]),
+            &mkt,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[mbp_wire::enc_snapshot_level(&codec_mbp::SnapshotLevel {
+                    snapshot_id: 7,
+                    price_raw: 6200,
+                    qty_raw: 10,
+                    order_count: Some(1),
+                    side: MBP_BID,
+                    level_flags: 0,
+                })],
+            ),
+            &snap,
+        );
+
+        assert_eq!(
+            dropped_levels(venue, "end_of_session"),
+            before.1 + 1,
+            "the level is attributed to the session that ended"
+        );
+        assert_eq!(
+            orphan_levels(venue),
+            before.0,
+            "and not to the orphan counter"
+        );
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::AwaitingSnapshot),
+            "the ended session's book awaits a fresh snapshot: nothing was applied to it"
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "and nothing reached the wire"
+        );
+    }
+
+    fn orphan_levels(venue: &str) -> u64 {
+        metrics()
+            .mbp_orphan_snapshot_levels
+            .with_label_values(&[venue])
+            .get()
+    }
+
+    fn dropped_levels(venue: &str, reason: &str) -> u64 {
+        metrics()
+            .mbp_snapshot_levels_dropped
+            .with_label_values(&[venue, reason])
+            .get()
+    }
+
     /// A synced book **correctly** declines a rotation it does not need (§4.2: `Ready` plus a
     /// `Last Instrument Seq` it has already applied). Its levels still arrive, and they are
     /// counted apart from orphans rather than summed with them.
@@ -7332,7 +7766,8 @@ mod tests {
     /// separate queues: the previous era's snapshot rotation is still arriving after the market-data
     /// port has moved on. Installing it would republish the dead session's book as a fresh
     /// re-baseline, and a reset memo shared across the roles would re-reset the channel on every
-    /// interleaving of the backlog.
+    /// interleaving of the backlog. Refusing the group is deliberate, so its levels are attributed
+    /// to `stale_era` rather than scored as orphans.
     #[test]
     fn mbp_a_stale_era_snapshot_neither_installs_nor_resets() {
         let venue = "MbpStaleEraTest";
@@ -7364,6 +7799,10 @@ mod tests {
                 .mbp_orphan_snapshot_levels
                 .with_label_values(&[venue])
                 .get(),
+            metrics()
+                .mbp_snapshot_levels_dropped
+                .with_label_values(&[venue, "stale_era"])
+                .get(),
         );
         // The previous run's rotation, still draining off the snapshot socket.
         proc.on_datagram(
@@ -7385,8 +7824,16 @@ mod tests {
                 .mbp_orphan_snapshot_levels
                 .with_label_values(&[venue])
                 .get(),
-            before.1 + 1,
-            "its levels are counted as unroutable"
+            before.1,
+            "a group this processor itself refused is not an attribution failure"
+        );
+        assert_eq!(
+            metrics()
+                .mbp_snapshot_levels_dropped
+                .with_label_values(&[venue, "stale_era"])
+                .get(),
+            before.2 + 1,
+            "its levels are attributed to the era that refused them"
         );
         assert_eq!(
             proc.books[&(TEST_PUB, 0, 41)].bids().next().map(|(p, _)| p),
