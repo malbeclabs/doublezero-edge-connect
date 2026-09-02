@@ -3,7 +3,7 @@
 //! `doublezero status --json` reports exactly the multicast groups **this host** is subscribed to,
 //! in its `multicast_groups` field: a comma-separated list of `ROLE:code` entries where `S:` is a
 //! subscriber and `P:` a publisher, e.g.
-//! `"S:edge-solana-root,S:edge-solana-shreds,S:tiredsolid,S:scottsdale"`. That is the authority
+//! `"S:edge-solana-root,S:edge-solana-shreds,S:tiredsolid,S:edge-phoenix-tob"`. That is the authority
 //! the reconciler (`crate::ingest::reconcile`) uses to decide which market-data receivers,
 //! shred sources, and the WebSocket sink to run.
 //!
@@ -824,8 +824,8 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|f| f.venue == "HYPERLIQUID"));
 
-        // Subscribed to Phoenix only.
-        let px = subs(&["scottsdale"], &[]);
+        // Subscribed to Phoenix's top-of-book group only -> that row, not the MBP sibling.
+        let px = subs(&["edge-phoenix-tob"], &[]);
         let got = px.market_data_feeds(enabled);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].venue, "PHOENIX");
