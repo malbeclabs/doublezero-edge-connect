@@ -643,6 +643,13 @@ impl BookAccumulator {
             if self.pending.len() > MAX_PENDING_CHANGES {
                 self.pending.clear();
                 self.baselined = false;
+                // The abandoned event's changes are gone, so its stamps go with them, or the next
+                // event's `last` commits a time and a slot for state that was never folded in —
+                // ahead of the book, which is the one direction PROTOCOL.md's "at least that slot"
+                // rules out. Rolled back to what IS folded in rather than zeroed: zeroing would let
+                // a later batch naming neither blank both.
+                self.pending_ts_ns = self.source_ts_ns;
+                self.pending_batch_id = self.batch_id;
             }
             return;
         }
@@ -1738,6 +1745,50 @@ mod tests {
         acc.apply(&book(flood, false, false));
         assert!(!acc.baselined());
         assert!(acc.price_fold().0.is_empty());
+    }
+
+    /// ...and its stamps are abandoned with it. Committing the discarded event's slot on the next
+    /// event's `last` would name a slot the accumulated state is not at — ahead of it, which is the
+    /// direction PROTOCOL.md's "at least that slot's" rules out.
+    #[test]
+    fn an_abandoned_events_stamps_are_not_committed_by_the_next_one() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        let mut first = book(
+            vec![order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0)],
+            true,
+            true,
+        );
+        first.batch_id = Some(900);
+        first.source_ts_ns = 100;
+        acc.apply(&first);
+        assert_eq!(acc.batch_id(), Some(900));
+
+        let mut abandoned = book(
+            (1..=MAX_PENDING_CHANGES as u64 + 1)
+                .map(|id| order(BookAction::Update, BookSide::Bid, id as f64, 1.0, id))
+                .collect(),
+            false,
+            false,
+        );
+        abandoned.batch_id = Some(901);
+        abandoned.source_ts_ns = 200;
+        acc.apply(&abandoned);
+
+        // An ordinary later batch, naming neither a slot nor a time of its own.
+        let mut next = book(
+            vec![order(BookAction::Update, BookSide::Bid, 1.0, 1.0, 1)],
+            false,
+            true,
+        );
+        next.batch_id = None;
+        next.source_ts_ns = 0;
+        acc.apply(&next);
+        assert_eq!(
+            acc.batch_id(),
+            Some(900),
+            "the abandoned event's slot is not the state's"
+        );
+        assert_eq!(acc.source_ts_ns(), 100, "nor its event time");
     }
 
     /// A connecting client is bootstrapped with price levels by default, so an L2 consumer never pays

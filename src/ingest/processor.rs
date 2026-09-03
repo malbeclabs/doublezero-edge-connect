@@ -2457,6 +2457,10 @@ impl MbpProcessor {
         self.books_order
             .retain(|(p, c, _)| !(*p == ctx.publisher && *c == channel));
         self.open.remove(&(ctx.publisher, channel));
+        // `Batch ID` is monotonic only *within* a `Reset Count` era, so the previous era's slot
+        // describes nothing here: on a publisher whose numbering restarts it names a slot ahead of
+        // the whole new era. Back to absent until the new era commits its first batch.
+        self.last_batch.remove(&(ctx.publisher, channel));
         if let Some(state) = self.state.state_mut(ctx.publisher) {
             state.on_datagram(reset_count);
         }
@@ -3080,6 +3084,9 @@ impl DatagramProcessor for MbpProcessor {
                         self.report_health(ctx, &key, false);
                         accum.remove(&key.2);
                     }
+                    // The ended session numbered the channel's batches, so its slot goes with it —
+                    // same era scoping as `on_channel_reset`.
+                    self.last_batch.remove(&(ctx.publisher, channel));
                     // Any group assembling belonged to the session that just ended, so it goes too
                     // — leaving a tombstone, since its remaining levels are still on the wire.
                     if let Some(group) = self.open.remove(&(ctx.publisher, channel)) {
@@ -3093,10 +3100,16 @@ impl DatagramProcessor for MbpProcessor {
                 }
                 codec_mbp::Message::BatchBoundary(b) => {
                     // The venue's committed slot, kept for the books this channel emits (see
-                    // `last_batch`). Only for a channel `note_reset_count` already tracks — which
-                    // is every channel whose publisher we hold reference data for, and so every
-                    // one that can emit a book at all.
-                    if self.last_reset.contains_key(&(ctx.publisher, channel)) {
+                    // `last_batch`). Gated on the **market-data role** like the era memo it is
+                    // scoped by: a boundary is a market-data type, the three ports are separate
+                    // sockets, and a restart leaves the previous era's traffic queued on the other
+                    // two — so a boundary decoded off them installs a slot the live era is not at.
+                    // Also only for a channel `note_reset_count` already tracks, which is every
+                    // channel whose publisher we hold reference data for, and so every one that can
+                    // emit a book at all.
+                    if ctx.role.handles_mktdata()
+                        && self.last_reset.contains_key(&(ctx.publisher, channel))
+                    {
                         self.last_batch.insert((ctx.publisher, channel), b.batch_id);
                     }
                     // The crossed-book consistency point: within a batch the inside market may
@@ -6781,6 +6794,115 @@ mod tests {
             &ctx,
         );
         assert_eq!(last_batch_id(&mut rx), Some(900));
+    }
+
+    /// `Batch ID` is monotonic only **within** a `Reset Count` era, so a channel reset takes the
+    /// channel's slot with it: on a publisher whose numbering restarts per era, the old value names
+    /// a slot ahead of everything the new era will commit, and a consumer doing the same-slot
+    /// comparison this field exists for reads that as a real disagreement. Absent is the honest
+    /// answer until the new era commits a batch.
+    #[test]
+    fn mbp_a_channel_reset_forgets_the_committed_slot() {
+        let venue = "MbpEraScopedSlotTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &snap,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                7,
+                0,
+                3,
+                &[
+                    mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                        batch_id: 900,
+                        batch_time: 5,
+                    }),
+                    mbp_level(41, 1, MBP_BID, 6200, 10, 7_000),
+                ],
+            ),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            Some(900)
+        );
+
+        // The publisher restarts: a changed `Reset Count` on the market-data role.
+        proc.on_datagram(&mbp_wire::datagram(7, 1, 4, &mbp_refdata(&[41])), &refdata);
+        assert!(
+            proc.last_batch.is_empty(),
+            "the previous era's slot describes nothing in this one"
+        );
+
+        // Rebuilt in the new era, which has committed no batch yet.
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 1, 5, &mbp_snapshot(41, 2, 0, 0, &[])),
+            &snap,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 1, 6, &[mbp_level(41, 1, MBP_BID, 6300, 20, 8_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            None,
+            "absent until the new era commits a batch, never the old era's number"
+        );
+    }
+
+    /// A `BatchBoundary` is a market-data type. The three ports are separate sockets, so a restart
+    /// leaves the previous era's traffic queued on the other two — the same hazard the stale-era
+    /// snapshot refusal exists for — and a boundary decoded off one of them would install a slot the
+    /// live era is not at, on every book the channel emits until the next real boundary.
+    #[test]
+    fn mbp_a_batch_boundary_off_the_market_data_role_installs_no_slot() {
+        let venue = "MbpBoundaryRoleTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        let boundary = |id: u32| {
+            mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                batch_id: id,
+                batch_time: 5,
+            })
+        };
+
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &snap,
+        );
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 3, &[boundary(900)]), &snap);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 4, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            None,
+            "a boundary off the snapshot port installs nothing"
+        );
+
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 5, &[boundary(900)]), &mkt);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 6, &[mbp_level(41, 2, MBP_BID, 6300, 20, 8_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            Some(900),
+            "the same boundary on the market-data port does"
+        );
     }
 
     /// Only the wire `symbol` is a label; the identity triple is what rides the message.
