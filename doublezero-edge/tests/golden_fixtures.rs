@@ -37,6 +37,9 @@ KALSHI:EAVE-27JAN01-YES#120.1165  Kalshi       online   market_by_price  0.01   
     );
 }
 
+/// The fixture is a Hyperliquid product, whose publisher states no `Tick Size` — so there is no
+/// `tick_size` row, and `price_increment` is the fixed-point granularity. See
+/// `a_stated_tick_is_rendered_beside_the_increment` in `render.rs` for the other half.
 #[test]
 fn product_get_renders_as_a_field_value_table() {
     let body = fixture("product_get.json");

@@ -25,8 +25,10 @@
 //!   agent to treat a partial reconstruction as the whole book.
 //! - **No field is fabricated to fill out the emulated envelope.** `price_increment` is the
 //!   definition's own `Tick Size` at its price exponent — the tradable increment, not the
-//!   fixed-point granularity, which they are not the same thing (see [`price_increment_string`]);
-//!   `base_increment` is derived from the instrument's own qty exponent (`10^exponent`);
+//!   fixed-point granularity, which they are not the same thing (see [`price_increment_string`]) —
+//!   and `tick_size` is present beside it exactly when the publisher stated one, so a caller can
+//!   tell which of the two it was given (see [`product_entry`]); `base_increment` is derived from
+//!   the instrument's own qty exponent (`10^exponent`);
 //!   `volume_24h`, `price_percentage_change_24h`, `base_currency_id`/`quote_currency_id` and
 //!   `quote_increment` have no honest basis in this crate's reference data or its one-hour window,
 //!   so they are omitted rather than guessed. An absent field is safe under PROTOCOL.md's
@@ -358,6 +360,14 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 /// One product's identity + registry-derived fields. Carries the discrete identity fields
 /// (`source_id`/`source_name`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
 /// string — an agent joining on identity should never have to re-parse the display id.
+///
+/// `tick_size` is **present only when the publisher stated one**, and that presence is the caller's
+/// signal for which of two things `price_increment` is: the venue's tradable tick when it is there,
+/// the fixed-point granularity when it is not (see [`price_increment_string`]). Reporting `0` for
+/// "none stated" instead would hand an agent a number it can divide or round by; an absent field it
+/// has to handle. Raw and in the same units as the `instrument` message's field of the same name,
+/// not a decimal string like the increments: it is wire metadata, and one name must not mean two
+/// things across the two surfaces.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
     let pid = products::ProductId {
         source_id: i.source_id,
@@ -366,7 +376,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         instrument_id: i.instrument_id,
         category: i.category.clone(),
     };
-    json!({
+    let mut entry = json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
         "source_name": i.source_name.as_ref(),
@@ -383,7 +393,11 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "base_increment": increment_string(i.qty_exponent),
         "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
         "feed_kind": feed_kind_for(state, i),
-    })
+    });
+    if i.tick_size > 0 {
+        entry["tick_size"] = json!(i.tick_size);
+    }
+    entry
 }
 
 /// `10^exponent` rendered as a decimal string — the fixed-point granularity, which is `base_increment`
@@ -1535,6 +1549,11 @@ mod tests {
         assert_eq!(
             p["price_increment"], "1.00",
             "the venue's tradable tick (tick_size x 10^price_exponent), not 10^price_exponent"
+        );
+        assert_eq!(
+            p["tick_size"], 100,
+            "present exactly when the publisher stated a tick, which is how a caller knows \
+             `price_increment` is that tick and not the fixed-point granularity"
         );
         assert_eq!(p["base_increment"], "0.00001");
         assert_eq!(p["status"], "online");
@@ -2978,6 +2997,10 @@ mod tests {
         assert_eq!(
             p["price_increment"], "0.001",
             "a publisher stating no tick falls back to the fixed-point granularity"
+        );
+        assert!(
+            p["tick_size"].is_null(),
+            "and omits the field rather than reporting a 0 an agent could round by: {p}"
         );
         assert_eq!(p["base_increment"], "0.0001");
         assert_eq!(p["status"], "online");
