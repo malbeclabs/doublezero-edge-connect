@@ -459,6 +459,7 @@ pub(crate) mod tests {
         b[4..4 + sym.len()].copy_from_slice(sym); // 16B NUL-padded field
         b[37] = d.price_exponent as u8;
         b[38] = d.qty_exponent as u8;
+        b[40..48].copy_from_slice(&d.tick_size.to_le_bytes());
         b[74..76].copy_from_slice(&d.manifest_seq.to_le_bytes());
         msg(MSG_INSTRUMENT_DEFINITION, 0, &b)
     }
@@ -1116,6 +1117,7 @@ pub(crate) mod tests {
     #[test]
     fn builders_round_trip_through_the_decoder() {
         let def = InstrumentDefinition {
+            tick_size: 0,
             instrument_id: 41,
             source_id: None,
             symbol: "KXBTCPERP".into(),

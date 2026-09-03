@@ -371,6 +371,7 @@ impl TobProcessor {
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
+            tick_size: def.tick_size,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -534,6 +535,7 @@ impl DatagramProcessor for TobProcessor {
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
+                                tick_size: d.tick_size,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -733,6 +735,9 @@ impl MidpointProcessor {
         self.revealed.insert(key, source_id);
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
+            // The Midpoint feed keeps its own slimmed definition, which has no `Tick Size` field —
+            // 0 is the "not stated" the consumer contract already defines for it.
+            tick_size: 0,
             venue: source.clone(),
             source_name: source.clone(),
             source_id,
@@ -819,6 +824,7 @@ impl DatagramProcessor for MidpointProcessor {
                     if let Some(&source_id) = self.revealed.get(&key) {
                         let source = venue_arc(source_label(source_id));
                         let inst = NormalizedInstrument {
+                            tick_size: 0, // no `Tick Size` on the Midpoint definition — see above
                             venue: source.clone(),
                             source_name: source.clone(),
                             source_id,
@@ -1039,6 +1045,7 @@ impl MboProcessor {
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
+            tick_size: def.tick_size,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -1465,6 +1472,9 @@ impl MboProcessor {
             category: category_arc(ctx.category),
             order_level: true,
             changes,
+            // The Market-by-Order wire carries a `BatchBoundary` too, but this path keeps no slot
+            // from it — see `MbpProcessor::last_batch` for the one that does.
+            batch_id: None,
             snapshot: mode != BookEmit::Delta,
             last: true,
             source_ts_ns,
@@ -1583,6 +1593,7 @@ impl DatagramProcessor for MboProcessor {
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
+                                tick_size: d.tick_size,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -1988,6 +1999,12 @@ type PriceBookKey = (IpAddr, u8, u32);
 struct OpenGroup {
     instrument_id: u32,
     snapshot_id: u32,
+    /// The group's `Anchor Seq`. An `InstrumentReset` discards the route only when this predates
+    /// the reset's `New Anchor Seq` — the same test `PriceBook::on_snapshot_begin` applies to a
+    /// begin. Resets ride mktdata and groups the snapshot port on independent sequence series, so
+    /// a re-admission's own recovery group is routinely processed before the reset that anchored
+    /// it, and tearing out its route strands the market until the next rotation.
+    anchor_seq: u64,
     /// Whether the book took the rotation. A **declined** one still holds the route — its levels
     /// arrive either way, and only a route makes them attributable — but they are discarded
     /// instead of applied, and counted as declined rather than as orphans.
@@ -2067,6 +2084,11 @@ pub struct MbpProcessor {
     /// Last `Reset Count` seen per `(publisher, channel)`, compared for inequality only (see
     /// [`Self::note_reset_count`]).
     last_reset: HashMap<(IpAddr, u8), u8>,
+    /// Last `BatchBoundary` `Batch ID` — the venue's committed slot — seen per `(publisher,
+    /// channel)`, stamped on every `book` emitted for that channel. Written only for a key
+    /// `last_reset` already holds, so its keys stay a subset of that map's and `channel_order`
+    /// bounds and evicts it with no queue of its own.
+    last_batch: HashMap<(IpAddr, u8), u32>,
     /// Insertion order of the `last_reset`/`open` keys, for the [`MAX_CHANNEL_KEYS`] eviction.
     channel_order: VecDeque<(IpAddr, u8)>,
     /// Deltas buffered across every book, kept in step by [`Self::with_book`] so the budget check is
@@ -2113,6 +2135,7 @@ impl MbpProcessor {
             dropped: HashMap::new(),
             dropped_order: VecDeque::new(),
             last_reset: HashMap::new(),
+            last_batch: HashMap::new(),
             channel_order: VecDeque::new(),
             buffered_total: 0,
             health_reported: HashMap::new(),
@@ -2168,6 +2191,7 @@ impl MbpProcessor {
             category: category_arc(ctx.category),
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
+            tick_size: def.tick_size,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -2202,6 +2226,7 @@ impl MbpProcessor {
                 match self.channel_order.pop_front() {
                     Some(old) => {
                         self.last_reset.remove(&old);
+                        self.last_batch.remove(&old);
                         self.open.remove(&old);
                     }
                     None => break,
@@ -2325,6 +2350,7 @@ impl MbpProcessor {
         self.dropped.retain(|(p, _), _| *p != publisher);
         self.dropped_order.retain(|(p, _)| *p != publisher);
         self.last_reset.retain(|(p, _), _| *p != publisher);
+        self.last_batch.retain(|(p, _), _| *p != publisher);
         self.channel_order.retain(|(p, _)| *p != publisher);
         // Belt and braces: `forget_book` already removed these for every key that had a book, but a
         // reveal without a surviving book must not leave an orphan behind.
@@ -2431,6 +2457,10 @@ impl MbpProcessor {
         self.books_order
             .retain(|(p, c, _)| !(*p == ctx.publisher && *c == channel));
         self.open.remove(&(ctx.publisher, channel));
+        // `Batch ID` is monotonic only *within* a `Reset Count` era, so the previous era's slot
+        // describes nothing here: on a publisher whose numbering restarts it names a slot ahead of
+        // the whole new era. Back to absent until the new era commits its first batch.
+        self.last_batch.remove(&(ctx.publisher, channel));
         if let Some(state) = self.state.state_mut(ctx.publisher) {
             state.on_datagram(reset_count);
         }
@@ -2525,6 +2555,7 @@ impl MbpProcessor {
             category: category_arc(ctx.category),
             order_level: false,
             changes,
+            batch_id: self.last_batch.get(&(ctx.publisher, channel)).copied(),
             snapshot,
             last: true,
             source_ts_ns: book.last_event_ts(),
@@ -2686,6 +2717,7 @@ impl DatagramProcessor for MbpProcessor {
                                 category: category_arc(ctx.category),
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
+                                tick_size: d.tick_size,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -2866,6 +2898,7 @@ impl DatagramProcessor for MbpProcessor {
                             OpenGroup {
                                 instrument_id: s.instrument_id,
                                 snapshot_id: s.snapshot_id,
+                                anchor_seq: s.anchor_seq,
                                 accepted: true,
                             },
                         );
@@ -2888,6 +2921,7 @@ impl DatagramProcessor for MbpProcessor {
                             OpenGroup {
                                 instrument_id: s.instrument_id,
                                 snapshot_id: s.snapshot_id,
+                                anchor_seq: s.anchor_seq,
                                 accepted: false,
                             },
                         );
@@ -3009,14 +3043,20 @@ impl DatagramProcessor for MbpProcessor {
                         // post-reset market is deferred again until a fresh delta reveals it.
                         self.revealed.remove(&key);
                     }
-                    // The book dropped any group it was assembling, so the route goes with it — and
-                    // a tombstone takes its place, since the group's remaining levels are still on
-                    // the wire and are the reset's doing, not an attribution failure.
-                    if let Some(group) = self
-                        .open
-                        .get(&(ctx.publisher, channel))
-                        .copied()
-                        .filter(|g| g.instrument_id == r.instrument_id)
+                    // A group anchored BEFORE this reset died with the book's assembly, so the
+                    // route goes with it — and a tombstone takes its place, since the group's
+                    // remaining levels are still on the wire and are the reset's doing, not an
+                    // attribution failure. One anchored at or after it is this reset's own
+                    // recovery group, which the book kept; taking its route would orphan the
+                    // recovery the reset asked for.
+                    if let Some(group) =
+                        self.open
+                            .get(&(ctx.publisher, channel))
+                            .copied()
+                            .filter(|g| {
+                                g.instrument_id == r.instrument_id
+                                    && g.anchor_seq < r.new_anchor_seq
+                            })
                     {
                         self.open.remove(&(ctx.publisher, channel));
                         self.note_dropped_group(
@@ -3044,6 +3084,9 @@ impl DatagramProcessor for MbpProcessor {
                         self.report_health(ctx, &key, false);
                         accum.remove(&key.2);
                     }
+                    // The ended session numbered the channel's batches, so its slot goes with it —
+                    // same era scoping as `on_channel_reset`.
+                    self.last_batch.remove(&(ctx.publisher, channel));
                     // Any group assembling belonged to the session that just ended, so it goes too
                     // — leaving a tombstone, since its remaining levels are still on the wire.
                     if let Some(group) = self.open.remove(&(ctx.publisher, channel)) {
@@ -3055,7 +3098,20 @@ impl DatagramProcessor for MbpProcessor {
                         );
                     }
                 }
-                codec_mbp::Message::BatchBoundary(_) => {
+                codec_mbp::Message::BatchBoundary(b) => {
+                    // The venue's committed slot, kept for the books this channel emits (see
+                    // `last_batch`). Gated on the **market-data role** like the era memo it is
+                    // scoped by: a boundary is a market-data type, the three ports are separate
+                    // sockets, and a restart leaves the previous era's traffic queued on the other
+                    // two — so a boundary decoded off them installs a slot the live era is not at.
+                    // Also only for a channel `note_reset_count` already tracks, which is every
+                    // channel whose publisher we hold reference data for, and so every one that can
+                    // emit a book at all.
+                    if ctx.role.handles_mktdata()
+                        && self.last_reset.contains_key(&(ctx.publisher, channel))
+                    {
+                        self.last_batch.insert((ctx.publisher, channel), b.batch_id);
+                    }
                     // The crossed-book consistency point: within a batch the inside market may
                     // legitimately cross. Observability only — it must never change status or
                     // discard a book. An instrument holding corrupt state is repaired by its next
@@ -5004,6 +5060,7 @@ mod tests {
         let instruments: crate::model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
 
         let base = NormalizedInstrument {
+            tick_size: 0,
             venue: "TestVenue".into(),
             source_name: "TestVenue".into(),
             source_id: 0,
@@ -5442,6 +5499,7 @@ mod tests {
         )];
         out.extend(ids.iter().map(|id| {
             mbp_wire::enc_instrument_definition(&codec_mbp::InstrumentDefinition {
+                tick_size: 0,
                 instrument_id: *id,
                 source_id: None,
                 symbol: format!("INST-{id}").into(),
@@ -5590,6 +5648,16 @@ mod tests {
             trade_qty_raw: 1,
             trade_id: 0,
             cumulative_volume_raw: 0,
+        })
+    }
+
+    /// One `InstrumentReset` for `id`, re-anchoring the instrument at `anchor`.
+    fn mbp_reset(id: u32, anchor: u64) -> Vec<u8> {
+        mbp_wire::enc_instrument_reset(&codec_mbp::InstrumentReset {
+            instrument_id: id,
+            reason: 0,
+            new_anchor_seq: anchor,
+            ts: 2,
         })
     }
 
@@ -6683,6 +6751,160 @@ mod tests {
         assert!(proc.books.is_empty(), "and no book to hold it");
     }
 
+    /// `BatchBoundary`'s `Batch ID` is the venue's committed slot, and it rides every `book` the
+    /// channel emits from then on — keying both sides of a ladder comparison on the slot is what
+    /// makes it instantaneous rather than a time-window comparison of sampling skew. Absent until a
+    /// boundary has been seen, since the alternative is claiming a slot the venue never named.
+    #[test]
+    fn mbp_emitted_books_carry_the_committed_slot() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 7, 0, &[41]);
+        let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let last_batch_id = |rx: &mut broadcast::Receiver<std::sync::Arc<FeedMessage>>| {
+            drain_books(rx).last().expect("a book was emitted").batch_id
+        };
+
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 100, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &ctx,
+        );
+        assert_eq!(last_batch_id(&mut rx), None, "no boundary seen yet");
+
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                7,
+                0,
+                101,
+                &[
+                    mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                        batch_id: 900,
+                        batch_time: 5,
+                    }),
+                    mbp_level(41, 2, MBP_BID, 6300, 20, 8_000),
+                ],
+            ),
+            &ctx,
+        );
+        assert_eq!(last_batch_id(&mut rx), Some(900));
+
+        // It is the channel's last committed slot, not a per-datagram field: a datagram carrying no
+        // boundary of its own reports the one the venue last committed.
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 102, &[mbp_level(41, 3, MBP_BID, 6400, 30, 9_000)]),
+            &ctx,
+        );
+        assert_eq!(last_batch_id(&mut rx), Some(900));
+    }
+
+    /// `Batch ID` is monotonic only **within** a `Reset Count` era, so a channel reset takes the
+    /// channel's slot with it: on a publisher whose numbering restarts per era, the old value names
+    /// a slot ahead of everything the new era will commit, and a consumer doing the same-slot
+    /// comparison this field exists for reads that as a real disagreement. Absent is the honest
+    /// answer until the new era commits a batch.
+    #[test]
+    fn mbp_a_channel_reset_forgets_the_committed_slot() {
+        let venue = "MbpEraScopedSlotTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &snap,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                7,
+                0,
+                3,
+                &[
+                    mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                        batch_id: 900,
+                        batch_time: 5,
+                    }),
+                    mbp_level(41, 1, MBP_BID, 6200, 10, 7_000),
+                ],
+            ),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            Some(900)
+        );
+
+        // The publisher restarts: a changed `Reset Count` on the market-data role.
+        proc.on_datagram(&mbp_wire::datagram(7, 1, 4, &mbp_refdata(&[41])), &refdata);
+        assert!(
+            proc.last_batch.is_empty(),
+            "the previous era's slot describes nothing in this one"
+        );
+
+        // Rebuilt in the new era, which has committed no batch yet.
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 1, 5, &mbp_snapshot(41, 2, 0, 0, &[])),
+            &snap,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 1, 6, &[mbp_level(41, 1, MBP_BID, 6300, 20, 8_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            None,
+            "absent until the new era commits a batch, never the old era's number"
+        );
+    }
+
+    /// A `BatchBoundary` is a market-data type. The three ports are separate sockets, so a restart
+    /// leaves the previous era's traffic queued on the other two — the same hazard the stale-era
+    /// snapshot refusal exists for — and a boundary decoded off one of them would install a slot the
+    /// live era is not at, on every book the channel emits until the next real boundary.
+    #[test]
+    fn mbp_a_batch_boundary_off_the_market_data_role_installs_no_slot() {
+        let venue = "MbpBoundaryRoleTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        let boundary = |id: u32| {
+            mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                batch_id: id,
+                batch_time: 5,
+            })
+        };
+
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &snap,
+        );
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 3, &[boundary(900)]), &snap);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 4, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            None,
+            "a boundary off the snapshot port installs nothing"
+        );
+
+        proc.on_datagram(&mbp_wire::datagram(7, 0, 5, &[boundary(900)]), &mkt);
+        proc.on_datagram(
+            &mbp_wire::datagram(7, 0, 6, &[mbp_level(41, 2, MBP_BID, 6300, 20, 8_000)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx).last().expect("a book").batch_id,
+            Some(900),
+            "the same boundary on the market-data port does"
+        );
+    }
+
     /// Only the wire `symbol` is a label; the identity triple is what rides the message.
     #[test]
     fn mbp_emitted_books_carry_the_channel_and_instrument_id() {
@@ -7298,6 +7520,64 @@ mod tests {
             drain_books(&mut rx).is_empty(),
             "and nothing reached the wire"
         );
+    }
+
+    /// ...but the reset's OWN recovery group must survive it. A publisher withholding and then
+    /// re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin`
+    /// follows its reset by ~0.1 ms on a different port — resets ride mktdata, groups the snapshot
+    /// port, on independent sequence series — so which is processed first is a coin flip. Either
+    /// order installs exactly one recovery group. Observed live: a 713-level CRCL group anchored at
+    /// the second reset's own anchor was dropped whole, and the market waited a full rotation.
+    #[test]
+    fn mbp_a_re_admission_group_survives_its_own_reset_in_either_order() {
+        let venue = "MbpReAdmissionGroupTest";
+        for begin_first in [false, true] {
+            let (arbiter, mut rx, instruments) = mbp_harness();
+            let mut proc = MbpProcessor::new(tape(false));
+            let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+            let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+            let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+            // Entering the withheld state: this anchor names a sequence from before it went dark.
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 2, &[mbp_reset(41, 10)]), &mkt);
+
+            let before = (orphan_levels(venue), dropped_levels(venue, "reset"));
+            let group = mbp_snapshot(41, 7, 20, 0, &[(MBP_BID, 6200, 10)]);
+            let re_admit = [mbp_reset(41, 20)];
+            if begin_first {
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &group[..1]), &snap);
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 4, &re_admit), &mkt);
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 5, &group[1..]), &snap);
+            } else {
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &re_admit), &mkt);
+                proc.on_datagram(&mbp_wire::datagram(0, 0, 4, &group), &snap);
+            }
+            // A snapshot carries no Source ID, so the re-baseline reaches the wire on the first
+            // message that names the market.
+            proc.on_datagram(&mbp_wire::datagram(0, 0, 6, &[mbp_reveal(41, 1)]), &mkt);
+
+            assert_eq!(
+                mbp_status(&proc, TEST_PUB, 0, 41),
+                Some(BookStatus::Ready),
+                "begin_first={begin_first}: the recovery group installed"
+            );
+            let books = drain_books(&mut rx);
+            assert_eq!(books.len(), 1, "begin_first={begin_first}");
+            assert_eq!(
+                shape(&books[0]),
+                vec![
+                    (BookAction::Clear, BookSide::Both, 0.0, 0.0),
+                    (BookAction::Update, BookSide::Bid, 6200.0, 10.0),
+                ],
+                "begin_first={begin_first}: one re-baseline carrying the group's levels"
+            );
+            assert_eq!(
+                (orphan_levels(venue), dropped_levels(venue, "reset")),
+                before,
+                "begin_first={begin_first}: a kept group's levels are neither orphaned nor \
+                 attributed to the reset that anchored it"
+            );
+        }
     }
 
     /// A `SnapshotBegin` for an instrument whose definition has not resolved yet takes no route —

@@ -258,6 +258,7 @@ mod tests {
         instrument_id: u32,
     ) -> NormalizedInstrument {
         NormalizedInstrument {
+            tick_size: 0,
             venue: "HYPERLIQUID".into(),
             source_name: "HYPERLIQUID".into(),
             source_id: 1,

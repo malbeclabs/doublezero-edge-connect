@@ -23,8 +23,12 @@
 //!   backs.** An accumulator that has not folded in a producer re-baseline holds only the levels
 //!   that moved since it started accumulating; serving that as `"complete": true` would tell an
 //!   agent to treat a partial reconstruction as the whole book.
-//! - **No field is fabricated to fill out the emulated envelope.** `price_increment`/
-//!   `base_increment` are derived from the instrument's own price/qty exponent (`10^exponent`);
+//! - **No field is fabricated to fill out the emulated envelope.** `price_increment` is the
+//!   definition's own `Tick Size` at its price exponent — the tradable increment, not the
+//!   fixed-point granularity, which they are not the same thing (see [`price_increment_string`]) —
+//!   and `tick_size` is present beside it exactly when the publisher stated one, so a caller can
+//!   tell which of the two it was given (see [`product_entry`]); `base_increment` is derived from
+//!   the instrument's own qty exponent (`10^exponent`);
 //!   `volume_24h`, `price_percentage_change_24h`, `base_currency_id`/`quote_currency_id` and
 //!   `quote_increment` have no honest basis in this crate's reference data or its one-hour window,
 //!   so they are omitted rather than guessed. An absent field is safe under PROTOCOL.md's
@@ -356,6 +360,14 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 /// One product's identity + registry-derived fields. Carries the discrete identity fields
 /// (`source_id`/`source_name`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
 /// string — an agent joining on identity should never have to re-parse the display id.
+///
+/// `tick_size` is **present only when the publisher stated one**, and that presence is the caller's
+/// signal for which of two things `price_increment` is: the venue's tradable tick when it is there,
+/// the fixed-point granularity when it is not (see [`price_increment_string`]). Reporting `0` for
+/// "none stated" instead would hand an agent a number it can divide or round by; an absent field it
+/// has to handle. Raw and in the same units as the `instrument` message's field of the same name,
+/// not a decimal string like the increments: it is wire metadata, and one name must not mean two
+/// things across the two surfaces.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
     let pid = products::ProductId {
         source_id: i.source_id,
@@ -364,7 +376,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         instrument_id: i.instrument_id,
         category: i.category.clone(),
     };
-    json!({
+    let mut entry = json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
         "source_name": i.source_name.as_ref(),
@@ -377,18 +389,37 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "symbol": i.symbol.as_ref(),
         "channel": i.channel,
         "instrument_id": i.instrument_id,
-        "price_increment": increment_string(i.price_exponent),
+        "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
         "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
         "feed_kind": feed_kind_for(state, i),
-    })
+    });
+    if i.tick_size > 0 {
+        entry["tick_size"] = json!(i.tick_size);
+    }
+    entry
 }
 
-/// `10^exponent` rendered as a decimal string — `price_increment`/`base_increment`. Derivable from
-/// the instrument's own exponent, unlike `quote_increment` (no honest basis; deliberately omitted
-/// — see the module docs).
+/// `10^exponent` rendered as a decimal string — the fixed-point granularity, which is `base_increment`
+/// and is the fallback for `price_increment`. Derivable from the instrument's own exponent, unlike
+/// `quote_increment` (no honest basis; deliberately omitted — see the module docs).
 fn increment_string(exponent: i8) -> String {
     decimal_string(10f64.powi(exponent as i32), exponent)
+}
+
+/// The **tradable** price increment: the definition's `Tick Size` at its own price exponent. The
+/// two differ by orders of magnitude — BTC on Phoenix is exponent `-2` with a tick of `100`, so it
+/// moves in dollars while `10^-2` claims cents — and `price_increment` conventionally means the
+/// tradable one. A `tick_size` of `0` is the publisher stating none (every Hyperliquid definition
+/// does), and there the granularity is the only honest answer left.
+fn price_increment_string(tick_size: i64, price_exponent: i8) -> String {
+    if tick_size <= 0 {
+        return increment_string(price_exponent);
+    }
+    decimal_string(
+        crate::ingest::codec_common::apply_exponent(tick_size, price_exponent),
+        price_exponent,
+    )
 }
 
 /// Render `value` as a fixed-decimal string at `exponent`'s precision (never Rust's scientific/debug
@@ -684,7 +715,15 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // copy out for).
     enum Held {
         Fold(Box<crate::model::BookAccumulator>),
-        Top(bool, u64, Vec<(f64, f64)>, Vec<(f64, f64)>, usize, usize),
+        Top(
+            bool,
+            u64,
+            Option<u32>,
+            Vec<(f64, f64)>,
+            Vec<(f64, f64)>,
+            usize,
+            usize,
+        ),
     }
     let held = {
         let books = crate::model::lock(&state.books);
@@ -696,6 +735,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
                 Held::Top(
                     acc.baselined(),
                     acc.source_ts_ns(),
+                    acc.batch_id(),
                     bids,
                     asks,
                     bids_total,
@@ -717,18 +757,19 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             Some((
                 acc.baselined(),
                 acc.source_ts_ns(),
+                acc.batch_id(),
                 level(bids),
                 level(asks),
                 bids_total,
                 asks_total,
             ))
         }
-        Some(Held::Top(baselined, ts, bids, asks, bids_total, asks_total)) => {
-            Some((baselined, ts, bids, asks, bids_total, asks_total))
+        Some(Held::Top(baselined, ts, batch_id, bids, asks, bids_total, asks_total)) => {
+            Some((baselined, ts, batch_id, bids, asks, bids_total, asks_total))
         }
         None => None,
     };
-    if let Some((baselined, source_ts_ns, bids, asks, bids_total, asks_total)) = mbp {
+    if let Some((baselined, source_ts_ns, batch_id, bids, asks, bids_total, asks_total)) = mbp {
         // Our own serving cap, independent of `baselined()`: even a fully re-baselined book is
         // truncated here, and — unlike the market-by-order path below — we know the true pre-cap
         // count, so cutting real levels off is itself what makes the response incomplete.
@@ -743,7 +784,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            source_ts_ns,
+            (source_ts_ns, batch_id),
             (inst.price_exponent, inst.qty_exponent),
             MAX_LEVELS_PER_SIDE,
             complete,
@@ -771,7 +812,8 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            d.source_ts_ns,
+            // The market-by-order path carries no committed slot — see `NormalizedBook::batch_id`.
+            (d.source_ts_ns, None),
             (inst.price_exponent, inst.qty_exponent),
             DEPTH_LEVELS,
             complete,
@@ -784,7 +826,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         &rendered_id,
         Vec::new(),
         Vec::new(),
-        0,
+        (0, None),
         (inst.price_exponent, inst.qty_exponent),
         MAX_LEVELS_PER_SIDE,
         false,
@@ -807,7 +849,7 @@ fn book_response(
     product_id: &str,
     mut bids: Vec<(f64, f64)>,
     mut asks: Vec<(f64, f64)>,
-    time_ns: u64,
+    (time_ns, batch_id): (u64, Option<u32>),
     (price_exponent, qty_exponent): (i8, i8),
     levels_capped_at: usize,
     complete: bool,
@@ -828,13 +870,20 @@ fn book_response(
             .collect()
     };
 
+    let mut pricebook = json!({
+        "product_id": product_id,
+        "bids": render(&bids),
+        "asks": render(&asks),
+        "time": time_ns.to_string(),
+    });
+    // Omitted, never null, until a `BatchBoundary` has named one: the venue's committed slot, which
+    // is what turns a ladder comparison against a slot-stamped venue snapshot from a time-window
+    // one (measuring sampling skew) into an instantaneous one.
+    if let Some(id) = batch_id {
+        pricebook["batch_id"] = json!(id);
+    }
     ok_json(json!({
-        "pricebook": {
-            "product_id": product_id,
-            "bids": render(&bids),
-            "asks": render(&asks),
-            "time": time_ns.to_string(),
-        },
+        "pricebook": pricebook,
         "coverage": {
             "levels_returned": levels_returned,
             "levels_capped_at": levels_capped_at,
@@ -1399,6 +1448,7 @@ mod tests {
         qty_exponent: i8,
     ) -> NormalizedInstrument {
         NormalizedInstrument {
+            tick_size: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,
@@ -1473,10 +1523,12 @@ mod tests {
     #[tokio::test]
     async fn products_list_carries_discrete_identity_fields() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
-        instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32),
-            inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
-        );
+        let mut btc = inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5);
+        btc.tick_size = 100; // BTC trades in dollars at a fixed point of cents
+        instruments
+            .lock()
+            .unwrap()
+            .insert(("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32), btc);
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
@@ -1494,7 +1546,15 @@ mod tests {
         assert_eq!(p["symbol"], "BTC");
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 41);
-        assert_eq!(p["price_increment"], "0.01");
+        assert_eq!(
+            p["price_increment"], "1.00",
+            "the venue's tradable tick (tick_size x 10^price_exponent), not 10^price_exponent"
+        );
+        assert_eq!(
+            p["tick_size"], 100,
+            "present exactly when the publisher stated a tick, which is how a caller knows \
+             `price_increment` is that tick and not the fixed-point granularity"
+        );
         assert_eq!(p["base_increment"], "0.00001");
         assert_eq!(p["status"], "online");
         // Hyperliquid carries two `FEEDS` kinds (Top-of-Book + Market-by-Order) and this fixture
@@ -2149,6 +2209,7 @@ mod tests {
         last: bool,
     ) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 3,
@@ -2187,7 +2248,7 @@ mod tests {
             // A fully re-baselined market: a producer `Clear` was folded in, so this holds the
             // market's whole book.
             let mut baselined = BookAccumulator::new("BASELINED".into());
-            baselined.apply(&book_batch(
+            let mut batch = book_batch(
                 "KALSHI",
                 "BASELINED",
                 2,
@@ -2204,7 +2265,9 @@ mod tests {
                     level_update(BookSide::Ask, 0.63, 50.0),
                 ],
                 true,
-            ));
+            );
+            batch.batch_id = Some(900);
+            baselined.apply(&batch);
             assert!(baselined.baselined());
             map.insert(("KALSHI".into(), "perps".into(), 2, 41), baselined);
 
@@ -2237,6 +2300,10 @@ mod tests {
         assert_eq!(body["coverage"]["levels_returned"], 2);
         assert_eq!(body["pricebook"]["bids"][0][0], "0.6100");
         assert_eq!(body["pricebook"]["asks"][0][0], "0.6300");
+        assert_eq!(
+            body["pricebook"]["batch_id"], 900,
+            "the slot these levels stand at, for a same-slot comparison against the venue"
+        );
 
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:PARTWAY%233.7/book"))
             .await
@@ -2246,6 +2313,10 @@ mod tests {
         assert_eq!(
             body["coverage"]["complete"], false,
             "an accumulator seeded partway through must never claim completeness it cannot back: {body}"
+        );
+        assert!(
+            body["pricebook"]["batch_id"].is_null(),
+            "and a market whose venue has named no slot omits the field rather than sending 0"
         );
     }
 
@@ -2923,7 +2994,14 @@ mod tests {
         assert_eq!(p["source_id"], 2);
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 7);
-        assert_eq!(p["price_increment"], "0.001");
+        assert_eq!(
+            p["price_increment"], "0.001",
+            "a publisher stating no tick falls back to the fixed-point granularity"
+        );
+        assert!(
+            p["tick_size"].is_null(),
+            "and omits the field rather than reporting a 0 an agent could round by: {p}"
+        );
         assert_eq!(p["base_increment"], "0.0001");
         assert_eq!(p["status"], "online");
         // Phoenix's perps category carries two `FEEDS` kinds (Top-of-Book + Market-by-Price) and

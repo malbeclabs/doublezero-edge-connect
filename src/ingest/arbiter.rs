@@ -353,11 +353,12 @@ pub struct DepthId {
 ///
 /// Unlike quotes and depth this needs no `source_ts` floor: a definition carries no timestamp and
 /// is idempotent full state, so content plus a re-announce clock is the whole identity. A genuine
-/// precision change differs and re-emits immediately.
+/// precision or tick change differs and re-emits immediately.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct InstrumentId {
     price_exponent: i8,
     qty_exponent: i8,
+    tick_size: i64,
 }
 
 /// How long unchanged instrument content is suppressed before it is re-broadcast.
@@ -2982,6 +2983,7 @@ impl Arbiter {
                 let id = InstrumentId {
                     price_exponent: i.price_exponent,
                     qty_exponent: i.qty_exponent,
+                    tick_size: i.tick_size,
                 };
                 let now = now_mono_ns();
                 let key = (i.venue.clone(), i.channel, i.instrument_id);
@@ -4451,6 +4453,7 @@ mod tests {
         qty_exponent: i8,
     ) -> FeedMessage {
         FeedMessage::Instrument(crate::model::NormalizedInstrument {
+            tick_size: 0,
             venue: "HYPERLIQUID".into(),
             source_name: "HYPERLIQUID".into(),
             source_id: 0,
@@ -4585,6 +4588,7 @@ mod tests {
         recv_ns: u64,
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 0,
@@ -5519,6 +5523,7 @@ mod tests {
         const OTHER_CHANNEL: u8 = BOOK_CHANNEL + 1;
         let book_on_channel = |channel: u8, instrument_id: u32, changes: Vec<BookChange>| {
             FeedMessage::Book(NormalizedBook {
+                batch_id: None,
                 venue: venue.into(),
                 source_name: venue.into(),
                 source_id: 0,
@@ -5694,6 +5699,7 @@ mod tests {
         changes: Vec<BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 0,

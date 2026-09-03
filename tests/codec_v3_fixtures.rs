@@ -127,6 +127,34 @@ fn every_datagram_decodes_as_schema_v3_and_takes_the_v3_path() {
     }
 }
 
+/// The v3 `Tick Size` decodes at the v3 offset — the other half of the Phoenix v1 check in
+/// `codec_phoenix_fixtures.rs`, since the field sits 50 bytes further along here and the two
+/// generations are live at once.
+#[test]
+fn v3_definitions_carry_the_venues_tradable_tick() {
+    let mut ticks: BTreeMap<String, (i8, i64)> = BTreeMap::new();
+    for (_, msgs) in tob_datagrams(TOB_V3) {
+        for m in msgs {
+            if let codec::Message::InstrumentDefinition(d) = m {
+                ticks.insert(d.symbol.to_string(), (d.price_exponent, d.tick_size));
+            }
+        }
+    }
+    assert!(!ticks.is_empty(), "{TOB_V3}: no InstrumentDefinitions");
+    assert_eq!(
+        ticks.get("KXBTCPERP"),
+        Some(&(-8, 100_000_000)),
+        "a $1.00 tick at a 10^-8 fixed point"
+    );
+    assert_eq!(ticks.get("KXETHPERP"), Some(&(-8, 10_000_000)), "$0.10");
+    for (symbol, &(_, tick)) in &ticks {
+        assert!(
+            tick > 0,
+            "every Kalshi definition states a tick; {symbol} states none"
+        );
+    }
+}
+
 /// One decoded `InstrumentDefinition`, tagged with the datagram's `channel_id` (the per-path identity
 /// on these captures).
 struct Def {
