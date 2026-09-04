@@ -112,6 +112,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removal rate rather than by how far the publishers lag.
 
 ### Added
+- ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
+  activated on the ledger and running on their own two groups, separate from perps and sports:
+  top-of-book on `233.84.178.21` and market-by-price on `233.84.178.22`, six channels each (`50`-`55`,
+  one per family — us, house, intl, primaries, offices, other) and two publishers each, the mirror
+  offset by `+100` exactly as the sports feeds are. Ports are the base plus the channel id, so a
+  subscriber binds one socket per family and hears both publishers on it. Only the market-by-price
+  row carries a snapshot plane; giving the top-of-book row one would bind a socket nothing ever sends
+  to, and an idle socket reads as a silent source rather than as a misconfiguration, so the row states
+  the absence instead. The codes are the post-rename ones — the ledger renamed `edge-kalshi-elections-*`
+  to `edge-kalshi-elections-pol-*` on 2026-09-01, and a row carrying the old code activates nothing,
+  silently, which is the same failure mode as the three stale Kalshi codes below.
+  ⚠️ **Neither group is wire-confirmed from a subscriber.** Groups, activation and publisher counts
+  were read off the ledger; ports and channel ids come from the publisher-side declaration in
+  `malbeclabs/infra`, which is what `aws-cmh-kl-elections1/2` are running. No capture has been taken
+  against either group from a host holding a subscribe grant, so both rows carry that caveat in their
+  notes and the first converge is the confirmation: check that the startup line names
+  `KALSHI/elections` among `ingesting feeds` and that its receivers report liveness up before trusting
+  any instrument count out of it.
 - **`tick_size` on the `instrument` message, and `/v1/products[].price_increment` now reports the venue's tradable tick** rather than `10^price_exponent`, which is only the fixed-point granularity: BTC on Phoenix is exponent `-2` with a tick of `100`, so the API reported `0.01` for a market that moves in dollars. The wire has carried `Tick Size` all along and the `InstrumentDefinition` decoder stopped short of it; it is now decoded at both schema generations, validated against the reference decoder and against the committed v1 and v3 captures. A publisher stating no tick (`0` — every Hyperliquid definition today) still reports the granularity, since omitting `price_increment` would break the packaged CLI's product parser — so `/v1/products` entries carry `tick_size` beside it, present exactly when the venue stated one, which is how a caller tells the two apart. `doublezero-edge products describe` renders that row when it is there. ⚠️ **PROTOCOL.md's `price_exponent` row previously called `10^price_exponent` the tick size; that was wrong** and is corrected — a consumer that rounded orders to it was wrong by the tick's own magnitude.
 - **`batch_id` on the `book` message and on `/v1/products/{id}/book`** — the venue's committed slot, decoded from the market-by-price feed's `BatchBoundary` and previously discarded. A slot on both sides turns a comparison against a venue's slot-stamped REST orderbook from a time-window one, which measures sampling skew (observed as 1-9 tick phantom disagreements on BTC), into an instantaneous one. Optional and absent — never `0` — until a boundary has been seen for the market, and absent again after a publisher restart or session end, since `Batch ID` is monotonic only within one `Reset Count` era; the market-by-order path (`order_book`, `depth`) carries no slot and is unchanged. See [PROTOCOL.md](PROTOCOL.md) for the exact scope of the claim, including what a batch straddling a boundary reports.
 - The feed registry document carries a **`sources` block** — the Source ID → registry-name allocation,
