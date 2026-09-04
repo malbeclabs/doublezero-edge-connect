@@ -460,9 +460,59 @@ mod tests {
                 ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
                 ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
                 ("KALSHI", "sports", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
+                ("KALSHI", "elections", FeedKind::TopOfBook) => "edge-kalshi-elections-pol-tob",
+                ("KALSHI", "elections", FeedKind::MarketByPrice) => "edge-kalshi-elections-pol-mbp",
                 other => panic!("unexpected feed {other:?}"),
             };
             assert_eq!(f.code, expected, "{} {:?} has wrong code", f.venue, f.kind);
+        }
+    }
+
+    /// Elections carries two rows on two groups, and only one of them has a snapshot plane.
+    ///
+    /// The asymmetry is the point. The market-by-price sibling publishes snapshots and the
+    /// top-of-book one does not, so a top-of-book row built with a snapshot port binds a socket
+    /// nothing ever sends to — and an idle socket reads as a dead publisher rather than as a
+    /// misconfiguration. The two rows must also agree on their channel ids, because those are the
+    /// refdata channel and the instrument catalog is keyed on it.
+    #[test]
+    fn elections_pairs_two_groups_and_only_one_snapshot_plane() {
+        let tob = feeds()
+            .iter()
+            .find(|f| f.category == "elections" && f.kind == FeedKind::TopOfBook)
+            .expect("no elections top-of-book row");
+        let mbp = feeds()
+            .iter()
+            .find(|f| f.category == "elections" && f.kind == FeedKind::MarketByPrice)
+            .expect("no elections market-by-price row");
+
+        assert_eq!(tob.group, Ipv4Addr::new(233, 84, 178, 21));
+        assert_eq!(mbp.group, Ipv4Addr::new(233, 84, 178, 22));
+        // Six families, 50 through 55, on both rows.
+        assert_eq!(tob.publishers.len(), 6);
+        assert_eq!(mbp.publishers.len(), 6);
+
+        for (p, id) in tob.publishers.iter().zip(50u16..=55) {
+            // Two ports, and that is the assertion: the enum has no snapshot to get wrong here,
+            // so a row that tried to give one would not typecheck as TwoPort.
+            let FeedPorts::TwoPort { mktdata, refdata } = p.ports else {
+                panic!("elections top-of-book publishers bind two ports, not three");
+            };
+            assert_eq!(mktdata, 35000 + id, "tob mktdata for channel {id}");
+            assert_eq!(refdata, 45000 + id, "tob refdata for channel {id}");
+        }
+        for (p, id) in mbp.publishers.iter().zip(50u16..=55) {
+            let FeedPorts::ThreePort {
+                mktdata,
+                refdata,
+                snapshot,
+            } = p.ports
+            else {
+                panic!("elections market-by-price publishers bind three ports");
+            };
+            assert_eq!(mktdata, 36000 + id, "mbp mktdata for channel {id}");
+            assert_eq!(refdata, 46000 + id, "mbp refdata for channel {id}");
+            assert_eq!(snapshot, 56000 + id, "mbp snapshot for channel {id}");
         }
     }
 

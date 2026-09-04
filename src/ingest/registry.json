@@ -355,6 +355,80 @@
           "ports": { "mktdata": 34000, "refdata": 44000, "snapshot": 54000 }
         }
       }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "elections",
+      "code": "edge-kalshi-elections-pol-tob",
+      "kind": "TopOfBook",
+      "group": "233.84.178.21",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Kalshi political event markets. Its own pair of groups, separate from perps and sports:",
+        "top-of-book on 233.84.178.21 and market-by-price on 233.84.178.22, both activated on the",
+        "ledger with two publishers each.",
+        "",
+        "CHANNELS. Six, 50 through 55, one per family - us, house, intl, primaries, offices, other.",
+        "Ports are the bases below plus the channel id, the same shape the sports row uses.",
+        "",
+        "NO SNAPSHOT PLANE on this spec. The market-by-price sibling has one and this does not, so a",
+        "snapshot port here would bind a socket nothing ever sends to, and an idle socket reads as a",
+        "silent source rather than as a misconfiguration.",
+        "",
+        "DEPLOYMENT. Two publishers, aws-cmh-kl-elections1 and -elections2, the second offset by +100",
+        "the way the sports feeds are: the port names the family so a subscriber binds one socket per",
+        "family and hears both publishers on it, while channel_id names the family AND the publisher.",
+        "publisher_offset canonicalises the mirror's id back for catalog and book identity only.",
+        "",
+        "The `pol` in the code is the ledger rename of 2026-09-01, when edge-kalshi-elections-* became",
+        "edge-kalshi-elections-pol-*. A row carrying the old code activates nothing, silently.",
+        "",
+        "NOT WIRE-CONFIRMED FROM A SUBSCRIBER. Groups, activation and publisher counts were read off",
+        "the ledger; ports and channel ids come from the publisher-side declaration in malbeclabs/infra",
+        "(kalshi_feed_capture_cmh.yml), which is what those hosts are actually running. No capture has",
+        "been taken against these two groups from a host holding a subscribe grant. Treat the first",
+        "converge as the confirmation: check that the startup line names KALSHI/elections among",
+        "`ingesting feeds`, and that the receivers for it report liveness up, before trusting any",
+        "instrument count that comes out of it."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [{ "range": [50, 55] }],
+          "ports": { "mktdata": 35000, "refdata": 45000 }
+        }
+      }
+    },
+    {
+      "venue": "KALSHI",
+      "category": "elections",
+      "code": "edge-kalshi-elections-pol-mbp",
+      "kind": "MarketByPrice",
+      "group": "233.84.178.22",
+      "emit_trades": true,
+      "arbitration": "Sticky",
+      "publisher_offset": 100,
+      "notes": [
+        "Market-by-price sibling of edge-kalshi-elections-pol-tob: same six channels, same two",
+        "publishers, same offset, its own group and its own port bases. Unlike the top-of-book row it",
+        "does carry a snapshot plane.",
+        "",
+        "The channel ids are the refdata channel, and they must agree with the sibling's or the",
+        "instrument catalog splits in two - they are the same 50-55 here by construction, for the same",
+        "reason the Phoenix pair states it.",
+        "",
+        "Both rows claim the tape. The reconciler ranks TopOfBook over MarketByPrice when both run,",
+        "which is the resolution the Phoenix pair already relies on.",
+        "",
+        "Same caveat as the sibling: not wire-confirmed from a subscriber."
+      ],
+      "publishers": {
+        "derived": {
+          "channels": [{ "range": [50, 55] }],
+          "ports": { "mktdata": 36000, "refdata": 46000, "snapshot": 56000 }
+        }
+      }
     }
   ]
 }
