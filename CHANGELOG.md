@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Fixed
+- Market-by-Order books were keyed `(publisher, instrument_id)`, dropping the `channel_id` that the
+  edge-feed-spec makes part of an instrument's unique key — `instrument_id` is scoped to its channel
+  and need not be unique across channels. Two channels on one group both carrying instrument id 7
+  had their books merged, applying each channel's deltas to the other's state; every per-publisher
+  sequence check still passed, so it surfaced only as a silently corrupt book. The book key, every
+  map keyed off it, and the `SnapshotOrder` routing filter now all carry the raw `channel_id` from
+  the datagram header. Latent — the live publishers put everything on channel 0. Reference data
+  remains channel-flat, so two such channels still resolve one definition and publish one symbol,
+  which the venue-wide depth floor then leaves flip-flopping between the two books. (#110)
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it
