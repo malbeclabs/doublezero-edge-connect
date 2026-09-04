@@ -138,13 +138,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the absence instead. The codes are the post-rename ones — the ledger renamed `edge-kalshi-elections-*`
   to `edge-kalshi-elections-pol-*` on 2026-09-01, and a row carrying the old code activates nothing,
   silently, which is the same failure mode as the three stale Kalshi codes below.
-  ⚠️ **Neither group is wire-confirmed from a subscriber.** Groups, activation and publisher counts
-  were read off the ledger; ports and channel ids come from the publisher-side declaration in
-  `malbeclabs/infra`, which is what `aws-cmh-kl-elections1/2` are running. No capture has been taken
-  against either group from a host holding a subscribe grant, so both rows carry that caveat in their
-  notes and the first converge is the confirmation: check that the startup line names
-  `KALSHI/elections` among `ingesting feeds` and that its receivers report liveness up before trusting
-  any instrument count out of it.
+  **The top-of-book row is confirmed on the wire from a subscriber**, as of 2026-09-04, at two
+  DoubleZero sites holding a subscribe grant on `233.84.178.21`: all six families carry traffic on
+  both port roles at base + channel id, and both publishers are present — channels `50`-`55`
+  alongside the mirror's `150`-`155` — with every datagram from a declared publisher address and from
+  the joined group, no undeclared address and no foreign group at either site.
+  ⚠️ **The market-by-price row is not.** Nothing subscribes to `233.84.178.22` from a site that could
+  report on it, so that row's group, ports and snapshot plane still rest on the ledger and on what
+  `aws-cmh-kl-elections1/2` are configured with. It carries that caveat in its notes, and the first
+  converge is its confirmation: check that the startup line names `KALSHI/elections` among
+  `ingesting feeds` and that the row's receivers report liveness up on all three port roles before
+  trusting an instrument count or a book out of it.
 - **`tick_size` on the `instrument` message, and `/v1/products[].price_increment` now reports the venue's tradable tick** rather than `10^price_exponent`, which is only the fixed-point granularity: BTC on Phoenix is exponent `-2` with a tick of `100`, so the API reported `0.01` for a market that moves in dollars. The wire has carried `Tick Size` all along and the `InstrumentDefinition` decoder stopped short of it; it is now decoded at both schema generations, validated against the reference decoder and against the committed v1 and v3 captures. A publisher stating no tick (`0` — every Hyperliquid definition today) still reports the granularity, since omitting `price_increment` would break the packaged CLI's product parser — so `/v1/products` entries carry `tick_size` beside it, present exactly when the venue stated one, which is how a caller tells the two apart. `doublezero-edge products describe` renders that row when it is there. ⚠️ **PROTOCOL.md's `price_exponent` row previously called `10^price_exponent` the tick size; that was wrong** and is corrected — a consumer that rounded orders to it was wrong by the tick's own magnitude.
 - **`batch_id` on the `book` message and on `/v1/products/{id}/book`** — the venue's committed slot, decoded from the market-by-price feed's `BatchBoundary` and previously discarded. A slot on both sides turns a comparison against a venue's slot-stamped REST orderbook from a time-window one, which measures sampling skew (observed as 1-9 tick phantom disagreements on BTC), into an instantaneous one. Optional and absent — never `0` — until a boundary has been seen for the market, and absent again after a publisher restart or session end, since `Batch ID` is monotonic only within one `Reset Count` era; the market-by-order path (`order_book`, `depth`) carries no slot and is unchanged. See [PROTOCOL.md](PROTOCOL.md) for the exact scope of the claim, including what a batch straddling a boundary reports.
 - The feed registry document carries a **`sources` block** — the Source ID → registry-name allocation,
