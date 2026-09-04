@@ -200,9 +200,20 @@ Modules are grouped by role under `src/`:
   `..._match_the_deployment`) asserts the document against literals written beside it — the code
   agreeing with itself. It catches a later edit that moves a value, never a value that was wrong when
   written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
-  sibling row's block, with the build green throughout. **The external check is a packet capture**, and
-  the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
-  port moves. A third **Kalshi** row
+  sibling row's block, with the build green throughout. **The external check is a packet capture** —
+  run it whenever a row is added or a port moves. **PORT PROVENANCE**, the rule that check exists to
+  serve: a port in that document is a claim about a machine outside this process, so it is verified
+  from *outside* — by capture, or by the publishers' own deployment inventory — or the row is marked
+  unverified in its `notes`. Never from prose that describes an allocation; read the values the
+  publisher actually renders. And the authoritative fleet list is the **feed-capture recorder**
+  inventory in the private infra repo, **not** the publisher deployment inventory: the latter covers
+  only a subset of the hosts on a group, and sourcing the table from it alone is what left five
+  blocks unbound and the bridge ingesting about a third of the group's datagrams. (The rule used to
+  live in the document's own notes; it moved here when those notes were rewritten for the operators
+  who read them — `registry.json` states what a subscriber needs, this states how we verify it.)
+  One row-level fact that lived there too: Hyperliquid's `9011`/`10011` block is on the wire and in
+  no inventory, and its depth half is the group's highest-volume publisher — its owner is still to
+  be established, so **do not drop the row** for being unattributed. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
