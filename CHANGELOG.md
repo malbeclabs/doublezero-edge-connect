@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Fixed
+- `MidpointProcessor` held a single bare `SeqTracker` where its siblings key one per publisher.
+  Datagram sequence is scoped to `(source_ip, group, port)`, so under a shared port block two
+  mirrored publishers' independent sequence spaces interleaved onto one anchor and whichever ran
+  lower read as stale on every datagram: its mids were dropped outright while
+  `dz_seq_events_total{kind="stale"}` climbed on a perfectly healthy feed. Both the sequence
+  trackers and the reference-data state now share one bounded `PerPublisher` map rather than three
+  hand-copied eviction loops. Latent — no feed row selects `FeedKind::Midpoint`. **Enabling one now
+  also requires giving `Midpoint` a `(venue, symbol)` staleness floor in the arbiter**, where it is
+  a bare passthrough: with both mirrors unblocked, a slower one's older mid overwrites the fresher.
+  Which clock that floor latches on is undecidable until this codec's offsets are validated against
+  a live datagram, so it is recorded alongside that precondition rather than guessed at. (#109)
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it
