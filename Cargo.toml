@@ -58,6 +58,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 prometheus = { version = "0.14", default-features = false, features = ["process"] }
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
 # Used only by examples/pcap2datagrams.rs (dev tooling) — not compiled into the release binary.
 pcap-file = "2"
