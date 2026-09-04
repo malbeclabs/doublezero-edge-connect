@@ -754,8 +754,9 @@ mod tests {
     /// matching code, or the socket binds and stays silent, and the only symptom is a permanently
     /// zero `dz_receiver_up` — indistinguishable from a quiet publisher.
     ///
-    /// **The external check is a packet capture**, and the procedure is recorded in the
-    /// `PORT PROVENANCE` block in `registry.json`. Run it when a row is added or a port moves. A
+    /// **The external check is a packet capture**, and the rule it serves — a port is a claim about a
+    /// machine outside this process, so it is verified from outside or marked unverified — is
+    /// recorded under PORT PROVENANCE in `CLAUDE.md`. Run it when a row is added or a port moves. A
     /// unit test cannot reach the wire, so this one is deliberately modest about what it pins:
     /// document → expansion consistency, nothing more.
     #[test]
