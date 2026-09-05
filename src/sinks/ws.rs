@@ -355,9 +355,57 @@ fn book_scope(acc: &BookAccumulator) -> ReplayScope {
     }
 }
 
+/// Shortest interval between one client's lag-triggered book re-baselines (see [`Replay::Books`] and
+/// the `Lagged` arm of [`serve_client`]).
+///
+/// A re-baseline is written into a client that is *already* behind, and writing it is exactly what
+/// keeps that client from draining the broadcast — so an unpaced one re-arms the lag that asked for
+/// it and the connection converges on replaying instead of streaming. The pace is the same trade
+/// `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices for its own `l4Book` bootstrap: long
+/// enough that the replay cannot be the dominant cost of the connection, short enough that a book
+/// left stale by a dropped batch is corrected in about the time a consumer would notice.
+const LAG_REBASELINE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether an owed lag repair may go out now: `due` says one is owed, `last` is when this client was
+/// last repaired (`None` = never). Split out from the loop so the pace is unit-testable without
+/// waiting [`LAG_REBASELINE_MIN_INTERVAL`] of wall clock.
+///
+/// The first repair after a quiet period is immediate — the pace exists to stop a repair from
+/// re-arming the lag that asked for it, not to delay a client's only correction.
+fn lag_repair_ready(due: bool, last: Option<Instant>, interval: Duration) -> bool {
+    due && last.is_none_or(|t| t.elapsed() >= interval)
+}
+
+/// How much current state one [`replay_scoped`] call sends.
+///
+/// The distinction is which products **cannot heal on their own**, and it is the whole reason a lag
+/// is not answered with a bootstrap:
+/// - `quote`/`depth` are full state, so a dropped one is corrected by the next message for that
+///   symbol with no producer action at all;
+/// - `instrument` is re-announced on the first publisher refdata burst after
+///   `ingest::arbiter::INSTRUMENT_REANNOUNCE_NS` — that rate limit is a rate limit rather than a
+///   latch *precisely* so a definition lost under backpressure comes back, and it is the mechanism
+///   an established client heals by (see that constant's doc);
+/// - `book`/`order_book` are incremental, and nothing in the stream restates them: a dropped batch
+///   leaves the consumer's book permanently wrong until the producer re-baselines it.
+///
+/// So a lag replays [`Replay::Books`] only. Replaying the catalog instead is the pathology in #149:
+/// the definitions outnumber the markets by orders of magnitude on a venue like Kalshi, they are
+/// pure duplication of state the client already holds, and the write blocks the very recv loop whose
+/// stall caused the lag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Replay {
+    /// Everything: definitions (precision first), then `depth`, then the `book` re-baselines. The
+    /// connect and `subscribe` bootstrap, where the client holds no state at all.
+    Full,
+    /// The `book`/`order_book` re-baselines alone — the lag repair.
+    Books,
+}
+
 /// Replay current full state matching `subs` (empty = everything): instrument definitions first so
 /// precision is known before any book, then the latest `depth` per `(venue, symbol)` and a `book`
-/// re-baseline per `(venue, channel, instrument_id)`.
+/// re-baseline per `(venue, channel, instrument_id)`. `what` selects how much of that is sent — see
+/// [`Replay`].
 ///
 /// Called on connect, and again on each `subscribe` so a client that narrows after connecting is
 /// bootstrapped for its new scope rather than waiting for the next event. Replay is idempotent full
@@ -368,6 +416,7 @@ async fn replay_scoped<W>(
     depth: &DepthSnapshot,
     books: &BookSnapshot,
     subs: &[SubFilter],
+    what: Replay,
 ) -> Result<()>
 where
     W: SinkExt<WsMessage> + Unpin,
@@ -383,7 +432,11 @@ where
     };
     // Every lock is taken and released before any `await`: a `std::sync::MutexGuard` held across an
     // await point does not compile here, and would be a latency bug regardless.
-    let snapshot: Vec<FeedMessage> = {
+    // Skipped entirely under `Replay::Books` — not merely filtered out of the send: the clone is
+    // taken under the mutex the ingest emit path shares, and on a large catalog that scan is itself
+    // the cost (a lagging client repeating it is what made `/v1/status`, which walks the same map,
+    // time out in #149).
+    let snapshot: Vec<FeedMessage> = if what == Replay::Full {
         let guard = crate::model::lock(instruments);
         guard
             .values()
@@ -391,8 +444,10 @@ where
             .cloned()
             .map(FeedMessage::Instrument)
             .collect()
+    } else {
+        Vec::new()
     };
-    let depths: Vec<FeedMessage> = {
+    let depths: Vec<FeedMessage> = if what == Replay::Full {
         let guard = crate::model::lock(depth);
         guard
             .values()
@@ -400,6 +455,8 @@ where
             .cloned()
             .map(FeedMessage::Depth)
             .collect()
+    } else {
+        Vec::new()
     };
     let rebaselines: Vec<FeedMessage> = {
         let guard = crate::model::lock(books);
@@ -453,14 +510,54 @@ async fn serve_client(
     // bootstrapped immediately instead of waiting for the next periodic book. (Quotes/trades are not
     // replayed - the next quote is itself full state.) `subs` is empty here, so this connect-time
     // replay is unfiltered.
-    replay_scoped(&mut write, &instruments, &depth, &books, &subs).await?;
+    replay_scoped(
+        &mut write,
+        &instruments,
+        &depth,
+        &books,
+        &subs,
+        Replay::Full,
+    )
+    .await?;
 
     let mut last_seen = Instant::now();
     let mut win_start = Instant::now();
     let mut win_count: u32 = 0;
     let mut hb = tokio::time::interval(cfg.heartbeat);
+    // Lag repair state: when this client was last re-baselined, and whether a lag since then is
+    // still owed one. Both are needed — the pace alone would drop the repair a suppressed lag asked
+    // for, leaving that client's book wrong for as long as it stays connected.
+    let mut last_lag_rebaseline: Option<Instant> = None;
+    let mut lag_rebaseline_due = false;
 
     loop {
+        // Discharge an owed lag repair here, at the top of the loop rather than in the `Lagged` arm
+        // that owed it: a client that keeps lagging never reaches a quiet moment of its own, and one
+        // that recovers would otherwise hold a stale book until its next lag. This runs on the next
+        // pass through the loop, so an owed repair goes out on this client's next frame or, on a
+        // silent feed, its next heartbeat tick — never later than that, and a silent feed is not one
+        // producing the batches the book is missing. Ordering against the live frames written in
+        // between is not a hazard: the re-baseline is materialized here, so it is current as of this
+        // moment and the batches that follow apply on top of it.
+        if lag_repair_ready(
+            lag_rebaseline_due,
+            last_lag_rebaseline,
+            LAG_REBASELINE_MIN_INTERVAL,
+        ) {
+            lag_rebaseline_due = false;
+            last_lag_rebaseline = Some(Instant::now());
+            metrics().ws_lag_rebaselines.inc();
+            replay_scoped(
+                &mut write,
+                &instruments,
+                &depth,
+                &books,
+                &subs,
+                Replay::Books,
+            )
+            .await?;
+        }
+
         tokio::select! {
             incoming = read.next() => match incoming {
                 Some(Ok(WsMessage::Text(txt))) => {
@@ -501,7 +598,7 @@ async fn serve_client(
                                 // (taken under the mutex the ingest emit path shares) at the inbound
                                 // rate limit without ever reaching `max_subs`.
                                 if added {
-                                    replay_scoped(&mut write, &instruments, &depth, &books, std::slice::from_ref(&subscription)).await?;
+                                    replay_scoped(&mut write, &instruments, &depth, &books, std::slice::from_ref(&subscription), Replay::Full).await?;
                                 }
                             }
                         }
@@ -561,8 +658,12 @@ async fn serve_client(
                     metrics().ws_client_lagged.inc();
                     warn!("subscriber lagged, dropped {n}");
                     // `book` is incremental: a dropped batch leaves this client's book permanently
-                    // wrong, so re-baseline it. (`quote`/`depth` self-heal on the next message.)
-                    replay_scoped(&mut write, &instruments, &depth, &books, &subs).await?;
+                    // wrong, so it must be re-baselined. Everything else this client missed restates
+                    // itself (see `Replay`), so nothing else is replayed — and the repair is *owed*
+                    // here rather than written here, so that a client lagging faster than
+                    // `LAG_REBASELINE_MIN_INTERVAL` cannot drive its own connection into replaying
+                    // full state in a loop instead of streaming (#149).
+                    lag_rebaseline_due = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -1880,6 +1981,211 @@ mod tests {
         assert!(quote.contains(r#""type":"quote""#), "got {quote}");
 
         srv.abort();
+    }
+
+    /// The lag repair is **books only**: a client that fell behind is not re-sent the instrument
+    /// catalog. That is the #149 loop — the definitions outnumber the markets by orders of magnitude,
+    /// so replaying them writes far more into an already-behind client than the batches it actually
+    /// lost, which re-arms the lag and converges the connection on replaying instead of streaming.
+    /// A dropped definition heals on the publisher's next refdata burst instead (see `Replay`).
+    #[tokio::test]
+    async fn a_lag_repair_replays_books_but_not_the_instrument_catalog() {
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+        // Two sends with no await between them: the runtime is current-thread, so the client task
+        // cannot drain the first, and the capacity-1 buffer overflows deterministically.
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+
+        let mut defs = HashMap::new();
+        defs.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            NormalizedInstrument {
+                tick_size: 0,
+                venue: "KALSHI".into(),
+                source_name: "KALSHI".into(),
+                source_id: 0,
+                symbol: "KXBTCPERP".into(),
+                channel: 2,
+                instrument_id: 41,
+                category: "perps".into(),
+                price_exponent: -2,
+                qty_exponent: -2,
+            },
+        );
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(defs)),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // The connect bootstrap is still the full one: definition first, then the book.
+        let connect_def = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("connect replay definition");
+        assert_eq!(book_type(&connect_def), "instrument", "got {connect_def}");
+        let connect_book = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("connect replay book");
+        assert_eq!(parse_book(&connect_book).instrument_id, 41);
+
+        // The lag repair that follows carries the book and nothing else — the next frame after it is
+        // the quote that survived the overflow, so no definition was re-sent in between.
+        let repair = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("re-baseline after lag");
+        assert_eq!(parse_book(&repair).instrument_id, 41, "got {repair}");
+        let quote = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("surviving quote");
+        assert!(
+            quote.contains(r#""type":"quote""#),
+            "the lag repair must not replay the catalog, got {quote}"
+        );
+
+        srv.abort();
+    }
+
+    /// A second lag inside the pace window is coalesced rather than answered immediately: the client
+    /// keeps receiving live frames instead of another O(markets) replay. Without this a client that
+    /// lags faster than it can be repaired spends the whole connection being repaired — the traffic
+    /// #149 measured.
+    #[tokio::test]
+    async fn a_second_lag_inside_the_pace_window_replays_nothing() {
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+        let quote = || prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+        for _ in 0..2 {
+            assert!(prepared_tx.send(quote()).is_ok(), "the receiver is alive");
+        }
+
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        for expected in ["connect replay", "re-baseline after the first lag"] {
+            let frame = next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect(expected);
+            assert_eq!(parse_book(&frame).instrument_id, 41, "{expected}");
+        }
+        let first = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("surviving quote");
+        assert!(first.contains(r#""type":"quote""#), "got {first}");
+
+        // The client is parked on `recv` and caught up; overflow it again, still well inside
+        // `LAG_REBASELINE_MIN_INTERVAL`.
+        for _ in 0..2 {
+            assert!(prepared_tx.send(quote()).is_ok(), "the receiver is alive");
+        }
+        let after = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the frame that survived the second overflow");
+        assert!(
+            after.contains(r#""type":"quote""#),
+            "a second lag inside the window must not replay again, got {after}"
+        );
+
+        srv.abort();
+    }
+
+    /// The pace itself: the first repair goes out immediately (a client's only correction must not
+    /// wait), a second inside the window is held, and it is released — not dropped — once the window
+    /// has passed.
+    #[test]
+    fn the_lag_repair_pace_holds_a_repair_without_losing_it() {
+        use super::{lag_repair_ready, LAG_REBASELINE_MIN_INTERVAL as WINDOW};
+        use std::time::Instant;
+
+        assert!(!lag_repair_ready(false, None, WINDOW), "nothing owed");
+        assert!(
+            lag_repair_ready(true, None, WINDOW),
+            "the first repair is immediate"
+        );
+        let just_now = Instant::now();
+        assert!(
+            !lag_repair_ready(true, Some(just_now), WINDOW),
+            "a repair inside the window is held"
+        );
+        let stale = just_now
+            .checked_sub(WINDOW + Duration::from_secs(1))
+            .expect("a representable instant");
+        assert!(
+            lag_repair_ready(true, Some(stale), WINDOW),
+            "the held repair is released once the window has passed"
+        );
     }
 
     #[test]

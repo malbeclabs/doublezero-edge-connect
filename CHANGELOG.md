@@ -15,6 +15,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Fixed
+- ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
+  asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
+  had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument
+  catalog and every `depth` alongside it, into a client that was by definition already behind, and
+  writing it blocked the same recv loop whose stall caused the lag. On a venue like Kalshi, where the
+  definitions outnumber the markets by orders of magnitude, the connection converged on replaying
+  instead of streaming: 144k frames/s of which 99.86% were `instrument`, every book message that
+  survived was a re-baseline whose following levels never arrived, no `trade` survived at all, and
+  `/v1/status` timed out behind the catalog clone the replay takes under the shared instrument mutex.
+  It presented as a producer-side re-emission because the rate tracked how many channels were
+  enabled rather than how much data there was — narrowing `DZ_CHANNELS` freed the CPU the replay loop
+  was competing for and the same channel's rate went *up* 4.6x. It is not: every `instrument` that
+  reaches the broadcast passes the arbiter's per-`(venue, channel, instrument_id)` re-announce
+  interval, which caps production at one per definition per 15s, so a six-figure rate cannot come from
+  the producer at all. The loop was per connection, and on a catalog that large the connect bootstrap
+  was itself the first lag — 4096 broadcast frames accumulate in a fraction of a second on this feed —
+  so it started at connect and never ended.
+
+  A lag now replays the incremental products only. Nothing else needs it: `quote`/`depth` are full
+  state and correct themselves on the next message, and an `instrument` lost under backpressure comes
+  back on the next publisher refdata burst — which is what the arbiter's re-announce interval being a
+  rate limit rather than a latch already exists for. The repair is additionally **paced** per client
+  (5s) and a lag inside that window is coalesced into the next repair rather than dropped, so a
+  consumer that keeps falling behind still converges on a correct book but can never drive an
+  unbounded replay loop. The connect and `subscribe` bootstraps are unchanged — a client that holds
+  no state still gets everything. New: `dz_ws_lag_rebaselines_total`, which against
+  `dz_ws_client_lagged_total` shows the pace working.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it

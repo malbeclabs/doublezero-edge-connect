@@ -276,6 +276,13 @@ pub struct Metrics {
     pub ws_bytes_sent: IntCounterVec,
     /// Times a client fell behind and the broadcast dropped messages for it (`Lagged`).
     pub ws_client_lagged: IntCounter,
+    /// Book re-baselines sent to repair a client's lag. Paced per client
+    /// (`sinks::ws::LAG_REBASELINE_MIN_INTERVAL`), so this is **below** [`Self::ws_client_lagged`]
+    /// whenever a client is lagging faster than it can be repaired; the difference is the lag events
+    /// that were coalesced into a later repair, not lost ones. A ratio near 1 with a high lag count
+    /// means many separate slow moments; a ratio far below 1 means one client is continuously
+    /// behind, which is a consumer or link problem — the repair itself is bounded either way.
+    pub ws_lag_rebaselines: IntCounter,
     /// Times the single serializer task fell behind the backbone and dropped messages (`Lagged`).
     /// Distinct from [`Self::ws_client_lagged`]: this is a global stall (every client misses those
     /// messages), not one slow consumer, so it must not hide behind the per-client counter.
@@ -874,6 +881,11 @@ impl Metrics {
                 &registry,
                 "dz_ws_client_lagged_total",
                 "Times a slow client fell behind and the broadcast dropped messages for it",
+            ),
+            ws_lag_rebaselines: counter(
+                &registry,
+                "dz_ws_lag_rebaselines_total",
+                "Book re-baselines sent to repair a lagging WebSocket client (paced per client)",
             ),
             ws_serializer_lagged: counter(
                 &registry,
