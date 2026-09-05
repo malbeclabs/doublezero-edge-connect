@@ -773,9 +773,25 @@ Modules are grouped by role under `src/`:
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
   materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
   every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
-  `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
-  scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
-  replaying every market. Implements the
+  `replay_scoped()` used three times, and `Replay::{Full,Books}` is what says how much of it goes out:
+  **`Full`** on connect (unfiltered — no subscriptions yet) and per `subscribe` (scoped to the filter
+  just added, so a client that narrows after connecting is bootstrapped without replaying every
+  market), **`Books`** to repair a lagging client. That split is the #149 fix and it is a
+  self-healing argument, not a cost saving: `quote`/`depth` are full state and correct themselves on
+  the next message, and an `instrument` lost under backpressure is re-announced on the next refdata
+  burst — which is the whole reason `INSTRUMENT_REANNOUNCE_NS` is a rate limit and not a latch — so
+  the only product a drop can permanently corrupt is the incremental `book`/`order_book`. Replaying
+  the catalog instead wrote O(catalog) into a client that was *already* behind, blocking the very
+  recv loop whose stall caused the lag, so the repair re-armed the lag that asked for it and the
+  connection converged on replaying: measured at 144k frames/s of which 99.86% were `instrument`, with
+  every surviving book message a re-baseline whose following levels never arrived, and `/v1/status`
+  timing out behind the catalog clone that replay takes under the shared instrument mutex. The repair
+  is also **paced** per client (`LAG_REBASELINE_MIN_INTERVAL`, the same trade
+  `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices) and a lag inside the window is *owed*, not
+  dropped — `lag_repair_ready` holds it and the top of the client loop discharges it once the window
+  passes, so a client lagging faster than it can be repaired still ends up with a correct book without
+  ever driving a replay loop. `dz_ws_lag_rebaselines_total` against `dz_ws_client_lagged_total` is
+  what shows the pace working. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
   `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
