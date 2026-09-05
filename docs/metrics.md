@@ -200,6 +200,8 @@ Recorded by the WebSocket sink (`src/sinks/ws.rs`).
 | `dz_ws_messages_sent_total` | counter | `kind` | Messages forwarded to clients, by `kind`. |
 | `dz_ws_bytes_sent_total` | counter | `kind` | Bytes forwarded to clients, by `kind` (serialized JSON payload length). |
 | `dz_ws_client_lagged_total` | counter | — | Times a slow client fell behind and the broadcast dropped messages for it. |
+| `dz_ws_serializer_lagged_total` | counter | — | Times the single serializer task fell behind the backbone. **Global**: every client missed those messages, so this is not one slow consumer and must not be read as one. |
+| `dz_ws_lag_rebaselines_total` | counter | — | Book re-baselines sent to repair a lagging client. Paced per client (5s), so it sits **below** `dz_ws_client_lagged_total` whenever a client lags faster than it can be repaired; the difference is lag events coalesced into a later repair, not lost ones. Only `book`/`order_book` are repaired — `quote`/`depth` are full state and `instrument` returns on the next refdata burst — so a lag costs O(markets), never O(catalog). |
 | `dz_ws_inbound_total` | counter | `kind` | Inbound control messages, by `kind` (ping/subscribe/unsubscribe/error). |
 | `dz_ws_rate_limited_total` | counter | — | Clients disconnected for exceeding the inbound rate limit. |
 | `dz_ws_idle_timeout_total` | counter | — | Clients reaped for crossing the idle timeout. |

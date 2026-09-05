@@ -481,7 +481,18 @@ Instrument definitions and current book state are replayed on connect (unfiltere
 | Broadcast buffer (`WS_BROADCAST_CAPACITY`) | 4096 | A slow client **drops the oldest** messages (logged); it is never allowed to stall the feed. |
 
 Because every `quote` is a full top-of-book snapshot, a consumer that drops messages under
-backpressure **self-heals** on the next quote - no resync handshake is required.
+backpressure **self-heals** on the next quote - no resync handshake is required. `depth` heals the
+same way (it is full state too), and a dropped `instrument` is re-announced on the producer's next
+periodic reference-data refresh.
+
+`book` and `order_book` are the exception, because they are incremental: a dropped batch would leave
+the book permanently wrong. So a client the producer had to drop messages for is **re-baselined** -
+each of its markets is re-sent as a `clear` plus the complete current state, exactly as on connect.
+That repair is **paced**: a client that keeps falling behind is re-baselined at most once every few
+seconds and the lags in between are coalesced into the next one, so a struggling consumer receives a
+bounded repair and keeps streaming rather than being handed an ever-larger replay it is even less
+able to drain. Nothing else is replayed on a drop - the definitions and the latest `depth` are
+re-sent only on connect and on `subscribe`.
 
 ## Consuming the feed (any engine)
 
