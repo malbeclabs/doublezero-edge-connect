@@ -51,8 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (5s) and a lag inside that window is coalesced into the next repair rather than dropped, so a
   consumer that keeps falling behind still converges on a correct book but can never drive an
   unbounded replay loop. The connect and `subscribe` bootstraps are unchanged — a client that holds
-  no state still gets everything. New: `dz_ws_lag_rebaselines_total`, which against
-  `dz_ws_client_lagged_total` shows the pace working.
+  no state still gets everything, and a client whose `type` filter excludes both book types is owed
+  no repair at all — sparing it the market scan, which is taken under the mutex the ingest emit path
+  shares. New: `dz_ws_lag_rebaselines_total`, which against `dz_ws_client_lagged_total` shows the
+  pace working.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it

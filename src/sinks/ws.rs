@@ -165,6 +165,15 @@ struct SubFilter {
 }
 
 impl SubFilter {
+    /// Whether this filter can deliver `kind` **at all**, ignoring scope. `type` is the one absolute
+    /// dimension (see [`Self::matches`]): `venue`/`symbol`/`channel` narrow *which* markets a client
+    /// sees and can leave that set empty, but they never rule a product out, while a `type` naming
+    /// another kind rules it out wholesale. Split out so the `type` dimension has one implementation
+    /// — a second copy is how a filter starts admitting on one path and refusing on the other.
+    fn admits_kind(&self, kind: &str) -> bool {
+        self.msg_type.as_deref().is_none_or(|t| t == kind)
+    }
+
     /// The single match path. `venue`/`source_name` are aliases and are ANDed. `symbol`/`channel` are
     /// `None` for a venue-level message (today only `status`), and a `None` on the *message* side
     /// satisfies a filter on that dimension — a venue-level message is about the whole venue, so a
@@ -189,7 +198,7 @@ impl SubFilter {
             // one type asked for that type. Filters are a union, so wanting books plus definitions is
             // two subscriptions. `venue`/`symbol`/`channel` below are *scope* selectors — which
             // markets — and those do carve out messages that aren't about one market.
-            && self.msg_type.as_deref().is_none_or(|t| t == kind)
+            && self.admits_kind(kind)
             && match symbol {
                 None => true,
                 Some(s) => self.symbol.as_deref().is_none_or(|f| f == s),
@@ -374,6 +383,20 @@ const LAG_REBASELINE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// re-arming the lag that asked for it, not to delay a client's only correction.
 fn lag_repair_ready(due: bool, last: Option<Instant>, interval: Duration) -> bool {
     due && last.is_none_or(|t| t.elapsed() >= interval)
+}
+
+/// Whether a lag repair can reach this client at all. Only `book`/`order_book` are repaired, so a
+/// client filtered to another type is owed nothing by a lag.
+///
+/// Checked where the repair is *marked due* rather than inside [`replay_scoped`], because what this
+/// avoids is the market scan itself — taken under the mutex the ingest emit path shares — and not the
+/// frames it would have sent, of which there are none. A client that adds a book subscription later
+/// is bootstrapped by that `subscribe`'s own [`Replay::Full`], so deciding here loses nothing.
+fn lag_repair_reaches(subs: &[SubFilter]) -> bool {
+    subs.is_empty()
+        || subs
+            .iter()
+            .any(|f| f.admits_kind("book") || f.admits_kind("order_book"))
 }
 
 /// How much current state one [`replay_scoped`] call sends.
@@ -663,7 +686,13 @@ async fn serve_client(
                     // here rather than written here, so that a client lagging faster than
                     // `LAG_REBASELINE_MIN_INTERVAL` cannot drive its own connection into replaying
                     // full state in a loop instead of streaming (#149).
-                    lag_rebaseline_due = true;
+                    //
+                    // Never cleared here: a client that unsubscribes from books between the lag and
+                    // the repair leaves a scan that sends nothing (cheap, and self-correcting), while
+                    // clearing it would drop a repair that a *later* filter still needs.
+                    if lag_repair_reaches(&subs) {
+                        lag_rebaseline_due = true;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -1923,6 +1952,7 @@ mod tests {
     /// is deterministic: the receiver is overflowed before `serve_client` first polls it, so the very
     /// first `recv` returns `Lagged`.
     #[tokio::test]
+    #[serial]
     async fn a_lagging_client_is_rebaselined() {
         use super::{prepare, serve_client};
 
@@ -1989,6 +2019,7 @@ mod tests {
     /// lost, which re-arms the lag and converges the connection on replaying instead of streaming.
     /// A dropped definition heals on the publisher's next refdata burst instead (see `Replay`).
     #[tokio::test]
+    #[serial]
     async fn a_lag_repair_replays_books_but_not_the_instrument_catalog() {
         use super::{prepare, serve_client};
 
@@ -2089,6 +2120,7 @@ mod tests {
     /// lags faster than it can be repaired spends the whole connection being repaired — the traffic
     /// #149 measured.
     #[tokio::test]
+    #[serial]
     async fn a_second_lag_inside_the_pace_window_replays_nothing() {
         use super::{prepare, serve_client};
 
@@ -2159,6 +2191,120 @@ mod tests {
         );
 
         srv.abort();
+    }
+
+    /// A client that cannot receive a book is owed no repair: only `book`/`order_book` are repaired,
+    /// so a lag on a `{"type":"quote"}` subscriber must not walk the market map at all. The frames
+    /// are identical either way (the filter would have excluded every market), so the counter is the
+    /// observable — the cost being avoided is the scan, under the mutex the ingest emit path shares.
+    /// `#[serial]` because that counter is a process-global Prometheus child, as it is for every
+    /// other lag test here.
+    #[tokio::test]
+    #[serial]
+    async fn a_lag_on_a_client_that_cannot_receive_books_repairs_nothing() {
+        use futures_util::SinkExt;
+
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // The connect bootstrap is unfiltered (no subscriptions yet), so the book still arrives here.
+        let connect = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("connect replay");
+        assert_eq!(parse_book(&connect).instrument_id, 41);
+
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"type":"quote"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscription ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+
+        // The client is parked on `recv` and holds a book-excluding filter; overflow it.
+        let before = metrics().ws_lag_rebaselines.get();
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+        let quote = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the frame that survived the overflow");
+        assert!(quote.contains(r#""type":"quote""#), "got {quote}");
+        assert_eq!(
+            metrics().ws_lag_rebaselines.get(),
+            before,
+            "a lag on a client that cannot receive books must not scan the market map"
+        );
+
+        srv.abort();
+    }
+
+    /// The reach test itself. A `type` filter is the only one that can rule the product out: a
+    /// `venue`/`symbol`/`channel` filter narrows which markets are repaired, possibly to none, but
+    /// the repair is still the right answer for it — the client is receiving books.
+    #[test]
+    fn only_a_type_filter_puts_a_client_out_of_reach_of_a_lag_repair() {
+        use super::lag_repair_reaches;
+
+        let f = |json: &str| serde_json::from_str::<SubFilter>(json).expect("parses");
+        assert!(lag_repair_reaches(&[]), "the firehose receives books");
+        for json in [
+            r#"{"type":"book"}"#,
+            r#"{"type":"order_book"}"#,
+            r#"{"venue":"KALSHI"}"#,
+            r#"{"symbol":"KXBTCPERP"}"#,
+            r#"{"channel":2}"#,
+            r#"{"venue":"NOBODY","type":"book"}"#,
+        ] {
+            assert!(lag_repair_reaches(&[f(json)]), "{json} receives books");
+        }
+        for json in [r#"{"type":"quote"}"#, r#"{"type":"instrument"}"#] {
+            assert!(!lag_repair_reaches(&[f(json)]), "{json} receives no book");
+        }
+        assert!(
+            lag_repair_reaches(&[f(r#"{"type":"quote"}"#), f(r#"{"type":"book"}"#)]),
+            "filters are a union: one book subscription is enough"
+        );
     }
 
     /// The pace itself: the first repair goes out immediately (a client's only correction must not

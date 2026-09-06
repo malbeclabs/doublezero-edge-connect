@@ -790,8 +790,12 @@ Modules are grouped by role under `src/`:
   `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices) and a lag inside the window is *owed*, not
   dropped — `lag_repair_ready` holds it and the top of the client loop discharges it once the window
   passes, so a client lagging faster than it can be repaired still ends up with a correct book without
-  ever driving a replay loop. `dz_ws_lag_rebaselines_total` against `dz_ws_client_lagged_total` is
-  what shows the pace working. Implements the
+  ever driving a replay loop. A repair is only owed to a client that can actually receive a book
+  (`lag_repair_reaches`): `type` is the one filter dimension that rules the product out wholesale —
+  `venue`/`symbol`/`channel` narrow *which* markets are repaired, possibly to none — and what that
+  spares a `{"type":"quote"}` subscriber is the market scan itself, taken under the mutex the ingest
+  emit path shares, not the frames (its filter would have excluded every one).
+  `dz_ws_lag_rebaselines_total` against `dz_ws_client_lagged_total` is what shows the pace working. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
   `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
