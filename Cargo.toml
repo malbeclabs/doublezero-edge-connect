@@ -33,7 +33,7 @@ tokio = { version = "1", features = [
 # `rustls-tls-webpki-roots` adds the outbound `wss://` client TLS used by the public WS input
 # (webpki bundled roots → portable container build, no system OpenSSL). The WS output sink uses the
 # same crate as a plaintext server and is unaffected.
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 # `rc` enables Serialize/Deserialize for `Arc<str>` — the wire `venue`/`symbol` are `Arc<str>` so a
 # per-message clone is a refcount bump, not a fresh allocation (see `model.rs`).
