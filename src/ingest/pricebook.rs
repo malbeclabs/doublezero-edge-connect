@@ -374,17 +374,31 @@ impl PriceBook {
         true
     }
 
-    /// `InstrumentReset(new_anchor_seq = S')`: drop the book and any open group, and await a snapshot
-    /// anchored at `S'` or newer — so a snapshot captured before the reset but delivered after cannot
-    /// reinstate the diverged book the reset exists to discard. Buffered deltas at/below `S'` are
-    /// superseded by it; those past it are kept for post-snapshot replay. `depth_bound` returns to
-    /// unknown: a reset instrument has made no claim about its depth.
+    /// `InstrumentReset(new_anchor_seq = S')`: drop the book, and any open group anchored before
+    /// `S'`, and await a snapshot anchored at `S'` or newer — so a snapshot captured before the
+    /// reset but delivered after cannot reinstate the diverged book the reset exists to discard.
+    /// A group already assembling against `S'` or newer is kept, by the same test
+    /// [`Self::on_snapshot_begin`] applies to a begin: the reset and its own recovery group ride
+    /// different ports, so the group is routinely processed first, and discarding it there leaves
+    /// the market dark until the next rotation. Buffered deltas at/below `S'` are superseded by
+    /// it; those past it are kept for post-snapshot replay. `depth_bound` returns to unknown: a
+    /// reset instrument has made no claim about its depth.
     pub fn on_instrument_reset(&mut self, new_anchor_seq: u64) {
         self.bids.clear();
         self.asks.clear();
-        self.open = None;
+        if self
+            .open
+            .as_ref()
+            .is_none_or(|b| b.anchor_seq < new_anchor_seq)
+        {
+            self.open = None;
+        }
         self.pending.retain(|d| d.mktdata_seq > new_anchor_seq);
-        self.status = Status::AwaitingSnapshot;
+        self.status = if self.open.is_some() {
+            Status::BuildingSnapshot
+        } else {
+            Status::AwaitingSnapshot
+        };
         self.last_applied_instrument_seq = 0;
         self.depth_bound = None;
         self.required_anchor_seq = Some(new_anchor_seq);
@@ -1299,6 +1313,22 @@ mod tests {
             b.on_snapshot_begin(3, 501, 0, 9, 0),
             "at or past S' -> accepted"
         );
+    }
+
+    /// ...but a group already assembling at or past `S'` IS that reset's recovery group and
+    /// survives it. The reset rides mktdata and the group the snapshot port, on independent
+    /// sequence series, so which is processed first is a coin flip; discarding it here leaves the
+    /// market dark until the publisher's next rotation.
+    #[test]
+    fn instrument_reset_keeps_the_group_anchored_at_its_own_new_anchor() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
+        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0));
+        b.on_snapshot_level(2, SIDE_BID, 6100, 20, Some(1), 0);
+        b.on_instrument_reset(500);
+        assert_eq!(b.status(), Status::BuildingSnapshot);
+        assert!(b.on_snapshot_end(500, 2), "and installs");
+        assert_eq!(b.status(), Status::Ready);
+        assert_eq!(bids_of(&b), vec![(6100, 20)]);
     }
 
     /// The required anchor clears on ANY accepted snapshot at or past `S'`, not only an exact match

@@ -98,6 +98,27 @@ fn phoenix_refdata_fixture_is_a_complete_manifest_era() {
     assert_eq!(sym(50), Some("AMZN"));
 }
 
+/// `Tick Size` is the venue's **tradable** increment and is not `10^price_exponent`: BTC here is
+/// exponent `-2` with a tick of `100`, so it moves in dollars while the fixed point is cents.
+/// Pinned against the real capture because the byte offset is the whole risk — a transposed one
+/// reads a neighbouring field and yields a plausible integer rather than an error.
+#[test]
+fn phoenix_definitions_carry_the_venues_tradable_tick() {
+    let defs = definitions();
+    let tick = |id: u32| defs.get(&id).map(|d| (d.price_exponent, d.tick_size));
+    assert_eq!(tick(1), Some((-2, 100)), "BTC trades in $1.00");
+    assert_eq!(tick(2), Some((-3, 100)), "ETH in $0.10");
+    assert_eq!(tick(0), Some((-4, 100)), "SOL in $0.01");
+    assert_eq!(tick(46), Some((-3, 10)), "INTC in $0.01");
+    for d in defs.values() {
+        assert!(
+            d.tick_size > 0,
+            "every Phoenix definition states a tick; {} states none",
+            d.symbol
+        );
+    }
+}
+
 /// Every fixture trade is a real Phoenix (`source_id=2`) fill referencing a defined instrument, and
 /// carries the on-chain `trade_id` that the public feed reported as `tradeSequenceNumber` for the
 /// same fill. Pinning the exact `(instrument_id, trade_id)` pairs anchors the dedup key the

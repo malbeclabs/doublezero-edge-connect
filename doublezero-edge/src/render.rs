@@ -123,7 +123,7 @@ fn render_product_get(body: &Value) -> Result<String, String> {
     let parsed: ProductResponse = parse(body)?;
     let p = parsed.product;
     let source_name = p.source_name().to_string();
-    let rows = vec![
+    let mut rows = vec![
         vec!["product_id".to_string(), p.product_id],
         vec!["source_name".to_string(), source_name],
         vec!["symbol".to_string(), p.symbol],
@@ -131,9 +131,16 @@ fn render_product_get(body: &Value) -> Result<String, String> {
         vec!["instrument_id".to_string(), p.instrument_id.to_string()],
         vec!["price_increment".to_string(), p.price_increment],
         vec!["base_increment".to_string(), p.base_increment],
+    ];
+    // Only when the venue stated a tick: the row's presence is what tells a reader whether
+    // `price_increment` above is that tick or the fixed-point granularity.
+    if let Some(tick) = p.tick_size {
+        rows.push(vec!["tick_size".to_string(), tick.to_string()]);
+    }
+    rows.extend([
         vec!["status".to_string(), p.status],
         vec!["feed_kind".to_string(), p.feed_kind],
-    ];
+    ]);
     Ok(table(&["FIELD", "VALUE"], &rows))
 }
 
@@ -445,6 +452,21 @@ mod tests {
         // The touch itself: best ask (0.9500) immediately above best bid (0.9100).
         assert_eq!(price_rows[2].split_whitespace().next().unwrap(), "ask");
         assert_eq!(price_rows[3].split_whitespace().next().unwrap(), "bid");
+    }
+
+    /// A product whose venue states a tick renders it beside the increment, so a reader can tell
+    /// `price_increment` is that tick rather than the fixed-point granularity. The absent case is
+    /// the `product_get` golden, whose Hyperliquid publisher states none.
+    #[test]
+    fn a_stated_tick_is_rendered_beside_the_increment() {
+        let body = serde_json::json!({"product": {
+            "product_id": "PHOENIX:BTC", "source_id": 2, "source_name": "Phoenix", "symbol": "BTC",
+            "channel": 0, "instrument_id": 1, "price_increment": "1.00",
+            "base_increment": "0.0001", "tick_size": 100,
+            "status": "online", "feed_kind": "top_of_book"
+        }});
+        let out = render_product_get(&body).unwrap();
+        assert!(out.contains("tick_size        100"), "{out}");
     }
 
     #[test]

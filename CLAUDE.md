@@ -12,8 +12,8 @@ feeds, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it both as full-state `depth` and as the order-level incremental **`order_book`**, carrying
 the venue's own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
-reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `edge-kalshi-perps-mbp`
-row selects it, on a group that is live). Each feed maps to one venue. The
+reconstructs the price-aggregated book and re-serves it as the incremental `book`; the
+`edge-kalshi-perps-mbp` and `edge-phoenix-mbp` rows select it, both on live groups). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
 WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
@@ -176,7 +176,7 @@ Modules are grouped by role under `src/`:
   installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
   `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
   rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
-  venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
+  venue, with a group `code` (`tiredsolid`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
@@ -200,9 +200,20 @@ Modules are grouped by role under `src/`:
   `..._match_the_deployment`) asserts the document against literals written beside it — the code
   agreeing with itself. It catches a later edit that moves a value, never a value that was wrong when
   written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
-  sibling row's block, with the build green throughout. **The external check is a packet capture**, and
-  the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
-  port moves. A third **Kalshi** row
+  sibling row's block, with the build green throughout. **The external check is a packet capture** —
+  run it whenever a row is added or a port moves. **PORT PROVENANCE**, the rule that check exists to
+  serve: a port in that document is a claim about a machine outside this process, so it is verified
+  from *outside* — by capture, or by the publishers' own deployment inventory — or the row is marked
+  unverified in its `notes`. Never from prose that describes an allocation; read the values the
+  publisher actually renders. And the authoritative fleet list is the **feed-capture recorder**
+  inventory in the private infra repo, **not** the publisher deployment inventory: the latter covers
+  only a subset of the hosts on a group, and sourcing the table from it alone is what left five
+  blocks unbound and the bridge ingesting about a third of the group's datagrams. (The rule used to
+  live in the document's own notes; it moved here when those notes were rewritten for the operators
+  who read them — `registry.json` states what a subscriber needs, this states how we verify it.)
+  One row-level fact that lived there too: Hyperliquid's `9011`/`10011` block is on the wire and in
+  no inventory, and its depth half is the group's highest-volume publisher — its owner is still to
+  be established, so **do not drop the row** for being unattributed. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
   under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
@@ -383,7 +394,7 @@ Modules are grouped by role under `src/`:
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher, category)` (quotes → quote
   floor, depth → depth floor, trades → the per-`(venue, category)` **tape leader** then the window, `book` → the
-  single-path authority gate below, `Instrument` → a rate limit on the precision pair per
+  single-path authority gate below, `Instrument` → a rate limit on the precision and tick per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
@@ -617,8 +628,14 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
-  non-negative). The only `FEEDS` row of that kind is `edge-kalshi-perps-mbp`, whose group is live, so these series
-  populate on any host subscribed to it — and report nothing on a host that is not.
+  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live; on a
+  host subscribed to neither the matcher never engages at all. Where it does, a **single-publisher row is the
+  degenerate case and the matcher's two series diverge on it**: a pair needs two paths, so `dz_path_lead_ns`
+  populates only for Kalshi's mirrored pair and never for Phoenix, while every Phoenix print still *enters* the
+  matcher (the authority tracks its one path, so `race_eligible` holds) and expires unpaired onto
+  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate. That series'
+  alarm reading, "the paths are barely pairing," cannot apply to a row that has one path; docs/metrics.md carries
+  the same caveat, since a dashboard alerting on the ratio would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -935,7 +952,7 @@ Modules are grouped by role under `src/`:
   it is honest about completeness only while `baselined` holds. The arbiter's `Book` branch is the
   single-path
   authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-path
-  accumulators; `MbpProcessor` emits `book`, and the `edge-kalshi-perps-mbp` row selects it on a live group.
+  accumulators; `MbpProcessor` emits `book`, selected by the `edge-kalshi-perps-mbp` and `edge-phoenix-mbp` rows on live groups.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.

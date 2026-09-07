@@ -47,6 +47,11 @@ pub struct Product {
     pub instrument_id: u32,
     pub price_increment: String,
     pub base_increment: String,
+    /// The venue's stated tick, absent when it stated none — which is what says whether
+    /// `price_increment` is that tick or the fixed-point granularity. Optional for both reasons: an
+    /// older bridge does not send it either.
+    #[serde(default)]
+    pub tick_size: Option<i64>,
     pub status: String,
     pub feed_kind: String,
 }

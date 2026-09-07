@@ -101,6 +101,11 @@ pub struct InstrumentDefinition {
     pub symbol: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
+    /// `Tick Size`: the venue's tradable price increment, in the same fixed point as every price on
+    /// the feed, so the real increment is `tick_size * 10^price_exponent`. **`0` is the publisher's
+    /// "not stated"**, not a zero tick — every Hyperliquid definition in the committed fixtures
+    /// carries it, while every Kalshi and Phoenix one states a real tick.
+    pub tick_size: i64,
     pub manifest_seq: u16,
 }
 
@@ -155,6 +160,7 @@ pub fn instrument_definition(
             symbol: cstr(b, body + 4, DEF_SYM_LEN_V1)?.into(),
             price_exponent: u8le(b, body + 37)? as i8,
             qty_exponent: u8le(b, body + 38)? as i8,
+            tick_size: i64le(b, body + 40)?,
             manifest_seq: u16le(b, body + 74)?,
         }),
         SCHEMA_V3 => Some(InstrumentDefinition {
@@ -163,6 +169,7 @@ pub fn instrument_definition(
             symbol: cstr(b, body + 6, DEF_SYM_LEN_V3)?.into(),
             price_exponent: u8le(b, body + 87)? as i8,
             qty_exponent: u8le(b, body + 88)? as i8,
+            tick_size: i64le(b, body + 90)?,
             manifest_seq: u16le(b, body + 124)?,
         }),
         _ => None,
@@ -278,6 +285,7 @@ mod tests {
         symbol: &str,
         price_exp: i8,
         qty_exp: i8,
+        tick_size: i64,
         manifest_seq: u16,
     ) -> Vec<u8> {
         let mut b = vec![0u8; 76];
@@ -285,6 +293,7 @@ mod tests {
         b[4..4 + symbol.len()].copy_from_slice(symbol.as_bytes()); // spec 8: Symbol char[16]
         b[37] = price_exp as u8; // spec 41
         b[38] = qty_exp as u8; // spec 42
+        b[40..48].copy_from_slice(&tick_size.to_le_bytes()); // spec 44: Tick Size
         b[74..76].copy_from_slice(&manifest_seq.to_le_bytes()); // spec 78
         b
     }
@@ -298,6 +307,7 @@ mod tests {
         symbol: &str,
         price_exp: i8,
         qty_exp: i8,
+        tick_size: i64,
         manifest_seq: u16,
     ) -> Vec<u8> {
         let mut b = vec![0u8; 126];
@@ -306,6 +316,7 @@ mod tests {
         b[6..6 + symbol.len()].copy_from_slice(symbol.as_bytes()); // spec 10: Symbol char[64]
         b[87] = price_exp as u8; // spec 91
         b[88] = qty_exp as u8; // spec 92
+        b[90..98].copy_from_slice(&tick_size.to_le_bytes()); // spec 94: Tick Size
         b[124..126].copy_from_slice(&manifest_seq.to_le_bytes()); // spec 128
         b
     }
@@ -316,7 +327,7 @@ mod tests {
     #[test]
     fn instrument_definition_decodes_schema_v3() {
         let long = "KXNCAAFGAME-26AUG15DALSEA-SEA";
-        let body = def_body_v3(41, 3, long, -8, -6, 7);
+        let body = def_body_v3(41, 3, long, -8, -6, 100, 7);
         let f = datagram(3, MSG_INSTRUMENT_DEFINITION, &body);
 
         let d = instrument_definition(&f, DATAGRAM_HEADER_SIZE, 3).expect("v3 definition decodes");
@@ -329,6 +340,7 @@ mod tests {
         );
         assert_eq!(d.price_exponent, -8);
         assert_eq!(d.qty_exponent, -6);
+        assert_eq!(d.tick_size, 100);
         assert_eq!(d.manifest_seq, 7);
     }
 
@@ -337,7 +349,7 @@ mod tests {
     /// may hold a v1 and a v3 publisher of the same venue simultaneously.
     #[test]
     fn instrument_definition_decodes_schema_v1() {
-        let body = def_body_v1(41, "BTC-USDT", -8, -6, 7);
+        let body = def_body_v1(41, "BTC-USDT", -8, -6, 100, 7);
         let f = datagram(1, MSG_INSTRUMENT_DEFINITION, &body);
 
         let d = instrument_definition(&f, DATAGRAM_HEADER_SIZE, 1).expect("v1 definition decodes");
@@ -347,6 +359,7 @@ mod tests {
         assert_eq!(&*d.symbol, "BTC-USDT");
         assert_eq!(d.price_exponent, -8);
         assert_eq!(d.qty_exponent, -6);
+        assert_eq!(d.tick_size, 100);
         assert_eq!(d.manifest_seq, 7);
     }
 
@@ -366,7 +379,7 @@ mod tests {
         let mut f = datagram(
             3,
             MSG_INSTRUMENT_DEFINITION,
-            &def_body_v1(41, "BTC-USDT", -8, -6, 7),
+            &def_body_v1(41, "BTC-USDT", -8, -6, 100, 7),
         );
         // Whatever the publisher packed next. Non-zero, so a v3-offset read yields values rather
         // than tripping over NUL padding and looking like an empty field.
@@ -386,7 +399,7 @@ mod tests {
     /// it and decoding it would be an unexercised path nothing validates.
     #[test]
     fn the_datagram_gate_admits_only_implemented_versions() {
-        let body = def_body_v3(41, 3, "BTC-USDT", -8, -6, 7);
+        let body = def_body_v3(41, 3, "BTC-USDT", -8, -6, 100, 7);
         let supported = &[SCHEMA_V1, SCHEMA_V3];
 
         for v in [0u8, 2, 4, 255] {
@@ -413,7 +426,7 @@ mod tests {
         let f = datagram(
             SCHEMA_V3,
             MSG_INSTRUMENT_DEFINITION,
-            &def_body_v3(41, 3, "BTC-USDT", -8, -6, 7),
+            &def_body_v3(41, 3, "BTC-USDT", -8, -6, 100, 7),
         );
         assert!(decode_datagram_with(&f, TEST_MAGIC, &[SCHEMA_V1], |_, _, _, _, _| ()).is_err());
     }
@@ -430,7 +443,7 @@ mod tests {
             &datagram(
                 SCHEMA_V1,
                 MSG_INSTRUMENT_DEFINITION,
-                &def_body_v1(41, "BTC-USDT", -8, -6, 7),
+                &def_body_v1(41, "BTC-USDT", -8, -6, 100, 7),
             ),
             DATAGRAM_HEADER_SIZE,
             SCHEMA_V1,
@@ -440,7 +453,7 @@ mod tests {
             &datagram(
                 SCHEMA_V3,
                 MSG_INSTRUMENT_DEFINITION,
-                &def_body_v3(41, 9, "BTC-USDT", -8, -6, 7),
+                &def_body_v3(41, 9, "BTC-USDT", -8, -6, 100, 7),
             ),
             DATAGRAM_HEADER_SIZE,
             SCHEMA_V3,

@@ -1565,6 +1565,7 @@ mod tests {
         changes: Vec<crate::model::BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(crate::model::NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,
@@ -1924,6 +1925,7 @@ mod tests {
         r.cfg.instruments.lock().unwrap().insert(
             ("KALSHI".into(), "sports".into(), 10u8, 1u32),
             crate::model::NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2061,6 +2063,7 @@ mod tests {
         r.cfg.instruments.lock().unwrap().insert(
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2176,6 +2179,7 @@ mod tests {
         r.cfg.instruments.lock().unwrap().insert(
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
@@ -2395,6 +2399,7 @@ mod tests {
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
+            tick_size: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,

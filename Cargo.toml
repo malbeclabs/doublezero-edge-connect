@@ -33,7 +33,7 @@ tokio = { version = "1", features = [
 # `rustls-tls-webpki-roots` adds the outbound `wss://` client TLS used by the public WS input
 # (webpki bundled roots → portable container build, no system OpenSSL). The WS output sink uses the
 # same crate as a plaintext server and is unaffected.
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 # `rc` enables Serialize/Deserialize for `Arc<str>` — the wire `venue`/`symbol` are `Arc<str>` so a
 # per-message clone is a refcount bump, not a fresh allocation (see `model.rs`).
@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Shred forwarder sigverify (issue #25): ed25519 over the shred/merkle-root signature, SHA-256 for
 # merkle-root recomputation, base58 for leader pubkeys, and a minimal JSON-RPC client (rustls, no
 # OpenSSL) for the leader schedule. Deliberately the *light* path — no heavy solana-* crates.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 sha2 = "0.11"
 bs58 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -58,6 +58,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 prometheus = { version = "0.14", default-features = false, features = ["process"] }
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
 # Used only by examples/pcap2datagrams.rs (dev tooling) — not compiled into the release binary.
 pcap-file = "2"

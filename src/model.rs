@@ -331,6 +331,13 @@ pub struct NormalizedBook {
     #[serde(skip)]
     pub order_level: bool,
     pub changes: Vec<BookChange>,
+    /// The venue's committed slot, truncated to `u32` by the publisher: the `Batch ID` of the most
+    /// recent `BatchBoundary` seen on this market's channel when the batch was produced. Absent
+    /// until one has been seen, and on the Market-by-Order path, which does not carry it. Lets a
+    /// consumer compare this book against a slot-stamped venue snapshot at the same slot, instead
+    /// of over a time window that measures sampling skew rather than correctness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<u32>,
     /// Advisory: this batch is part of a rebuild rather than ordinary activity. Deliberately NOT
     /// what re-baselines a consumer — `changes[0].action == Clear` is.
     pub snapshot: bool,
@@ -384,6 +391,13 @@ pub struct NormalizedInstrument {
     pub category: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
+    /// The venue's tradable price increment as `tick_size * 10^price_exponent` — the wire's `Tick
+    /// Size` in the same fixed point as every price on the feed. **`0` means the publisher stated
+    /// none**, not a zero tick, and is what a Hyperliquid definition carries today. Distinct from
+    /// `10^price_exponent`, which is only the fixed-point granularity: BTC on Phoenix is exponent
+    /// `-2` with a tick of `100`, so it moves in dollars, not cents.
+    #[serde(default)]
+    pub tick_size: i64,
 }
 
 /// A venue-level feed-health status (the PROTOCOL.md `status` candidate extension). Emitted when
@@ -519,6 +533,11 @@ pub struct BookAccumulator {
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
     source_ts_ns: u64,
+    pending_batch_id: Option<u32>,
+    /// The venue's committed slot the accumulated state stands at — see
+    /// [`NormalizedBook::batch_id`]. Committed with the event clock, so it names a slot whose
+    /// changes are actually folded in rather than one still waiting for its `last` batch.
+    batch_id: Option<u32>,
     /// Whether a producer re-baseline has been folded in, i.e. whether these levels are the market's
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
@@ -573,6 +592,8 @@ impl BookAccumulator {
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
+            pending_batch_id: None,
+            batch_id: None,
             baselined: false,
             source_id: 0,
         }
@@ -602,6 +623,10 @@ impl BookAccumulator {
         if b.source_ts_ns != 0 {
             self.pending_ts_ns = b.source_ts_ns;
         }
+        // Same rule as the event clock: a batch that names no slot must not blank the last one.
+        if b.batch_id.is_some() {
+            self.pending_batch_id = b.batch_id;
+        }
         // A non-finite price would saturate the fixed-point key (NaN to 0, inf to i128::MIN/MAX),
         // silently merging unrelated levels into one entry that then lives in the replay map forever.
         self.pending.extend(
@@ -618,6 +643,13 @@ impl BookAccumulator {
             if self.pending.len() > MAX_PENDING_CHANGES {
                 self.pending.clear();
                 self.baselined = false;
+                // The abandoned event's changes are gone, so its stamps go with them, or the next
+                // event's `last` commits a time and a slot for state that was never folded in —
+                // ahead of the book, which is the one direction PROTOCOL.md's "at least that slot"
+                // rules out. Rolled back to what IS folded in rather than zeroed: zeroing would let
+                // a later batch naming neither blank both.
+                self.pending_ts_ns = self.source_ts_ns;
+                self.pending_batch_id = self.batch_id;
             }
             return;
         }
@@ -681,6 +713,7 @@ impl BookAccumulator {
             self.baselined = false;
         }
         self.source_ts_ns = self.pending_ts_ns;
+        self.batch_id = self.pending_batch_id;
     }
 
     /// Discard one or both sides of the book, across **both** populations — a `Clear` names a side, and
@@ -740,6 +773,11 @@ impl BookAccumulator {
     /// [`Self::to_book`] — which stamps this same value — just to read it.
     pub fn source_ts_ns(&self) -> u64 {
         self.source_ts_ns
+    }
+
+    /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
+    pub fn batch_id(&self) -> Option<u32> {
+        self.batch_id
     }
 
     /// Fold the accumulated orders into price levels with the order count at each, bids best-first
@@ -856,6 +894,7 @@ impl BookAccumulator {
                 size: 0.0,
                 order_id: 0,
             }],
+            batch_id: self.batch_id,
             snapshot: true,
             last: true,
             source_ts_ns: self.source_ts_ns,
@@ -1029,6 +1068,7 @@ mod tests {
 
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,
@@ -1493,6 +1533,7 @@ mod tests {
         let venue: Arc<str> = Arc::from("HYPERLIQUID");
         let mut acc = BookAccumulator::new(Arc::from("SOL"));
         acc.apply(&NormalizedBook {
+            batch_id: None,
             venue: venue.clone(),
             source_name: venue.clone(),
             source_id: 1,
@@ -1704,6 +1745,50 @@ mod tests {
         acc.apply(&book(flood, false, false));
         assert!(!acc.baselined());
         assert!(acc.price_fold().0.is_empty());
+    }
+
+    /// ...and its stamps are abandoned with it. Committing the discarded event's slot on the next
+    /// event's `last` would name a slot the accumulated state is not at — ahead of it, which is the
+    /// direction PROTOCOL.md's "at least that slot's" rules out.
+    #[test]
+    fn an_abandoned_events_stamps_are_not_committed_by_the_next_one() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        let mut first = book(
+            vec![order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0)],
+            true,
+            true,
+        );
+        first.batch_id = Some(900);
+        first.source_ts_ns = 100;
+        acc.apply(&first);
+        assert_eq!(acc.batch_id(), Some(900));
+
+        let mut abandoned = book(
+            (1..=MAX_PENDING_CHANGES as u64 + 1)
+                .map(|id| order(BookAction::Update, BookSide::Bid, id as f64, 1.0, id))
+                .collect(),
+            false,
+            false,
+        );
+        abandoned.batch_id = Some(901);
+        abandoned.source_ts_ns = 200;
+        acc.apply(&abandoned);
+
+        // An ordinary later batch, naming neither a slot nor a time of its own.
+        let mut next = book(
+            vec![order(BookAction::Update, BookSide::Bid, 1.0, 1.0, 1)],
+            false,
+            true,
+        );
+        next.batch_id = None;
+        next.source_ts_ns = 0;
+        acc.apply(&next);
+        assert_eq!(
+            acc.batch_id(),
+            Some(900),
+            "the abandoned event's slot is not the state's"
+        );
+        assert_eq!(acc.source_ts_ns(), 100, "nor its event time");
     }
 
     /// A connecting client is bootstrapped with price levels by default, so an L2 consumer never pays

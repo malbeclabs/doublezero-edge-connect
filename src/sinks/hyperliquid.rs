@@ -1519,6 +1519,7 @@ mod tests {
 
     fn book_with(changes: Vec<BookChange>) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: VENUE.into(),
             source_name: VENUE.into(),
             source_id: 1,

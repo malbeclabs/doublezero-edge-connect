@@ -968,10 +968,13 @@ mod tests {
         mbp.sort_unstable();
         // The categories themselves, not a count: a count of 2 would also be satisfied by the same
         // universe selected twice, which is the opposite failure and equally wrong.
+        // The categories themselves, each exactly once. Elections joined perps and sports as a
+        // third market-by-price universe on this venue, which is the case the dedup has to keep
+        // getting right rather than a reason to loosen the assertion to a count.
         assert_eq!(
             mbp,
-            vec!["perps", "sports"],
-            "both universes must be selected, each once"
+            vec!["elections", "perps", "sports"],
+            "every universe must be selected, each once"
         );
     }
 
@@ -1044,7 +1047,7 @@ mod tests {
     }
 
     /// A feed left with no matching publisher drops out entirely rather than running with zero
-    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201).
+    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201/9211).
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
         registry();
@@ -1054,8 +1057,8 @@ mod tests {
     }
 
     /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
-    /// block and Phoenix's only block, so selecting it keeps a publisher on each. Scoping to one
-    /// venue is `--feed`'s job.
+    /// block and Phoenix's top-of-book block, so selecting it keeps a publisher on each. Scoping
+    /// to one venue is `--feed`'s job.
     #[test]
     fn base_ports_are_not_unique_across_feeds() {
         registry();

@@ -92,6 +92,7 @@ fn batch_for(
     recv_ts_ns: u64,
 ) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
+        batch_id: None,
         venue: VENUE.into(),
         source_name: VENUE.into(),
         source_id: 1,
