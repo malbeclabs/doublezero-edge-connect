@@ -53,8 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unbounded replay loop. The connect and `subscribe` bootstraps are unchanged — a client that holds
   no state still gets everything, and a client whose `type` filter excludes both book types is owed
   no repair at all — sparing it the market scan, which is taken under the mutex the ingest emit path
-  shares. New: `dz_ws_lag_rebaselines_total`, which against `dz_ws_client_lagged_total` shows the
-  pace working.
+  shares. New: `dz_ws_lag_repairs_total`, which against `dz_ws_client_lagged_total` shows the pace
+  working. It counts the repair **pass**, not the re-baselines the pass wrote — a pass whose filters
+  match no baselined market sends nothing, which is every pass on a deployment carrying no
+  book-bearing feed, and counting frames would leave the series silent exactly where a lag is worth
+  reading about while making that ratio mean two things at once.
+- **`tob_source_id_change_reannounces_and_is_counted` was flaky**, and the flake was the test's, not
+  the code's: it asserts an exact count on the process-global
+  `dz_source_id_changed_total{venue="PHOENIX"}` child, and three sibling tests reveal that same
+  Source ID without asserting anything about it. Only one of the three was `#[serial]`, so the other
+  two could bump the child between this test's `before` read and its assertion. All four now share
+  the serial group, and each of the three carries the reason in its own doc comment — the writer is
+  the one that has to know, since the reader cannot enumerate them.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it

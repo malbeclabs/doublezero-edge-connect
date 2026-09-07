@@ -3935,7 +3935,13 @@ mod tests {
     /// passing the assertion below for the wrong reason. Varying the exponent guarantees the
     /// arbiter would forward a stale reannounce if the processor ever emitted one, so this test
     /// actually exercises the processor's own decision, not the arbiter's.
+    ///
+    /// `#[serial]` for a sibling's sake, not its own: this is the fourth test in the file that
+    /// reveals Source ID 2, and so the fourth writer of the
+    /// `dz_source_id_changed_total{venue="PHOENIX"}` child that
+    /// `tob_source_id_change_reannounces_and_is_counted` measures by exact count.
     #[test]
+    #[serial_test::serial]
     fn tob_v3_definition_id_change_emits_exactly_one_instrument() {
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = TobProcessor::new(tape(false));
@@ -4388,7 +4394,14 @@ mod tests {
     /// (`last_top`, keyed by CONTENT, not by identity). `last_top` is now cleared on the same
     /// id-change branch `reveal_if_needed` already takes the metric/re-announce action on —
     /// mirroring what `InstrumentReset` already does for the identical reason.
+    ///
+    /// `#[serial]` for a sibling's sake, not its own, exactly as
+    /// `tob_source_id_change_purges_the_stale_instrument_snapshot_entry` is: this test asserts no
+    /// counter, but revealing Source ID 2 increments the same `dz_source_id_changed_total{venue=
+    /// "PHOENIX"}` child that `tob_source_id_change_reannounces_and_is_counted` measures by exact
+    /// count. Any future test that reveals that id belongs in this group too.
     #[test]
+    #[serial_test::serial]
     fn mbo_id_change_forces_a_depth_rebaseline_even_when_top_n_is_unchanged() {
         let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));

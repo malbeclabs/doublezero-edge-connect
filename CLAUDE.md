@@ -786,7 +786,7 @@ Modules are grouped by role under `src/`:
   connection converged on replaying: measured at 144k frames/s of which 99.86% were `instrument`, with
   every surviving book message a re-baseline whose following levels never arrived, and `/v1/status`
   timing out behind the catalog clone that replay takes under the shared instrument mutex. The repair
-  is also **paced** per client (`LAG_REBASELINE_MIN_INTERVAL`, the same trade
+  is also **paced** per client (`LAG_REPAIR_MIN_INTERVAL`, the same trade
   `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices) and a lag inside the window is *owed*, not
   dropped — `lag_repair_ready` holds it and the top of the client loop discharges it once the window
   passes, so a client lagging faster than it can be repaired still ends up with a correct book without
@@ -795,7 +795,10 @@ Modules are grouped by role under `src/`:
   `venue`/`symbol`/`channel` narrow *which* markets are repaired, possibly to none — and what that
   spares a `{"type":"quote"}` subscriber is the market scan itself, taken under the mutex the ingest
   emit path shares, not the frames (its filter would have excluded every one).
-  `dz_ws_lag_rebaselines_total` against `dz_ws_client_lagged_total` is what shows the pace working. Implements the
+  `dz_ws_lag_repairs_total` against `dz_ws_client_lagged_total` is what shows the pace working — it
+  counts the repair **pass**, never the re-baselines the pass wrote, because a pass whose filters
+  match no baselined market (every pass, where no feed carries books) sends nothing and the pace is
+  still the thing being read. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
   `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level

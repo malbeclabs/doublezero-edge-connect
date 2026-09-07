@@ -364,8 +364,8 @@ fn book_scope(acc: &BookAccumulator) -> ReplayScope {
     }
 }
 
-/// Shortest interval between one client's lag-triggered book re-baselines (see [`Replay::Books`] and
-/// the `Lagged` arm of [`serve_client`]).
+/// Shortest interval between one client's lag-triggered book repairs (see [`Replay::Books`] and the
+/// `Lagged` arm of [`serve_client`]).
 ///
 /// A re-baseline is written into a client that is *already* behind, and writing it is exactly what
 /// keeps that client from draining the broadcast — so an unpaced one re-arms the lag that asked for
@@ -373,11 +373,11 @@ fn book_scope(acc: &BookAccumulator) -> ReplayScope {
 /// `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices for its own `l4Book` bootstrap: long
 /// enough that the replay cannot be the dominant cost of the connection, short enough that a book
 /// left stale by a dropped batch is corrected in about the time a consumer would notice.
-const LAG_REBASELINE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const LAG_REPAIR_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Whether an owed lag repair may go out now: `due` says one is owed, `last` is when this client was
 /// last repaired (`None` = never). Split out from the loop so the pace is unit-testable without
-/// waiting [`LAG_REBASELINE_MIN_INTERVAL`] of wall clock.
+/// waiting [`LAG_REPAIR_MIN_INTERVAL`] of wall clock.
 ///
 /// The first repair after a quiet period is immediate — the pace exists to stop a repair from
 /// re-arming the lag that asked for it, not to delay a client's only correction.
@@ -547,11 +547,11 @@ async fn serve_client(
     let mut win_start = Instant::now();
     let mut win_count: u32 = 0;
     let mut hb = tokio::time::interval(cfg.heartbeat);
-    // Lag repair state: when this client was last re-baselined, and whether a lag since then is
-    // still owed one. Both are needed — the pace alone would drop the repair a suppressed lag asked
+    // Lag repair state: when this client was last repaired, and whether a lag since then is still
+    // owed one. Both are needed — the pace alone would drop the repair a suppressed lag asked
     // for, leaving that client's book wrong for as long as it stays connected.
-    let mut last_lag_rebaseline: Option<Instant> = None;
-    let mut lag_rebaseline_due = false;
+    let mut last_lag_repair: Option<Instant> = None;
+    let mut lag_repair_due = false;
 
     loop {
         // Discharge an owed lag repair here, at the top of the loop rather than in the `Lagged` arm
@@ -562,14 +562,17 @@ async fn serve_client(
         // producing the batches the book is missing. Ordering against the live frames written in
         // between is not a hazard: the re-baseline is materialized here, so it is current as of this
         // moment and the batches that follow apply on top of it.
-        if lag_repair_ready(
-            lag_rebaseline_due,
-            last_lag_rebaseline,
-            LAG_REBASELINE_MIN_INTERVAL,
-        ) {
-            lag_rebaseline_due = false;
-            last_lag_rebaseline = Some(Instant::now());
-            metrics().ws_lag_rebaselines.inc();
+        if lag_repair_ready(lag_repair_due, last_lag_repair, LAG_REPAIR_MIN_INTERVAL) {
+            lag_repair_due = false;
+            last_lag_repair = Some(Instant::now());
+            // Counts the repair *pass*, which is the quantity the pace above governs and the one
+            // that costs the market scan — not the re-baselines the pass writes, of which there can
+            // legitimately be none (a client whose filters match no baselined market, or any
+            // deployment carrying no book-bearing feed). Counting frames instead would leave this
+            // silent on exactly the deployments where a lag is worth reading about, and would make
+            // its ratio against `dz_ws_client_lagged_total` unreadable: a gap would no longer mean
+            // "coalesced by the pace".
+            metrics().ws_lag_repairs.inc();
             replay_scoped(
                 &mut write,
                 &instruments,
@@ -684,14 +687,14 @@ async fn serve_client(
                     // wrong, so it must be re-baselined. Everything else this client missed restates
                     // itself (see `Replay`), so nothing else is replayed — and the repair is *owed*
                     // here rather than written here, so that a client lagging faster than
-                    // `LAG_REBASELINE_MIN_INTERVAL` cannot drive its own connection into replaying
+                    // `LAG_REPAIR_MIN_INTERVAL` cannot drive its own connection into replaying
                     // full state in a loop instead of streaming (#149).
                     //
                     // Never cleared here: a client that unsubscribes from books between the lag and
                     // the repair leaves a scan that sends nothing (cheap, and self-correcting), while
                     // clearing it would drop a repair that a *later* filter still needs.
                     if lag_repair_reaches(&subs) {
-                        lag_rebaseline_due = true;
+                        lag_repair_due = true;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -2178,7 +2181,7 @@ mod tests {
         assert!(first.contains(r#""type":"quote""#), "got {first}");
 
         // The client is parked on `recv` and caught up; overflow it again, still well inside
-        // `LAG_REBASELINE_MIN_INTERVAL`.
+        // `LAG_REPAIR_MIN_INTERVAL`.
         for _ in 0..2 {
             assert!(prepared_tx.send(quote()).is_ok(), "the receiver is alive");
         }
@@ -2261,7 +2264,7 @@ mod tests {
         assert!(ack.contains("subscription_response"), "got {ack}");
 
         // The client is parked on `recv` and holds a book-excluding filter; overflow it.
-        let before = metrics().ws_lag_rebaselines.get();
+        let before = metrics().ws_lag_repairs.get();
         for _ in 0..2 {
             let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
             assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
@@ -2271,9 +2274,100 @@ mod tests {
             .expect("the frame that survived the overflow");
         assert!(quote.contains(r#""type":"quote""#), "got {quote}");
         assert_eq!(
-            metrics().ws_lag_rebaselines.get(),
+            metrics().ws_lag_repairs.get(),
             before,
             "a lag on a client that cannot receive books must not scan the market map"
+        );
+
+        srv.abort();
+    }
+
+    /// The counter's own semantics, pinned: `dz_ws_lag_repairs_total` counts the repair **pass**,
+    /// not the re-baselines it wrote. This client is subscribed to books — so the repair is owed and
+    /// the pass runs — but under a `venue` that matches no market, so the pass writes nothing. It
+    /// still counts, because what the series is read against is the pace (`dz_ws_client_lagged_total`)
+    /// and counting frames would make a gap mean either "coalesced" or "nothing to repair"; on a
+    /// deployment carrying no book-bearing feed it would read zero through every lag.
+    /// `#[serial]` because that counter is a process-global Prometheus child.
+    #[tokio::test]
+    #[serial]
+    async fn a_repair_pass_that_writes_no_rebaseline_is_still_counted() {
+        use futures_util::SinkExt;
+
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let connect = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("connect replay");
+        assert_eq!(parse_book(&connect).instrument_id, 41);
+
+        // Books from a venue this process serves nothing for, plus quotes — the quote filter is what
+        // lets the surviving frame through, so the pass can be observed without a sleep.
+        for sub in [
+            r#"{"method":"subscribe","subscription":{"venue":"NOBODY","type":"book"}}"#,
+            r#"{"method":"subscribe","subscription":{"type":"quote"}}"#,
+        ] {
+            ws.send(WsMessage::Text(sub.into())).await.unwrap();
+            let ack = next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("subscription ack");
+            assert!(ack.contains("subscription_response"), "got {ack}");
+        }
+
+        let before = metrics().ws_lag_repairs.get();
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+        let survivor = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the frame that survived the overflow");
+        assert!(
+            survivor.contains(r#""type":"quote""#),
+            "the repair wrote nothing, so the next frame is the live quote, got {survivor}"
+        );
+        assert_eq!(
+            metrics().ws_lag_repairs.get(),
+            before + 1,
+            "the pass ran and is counted even though it re-baselined nothing"
         );
 
         srv.abort();
@@ -2312,7 +2406,7 @@ mod tests {
     /// has passed.
     #[test]
     fn the_lag_repair_pace_holds_a_repair_without_losing_it() {
-        use super::{lag_repair_ready, LAG_REBASELINE_MIN_INTERVAL as WINDOW};
+        use super::{lag_repair_ready, LAG_REPAIR_MIN_INTERVAL as WINDOW};
         use std::time::Instant;
 
         assert!(!lag_repair_ready(false, None, WINDOW), "nothing owed");
