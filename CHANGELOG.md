@@ -14,6 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release does — is a v2 change, and upstream's own `sources/spec.md` still describes the field the
   old way. PROTOCOL.md records the same note beside the deprecation.
 
+### Security
+- **`cargo deny check advisories` failed on `main`: the dependency tree carried a yanked
+  `chacha20 0.10.1`.** It arrives through `tokio-tungstenite 0.30 -> tungstenite -> rand 0.10.2`,
+  which depends on it directly, so nothing in this crate chose the version and no `Cargo.toml`
+  change can avoid it — the lockfile is pinned forward to the republished `0.10.2` instead
+  (`cargo update -p chacha20`, lockfile only; the same update drops the `digest`/`generic-array`
+  chain `0.10.1` pulled in). A yanked crate is not itself a disclosed vulnerability, but the audit
+  denies it because a version its own author withdrew has no upgrade path and no advisory coverage,
+  and this one sits under the WebSocket stack's RNG. The check is a required status, so it also
+  blocked every unrelated pull request until now.
+
 ### Fixed
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
