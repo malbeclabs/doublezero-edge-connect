@@ -432,8 +432,8 @@ mod tests {
     fn sports_row() -> Feed {
         *crate::ingest::feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row")
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row")
     }
 
     /// The sports row narrowed to a single publisher (`channel`'s), mirroring what

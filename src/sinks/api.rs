@@ -3500,13 +3500,13 @@ mod tests {
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
-    /// registry rung filtered by `(venue, category)` — Kalshi's `sports` category carries exactly
+    /// registry rung filtered by `(venue, category)` — Kalshi's `events` category carries exactly
     /// one `FEEDS` kind and resolves it; and `"unknown"` — never a guess — for Kalshi's `perps`
     /// and Phoenix's `perps` categories, which genuinely carry two (Top-of-Book +
     /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
     /// category per venue could not express the difference the `(venue, category)` filter makes:
     /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
-    /// categories) and report `"unknown"` for `sports` too, which would be a false negative for
+    /// categories) and report `"unknown"` for `events` too, which would be a false negative for
     /// the very venue this fix targets.
     #[tokio::test]
     async fn feed_kind_ladder_prefers_book_then_depth_then_registry_then_unknown() {
@@ -3530,8 +3530,8 @@ mod tests {
                 inst_in("perps", 3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), "sports".into(), 20u8, 5u32),
-                inst_in("sports", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
+                ("KALSHI".into(), "events".into(), 20u8, 5u32),
+                inst_in("events", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
             );
         }
         books.lock().unwrap().insert(
@@ -3592,7 +3592,7 @@ mod tests {
         assert_eq!(
             kind_of("SINGLE_CATEGORY"),
             "market_by_price",
-            "Kalshi's sports category has exactly one FEEDS kind, distinct from its ambiguous \
+            "Kalshi's events category has exactly one FEEDS kind, distinct from its ambiguous \
              perps category on the same venue"
         );
     }
@@ -3746,8 +3746,8 @@ mod tests {
     fn sports_row() -> Feed {
         *feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row")
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row")
     }
 
     /// A store below cap must report real occupancy, not a hardcoded shape: exactly one product,
@@ -3904,7 +3904,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "one enabled row: {rows:?}");
         let row_json = &rows[0];
         assert_eq!(row_json["venue"], "KALSHI");
-        assert_eq!(row_json["category"], "sports");
+        assert_eq!(row_json["category"], "events");
         assert_eq!(row_json["code"], "edge-kalshi-sports-mbp");
 
         let channels = row_json["channels"].as_array().unwrap();
