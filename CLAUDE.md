@@ -673,10 +673,21 @@ Modules are grouped by role under `src/`:
   a shared port block one publisher's restart would otherwise clear every publisher's definitions and
   blank the venue. Reads take the **non-inserting** `PerPublisher::def`; only the refdata handlers use
   the inserting `get`, so a forged-publisher market-data flood cannot evict a real publisher's definitions.
-  `MboProcessor` reconstructs an **independent book per `(publisher, instrument)`** (keyed on the
-  datagram source IP address): two publishers mirror one feed but their instance-scoped per-instrument delta
-  sequences collide, so the books can't be merged. `SnapshotOrder` carries only a `snapshot_id` (no
-  instrument id) and routes **only to the originating publisher's** building book. `emit_depth` stamps
+  `MboProcessor` reconstructs an **independent book per `BookKey` = `(publisher, channel_id,
+  instrument_id)`** — the same three axes `MbpProcessor`'s `PriceBookKey` carries, and every map
+  keyed off `books` (`last_top`, `emitted_symbol`, `revealed`, `synced_reported`,
+  `reveal_rebaselined_ns`) moves with it or an eviction strands, or silently un-reveals, a sibling.
+  *Publisher* (the source IP address): two publishers mirror one feed but their instance-scoped
+  per-instrument delta sequences collide, so the books can't be merged. *Channel* (the **raw** wire
+  id from the datagram header, never canonicalized and never a message body): the edge-feed-spec
+  scopes `instrument_id` to its channel, so two channels reusing an id would otherwise share one book
+  and cross-apply deltas — silent corruption no sequence check catches. ⚠️ `RefDataState` is **not**
+  channel-scoped, so such a pair still resolves one definition and publishes one symbol, and the
+  venue-wide depth floor then drops whichever channel trails each tick: the consumer sees that symbol
+  flip-flopping between two books, not merely a shared name. Moot while publishers stay on channel 0.
+  `SnapshotOrder` carries only a `snapshot_id` (no instrument id) and routes **only to the originating
+  channel instance's** building book — publisher alone stopped guaranteeing a single builder the
+  moment a second channel existed. `emit_depth` stamps
   `source_ts_ns = book.last_event_ts()` (a per-*event* time) while coalescing per *datagram*, so two
   datagrams in one tick can emit two depths with the same `source_ts`; this is **benign** under the
   content-inclusive depth floor (same tick + same leader + new content → both admitted, distinct
