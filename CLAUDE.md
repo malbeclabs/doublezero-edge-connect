@@ -965,7 +965,10 @@ Modules are grouped by role under `src/`:
 - **Midpoint offsets are still unvalidated.** The `codec_midpoint.rs` byte layout came from the
   edge-feed-spec *draft*, not a reference codec; its round-trip tests only pin self-consistency.
   Before enabling a live Midpoint feed, run the bridge with `RUST_LOG=debug` against the real
-  group/ports and confirm decoded fields against a datagram hexdump. **`codec_mbo.rs` is validated
+  group/ports and confirm decoded fields against a datagram hexdump — **and give `Midpoint` a
+  `(venue, symbol)` staleness floor in the arbiter**, where it is a bare passthrough today, or two
+  mirrored publishers both reach the wire and the slower one's older mid overwrites the fresher.
+  Which of `book_ts`/`compute_ts` that floor latches on is what the hexdump has to settle first. **`codec_mbo.rs` is validated
   (#4):** shared-with-TOB types (datagram/message headers, `InstrumentDefinition`, `Trade`,
   `ManifestSummary`, type tags) reuse the byte-validated TOB layout, and the MBO-specific types are
   pinned by offset-independent unit tests + a real-datagram decode test over the committed fixtures
