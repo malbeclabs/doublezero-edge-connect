@@ -25,21 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and this one sits under the WebSocket stack's RNG. The check is a required status, so it also
   blocked every unrelated pull request until now.
 
-  ⚠️ **The same regeneration repairs a `Cargo.lock` that Cargo had been refusing outright, which is
-  why the image publishes had stopped.** Six Dependabot PRs merged within about thirty seconds on
-  2026-09-07 without being rebased onto one another: the ed25519-dalek 3 upgrade resolved a lock
-  with a single `rand_core` and dropped the old `digest 0.10` chain, while the rust-minor-patch
-  group was resolved against the tree that still had both. Each lock was correct against its own
-  base and git merged them line by line with no conflict, leaving `rand 0.9.4` and
-  `rand_chacha 0.9.0` naming a bare `rand_core` while two versions of it were locked — a name Cargo
-  cannot resolve — plus six entries reachable from nothing. `cargo build --workspace` passes on that
-  lock because CI does not use `--locked`; the Dockerfile's `cargo build --release --locked` does,
-  so the only thing that noticed was the image build. Every GHCR publish failed from 2026-09-08
-  onward, and `doublezero-edge-connect:mainnet-beta` sat on the 0.38.0 client base across the
-  doublezero v0.39.0 release and the `mainnet-beta-0.39.0-1` base image published after it. No
-  reachable package changes version here beyond `chacha20`; the rest of the diff is those six
-  orphans and the names they had made ambiguous.
-
 ### Fixed
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
@@ -151,6 +136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window would still have held); headroom stays on `dz_mbo_guarded_tombstones_max`, which keeps its
   name and its 1,048,576-entry ceiling but is now sized by the retention window and the venue's
   removal rate rather than by how far the publishers lag.
+
+- **`rust` CI now builds, lints and tests with `--locked`.** The Dockerfile's
+  `cargo build --release --locked` was the only place the lock was enforced, so a `Cargo.lock` Cargo
+  would have to rewrite passed every check and first surfaced days later as a failed GHCR publish.
+  That is how two independently-resolved Dependabot lockfiles merged cleanly into an unusable one
+  and stalled the image publishes for three days, leaving `:mainnet-beta` on the 0.38.0 client base
+  across a doublezero release (#155). A stale or internally inconsistent lock now fails the PR that
+  introduces it.
 
 ### Added
 - ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
