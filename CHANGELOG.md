@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/admin/channels`, and the `(category: …)` suffix `/v1/products` appends when a symbol resolves in
   more than one universe under one Source ID. `category` is producer-side only and is not
   serialized onto the WebSocket, so PROTOCOL.md is untouched.
+
+  ⚠️ **The hosted feed-registry document has to be republished for any of that to take effect.**
+  The image bakes `DZ_FEED_REGISTRY_URL` in and a URL origin wins over the compiled-in copy, so on a
+  default container `src/ingest/registry.json` is the fallback, not the authority — until the
+  document served at that URL carries `"category": "events"`, every surface above keeps reporting
+  `sports` and the rename is invisible to an operator. Same shape as the stale `lashay-*` group
+  codes below, and the document is behind in the same way today: it carries neither the `elections`
+  rows nor the Phoenix row. Clearing `DZ_FEED_REGISTRY_URL` on one host makes the built-in document
+  win, which is the workaround until it is republished.
 - **The feed registry's `notes` are written for whoever runs the bridge now, not for whoever wrote
   the row.** Every row carried a different mixture of what a subscriber needs and how we came to
   know it — dated captures, port allocations that were once wrong and have since been corrected,

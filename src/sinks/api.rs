@@ -3740,9 +3740,11 @@ mod tests {
     // /v1/status: history, channels and process blocks (Task 6)
     // -----------------------------------------------------------------------------------------
 
-    /// The real built-in "sports" row (group code `edge-kalshi-sports-mbp`) — a genuinely derived, multi-channel
-    /// row, matching `sinks::admin`'s and `ingest::channel_filter`'s own tests. Using the real row (rather
-    /// than a hand-built one) is what lets a real `ChannelFilter::parse` spec actually narrow it.
+    /// The real built-in row whose group `code` is `edge-kalshi-sports-mbp` — a genuinely derived,
+    /// multi-channel row, matching `sinks::admin`'s and `ingest::channel_filter`'s own tests. Using
+    /// the real row (rather than a hand-built one) is what lets a real `ChannelFilter::parse` spec
+    /// actually narrow it. The helper is named for that code, not for the `category`, which is
+    /// `events`: the code is the ledger's and does not change with the universe's name.
     fn sports_row() -> Feed {
         *feeds()
             .iter()
