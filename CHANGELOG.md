@@ -137,6 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name and its 1,048,576-entry ceiling but is now sized by the retention window and the venue's
   removal rate rather than by how far the publishers lag.
 
+- **`rust` CI now builds, lints and tests with `--locked`.** The Dockerfile's
+  `cargo build --release --locked` was the only place the lock was enforced, so a `Cargo.lock` Cargo
+  would have to rewrite passed every check and first surfaced days later as a failed GHCR publish.
+  That is how two independently-resolved Dependabot lockfiles merged cleanly into an unusable one
+  and stalled the image publishes for three days, leaving `:mainnet-beta` on the 0.38.0 client base
+  across a doublezero release (#155). A stale or internally inconsistent lock now fails the PR that
+  introduces it.
+
 ### Added
 - ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
   activated on the ledger and running on their own two groups, separate from perps and sports:
