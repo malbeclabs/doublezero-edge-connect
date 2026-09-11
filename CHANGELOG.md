@@ -53,6 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
+- **Two Dependabot lockfile updates merged cleanly into a `Cargo.lock` that Cargo then refused, and
+  the first thing it broke was the image publish.** `rand 0.9.4` and `rand_chacha 0.9.0` were left
+  pointing at a bare `rand_core` while both `rand_core 0.9.5` and `0.10.1` were locked — a name Cargo
+  cannot resolve against two versions — and six packages the ed25519-dalek 3 upgrade had dropped
+  (`block-buffer 0.10.4`, `cpufeatures 0.2.17`, `crypto-common 0.1.7`, `digest 0.10.7`,
+  `generic-array 0.14.7`, `version_check 0.9.5`) came back as orphans reachable from nothing. Each
+  PR's lock was correct against the tree it was resolved against; neither was rebased onto the other,
+  and git merged them line by line without a conflict. Nothing caught it: `rust` CI runs
+  `cargo build/clippy/test --workspace` without `--locked` and so silently re-resolves, leaving the
+  Dockerfile's `cargo build --release --locked` as the only enforcement — every GHCR publish has
+  failed since, so `doublezero-edge-connect:mainnet-beta` stayed pinned to the 0.38.0 client base
+  across the doublezero v0.39.0 release and the mainnet-beta base image that followed it. The lock is
+  regenerated; no reachable package changes version or checksum.
+
 ### Changed
 - **The feed registry's `notes` are written for whoever runs the bridge now, not for whoever wrote
   the row.** Every row carried a different mixture of what a subscriber needs and how we came to
