@@ -2358,6 +2358,7 @@ mod tests {
                 max_subs: 1,
                 max_inbound_per_min: 1,
                 broadcast_capacity: 1,
+                lag_repair_min_interval: crate::sinks::ws::LAG_REPAIR_MIN_INTERVAL,
             },
             api_bind: String::new(),
             history: Arc::new(Mutex::new(Store::new())),

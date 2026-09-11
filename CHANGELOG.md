@@ -50,7 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate limit rather than a latch already exists for. The repair is additionally **paced** per client
   (5s) and a lag inside that window is coalesced into the next repair rather than dropped, so a
   consumer that keeps falling behind still converges on a correct book but can never drive an
-  unbounded replay loop. The connect and `subscribe` bootstraps are unchanged — a client that holds
+  unbounded replay loop. The window is measured from the **end** of the previous repair, not its
+  start: the client being repaired is by definition slow, so a repair can itself outlast the window,
+  and a start-to-start pace would make the next one eligible the instant the last drained — bounding
+  the number of repairs while leaving the connection with no streaming in between, which is #149's
+  shape again at O(markets). End-to-start guarantees a whole window of live frames between two
+  repairs however long a repair takes. The connect and `subscribe` bootstraps are unchanged — a client that holds
   no state still gets everything, and a client whose `type` filter excludes both book types is owed
   no repair at all — sparing it the market scan, which is taken under the mutex the ingest emit path
   shares. New: `dz_ws_lag_repairs_total`, which against `dz_ws_client_lagged_total` shows the pace

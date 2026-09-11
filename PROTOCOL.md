@@ -482,8 +482,14 @@ Instrument definitions and current book state are replayed on connect (unfiltere
 
 Because every `quote` is a full top-of-book snapshot, a consumer that drops messages under
 backpressure **self-heals** on the next quote - no resync handshake is required. `depth` heals the
-same way (it is full state too), and a dropped `instrument` is re-announced on the producer's next
+same way, being full state too, and a dropped `instrument` is re-announced on the producer's next
 periodic reference-data refresh.
+
+Both heal on the *next* message of that kind, which is a guarantee about arrival and not about
+timing: a symbol that goes quiet right after its `depth` was dropped keeps the stale one until it
+trades again, or until the client reconnects or re-subscribes (both of which replay `depth` in
+full). If a consumer needs a bound here rather than an eventual correction, re-subscribing is the
+handshake.
 
 `book` and `order_book` are the exception, because they are incremental: a dropped batch would leave
 the book permanently wrong. So a client the producer had to drop messages for is **re-baselined** -
@@ -493,6 +499,13 @@ seconds and the lags in between are coalesced into the next one, so a struggling
 bounded repair and keeps streaming rather than being handed an ever-larger replay it is even less
 able to drain. Nothing else is replayed on a drop - the definitions and the latest `depth` are
 re-sent only on connect and on `subscribe`.
+
+One consequence of that, for a consumer that joins books to definitions: a re-baseline can arrive
+for a market whose `instrument` the *same* lag dropped, so the ordering guaranteed on connect
+(definition before book) does not hold across a repair. The book is still usable on its own - every
+price and size on the wire is already decoded - and the definition returns on the producer's next
+reference-data refresh. A consumer that indexes strictly by definition should hold the book until
+it arrives rather than discard it.
 
 ## Consuming the feed (any engine)
 

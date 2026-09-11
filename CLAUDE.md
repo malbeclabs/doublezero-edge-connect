@@ -786,8 +786,11 @@ Modules are grouped by role under `src/`:
   connection converged on replaying: measured at 144k frames/s of which 99.86% were `instrument`, with
   every surviving book message a re-baseline whose following levels never arrived, and `/v1/status`
   timing out behind the catalog clone that replay takes under the shared instrument mutex. The repair
-  is also **paced** per client (`LAG_REPAIR_MIN_INTERVAL`, the same trade
-  `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices) and a lag inside the window is *owed*, not
+  is also **paced** per client (`WsConfig::lag_repair_min_interval`, defaulted from
+  `LAG_REPAIR_MIN_INTERVAL` — the same trade `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL`
+  prices; a field rather than a bare constant so a test can collapse the window and prove a
+  *coalesced* lag is still discharged, which is the half a predicate test cannot reach), measured
+  from the **end** of the previous repair so the pace bounds the duty cycle and not merely the count and a lag inside the window is *owed*, not
   dropped — `lag_repair_ready` holds it and the top of the client loop discharges it once the window
   passes, so a client lagging faster than it can be repaired still ends up with a correct book without
   ever driving a replay loop. A repair is only owed to a client that can actually receive a book

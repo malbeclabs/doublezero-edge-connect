@@ -132,6 +132,11 @@ pub struct WsConfig {
     /// Capacity of the internal "prepared frame" broadcast (the serialize-once fan-out); sized to
     /// match the backbone so a client that keeps up with the backbone keeps up here too.
     pub broadcast_capacity: usize,
+    /// Shortest gap between one client's lag-triggered book repairs; production passes
+    /// [`LAG_REPAIR_MIN_INTERVAL`]. A field rather than a bare constant so a test can collapse the
+    /// window and assert that a *coalesced* lag is still discharged — the property the pace is only
+    /// safe because of, and one no unit test of `lag_repair_ready` alone can reach.
+    pub lag_repair_min_interval: Duration,
 }
 
 /// A subscription filter: a `None` field matches any value (so `{}` = everything).
@@ -373,7 +378,7 @@ fn book_scope(acc: &BookAccumulator) -> ReplayScope {
 /// `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL` prices for its own `l4Book` bootstrap: long
 /// enough that the replay cannot be the dominant cost of the connection, short enough that a book
 /// left stale by a dropped batch is corrected in about the time a consumer would notice.
-const LAG_REPAIR_MIN_INTERVAL: Duration = Duration::from_secs(5);
+pub const LAG_REPAIR_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Whether an owed lag repair may go out now: `due` says one is owed, `last` is when this client was
 /// last repaired (`None` = never). Split out from the loop so the pace is unit-testable without
@@ -562,9 +567,8 @@ async fn serve_client(
         // producing the batches the book is missing. Ordering against the live frames written in
         // between is not a hazard: the re-baseline is materialized here, so it is current as of this
         // moment and the batches that follow apply on top of it.
-        if lag_repair_ready(lag_repair_due, last_lag_repair, LAG_REPAIR_MIN_INTERVAL) {
+        if lag_repair_ready(lag_repair_due, last_lag_repair, cfg.lag_repair_min_interval) {
             lag_repair_due = false;
-            last_lag_repair = Some(Instant::now());
             // Counts the repair *pass*, which is the quantity the pace above governs and the one
             // that costs the market scan — not the re-baselines the pass writes, of which there can
             // legitimately be none (a client whose filters match no baselined market, or any
@@ -582,6 +586,14 @@ async fn serve_client(
                 Replay::Books,
             )
             .await?;
+            // Stamped *after* the write, not before it, so the pace bounds the duty cycle and not
+            // merely the count. A repair is written into a client that is by definition slow, so
+            // the write itself can outlast the window — and a start-to-start pace would then make
+            // the next repair eligible the instant this one drained, leaving zero streaming in
+            // between and reproducing #149's shape at O(markets) instead of O(catalog). End-to-start
+            // guarantees the client gets a whole window of live frames between two repairs, however
+            // long a repair takes.
+            last_lag_repair = Some(Instant::now());
         }
 
         tokio::select! {
@@ -969,6 +981,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
@@ -1033,6 +1046,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
@@ -1128,6 +1142,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let books = Arc::new(Mutex::new(BookReplay::default()));
         let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
@@ -1255,6 +1270,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(serve(
             listener,
@@ -1399,6 +1415,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(serve(
             listener,
@@ -1984,6 +2001,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 1,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2074,6 +2092,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 1,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2152,6 +2171,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 1,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2230,6 +2250,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 1,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2317,6 +2338,7 @@ mod tests {
             max_subs: 8,
             max_inbound_per_min: 600,
             broadcast_capacity: 1,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
         };
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2399,6 +2421,126 @@ mod tests {
             lag_repair_reaches(&[f(r#"{"type":"quote"}"#), f(r#"{"type":"book"}"#)]),
             "filters are a union: one book subscription is enough"
         );
+    }
+
+    /// The end-to-end half of the pace: a lag coalesced inside the window is **discharged**, not
+    /// dropped. `the_lag_repair_pace_holds_a_repair_without_losing_it` below pins the predicate,
+    /// which is the easy half — clearing `lag_repair_due` in the wrong place, or never reaching the
+    /// top of the loop again, leaves that unit test green while the client keeps a permanently
+    /// wrong book, which is the one thing the pace is not allowed to cost. So this drives a real
+    /// connection: lag once (repaired immediately), lag again inside the window (held), then assert
+    /// the held repair goes out once the window has passed.
+    ///
+    /// `lag_repair_min_interval` is collapsed to 500ms so the wait is a test's rather than a
+    /// consumer's — the field exists for this. `#[serial]` because `dz_ws_lag_repairs_total` is a
+    /// process-global Prometheus child.
+    #[tokio::test]
+    #[serial]
+    async fn a_coalesced_lag_repair_is_discharged_once_the_window_passes() {
+        use super::{prepare, serve_client};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(1);
+
+        let mut books = BookReplay::default();
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                41u32,
+            ),
+            accumulator("KXBTCPERP", 0.61, 0.63),
+        );
+        let window = Duration::from_millis(500);
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 1,
+            lag_repair_min_interval: window,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let connect = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("connect replay");
+        assert_eq!(parse_book(&connect).instrument_id, 41);
+
+        // First lag: repaired immediately — a client's only correction must not wait on the pace.
+        let before = metrics().ws_lag_repairs.get();
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+        let repair = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the first repair");
+        assert_eq!(parse_book(&repair).instrument_id, 41, "got {repair}");
+        let survivor = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the frame that survived the first overflow");
+        assert!(survivor.contains(r#""type":"quote""#), "got {survivor}");
+        assert_eq!(metrics().ws_lag_repairs.get(), before + 1);
+
+        // Second lag, inside the window: held. Reading the frame that survived it proves the
+        // `Lagged` arm has already run, so an unchanged counter here is suppression, not a race.
+        for _ in 0..2 {
+            let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+        let survivor = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the frame that survived the second overflow");
+        assert!(survivor.contains(r#""type":"quote""#), "got {survivor}");
+        assert_eq!(
+            metrics().ws_lag_repairs.get(),
+            before + 1,
+            "a lag inside the window is coalesced, not repaired"
+        );
+
+        // Once the window passes the held repair goes out on this client's next frame. The loop
+        // discharges at its top, so the quote that wakes it is written first and the re-baseline
+        // follows — the ordering is safe either way, the re-baseline is materialized when it is sent.
+        tokio::time::sleep(window + Duration::from_millis(300)).await;
+        let frame = prepare(&FeedMessage::Quote(sample_quote())).expect("serializes");
+        assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        let waker = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the quote that wakes the loop");
+        assert!(waker.contains(r#""type":"quote""#), "got {waker}");
+        let held = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("the held repair");
+        assert_eq!(
+            parse_book(&held).instrument_id,
+            41,
+            "a coalesced lag must still be repaired, got {held}"
+        );
+        assert_eq!(
+            metrics().ws_lag_repairs.get(),
+            before + 2,
+            "exactly one further pass: the held one"
+        );
+
+        srv.abort();
     }
 
     /// The pace itself: the first repair goes out immediately (a client's only correction must not
