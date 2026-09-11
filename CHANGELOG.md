@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **Two pushes to `main` close together could leave a moving image tag on the older commit.** Every
+  path that publishes a variant — the push/tag/manual matrix, the `doublezero-base-published`
+  dispatch and the daily base poll — writes the same moving tag (`:testnet`, `:mainnet-beta`,
+  devnet `:latest`), so the tag ends up wherever the *last* push landed rather than at the newest
+  commit. On 2026-09-11 two pushes three minutes apart inverted exactly that way: the older commit's
+  testnet build finished ten minutes after the newer one and left `:testnet` on the older image,
+  which the image's own `org.opencontainers.image.revision` label then reported. The serialization
+  lane now lives in the reusable builder's `build` job — the one job that pushes — so all
+  four callers share one lane per variant. The dispatch workflow's own group is gone with it: it
+  only ever serialized dispatches against each other, and a workflow-level group of the same name
+  would have queued that run's own build job behind the run holding it. A build that pushes nothing
+  (the pull-request smoke test) and a release build each get a lane of their own, because a newly
+  queued run cancels the previously *pending* run of its group whatever `cancel-in-progress` says:
+  a smoke build must not evict a publish from the queue, and a queued release must not be cancelled
+  by a later push to `main`, which would silently skip its pinned `:<env>-X.Y.Z` and `:latest` tags.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it
