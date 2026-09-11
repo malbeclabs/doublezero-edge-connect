@@ -38,6 +38,37 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Serialize everything that pushes one variant's tags, whichever workflow called
+    # us: the publish matrix (push to main, manual dispatch, release tag), the
+    # base-published dispatch and the poll's rebuild all write the same moving tag
+    # (:testnet, :mainnet-beta, devnet :latest), which ends up wherever the LAST push
+    # points rather than at the newest commit. On 2026-09-11 two main pushes three
+    # minutes apart inverted exactly that way: the older commit's testnet build
+    # finished ten minutes after the newer one and left :testnet on the older image.
+    # The lane belongs here, in the one job that pushes — a group per calling
+    # workflow only serializes that workflow against itself, which is what the
+    # dispatch's own group used to do.
+    #
+    # Three lanes, keyed by what the build actually publishes. The split exists
+    # because queueing is not free: a newly queued run cancels the previously
+    # *pending* run of its group, and cancel-in-progress: false does not change that.
+    #   push=false  -> per-run lane. A PR smoke build pushes nothing, so it must
+    #                  neither wait behind a publish nor evict one from the queue.
+    #   version set -> per-version lane, so a queued release publish can never be
+    #                  cancelled by a later main push, which would silently skip its
+    #                  pinned :<env>-X.Y.Z (and :latest) tags. It can still race a
+    #                  moving-tag build, but a release tag names a commit that is
+    #                  already main's HEAD, so both build the same source.
+    #   otherwise   -> one lane per variant: the moving-tag lane this exists for.
+    concurrency:
+      group: >-
+        ${{ inputs.push
+        && (inputs.version != ''
+        && format('edge-connect-release-{0}-{1}', inputs.env, inputs.version)
+        || format('edge-connect-publish-{0}', inputs.env))
+        || format('edge-connect-smoke-{0}-{1}', inputs.env, github.run_id) }}
+      # Let an in-flight build finish rather than abort a push mid-flight.
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
