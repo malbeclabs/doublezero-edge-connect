@@ -966,14 +966,13 @@ mod tests {
             .map(|f| f.category)
             .collect();
         mbp.sort_unstable();
-        // The categories themselves, not a count: a count of 2 would also be satisfied by the same
-        // universe selected twice, which is the opposite failure and equally wrong.
-        // The categories themselves, each exactly once. Elections joined perps and sports as a
-        // third market-by-price universe on this venue, which is the case the dedup has to keep
-        // getting right rather than a reason to loosen the assertion to a count.
+        // The categories themselves, each exactly once — not a count, which the same universe
+        // selected twice would also satisfy, the opposite failure and equally wrong. Elections
+        // joined perps and events as a third market-by-price universe on this venue, which is the
+        // case the dedup has to keep getting right rather than a reason to loosen the assertion.
         assert_eq!(
             mbp,
-            vec!["elections", "perps", "sports"],
+            vec!["elections", "events", "perps"],
             "every universe must be selected, each once"
         );
     }
@@ -1091,8 +1090,8 @@ mod tests {
         registry();
         let sports = feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row");
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row");
         let chan10_port = sports
             .publishers
             .iter()
@@ -1128,8 +1127,8 @@ mod tests {
         registry();
         let sports = feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row");
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row");
         let chan10_port = sports
             .publishers
             .iter()

@@ -429,11 +429,14 @@ mod tests {
     /// ([`ChannelFilter::parse`]'s own docs), so a fixture built from an ad hoc `Feed` (an unknown
     /// code) would make every `POST` in this module 400 regardless of what this handler does; using
     /// the real feed is what lets a valid spec actually apply.
+    ///
+    /// Named for the group `code` (`edge-kalshi-sports-mbp`), which is the ledger's and unchanged,
+    /// not for the `category` — that is `events`, since the row carries more than sport.
     fn sports_row() -> Feed {
         *crate::ingest::feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row")
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row")
     }
 
     /// The sports row narrowed to a single publisher (`channel`'s), mirroring what

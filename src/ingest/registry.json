@@ -251,7 +251,7 @@
     },
     {
       "venue": "KALSHI",
-      "category": "sports",
+      "category": "events",
       "code": "edge-kalshi-sports-mbp",
       "kind": "MarketByPrice",
       "group": "233.84.178.20",
@@ -259,9 +259,13 @@
       "arbitration": "Sticky",
       "publisher_offset": 100,
       "notes": [
-        "Kalshi sports markets, market-by-price depth. A universe disjoint from the perps rows under the",
+        "Kalshi event markets, market-by-price depth. A universe disjoint from the perps rows under the",
         "same Source ID, which is what `category` expresses: the two never contest each other's tape or",
         "book.",
+        "",
+        "NAMING. The `category` is `events` - sport is one kind of event market and the universe carries",
+        "more than sport - while the group `code` stays edge-kalshi-sports-mbp: that name is the ledger's",
+        "and a subscriber matches `doublezero status` on it, so it is not ours to rename here.",
         "",
         "CHANNELS. One channel is one league or sport, each an independent state machine with its own reset",
         "count, sequence series, manifest seq and snapshot cycle - so one channel is one publisher and one",
