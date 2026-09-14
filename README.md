@@ -402,8 +402,9 @@ active measurement, and the answer moves with topology), so the block carries it
 than something an HTTP surface with no authentication can trigger.
 
 The full flag reference (`--jq`, `--template`, `--output table`) is in `--help`. Note:
-`doublezero-edge` builds and runs on macOS as well as Linux; the bridge itself does not (it uses
-`SO_TIMESTAMPNS` via `nix` with no `cfg` gate), which is why the CLI is a separate workspace member.
+`doublezero-edge` builds and runs on macOS as well as Linux. The bridge now compiles there too, but
+it is a separate workspace member because the CLI shares no types with it and carries no path
+dependency on it.
 
 ## Standalone shred-proxy
 
