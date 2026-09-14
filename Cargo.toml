@@ -3,8 +3,8 @@
 # `doublezero-edge/` is the host-side query CLI: a separate member (not a bin in this package)
 # because it shares no types with the bridge and carries no path dependency on it — the CLI is
 # clap + serde + a JSON HTTP client and builds anywhere, with none of the bridge's multicast
-# plumbing. A single workspace-level Cargo.lock keeps the
-# `--locked` Docker build reproducible across all three members.
+# plumbing. A single workspace-level Cargo.lock keeps the `--locked` Docker build reproducible
+# across all three members.
 [workspace]
 members = [".", "shred-proxy", "doublezero-edge"]
 resolver = "2"
