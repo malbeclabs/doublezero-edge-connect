@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **The crate did not build on macOS.** `SO_TIMESTAMPNS` and the `SCM_TIMESTAMPNS` control message it
+  produces are Linux-only, and `src/ingest/receiver.rs` imported and used them unconditionally, so a
+  darwin target failed to compile. The option is now requested, and its control
+  message parsed, only on Linux; elsewhere `kernel_rx_ts_ns` stays `0` — the value that field already
+  documents as unavailable — and the receive path falls back to the user-space timestamp, which is what
+  already happened on a Linux kernel that refused the option. Linux behavior is unchanged.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it

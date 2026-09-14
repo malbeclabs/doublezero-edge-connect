@@ -21,10 +21,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use nix::sys::socket::{
-    recvmsg, setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned, MsgFlags,
-    SockaddrStorage,
-};
+use nix::sys::socket::{recvmsg, MsgFlags, SockaddrStorage};
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{setsockopt, sockopt::ReceiveTimestampns, ControlMessageOwned};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{io::unix::AsyncFd, time::timeout};
 use tracing::{info, warn};
@@ -434,17 +433,28 @@ async fn recv_with_ts(sock: &TsSocket, buf: &mut [u8]) -> Result<(usize, u64, u6
         let res = guard.try_io(|inner| {
             let fd = inner.get_ref().as_raw_fd();
             let mut iov = [std::io::IoSliceMut::new(buf)];
+            #[cfg(target_os = "linux")]
             let mut cmsg = nix::cmsg_space!(nix::sys::time::TimeSpec);
+            #[cfg(target_os = "linux")]
             let r = recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty())
                 .map_err(std::io::Error::from)?;
-            let mut kernel_ns = 0u64;
-            if let Ok(cmsgs) = r.cmsgs() {
-                for c in cmsgs {
-                    if let ControlMessageOwned::ScmTimestampns(ts) = c {
-                        kernel_ns = (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64;
+            #[cfg(not(target_os = "linux"))]
+            let r = recvmsg::<SockaddrStorage>(fd, &mut iov, None, MsgFlags::empty())
+                .map_err(std::io::Error::from)?;
+            #[cfg(target_os = "linux")]
+            let kernel_ns = {
+                let mut ns = 0u64;
+                if let Ok(cmsgs) = r.cmsgs() {
+                    for c in cmsgs {
+                        if let ControlMessageOwned::ScmTimestampns(ts) = c {
+                            ns = (ts.tv_sec() as u64) * 1_000_000_000 + ts.tv_nsec() as u64;
+                        }
                     }
                 }
-            }
+                ns
+            };
+            #[cfg(not(target_os = "linux"))]
+            let kernel_ns = 0u64;
             let src = datagram_src_ip(r.address);
             Ok((r.bytes, kernel_ns, src))
         });
@@ -556,7 +566,9 @@ pub fn bind_multicast(
 
     let std_sock: std::net::UdpSocket = socket.into();
     // Kernel software RX timestamps (SCM_TIMESTAMPNS). Best-effort: if the option is not
-    // supported the bridge still works, falling back to the user-space recv timestamp.
+    // supported — including every non-Linux target, where it does not exist — the bridge still
+    // works, falling back to the user-space recv timestamp.
+    #[cfg(target_os = "linux")]
     if let Err(e) = setsockopt(&std_sock, ReceiveTimestampns, &true) {
         warn!("SO_TIMESTAMPNS unavailable on port {port}: {e}; using user-space recv ts only");
     }
