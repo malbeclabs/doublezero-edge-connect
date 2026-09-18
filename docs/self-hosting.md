@@ -69,7 +69,14 @@ a `:sha-<commit>` tag for precise pinning.
 The image sets `DZ_FEED_REGISTRY_URL` to the hosted document
 (`https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json`); building/running from
 source instead gets the `clap` default, which is empty — no network call unless you pass
-`--feed-registry-url`/`DZ_FEED_REGISTRY_URL` yourself. Override with a different URL, or with
+`--feed-registry-url`/`DZ_FEED_REGISTRY_URL` yourself.
+
+The hosted document is `src/ingest/registry.json` from this repo, published by
+`.github/workflows/release.feed-registry.yml` on every change to it on `main`, with an immutable
+per-commit copy alongside at `…/feeds/doublezero-edge-feeds-<sha>.json` to pin or roll back to. It
+is published only after the loader that reads it has validated it, because a document the fleet
+cannot use is not rejected by the fleet: each host warns once and degrades to its own built-in
+copy, silently, one at a time as containers restart. Override with a different URL, or with
 `--feed-registry <path>`/`DZ_FEED_REGISTRY <path>` (a bind-mounted file, in Docker) — note the
 bridge tries the URL first when it's non-empty, so pass an empty `--feed-registry-url ""` alongside
 the file if you've also set a URL. A URL that can't be reached or fails validation falls back to
@@ -101,3 +108,7 @@ document to the built-in copy, so that host loses every other feed-row change in
 not just the new source. Until the fleet is upgraded, a `sources` block may only name sources every
 deployed binary already resolves; assigning a genuinely new venue is a release *and* a republish, in
 that order.
+
+Since the document is published from `main`, "in that order" means the release has to be out and the
+fleet upgraded **before the document change merges** — merging is the republish, and there is no
+later step at which to hold it back.

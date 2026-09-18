@@ -1,0 +1,118 @@
+name: release.feed-registry
+
+# Publishes src/ingest/registry.json as the hosted feed-registry document behind
+# https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json — the URL the image
+# bakes into DZ_FEED_REGISTRY_URL. Same doublezero-install S3 bucket + CloudFront
+# distribution and the same OIDC deploy role as release.install-script.yml; only the key
+# differs.
+#
+# WHY THIS EXISTS. That document used to be hand-curated and uploaded by hand, and a
+# hand-curated document drifts: on 2026-09-18 the hosted copy was five weeks old and
+# carried three rows where the built-in copy carried nine (no Hyperliquid, no Phoenix, no
+# Kalshi elections), and no `publisher_offset` on any row. Drift is not a cosmetic problem
+# here, because a `Url` origin WINS over the copy compiled into the binary: a stale hosted
+# document silently downgrades every default container to whatever it says. The missing
+# `publisher_offset` alone made each mirrored Kalshi market appear in the catalog twice,
+# `products::resolve` report a bare `KALSHI:KXBTCPERP` as ambiguous, and `history::Key`
+# split each tape into two series — see `processor::tests::tob_mirror_offset_collapses_
+# catalog_identity`. Publishing the document from the file the tests validate is what
+# makes that class of drift impossible rather than merely noticed.
+#
+# The cadence is still the point of a hosted document: a merge to main republishes it, so
+# a new venue, a moved port or a channel-set change reaches the fleet at the next container
+# start with no image rebuild and no redeploy. It is the same cadence as the connect
+# scripts this repo already publishes.
+#
+# ⚠️ ORDERING, for a `sources` block change. A document is republished the moment it merges,
+# and a binary that predates a Source ID assignment rejects the row that needs it — which
+# under a URL origin degrades the WHOLE document to that host's built-in copy, losing every
+# other change in the same republish. So a genuinely new source is a release FIRST, then the
+# document change. docs/self-hosting.md states the rule; this comment is here because this
+# workflow is what makes "then" mean "on merge".
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/ingest/registry.json"
+      - ".github/workflows/release.feed-registry.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # assume the AWS deploy role via OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  BUCKET: doublezero-install
+  KEY: feeds/doublezero-edge-feeds-latest.json
+  DOCUMENT: src/ingest/registry.json
+  # Account-scoped infra (deploy-role ARN incl. the AWS account ID, and the CloudFront
+  # distribution id) lives in repo Actions Variables so it is not baked into a public
+  # workflow — the same two variables release.install-script.yml reads.
+  DEPLOY_ROLE: ${{ vars.DEPLOY_ROLE }}
+  DISTRIBUTION_ID: ${{ vars.DISTRIBUTION_ID }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The gate, and the reason this job compiles anything at all. A document the fleet
+      # cannot use is not rejected by the fleet: each host warns once and degrades to its
+      # own built-in copy, silently, one at a time as containers restart. So validation
+      # has to happen before the bytes leave, and it has to be the real loader rather
+      # than a JSON schema — `registry::tests::built_in_document_loads` runs the same
+      # parse + expand + validate path `feeds::init` runs at startup, and the rest of the
+      # module's tests cover the cross-row invariants (one arbitration mode per venue,
+      # global (group, port) uniqueness, one venue per MarketByOrder category, ...).
+      - name: Validate the document with the loader that will read it
+        run: cargo test --locked --lib ingest::registry
+
+      # Credentials are assumed only after the document has passed, so a job that is going
+      # to fail validation never holds a session that could write to the bucket.
+      - uses: aws-actions/configure-aws-credentials@254c19bd240aabef8777f48595e9d2d7b972184b # v6.2.1
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Byte-for-byte what the tests just validated and what `include_str!` compiles in,
+      # so "hosted" and "built-in" are the same document for this commit and the
+      # `origin` field in /v1/status stops being a thing that can disagree on content.
+      - name: Upload the document
+        run: |
+          aws s3 cp "$DOCUMENT" "s3://${BUCKET}/${KEY}" \
+            --content-type application/json \
+            --cache-control "public,max-age=120"
+
+      # An immutable copy per commit, which is what makes the `-latest` in the key above
+      # mean something: a rollback is a copy of a known-good key over -latest, and a host
+      # that must not move under a republish can pin DZ_FEED_REGISTRY_URL at one of these.
+      - name: Upload the immutable per-commit copy
+        run: |
+          aws s3 cp "$DOCUMENT" "s3://${BUCKET}/feeds/doublezero-edge-feeds-${GITHUB_SHA}.json" \
+            --content-type application/json \
+            --cache-control "public,max-age=31536000,immutable"
+
+      # Only -latest needs invalidating; the per-commit key is new on every run.
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/${KEY}"
+
+      - name: Report what was published
+        run: |
+          python3 - "$DOCUMENT" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          rows = d["feeds"]
+          print(f"version={d['version']} rows={len(rows)}")
+          for f in rows:
+              print(f"  {f['venue']:12} {f['category']:12} {f['kind']:14} {f['code']}")
+          PY

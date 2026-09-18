@@ -209,9 +209,18 @@ The document that maps venues to multicast groups/ports (`src/ingest/registry.rs
 https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json
 ```
 
-served fresh at every container start — no rebuild needed to pick up a new venue or port. Override
-with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY` (the
-installer clears the default URL for you in that case — see the table above). A host that can't
+served fresh at every container start — no rebuild needed to pick up a new venue or port.
+
+**That document is this repo's `src/ingest/registry.json`,** published to the CDN by
+`release.feed-registry.yml` whenever it changes on `main` (the same bucket and OIDC role that
+publish the `connect` one-liner). So the hosted copy and the copy compiled into the image are the
+same bytes for a given commit, and a new venue, a moved port or a changed channel set still reaches
+the fleet at the next container start rather than at the next image rebuild. Each publish also
+leaves an immutable per-commit copy at `…/feeds/doublezero-edge-feeds-<sha>.json`, which is what to
+pin `DZ_FEED_REGISTRY_URL` at if a host must not move when the document is republished.
+
+Override with your own `DZ_FEED_REGISTRY_URL`, or with a bind-mounted file via `DZ_FEED_REGISTRY`
+(the installer clears the default URL for you in that case — see the table above). A host that can't
 reach the URL falls back to the built-in copy **silently by design**; the bridge's own startup log
 says which document actually won, and the one-liner echoes it for you:
 
