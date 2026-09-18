@@ -95,11 +95,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lane now lives in the reusable builder's `build` job — the one job that pushes — so all
   four callers share one lane per variant. The dispatch workflow's own group is gone with it: it
   only ever serialized dispatches against each other, and a workflow-level group of the same name
-  would have queued that run's own build job behind the run holding it. A build that pushes nothing
-  (the pull-request smoke test) and a release build each get a lane of their own, because a newly
-  queued run cancels the previously *pending* run of its group whatever `cancel-in-progress` says:
-  a smoke build must not evict a publish from the queue, and a queued release must not be cancelled
-  by a later push to `main`, which would silently skip its pinned `:<env>-X.Y.Z` and `:latest` tags.
+  would have queued that run's own build job behind the run holding it.
+
+  A release tag shares that lane rather than getting one of its own, and `queue: max` is what
+  makes that safe. By default a concurrency group holds one run in progress and *one* pending, and
+  a newly queued run cancels the pending one whatever `cancel-in-progress` says — so a release
+  publish waiting behind a build could be evicted by a later push to `main` and silently never
+  publish its pinned `:<env>-X.Y.Z` and `:latest` tags. That is the whole reason a release lane
+  looked attractive, and it was the wrong trade: a release build writes the moving tag beside its
+  pinned one, so a lane it did not share put it back in the race this entry is about. With
+  `queue: max` up to 100 runs wait in the lane, first-in-first-out by when each reached it, so
+  nothing is dropped and the moving tag ends where the last arrival points. Only a build that
+  pushes nothing — the pull-request smoke test — still takes a per-run lane, so it neither waits
+  behind a publish nor sits in a publisher's queue.
+
+  What this does not promise: FIFO orders by arrival, not by commit, so a release tag cut on a
+  commit that is *not* `main`'s HEAD still publishes the moving tag for that older commit.
+  Ordering by commit means consulting the tag's current `org.opencontainers.image.revision` before
+  overwriting it, which is worth doing the day this repo tags anything but HEAD. `queue` is also
+  newer (May 2026) than the newest actionlint release (v1.7.12, March 2026), so
+  `.github/actionlint.yaml` ignores exactly that one syntax-check message — every other unexpected
+  key under `concurrency` still fails the lint.
 - **A mirror publisher's `publisher_offset` was applied only by the market-by-price processor**, so
   top-of-book, midpoint and market-by-order stamped the raw wire `channel_id` into consumer-facing
   identity. `edge-kalshi-perps-tob` is a top-of-book row with an offset of 100, and un-darking it

@@ -49,26 +49,40 @@ jobs:
     # workflow only serializes that workflow against itself, which is what the
     # dispatch's own group used to do.
     #
-    # Three lanes, keyed by what the build actually publishes. The split exists
-    # because queueing is not free: a newly queued run cancels the previously
-    # *pending* run of its group, and cancel-in-progress: false does not change that.
+    # Two lanes, and the dividing line is whether the build pushes at all:
+    #   push=true   -> one lane per variant. EVERY publisher of a variant shares it,
+    #                  release tags included, because a release build writes the
+    #                  moving tag beside its pinned :<env>-X.Y.Z. A lane it did not
+    #                  share would let it run alongside a main push and leave the
+    #                  moving tag on whichever finished last — which is the bug this
+    #                  whole change exists to remove, reintroduced one lane over.
     #   push=false  -> per-run lane. A PR smoke build pushes nothing, so it must
-    #                  neither wait behind a publish nor evict one from the queue.
-    #   version set -> per-version lane, so a queued release publish can never be
-    #                  cancelled by a later main push, which would silently skip its
-    #                  pinned :<env>-X.Y.Z (and :latest) tags. It can still race a
-    #                  moving-tag build, but a release tag names a commit that is
-    #                  already main's HEAD, so both build the same source.
-    #   otherwise   -> one lane per variant: the moving-tag lane this exists for.
+    #                  neither wait behind a publish nor sit in a publisher's queue.
+    #
+    # `queue: max` is what makes the single lane safe, and is the reason a release
+    # does not need a lane of its own: by default a group holds one run in progress
+    # and ONE pending, and a newly queued run cancels that pending one — so a release
+    # publish waiting behind a build could be evicted by a later push to main and
+    # silently never publish its pinned tags. With queue: max up to 100 runs wait,
+    # first-in-first-out by when each reached the lane, so nothing is dropped and the
+    # moving tag ends up wherever the last arrival points. It is incompatible with
+    # cancel-in-progress: true, which is not wanted here anyway.
+    #
+    # What this still does not promise: a release tag cut on a commit that is not
+    # main's HEAD publishes the moving tag for that older commit, and FIFO will
+    # honour it because arrival order is all the lane knows. Ordering by commit
+    # would take a check against the tag's current revision label, which is worth
+    # doing the day we tag anything but HEAD.
     concurrency:
       group: >-
         ${{ inputs.push
-        && (inputs.version != ''
-        && format('edge-connect-release-{0}-{1}', inputs.env, inputs.version)
-        || format('edge-connect-publish-{0}', inputs.env))
+        && format('edge-connect-publish-{0}', inputs.env)
         || format('edge-connect-smoke-{0}-{1}', inputs.env, github.run_id) }}
       # Let an in-flight build finish rather than abort a push mid-flight.
       cancel-in-progress: false
+      # Not known to actionlint v1.7.12 (March 2026) — the key shipped in May 2026 —
+      # so .github/actionlint.yaml ignores that one message until a release knows it.
+      queue: max
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
