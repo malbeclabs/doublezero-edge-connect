@@ -2,3 +2,13 @@
 # ubuntu-latest runner, so no self-hosted runner labels need declaring.
 self-hosted-runner:
   labels: []
+
+# actionlint v1.7.12 is the newest release (March 2026) and predates GitHub's
+# `concurrency.queue` key (May 2026), so it rejects `queue: max` in
+# release.docker.edge-connect.build.yml as an unexpected key. The pattern names that
+# one message: every other unexpected key under `concurrency` still fails the lint.
+# Delete this once an actionlint release knows the key.
+paths:
+  .github/workflows/**:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
