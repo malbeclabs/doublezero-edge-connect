@@ -139,6 +139,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **`edge-kalshi-sports-mbp`'s `category` is now `events`, and its group `code` is unchanged.** The
+  universe that row carries is event markets, of which sport is one kind, so `sports` named it too
+  narrowly; the group name is the ledger's and a subscriber matches `doublezero status` on it, so
+  renaming that here would have darkened the row silently. Nothing an operator passes changes:
+  `--channels`/`DZ_CHANNELS` key on the `code`, not the category. What does change is the
+  producer-side identity every universe-scoped key is built from — the arbitration scope
+  (`(venue, category)`), the tape-owner rank, the catalog, book and history keys — plus the two
+  read-only surfaces that report it: `category` in `/v1/status`'s `channels.rows[]` and in
+  `/admin/channels`, and the `(category: …)` suffix `/v1/products` appends when a symbol resolves in
+  more than one universe under one Source ID. `category` is producer-side only and is not
+  serialized onto the WebSocket, so PROTOCOL.md is untouched. The operator-facing prose follows the
+  value: the registry rows' own `notes` and `docs/input-sources.md` name the universe `events`, and
+  `sport` survives only where it names a channel or a kind of market — a sentence that still called
+  it the `sports` category sent a reader looking for one that no longer resolves.
+
+  ⚠️ **The hosted feed-registry document has to be republished for any of that to take effect.**
+  The image bakes `DZ_FEED_REGISTRY_URL` in and a URL origin wins over the compiled-in copy, so on a
+  default container `src/ingest/registry.json` is the fallback, not the authority — until the
+  document served at that URL carries `"category": "events"`, every surface above keeps reporting
+  `sports` and the rename is invisible to an operator. Same shape as the stale `lashay-*` group
+  codes below, and the document is behind in the same way today: fetched on 2026-09-18 it carries
+  three rows, all Kalshi (`edge-kalshi-perps-tob`, `edge-kalshi-perps-mbp` and
+  `edge-kalshi-sports-mbp`) — neither the `elections` rows, nor the Phoenix row, nor either
+  Hyperliquid row, so a default container ingests only that venue. Clearing `DZ_FEED_REGISTRY_URL`
+  on one host makes the built-in document win, which is the workaround until it is republished.
 - **The feed registry's `notes` are written for whoever runs the bridge now, not for whoever wrote
   the row.** Every row carried a different mixture of what a subscriber needs and how we came to
   know it — dated captures, port allocations that were once wrong and have since been corrected,
@@ -221,10 +246,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
-  activated on the ledger and running on their own two groups, separate from perps and sports:
+  activated on the ledger and running on their own two groups, separate from perps and events:
   top-of-book on `233.84.178.21` and market-by-price on `233.84.178.22`, six channels each (`50`-`55`,
   one per family — us, house, intl, primaries, offices, other) and two publishers each, the mirror
-  offset by `+100` exactly as the sports feeds are. Ports are the base plus the channel id, so a
+  offset by `+100` exactly as the events feeds are. Ports are the base plus the channel id, so a
   subscriber binds one socket per family and hears both publishers on it. Only the market-by-price
   row carries a snapshot plane; giving the top-of-book row one would bind a socket nothing ever sends
   to, and an idle socket reads as a silent source rather than as a misconfiguration, so the row states
@@ -489,7 +514,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own. It now matches the values' `Up` suffix, as the installers' new probe does.
 - `GET /v1/products`'s `feed_kind` fell back to `unknown` for every market on a venue whose rows
   span more than one category, even when its own category resolves unambiguously (e.g. Kalshi's
-  single-kind `sports` category, sharing a venue with the two-kind `perps` category). The registry
+  single-kind `events` category, sharing a venue with the two-kind `perps` category). The registry
   fallback now filters by `(venue, category)` instead of venue alone.
 - `doublezero-edge`'s admin-surface connection failure still said the surface is "off unless
   DZ_ADMIN_BIND is set", which stopped being true when that bind defaulted to `127.0.0.1:9098`.
