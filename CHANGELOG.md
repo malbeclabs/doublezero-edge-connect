@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way. PROTOCOL.md records the same note beside the deprecation.
 
 ### Security
+- **`rustls` pinned forward past RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted
+  at the wrong encryption level.** `0.23.40` accepted a handshake message that followed a
+  key-changing message inside the same record — a plaintext `EncryptedExtensions` packed in behind
+  the `ServerHello`, for instance — where RFC 8446 §5.1 requires the connection be terminated with
+  an `unexpected_message` alert (GHSA-2mjx-qc3c-rqvc; the same bug as Go's CVE-2025-61730). The
+  transcript stays authenticated, so this is not a path to altering or completing a handshake; what
+  it allows is a peer sending messages in plaintext that should have been encrypted without rustls
+  refusing the connection.
+
+  Lockfile only — `cargo update -p rustls`, to `0.23.45` with `rustls-webpki 0.103.13 -> 0.103.15`
+  alongside it. Nothing here chose the version: rustls arrives through `reqwest 0.12` and
+  `tokio-tungstenite 0.30`, which is also where the exposure is — this crate uses rustls for
+  *outbound* client TLS only, the `wss://` public inputs (Hyperliquid, Phoenix) and the JSON-RPC and
+  feed-registry fetches. It terminates no TLS of its own. The audit is a required status, so the
+  advisory also sat red on every open pull request until this landed.
 - **`cargo deny check advisories` failed on `main`: the dependency tree carried a yanked
   `chacha20 0.10.1`.** It arrives through `tokio-tungstenite 0.30 -> tungstenite -> rand 0.10.2`,
   which depends on it directly, so nothing in this crate chose the version and no `Cargo.toml`
