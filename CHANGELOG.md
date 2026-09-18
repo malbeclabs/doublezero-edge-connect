@@ -41,6 +41,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **The hosted feed-registry document was hand-curated, and had drifted five weeks and six rows
+  behind the document this repo tests.** It is now published from `src/ingest/registry.json` by
+  `.github/workflows/release.feed-registry.yml` on every change to that file on `main` — the same
+  `doublezero-install` bucket, CloudFront distribution and OIDC deploy role that publish the
+  `connect` one-liner, and only after `cargo test --lib ingest::registry` has run the real loader
+  over the document, since a document the fleet cannot use is not rejected by the fleet: each host
+  warns once and degrades to its own built-in copy, silently, one at a time as containers restart.
+
+  Drift here is not cosmetic, because a `Url` origin **wins** over the copy compiled into the image:
+  whatever the hosted document says is what a default container runs. Fetched on 2026-09-18 it was
+  last modified 2026-08-11 and served three rows where the built-in copy served nine — no
+  Hyperliquid, no Phoenix, no Kalshi elections — and carried no `publisher_offset` on any row, which
+  is the field that folds a mirrored publisher's `channel_id` back onto the league's. Without it
+  every mirrored Kalshi market appeared in the catalog twice, `/v1/products` reported a bare
+  `KALSHI:KXBTCPERP` as ambiguous, and `history::Key` split each tape into two series
+  (`processor::tests::tob_mirror_offset_collapses_catalog_identity` is the property). The three rows
+  it did carry had the right group, kind, ports and channel set — every value a subscriber binds on
+  matched — so nothing about the drift was visible from a receiver's liveness.
+
+  What the operator sees change, on the first container start after this publishes: six more rows,
+  `edge-kalshi-sports-mbp`'s `category` as `events` (the rename that merged in #152 and was inert
+  until now), and one catalog entry per Kalshi market instead of two. Each publish also leaves an
+  immutable `…/feeds/doublezero-edge-feeds-<sha>.json` beside `-latest`, to pin a host that must not
+  move under a republish, or to roll back to — written **before** `-latest` moves, so whatever
+  `-latest` points at always has a pin target that exists. The publisher runs in one queued,
+  non-cancelling lane (the image publisher's pattern, `queue: max` included) so two merges cannot
+  finish out of order and leave `-latest` on the older document, and it is gated to `main`, since
+  `workflow_dispatch` otherwise runs a branch's own copy of the workflow against the deploy role.
+
+  ⚠️ One rule tightens with the cadence: `docs/self-hosting.md`'s ordering constraint on the
+  `sources` block now means the release has to be out and the fleet upgraded **before the document
+  change merges**, because merging is the republish and there is no later step at which to hold it
+  back.
 - ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
   asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
   had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument
