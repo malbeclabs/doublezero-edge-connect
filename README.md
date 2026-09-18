@@ -225,7 +225,7 @@ reach the URL falls back to the built-in copy **silently by design**; the bridge
 says which document actually won, and the one-liner echoes it for you:
 
 ```
-==> Feed registry: origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=6 receivers=56
+==> Feed registry: origin="url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json" version=1 rows=9 receivers=69
 ```
 
 That line only appears at startup, so `/v1/status` reports it too — which is how you check a
@@ -234,7 +234,7 @@ running process, or compare a fleet, without reading logs on each box:
 ```bash
 doublezero-edge status --jq '.registry'
 # {"origin":"url https://get.doublezero.xyz/feeds/doublezero-edge-feeds-latest.json",
-#  "version":1,"rows":3,"receivers":33}
+#  "version":1,"rows":9,"receivers":69}
 ```
 
 An `origin` of `built-in` on a host you expected to be using the hosted document means the fetch

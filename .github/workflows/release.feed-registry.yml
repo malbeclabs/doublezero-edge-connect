@@ -55,6 +55,28 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # `workflow_dispatch` runs the workflow definition from the ref it is dispatched on,
+    # and the deploy role trusts this repo rather than one ref of it — so without this a
+    # branch could dispatch its own edited copy of this file and publish whatever it liked
+    # to the production bucket. It does NOT make dispatch safe against someone who edits
+    # this line on their branch; what would is a ref-scoped trust policy or a protected
+    # deployment environment, and both live in the infra repo. This is the half that is
+    # ours: manual dispatch still works, but only against main.
+    if: github.ref == 'refs/heads/main'
+    # One lane for the moving key. Two pushes to main can otherwise validate
+    # concurrently and finish out of order, leaving `-latest` pointing at the older
+    # document while both runs report success. Modelled on the image publisher's lane
+    # (release.docker.edge-connect.build.yml), including why `queue: max` is the load-
+    # bearing part: by default a group holds one run plus ONE pending and a new arrival
+    # evicts that pending one, so a registry change could be silently dropped by a later
+    # unrelated push. With `queue: max` runs wait first-in-first-out and `-latest` ends up
+    # wherever the last arrival points.
+    concurrency:
+      group: edge-connect-feed-registry-publish
+      cancel-in-progress: false
+      # Not known to actionlint v1.7.12 (March 2026) — the key shipped in May 2026 — so
+      # .github/actionlint.yaml ignores that one message until a release knows it.
+      queue: max
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -81,23 +103,28 @@ jobs:
           role-to-assume: ${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Byte-for-byte what the tests just validated and what `include_str!` compiles in,
-      # so "hosted" and "built-in" are the same document for this commit and the
-      # `origin` field in /v1/status stops being a thing that can disagree on content.
-      - name: Upload the document
-        run: |
-          aws s3 cp "$DOCUMENT" "s3://${BUCKET}/${KEY}" \
-            --content-type application/json \
-            --cache-control "public,max-age=120"
-
-      # An immutable copy per commit, which is what makes the `-latest` in the key above
-      # mean something: a rollback is a copy of a known-good key over -latest, and a host
-      # that must not move under a republish can pin DZ_FEED_REGISTRY_URL at one of these.
+      # The immutable copy per commit is what makes the `-latest` in the moving key mean
+      # something: a rollback is a copy of a known-good key over -latest, and a host that
+      # must not move under a republish can pin DZ_FEED_REGISTRY_URL at one of these.
+      #
+      # It goes FIRST, and the order is the point rather than a preference: if -latest
+      # moved first and this upload then failed, the fleet would be serving a document
+      # whose promised pin and rollback target was never written — the one state an
+      # operator reaching for this key is already in trouble in.
       - name: Upload the immutable per-commit copy
         run: |
           aws s3 cp "$DOCUMENT" "s3://${BUCKET}/feeds/doublezero-edge-feeds-${GITHUB_SHA}.json" \
             --content-type application/json \
             --cache-control "public,max-age=31536000,immutable"
+
+      # Byte-for-byte what the tests just validated and what `include_str!` compiles in,
+      # so "hosted" and "built-in" are the same document for this commit and the
+      # `origin` field in /v1/status stops being a thing that can disagree on content.
+      - name: Move -latest onto it
+        run: |
+          aws s3 cp "$DOCUMENT" "s3://${BUCKET}/${KEY}" \
+            --content-type application/json \
+            --cache-control "public,max-age=120"
 
       # Only -latest needs invalidating; the per-commit key is new on every run.
       - name: Invalidate CloudFront cache
@@ -112,7 +139,21 @@ jobs:
           import json, sys
           d = json.load(open(sys.argv[1]))
           rows = d["feeds"]
-          print(f"version={d['version']} rows={len(rows)}")
+
+          # Expanded the way `Loaded::info` counts receivers: one per explicit port
+          # block, one per derived channel id. These are the figures the startup log
+          # line and /v1/status report, so a host can be compared against them.
+          def receivers(f):
+              p = f["publishers"]
+              if "explicit" in p:
+                  return len(p["explicit"])
+              n = 0
+              for c in p["derived"]["channels"]:
+                  n += c["range"][1] - c["range"][0] + 1 if "range" in c else 1
+              return n
+
+          print(f"version={d['version']} rows={len(rows)} receivers={sum(map(receivers, rows))}")
           for f in rows:
-              print(f"  {f['venue']:12} {f['category']:12} {f['kind']:14} {f['code']}")
+              print(f"  {f['venue']:12} {f['category']:12} {f['kind']:14} "
+                    f"{f['code']:32} receivers={receivers(f)}")
           PY

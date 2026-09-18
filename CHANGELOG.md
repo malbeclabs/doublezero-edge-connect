@@ -64,7 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `edge-kalshi-sports-mbp`'s `category` as `events` (the rename that merged in #152 and was inert
   until now), and one catalog entry per Kalshi market instead of two. Each publish also leaves an
   immutable `…/feeds/doublezero-edge-feeds-<sha>.json` beside `-latest`, to pin a host that must not
-  move under a republish, or to roll back to.
+  move under a republish, or to roll back to — written **before** `-latest` moves, so whatever
+  `-latest` points at always has a pin target that exists. The publisher runs in one queued,
+  non-cancelling lane (the image publisher's pattern, `queue: max` included) so two merges cannot
+  finish out of order and leave `-latest` on the older document, and it is gated to `main`, since
+  `workflow_dispatch` otherwise runs a branch's own copy of the workflow against the deploy role.
 
   ⚠️ One rule tightens with the cadence: `docs/self-hosting.md`'s ordering constraint on the
   `sources` block now means the release has to be out and the fleet upgraded **before the document
