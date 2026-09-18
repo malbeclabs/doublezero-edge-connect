@@ -215,7 +215,9 @@ Modules are grouped by role under `src/`:
   no inventory, and its depth half is the group's highest-volume publisher — its owner is still to
   be established, so **do not drop the row** for being unattributed. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
-  under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
+  under the same Source ID — hence its own `category` (`events`: sport is one kind of event
+  market and the row carries more than sport, while the group `code` stays the ledger's
+  `edge-kalshi-sports-mbp`) — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
   own deployment inventory on 2026-08-09. `33000`/`43000` is the **top-of-book sibling's** base, and a
   market-by-price row built on it joins the right group and receives nothing, which reads as a dead

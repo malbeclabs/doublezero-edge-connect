@@ -1144,8 +1144,8 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
-/// The sports row's published set of channels, read from the **document** rather than from the
-/// expanded rows.
+/// The `events` row's published set of channels (group code `edge-kalshi-sports-mbp`), read from the
+/// **document** rather than from the expanded rows.
 ///
 /// A test helper, not the authority: reading the document is what lets the port tests assert
 /// the `base + id` derivation instead of merely echoing whatever the expander produced.
@@ -1155,15 +1155,15 @@ pub(crate) fn sports_channel_ids() -> Vec<u8> {
     let row = doc
         .feeds
         .iter()
-        .find(|f| f.category == "sports")
-        .expect("built-in document has no sports row");
+        .find(|f| f.category == "events")
+        .expect("built-in document has no events row");
     match &row.publishers {
         Publishers::Derived(d) => published_set_entries(row, &d.channels)
-            .expect("sports published set")
+            .expect("events published set")
             .into_iter()
             .map(|e| e.id)
             .collect(),
-        Publishers::Explicit(_) => panic!("the sports row must carry a derived published set"),
+        Publishers::Explicit(_) => panic!("the events row must carry a derived published set"),
     }
 }
 

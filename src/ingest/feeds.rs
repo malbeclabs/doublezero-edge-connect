@@ -368,8 +368,8 @@ mod tests {
     fn sports_ports_are_the_base_plus_the_channel_id() {
         let row = feeds()
             .iter()
-            .find(|f| f.venue == "KALSHI" && f.category == "sports")
-            .expect("no sports row");
+            .find(|f| f.venue == "KALSHI" && f.category == "events")
+            .expect("no events row");
         assert_eq!(row.code, "edge-kalshi-sports-mbp");
         assert_eq!(row.group, Ipv4Addr::new(233, 84, 178, 20));
         assert_eq!(row.kind, FeedKind::MarketByPrice);
@@ -459,7 +459,7 @@ mod tests {
                 ("PHOENIX", "perps", FeedKind::MarketByPrice) => "edge-phoenix-mbp",
                 ("KALSHI", "perps", FeedKind::TopOfBook) => "edge-kalshi-perps-tob",
                 ("KALSHI", "perps", FeedKind::MarketByPrice) => "edge-kalshi-perps-mbp",
-                ("KALSHI", "sports", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
+                ("KALSHI", "events", FeedKind::MarketByPrice) => "edge-kalshi-sports-mbp",
                 ("KALSHI", "elections", FeedKind::TopOfBook) => "edge-kalshi-elections-pol-tob",
                 ("KALSHI", "elections", FeedKind::MarketByPrice) => "edge-kalshi-elections-pol-mbp",
                 other => panic!("unexpected feed {other:?}"),
