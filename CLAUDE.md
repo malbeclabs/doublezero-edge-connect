@@ -674,8 +674,16 @@ Modules are grouped by role under `src/`:
   (`ChannelBatching`, which is why `open` has to outlive the datagram); publishing each datagram as
   finished is what exposed locked and crossed intermediate books to every consumer honouring `last`.
   A channel that has shown none keeps the datagram as the event, and a channel that shows one and
-  then stops reverts to that after `MAX_DATAGRAMS_WITHOUT_BOUNDARY` — the wedge PROTOCOL.md warns
-  about under `last` is a buffering consumer held forever, so the fallback is not optional. All gate emission **per instrument** on a known definition (precision before price). The
+  then stops reverts to that after `BOUNDARY_TIMEOUT_NS` — the wedge PROTOCOL.md warns about under
+  `last` is a buffering consumer held forever, so the fallback is not optional. ⚠️ **That bound is
+  wall clock and must stay so.** The publishers run a mean ~210 mktdata datagrams/s per host against
+  a two-minute-average peak near 1,250/s, so one 400 ms slot carries ~500 datagrams: any datagram
+  count small enough to bound the wedge sits inside a single busy slot, fires mid-event and
+  re-exposes the very books this closes. `MAX_DATAGRAMS_WITHOUT_BOUNDARY` survives only as the
+  backstop for a datagram whose `recv_ts_ns` is the `0` sentinel. The fallback closes whatever
+  `open` still holds; the paths that instead *drop* that map (channel reset, `EndOfSession`,
+  publisher eviction) emit nothing on purpose — the books are already gone and the recovery is a
+  `Clear`-led re-baseline, which discards the consumer's buffer rather than committing it. All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-transport dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
   IP address and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under

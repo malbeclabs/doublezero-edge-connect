@@ -56,10 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the contract under `last`; nothing changes for a consumer already honouring it.
 
   Guarded against the wedge that field warns about: a channel that emitted boundaries and then
-  stopped reverts to closing each datagram after 256 market-data datagrams without one. Phoenix
-  emits one boundary per venue slot and a slot's changes measure one or two datagrams, so the bound
-  sits two orders of magnitude clear of a channel still emitting them, while staying well inside the
-  8,192 changes the replay accumulator will hold for one unterminated event.
+  stopped reverts to closing each datagram 2 s — five slots — after the last one, and whatever that
+  channel left open is closed with it. The bound is wall clock rather than a datagram count because
+  the publishers run a mean ~210 market-data datagrams/s per host against a two-minute-average peak
+  near 1,250/s, so a single 400 ms slot carries ~500 datagrams: any count tight enough to bound the
+  wedge would fire inside one busy slot and re-expose the intermediate books. A datagram cap
+  survives only for a datagram whose `recv_ts_ns` is the not-available sentinel.
 - ⚠️ **A client joining mid-stream was sent a `book` bootstrap and then the batches it already
   contained, walking its book backwards.** A client's broadcast receiver is subscribed in the accept
   loop, before `serve_client` finishes the WebSocket handshake and reads the replay caches, so every
