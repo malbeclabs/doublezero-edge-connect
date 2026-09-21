@@ -101,14 +101,32 @@ loads and resolves against the copy compiled into the binary. A Source ID the bl
 is not an error — the wire value is authoritative and gets a distinct synthesized `SOURCE_<id>`
 label. Assigning a venue is therefore a republish of this document rather than a new release.
 
-⚠️ **With one ordering constraint.** A binary that predates the block has no `sources` field, so it
-warns about `$.sources` and ignores it — and then validates the rows against its own compiled-in
-table, where the new venue does not resolve. Under a URL origin that rejection degrades the **whole**
-document to the built-in copy, so that host loses every other feed-row change in the same republish,
-not just the new source. Until the fleet is upgraded, a `sources` block may only name sources every
-deployed binary already resolves; assigning a genuinely new venue is a release *and* a republish, in
-that order.
+⚠️ **With one ordering constraint** — and it is not specific to `sources`. A binary that predates
+the block has no `sources` field, so it warns about `$.sources` and ignores it — and then validates
+the rows against its own compiled-in table, where the new venue does not resolve. Under a URL origin
+that rejection degrades the **whole** document to the built-in copy, so that host loses every other
+feed-row change in the same republish, not just the new source.
+
+### Ordering: any change an older deployed binary rejects
+
+A new `sources` assignment is one instance of a wider class, and the class is what the rule is
+about: **a document change that an already-deployed binary rejects at parse or validation degrades
+that host to its built-in copy, whatever the field.** The others the schema allows today:
+
+- a **`version` bump** — the loader's check is an equality test, not a floor, so a binary that
+  understands `1` rejects `2` outright rather than reading what it recognizes;
+- a new **`kind`** or **`arbitration`** value — both are closed enums, so an unknown variant fails
+  the parse of the *whole document*, not of the row that carries it.
+
+So until the fleet is upgraded, a document may only use values every deployed binary already
+accepts; introducing one is a release *and* a republish, in that order.
 
 Since the document is published from `main`, "in that order" means the release has to be out and the
 fleet upgraded **before the document change merges** — merging is the republish, and there is no
 later step at which to hold it back.
+
+⚠️ **The publisher's validation gate does not cover this class**, and cannot: it runs the loader
+from the commit being published, so a change that bumps `SUPPORTED_VERSION` and the document's
+`version` together compiles a binary that supports the new value, passes the gate, and republishes a
+document the whole *running* fleet rejects. The gate proves the document loads in the build it
+shipped with; the ordering above is what makes it load in the builds already out there.

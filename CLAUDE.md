@@ -155,8 +155,15 @@ Modules are grouped by role under `src/`:
   simply did not run, and the `publisher_offset` it was missing doubled every mirrored Kalshi market
   in the catalog. The cadence is the point that survives: a merge republishes, so a moved port
   reaches the fleet at the next container start rather than the next image build. ⚠️ Which is also
-  why a `sources` assignment must be released *before* its document change merges — merging is the
-  republish, and `docs/self-hosting.md` states the rule.
+  why **any** document change an already-deployed binary rejects at parse or validation must be
+  released, and the fleet upgraded, *before* the document change merges: merging is the republish.
+  A `sources` assignment a deployed binary cannot resolve is one instance of that class, not the
+  class — the `version` check is an equality test rather than a floor, and `kind`/`arbitration` are
+  closed enums whose unknown variant fails the parse of the whole document — and every one of them
+  degrades that host to its built-in copy, losing the rest of the republish with it. ⚠️ The
+  workflow's own validation gate cannot catch the class, because it runs the loader from the commit
+  being published: a change bumping `SUPPORTED_VERSION` and the document `version` together passes
+  it and republishes to a fleet that rejects it. `docs/self-hosting.md` states the rule.
   There is deliberately **no `deny_unknown_fields`** anywhere in the module — same rule as
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.

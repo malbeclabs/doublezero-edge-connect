@@ -23,12 +23,21 @@ name: release.feed-registry
 # start with no image rebuild and no redeploy. It is the same cadence as the connect
 # scripts this repo already publishes.
 #
-# ⚠️ ORDERING, for a `sources` block change. A document is republished the moment it merges,
-# and a binary that predates a Source ID assignment rejects the row that needs it — which
-# under a URL origin degrades the WHOLE document to that host's built-in copy, losing every
-# other change in the same republish. So a genuinely new source is a release FIRST, then the
-# document change. docs/self-hosting.md states the rule; this comment is here because this
-# workflow is what makes "then" mean "on merge".
+# ⚠️ ORDERING, for any document change an ALREADY-DEPLOYED binary rejects. A document is
+# republished the moment it merges, and a rejection under a URL origin degrades the WHOLE
+# document to that host's built-in copy, losing every other change in the same republish. The
+# class is wider than the `sources` block it was first written for: a Source ID assignment a
+# deployed binary cannot resolve, a `version` bump (the loader's check is an equality test, not
+# a floor), and a new `kind` or `arbitration` value (closed enums — an unknown variant fails the
+# parse of the whole document, not of the row carrying it) all do it. So such a change is a
+# release FIRST, the fleet upgraded, and only then the document change merged.
+#
+# ⚠️ The validate step below does NOT cover that class and cannot: it runs the loader from THIS
+# commit, so a change that bumps `SUPPORTED_VERSION` and the document's `version` together
+# passes the gate and republishes a document the whole running fleet rejects. The gate proves
+# the document loads in the build it ships with; the ordering is what makes it load in the
+# builds already out there. docs/self-hosting.md states the rule; this comment is here because
+# this workflow is what makes "then" mean "on merge".
 on:
   push:
     branches: [main]
@@ -93,8 +102,15 @@ jobs:
       # parse + expand + validate path `feeds::init` runs at startup, and the rest of the
       # module's tests cover the cross-row invariants (one arbitration mode per venue,
       # global (group, port) uniqueness, one venue per MarketByOrder category, ...).
+      #
+      # Deliberately UNFILTERED. `--lib ingest::registry` reads as the tighter command and is
+      # the more dangerous one: a cargo test name filter that matches nothing exits 0
+      # ("0 passed; N filtered out"), so re-homing the module or renaming its tests would turn
+      # this gate into a no-op and publish unvalidated bytes with the run still green. The job
+      # already pays for the compile, so the whole lib suite costs the test runtime and removes
+      # the failure mode.
       - name: Validate the document with the loader that will read it
-        run: cargo test --locked --lib ingest::registry
+        run: cargo test --locked --lib
 
       # Credentials are assumed only after the document has passed, so a job that is going
       # to fail validation never holds a session that could write to the bucket.
@@ -141,16 +157,26 @@ jobs:
           rows = d["feeds"]
 
           # Expanded the way `Loaded::info` counts receivers: one per explicit port
-          # block, one per derived channel id. These are the figures the startup log
-          # line and /v1/status report, so a host can be compared against them.
+          # block, one per DISTINCT derived channel id. These are the figures the startup
+          # log line and /v1/status report, so a host can be compared against them — which
+          # is exactly why the ids are deduped rather than summed. A published set is a
+          # human-edited list where a singleton overlapping a range is a plausible edit,
+          # and the loader collapses the repeat and merely warns
+          # (`published_set_entries`, pinned by `overlapping_published_set_entries_dedup`).
+          # Summing widths would print one receiver more than the host runs, and the
+          # difference would read as a host that lost one.
           def receivers(f):
               p = f["publishers"]
               if "explicit" in p:
                   return len(p["explicit"])
-              n = 0
+              ids = set()
               for c in p["derived"]["channels"]:
-                  n += c["range"][1] - c["range"][0] + 1 if "range" in c else 1
-              return n
+                  if "range" in c:
+                      lo, hi = c["range"]
+                      ids.update(range(lo, hi + 1))
+                  else:
+                      ids.add(c["id"])
+              return len(ids)
 
           print(f"version={d['version']} rows={len(rows)} receivers={sum(map(receivers, rows))}")
           for f in rows:

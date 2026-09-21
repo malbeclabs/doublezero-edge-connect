@@ -70,10 +70,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finish out of order and leave `-latest` on the older document, and it is gated to `main`, since
   `workflow_dispatch` otherwise runs a branch's own copy of the workflow against the deploy role.
 
-  ⚠️ One rule tightens with the cadence: `docs/self-hosting.md`'s ordering constraint on the
-  `sources` block now means the release has to be out and the fleet upgraded **before the document
-  change merges**, because merging is the republish and there is no later step at which to hold it
-  back.
+  ⚠️ One rule tightens with the cadence, and it is wider than the `sources` block it was first
+  written for. **Any** document change an already-deployed binary rejects at parse or validation
+  degrades that host to its own built-in copy — a `version` bump (the loader's check is an equality
+  test, not a floor), a new `kind` or `arbitration` value (closed enums, so an unknown variant fails
+  the parse of the whole document), or a Source ID assignment it cannot resolve — so the release has
+  to be out and the fleet upgraded **before the document change merges**, because merging is the
+  republish and there is no later step at which to hold it back. The validation gate above does not
+  substitute for that ordering: it runs the loader from the commit being published, so a change
+  bumping `SUPPORTED_VERSION` and the document `version` together passes it and republishes a
+  document the whole running fleet rejects. `docs/self-hosting.md` states the rule.
 - ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
   asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
   had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument
