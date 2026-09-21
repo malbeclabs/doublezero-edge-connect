@@ -533,6 +533,10 @@ pub struct BookAccumulator {
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
     source_ts_ns: u64,
+    /// `recv_ts_ns` of the newest batch folded in — the join watermark. See
+    /// [`BookAccumulator::wire_ts_ns`].
+    wire_ts_ns: u64,
+    pending_wire_ts_ns: u64,
     pending_batch_id: Option<u32>,
     /// The venue's committed slot the accumulated state stands at — see
     /// [`NormalizedBook::batch_id`]. Committed with the event clock, so it names a slot whose
@@ -592,6 +596,8 @@ impl BookAccumulator {
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
+            wire_ts_ns: 0,
+            pending_wire_ts_ns: 0,
             pending_batch_id: None,
             batch_id: None,
             baselined: false,
@@ -627,6 +633,7 @@ impl BookAccumulator {
         if b.batch_id.is_some() {
             self.pending_batch_id = b.batch_id;
         }
+        self.pending_wire_ts_ns = self.pending_wire_ts_ns.max(b.recv_ts_ns);
         // A non-finite price would saturate the fixed-point key (NaN to 0, inf to i128::MIN/MAX),
         // silently merging unrelated levels into one entry that then lives in the replay map forever.
         self.pending.extend(
@@ -650,6 +657,7 @@ impl BookAccumulator {
                 // a later batch naming neither blank both.
                 self.pending_ts_ns = self.source_ts_ns;
                 self.pending_batch_id = self.batch_id;
+                self.pending_wire_ts_ns = self.wire_ts_ns;
             }
             return;
         }
@@ -714,6 +722,7 @@ impl BookAccumulator {
         }
         self.source_ts_ns = self.pending_ts_ns;
         self.batch_id = self.pending_batch_id;
+        self.wire_ts_ns = self.pending_wire_ts_ns;
     }
 
     /// Discard one or both sides of the book, across **both** populations — a `Clear` names a side, and
@@ -778,6 +787,19 @@ impl BookAccumulator {
     /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
     pub fn batch_id(&self) -> Option<u32> {
         self.batch_id
+    }
+
+    /// The `recv_ts_ns` of the newest batch **folded in**, or `0` if none has been. This is the
+    /// watermark a joining client is bootstrapped at: `sinks::ws` records it when it replays this
+    /// market and then discards queued `book` frames at or below it, which are the batches the
+    /// replayed state already contains (see that module's `BookWatermarks`).
+    ///
+    /// Advanced on the fold, never on a buffered batch, and that is the whole contract: the batches
+    /// of an event still awaiting its `last` are **not** in what [`Self::to_book`] materializes, so
+    /// a watermark that counted them would have the client drop the very batches its bootstrap is
+    /// missing.
+    pub fn wire_ts_ns(&self) -> u64 {
+        self.wire_ts_ns
     }
 
     /// Fold the accumulated orders into price levels with the order count at each, bids best-first
@@ -1085,6 +1107,44 @@ mod tests {
             kernel_rx_ts_ns: 1_781_019_263_715_300_010,
             ws_send_ts_ns: 0,
         }
+    }
+
+    /// The join watermark advances on the **fold**, never on a buffered batch. A batch still
+    /// waiting for its `last` is not in what `to_book` materializes, so counting it would have
+    /// `sinks::ws` drop the very batches a joining client's bootstrap is missing.
+    #[test]
+    fn the_wire_watermark_advances_only_when_the_event_folds() {
+        let level = |price: f64| BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price,
+            size: 1.0,
+            order_id: 0,
+        };
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        assert_eq!(acc.wire_ts_ns(), 0, "nothing folded yet");
+
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: 100,
+            ..book(vec![level(0.61)], false, true)
+        });
+        assert_eq!(acc.wire_ts_ns(), 100);
+
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: 200,
+            ..book(vec![level(0.62)], false, false)
+        });
+        assert_eq!(
+            acc.wire_ts_ns(),
+            100,
+            "a buffered batch is not in the materialized state"
+        );
+
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: 300,
+            ..book(vec![level(0.63)], false, true)
+        });
+        assert_eq!(acc.wire_ts_ns(), 300, "the whole event folded");
     }
 
     /// The wire shape PROTOCOL.md documents, pinned exactly — field names and the `type` tag are the

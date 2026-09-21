@@ -41,6 +41,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **A client joining mid-stream was sent a `book` bootstrap and then the batches it already
+  contained, walking its book backwards.** A client's broadcast receiver is subscribed in the accept
+  loop, before `serve_client` finishes the WebSocket handshake and reads the replay caches, so every
+  batch published in that window is queued *behind* a snapshot that already carries it. Applying
+  them in arrival order corrupts the consumer: measured against the Phoenix venue's own API, SOL
+  showed a bid and an ask both at 118.06 after a snapshot at slot 449077018 was followed by deltas
+  labelled 449077013. `quote` and `depth` race the same way and are unaffected — both are full state
+  and correct themselves on the next message — so only the incremental `book`/`order_book` pair
+  could be left permanently wrong.
+
+  The bootstrap now carries a per-market watermark, the `recv_ts_ns` of the newest batch the
+  replayed accumulator has **folded** in, and a queued batch at or below it is discarded. Folded,
+  not merely applied, is the load-bearing half: an event still waiting for its `last` is not in the
+  materialized state, so counting its batches would drop exactly the ones the bootstrap is missing.
+  The lag-triggered repair replays through the same path and takes the same watermark. Moving the
+  subscribe after the snapshot would close the overlap by opening a gap, where a batch published in
+  the window reaches nobody, and was rejected for that reason.
 - ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
   asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
   had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument

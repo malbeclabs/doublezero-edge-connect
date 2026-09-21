@@ -774,7 +774,16 @@ Modules are grouped by role under `src/`:
   work. On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
   materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
-  every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
+  every other dimension), then streams quotes/trades/midpoints/depth/book. ⚠️ **A replayed market
+  records a per-client watermark and every `replay_scoped()` call takes one**, because `rx` is
+  subscribed in the accept loop and the caches are read after the handshake, so the frames in
+  between are queued *behind* a bootstrap that already holds them — harmless on full-state
+  `quote`/`depth`, permanent corruption on the incremental `book`/`order_book`, which is the
+  backwards-walking book Ellipsis measured against Phoenix. The watermark is
+  `BookAccumulator::wire_ts_ns`, the newest `recv_ts_ns` the accumulator has **folded**: a batch
+  still awaiting its `last` is not in what `to_book` materializes, so counting it would drop the
+  batches the bootstrap is missing. Moving the subscribe after the snapshot instead trades the
+  overlap for a gap and is the worse bug. Replay is one
   `replay_scoped()` used three times, and `Replay::{Full,Books}` is what says how much of it goes out:
   **`Full`** on connect (unfiltered — no subscriptions yet) and per `subscribe` (scoped to the filter
   just added, so a client that narrows after connecting is bootstrapped without replaying every
