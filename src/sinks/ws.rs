@@ -721,13 +721,24 @@ async fn serve_client(
             // upstream (see `serve`); here we only filter and write a cheap `Utf8Bytes` clone.
             msg = rx.recv() => match msg {
                 Ok(frame) => {
-                    // A batch already folded into the bootstrap this client was just sent. It was
-                    // queued on `rx` before the replay read the market, so forwarding it would
-                    // re-apply state the snapshot already carries — silently wrong on an
-                    // incremental product, and the reason the watermark exists (see
-                    // `BookWatermarks`).
+                    // A batch strictly older than the bootstrap this client was just sent: queued
+                    // on `rx` before the replay read the market, so forwarding it would re-apply
+                    // state the snapshot already carries — silently wrong on an incremental
+                    // product, and the reason the watermark exists (see `BookWatermarks`).
+                    //
+                    // ⚠️ **Strictly older. A tie is forwarded, and must be.** One datagram
+                    // straddling a venue batch boundary emits two batches for the same market —
+                    // the boundary's closing one and the changes after it — both stamped that
+                    // datagram's `recv_ts_ns`. The first folds and the second only buffers, so
+                    // the watermark sits at their shared stamp while the bootstrap holds the
+                    // first alone: dropping at the tie would take the second with it and its
+                    // changes would never arrive, the next boundary delivering a `last` over a
+                    // buffer missing them. Re-delivering a tie instead costs nothing — a change
+                    // carries an absolute size, the tie set replays in broadcast order, and the
+                    // bootstrap ends exactly at the last folded batch of that set, so re-applying
+                    // lands on the same state.
                     if let Some(key) = &frame.book_market {
-                        if watermarks.get(key).is_some_and(|&w| frame.recv_ts_ns <= w) {
+                        if watermarks.get(key).is_some_and(|&w| frame.recv_ts_ns < w) {
                             continue;
                         }
                     }
@@ -2301,6 +2312,119 @@ mod tests {
             next_frame(&mut ws, Duration::from_millis(200)).await,
             None,
             "nothing else is owed"
+        );
+
+        srv.abort();
+    }
+
+    /// The tie, which is why the gate is strictly `<`. One datagram straddling a venue batch
+    /// boundary emits two batches for one market at the same `recv_ts_ns`: the boundary's closing
+    /// batch, which folds, and the changes after it, which only buffer. The watermark then sits at
+    /// their shared stamp while the bootstrap holds the first alone, so dropping at the tie would
+    /// take the second with it — permanently, since the next boundary would deliver its `last` over
+    /// a buffer missing those changes.
+    #[tokio::test]
+    #[serial]
+    async fn a_batch_tied_with_the_bootstrap_is_still_delivered() {
+        use super::{prepare, serve_client};
+
+        const T: u64 = 1_000;
+        let market = (
+            Arc::<str>::from("KALSHI"),
+            Arc::<str>::from("perps"),
+            2u8,
+            41u32,
+        );
+        let tied = |changes: Vec<BookChange>, last: bool| {
+            prepare(&FeedMessage::Book(NormalizedBook {
+                recv_ts_ns: T,
+                category: "perps".into(),
+                channel: 2,
+                instrument_id: 41,
+                last,
+                ..book_batch("KXBTCPERP", changes, last)
+            }))
+            .expect("serializes")
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prepared_tx, prepared_rx) = broadcast::channel(8);
+        // Closing batch (folds, so it IS in the bootstrap), then the post-boundary changes
+        // (buffered, so they are NOT) — same datagram, same stamp.
+        for frame in [
+            tied(vec![level_update(BookSide::Bid, 0.56, 10.0)], true),
+            tied(vec![level_update(BookSide::Ask, 0.60, 20.0)], false),
+        ] {
+            assert!(prepared_tx.send(frame).is_ok(), "the receiver is alive");
+        }
+
+        // The replay accumulator has folded only the first: `wire_ts_ns == T`, ask absent.
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: T,
+            ..book_batch(
+                "KXBTCPERP",
+                vec![
+                    BookChange {
+                        action: BookAction::Clear,
+                        side: BookSide::Both,
+                        price: 0.0,
+                        size: 0.0,
+                        order_id: 0,
+                    },
+                    level_update(BookSide::Bid, 0.56, 10.0),
+                ],
+                true,
+            )
+        });
+        assert_eq!(acc.wire_ts_ns(), T, "the watermark ties with both frames");
+        let mut books = BookReplay::default();
+        books.insert(market, acc);
+
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 8,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
+        };
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_client(
+                stream,
+                prepared_rx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(books)),
+                cfg,
+            )
+            .await
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Drive the frames through the same accumulator a consumer would: the bootstrap, then both
+        // ties. Re-applying the folded one is a no-op because a change carries an absolute size.
+        let mut consumer = BookAccumulator::new("KXBTCPERP".into());
+        for expected in ["bootstrap", "the folded tie", "the buffered tie"] {
+            let frame = next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|| panic!("{expected} must reach the client"));
+            consumer.apply(&parse_book(&frame));
+        }
+        // The buffered tie carried no `last`, so close its event as the next boundary would.
+        consumer.apply(&NormalizedBook {
+            recv_ts_ns: T + 1,
+            ..book_batch("KXBTCPERP", Vec::new(), true)
+        });
+        assert_eq!(
+            (consumer.best_bid(), consumer.best_ask()),
+            (Some((0.56, 10.0)), Some((0.60, 20.0))),
+            "the post-boundary changes must survive the join"
         );
 
         srv.abort();

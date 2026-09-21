@@ -73,9 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could be left permanently wrong.
 
   The bootstrap now carries a per-market watermark, the `recv_ts_ns` of the newest batch the
-  replayed accumulator has **folded** in, and a queued batch at or below it is discarded. Folded,
-  not merely applied, is the load-bearing half: an event still waiting for its `last` is not in the
-  materialized state, so counting its batches would drop exactly the ones the bootstrap is missing.
+  replayed accumulator has **folded** in, and a queued batch strictly older than it is discarded.
+  Folded, not merely applied, is the load-bearing half: an event still waiting for its `last` is not
+  in the materialized state, so counting its batches would drop exactly the ones the bootstrap is
+  missing. Strictly older for the same reason: one datagram straddling a venue batch boundary emits
+  two batches for a market at one stamp, only the first of them folded, so a tie is re-delivered —
+  which costs nothing, since a change carries an absolute size and re-applying lands on the same
+  state.
   The lag-triggered repair replays through the same path and takes the same watermark. Moving the
   subscribe after the snapshot would close the overlap by opening a gap, where a batch published in
   the window reaches nobody, and was rejected for that reason.

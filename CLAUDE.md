@@ -797,8 +797,12 @@ Modules are grouped by role under `src/`:
   backwards-walking book Ellipsis measured against Phoenix. The watermark is
   `BookAccumulator::wire_ts_ns`, the newest `recv_ts_ns` the accumulator has **folded**: a batch
   still awaiting its `last` is not in what `to_book` materializes, so counting it would drop the
-  batches the bootstrap is missing. Moving the subscribe after the snapshot instead trades the
-  overlap for a gap and is the worse bug. Replay is one
+  batches the bootstrap is missing. ⚠️ **The gate is strictly `<` and a tie must be forwarded** —
+  one datagram straddling a `BatchBoundary` emits two batches for a market at that datagram's one
+  stamp, and only the first folds, so `<=` would drop the second and the next boundary would
+  deliver its `last` over a buffer missing those changes. Re-delivering a tie is free: a change
+  carries an absolute size and the bootstrap ends at the last folded batch of the tie set. Moving
+  the subscribe after the snapshot instead trades the overlap for a gap and is the worse bug. Replay is one
   `replay_scoped()` used three times, and `Replay::{Full,Books}` is what says how much of it goes out:
   **`Full`** on connect (unfiltered — no subscriptions yet) and per `subscribe` (scoped to the filter
   just added, so a client that narrows after connecting is bootstrapped without replaying every

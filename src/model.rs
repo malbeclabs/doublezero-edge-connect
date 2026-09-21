@@ -791,8 +791,9 @@ impl BookAccumulator {
 
     /// The `recv_ts_ns` of the newest batch **folded in**, or `0` if none has been. This is the
     /// watermark a joining client is bootstrapped at: `sinks::ws` records it when it replays this
-    /// market and then discards queued `book` frames at or below it, which are the batches the
-    /// replayed state already contains (see that module's `BookWatermarks`).
+    /// market and then discards queued `book` frames strictly below it, which are the batches the
+    /// replayed state already contains (see that module's `BookWatermarks`). Strictly: two batches
+    /// for one market can share a stamp with only the first folded, so a tie is forwarded.
     ///
     /// Advanced on the fold, never on a buffered batch, and that is the whole contract: the batches
     /// of an event still awaiting its `last` are **not** in what [`Self::to_book`] materializes, so
