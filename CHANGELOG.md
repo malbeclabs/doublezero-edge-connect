@@ -41,6 +41,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **Every per-datagram `book` batch was published as a finished logical event, exposing locked
+  and crossed intermediate books to every consumer that honours `last`.** A venue event's level
+  changes routinely span two datagrams — the bid lifts in one, the ask moves away in the next — so
+  closing each datagram published the state in between as if the venue stood there. Ellipsis
+  measured 2,546 such states in 30 minutes across BTC, ETH and SOL on the Phoenix feed, one of them
+  SOL at bid 118.63 = ask 118.63 for 4.4 microseconds.
+
+  The Market-by-Price processor already parsed the venue's `BatchBoundary` for `batch_id`; it is now
+  the consistency point it is on the wire. On a channel where one has been observed, per-datagram
+  batches carry `last: false` and the boundary emits a closing batch, possibly with no changes, per
+  instrument touched since the previous one. A channel whose venue publishes no boundary keeps a
+  datagram as the event. Re-baselines are complete state and stay `last: true`. PROTOCOL.md documents
+  the contract under `last`; nothing changes for a consumer already honouring it.
+
+  Guarded against the wedge that field warns about: a channel that emitted boundaries and then
+  stopped reverts to closing each datagram after 256 market-data datagrams without one. Phoenix
+  emits one boundary per venue slot and a slot's changes measure one or two datagrams, so the bound
+  sits two orders of magnitude clear of a channel still emitting them, while staying well inside the
+  8,192 changes the replay accumulator will hold for one unterminated event.
 - ⚠️ **A client joining mid-stream was sent a `book` bootstrap and then the batches it already
   contained, walking its book backwards.** A client's broadcast receiver is subscribed in the accept
   loop, before `serve_client` finishes the WebSocket handshake and reads the replay caches, so every

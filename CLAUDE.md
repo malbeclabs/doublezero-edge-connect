@@ -668,7 +668,14 @@ Modules are grouped by role under `src/`:
   sync state is reported to the arbiter *before* the datagram's emissions so the re-baseline suppression has
   a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
   suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot feed into `pricebook.rs` and emits the
-  incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
+  incremental `book` + trades). ⚠️ **A datagram is not a logical event where the venue publishes
+  `BatchBoundary`.** One event's level changes span datagrams, so on a channel that has shown a
+  boundary the per-datagram batches carry `last: false` and the boundary emits the closing batch
+  (`ChannelBatching`, which is why `open` has to outlive the datagram); publishing each datagram as
+  finished is what exposed locked and crossed intermediate books to every consumer honouring `last`.
+  A channel that has shown none keeps the datagram as the event, and a channel that shows one and
+  then stops reverts to that after `MAX_DATAGRAMS_WITHOUT_BOUNDARY` — the wedge PROTOCOL.md warns
+  about under `last` is a buffering consumer held forever, so the fallback is not optional. All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-transport dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
   IP address and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
