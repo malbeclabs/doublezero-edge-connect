@@ -205,6 +205,19 @@ impl<D: InstrumentDef> PerPublisher<D> {
 /// surfacing rather than silently clobbering. `category` is part of the key precisely so this
 /// never fires across two *different* universes that legitimately disagree on precision — see
 /// `InstrumentSnapshot`'s doc.
+///
+/// **This is also the catalog's one liveness signal.** The stored entry is stamped
+/// `last_named_ns = now`, because reaching here means a publisher just named this instrument in a
+/// reference-data burst — and a publisher's burst carries exactly its current manifest era, so an
+/// instrument the venue retired simply stops arriving and stops being stamped. The stamp is on the
+/// **shared** entry, which is what makes the rule a *union across publishers*: any mirror, on any
+/// port block, in any receiver task, refreshes the one entry, so a single publisher's era dropping
+/// an instrument its peer still names retires nothing. See
+/// [`crate::model::INSTRUMENT_RETIRE_AFTER_NS`] for the whole rule and
+/// [`crate::model::sweep_forgotten_instruments`] for the sweep it feeds.
+///
+/// Stamped on the stored clone only, never on the caller's message: the wire carries no lifecycle
+/// field, and a definition on the wire is by construction one a publisher is naming right now.
 fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
     let key = (
         inst.venue.clone(),
@@ -229,7 +242,9 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
             );
         }
     }
-    map.insert(key, inst.clone());
+    let mut stored = inst.clone();
+    stored.last_named_ns = crate::model::now_ns();
+    map.insert(key, stored);
 }
 
 /// Remove one `(venue, category, channel, instrument_id)` entry from the shared snapshot — the
@@ -372,6 +387,7 @@ impl TobProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
             tick_size: def.tick_size,
+            last_named_ns: 0,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -536,6 +552,7 @@ impl DatagramProcessor for TobProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                                 tick_size: d.tick_size,
+                                last_named_ns: 0,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -750,6 +767,7 @@ impl MidpointProcessor {
             // in the shared snapshot (consumers ignore it for mids) — same as the previous
             // unconditional emission.
             qty_exponent: 0,
+            last_named_ns: 0,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -834,6 +852,7 @@ impl DatagramProcessor for MidpointProcessor {
                             category: category_arc(ctx.category),
                             price_exponent: d.price_exponent,
                             qty_exponent: 0,
+                            last_named_ns: 0,
                         };
                         upsert_instrument(ctx.instruments, &inst);
                         ctx.emit(FeedMessage::Instrument(inst));
@@ -1046,6 +1065,7 @@ impl MboProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
             tick_size: def.tick_size,
+            last_named_ns: 0,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -1594,6 +1614,7 @@ impl DatagramProcessor for MboProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                                 tick_size: d.tick_size,
+                                last_named_ns: 0,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -2192,6 +2213,7 @@ impl MbpProcessor {
             price_exponent: def.price_exponent,
             qty_exponent: def.qty_exponent,
             tick_size: def.tick_size,
+            last_named_ns: 0,
         };
         upsert_instrument(ctx.instruments, &inst);
         ctx.emit(FeedMessage::Instrument(inst));
@@ -2718,6 +2740,7 @@ impl DatagramProcessor for MbpProcessor {
                                 price_exponent: d.price_exponent,
                                 qty_exponent: d.qty_exponent,
                                 tick_size: d.tick_size,
+                                last_named_ns: 0,
                             };
                             upsert_instrument(ctx.instruments, &inst);
                             ctx.emit(FeedMessage::Instrument(inst));
@@ -5083,6 +5106,7 @@ mod tests {
             category: "default".into(),
             price_exponent: -2,
             qty_exponent: -4,
+            last_named_ns: 0,
         };
 
         // First insert.
@@ -8780,6 +8804,203 @@ mod tests {
                 && !proc.emitted_symbol.keys().any(|(p, _)| *p == victim)
                 && !proc.reveal_rebaselined_ns.keys().any(|(p, _)| *p == victim),
             "the eviction must drop the same sibling maps a book eviction does"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Instrument lifecycle (#139): which publisher's manifest epoch may retire a catalog entry
+    // ---------------------------------------------------------------------------------------
+
+    /// A second publisher source IP address, so one processor sees two mirrors of one feed on one
+    /// port block — exactly the live `edge-kalshi-sports-mbp` shape, where a second publisher
+    /// carries the same published set on the same ports.
+    const PEER_PUB: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+
+    /// Backdate every catalog entry so each one reads as retired. Standing in for elapsed wall
+    /// clock: the rule is "no publisher has named it for `INSTRUMENT_RETIRE_AFTER_NS`", and a test
+    /// cannot wait 15 minutes for that.
+    fn backdate_catalog(instruments: &crate::model::InstrumentSnapshot, now_ns: u64) {
+        let mut map = crate::model::lock(instruments);
+        for inst in map.values_mut() {
+            inst.last_named_ns = now_ns - crate::model::INSTRUMENT_RETIRE_AFTER_NS - 1;
+        }
+    }
+
+    /// Whether the catalog holds `instrument_id` and, if so, whether it reads as active.
+    fn catalog_state(
+        instruments: &crate::model::InstrumentSnapshot,
+        instrument_id: u32,
+        now_ns: u64,
+    ) -> Option<bool> {
+        crate::model::lock(instruments)
+            .values()
+            .find(|i| i.instrument_id == instrument_id)
+            .map(|i| i.is_active(now_ns))
+    }
+
+    /// The whole of #139's multi-publisher rule, driven through real datagrams.
+    ///
+    /// Two publishers mirror one feed on one port block, each with its own `RefDataState` and its
+    /// own manifest era. One of them advances its era and stops naming instrument 42 while its peer
+    /// still does: the catalog entry must stay **active**, because the rule is a union across the
+    /// live publishers of a `(venue, category, channel)` and not one publisher's epoch clear. Only
+    /// once the peer's era drops it too does it retire — and even then it is *kept* (flagged), so
+    /// its history still resolves, until the forget grace passes.
+    ///
+    /// Getting the first half wrong is not a cosmetic bug: it blanks the catalog for the whole
+    /// venue every time a single mirror rotates its manifest.
+    #[test]
+    fn a_manifest_epoch_retires_only_what_no_publisher_still_names() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = TobProcessor::new(tape(false));
+
+        // Era 1 on both publishers: instruments 41 and 42 defined, then revealed by a quote each
+        // (a v1 definition carries no Source ID, so the catalog entry is deferred until a price
+        // message names one).
+        for pub_ip in [TEST_PUB, PEER_PUB] {
+            let ctx = tob_ctx(&arbiter, &instruments, PortRole::Combined, pub_ip);
+            proc.on_datagram(
+                &tob_datagram(
+                    0,
+                    &[
+                        enc_manifest_summary(1, 2),
+                        enc_instrument_def(41, "INST-41", 1),
+                        enc_instrument_def(42, "INST-42", 1),
+                    ],
+                ),
+                &ctx,
+            );
+            proc.on_datagram(&tob_datagram(1, &[enc_tob_quote(41, 1, 1_000)]), &ctx);
+            proc.on_datagram(&tob_datagram(2, &[enc_tob_quote(42, 1, 1_000)]), &ctx);
+        }
+        let _ = drain_all(&mut rx);
+        assert_eq!(
+            crate::model::lock(&instruments).len(),
+            2,
+            "both instruments are in the catalog"
+        );
+
+        // Age both entries past the retirement horizon, so only a fresh naming can revive them.
+        let now = 10 * crate::model::INSTRUMENT_FORGET_AFTER_NS;
+        backdate_catalog(&instruments, now);
+        assert_eq!(catalog_state(&instruments, 41, now), Some(false));
+        assert_eq!(catalog_state(&instruments, 42, now), Some(false));
+
+        // One publisher's manifest epoch advances and names 41 alone.
+        proc.on_datagram(
+            &tob_datagram(
+                3,
+                &[
+                    enc_manifest_summary(2, 1),
+                    enc_instrument_def(41, "INST-41", 2),
+                ],
+            ),
+            &tob_ctx(&arbiter, &instruments, PortRole::Combined, TEST_PUB),
+        );
+        // Its peer is still on era 1 and re-announces both, as every reference-data burst does.
+        proc.on_datagram(
+            &tob_datagram(
+                3,
+                &[
+                    enc_manifest_summary(1, 2),
+                    enc_instrument_def(41, "INST-41", 1),
+                    enc_instrument_def(42, "INST-42", 1),
+                ],
+            ),
+            &tob_ctx(&arbiter, &instruments, PortRole::Combined, PEER_PUB),
+        );
+        let _ = drain_all(&mut rx);
+        assert_eq!(
+            catalog_state(&instruments, 42, now),
+            Some(true),
+            "42 must stay live: one publisher's epoch dropped it, its peer still names it"
+        );
+        assert_eq!(catalog_state(&instruments, 41, now), Some(true));
+
+        // Re-age, then let the peer advance too: 42 is now named by nobody, 41 by both.
+        backdate_catalog(&instruments, now);
+        proc.on_datagram(
+            &tob_datagram(
+                4,
+                &[
+                    enc_manifest_summary(2, 1),
+                    enc_instrument_def(41, "INST-41", 2),
+                ],
+            ),
+            &tob_ctx(&arbiter, &instruments, PortRole::Combined, PEER_PUB),
+        );
+        proc.on_datagram(
+            &tob_datagram(
+                4,
+                &[
+                    enc_manifest_summary(2, 1),
+                    enc_instrument_def(41, "INST-41", 2),
+                ],
+            ),
+            &tob_ctx(&arbiter, &instruments, PortRole::Combined, TEST_PUB),
+        );
+        let _ = drain_all(&mut rx);
+        assert_eq!(
+            catalog_state(&instruments, 42, now),
+            Some(false),
+            "no publisher names 42 any more, so it retires"
+        );
+        assert_eq!(
+            catalog_state(&instruments, 41, now),
+            Some(true),
+            "41 is still named by both and must not retire with its neighbour"
+        );
+
+        // Retired, not dropped: it is still resolvable until the history window has passed.
+        assert_eq!(
+            crate::model::sweep_forgotten_instruments(&instruments, now),
+            0,
+            "inside the forget grace nothing is swept"
+        );
+        assert_eq!(crate::model::lock(&instruments).len(), 2);
+        let later = now + crate::model::INSTRUMENT_FORGET_AFTER_NS;
+        assert_eq!(
+            crate::model::sweep_forgotten_instruments(&instruments, later),
+            1,
+            "past the grace the retired entry is forgotten"
+        );
+        assert!(
+            catalog_state(&instruments, 41, now).is_some(),
+            "the live entry survives the sweep that took its retired neighbour"
+        );
+    }
+
+    /// The stamp itself: `upsert_instrument` is the catalog's one liveness signal, so it must
+    /// record *when* a publisher named the instrument, not leave the entry at the sentinel.
+    #[test]
+    fn upsert_instrument_stamps_the_entry_as_named_now() {
+        let instruments: crate::model::InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let before = crate::model::now_ns();
+        let inst = NormalizedInstrument {
+            venue: "TestVenue".into(),
+            source_name: "TestVenue".into(),
+            source_id: 7,
+            symbol: "SYM".into(),
+            channel: 0,
+            instrument_id: 1,
+            category: "default".into(),
+            last_named_ns: 0,
+            price_exponent: -2,
+            qty_exponent: -4,
+            tick_size: 0,
+        };
+        upsert_instrument(&instruments, &inst);
+        let map = crate::model::lock(&instruments);
+        let stored = map
+            .get(&("TestVenue".into(), "default".into(), 0u8, 1u32))
+            .unwrap();
+        assert!(
+            stored.last_named_ns >= before,
+            "the stored entry carries the moment it was named"
+        );
+        assert_eq!(
+            inst.last_named_ns, 0,
+            "the caller's message is untouched — the wire carries no lifecycle field"
         );
     }
 }

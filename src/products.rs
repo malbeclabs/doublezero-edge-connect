@@ -268,6 +268,7 @@ mod tests {
             category: category.into(),
             price_exponent: -2,
             qty_exponent: -4,
+            last_named_ns: 0,
         }
     }
 

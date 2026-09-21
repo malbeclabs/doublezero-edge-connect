@@ -219,7 +219,9 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
     match sub {
         None | Some("") => {
             let ambiguous = is_ambiguous(state, inst.source_id, &inst.symbol);
-            ok_json(json!({ "product": product_entry(state, &inst, ambiguous) }))
+            ok_json(
+                json!({ "product": product_entry(state, &inst, ambiguous, crate::model::now_ns()) }),
+            )
         }
         Some("ticker") => ticker(state, &inst),
         Some("candles") => candles(state, &inst, req),
@@ -338,6 +340,9 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
         (next < total).then_some(next)
     });
 
+    // One clock read for the whole page, so every product's `active`/`status` is judged against
+    // the same instant — see [`product_entry`].
+    let now_ns = crate::model::now_ns();
     let products: Vec<Value> = page
         .iter()
         .map(|i| {
@@ -346,7 +351,7 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
                 .copied()
                 .unwrap_or(1)
                 > 1;
-            product_entry(state, i, ambiguous)
+            product_entry(state, i, ambiguous, now_ns)
         })
         .collect();
 
@@ -368,7 +373,33 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 /// has to handle. Raw and in the same units as the `instrument` message's field of the same name,
 /// not a decimal string like the increments: it is wire metadata, and one name must not mean two
 /// things across the two surfaces.
-fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
+///
+/// ## `active` and what `status` now means
+///
+/// `active` is the instrument's own lifecycle: `false` once no publisher has named it in a
+/// reference-data burst for [`crate::model::INSTRUMENT_RETIRE_AFTER_NS`] (see that constant for the
+/// rule and why it is a union across a venue's publishers rather than one publisher's manifest
+/// epoch). A retired product is still served, and still resolves through
+/// `/v1/products/{id}/candles` and `/ticker`, for as long as `history::Store` holds prints for it —
+/// which is the whole point of retaining it rather than dropping it on the spot.
+///
+/// `status` reported venue health alone, which meant every product on a reachable venue read
+/// `online` however long ago it settled — the field name already promised an instrument state it
+/// never carried. It now reports `retired` for a retired instrument and falls back to the venue's
+/// `online`/`offline` otherwise: a retired instrument's venue health answers a question nobody
+/// asked of it, and `online` beside an empty book and an empty tape is the reading that has to go.
+/// Venue health is unchanged for everything still named, and is reported in full on `/v1/status`'s
+/// own `venues` block regardless.
+///
+/// `now_ns` is passed in rather than read per entry so one response is a single consistent cut of
+/// the catalog: two products must not straddle the retirement boundary because the page took a
+/// moment to build.
+fn product_entry(
+    state: &ApiState,
+    i: &NormalizedInstrument,
+    ambiguous: bool,
+    now_ns: u64,
+) -> Value {
     let pid = products::ProductId {
         source_id: i.source_id,
         symbol: i.symbol.clone(),
@@ -376,6 +407,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         instrument_id: i.instrument_id,
         category: i.category.clone(),
     };
+    let active = i.is_active(now_ns);
     let mut entry = json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
@@ -391,7 +423,14 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "instrument_id": i.instrument_id,
         "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
-        "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
+        "active": active,
+        "status": if !active {
+            "retired"
+        } else if state.health.venue_up(i.venue.as_ref()) {
+            "online"
+        } else {
+            "offline"
+        },
         "feed_kind": feed_kind_for(state, i),
     });
     if i.tick_size > 0 {
@@ -1083,64 +1122,87 @@ fn symbol_prefix(symbol: &str) -> Option<&str> {
     }
 }
 
-/// Symbol prefixes seen per `(venue, category, channel)`, ranked by how many instruments carry
-/// each one — derived from the live instrument catalog in **one linear pass** — the same grain
-/// `history::products_for` counts at, so two disjoint universes sharing a channel id (see
-/// `ingest/feeds.rs`'s sports/perps docs) never leak prefixes into each other's list. Costs one
-/// lock acquisition plus one pass over every `InstrumentSnapshot` entry — a symbol split and a
-/// small per-channel `HashMap<String, usize>` counter bump per instrument, so on a catalog of
-/// ~38,000 instruments this is ~38,000 cheap operations (microseconds), not per-channel work: the
-/// whole `channels` block does this scan once regardless of how many channels a row lists, rather
-/// than once per channel.
-///
-/// **Ranked by frequency, not alphabetically.** The column exists to answer "what is this
-/// channel?", and the most-instrument-carrying prefix is the answer — alphabetical order instead
-/// left a channel's dominant prefix unreported whenever it happened to sort past the cap while
-/// incidental ones didn't. Ties break alphabetically so the output is deterministic. Sorting is
-/// over each channel's own (typically small) distinct-prefix set, not a second pass over the
-/// catalog, so the "one linear pass" cost above is unaffected.
-///
-/// Keyed exactly as `history::products_for` scopes its count (`(venue, category, channel)`) — named
-/// so clippy's `type_complexity` lint doesn't flag the bare tuple type at every use site. The
-/// second element of the value is the true **distinct** prefix count, not the sent (possibly
-/// capped) list's length — see `symbol_prefixes_total` on [`channels_block`].
-type ChannelPrefixes = HashMap<(Arc<str>, Arc<str>, u8), (Vec<String>, usize)>;
+/// What one linear pass over the instrument catalog knows about one `(venue, category, channel)`.
+/// Both halves come from the same pass because they are read together and because that pass takes
+/// the `instruments` mutex the ingest emit path shares — one walk per request, not two.
+#[derive(Default)]
+struct ChannelCatalog {
+    /// The most-carried symbol prefixes, capped at [`MAX_SYMBOL_PREFIXES`].
+    prefixes: Vec<String>,
+    /// The true **distinct** prefix count, not the (possibly capped) `prefixes` length — see
+    /// `symbol_prefixes_total` on [`channels_block`].
+    prefixes_total: usize,
+    /// Catalog entries on this channel, retired ones included.
+    instruments: usize,
+    /// Of those, the ones a publisher still names (`NormalizedInstrument::is_active`).
+    instruments_active: usize,
+}
 
-/// Per-channel prefix -> instrument-count accumulator, keyed the same way as [`ChannelPrefixes`]
-/// — named for the same `type_complexity` reason.
+/// Keyed exactly as `history::products_for` scopes its count (`(venue, category, channel)`) — named
+/// so clippy's `type_complexity` lint doesn't flag the bare tuple type at every use site.
+type ChannelCatalogFacts = HashMap<(Arc<str>, Arc<str>, u8), ChannelCatalog>;
+
+/// Per-channel prefix -> instrument-count accumulator, keyed the same way as
+/// [`ChannelCatalogFacts`] — named for the same `type_complexity` reason.
 type PrefixCounts = HashMap<(Arc<str>, Arc<str>, u8), HashMap<String, usize>>;
 
-fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
+/// Per `(venue, category, channel)`: how many instruments the catalog holds, how many of those a
+/// publisher still names, and the symbol prefixes they carry ranked by how many instruments carry
+/// each one — all derived from the live instrument catalog in **one linear pass**, at the same
+/// grain `history::products_for` counts at, so two disjoint universes sharing a channel id (see
+/// `ingest/feeds.rs`'s sports/perps docs) never leak into each other's figures. Costs one lock
+/// acquisition plus one pass over every `InstrumentSnapshot` entry — a symbol split and a couple
+/// of counter bumps per instrument, so on a catalog of ~38,000 instruments this is ~38,000 cheap
+/// operations (microseconds), not per-channel work: the whole `channels` block does this scan once
+/// regardless of how many channels a row lists, rather than once per channel.
+///
+/// **Prefixes are ranked by frequency, not alphabetically.** The column exists to answer "what is
+/// this channel?", and the most-instrument-carrying prefix is the answer — alphabetical order
+/// instead left a channel's dominant prefix unreported whenever it happened to sort past the cap
+/// while incidental ones didn't. Ties break alphabetically so the output is deterministic. Sorting
+/// is over each channel's own (typically small) distinct-prefix set, not a second pass over the
+/// catalog, so the "one linear pass" cost above is unaffected.
+fn channel_catalog_facts(state: &ApiState) -> ChannelCatalogFacts {
     let mut acc: PrefixCounts = HashMap::new();
+    let mut facts: ChannelCatalogFacts = HashMap::new();
     {
+        // One clock read for the whole pass, so two channels cannot disagree about where the
+        // retirement boundary fell — the same discipline `products_list` applies to a page.
+        let now_ns = crate::model::now_ns();
         let map = crate::model::lock(&state.instruments);
         for inst in map.values() {
+            let key = (inst.venue.clone(), inst.category.clone(), inst.channel);
+            let entry = facts.entry(key.clone()).or_default();
+            entry.instruments += 1;
+            if inst.is_active(now_ns) {
+                entry.instruments_active += 1;
+            }
             let Some(prefix) = symbol_prefix(&inst.symbol) else {
                 continue;
             };
-            *acc.entry((inst.venue.clone(), inst.category.clone(), inst.channel))
+            *acc.entry(key)
                 .or_default()
                 .entry(prefix.to_string())
                 .or_insert(0) += 1;
         }
     }
-    acc.into_iter()
-        .map(|(key, counts)| {
-            let total = counts.len();
-            let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
-            // Most instruments first; alphabetical tiebreak for determinism when two prefixes tie
-            // on count.
-            ranked.sort_by(|(name_a, count_a), (name_b, count_b)| {
-                count_b.cmp(count_a).then_with(|| name_a.cmp(name_b))
-            });
-            let prefixes = ranked
-                .into_iter()
-                .take(MAX_SYMBOL_PREFIXES)
-                .map(|(name, _count)| name)
-                .collect();
-            (key, (prefixes, total))
-        })
-        .collect()
+    for (key, counts) in acc {
+        let total = counts.len();
+        let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+        // Most instruments first; alphabetical tiebreak for determinism when two prefixes tie
+        // on count.
+        ranked.sort_by(|(name_a, count_a), (name_b, count_b)| {
+            count_b.cmp(count_a).then_with(|| name_a.cmp(name_b))
+        });
+        let entry = facts.entry(key).or_default();
+        entry.prefixes_total = total;
+        entry.prefixes = ranked
+            .into_iter()
+            .take(MAX_SYMBOL_PREFIXES)
+            .map(|(name, _count)| name)
+            .collect();
+    }
+    facts
 }
 
 /// The `channels` block: per enabled row that carries a channel id (i.e. every row except a flat
@@ -1159,16 +1221,31 @@ fn channel_symbol_prefixes(state: &ApiState) -> ChannelPrefixes {
 ///
 /// Each channel also carries `label` (from the registry document, display-only — see
 /// `ingest::feeds::FeedPublisher::label`) when the document supplied one, and `symbol_prefixes`
-/// (derived live from reference data, see [`channel_symbol_prefixes`]) otherwise. Both are omitted
+/// (derived live from reference data, see [`channel_catalog_facts`]) otherwise. Both are omitted
 /// rather than sent empty/null: an operator's tool renders the bare channel id when neither is
 /// present, which is a normal state (no label yet, no reference data yet), not an error.
+///
+/// ## Three counts, three populations (#139)
+///
+/// A channel reports three numbers that are routinely mistaken for each other, so they are
+/// reported side by side:
+/// - `instruments` — catalog entries on this channel, retired ones included. This is what
+///   `/v1/products` filtered to the channel returns.
+/// - `instruments_active` — of those, the ones a publisher still names. This is the number that
+///   should agree with the channel's `ManifestSummary` instrument count on the wire, and the gap
+///   to `instruments` is the retirement backlog the catalog is still holding for history.
+/// - `products` — `history::Store` occupancy: instruments that have **printed a trade** inside the
+///   store's rolling window and survived its caps. Always the smallest of the three on a channel
+///   whose markets do not all trade continuously, and never a count of definitions. It answers
+///   "how much of the store does this channel hold", which is a memory question, not a catalog
+///   one.
 fn channels_block(state: &ApiState) -> Value {
     let filter = crate::model::lock(&state.filter).clone();
-    // Computed before taking `history`'s lock, not after: `channel_symbol_prefixes` locks
+    // Computed before taking `history`'s lock, not after: `channel_catalog_facts` locks
     // `instruments` and walks the whole catalog, and holding `history` across that walk would block
     // the history writer (which appends under the same lock) for as long as the walk takes,
     // punching a hole in the rolling window `/v1` serves.
-    let prefixes = channel_symbol_prefixes(state);
+    let catalog = channel_catalog_facts(state);
     let history = crate::model::lock(&state.history);
     let mut rows = Vec::new();
     let mut excluded_by_filter = 0usize;
@@ -1199,20 +1276,25 @@ fn channels_block(state: &ApiState) -> Value {
                 (f.venue, f.category, f.kind, p.base_port());
             let bound = matches!(state.health.liveness(&key), TapeLiveness::Up);
             let products = history.products_for(source_id, &category, channel);
+            let facts = catalog.get(&(venue.clone(), category.clone(), channel));
             let mut entry = json!({
                 "channel": channel,
                 "allowed": admitted,
                 "bound": bound,
                 "products": products,
+                // Zero when the channel has no catalog entries at all, which is a real state (not
+                // yet any reference data) rather than a missing field — unlike `label` and
+                // `symbol_prefixes`, a count of nothing is still an answer.
+                "instruments": facts.map(|f| f.instruments).unwrap_or(0),
+                "instruments_active": facts.map(|f| f.instruments_active).unwrap_or(0),
             });
             if let Some(label) = p.label {
                 entry["label"] = json!(label);
             }
-            if let Some((names, total)) = prefixes.get(&(venue.clone(), category.clone(), channel))
-            {
-                if !names.is_empty() {
-                    entry["symbol_prefixes"] = json!(names);
-                    entry["symbol_prefixes_total"] = json!(total);
+            if let Some(f) = facts {
+                if !f.prefixes.is_empty() {
+                    entry["symbol_prefixes"] = json!(f.prefixes);
+                    entry["symbol_prefixes_total"] = json!(f.prefixes_total);
                 }
             }
             channels.push(entry);
@@ -1458,6 +1540,7 @@ mod tests {
             category: category.into(),
             price_exponent,
             qty_exponent,
+            last_named_ns: 0,
         }
     }
 
@@ -4319,5 +4402,122 @@ mod tests {
 
         drop(instruments_guard);
         worker.join().unwrap();
+    }
+
+    /// #139: a retired instrument — one no publisher has named for
+    /// `model::INSTRUMENT_RETIRE_AFTER_NS` — is still served (so its history resolves) but says so,
+    /// on both fields a consumer reads. `status` used to be venue health alone, which reported
+    /// `online` for a market that settled two days ago.
+    #[tokio::test]
+    async fn products_list_flags_a_retired_instrument() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let now = crate::model::now_ns();
+        let mut live = inst_in("perps", 1, "HYPERLIQUID", "LIVE", 0, 41, -2, -5);
+        live.last_named_ns = now;
+        let mut settled = inst_in("perps", 1, "HYPERLIQUID", "SETTLED", 0, 42, -2, -5);
+        settled.last_named_ns = now - crate::model::INSTRUMENT_RETIRE_AFTER_NS - 1;
+        {
+            let mut map = instruments.lock().unwrap();
+            map.insert(("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32), live);
+            map.insert(("HYPERLIQUID".into(), "perps".into(), 0u8, 42u32), settled);
+        }
+        health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
+
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let body: Value = reqwest::get(format!("{base}/v1/products"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let products = body["products"].as_array().unwrap();
+        let by_symbol = |sym: &str| {
+            products
+                .iter()
+                .find(|p| p["symbol"] == sym)
+                .unwrap_or_else(|| panic!("{sym} must still be served"))
+                .clone()
+        };
+
+        let live = by_symbol("LIVE");
+        assert_eq!(live["active"], true);
+        assert_eq!(
+            live["status"], "online",
+            "a named instrument still reports its venue's health"
+        );
+
+        let settled = by_symbol("SETTLED");
+        assert_eq!(
+            settled["active"], false,
+            "no publisher names it any more, and the catalog says so"
+        );
+        assert_eq!(
+            settled["status"], "retired",
+            "not `online`: the venue is up, this instrument is not"
+        );
+    }
+
+    /// The three counts #139 could not reconcile, reported side by side on one channel: the
+    /// catalog total, the still-named subset (what the wire's `ManifestSummary` count answers to),
+    /// and `history::Store` occupancy. They are three different populations, which is the whole
+    /// reason the issue read the third as a bug.
+    #[tokio::test]
+    async fn channels_block_separates_catalog_size_from_live_and_from_history() {
+        let (instruments, depth, books, history, health, filter, _unused) = empty_state();
+        let now = crate::model::now_ns();
+        {
+            let mut map = instruments.lock().unwrap();
+            for (id, last_named_ns) in [
+                (1u32, now),
+                (2, now),
+                (3, now - crate::model::INSTRUMENT_RETIRE_AFTER_NS - 1),
+            ] {
+                let mut inst = inst_in("perps", 3, "KALSHI", &format!("SYM-{id}"), 20, id, -4, -2);
+                inst.last_named_ns = last_named_ns;
+                map.insert(("KALSHI".into(), "perps".into(), 20u8, id), inst);
+            }
+        }
+        let publishers: Vec<FeedPublisher> = vec![channel_pub(39400, 20, None)];
+        let row = Feed {
+            venue: "KALSHI",
+            category: "perps",
+            code: "lifecycletest",
+            kind: FeedKind::MarketByPrice,
+            group: std::net::Ipv4Addr::new(233, 84, 178, 213),
+            publishers: Box::leak(publishers.into_boxed_slice()),
+            emit_trades: true,
+            arbitration: ArbitrationMode::Sticky,
+            mirror_offset: None,
+        };
+
+        let base = spawn(
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            vec![row],
+        )
+        .await;
+        let body: Value = reqwest::get(format!("{base}/v1/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let channel = &body["channels"]["rows"][0]["channels"][0];
+        assert_eq!(
+            channel["instruments"], 3,
+            "the catalog total, retired included: {channel}"
+        );
+        assert_eq!(
+            channel["instruments_active"], 2,
+            "the subset a publisher still names: {channel}"
+        );
+        assert_eq!(
+            channel["products"], 0,
+            "history occupancy is a third population: nothing has printed here: {channel}"
+        );
     }
 }

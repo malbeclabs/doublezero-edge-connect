@@ -41,6 +41,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **The served product catalog was insert-only and never pruned, so retired instruments were
+  served as though they were live** (#139). `RefDataState` already implements the reference-data
+  supplement's removal correctly — `on_manifest` clears the set on a manifest epoch change and only
+  current-era definitions are readmitted — but that map is per publisher and per receiver task,
+  while the catalog `/v1/products` and the WebSocket connect-time replay are served from is shared
+  and only ever inserted into. On a live host one market-by-price channel served 12,498 instruments
+  against 5,572 on the wire's own manifest, and markets that settled 40 hours earlier still resolved
+  with a live-looking entry. Every stored entry now carries the moment a publisher last **named** it
+  (stamped by `upsert_instrument` on each reference-data burst), which is the union across a
+  venue's live publishers by construction: the stamp is on the one shared entry, so any mirror, on
+  any port block, in any receiver task refreshes it and a single publisher's epoch dropping an
+  instrument its peer still names retires nothing. Past `INSTRUMENT_RETIRE_AFTER_NS` (15 min, two
+  orders of magnitude clear of the burst period) an entry reads as **retired**: kept and flagged
+  rather than dropped, because `/v1/products/{id}/candles` and `/ticker` resolve the product id
+  through this map and dropping it would take the prints `history::Store` still holds with it. It is
+  forgotten outright one history window later, when nothing can answer for it either. `/v1/products`
+  gains `active` and reports `"status": "retired"` in place of the venue health it used to report
+  for every product on a reachable venue; the connect-time WebSocket replay no longer bootstraps a
+  new subscriber with retired definitions, which is also what stops a settled instrument colliding
+  with its live namesake on the 16-byte truncated `symbol`; and `/v1/status`'s `channels` block now
+  reports `instruments` and `instruments_active` beside `products`, which reconciles the three
+  counts the issue could not — catalog total, still-named subset, and `history::Store` occupancy
+  (trades printed inside the rolling window), three different populations. The sweep runs on the
+  reconciler's tick, beside `forget_departing_channel`, so it stays off the ingest hot path.
 - ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
   asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
   had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument

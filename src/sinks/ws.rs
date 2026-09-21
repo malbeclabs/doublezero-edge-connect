@@ -465,9 +465,19 @@ where
     // the cost (a lagging client repeating it is what made `/v1/status`, which walks the same map,
     // time out in #149).
     let snapshot: Vec<FeedMessage> = if what == Replay::Full {
+        let now = crate::model::now_ns();
         let guard = crate::model::lock(instruments);
         guard
             .values()
+            // A retired instrument — one no publisher has named for
+            // `model::INSTRUMENT_RETIRE_AFTER_NS` — is not bootstrapped into a client that has
+            // never heard of it. The catalog keeps it (so `/v1` can still resolve its history,
+            // flagged), but replaying it would hand every new subscriber a definition for a market
+            // that will never quote again: dead weight in its store, and a live namesake's price
+            // withheld as ambiguous because a settled instrument still claims the same truncated
+            // `symbol`. Evaluated against one `now` for the whole pass, so the replayed catalog is
+            // a consistent cut rather than one drifting as the scan proceeds.
+            .filter(|i| i.is_active(now))
             .filter(|i| pass(&i.venue, &i.symbol, Some(i.channel), "instrument"))
             .cloned()
             .map(FeedMessage::Instrument)
@@ -904,6 +914,7 @@ mod tests {
             category: "default".into(),
             price_exponent: -2,
             qty_exponent: -2,
+            last_named_ns: 0,
         }))
         .expect("serializes");
         assert_eq!(i.kind, "instrument");
@@ -1130,6 +1141,7 @@ mod tests {
                     category: "default".into(),
                     price_exponent: -2,
                     qty_exponent: -2,
+                    last_named_ns: 0,
                 },
             );
         }
@@ -1258,6 +1270,7 @@ mod tests {
                     category: "default".into(),
                     price_exponent: -2,
                     qty_exponent: -2,
+                    last_named_ns: 0,
                 },
             );
         }
@@ -1882,6 +1895,7 @@ mod tests {
                 category: "perps".into(),
                 price_exponent: -2,
                 qty_exponent: -2,
+                last_named_ns: 0,
             },
         );
         let mut books = BookReplay::default();
@@ -2073,6 +2087,7 @@ mod tests {
                 category: "perps".into(),
                 price_exponent: -2,
                 qty_exponent: -2,
+                last_named_ns: 0,
             },
         );
         let mut books = BookReplay::default();
@@ -2621,5 +2636,87 @@ mod tests {
             serde_json::from_str(r#"{"source":"HYPERLIQUID","source_name":"PHOENIX"}"#).unwrap();
         assert!(!disagreeing.matches("HYPERLIQUID", Some("SOL"), None, "quote"));
         assert!(!disagreeing.matches("PHOENIX", Some("SOL"), None, "quote"));
+    }
+
+    /// #139: the connect-time replay bootstraps a client with the instruments a publisher still
+    /// names, not with every definition the process has ever seen. A retired one is kept in the
+    /// catalog (`/v1` still resolves its history, flagged) but replaying it would hand every new
+    /// subscriber a market that will never quote again — and, because a market-by-price `symbol` is
+    /// a truncated label, a settled instrument still claiming one collides with its live namesake
+    /// and blanks that market's price for a consumer that withholds ambiguous symbols.
+    /// `#[serial]` for the shared `dz_ws_clients` gauge.
+    #[tokio::test]
+    #[serial]
+    async fn connect_replay_skips_retired_instruments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(16);
+
+        let now = crate::model::now_ns();
+        let mut defs = HashMap::new();
+        for (id, symbol, last_named_ns) in [
+            (0u32, "LIVE", now),
+            (
+                1u32,
+                "SETTLED",
+                now - crate::model::INSTRUMENT_RETIRE_AFTER_NS - 1,
+            ),
+        ] {
+            defs.insert(
+                (
+                    Arc::<str>::from("HYPERLIQUID"),
+                    Arc::<str>::from("default"),
+                    0u8,
+                    id,
+                ),
+                NormalizedInstrument {
+                    tick_size: 0,
+                    venue: "HYPERLIQUID".into(),
+                    source_name: "HYPERLIQUID".into(),
+                    source_id: 0,
+                    symbol: symbol.into(),
+                    channel: 0,
+                    instrument_id: id,
+                    category: "default".into(),
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                    last_named_ns,
+                },
+            );
+        }
+        let instruments = Arc::new(Mutex::new(defs));
+        let depth = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = WsConfig {
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            max_clients: 8,
+            max_subs: 8,
+            max_inbound_per_min: 600,
+            broadcast_capacity: 16,
+            lag_repair_min_interval: super::LAG_REPAIR_MIN_INTERVAL,
+        };
+        let books = Arc::new(Mutex::new(BookReplay::default()));
+        let srv = tokio::spawn(serve(listener, tx.clone(), instruments, depth, books, cfg));
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+
+        let mut frames = Vec::new();
+        while let Ok(Some(Ok(m))) = timeout(Duration::from_millis(500), ws.next()).await {
+            if let WsMessage::Text(t) = m {
+                frames.push(t.to_string());
+            }
+        }
+        assert!(
+            frames.iter().any(|t| t.contains("\"LIVE\"")),
+            "the still-named instrument is replayed: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|t| t.contains("\"SETTLED\"")),
+            "the retired instrument must not be replayed: {frames:?}"
+        );
+
+        srv.abort();
     }
 }

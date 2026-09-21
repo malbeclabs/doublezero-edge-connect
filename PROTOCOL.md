@@ -33,7 +33,11 @@ On each new connection the producer:
    at least once** - a symbol it defines but has not yet priced is not replayed. For a publisher
    whose reference data carries its own Source ID, every symbol it defines is replayed, priced or
    not (see [*A symbol appears only once its Source ID is
-   known*](#a-symbol-appears-only-once-its-source-id-is-known)).
+   known*](#a-symbol-appears-only-once-its-source-id-is-known)). The replay carries the
+   instruments a publisher **still names**: a publisher re-announces its whole current instrument
+   set in every reference-data burst, and one it has stopped naming (a settled or delisted market)
+   drops out of the replay once it has been absent for long enough to be more than a gap. It keeps
+   resolving on the query API, flagged, for as long as there is trade history to answer with.
 2. **Replays the latest full-state book** per market, if any - the latest `depth` per symbol, and a
    `book` re-baseline (a `clear` plus the complete book) for every market that has one, at the
    market's own granularity.

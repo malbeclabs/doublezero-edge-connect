@@ -887,7 +887,13 @@ Modules are grouped by role under `src/`:
   admitted-but-unsubscribed channel reads `Unregistered`/`Down` here rather than a false "bound",
   the exact field the admin surface's own `GET` had to caveat instead of fix, since it has no
   liveness handle at all), `products` from `history::products_for` at the same `(venue, category,
-  channel)` grain, plus `label` (registry-supplied, display-only) or, failing that, live-derived
+  channel)` grain, `instruments`/`instruments_active` from the catalog at that same grain — the
+  three counts #139 could not reconcile, reported side by side because they are three
+  **populations**, not three readings of one: the catalog total (retired included), the subset a
+  publisher still names (what the wire's `ManifestSummary` count answers to) and history-store
+  occupancy (instruments that have *printed* inside the rolling window and survived its caps),
+  which is why the last is routinely the smallest and is not a catalog number at all — plus
+  `label` (registry-supplied, display-only) or, failing that, live-derived
   `symbol_prefixes` — one linear pass over the whole instrument catalog per request (not per
   channel), ranked by how many instruments carry each prefix (alphabetical tiebreak) and capped at
   8 sent, with `symbol_prefixes_total` reporting the true distinct count regardless of the cap so a
@@ -984,6 +990,27 @@ Modules are grouped by role under `src/`:
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.
+  **`InstrumentSnapshot` is not insert-only any more (#139).** Every entry carries
+  `last_named_ns` — the moment a publisher last *named* it, stamped on the **stored clone** by
+  `processor::upsert_instrument` (never on the emitted message; the wire has no lifecycle field and
+  a definition on it is by construction one a publisher is naming now). Past
+  `INSTRUMENT_RETIRE_AFTER_NS` (15 min) the entry is **retired**: kept and flagged, excluded from
+  the WS connect-time replay, `"active": false` / `"status": "retired"` on `/v1/products`. Past
+  `INSTRUMENT_FORGET_AFTER_NS` (that plus the history window) `sweep_forgotten_instruments`, called
+  from `reconcile::tick` beside `forget_departing_channel`, drops it — the grace is the history
+  window exactly because `/v1/products/{id}/candles` and `/ticker` resolve a product id through
+  this map, so dropping on the spot would take the prints `history::Store` still holds with it.
+  ⚠️ **Retirement is a union across a venue's live publishers, never one publisher's manifest
+  epoch.** `RefDataState`'s own pruning is correct but is per publisher *and* per receiver task,
+  while this map is shared: several mirrors carry one feed on one port block, and one venue's rows
+  can even be different feeds (Hyperliquid TOB + MBO both write `channel = 0` under the default
+  category). Retiring on one publisher's epoch clear would blank the catalog every time a single
+  mirror rotated its manifest. The shared stamp *is* the union — whichever publisher still names it
+  refreshes the one entry — which is why the rule is expressed as a stamp and not as an
+  `on_manifest` hook. What it cannot see is an instrument whose reveal was lost (a `ChannelReset`
+  clears `revealed`, and the definition branch only upserts a key already revealed), which then
+  waits on its next price message; the horizon is sized far above the burst period for that, and a
+  false retirement is recoverable — the entry is kept and the next burst flips it back.
 
 ## Conventions and gotchas
 

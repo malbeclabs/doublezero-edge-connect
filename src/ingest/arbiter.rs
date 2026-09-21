@@ -4463,6 +4463,7 @@ mod tests {
             category: "default".into(),
             price_exponent,
             qty_exponent,
+            last_named_ns: 0,
         })
     }
 

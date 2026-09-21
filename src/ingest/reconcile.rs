@@ -371,7 +371,36 @@ impl Reconciler {
         if let Some(desired) = outcome.desired.take() {
             self.apply_desired(desired).await;
         }
+        self.sweep_catalog();
         self.publish_diagnostics(&outcome);
+    }
+
+    /// Drop the catalog entries no publisher names any more and that nothing can answer for any
+    /// more — the lifecycle sibling of [`Self::forget_departing_channel`], and here for the same
+    /// reasons: this is the one periodic loop that already owns cross-cutting catalog/book/history
+    /// state, it is off the ingest hot path, and one O(catalog) pass per
+    /// `--subscription-refresh-secs` is a rounding error beside the per-request walk `/v1/products`
+    /// already does over the same map.
+    ///
+    /// Runs on **every** tick, an inconclusive one included: the rule is about what publishers are
+    /// sending, not about what the `doublezero` CLI managed to report, and a transient status
+    /// failure must not stall the only bound on this map's growth.
+    ///
+    /// Retirement itself needs no sweep — it is derived from the entry's own stamp at read time
+    /// (`NormalizedInstrument::is_active`), so `/v1` and the WS replay agree without either of them
+    /// waiting on this tick. This only forgets.
+    fn sweep_catalog(&self) {
+        let dropped = crate::model::sweep_forgotten_instruments(
+            &self.cfg.instruments,
+            crate::model::now_ns(),
+        );
+        if dropped > 0 {
+            info!(
+                dropped,
+                "dropped catalog entries no publisher has named for longer than the retirement \
+                 grace"
+            );
+        }
     }
 
     /// Write the polled half of the shared diagnostics snapshot. Activation is read back off this
@@ -1935,6 +1964,7 @@ mod tests {
                 category: "events".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
+                last_named_ns: 0,
             },
         );
         seed_book(&r, "KALSHI", 3, "DEPARTED", "events", 10, 1);
@@ -2073,6 +2103,7 @@ mod tests {
                 category: "events".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
+                last_named_ns: 0,
             },
         );
         seed_book(&r, "KALSHI", 3, "NARROWED", "events", 10, 1);
@@ -2189,6 +2220,7 @@ mod tests {
                 category: "events".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
+                last_named_ns: 0,
             },
         );
         seed_book(&r, "KALSHI", 3, "STILLHERE", "events", 10, 1);
@@ -2410,6 +2442,7 @@ mod tests {
             category: category.into(),
             price_exponent: -2,
             qty_exponent: -5,
+            last_named_ns: 0,
         }
     }
 

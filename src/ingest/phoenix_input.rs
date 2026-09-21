@@ -351,6 +351,7 @@ mod tests {
                 category: PHOENIX_CATEGORY.into(),
                 price_exponent: -2,
                 qty_exponent: -2,
+                last_named_ns: 0,
             },
         );
         map

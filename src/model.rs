@@ -389,6 +389,18 @@ pub struct NormalizedInstrument {
     /// arbitration key.
     #[serde(skip, default = "empty_category")]
     pub category: Arc<str>,
+    /// Wall clock (ns since epoch) when a publisher last **named** this instrument — stamped by
+    /// `processor::upsert_instrument` on every reference-data burst that carries it. The one
+    /// lifecycle input the served catalog has, and **never serialized**: it is producer-side
+    /// bookkeeping, and the wire already carries a definition only because a publisher just named
+    /// it.
+    ///
+    /// `0` is this crate's usual "not available" sentinel and reads as **active**, not as
+    /// retired-since-the-epoch: an entry nothing stamped (a test fixture, a future writer that
+    /// forgets) must never be swept away for it. See [`INSTRUMENT_RETIRE_AFTER_NS`] for the rule
+    /// this field feeds and [`NormalizedInstrument::is_active`] for how it is read.
+    #[serde(skip)]
+    pub last_named_ns: u64,
     pub price_exponent: i8,
     pub qty_exponent: i8,
     /// The venue's tradable price increment as `tick_size * 10^price_exponent` — the wire's `Tick
@@ -501,8 +513,92 @@ impl FeedMessage {
 /// registry's default category), both write the same entry (last-writer-wins). Those feeds are
 /// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
 /// diverge.
+/// The map is **not** insert-only: see [`INSTRUMENT_RETIRE_AFTER_NS`] for the lifecycle rule that
+/// retires and eventually drops an entry no publisher names any more.
 pub type InstrumentSnapshot =
     Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>>>;
+
+/// How long an [`InstrumentSnapshot`] entry survives with **no publisher naming it** before it
+/// reads as *retired*.
+///
+/// ## The rule
+///
+/// An instrument is live while at least one publisher still names it in its reference-data burst.
+/// A publisher names exactly the instruments of its **current manifest era** — that is what makes
+/// `ingest::subscriber::RefDataState::on_manifest`'s clear-and-refill work at all — so an
+/// instrument the venue has retired simply stops appearing in every burst, and its entry's
+/// [`NormalizedInstrument::last_named_ns`] stops advancing. Past this horizon the entry is
+/// *retired*: kept and flagged, excluded from the WebSocket connect-time replay, and reported as
+/// `"status": "retired"` / `"active": false` on `/v1/products`. Past
+/// [`INSTRUMENT_FORGET_AFTER_NS`] it is dropped outright.
+///
+/// ## Why a shared last-named stamp and not the epoch event itself
+///
+/// ⚠️ The pruning in `RefDataState` is per **publisher** and per **receiver task**; this map is
+/// shared and venue-scoped. Several publishers mirror one feed (and one venue's rows can even be
+/// different feeds — Hyperliquid's Top-of-Book and Market-by-Order both write `channel = 0` under
+/// the registry's default category), each with its own `RefDataState`, its own manifest era and,
+/// for a separate port block, its own task. Retiring an entry the moment *one* publisher's epoch
+/// stopped naming it would blank the catalog every time a single mirror restarted, or every time
+/// one of a venue's two feeds rotated its manifest.
+///
+/// The stamp lives on the **shared entry**, so whichever publisher still names it refreshes it —
+/// in any era, in any task. That is precisely the **union across live publishers** of the same
+/// `(venue, category, channel)`, expressed at the one place all of them meet, and it needs no
+/// cross-task bookkeeping to stay correct. Retirement is therefore "no publisher named this for
+/// `INSTRUMENT_RETIRE_AFTER_NS`", never "this publisher's epoch dropped it".
+///
+/// The horizon has to exceed the slowest reference-data burst period by a wide margin (the live
+/// feeds re-announce every few seconds, and the arbiter re-broadcasts unchanged definitions every
+/// `ingest::arbiter::INSTRUMENT_REANNOUNCE_NS` = 15s), or a live instrument would flap in and out
+/// of retirement between bursts. 15 minutes is two orders of magnitude clear of that while still
+/// shedding a settled instrument long before a long-lived process accumulates a second catalog's
+/// worth of them.
+pub const INSTRUMENT_RETIRE_AFTER_NS: u64 = 900 * 1_000_000_000;
+
+/// How long an entry is kept **after** it retires, before it is dropped from the catalog outright.
+///
+/// Retired-and-flagged rather than dropped is what keeps a settled instrument's history queryable:
+/// `/v1/products/{id}/candles` and `/ticker` resolve the product id through this very map, so an
+/// entry removed the instant it retires takes the prints `history::Store` still holds with it. The
+/// grace is therefore exactly the history window — past it the store can no longer answer for the
+/// instrument either, so keeping the catalog entry preserves nothing and only feeds the unbounded
+/// growth this rule exists to stop.
+pub const INSTRUMENT_FORGET_AFTER_NS: u64 =
+    INSTRUMENT_RETIRE_AFTER_NS + crate::history::WINDOW_SECS * 1_000_000_000;
+
+impl NormalizedInstrument {
+    /// Whether some publisher still names this instrument, as of `now_ns` (wall clock).
+    ///
+    /// An unstamped entry (`last_named_ns == 0`) is active: `0` is the "not available" sentinel,
+    /// never a real time. A stamp in the future (a host clock stepping backwards) is active too —
+    /// `saturating_sub` floors the age at zero rather than wrapping it into a retirement.
+    pub fn is_active(&self, now_ns: u64) -> bool {
+        self.last_named_ns == 0
+            || now_ns.saturating_sub(self.last_named_ns) < INSTRUMENT_RETIRE_AFTER_NS
+    }
+}
+
+/// Drop every catalog entry no publisher has named for [`INSTRUMENT_FORGET_AFTER_NS`], returning
+/// how many went. Retired-but-still-resolvable entries (past [`INSTRUMENT_RETIRE_AFTER_NS`], inside
+/// this one) are deliberately left in place — they are flagged, not forgotten.
+///
+/// Called from the reconciler's tick, the same single place `forget_departing_channel` purges
+/// catalog/book/history state from, and for the same reason: it is off the ingest hot path, and it
+/// is periodic rather than per-datagram, so the O(catalog) pass happens once every
+/// `--subscription-refresh-secs` instead of per reference-data burst.
+///
+/// One `retain` under one lock acquisition, so it cannot interleave with `sinks::ws::replay_scoped`
+/// (which clones the map under the same mutex) or with `upsert_instrument`: a replay sees the
+/// catalog wholly before or wholly after the sweep, never a half-swept one.
+pub fn sweep_forgotten_instruments(instruments: &InstrumentSnapshot, now_ns: u64) -> usize {
+    let mut map = lock(instruments);
+    let before = map.len();
+    map.retain(|_, i| {
+        i.last_named_ns == 0 || now_ns.saturating_sub(i.last_named_ns) < INSTRUMENT_FORGET_AFTER_NS
+    });
+    before - map.len()
+}
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
@@ -1828,6 +1924,104 @@ mod tests {
             orders.iter().map(|c| c.order_id).collect::<Vec<_>>(),
             vec![1, 2],
             "every resting order, deterministically ordered"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Instrument lifecycle (#139)
+    // ---------------------------------------------------------------------------------------
+
+    fn catalog_entry(instrument_id: u32, last_named_ns: u64) -> NormalizedInstrument {
+        NormalizedInstrument {
+            venue: "KALSHI".into(),
+            source_name: "KALSHI".into(),
+            source_id: 3,
+            symbol: format!("SYM-{instrument_id}").into(),
+            channel: 10,
+            instrument_id,
+            category: "events".into(),
+            last_named_ns,
+            price_exponent: -2,
+            qty_exponent: -2,
+            tick_size: 0,
+        }
+    }
+
+    fn catalog(entries: Vec<NormalizedInstrument>) -> InstrumentSnapshot {
+        let mut map = HashMap::new();
+        for e in entries {
+            map.insert(
+                (
+                    e.venue.clone(),
+                    e.category.clone(),
+                    e.channel,
+                    e.instrument_id,
+                ),
+                e,
+            );
+        }
+        Arc::new(Mutex::new(map))
+    }
+
+    /// `0` is the "not available" sentinel this crate uses for every other timestamp, so an
+    /// unstamped entry reads as active rather than as retired since 1970 — otherwise the first
+    /// writer to forget the stamp silently empties the catalog.
+    #[test]
+    fn an_unstamped_instrument_is_active_not_retired() {
+        let now = 10 * INSTRUMENT_FORGET_AFTER_NS;
+        assert!(catalog_entry(1, 0).is_active(now));
+
+        let instruments = catalog(vec![catalog_entry(1, 0)]);
+        assert_eq!(sweep_forgotten_instruments(&instruments, now), 0);
+        assert_eq!(
+            lock(&instruments).len(),
+            1,
+            "an unstamped entry is never swept"
+        );
+    }
+
+    /// The retirement boundary, and the host-clock-stepped-backwards case: an age that would
+    /// underflow is floored at zero rather than wrapping into a retirement.
+    #[test]
+    fn retirement_is_decided_by_age_and_never_wraps() {
+        let now = 2 * INSTRUMENT_RETIRE_AFTER_NS;
+        assert!(
+            catalog_entry(1, now - INSTRUMENT_RETIRE_AFTER_NS + 1).is_active(now),
+            "just inside the horizon"
+        );
+        assert!(
+            !catalog_entry(1, now - INSTRUMENT_RETIRE_AFTER_NS).is_active(now),
+            "exactly at the horizon has stopped being named"
+        );
+        assert!(
+            catalog_entry(1, now + INSTRUMENT_RETIRE_AFTER_NS).is_active(now),
+            "a stamp in the future is active, not an underflowed age"
+        );
+    }
+
+    /// The two horizons are distinct on purpose: a retired instrument is *kept* so its history
+    /// still resolves, and only forgotten once the history window can no longer answer for it.
+    #[test]
+    fn a_retired_instrument_is_kept_until_the_history_window_has_passed() {
+        let now = 10 * INSTRUMENT_FORGET_AFTER_NS;
+        let live = catalog_entry(1, now);
+        let retired = catalog_entry(2, now - INSTRUMENT_RETIRE_AFTER_NS - 1);
+        let forgotten = catalog_entry(3, now - INSTRUMENT_FORGET_AFTER_NS - 1);
+        assert!(live.is_active(now));
+        assert!(!retired.is_active(now), "retired");
+        assert!(!forgotten.is_active(now), "retired, and past the grace too");
+
+        let instruments = catalog(vec![live, retired, forgotten]);
+        assert_eq!(sweep_forgotten_instruments(&instruments, now), 1);
+        let map = lock(&instruments);
+        assert_eq!(map.len(), 2);
+        assert!(
+            map.contains_key(&("KALSHI".into(), "events".into(), 10u8, 2u32)),
+            "the retired entry stays: `/v1` still resolves its candles and ticker"
+        );
+        assert!(
+            !map.contains_key(&("KALSHI".into(), "events".into(), 10u8, 3u32)),
+            "past the grace nothing can answer for it, so nothing keeps it"
         );
     }
 }
