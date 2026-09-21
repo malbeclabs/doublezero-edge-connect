@@ -262,6 +262,14 @@ pub struct Metrics {
     pub mbp_duplicate_deltas: IntCounterVec,
     /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
     pub mbp_crossed: IntCounterVec,
+    /// `BookClear`s as they arrive on the wire, by the venue's own `Clear Reason`. The **conformance
+    /// census**: routing an instrument's lifecycle off that field is only worth building once the
+    /// publishers are seen to populate it, and a publisher reporting every departure under one
+    /// reason shows up here as a single series. Counted on arrival, before the sequence check, so a
+    /// clear the book declines still tells us what the publisher said. `reason` is a bounded label
+    /// set — every unassigned byte is `unknown`; the byte itself is on the wire (`book`'s
+    /// `clear_reason`).
+    pub mbp_book_clears: IntCounterVec,
     /// Publisher `Action`-vs-quantity disagreements by `kind`. Never changes the applied result.
     pub mbp_divergence: IntCounterVec,
 
@@ -717,6 +725,13 @@ impl Metrics {
                 "Crossed inside markets observed at a BatchBoundary (observability only)",
                 &["venue"],
             ),
+            mbp_book_clears: counter_vec(
+                &registry,
+                "dz_mbp_book_clears_total",
+                "BookClears received, by the venue's Clear Reason (unassigned values collapse to \
+                 unknown). The conformance census for whether that field is populated.",
+                &["venue", "reason"],
+            ),
             mbp_divergence: counter_vec(
                 &registry,
                 "dz_mbp_divergence_total",
@@ -1159,6 +1174,9 @@ mod tests {
             .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
+        m.mbp_book_clears
+            .with_label_values(&["KALSHI", "settled"])
+            .inc();
         m.mbp_divergence
             .with_label_values(&["KALSHI", "delete_with_quantity"])
             .inc();
@@ -1241,6 +1259,7 @@ mod tests {
             "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
             "dz_mbp_crossed_total",
+            "dz_mbp_book_clears_total",
             "dz_mbp_divergence_total",
             "dz_path_unmatched_trades_total",
             "dz_book_dropped_total",

@@ -338,6 +338,31 @@ pub struct NormalizedBook {
     /// of over a time window that measures sampling skew rather than correctness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<u32>,
+    /// The venue's own **`Clear Reason`** for the clear this batch carries — the Market-by-Price
+    /// feed's `BookClear` field, passed through verbatim as a `u8` (see
+    /// `ingest::codec_mbp::CLEAR_REASON_UNSPECIFIED` and its siblings). `None` on every batch that
+    /// carries no venue clear.
+    ///
+    /// Three properties are load-bearing and each is a way of getting this wrong:
+    ///
+    /// - **It is never set on a producer-synthesized re-baseline.** A `clear` the bridge emits of
+    ///   its own accord — a path failover, a forced re-baseline, the connect-time replay — is an
+    ///   instruction to the consumer, not a statement by the venue, and stamping it with a reason
+    ///   the venue never gave would let a consumer retire an instrument that is still trading. The
+    ///   two `..b.clone()` sites are where that leak would happen; `arbiter::clear_only` overrides
+    ///   this field for exactly that reason, while the *filtered* republish inherits it correctly,
+    ///   being the same batch minus duplicate changes.
+    /// - **It is verbatim, not classified.** The spec requires a subscriber to accept any `u8`, so
+    ///   an unassigned reason reaches the consumer intact rather than being coerced into `Other`
+    ///   (`255`), which is a claim of its own.
+    /// - **It rides the batch, not the change.** A price-bounded clear is re-served as the exact
+    ///   `Delete`s it removed and carries no `Clear` entry at all (see the `BookClear` arm of
+    ///   `MbpProcessor`), so a per-change field would silently drop the reason on that path. Where
+    ///   one datagram coalesces two applied clears for one instrument, the later one's reason wins:
+    ///   it is the venue's later word, and no precedence over these values is defined anywhere to
+    ///   rank them by instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_reason: Option<u8>,
     /// Advisory: this batch is part of a rebuild rather than ordinary activity. Deliberately NOT
     /// what re-baselines a consumer — `changes[0].action == Clear` is.
     pub snapshot: bool,
@@ -895,6 +920,9 @@ impl BookAccumulator {
                 order_id: 0,
             }],
             batch_id: self.batch_id,
+            // Producer-synthesized: this clear is the bridge's instruction, never the venue's
+            // statement, so it names no reason. See `NormalizedBook::clear_reason`.
+            clear_reason: None,
             snapshot: true,
             last: true,
             source_ts_ns: self.source_ts_ns,
@@ -1078,6 +1106,7 @@ mod tests {
             category: TEST_CATEGORY.into(),
             order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
+            clear_reason: None,
             snapshot,
             last,
             source_ts_ns: 1_781_019_263_715_344_015,
@@ -1131,6 +1160,42 @@ mod tests {
         assert_eq!(v["changes"][1]["action"], "delete");
         assert_eq!(v["changes"][1]["side"], "ask");
         assert!(v["source_ts_ns"].is_u64() && v["kernel_rx_ts_ns"].is_u64());
+    }
+
+    /// `clear_reason` is **absent**, never `null` or `0`, on every batch that carries no venue
+    /// clear — `0` is the spec's `Unspecified`, a reason a publisher can actually send, so
+    /// serializing it as the default would turn "the venue said nothing" into "the venue gave no
+    /// reason". When present it is the byte the publisher sent, unassigned values included.
+    #[test]
+    fn clear_reason_is_absent_unless_the_venue_gave_one() {
+        let level = vec![BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price: 0.62,
+            size: 150.0,
+            order_id: 0,
+        }];
+        let plain = serde_json::to_value(FeedMessage::Book(book(level.clone(), false, true)))
+            .expect("serializes");
+        assert!(
+            plain.get("clear_reason").is_none(),
+            "an ordinary batch carries no reason field at all"
+        );
+
+        for reason in [0u8, 4, 7, 255] {
+            let mut b = book(level.clone(), false, true);
+            b.clear_reason = Some(reason);
+            let v = serde_json::to_value(FeedMessage::Book(b)).expect("serializes");
+            assert_eq!(v["clear_reason"], reason, "verbatim, not classified");
+        }
+
+        // And a consumer that predates the field still parses a message carrying it, which is what
+        // keeps this additive rather than a break.
+        let round: NormalizedBook = serde_json::from_value(
+            serde_json::to_value(book(level, false, true)).expect("serializes"),
+        )
+        .expect("a batch with no reason round-trips");
+        assert_eq!(round.clear_reason, None);
     }
 
     /// A re-baseline is structural: `changes[0].action == "clear"`, because the reference consumer's
@@ -1557,6 +1622,7 @@ mod tests {
                     order_id: 0,
                 },
             ],
+            clear_reason: None,
             snapshot: true,
             last: true,
             source_ts_ns: 7,

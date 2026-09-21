@@ -1575,6 +1575,7 @@ mod tests {
             category: category.into(),
             order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
+            clear_reason: None,
             snapshot: false,
             last: true,
             source_ts_ns: 1,

@@ -261,6 +261,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- **The Market-by-Price feed's `Clear Reason` reaches consumers, and a census says whether it is
+  worth routing on** (#140). `BookClear` carries the venue's own cause for withdrawing a book —
+  `Halt`, `SessionEnd`, `VenueReset`, `Settled`, `Other` — and `Settled` is the strongest claim the
+  protocol lets a publisher make about an instrument, the one the spec says a conforming subscriber
+  never has to take back. It was decoded into the struct and then dropped on the floor, so the only
+  departure signal anything downstream could see was the manifest epoch changing: later by a whole
+  definition cycle, and unable to tell a settled instrument from a halted one.
+  - **On the wire**, `book` gains an optional `clear_reason`, the byte verbatim. Additive, so still
+    v1 — it is absent on every batch that does not carry a clear the *venue* sent, which is what
+    makes absence readable as "the venue said nothing" (`0` is `Unspecified`, a cause a publisher
+    can actually give, so the field is absent rather than `0`). It rides the message rather than the
+    change because a price-bounded clear is re-served as the exact `delete`s it removed and has no
+    `clear` entry to carry it; and it is never stamped on a clear the **producer** synthesized — a
+    failover, a degraded re-baseline, the connect-time bootstrap — since `..b.clone()` would
+    otherwise have a bridge-internal re-baseline tell a consumer the market had settled.
+    `order_book` never carries it: the Market-by-Order wire has no such field.
+  - **Not** routed on internally. Retiring a settled instrument needs somewhere for that state to
+    live, which is #139, and the issue asks for a conformance check before behaviour is built on a
+    distinction the publishers may not actually draw. `dz_mbp_book_clears_total{venue,reason}` is
+    that check: counted on arrival, before the sequence check, so a clear the book declines still
+    reports what the publisher said. A venue reporting every departure under one cause shows up as a
+    single series, and the answer comes off the running fleet rather than a separate capture.
 - ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
   activated on the ledger and running on their own two groups, separate from perps and events:
   top-of-book on `233.84.178.21` and market-by-price on `233.84.178.22`, six channels each (`50`-`55`,

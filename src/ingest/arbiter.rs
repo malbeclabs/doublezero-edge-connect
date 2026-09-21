@@ -1550,6 +1550,11 @@ fn clear_only(b: &NormalizedBook) -> NormalizedBook {
         // Producer-synthesized, like `to_book`'s: the triggering batch's arrival time is not when this
         // message was built.
         recv_ts_ns: now_ns(),
+        // And for the same reason it carries no `Clear Reason`. `b` may well be the batch that
+        // *did* carry one — a venue `BookClear` is one of the things that reaches here — and
+        // `..b.clone()` would inherit it onto a clear the venue never sent, telling a consumer that
+        // this market settled when all that happened is that the bridge degraded a re-baseline.
+        clear_reason: None,
         ..b.clone()
     }
 }
@@ -4598,6 +4603,7 @@ mod tests {
             category: TEST_CATEGORY.into(),
             order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
+            clear_reason: None,
             snapshot: false,
             last,
             source_ts_ns: 1_000,
@@ -5533,6 +5539,7 @@ mod tests {
                 category: TEST_CATEGORY.into(),
                 order_level: changes.iter().any(|c| c.order_id != 0),
                 changes,
+                clear_reason: None,
                 snapshot: false,
                 last: true,
                 source_ts_ns: 1_000,
@@ -5709,6 +5716,7 @@ mod tests {
             category: TEST_CATEGORY.into(),
             order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
+            clear_reason: None,
             snapshot: false,
             last: true,
             source_ts_ns: 1_000,
@@ -6251,6 +6259,64 @@ mod tests {
         assert!(
             acc.baselined(),
             "after a broadcast clear the accumulator IS the whole book, so it must say so"
+        );
+    }
+
+    /// The degraded re-baseline is built with `..b.clone()` from whichever batch triggered it, and
+    /// that batch may well be one carrying the venue's own `Clear Reason` — a `BookClear` is one of
+    /// the things that reaches this gate. Inheriting it would stamp a producer-synthesized clear
+    /// with a claim the venue never made about *this* clear, and `Settled` is the claim a consumer
+    /// is told it never has to take back: it would retire a market whose book the bridge merely
+    /// gave up republishing.
+    #[test]
+    fn the_degraded_rebaseline_does_not_inherit_the_venues_clear_reason() {
+        const VENUE: &str = "BookDegradedReason";
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_mode(VENUE, ArbitrationMode::Coordinated);
+        let replay: BookSnapshot = Arc::new(std::sync::Mutex::new(BookReplay::default()));
+        a.set_book_replay(replay.clone());
+        let key: MarketKey = mkey(VENUE, BOOK_INSTRUMENT);
+        for p in [path(1), path(2)] {
+            a.set_book_synced(&key, p, true);
+        }
+
+        let with_reason = |changes: Vec<BookChange>, recv_ns: u64| {
+            let FeedMessage::Book(mut b) = l3_batch(VENUE, changes, recv_ns) else {
+                unreachable!()
+            };
+            b.clear_reason = Some(crate::ingest::codec_mbp::CLEAR_REASON_SETTLED);
+            FeedMessage::Book(b)
+        };
+
+        // Un-baselined accumulator, then a disagreement: the same setup as the item-E test, so the
+        // forced re-baseline has nothing complete to republish and degrades to `clear_only`.
+        a.emit(
+            with_reason(vec![order(BookAction::Update, 7, 100.0, 6.0)], 1_000),
+            path(1),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            with_reason(vec![order(BookAction::Update, 7, 100.0, 8.0)], 1_100),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        a.emit(
+            with_reason(vec![order(BookAction::Update, 9, 99.0, 1.0)], 1_200),
+            path(1),
+            TEST_CATEGORY,
+        );
+        let out = drain_books(&mut rx);
+        let degraded = out.first().expect("the degraded clear is broadcast");
+        assert_eq!(
+            degraded.changes[0].action,
+            BookAction::Clear,
+            "the setup must reach the degraded path"
+        );
+        assert_eq!(
+            degraded.clear_reason, None,
+            "a producer-synthesized clear speaks for the producer, never for the venue"
         );
     }
 

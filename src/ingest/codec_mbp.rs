@@ -96,6 +96,36 @@ pub const CLEAR_SIDE_BOTH: u8 = 2;
 pub const SCOPE_ENTIRE_SIDE: u8 = 0;
 pub const SCOPE_FROM_PRICE: u8 = 1;
 
+/// `BookClear`'s `Clear Reason`: why the publisher withdrew the levels. **Not a value space this
+/// decoder closes** — the spec requires a subscriber to accept any `u8`, and the unassigned range
+/// `5..=254` is where a later revision's reasons land, so an unrecognized byte is carried through
+/// verbatim rather than folded into [`CLEAR_REASON_OTHER`], which is itself a *claim* ("venue-specific,
+/// documented out of band") and not a catch-all. The only one of these that is a statement about the
+/// instrument rather than about the book is [`CLEAR_REASON_SETTLED`]: the spec describes it as the
+/// claim a conforming subscriber never has to take back.
+pub const CLEAR_REASON_UNSPECIFIED: u8 = 0;
+pub const CLEAR_REASON_HALT: u8 = 1;
+pub const CLEAR_REASON_SESSION_END: u8 = 2;
+pub const CLEAR_REASON_VENUE_RESET: u8 = 3;
+pub const CLEAR_REASON_SETTLED: u8 = 4;
+pub const CLEAR_REASON_OTHER: u8 = 255;
+
+/// The census label for a `Clear Reason`, for `dz_mbp_book_clears_total{venue, reason}`. Every
+/// unassigned byte collapses to `"unknown"` deliberately: the label set has to stay bounded (a raw
+/// `u8` would be 256 series per venue), and the byte itself is not lost — it rides the wire on
+/// `book`'s `clear_reason`, which is where a consumer that cares reads it.
+pub fn clear_reason_label(reason: u8) -> &'static str {
+    match reason {
+        CLEAR_REASON_UNSPECIFIED => "unspecified",
+        CLEAR_REASON_HALT => "halt",
+        CLEAR_REASON_SESSION_END => "session_end",
+        CLEAR_REASON_VENUE_RESET => "venue_reset",
+        CLEAR_REASON_SETTLED => "settled",
+        CLEAR_REASON_OTHER => "other",
+        _ => "unknown",
+    }
+}
+
 /// `0xFFFF` on `order_count`/`level_index` means "not provided, or beyond what this field can
 /// express" — both saturate at it rather than wrapping, so it must never be read as a magnitude.
 const U16_UNAVAILABLE: u16 = 0xFFFF;
@@ -172,6 +202,8 @@ pub struct BookClear {
     pub per_instrument_seq: u32,
     pub from_price_raw: i64,
     pub ts: u64,
+    /// Why the publisher withdrew the levels — the `CLEAR_REASON_*` space, **verbatim**, including
+    /// an unassigned byte. Re-served on `book`'s `clear_reason`; see [`clear_reason_label`].
     pub clear_reason: u8,
 }
 
@@ -960,6 +992,34 @@ pub(crate) mod tests {
         b[7] = SCOPE_ENTIRE_SIDE;
         let (_, m) = decode_datagram(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
         assert!(matches!(m[0], Message::BookClear(_)));
+    }
+
+    /// `Clear Reason` is a value space this decoder does **not** close. The spec requires a
+    /// subscriber to accept any `u8` and reserves `5..=254`, so every byte decodes to a clear and
+    /// arrives verbatim; only the census label collapses the unassigned range, and `Other` (255) is
+    /// a claim of its own rather than that range's name.
+    #[test]
+    fn every_clear_reason_decodes_and_only_the_label_collapses() {
+        for reason in [0u8, 1, 2, 3, 4, 5, 7, 128, 254, 255] {
+            let mut b = vec![0u8; 32];
+            b[6] = CLEAR_SIDE_BID;
+            b[7] = SCOPE_ENTIRE_SIDE;
+            b[28] = reason;
+            let (_, m) = decode_datagram(&one(MSG_BOOK_CLEAR, 0, &b)).unwrap();
+            let Message::BookClear(c) = &m[0] else {
+                panic!("reason {reason} must still decode as a clear: {:?}", m[0])
+            };
+            assert_eq!(c.clear_reason, reason, "carried verbatim");
+        }
+        assert_eq!(clear_reason_label(CLEAR_REASON_SETTLED), "settled");
+        assert_eq!(clear_reason_label(CLEAR_REASON_OTHER), "other");
+        for unassigned in [5u8, 7, 128, 254] {
+            assert_eq!(
+                clear_reason_label(unassigned),
+                "unknown",
+                "an unassigned reason is not Other"
+            );
+        }
     }
 
     /// spec: SnapshotLevel 0x42, 32 bytes. Body: snapshot_id @0, price i64 @4, qty u64 @12,

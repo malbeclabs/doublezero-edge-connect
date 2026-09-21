@@ -673,6 +673,7 @@ fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage
         // Every change this suite builds is price-aggregated (`level()` stamps `order_id: 0`).
         order_level: false,
         changes,
+        clear_reason: None,
         snapshot: false,
         last,
         source_ts_ns: recv_ns,

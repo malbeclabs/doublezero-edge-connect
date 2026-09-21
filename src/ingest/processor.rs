@@ -1475,6 +1475,10 @@ impl MboProcessor {
             // The Market-by-Order wire carries a `BatchBoundary` too, but this path keeps no slot
             // from it — see `MbpProcessor::last_batch` for the one that does.
             batch_id: None,
+            // The Market-by-Order protocol has no `Clear Reason` of any kind: every clear this path
+            // emits is the producer's own re-baseline, built from a recovery, a session end or an
+            // instrument reset. There is nothing to pass through.
+            clear_reason: None,
             snapshot: mode != BookEmit::Delta,
             last: true,
             source_ts_ns,
@@ -2514,7 +2518,9 @@ impl MbpProcessor {
         }];
         changes.extend(book.bids().map(|(p, l)| level(BookSide::Bid, p, l.qty_raw)));
         changes.extend(book.asks().map(|(p, l)| level(BookSide::Ask, p, l.qty_raw)));
-        self.send_book(ctx, channel, instrument_id, changes, true);
+        // No `clear_reason`: this clear is the producer's own re-baseline instruction and the venue
+        // said nothing. See `NormalizedBook::clear_reason`.
+        self.send_book(ctx, channel, instrument_id, changes, None, true);
     }
 
     /// The one place a `book` reaches the arbiter: resolves the display symbol and the book's event
@@ -2528,6 +2534,7 @@ impl MbpProcessor {
         channel: u8,
         instrument_id: u32,
         changes: Vec<BookChange>,
+        clear_reason: Option<u8>,
         snapshot: bool,
     ) {
         let key = (ctx.publisher, channel, instrument_id);
@@ -2556,6 +2563,7 @@ impl MbpProcessor {
             order_level: false,
             changes,
             batch_id: self.last_batch.get(&(ctx.publisher, channel)).copied(),
+            clear_reason,
             snapshot,
             last: true,
             source_ts_ns: book.last_event_ts(),
@@ -2658,6 +2666,9 @@ impl DatagramProcessor for MbpProcessor {
         // Wire changes per instrument, emitted once per datagram; a `BTreeMap` gives deterministic
         // ascending-id order across a multi-instrument datagram, matching `MboProcessor`'s `BTreeSet`.
         let mut accum: BTreeMap<u32, Vec<BookChange>> = BTreeMap::new();
+        // The venue's `Clear Reason` per instrument, for the batch `accum` will flush. Kept beside
+        // `accum` rather than on the `BookChange`, and populated only by an *applied* `BookClear`.
+        let mut clear_reasons: BTreeMap<u32, u8> = BTreeMap::new();
         // Instruments touched since the previous `BatchBoundary`, and since the datagram started (for
         // the health report). Both are datagram-scoped: the publisher and channel are fixed per datagram.
         let mut since_boundary: BTreeSet<u32> = BTreeSet::new();
@@ -2786,6 +2797,17 @@ impl DatagramProcessor for MbpProcessor {
                     }
                 }
                 codec_mbp::Message::BookClear(c) => {
+                    // Census first, before every gate below: the question this answers is what the
+                    // publishers actually put in `Clear Reason`, and a clear the book declines — no
+                    // definition yet, a sequence gap, a duplicate — still said something. See
+                    // `Metrics::mbp_book_clears`.
+                    metrics()
+                        .mbp_book_clears
+                        .with_label_values(&[
+                            ctx.venue,
+                            codec_mbp::clear_reason_label(c.clear_reason),
+                        ])
+                        .inc();
                     let Some((price_exp, _)) = self.exponents(ctx.publisher, c.instrument_id)
                     else {
                         continue;
@@ -2816,6 +2838,13 @@ impl DatagramProcessor for MbpProcessor {
                     if !matches!(outcome, DeltaOutcome::Applied { .. }) {
                         continue;
                     }
+                    // The venue's reason rides the batch this clear lands in, not the change: a
+                    // price-bounded clear is published as the exact `Delete`s it removed and has no
+                    // `Clear` entry to carry it. Recorded only for a clear the book actually
+                    // applied, so a refused one cannot name a reason on a batch it did not produce;
+                    // a second applied clear for the same instrument in this datagram overwrites
+                    // it, being the venue's later word. See `NormalizedBook::clear_reason`.
+                    clear_reasons.insert(c.instrument_id, c.clear_reason);
                     let changes = accum.entry(c.instrument_id).or_default();
                     if c.scope == codec_mbp::SCOPE_ENTIRE_SIDE {
                         // Only for a side the apply acted on: an unrecognized byte clears nothing in
@@ -3207,9 +3236,14 @@ impl DatagramProcessor for MbpProcessor {
         let accum_keys: BTreeSet<u32> = accum.keys().copied().collect();
         for (instrument_id, changes) in accum {
             if revealed_this_datagram.contains(&instrument_id) {
+                // A reveal replaces this datagram's incremental batch with the whole book, so it is
+                // a producer re-baseline and names no reason even if a `BookClear` landed in it:
+                // the consumer has no prior state, so there is nothing for the venue's reason to
+                // qualify.
                 self.emit_rebaseline(ctx, channel, instrument_id);
             } else if !changes.is_empty() {
-                self.send_book(ctx, channel, instrument_id, changes, false);
+                let clear_reason = clear_reasons.get(&instrument_id).copied();
+                self.send_book(ctx, channel, instrument_id, changes, clear_reason, false);
             }
         }
         // Revealed this datagram via a message with no book-content representation of its own
@@ -6556,6 +6590,238 @@ mod tests {
             shape(&drain_books(&mut rx)[0]),
             vec![(BookAction::Clear, BookSide::Ask, 0.0, 0.0)],
             "a whole-side clear is expressible verbatim"
+        );
+    }
+
+    /// The venue's `Clear Reason` reaches the wire on **both** shapes a `BookClear` is re-served
+    /// as. The price-bounded one is the case a per-change field would have missed: it publishes
+    /// exact `Delete`s and carries no `Clear` entry at all, so the reason has to ride the batch.
+    #[test]
+    fn mbp_a_wire_clear_carries_its_reason_on_both_shapes() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                2,
+                &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10), (MBP_BID, 6100, 20)]),
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        // Reveal first, so neither clear below is the market's first-ever admission — that is
+        // re-baselined by the arbiter's gate and would replace the batch this test reads.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        let clear = |seq: u32, scope: u8, from: i64, reason: u8| {
+            mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                instrument_id: 41,
+                source_id: 0,
+                clear_side: codec_mbp::CLEAR_SIDE_BID,
+                scope,
+                per_instrument_seq: seq,
+                from_price_raw: from,
+                ts: 7_000 + seq as u64,
+                clear_reason: reason,
+            })
+        };
+
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                100,
+                &[clear(
+                    1,
+                    codec_mbp::SCOPE_FROM_PRICE,
+                    6200,
+                    codec_mbp::CLEAR_REASON_HALT,
+                )],
+            ),
+            &mkt,
+        );
+        let bounded = drain_books(&mut rx).remove(0);
+        assert!(
+            bounded
+                .changes
+                .iter()
+                .all(|c| c.action == BookAction::Delete),
+            "a price-bounded clear has no Clear entry to hang a reason on"
+        );
+        assert_eq!(bounded.clear_reason, Some(codec_mbp::CLEAR_REASON_HALT));
+
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                101,
+                &[clear(
+                    2,
+                    codec_mbp::SCOPE_ENTIRE_SIDE,
+                    0,
+                    codec_mbp::CLEAR_REASON_SETTLED,
+                )],
+            ),
+            &mkt,
+        );
+        let whole = drain_books(&mut rx).remove(0);
+        assert_eq!(
+            shape(&whole),
+            vec![(BookAction::Clear, BookSide::Bid, 0.0, 0.0)]
+        );
+        assert_eq!(whole.clear_reason, Some(codec_mbp::CLEAR_REASON_SETTLED));
+    }
+
+    /// An unassigned reason is passed through as the byte the publisher sent, not folded into
+    /// `Other` — which is a claim of its own ("venue-specific, documented out of band") and would
+    /// tell a consumer the publisher said something it did not. A batch that carries no wire clear
+    /// names no reason at all.
+    #[test]
+    fn mbp_an_unassigned_clear_reason_is_verbatim_and_an_ordinary_batch_has_none() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+
+        // 7 is in the spec's unassigned range, where a later revision's reasons land.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                100,
+                &[mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                    instrument_id: 41,
+                    source_id: 0,
+                    clear_side: codec_mbp::CLEAR_SIDE_BID,
+                    scope: codec_mbp::SCOPE_ENTIRE_SIDE,
+                    per_instrument_seq: 1,
+                    from_price_raw: 0,
+                    ts: 7_001,
+                    clear_reason: 7,
+                })],
+            ),
+            &mkt,
+        );
+        assert_eq!(drain_books(&mut rx)[0].clear_reason, Some(7));
+
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 101, &[mbp_level(41, 2, MBP_BID, 6200, 15, 7_002)]),
+            &mkt,
+        );
+        assert_eq!(
+            drain_books(&mut rx)[0].clear_reason,
+            None,
+            "an ordinary delta batch is not a venue statement about the instrument"
+        );
+    }
+
+    /// A reveal replaces the datagram's incremental batch with the whole book — a producer
+    /// re-baseline. It must not inherit a `Clear Reason` from a `BookClear` that happened to land
+    /// in the same datagram: the consumer has no prior state, so there is nothing for the venue's
+    /// reason to qualify, and a `Settled` riding a bootstrap would retire a market on sight.
+    #[test]
+    fn mbp_a_reveal_rebaseline_names_no_clear_reason() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10)])),
+            &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+        );
+        let _ = drain_books(&mut rx);
+
+        // The clear itself reveals the Source ID, so this datagram is both the reveal and a wire
+        // clear.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                100,
+                &[mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                    instrument_id: 41,
+                    source_id: 0,
+                    clear_side: codec_mbp::CLEAR_SIDE_ASK,
+                    scope: codec_mbp::SCOPE_ENTIRE_SIDE,
+                    per_instrument_seq: 1,
+                    from_price_raw: 0,
+                    ts: 7_001,
+                    clear_reason: codec_mbp::CLEAR_REASON_SETTLED,
+                })],
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        let books = drain_books(&mut rx);
+        assert!(!books.is_empty(), "the reveal publishes the book");
+        assert!(
+            books.iter().all(|b| b.clear_reason.is_none()),
+            "a producer re-baseline never speaks for the venue"
+        );
+    }
+
+    /// The census counts what the **publisher said**, not what the book accepted. A clear the
+    /// processor declines — here for an instrument it holds no definition for — never reaches a
+    /// batch, so if the counter sat behind that gate the one question it exists to answer ("do
+    /// these publishers populate `Clear Reason` at all?") would be answered only for the clears
+    /// that happened to apply.
+    #[test]
+    fn mbp_the_clear_census_counts_a_clear_the_book_declines() {
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let before = metrics()
+            .mbp_book_clears
+            .with_label_values(&["TV", "settled"])
+            .get();
+
+        // No refdata at all, so `exponents` cannot resolve and the arm bails before the book.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                1,
+                &[mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                    instrument_id: 41,
+                    source_id: 0,
+                    clear_side: codec_mbp::CLEAR_SIDE_BOTH,
+                    scope: codec_mbp::SCOPE_ENTIRE_SIDE,
+                    per_instrument_seq: 1,
+                    from_price_raw: 0,
+                    ts: 7_001,
+                    clear_reason: codec_mbp::CLEAR_REASON_SETTLED,
+                })],
+            ),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+
+        assert_eq!(
+            metrics()
+                .mbp_book_clears
+                .with_label_values(&["TV", "settled"])
+                .get(),
+            before + 1
         );
     }
 

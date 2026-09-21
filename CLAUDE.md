@@ -970,7 +970,17 @@ Modules are grouped by role under `src/`:
   *They are separate types*: a new `order_id` field on `book` would have corrupted every consumer
   that correctly ignored it. A `Clear` names a *side*, so it always carries
   `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
-  of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
+  of a re-baselined-away book resting in the replay map forever. `clear_reason` (#140) carries the
+  Market-by-Price wire's `Clear Reason` verbatim — `Settled` being the one value that is a statement
+  about the *instrument* rather than the book — and sits on the **batch**, not the change, because a
+  price-bounded clear is re-served as the exact `Delete`s it removed and has no `Clear` entry to
+  carry it. ⚠️ It is a statement by the **venue**, so it must never appear on a clear the producer
+  synthesized: `arbiter::clear_only` and `emit_rebaseline` override it explicitly, and the two
+  `..b.clone()` sites are where that leak lives (the *filtered* republish inherits it correctly,
+  being the same batch minus duplicate changes). The bridge does **not** route on it — retiring a
+  settled instrument needs #139's state — so the field is passed through and counted
+  (`dz_mbp_book_clears_total{venue,reason}`, the conformance census for whether publishers populate
+  it at all, counted on arrival so a declined clear still reports what was said). Its pending-change cap now bounds only an event still awaiting its
   `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
   baseline. `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's

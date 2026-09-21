@@ -105,6 +105,7 @@ fn batch_for(
         // lone clear carries nothing else, so content would mislabel the batches under test.
         order_level: true,
         changes,
+        clear_reason: None,
         snapshot: false,
         last: true,
         source_ts_ns,

@@ -2218,6 +2218,7 @@ mod tests {
             instrument_id,
             order_level: changes.iter().any(|c| c.order_id != 0),
             changes,
+            clear_reason: None,
             snapshot: false,
             last,
             source_ts_ns: 7,
