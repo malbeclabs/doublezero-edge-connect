@@ -668,7 +668,22 @@ Modules are grouped by role under `src/`:
   sync state is reported to the arbiter *before* the datagram's emissions so the re-baseline suppression has
   a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
   suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot feed into `pricebook.rs` and emits the
-  incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
+  incremental `book` + trades). ⚠️ **A datagram is not a logical event where the venue publishes
+  `BatchBoundary`.** One event's level changes span datagrams, so on a channel that has shown a
+  boundary the per-datagram batches carry `last: false` and the boundary emits the closing batch
+  (`ChannelBatching`, which is why `open` has to outlive the datagram); publishing each datagram as
+  finished is what exposed locked and crossed intermediate books to every consumer honouring `last`.
+  A channel that has shown none keeps the datagram as the event, and a channel that shows one and
+  then stops reverts to that after `BOUNDARY_TIMEOUT_NS` — the wedge PROTOCOL.md warns about under
+  `last` is a buffering consumer held forever, so the fallback is not optional. ⚠️ **That bound is
+  wall clock and must stay so.** The publishers run a mean ~210 mktdata datagrams/s per host against
+  a two-minute-average peak near 1,250/s, so one 400 ms slot carries ~500 datagrams: any datagram
+  count small enough to bound the wedge sits inside a single busy slot, fires mid-event and
+  re-exposes the very books this closes. `MAX_DATAGRAMS_WITHOUT_BOUNDARY` survives only as the
+  backstop for a datagram whose `recv_ts_ns` is the `0` sentinel. The fallback closes whatever
+  `open` still holds; the paths that instead *drop* that map (channel reset, `EndOfSession`,
+  publisher eviction) emit nothing on purpose — the books are already gone and the recovery is a
+  `Clear`-led re-baseline, which discards the consumer's buffer rather than committing it. All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-transport dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
   IP address and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
@@ -774,7 +789,20 @@ Modules are grouped by role under `src/`:
   work. On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
   materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
-  every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
+  every other dimension), then streams quotes/trades/midpoints/depth/book. ⚠️ **A replayed market
+  records a per-client watermark and every `replay_scoped()` call takes one**, because `rx` is
+  subscribed in the accept loop and the caches are read after the handshake, so the frames in
+  between are queued *behind* a bootstrap that already holds them — harmless on full-state
+  `quote`/`depth`, permanent corruption on the incremental `book`/`order_book`, which is the
+  backwards-walking book Ellipsis measured against Phoenix. The watermark is
+  `BookAccumulator::wire_ts_ns`, the newest `recv_ts_ns` the accumulator has **folded**: a batch
+  still awaiting its `last` is not in what `to_book` materializes, so counting it would drop the
+  batches the bootstrap is missing. ⚠️ **The gate is strictly `<` and a tie must be forwarded** —
+  one datagram straddling a `BatchBoundary` emits two batches for a market at that datagram's one
+  stamp, and only the first folds, so `<=` would drop the second and the next boundary would
+  deliver its `last` over a buffer missing those changes. Re-delivering a tie is free: a change
+  carries an absolute size and the bootstrap ends at the last folded batch of the tie set. Moving
+  the subscribe after the snapshot instead trades the overlap for a gap and is the worse bug. Replay is one
   `replay_scoped()` used three times, and `Replay::{Full,Books}` is what says how much of it goes out:
   **`Full`** on connect (unfiltered — no subscriptions yet) and per `subscribe` (scoped to the filter
   just added, so a client that narrows after connecting is bootstrapped without replaying every

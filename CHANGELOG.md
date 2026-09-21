@@ -41,6 +41,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **Every per-datagram `book` batch was published as a finished logical event, exposing locked
+  and crossed intermediate books to every consumer that honours `last`.** A venue event's level
+  changes routinely span two datagrams — the bid lifts in one, the ask moves away in the next — so
+  closing each datagram published the state in between as if the venue stood there. Ellipsis
+  measured 2,546 such states in 30 minutes across BTC, ETH and SOL on the Phoenix feed, one of them
+  SOL at bid 118.63 = ask 118.63 for 4.4 microseconds.
+
+  The Market-by-Price processor already parsed the venue's `BatchBoundary` for `batch_id`; it is now
+  the consistency point it is on the wire. On a channel where one has been observed, per-datagram
+  batches carry `last: false` and the boundary emits a closing batch, possibly with no changes, per
+  instrument touched since the previous one. A channel whose venue publishes no boundary keeps a
+  datagram as the event. Re-baselines are complete state and stay `last: true`. PROTOCOL.md documents
+  the contract under `last`; nothing changes for a consumer already honouring it.
+
+  Guarded against the wedge that field warns about: a channel that emitted boundaries and then
+  stopped reverts to closing each datagram 2 s — five slots — after the last one, and whatever that
+  channel left open is closed with it. The bound is wall clock rather than a datagram count because
+  the publishers run a mean ~210 market-data datagrams/s per host against a two-minute-average peak
+  near 1,250/s, so a single 400 ms slot carries ~500 datagrams: any count tight enough to bound the
+  wedge would fire inside one busy slot and re-expose the intermediate books. A datagram cap
+  survives only for a datagram whose `recv_ts_ns` is the not-available sentinel.
+- ⚠️ **A client joining mid-stream was sent a `book` bootstrap and then the batches it already
+  contained, walking its book backwards.** A client's broadcast receiver is subscribed in the accept
+  loop, before `serve_client` finishes the WebSocket handshake and reads the replay caches, so every
+  batch published in that window is queued *behind* a snapshot that already carries it. Applying
+  them in arrival order corrupts the consumer: measured against the Phoenix venue's own API, SOL
+  showed a bid and an ask both at 118.06 after a snapshot at slot 449077018 was followed by deltas
+  labelled 449077013. `quote` and `depth` race the same way and are unaffected — both are full state
+  and correct themselves on the next message — so only the incremental `book`/`order_book` pair
+  could be left permanently wrong.
+
+  The bootstrap now carries a per-market watermark, the `recv_ts_ns` of the newest batch the
+  replayed accumulator has **folded** in, and a queued batch strictly older than it is discarded.
+  Folded, not merely applied, is the load-bearing half: an event still waiting for its `last` is not
+  in the materialized state, so counting its batches would drop exactly the ones the bootstrap is
+  missing. Strictly older for the same reason: one datagram straddling a venue batch boundary emits
+  two batches for a market at one stamp, only the first of them folded, so a tie is re-delivered —
+  which costs nothing, since a change carries an absolute size and re-applying lands on the same
+  state.
+  The lag-triggered repair replays through the same path and takes the same watermark. Moving the
+  subscribe after the snapshot would close the overlap by opening a gap, where a batch published in
+  the window reaches nobody, and was rejected for that reason.
 - ⚠️ **A lagging WebSocket client was answered with a full state replay, which re-armed the lag that
   asked for it** (#149). The `book`/`order_book` products are incremental, so a client the broadcast
   had to drop messages for does need a re-baseline — but the repair replayed the *whole* instrument

@@ -1975,6 +1975,67 @@ const MAX_PRICE_BOOKS: usize = 4096;
 /// memory-exhaustion vector; two paths across a handful of shards sit far below this.
 const MAX_CHANNEL_KEYS: usize = 256;
 
+/// How long a channel that has shown a `BatchBoundary` may go without another before its batches
+/// revert to closing themselves. The wedge PROTOCOL.md names under `last`: a consumer buffers a
+/// logical event until its final batch, so a channel that emitted boundaries and then stopped
+/// would hold every consumer's book frozen for the life of the session.
+///
+/// **Wall clock, never a datagram count.** Measured over 24 h on the live publishers
+/// (`dz_publisher_egress_datagrams_total`, `port_role=mktdata`, per host): mean ~210 datagrams/s
+/// against a two-minute-average peak near 1,250/s, so one 400 ms slot carries ~500 datagrams and
+/// per-minute peaks run higher. Any count small enough to bound the wedge usefully therefore sits
+/// *inside* one busy slot, where it would fire mid-event and re-expose the intermediate books this
+/// closing exists to hide. Time has no such collision: the publisher emits one boundary per slot
+/// boundary, so five missed slots is not a slow venue, it is a venue that has stopped batching.
+const BOUNDARY_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// Datagram backstop for the one case [`BOUNDARY_TIMEOUT_NS`] cannot be evaluated: `recv_ts_ns` is
+/// `0`, the crate-wide "not available" sentinel, so there is no clock to measure against. Set far
+/// above the measured peak — ~13 s of slot-peak traffic — because on a host whose stamps *are*
+/// available this must never be what fires.
+const MAX_DATAGRAMS_WITHOUT_BOUNDARY: u32 = 16_384;
+
+/// What a `BatchBoundary` on one `(publisher, channel)` closes, carried across datagrams because a
+/// venue event is not bounded by one: a `BatchBoundary` is the venue's consistency point, and level
+/// changes belonging to one event routinely span two datagrams. Publishing each datagram as a
+/// finished event is what exposed locked and crossed intermediate books to every consumer honouring
+/// `last`.
+#[derive(Default)]
+struct ChannelBatching {
+    /// Instruments whose last published batch carried `last: false`, still owed a closing batch.
+    /// Only a batch that actually reached the wire enters this — nothing else leaves a consumer
+    /// buffering.
+    ///
+    /// Discharged by the next boundary, or by the fallback, which closes whatever is left here.
+    /// The paths that instead **drop** this map — channel reset, `EndOfSession`, publisher
+    /// eviction — deliberately emit nothing: each has already forgotten the books, so `send_book`
+    /// could not resolve one anyway, and closing the event there would commit the consumer's
+    /// half-applied buffer. Leaving it buffered is the correct state, because what those paths
+    /// lead to is a `Clear`-led re-baseline, and the consumer applies its stale buffer and then
+    /// the `Clear` that discards it in one fold.
+    open: BTreeSet<u32>,
+    /// `recv_ts_ns` of the datagram carrying the last boundary — the clock
+    /// [`BOUNDARY_TIMEOUT_NS`] is measured on. `0` when that stamp was unavailable.
+    last_boundary_ns: u64,
+    /// Market-data datagrams since the last boundary, against [`MAX_DATAGRAMS_WITHOUT_BOUNDARY`].
+    since_boundary: u32,
+    /// Whether a boundary has ever been observed here. A channel whose venue publishes none keeps
+    /// the one-event-per-datagram behaviour rather than buffering against a signal that never comes.
+    seen: bool,
+}
+
+impl ChannelBatching {
+    /// Whether the venue has gone [`BOUNDARY_TIMEOUT_NS`] without a boundary. Both stamps must be
+    /// real — `0` is the "not available" sentinel on `recv_ts_ns`, and measuring against it would
+    /// read every datagram as decades overdue and disable batching outright. `saturating_sub` so a
+    /// backwards clock step reads as "not overdue" rather than wrapping into one.
+    fn boundary_overdue(&self, now_ns: u64) -> bool {
+        self.last_boundary_ns != 0
+            && now_ns != 0
+            && now_ns.saturating_sub(self.last_boundary_ns) > BOUNDARY_TIMEOUT_NS
+    }
+}
+
 /// Deltas [`MbpProcessor`] holds buffered **across every book** before the overflow policy fires —
 /// distinct from `pricebook`'s per-book `MAX_BUFFERED_DELTAS` (2^18), which bounds nothing useful in
 /// aggregate: [`MAX_PRICE_BOOKS`] books at that cap is 2^30 deltas. This is the bound that holds, and
@@ -2089,6 +2150,9 @@ pub struct MbpProcessor {
     /// `last_reset` already holds, so its keys stay a subset of that map's and `channel_order`
     /// bounds and evicts it with no queue of its own.
     last_batch: HashMap<(IpAddr, u8), u32>,
+    /// Batch-boundary state per `(publisher, channel)` — see [`ChannelBatching`]. Keyed and bounded
+    /// exactly like `last_batch`.
+    batching: HashMap<(IpAddr, u8), ChannelBatching>,
     /// Insertion order of the `last_reset`/`open` keys, for the [`MAX_CHANNEL_KEYS`] eviction.
     channel_order: VecDeque<(IpAddr, u8)>,
     /// Deltas buffered across every book, kept in step by [`Self::with_book`] so the budget check is
@@ -2136,6 +2200,7 @@ impl MbpProcessor {
             dropped_order: VecDeque::new(),
             last_reset: HashMap::new(),
             last_batch: HashMap::new(),
+            batching: HashMap::new(),
             channel_order: VecDeque::new(),
             buffered_total: 0,
             health_reported: HashMap::new(),
@@ -2227,6 +2292,7 @@ impl MbpProcessor {
                     Some(old) => {
                         self.last_reset.remove(&old);
                         self.last_batch.remove(&old);
+                        self.batching.remove(&old);
                         self.open.remove(&old);
                     }
                     None => break,
@@ -2351,6 +2417,7 @@ impl MbpProcessor {
         self.dropped_order.retain(|(p, _)| *p != publisher);
         self.last_reset.retain(|(p, _), _| *p != publisher);
         self.last_batch.retain(|(p, _), _| *p != publisher);
+        self.batching.retain(|(p, _), _| *p != publisher);
         self.channel_order.retain(|(p, _)| *p != publisher);
         // Belt and braces: `forget_book` already removed these for every key that had a book, but a
         // reveal without a surviving book must not leave an orphan behind.
@@ -2461,6 +2528,7 @@ impl MbpProcessor {
         // describes nothing here: on a publisher whose numbering restarts it names a slot ahead of
         // the whole new era. Back to absent until the new era commits its first batch.
         self.last_batch.remove(&(ctx.publisher, channel));
+        self.batching.remove(&(ctx.publisher, channel));
         if let Some(state) = self.state.state_mut(ctx.publisher) {
             state.on_datagram(reset_count);
         }
@@ -2491,12 +2559,17 @@ impl MbpProcessor {
     /// Emit a full re-baseline for one instrument: `Clear{Both}` then every level it now holds.
     /// `changes[0].action == Clear` is what re-baselines a consumer (the `snapshot` flag is
     /// advisory), so this is a batch rather than a distinct message type.
-    fn emit_rebaseline(&self, ctx: &DatagramCtx, channel: u8, instrument_id: u32) {
+    ///
+    /// Always `last: true`, on a batching channel included: this is complete state, so it is its
+    /// own consistency point and there is nothing for a boundary to add to it.
+    ///
+    /// Returns whether a batch reached the wire — see [`Self::send_book`].
+    fn emit_rebaseline(&self, ctx: &DatagramCtx, channel: u8, instrument_id: u32) -> bool {
         let Some(book) = self.books.get(&(ctx.publisher, channel, instrument_id)) else {
-            return;
+            return false;
         };
         let Some((price_exp, qty_exp)) = self.exponents(ctx.publisher, instrument_id) else {
-            return;
+            return false;
         };
         let level = |side: BookSide, price_raw: i64, qty_raw: u64| BookChange {
             action: BookAction::Update,
@@ -2514,7 +2587,7 @@ impl MbpProcessor {
         }];
         changes.extend(book.bids().map(|(p, l)| level(BookSide::Bid, p, l.qty_raw)));
         changes.extend(book.asks().map(|(p, l)| level(BookSide::Ask, p, l.qty_raw)));
-        self.send_book(ctx, channel, instrument_id, changes, true);
+        self.send_book(ctx, channel, instrument_id, changes, true, true)
     }
 
     /// The one place a `book` reaches the arbiter: resolves the display symbol and the book's event
@@ -2522,6 +2595,10 @@ impl MbpProcessor {
     /// applies to `book` exactly as it does to the definition — nothing is emitted for a market
     /// until its Source ID is known; this is the safety net every caller ultimately routes through,
     /// so a snapshot-only re-baseline from `emit_rebaseline` can never slip out ahead of a reveal).
+    ///
+    /// Returns whether a batch actually reached the wire, which is what [`Self::note_batch`] keys
+    /// on: a batch refused here leaves no consumer buffering, so it must not open an event that a
+    /// boundary then has to close.
     fn send_book(
         &self,
         ctx: &DatagramCtx,
@@ -2529,19 +2606,20 @@ impl MbpProcessor {
         instrument_id: u32,
         changes: Vec<BookChange>,
         snapshot: bool,
-    ) {
+        last: bool,
+    ) -> bool {
         let key = (ctx.publisher, channel, instrument_id);
         let Some(&source_id) = self.revealed.get(&key) else {
-            return;
+            return false;
         };
         let Some(book) = self.books.get(&key) else {
-            return;
+            return false;
         };
         if book.status() != BookStatus::Ready {
-            return;
+            return false;
         }
         let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
-            return; // precision unknown; don't emit prices we can't scale
+            return false; // precision unknown; don't emit prices we can't scale
         };
         let venue: &'static str = source_label(source_id);
         let source = venue_arc(venue);
@@ -2557,12 +2635,44 @@ impl MbpProcessor {
             changes,
             batch_id: self.last_batch.get(&(ctx.publisher, channel)).copied(),
             snapshot,
-            last: true,
+            last,
             source_ts_ns: book.last_event_ts(),
             recv_ts_ns: ctx.recv_ts_ns,
             kernel_rx_ts_ns: ctx.kernel_rx_ts_ns,
             ws_send_ts_ns: 0, // stamped by the WS server just before send
         }));
+        true
+    }
+
+    /// Whether this channel's per-datagram batches are intermediate — a `BatchBoundary` has been
+    /// observed and one is still expected. False for a channel whose venue publishes none, and
+    /// false again once the boundaries have stopped (see [`BOUNDARY_TIMEOUT_NS`]).
+    fn batches_events(&self, publisher: IpAddr, channel: u8, now_ns: u64) -> bool {
+        self.batching.get(&(publisher, channel)).is_some_and(|b| {
+            b.seen
+                && b.since_boundary <= MAX_DATAGRAMS_WITHOUT_BOUNDARY
+                && !b.boundary_overdue(now_ns)
+        })
+    }
+
+    /// Record that `instrument_id`'s event is open (`last: false` published) or closed.
+    fn note_batch(&mut self, publisher: IpAddr, channel: u8, instrument_id: u32, last: bool) {
+        let Some(state) = self.batching.get_mut(&(publisher, channel)) else {
+            return;
+        };
+        if last {
+            state.open.remove(&instrument_id);
+        } else {
+            state.open.insert(instrument_id);
+        }
+    }
+
+    /// Take the instruments still owed a closing batch on this channel, leaving none behind.
+    fn take_open(&mut self, publisher: IpAddr, channel: u8) -> BTreeSet<u32> {
+        self.batching
+            .get_mut(&(publisher, channel))
+            .map(|b| std::mem::take(&mut b.open))
+            .unwrap_or_default()
     }
 }
 
@@ -2653,6 +2763,14 @@ impl DatagramProcessor for MbpProcessor {
                 .is_some_and(|prev| prev != header.reset_count)
         {
             self.on_channel_reset(ctx, channel, header.reset_count);
+        }
+        // A venue event spans datagrams, so the wedge fallback counts them. Scoped to the
+        // market-data role and to a channel `note_reset_count` already tracks, exactly like
+        // `last_batch`: a boundary is a market-data type, and this map is bounded by that map's
+        // eviction rather than one of its own.
+        if ctx.role.handles_mktdata() && self.last_reset.contains_key(&(ctx.publisher, channel)) {
+            let state = self.batching.entry((ctx.publisher, channel)).or_default();
+            state.since_boundary = state.since_boundary.saturating_add(1);
         }
 
         // Wire changes per instrument, emitted once per datagram; a `BTreeMap` gives deterministic
@@ -3087,6 +3205,7 @@ impl DatagramProcessor for MbpProcessor {
                     // The ended session numbered the channel's batches, so its slot goes with it —
                     // same era scoping as `on_channel_reset`.
                     self.last_batch.remove(&(ctx.publisher, channel));
+                    self.batching.remove(&(ctx.publisher, channel));
                     // Any group assembling belonged to the session that just ended, so it goes too
                     // — leaving a tombstone, since its remaining levels are still on the wire.
                     if let Some(group) = self.open.remove(&(ctx.publisher, channel)) {
@@ -3111,6 +3230,27 @@ impl DatagramProcessor for MbpProcessor {
                         && self.last_reset.contains_key(&(ctx.publisher, channel))
                     {
                         self.last_batch.insert((ctx.publisher, channel), b.batch_id);
+                        // The boundary is the venue's consistency point, so it is where a logical
+                        // event ends: every instrument left open since the previous one is closed
+                        // here, folding in whatever this datagram accumulated for it beforehand.
+                        // Messages after the boundary belong to the next event and stay in `accum`.
+                        let state = self.batching.entry((ctx.publisher, channel)).or_default();
+                        state.seen = true;
+                        state.since_boundary = 0;
+                        state.last_boundary_ns = ctx.recv_ts_ns;
+                        let mut closing = std::mem::take(&mut state.open);
+                        closing.extend(accum.keys().copied());
+                        for id in closing {
+                            let changes = accum.remove(&id).unwrap_or_default();
+                            if revealed_this_datagram.remove(&id) {
+                                self.emit_rebaseline(ctx, channel, id);
+                            } else {
+                                // An empty closing batch is the ordinary case for an instrument
+                                // this datagram did not touch, and PROTOCOL.md allows it: what a
+                                // buffering consumer needs is the `last`, not more changes.
+                                self.send_book(ctx, channel, id, changes, false, true);
+                            }
+                        }
                     }
                     // The crossed-book consistency point: within a batch the inside market may
                     // legitimately cross. Observability only — it must never change status or
@@ -3195,29 +3335,52 @@ impl DatagramProcessor for MbpProcessor {
         cleared.clear();
         self.cleared = cleared;
         self.enforce_buffer_budget(ctx);
-        // One batch per instrument, `last: true`: a datagram is one logical event per instrument, since
-        // cross-instrument atomicity is not promised. A clear that removed nothing has no changes to
-        // publish.
+        // One batch per instrument. A clear that removed nothing has no changes to publish.
+        //
+        // `last` says whether that batch also ends the logical event. Where the venue publishes
+        // `BatchBoundary` it does not: one event's level changes routinely span two datagrams, and
+        // closing each of them exposed the locked and crossed intermediate states in between to
+        // every consumer honouring `last`. The boundary closes them instead (see
+        // [`ChannelBatching`]). Where it publishes none, a datagram remains the event — nothing
+        // else on the wire delimits one, and cross-instrument atomicity is not promised anyway.
         //
         // An instrument revealed THIS datagram always gets the full current book (`emit_rebaseline`),
         // never this datagram's own incremental `accum` batch alone — a consumer that has never seen
         // the market has no prior state an incremental update could apply against, and a reveal can
         // be followed by more deltas for the SAME instrument later in the SAME datagram, which must
         // still coalesce into that one re-baseline rather than a second, separate message.
+        let closes_event = !self.batches_events(ctx.publisher, channel, ctx.recv_ts_ns);
         let accum_keys: BTreeSet<u32> = accum.keys().copied().collect();
         for (instrument_id, changes) in accum {
-            if revealed_this_datagram.contains(&instrument_id) {
-                self.emit_rebaseline(ctx, channel, instrument_id);
+            let published = if revealed_this_datagram.contains(&instrument_id) {
+                self.emit_rebaseline(ctx, channel, instrument_id)
+                    .then_some(true)
             } else if !changes.is_empty() {
-                self.send_book(ctx, channel, instrument_id, changes, false);
+                self.send_book(ctx, channel, instrument_id, changes, false, closes_event)
+                    .then_some(closes_event)
+            } else {
+                None
+            };
+            if let Some(last) = published {
+                self.note_batch(ctx.publisher, channel, instrument_id, last);
             }
         }
         // Revealed this datagram via a message with no book-content representation of its own
         // (`Trade`) and no accompanying delta this datagram, so it never entered `accum` above — still
         // show whatever the book already holds (e.g. from an earlier silently-applied snapshot).
         for instrument_id in &revealed_this_datagram {
-            if !accum_keys.contains(instrument_id) {
-                self.emit_rebaseline(ctx, channel, *instrument_id);
+            if !accum_keys.contains(instrument_id)
+                && self.emit_rebaseline(ctx, channel, *instrument_id)
+            {
+                self.note_batch(ctx.publisher, channel, *instrument_id, true);
+            }
+        }
+        // The wedge fallback discharging: batches close themselves again past the bound, so
+        // whatever the vanished boundaries left open is closed with them rather than held by a
+        // consumer for the life of the session.
+        if closes_event {
+            for id in self.take_open(ctx.publisher, channel) {
+                self.send_book(ctx, channel, id, Vec::new(), false, true);
             }
         }
         for id in touched {
@@ -6380,8 +6543,10 @@ mod tests {
         );
     }
 
-    /// A batch of level updates in one datagram coalesces into ONE `book` message per instrument, with
-    /// `last: true`. Cross-instrument atomicity is not promised, so per-datagram batching is correct.
+    /// A batch of level updates in one datagram coalesces into ONE `book` message per instrument.
+    /// On a channel where the venue publishes no `BatchBoundary` — this one — the datagram is also
+    /// the logical event, so the batch carries `last: true`; nothing else on the wire delimits one,
+    /// and cross-instrument atomicity is not promised anyway.
     #[test]
     fn mbp_one_book_message_per_instrument_per_datagram() {
         let (arbiter, mut rx, instruments) = mbp_harness();
@@ -6807,6 +6972,222 @@ mod tests {
             &ctx,
         );
         assert_eq!(last_batch_id(&mut rx), Some(900));
+    }
+
+    /// A venue event whose level changes span two datagrams must not be published as two finished
+    /// events. Each intermediate batch carries `last: false` and the `BatchBoundary` — the venue's
+    /// own consistency point — closes it, so a consumer publishing only on `last` never sees the
+    /// locked inside market in between. Ellipsis measured 2,546 such states in 30 minutes on the
+    /// Phoenix feed, one of them SOL at bid 118.63 = ask 118.63.
+    #[test]
+    fn mbp_a_venue_event_spanning_two_datagrams_closes_only_at_the_boundary() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let boundary = |batch_id: u32| {
+            mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                batch_id,
+                batch_time: 5,
+            })
+        };
+        // Reveal, then seat an uncrossed book, then arm the channel with one boundary — a channel
+        // that has never seen one keeps the per-datagram behaviour and would not exercise this.
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]), &ctx);
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[
+                    mbp_level(41, 1, MBP_BID, 6200, 10, 7_000),
+                    mbp_level(41, 2, MBP_ASK, 6400, 10, 7_001),
+                ],
+            ),
+            &ctx,
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 5, &[boundary(900)]), &ctx);
+        let _ = drain_books(&mut rx);
+
+        // One venue event, two datagrams: the bid lifts to the resting ask, then the ask lifts
+        // away. Between them the book is locked.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 6, &[mbp_level(41, 3, MBP_BID, 6400, 10, 7_002)]),
+            &ctx,
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 7, &[mbp_level(41, 4, MBP_ASK, 6500, 10, 7_003)]),
+            &ctx,
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 8, &[boundary(901)]), &ctx);
+
+        let books = drain_books(&mut rx);
+        assert_eq!(
+            books.iter().map(|b| b.last).collect::<Vec<_>>(),
+            vec![false, false, true],
+            "the boundary closes the event, not either datagram"
+        );
+
+        // The consumer contract, driven through the same accumulator `sinks::ws` replays from: it
+        // publishes on `last`, so it must never hold a locked book.
+        let mut consumer = crate::model::BookAccumulator::new("TEST".into());
+        for b in &books {
+            consumer.apply(b);
+            if let (Some((bid, _)), Some((ask, _))) = (consumer.best_bid(), consumer.best_ask()) {
+                assert!(bid < ask, "consumer saw a locked book: bid {bid} ask {ask}");
+            }
+        }
+        let (bid, ask) = (
+            consumer.best_bid().expect("a bid"),
+            consumer.best_ask().expect("an ask"),
+        );
+        assert!(bid.0 < ask.0, "and lands on the event's real state");
+    }
+
+    /// The wedge PROTOCOL.md warns about under `last`, and the case that actually produces it: an
+    /// instrument whose event was left open by a `last: false` batch and which then sees no further
+    /// change before the boundaries stop. It is owed a closing batch by nothing else on the wire, so
+    /// the fallback has to emit one — with no changes, which is what PROTOCOL.md allows and all a
+    /// buffering consumer needs.
+    #[test]
+    fn a_stalled_channel_closes_the_event_it_left_open() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        // The bound is wall clock, read off each datagram's own `recv_ts_ns`.
+        let at = |ns: u64| {
+            let mut c = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+            c.recv_ts_ns = ns;
+            c
+        };
+        const T0: u64 = 1_700_000_000_000_000_000;
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]), &at(T0));
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                    batch_id: 900,
+                    batch_time: 5,
+                })],
+            ),
+            &at(T0),
+        );
+        let _ = drain_books(&mut rx);
+
+        // 41's event opens, and then the venue stops: no further change for it, no boundary.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 5, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &at(T0 + 1),
+        );
+        let opened = drain_books(&mut rx);
+        assert_eq!(
+            opened.iter().map(|b| b.last).collect::<Vec<_>>(),
+            vec![false],
+            "the batch is intermediate; the boundary was to close it"
+        );
+        assert!(
+            proc.batching[&(TEST_PUB, 0)].open.contains(&41),
+            "precondition: 41 is owed a closing batch"
+        );
+
+        // Inside the window nothing is forced, even on a datagram touching no book at all.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 6, &[mbp_wire::enc_heartbeat(7_001)]),
+            &at(T0 + super::BOUNDARY_TIMEOUT_NS),
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "a slow venue is not a stopped one"
+        );
+
+        // Past it, 41 is closed exactly once and with nothing to apply.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 7, &[mbp_wire::enc_heartbeat(7_002)]),
+            &at(T0 + super::BOUNDARY_TIMEOUT_NS + 2),
+        );
+        let closed = drain_books(&mut rx);
+        assert_eq!(closed.len(), 1, "exactly one closing batch, got {closed:?}");
+        assert!(closed[0].last && closed[0].changes.is_empty());
+        assert_eq!(closed[0].instrument_id, 41);
+        assert!(
+            proc.batching[&(TEST_PUB, 0)].open.is_empty(),
+            "nothing is left owed"
+        );
+
+        // And the channel is back to a datagram being the event.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 8, &[mbp_level(41, 2, MBP_BID, 6300, 20, 7_003)]),
+            &at(T0 + super::BOUNDARY_TIMEOUT_NS + 3),
+        );
+        assert_eq!(
+            drain_books(&mut rx)
+                .iter()
+                .map(|b| b.last)
+                .collect::<Vec<_>>(),
+            vec![true],
+            "per-datagram closing resumes"
+        );
+    }
+
+    /// The datagram backstop, which is reachable only where `recv_ts_ns` is the `0` sentinel and
+    /// there is no clock to measure the timeout on. Same outcome, counted rather than timed.
+    #[test]
+    fn mbp_batches_close_themselves_again_when_the_boundaries_stop() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        // `make_ctx` stamps `recv_ts_ns: 0`, which is exactly the unstamped case.
+        let ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]), &ctx);
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                    batch_id: 900,
+                    batch_time: 5,
+                })],
+            ),
+            &ctx,
+        );
+        let _ = drain_books(&mut rx);
+
+        let mut last_flags = Vec::new();
+        for n in 0..=super::MAX_DATAGRAMS_WITHOUT_BOUNDARY {
+            proc.on_datagram(
+                &mbp_wire::datagram(
+                    0,
+                    0,
+                    100 + n as u64,
+                    &[mbp_level(
+                        41,
+                        n + 1,
+                        MBP_BID,
+                        6200 + n as i64,
+                        10,
+                        7_000 + n as u64,
+                    )],
+                ),
+                &ctx,
+            );
+            last_flags.extend(drain_books(&mut rx).iter().map(|b| b.last));
+        }
+
+        let closed: Vec<usize> = last_flags
+            .iter()
+            .enumerate()
+            .filter(|(_, last)| **last)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            closed,
+            vec![last_flags.len() - 1],
+            "exactly one batch closes, and it is the first past the bound"
+        );
+        assert!(
+            proc.batching[&(TEST_PUB, 0)].open.is_empty(),
+            "nothing is left owed a closing batch"
+        );
     }
 
     /// `Batch ID` is monotonic only **within** a `Reset Count` era, so a channel reset takes the
