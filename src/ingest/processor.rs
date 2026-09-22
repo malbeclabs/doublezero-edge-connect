@@ -2036,6 +2036,12 @@ struct ChannelBatching {
     /// Whether a boundary has ever been observed here. A channel whose venue publishes none keeps
     /// the one-event-per-datagram behaviour rather than buffering against a signal that never comes.
     seen: bool,
+    /// Set when a boundary named a slot this channel has already committed, and cleared by the next
+    /// one that passes it. While it holds, `batch_id` is **absent** rather than backwards — see the
+    /// `BatchBoundary` arm. Lives here, not beside `last_batch`, because a `Reset Count` change and
+    /// an `EndOfSession` drop this map, and both start a new era in which the old high-water means
+    /// nothing.
+    slot_regressed: bool,
 }
 
 impl ChannelBatching {
@@ -2662,7 +2668,7 @@ impl MbpProcessor {
             category: category_arc(ctx.category),
             order_level: false,
             changes,
-            batch_id: self.last_batch.get(&(ctx.publisher, channel)).copied(),
+            batch_id: self.committed_slot(ctx.publisher, channel),
             snapshot,
             last,
             source_ts_ns: book.last_event_ts(),
@@ -2671,6 +2677,20 @@ impl MbpProcessor {
             ws_send_ts_ns: 0, // stamped by the WS server just before send
         }));
         true
+    }
+
+    /// The slot this channel has committed, or `None` while it has none to claim: before the first
+    /// boundary, after a lapse or an era change drops it, and while a boundary has named a slot
+    /// below the one already committed (see the `BatchBoundary` arm).
+    fn committed_slot(&self, publisher: IpAddr, channel: u8) -> Option<u32> {
+        let regressed = self
+            .batching
+            .get(&(publisher, channel))
+            .is_some_and(|b| b.slot_regressed);
+        if regressed {
+            return None;
+        }
+        self.last_batch.get(&(publisher, channel)).copied()
     }
 
     /// Whether this channel's per-datagram batches are intermediate — a `BatchBoundary` has been
@@ -3284,12 +3304,37 @@ impl DatagramProcessor for MbpProcessor {
                     if ctx.role.handles_mktdata()
                         && self.last_reset.contains_key(&(ctx.publisher, channel))
                     {
-                        self.last_batch.insert((ctx.publisher, channel), b.batch_id);
+                        // ⚠️ A slot is monotonic within one publisher era, and PROTOCOL.md promises a
+                        // consumer its committed slot never moves backwards. A boundary naming one
+                        // this channel has already committed therefore describes state we cannot
+                        // place: the high-water stands and the stamp goes **absent** until the
+                        // publisher passes it, which is the same "unknown" `batch_id` a boundary
+                        // lapse already produces. Stamping it anyway walked 30 markets back five
+                        // slots in one second on the live feed; carrying the high-water forward
+                        // instead would claim a slot the batch's content is older than. (A 32-bit
+                        // slot wraps after ~36 years of one unbroken era; a restart resets the era
+                        // and this map with it.)
+                        let key = (ctx.publisher, channel);
+                        let regressed = self
+                            .last_batch
+                            .get(&key)
+                            .is_some_and(|committed| b.batch_id < *committed);
+                        if regressed {
+                            metrics()
+                                .mbp_slot_regressions
+                                .with_label_values(&[ctx.venue])
+                                .inc();
+                        } else {
+                            self.last_batch.insert(key, b.batch_id);
+                        }
                         // The boundary is the venue's consistency point, so it is where a logical
                         // event ends: every instrument left open since the previous one is closed
                         // here, folding in whatever this datagram accumulated for it beforehand.
                         // Messages after the boundary belong to the next event and stay in `accum`.
+                        // A regressed slot does not change that: the events still end here, they
+                        // just carry no slot.
                         let state = self.batching.entry((ctx.publisher, channel)).or_default();
+                        state.slot_regressed = regressed;
                         state.seen = true;
                         state.since_boundary = 0;
                         state.last_boundary_ns = ctx.recv_ts_ns;
@@ -7139,6 +7184,107 @@ mod tests {
         );
         proc.on_datagram(&mbp_wire::datagram(0, 0, 13, rest), &snap());
         assert_eq!(proc.health_reported.get(&key), Some(&true));
+    }
+
+    /// ⚠️ **A consumer's committed slot must never move backwards within an era** (PROTOCOL.md).
+    /// A boundary naming a slot this channel has already committed is therefore not propagated: the
+    /// high-water stands and `batch_id` goes absent until the publisher passes it. Measured on the
+    /// live feed after a 1.5 s stall: 30 markets took an empty closing batch stamped five slots
+    /// behind their own previous one, with no stale datagram and no boundary lapse to explain it.
+    #[test]
+    fn mbp_a_boundary_naming_a_committed_slot_unsets_the_stamp() {
+        let venue = "MbpSlotRegression";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let regressions = metrics().mbp_slot_regressions.with_label_values(&[venue]);
+        let before = regressions.get();
+        let ctx = |role| mbp_ctx(venue, &arbiter, &instruments, role);
+        let boundary = |batch_id: u32, batch_time: u64| {
+            mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                batch_id,
+                batch_time,
+            })
+        };
+        let mut proc = MbpProcessor::new(tape(false));
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
+            &ctx(PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &ctx(PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 0)]),
+            &ctx(PortRole::Mktdata),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 4, &[boundary(900, 5)]),
+            &ctx(PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 5, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &ctx(PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_books(&mut rx)
+                .iter()
+                .map(|b| (b.last, b.batch_id))
+                .collect::<Vec<_>>(),
+            vec![(false, Some(900))],
+            "precondition: the channel has committed slot 900"
+        );
+
+        // A later datagram, in sequence and in era, naming a slot five behind the committed one.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 6, &[boundary(895, 6)]),
+            &ctx(PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_books(&mut rx)
+                .iter()
+                .map(|b| (b.last, b.changes.len(), b.batch_id))
+                .collect::<Vec<_>>(),
+            vec![(true, 0, None)],
+            "the event still closes here, and claims no slot rather than an older one"
+        );
+        assert_eq!(regressions.get(), before + 1);
+
+        // Still absent while the publisher is below its own high-water.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 7, &[boundary(899, 7)]),
+            &ctx(PortRole::Mktdata),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 8, &[mbp_level(41, 2, MBP_BID, 6300, 20, 7_001)]),
+            &ctx(PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_books(&mut rx)
+                .iter()
+                .map(|b| b.batch_id)
+                .collect::<Vec<_>>(),
+            vec![None],
+            "899 is still behind 900"
+        );
+
+        // Past the high-water, the slot is knowable again.
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 9, &[boundary(901, 8)]),
+            &ctx(PortRole::Mktdata),
+        );
+        let _ = drain_books(&mut rx);
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 10, &[mbp_level(41, 3, MBP_BID, 6400, 30, 7_002)]),
+            &ctx(PortRole::Mktdata),
+        );
+        assert_eq!(
+            drain_books(&mut rx)
+                .iter()
+                .map(|b| b.batch_id)
+                .collect::<Vec<_>>(),
+            vec![Some(901)]
+        );
     }
 
     /// A reordered or duplicated market-data datagram is dropped whole, as it already is on the

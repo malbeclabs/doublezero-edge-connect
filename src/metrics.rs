@@ -262,6 +262,11 @@ pub struct Metrics {
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
     /// series that surfaces that wedge.
     pub mbp_duplicate_deltas: IntCounterVec,
+    /// `BatchBoundary` slots naming a slot the channel had already committed. The stamp goes absent
+    /// until the publisher passes its own high-water, so a consumer's committed slot never moves
+    /// backwards; a non-zero rate is the publisher restating a slot, or a reordered datagram the
+    /// sequence check did not catch.
+    pub mbp_slot_regressions: IntCounterVec,
     /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
     pub mbp_crossed: IntCounterVec,
     /// Publisher `Action`-vs-quantity disagreements by `kind`. Never changes the applied result.
@@ -713,6 +718,14 @@ impl Metrics {
                  above the publisher's real counter, which only a Reset Count clears.",
                 &["venue"],
             ),
+            mbp_slot_regressions: counter_vec(
+                &registry,
+                "dz_mbp_slot_regressions_total",
+                "BatchBoundary naming a slot the channel had already committed. The batch_id goes \
+                 absent until the publisher passes its high-water, so a consumer's committed slot \
+                 never moves backwards.",
+                &["venue"],
+            ),
             mbp_crossed: counter_vec(
                 &registry,
                 "dz_mbp_crossed_total",
@@ -1162,6 +1175,7 @@ mod tests {
             .with_label_values(&["KALSHI", "reset"])
             .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
+        m.mbp_slot_regressions.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
         m.mbp_divergence
             .with_label_values(&["KALSHI", "delete_with_quantity"])
@@ -1244,6 +1258,7 @@ mod tests {
             "dz_mbp_declined_rotation_levels_total",
             "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
+            "dz_mbp_slot_regressions_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",
             "dz_path_unmatched_trades_total",

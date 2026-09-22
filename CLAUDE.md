@@ -743,7 +743,12 @@ Modules are grouped by role under `src/`:
   publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
   `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
   `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
-  closes every open event at a slot the venue has left — committing each consumer's buffer mid-event. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
+  closes every open event at a slot the venue has left — committing each consumer's buffer mid-event.
+  ⚠️ Independently of that check, a boundary naming a slot the channel has **already committed** does
+  not move `last_batch`: the high-water stands and `batch_id` goes absent until the publisher passes
+  it (`dz_mbp_slot_regressions_total`, `ChannelBatching::slot_regressed`), because PROTOCOL.md
+  promises a consumer's committed slot never moves backwards within an era and carrying the
+  high-water forward instead would claim a slot the batch's content is older than. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
   `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
   whole-side clear would tell the consumer to drop levels this book still holds. Its
   `ManifestSummary`/`InstrumentDefinition` branches are `handle_refdata`-gated exactly like the three
