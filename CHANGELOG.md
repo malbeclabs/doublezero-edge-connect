@@ -55,10 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}`.
 - ⚠️ **A `BatchBoundary` naming a slot the channel had already committed walked every open
   market's `batch_id` backwards.** Seen live after a 1.5 s stall: 30 markets took an empty closing
-  batch stamped five slots behind their own previous one, with no stale datagram, no boundary lapse
-  and no path change to explain it. The committed slot is now a high-water per publisher era: a boundary below it
-  does not move it, and `batch_id` goes absent until the publisher passes it, so a consumer's
-  committed slot never moves backwards as PROTOCOL.md promises (`dz_mbp_slot_regressions_total`).
+  batch stamped five slots behind their own previous one, the observed cause being the publisher
+  relaying the slot of a block executed late on an abandoned fork. The committed slot is now a
+  high-water per publisher era: a boundary below it does not move it and `batch_id` goes absent
+  until the publisher passes it, so a consumer's committed slot never moves backwards whatever
+  produced it, as PROTOCOL.md promises (`dz_mbp_slot_regressions_total`).
 - ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset
   purges the instrument's wire Source ID in the same message that reports its book unhealthy, so the
   readmitting snapshot's healthy report had no venue to file the report under — and the
