@@ -603,8 +603,14 @@ Modules are grouped by role under `src/`:
   a book that was *not* being served stays unhealthy — that one is empty. Both directions are now
   counted, `reason="health"` and `reason="health_revert"` with a `rebaselined` label. Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
-  serving-path change (margin, silence, or that health override), a market's first admission, or a market
-  whose state was evicted. The re-baseline is a `clear` plus the new path's complete current level set,
+  serving-path change (margin, silence, or that health override), a market's first admission, a market
+  whose state was evicted, or ⚠️ **a batch dropped from the path the consumer was following**
+  (`force_rebaseline`, `reason="dropped_batch"`) — the override mutes that path's batches, and on a
+  market whose peer publishes nothing inside the window `last_admitted` never moves, so the path
+  resuming reads as a continuation onto a book missing them, silently and until some later
+  re-baseline. That is what served 183 crossed books over one night on two quiet Phoenix markets, the
+  rotation's own re-baseline included (the processor emits it before it reports health, so the gate
+  drops that too). The re-baseline is a `clear` plus the new path's complete current level set,
   `snapshot`/`last` true — so the gate accumulates **every eligible path's** book (`BookMarket::paths`), not
   only the serving one. Three constraints shape it: it is emitted lazily on that path's next *completed*
   logical event, never as a venue-wide burst of clears (most markets are idle, and `to_book` of a

@@ -41,6 +41,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **A batch dropped from the path a consumer was following left its book with a permanent hole,
+  and served a crossed book for minutes.** The per-market health override mutes the overridden path's
+  batches, which is correct only if the peer publishes: on a market whose peer sends nothing inside
+  the window — quiet markets, against an override measured at p50 0.65 s — `last_admitted` never
+  moves, so the path resuming looks like a continuation and the dropped changes are never
+  republished. The market's *own* re-baseline is dropped with them, because the processor emits a
+  snapshot install's re-baseline before it reports the book healthy again, so the gate refuses it as
+  a non-serving path's copy. Measured on the Oregon bridge: 183 crossed books served over one night
+  on two Phoenix markets (NEAR 109, ZEC 74), the side whose deltas fell inside a window frozen while
+  the other kept moving, each cluster lasting two to six minutes and ending only at the next
+  re-baseline the consumer actually received. Invisible to `dz_mbp_crossed_total`, which read 2 for
+  the night: the per-path books were consistent and uncrossed, and the crossing existed only in what
+  the gate emitted.
+
+  A drop now forces a re-baseline of that market when the batch came from the path the consumer was
+  following, discharged from whichever path next serves it off that path's own accumulator (every
+  eligible path's copies are folded in whether or not they are published, so the repair is complete).
+  Counted on the existing `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}` — the `mbo_` in
+  that name is historical; it is the one place forced re-baselines are counted. The health fix above
+  removes the trigger this ran on; the guard is what closes it for a genuine gap, and for the
+  hysteresis and handover work that follows.
 - ⚠️ **A publisher's own snapshot rotation was reported to the book gate as an unhealthy path, so
   every rotation moved the market to the peer and straight back.** A Market-by-Price book accepts a
   rotation captured ahead of the deltas it has applied *while it is `Ready`*: the group assembles

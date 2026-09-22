@@ -2450,7 +2450,9 @@ impl Arbiter {
         self.publish_book(key, b.clone());
     }
 
-    /// Mark a market unserveable until it is re-baselined, counting why.
+    /// Mark a market unserveable until it is re-baselined, counting why. Both gates use it: the
+    /// order-level racer on an unanswerable disagreement, and the single-path gate when it drops a
+    /// batch from the path the consumer is following.
     fn force_rebaseline(&mut self, key: &MarketKey, venue: &str, reason: &'static str) {
         if let Some(m) = self.book_markets.get_mut(key) {
             m.rebaseline = true;
@@ -3136,6 +3138,21 @@ impl Arbiter {
                 // the new path's current levels, which exist only if its copies were folded in all along.
                 self.accumulate_book(&key, publisher, b);
                 if !decision.emitted() {
+                    // ⚠️ Dropping a batch from the path the consumer is *following* punches a hole in
+                    // the book it holds, and nothing else here would ever repair it: the change never
+                    // reaches the wire, and if the peer publishes nothing for this market while the
+                    // override lasts — a quiet market, and the override is sub-second — then
+                    // `last_admitted` never moves, so when this path resumes serving its batches
+                    // continue as an ordinary delta series onto a book missing them. Measured: 183
+                    // crossed books served over one night on two quiet Phoenix markets, bid side
+                    // frozen where the dropped batch carried the bid deltas, each lasting until some
+                    // later re-baseline the consumer did receive. The market's own re-baseline is
+                    // dropped by this very path, since the processor emits it before it reports
+                    // health. So the drop forces one, discharged from whichever path next serves the
+                    // market, off that path's own accumulator (which folded the batch above).
+                    if prev == Some(publisher) {
+                        self.force_rebaseline(&key, &b.venue, "dropped_batch");
+                    }
                     self.vm(&b.venue).book_dropped[pub_idx(publisher)].inc();
                     return;
                 }
@@ -4964,6 +4981,66 @@ mod tests {
             "the venue is untouched"
         );
         assert_eq!(health.get(), before + 1);
+    }
+
+    /// ⚠️ **The hole the overnight crossed books came out of.** While a path is marked unhealthy for
+    /// one market its batches are dropped, and if the peer publishes nothing for that market in that
+    /// window — a quiet market against a sub-second override — `last_admitted` never moves, so the
+    /// path resuming looks like a continuation and its dropped changes are never republished. The
+    /// consumer then holds a book missing them for as long as nothing else re-baselines it: measured
+    /// as 183 crossed books served on two Phoenix markets in one night, the side whose deltas fell in
+    /// the window frozen while the other kept moving. The drop must therefore force the re-baseline
+    /// itself.
+    #[test]
+    fn dropping_the_followed_paths_batch_forces_a_rebaseline() {
+        let venue = "BookDroppedFollowedPath";
+        let forced = metrics()
+            .mbo_forced_rebaselines
+            .with_label_values(&[venue, "dropped_batch"]);
+        let before = forced.get();
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            path(1),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+
+        // Marked unhealthy here, path(1)'s own batch is dropped — and the peer sends nothing.
+        a.set_book_health(&key, path(1), false);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.41, 20.0)], true, 1_200),
+            path(1),
+            TEST_CATEGORY,
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "a path the gate is not serving is muted"
+        );
+        assert_eq!(forced.get(), before + 1);
+
+        // Healthy again and serving the market again: it must re-baseline rather than resume, or the
+        // dropped level is missing from the consumer's book for good.
+        a.set_book_health(&key, path(1), true);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 30.0)], true, 1_300),
+            path(1),
+            TEST_CATEGORY,
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1, "one re-baseline, not a bare continuation");
+        assert!(out[0].snapshot && out[0].last);
+        assert_eq!(
+            out[0].changes,
+            vec![
+                clear_both(),
+                bid(0.42, 30.0),
+                bid(0.41, 20.0),
+                bid(0.40, 10.0)
+            ],
+            "clear plus every level the path holds, the dropped batch's included"
+        );
     }
 
     /// The other half of a health episode, and the one that used to be invisible: the leader takes

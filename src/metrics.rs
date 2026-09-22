@@ -208,8 +208,9 @@ pub struct Metrics {
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
     pub book_resurrections_dropped: IntCounterVec,
-    /// Order-level markets forced to re-baseline because two paths claimed different resting state for
-    /// one order (`reason="disagreement"`).
+    /// Markets forced to re-baseline, by `reason`: `disagreement` (two paths claimed different
+    /// resting state for one order) and `dropped_batch` (the single-path gate dropped a batch from
+    /// the path the consumer was following). The `mbo_` in the name is historical.
     pub mbo_forced_rebaselines: IntCounterVec,
     /// Order-level changes refused because the batch carrying them is older than its channel's
     /// retention window — a link returning with a backlog, or a forged replay. Expected to spike once
@@ -781,10 +782,12 @@ impl Metrics {
             mbo_forced_rebaselines: counter_vec(
                 &registry,
                 "dz_mbo_forced_rebaselines_total",
-                "Order-level markets withheld and re-baselined because the cross-publisher guard \
-                 could not answer. reason=disagreement: two paths claimed different resting state for \
-                 one order, so neither is known to be right. A sustained rate is the signal to \
-                 reconsider the per-publisher book model.",
+                "Markets withheld and re-baselined because a gate could not carry the consumer's \
+                 book forward. reason=disagreement: two paths claimed different resting state for \
+                 one order, so neither is known to be right; a sustained rate is the signal to \
+                 reconsider the per-publisher book model. reason=dropped_batch: the single-path gate \
+                 dropped a batch from the path the consumer was following, so its book has a hole \
+                 only a re-baseline can close.",
                 &["venue", "reason"],
             ),
             mbo_events_past_frontier: counter_vec(
