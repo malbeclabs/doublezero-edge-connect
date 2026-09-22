@@ -262,10 +262,18 @@ pub struct Metrics {
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
     /// series that surfaces that wedge.
     pub mbp_duplicate_deltas: IntCounterVec,
-    /// `BatchBoundary` slots naming a slot the channel had already committed. The stamp goes absent
-    /// until the publisher passes its own high-water, so a consumer's committed slot never moves
-    /// backwards; a non-zero rate is one path's boundary stream naming a slot it had already
-    /// passed, or a reordered datagram the sequence check did not catch.
+    /// Logical events abandoned because their buffered changes outgrew the accumulator's cap. The
+    /// market is withheld from every bootstrap until a producer re-baseline, so a non-zero rate is
+    /// markets missing from connecting clients, not just a wide event.
+    pub book_events_abandoned: IntCounterVec,
+    /// Closing batches a publish gate refused (mid-rotation, gapped, not yet revealed). The
+    /// instrument stays owed its close and is retried at the next boundary; a sustained rate means
+    /// one path is holding markets it cannot publish.
+    pub mbp_closes_refused: IntCounterVec,
+    /// `BatchBoundary` naming a slot at or below the one its channel had already committed. It is
+    /// ignored — no event closes on it, the slot does not move — so a consumer's committed slot
+    /// never moves backwards; a non-zero rate is one path's boundary stream naming a slot it had
+    /// already passed.
     pub mbp_slot_regressions: IntCounterVec,
     /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
     pub mbp_crossed: IntCounterVec,
@@ -718,12 +726,26 @@ impl Metrics {
                  above the publisher's real counter, which only a Reset Count clears.",
                 &["venue"],
             ),
+            book_events_abandoned: counter_vec(
+                &registry,
+                "dz_book_events_abandoned_total",
+                "Logical events whose buffered changes outgrew the accumulator cap. The market is \
+                 withheld from bootstraps until it re-baselines.",
+                &["venue"],
+            ),
+            mbp_closes_refused: counter_vec(
+                &registry,
+                "dz_mbp_closes_refused_total",
+                "Closing batches a publish gate refused. The instrument stays owed its close and \
+                 is retried at the next boundary rather than forgotten.",
+                &["venue"],
+            ),
             mbp_slot_regressions: counter_vec(
                 &registry,
                 "dz_mbp_slot_regressions_total",
-                "BatchBoundary naming a slot the channel had already committed. The batch_id goes \
-                 absent until the publisher passes its high-water, so a consumer's committed slot \
-                 never moves backwards.",
+                "BatchBoundary naming a slot at or below the one the channel had already \
+                 committed. It is ignored: no event closes on it and the slot does not move, so a \
+                 consumer's committed slot never moves backwards.",
                 &["venue"],
             ),
             mbp_crossed: counter_vec(
@@ -1175,6 +1197,8 @@ mod tests {
             .with_label_values(&["KALSHI", "reset"])
             .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
+        m.book_events_abandoned.with_label_values(&["KALSHI"]).inc();
+        m.mbp_closes_refused.with_label_values(&["KALSHI"]).inc();
         m.mbp_slot_regressions.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
         m.mbp_divergence
@@ -1258,6 +1282,8 @@ mod tests {
             "dz_mbp_declined_rotation_levels_total",
             "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
+            "dz_book_events_abandoned_total",
+            "dz_mbp_closes_refused_total",
             "dz_mbp_slot_regressions_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",

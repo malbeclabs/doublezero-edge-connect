@@ -56,7 +56,22 @@ struct PreparedFrame {
     /// The frame's `recv_ts_ns`, carried so the join watermark can be applied without re-parsing
     /// the JSON. Only read for a `book_market` frame; `0` on the rest.
     recv_ts_ns: u64,
+    /// Whether this frame re-baselines its market (`changes[0].action == Clear`, the structural
+    /// rule PROTOCOL.md states). Read only for a market a client is waiting to be re-baselined —
+    /// see [`BookWatermarks`] — and computed here so the client loop parses nothing.
+    rebaselines: bool,
 }
+
+/// Markets one client has **not** been bootstrapped for, and must therefore not be handed
+/// incremental batches of until one re-baselines.
+///
+/// A market the replay skipped — accumulated partway through, or mid-event with changes still
+/// buffered behind their `last` — has batches the client can never place: the ones before the
+/// skip are in no bootstrap and, if they were broadcast before the client's `rx` subscribed, in
+/// no queue either. Applying what does arrive leaves the levels it did not touch at values the
+/// client invented, which is the frozen-side book with no way back. Withholding the market until
+/// its next `Clear`-led batch costs the client that market for one rotation and cannot corrupt it.
+type AwaitingRebaseline = std::collections::HashSet<BookKey>;
 
 /// Per-market join watermarks for one client: the `BookAccumulator::wire_ts_ns` each replayed
 /// market's bootstrap was materialized at.
@@ -70,6 +85,14 @@ struct PreparedFrame {
 /// Moving the `subscribe` after the snapshot instead would trade the overlap for a gap, which is
 /// the worse failure: a batch broadcast in that window would reach nobody.
 type BookWatermarks = std::collections::HashMap<BookKey, u64>;
+
+/// One client's per-market bootstrap state: what it was replayed and at what point, and what it
+/// was not replayed at all. Both are written by [`replay_scoped`] and read by the forwarding loop.
+#[derive(Default)]
+struct ClientBooks {
+    watermarks: BookWatermarks,
+    awaiting: AwaitingRebaseline,
+}
 
 /// Serialize one backbone message once: clone it, stamp the shared `ws_send_ts_ns`, render the JSON,
 /// and capture the fields the per-client filter needs. Returns `None` only if serialization fails
@@ -132,7 +155,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         }
         FeedMessage::Status(s) => (s.venue.clone(), None),
     };
-    let (book_market, recv_ts_ns) = match &m {
+    let (book_market, recv_ts_ns, rebaselines) = match &m {
         FeedMessage::Book(b) | FeedMessage::OrderBook(b) => (
             Some((
                 b.venue.clone(),
@@ -141,8 +164,12 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
                 b.instrument_id,
             )),
             b.recv_ts_ns,
+            // The structural rule, read here so the client loop parses nothing.
+            b.changes
+                .first()
+                .is_some_and(|c| c.action == crate::model::BookAction::Clear),
         ),
-        _ => (None, 0),
+        _ => (None, 0, false),
     };
     Some(Arc::new(PreparedFrame {
         payload,
@@ -152,6 +179,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
         channel: m.channel(),
         book_market,
         recv_ts_ns,
+        rebaselines,
     }))
 }
 
@@ -479,7 +507,7 @@ async fn replay_scoped<W>(
     books: &BookSnapshot,
     subs: &[SubFilter],
     what: Replay,
-    watermarks: &mut BookWatermarks,
+    books_seen: &mut ClientBooks,
 ) -> Result<()>
 where
     W: SinkExt<WsMessage> + Unpin,
@@ -523,37 +551,43 @@ where
     };
     let rebaselines: Vec<FeedMessage> = {
         let guard = crate::model::lock(books);
-        guard
-            .iter()
-            // A market accumulated partway through holds only the levels that have moved since, so
-            // replaying it as full state would tell the client to discard the ones it never saw.
-            .filter(|(_, acc)| acc.baselined())
+        let mut out = Vec::new();
+        for (key, acc) in guard.iter() {
             // The key's second element is the producer-side arbitration scope (`Feed::category`,
             // which keeps two universes' colliding instrument ids apart in the map); it is not a
             // filter dimension and never reaches the wire.
             // Filtered and tagged under the market's *own* type, matching the live feed it
-            // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and one
-            // subscribed to `book` alone must not be handed a market it cannot apply.
-            .filter(|((venue, _, channel, _), acc)| {
-                pass(venue, acc.symbol(), Some(*channel), book_kind(acc))
-            })
-            .map(|(key, acc)| {
-                // Recorded market by market, only for the ones actually sent: a market the filters
-                // skipped, or one not yet `baselined`, gets no bootstrap, so every queued batch for
-                // it is still the client's only copy. `0` means nothing has been folded in, which
-                // is no watermark at all.
-                if acc.wire_ts_ns() != 0 {
-                    let w = watermarks.entry(key.clone()).or_default();
-                    *w = (*w).max(acc.wire_ts_ns());
-                }
-                let book = acc.to_book(key, book_scope(acc));
-                if acc.is_order_level() {
-                    FeedMessage::OrderBook(book)
-                } else {
-                    FeedMessage::Book(book)
-                }
-            })
-            .collect()
+            // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and
+            // one subscribed to `book` alone must not be handed a market it cannot apply.
+            if !pass(&key.0, acc.symbol(), Some(key.2), book_kind(acc)) {
+                continue;
+            }
+            // A market accumulated partway through holds only the levels that have moved since, so
+            // replaying it as full state would tell the client to discard the ones it never saw.
+            // One **mid-event** is no better: `to_book` materializes folded state, so the batches
+            // still buffered behind their `last` are in no bootstrap, and any of them broadcast
+            // before this client's `rx` subscribed are in no queue either. Both are withheld, and
+            // the market is held back until it re-baselines (see `AwaitingRebaseline`).
+            if !acc.baselined() || !acc.pending_empty() {
+                books_seen.awaiting.insert(key.clone());
+                continue;
+            }
+            // Recorded market by market, only for the ones actually sent: a market the filters
+            // skipped gets no bootstrap, so every queued batch for it is still the client's only
+            // copy. `0` means nothing has been folded in, which is no watermark at all.
+            if acc.wire_ts_ns() != 0 {
+                let w = books_seen.watermarks.entry(key.clone()).or_default();
+                *w = (*w).max(acc.wire_ts_ns());
+            }
+            books_seen.awaiting.remove(key);
+            let book = acc.to_book(key, book_scope(acc));
+            out.push(if acc.is_order_level() {
+                FeedMessage::OrderBook(book)
+            } else {
+                FeedMessage::Book(book)
+            });
+        }
+        out
     };
     for m in snapshot.into_iter().chain(depths).chain(rebaselines) {
         write
@@ -576,7 +610,7 @@ async fn serve_client(
 
     // Per-client state. Empty `subs` = firehose (receive every venue/symbol).
     let mut subs: Vec<SubFilter> = Vec::new();
-    let mut watermarks = BookWatermarks::new();
+    let mut books_seen = ClientBooks::default();
 
     // Replay definitions (precision first) then current book state, so a consumer joining partway is
     // bootstrapped immediately instead of waiting for the next periodic book. (Quotes/trades are not
@@ -589,7 +623,7 @@ async fn serve_client(
         &books,
         &subs,
         Replay::Full,
-        &mut watermarks,
+        &mut books_seen,
     )
     .await?;
 
@@ -629,7 +663,7 @@ async fn serve_client(
                 &books,
                 &subs,
                 Replay::Books,
-                &mut watermarks,
+                &mut books_seen,
             )
             .await?;
             // Stamped *after* the write, not before it, so the pace bounds the duty cycle and not
@@ -682,7 +716,7 @@ async fn serve_client(
                                 // (taken under the mutex the ingest emit path shares) at the inbound
                                 // rate limit without ever reaching `max_subs`.
                                 if added {
-                                    replay_scoped(&mut write, &instruments, &depth, &books, std::slice::from_ref(&subscription), Replay::Full, &mut watermarks).await?;
+                                    replay_scoped(&mut write, &instruments, &depth, &books, std::slice::from_ref(&subscription), Replay::Full, &mut books_seen).await?;
                                 }
                             }
                         }
@@ -738,8 +772,17 @@ async fn serve_client(
                     // bootstrap ends exactly at the last folded batch of that set, so re-applying
                     // lands on the same state.
                     if let Some(key) = &frame.book_market {
-                        if watermarks.get(key).is_some_and(|&w| frame.recv_ts_ns < w) {
+                        if books_seen.watermarks.get(key).is_some_and(|&w| frame.recv_ts_ns < w) {
                             continue;
+                        }
+                        // A market this client was not bootstrapped for: withheld until it
+                        // re-baselines, since an incremental batch applied to a book the client
+                        // does not hold is a book it can never correct (see `AwaitingRebaseline`).
+                        if !books_seen.awaiting.is_empty() && books_seen.awaiting.contains(key) {
+                            if !frame.rebaselines {
+                                continue;
+                            }
+                            books_seen.awaiting.remove(key);
                         }
                     }
                     // One match path for every kind, venue-level included: a dimension added to
@@ -1984,6 +2027,86 @@ mod tests {
     /// Only a re-baselined market is bootstrapped. One accumulated partway through holds just the levels
     /// that have moved since, and `to_book` stamps `snapshot: true` — replaying it would tell the
     /// client to discard the rest of the book. Such a client waits for the producer's next
+    /// ⚠️ **A market mid-event at replay time is withheld, and stays withheld until it
+    /// re-baselines.** `to_book` materializes folded state, so the batches still buffered behind
+    /// their `last` are in no bootstrap — and the ones broadcast before this client's `rx`
+    /// subscribed are in no queue either, which no watermark can repair. Applying what does arrive
+    /// leaves the untouched levels at values the client invented.
+    #[tokio::test]
+    async fn a_market_mid_event_is_withheld_until_it_rebaselines() {
+        let mut mid_event = accumulator("KXBTCPERP", 0.61, 0.63);
+        mid_event.apply(&book_batch(
+            "KXBTCPERP",
+            vec![level_update(BookSide::Bid, 0.62, 7.0)],
+            false,
+        ));
+        assert!(mid_event.baselined() && !mid_event.pending_empty());
+        let key = (
+            Arc::<str>::from("KALSHI"),
+            Arc::<str>::from("perps"),
+            2u8,
+            41u32,
+        );
+        let mut books = BookReplay::default();
+        books.insert(key.clone(), mid_event);
+        let (srv, tx, addr) = spawn_server(HashMap::new(), books).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "no bootstrap for a market whose event is still open"
+        );
+
+        // The rest of that event must not reach the client either: it has no baseline to apply it
+        // to, and the batch that opened the event is in neither place.
+        let mut tail = book_batch(
+            "KXBTCPERP",
+            vec![level_update(BookSide::Ask, 0.64, 3.0)],
+            true,
+        );
+        tail.channel = 2;
+        tail.instrument_id = 41;
+        tail.category = "perps".into();
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(tail.clone())));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(200)).await,
+            None,
+            "an incremental batch onto a book the client does not hold"
+        );
+
+        // The market's next re-baseline releases it.
+        let mut rebuild = tail.clone();
+        rebuild.changes = vec![
+            BookChange {
+                action: BookAction::Clear,
+                side: BookSide::Both,
+                price: 0.0,
+                size: 0.0,
+                order_id: 0,
+            },
+            level_update(BookSide::Bid, 0.62, 7.0),
+        ];
+        rebuild.snapshot = true;
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(rebuild)));
+        let b = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("the re-baseline reaches the client"),
+        );
+        assert_eq!((b.channel, b.instrument_id), (2, 41));
+
+        // And the live feed flows from there.
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(tail)));
+        assert!(
+            next_frame(&mut ws, Duration::from_secs(2)).await.is_some(),
+            "the market is live again"
+        );
+        srv.abort();
+    }
+
     /// re-baseline, as it did before the book replay existed.
     #[tokio::test]
     #[serial]

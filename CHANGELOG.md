@@ -53,13 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were never republished. Such a drop now forces a re-baseline of that market, discharged off the
   serving path's own accumulator and counted as
   `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}`.
-- ⚠️ **A `BatchBoundary` naming a slot the channel had already committed walked every open
-  market's `batch_id` backwards.** Seen live after a 1.5 s stall: 30 markets took an empty closing
-  batch stamped five slots behind their own previous one, the observed cause being the publisher
-  relaying the slot of a block executed late on an abandoned fork. The committed slot is now a
-  high-water per publisher era: a boundary below it does not move it and `batch_id` goes absent
-  until the publisher passes it, so a consumer's committed slot never moves backwards whatever
-  produced it, as PROTOCOL.md promises (`dz_mbp_slot_regressions_total`).
+- ⚠️ **A `BatchBoundary` naming a slot at or below the one its channel had already committed closed
+  every open market's event and stamped it backwards.** Seen live after a 1.5 s stall: 30 markets
+  took an empty closing batch five slots behind their own previous one, the observed cause being
+  the publisher relaying the slot of a block executed late on an abandoned fork. Such a boundary is
+  now ignored, no event closes on it, and a failover to a path whose own boundary stream is behind
+  withholds `batch_id` until it passes — a committed slot never moves backwards, whatever produced
+  it (`dz_mbp_slot_regressions_total`).
+- ⚠️ **A closing batch the publish gate refused was forgotten, leaving every consumer buffering that
+  event for good** — routine now that a path keeps a market through its own snapshot rotation. The
+  instrument stays owed its close and is retried (`dz_mbp_closes_refused_total`), a rebuild records
+  the close it performs, and a rotation that never installs gives the market up after 15 s rather
+  than holding it unpublished. A client is no longer bootstrapped mid-event either: a market whose
+  event is still open is withheld until it re-baselines instead of handed a book it cannot complete.
 - ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset
   purges the instrument's wire Source ID in the same message that reports its book unhealthy, so the
   readmitting snapshot's healthy report had no venue to file the report under — and the

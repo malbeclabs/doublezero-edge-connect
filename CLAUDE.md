@@ -817,7 +817,12 @@ Modules are grouped by role under `src/`:
   work. On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
   materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
-  every other dimension), then streams quotes/trades/midpoints/depth/book. ⚠️ **A replayed market
+  every other dimension), then streams quotes/trades/midpoints/depth/book. ⚠️ **A market the
+  bootstrap skips is withheld from that client until it re-baselines** (`AwaitingRebaseline`): one
+  accumulated partway holds only what moved since, and one **mid-event** has batches buffered
+  behind their `last` that are in no bootstrap and — if they were broadcast before this client's
+  `rx` subscribed — in no queue either, so applying what does arrive leaves the untouched levels at
+  invented values. ⚠️ **A replayed market
   records a per-client watermark and every `replay_scoped()` call takes one**, because `rx` is
   subscribed in the accept loop and the caches are read after the handshake, so the frames in
   between are queued *behind* a bootstrap that already holds them — harmless on full-state
