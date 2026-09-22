@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were never republished. Such a drop now forces a re-baseline of that market, discharged off the
   serving path's own accumulator and counted as
   `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}`.
+- ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset
+  purges the instrument's wire Source ID in the same message that reports its book unhealthy, so the
+  readmitting snapshot's healthy report had no venue to file the report under — and the
+  transition memo recorded it as filed regardless, leaving the path unhealthy at the gate while its
+  book was `Ready`. The memo now records only a report that was actually filed, so a subscriber's
+  book unfreezes when the *first* publisher readmits rather than when the last one does.
 - ⚠️ **A reordered or duplicated market-data datagram closed every open book event on its
   channel**, at a slot the venue had already left: Market-by-Price ran no stale-datagram check and a
   `BatchBoundary` carries no sequence of its own. It now runs the shared `SeqTracker` per publisher

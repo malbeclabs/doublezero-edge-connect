@@ -734,7 +734,11 @@ Modules are grouped by role under `src/`:
   O(1); a test recomputes the true sum after every mutation path. Per-market health transitions are
   reported to the arbiter's `StickyAuthority` (`set_book_health`) off `serves_a_book()`, never
   `status()`, which is what fails a gapped path over to its peer without failing over a healthy one
-  mid-rotation. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
+  mid-rotation. ⚠️ That report's transition memo records what was **filed**, never what was
+  computed (#163): an `InstrumentReset` purges `revealed` in the same message that reports unhealth,
+  so the install that readmits the instrument has no venue to file under, and marking that report
+  done would leave the path unhealthy at the gate with a `Ready` book — the market then sits on a
+  stale peer while a live path is on the wire. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
   and publishes nothing until the install's re-baseline. It also runs the shared `SeqTracker` per
   publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
   `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a

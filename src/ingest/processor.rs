@@ -2494,23 +2494,31 @@ impl MbpProcessor {
         }
     }
 
-    /// Report one book's `Ready`-ness for its market, but only when it changed: an unhealthy path
-    /// loses the market to its peer, so this is a transition signal rather than a per-datagram one.
+    /// Report one book's health for its market, but only when it changed: an unhealthy path loses
+    /// the market to its peer, so this is a transition signal rather than a per-datagram one.
     fn report_health(&mut self, ctx: &DatagramCtx, key: &PriceBookKey, healthy: bool) {
         if self.health_reported.get(key) == Some(&healthy) {
             return;
         }
-        self.health_reported.insert(*key, healthy);
         // `self.wire_venue(key)` — not `ctx.venue` — to match the `MarketKey` the arbiter itself
         // builds off the emitted `book`'s own venue field on admission (`b.venue.clone()`): a
         // health report keyed by the feed row's static venue would target a `MarketKey` no book
         // was ever admitted under, once this feed's instruments carry distinct wire Source IDs.
         // `None` before this key is revealed: nothing was ever admitted for it, so there is no
-        // `MarketKey` to report health against yet either — it self-heals once revealed (the
-        // rebaseline that follows is what actually establishes the market).
+        // `MarketKey` to report health against yet either.
+        //
+        // ⚠️ **The memo records what was FILED, never what was computed**, which is why it is written
+        // below this gate rather than above it. An `InstrumentReset` purges `revealed` in the same
+        // message that reports unhealth, so the install that readmits the instrument reports healthy
+        // while the venue is still unresolvable: marking that report done would swallow the
+        // transition, leaving the path unhealthy at the gate for the life of the process while its
+        // book is `Ready` — the market then sits on a stale peer with a live path on the wire.
+        // Unfiled, it is retried on the next datagram that touches the book, which is the one the
+        // reveal rides in on.
         let Some(venue) = self.wire_venue(key) else {
             return;
         };
+        self.health_reported.insert(*key, healthy);
         // `ctx.category` for the same reason: the arbiter keys the market on the emitting row's
         // instrument universe, so a report filed without it targets nothing the gate ever admitted.
         // `ctx.canonical_channel`, not the raw `key.1`, so a mirror path's health report lands on
@@ -7027,6 +7035,71 @@ mod tests {
         assert!(
             !drain_books(&mut rx).is_empty(),
             "the install re-baselines the market — one publisher-driven re-baseline per rotation"
+        );
+    }
+
+    /// ⚠️ **A readmitted instrument has to reach the gate as healthy again.** Both publishers
+    /// reset one market, so neither path serves it; the first to readmit must take it. Measured
+    /// failure: after a simultaneous `InstrumentReset` on SOL, one publisher readmitted 113 s later
+    /// and the other 476 s later, and the bridge served the *stale* path throughout — a subscriber
+    /// held a frozen book for eight minutes with a live one on the wire.
+    ///
+    /// The reset purges `revealed` in the same message that reports unhealth, so the install's own
+    /// health report cannot resolve a venue to file under. `report_health` must therefore not record
+    /// a report it could not file, or the recovery transition is swallowed and the path stays
+    /// unhealthy at the gate for the life of the process.
+    #[test]
+    fn mbp_a_readmitted_instrument_reports_healthy_again() {
+        use crate::ingest::sources::source_label;
+
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
+        let market: MarketKey = (
+            venue_arc(source_label(0)),
+            category_arc("testcategory"),
+            0,
+            41,
+        );
+        let healthy = || {
+            lock(&arbiter)
+                .authority()
+                .healthy(&market, Transport::Edge(TEST_PUB))
+        };
+        let mkt = || make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let snap = || make_ctx(&arbiter, &instruments, PortRole::Snapshot);
+
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 10, &[mbp_level(41, 1, MBP_BID, 6200, 10, 7_000)]),
+            &mkt(),
+        );
+        let _ = drain_books(&mut rx);
+
+        // The publisher resets 41, which is what takes the market off this path.
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 11, &[mbp_reset(41, 11)]), &mkt());
+        assert!(!healthy(), "precondition: the reset reported unhealthy");
+
+        // It readmits with a snapshot anchored at the reset, then resumes deltas.
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                12,
+                &mbp_snapshot(41, 2, 11, 0, &[(MBP_BID, 6300, 20)]),
+            ),
+            &snap(),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 13, &[mbp_level(41, 1, MBP_BID, 6400, 30, 7_002)]),
+            &mkt(),
+        );
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+        assert!(
+            healthy(),
+            "a readmitted book must reach the gate as healthy, or it keeps serving the stale peer"
+        );
+        assert!(
+            !drain_books(&mut rx).is_empty(),
+            "and the readmitted market re-baselines"
         );
     }
 
