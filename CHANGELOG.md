@@ -55,8 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}`.
 - ⚠️ **A `BatchBoundary` naming a slot the channel had already committed walked every open
   market's `batch_id` backwards.** Seen live after a 1.5 s stall: 30 markets took an empty closing
-  batch stamped five slots behind their own previous one, with no stale datagram and no boundary
-  lapse to explain it. The committed slot is now a high-water per publisher era: a boundary below it
+  batch stamped five slots behind their own previous one, with no stale datagram, no boundary lapse
+  and no path change to explain it. The committed slot is now a high-water per publisher era: a boundary below it
   does not move it, and `batch_id` goes absent until the publisher passes it, so a consumer's
   committed slot never moves backwards as PROTOCOL.md promises (`dz_mbp_slot_regressions_total`).
 - ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset

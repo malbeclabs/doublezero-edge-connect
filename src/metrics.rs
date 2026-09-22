@@ -264,8 +264,8 @@ pub struct Metrics {
     pub mbp_duplicate_deltas: IntCounterVec,
     /// `BatchBoundary` slots naming a slot the channel had already committed. The stamp goes absent
     /// until the publisher passes its own high-water, so a consumer's committed slot never moves
-    /// backwards; a non-zero rate is the publisher restating a slot, or a reordered datagram the
-    /// sequence check did not catch.
+    /// backwards; a non-zero rate is one path's boundary stream naming a slot it had already
+    /// passed, or a reordered datagram the sequence check did not catch.
     pub mbp_slot_regressions: IntCounterVec,
     /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
     pub mbp_crossed: IntCounterVec,
