@@ -602,6 +602,13 @@ impl SeqTracker {
     /// last-seen value, per spec) re-anchors to this datagram's sequence; otherwise the sequence
     /// is compared within the era. The tracker is only advanced for accepted datagrams, so a
     /// dropped stale datagram leaves the anchor on the freshest sequence.
+    /// Forget one channel's anchor, so the next datagram on it re-anchors (`SeqCheck::First`).
+    /// For the callers whose own state for that channel is gone — a publisher era change, a
+    /// session end — where keeping an anchor from the previous era can only refuse the new one.
+    pub fn forget_channel(&mut self, channel_id: u8) {
+        self.last.remove(&channel_id);
+    }
+
     pub fn check(&mut self, channel_id: u8, reset_count: u8, sequence: u64) -> SeqCheck {
         match self.last.get_mut(&channel_id) {
             None => {

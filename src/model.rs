@@ -613,6 +613,13 @@ impl BookAccumulator {
         self.baselined
     }
 
+    /// Whether every batch folded so far has been terminated by its `last`. False means an event is
+    /// still buffered here, so what [`Self::to_book`] materializes is a whole logical event behind
+    /// the feed — see `sinks::ws`'s `AwaitingRebaseline`.
+    pub fn pending_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     /// Buffer one broadcast batch, and fold the whole logical event into the book on its `last`
     /// batch.
     ///
@@ -648,6 +655,22 @@ impl BookAccumulator {
             // below whatever its size, or an order-level snapshot — tens of thousands of orders in one
             // batch — could never baseline.
             if self.pending.len() > MAX_PENDING_CHANGES {
+                // ⚠️ Observable, because the consequence is silent and lasts until a producer
+                // `Clear`: the market drops out of every bootstrap (`sinks::ws` filters on
+                // `baselined`) and the gate's own re-baseline degrades to a bare clear. The cap
+                // bounds a whole boundary interval now, not one datagram, so it is reachable.
+                crate::metrics::metrics()
+                    .book_events_abandoned
+                    .with_label_values(&[b.venue.as_ref()])
+                    .inc();
+                tracing::warn!(
+                    venue = %b.venue,
+                    channel = b.channel,
+                    instrument_id = b.instrument_id,
+                    pending = self.pending.len(),
+                    "book event outgrew the pending-change cap; the market is withheld until it \
+                     re-baselines"
+                );
                 self.pending.clear();
                 self.baselined = false;
                 // The abandoned event's changes are gone, so its stamps go with them, or the next

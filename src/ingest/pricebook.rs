@@ -30,9 +30,19 @@ const ACTION_DELETE: u8 = 3;
 
 /// Cap on deltas buffered while not `Ready`. In normal operation the buffer holds at most one
 /// snapshot cycle; this bounds a flood of deltas for an instrument that never receives a snapshot.
-/// Excess deltas are dropped — the book re-anchors on the next snapshot regardless of which
-/// buffered deltas survived. Matches `book.rs`'s `MAX_PENDING_DELTAS`.
+/// Crossing it costs the book its served state — see [`PriceBook::buffer`]. Matches `book.rs`'s
+/// `MAX_PENDING_DELTAS`.
 pub(crate) const MAX_BUFFERED_DELTAS: usize = 1 << 18;
+
+/// How long a book may keep being reported as served while a snapshot group assembles over its
+/// live levels. Past it the assembly is treated as lost rather than slow, so the market fails over
+/// to a peer instead of freezing on a path that publishes nothing (`send_book` refuses a book that
+/// is not `Ready`).
+///
+/// The value is what a consumer trades: an assembly inside the bound costs it a stall of at most
+/// this long and no re-baseline, and one past it costs a re-baseline pair as the market fails over
+/// and comes back.
+const MAX_REBUILD_SERVE_NS: u64 = 3_000_000_000;
 
 /// Cap on price levels held per book — both the live sides and the snapshot under assembly. The
 /// multicast wire is unauthenticated, so a forged feed of level updates at distinct prices would
@@ -114,6 +124,10 @@ pub enum DeltaOutcome {
     /// because the cause (a malformed or forged feed, never packet loss) and the resulting `status`
     /// both differ; a caller counting one as the other would read a hostile book as a lossy network.
     Overflow,
+    /// The delta buffer was full, so this delta and the buffer behind it were discarded and
+    /// `status` is [`Status::Gap`] — see [`PriceBook::buffer`]. Distinct from [`Self::Gap`], whose
+    /// hole is in the publisher's sequence rather than in what we agreed to hold.
+    BufferOverflow,
     Applied {
         divergence: Option<Divergence>,
     },
@@ -130,6 +144,15 @@ struct Building {
     received_levels: u32,
     last_instrument_seq: u32,
     depth_bound: u32,
+    /// Whether the live book this group is replacing is still complete — see
+    /// [`PriceBook::serves_a_book`]. Set from the status the group opened over, so a rotation
+    /// accepted while the market was already being served does not read as a cold rebuild.
+    over_live_book: bool,
+    /// When this *chain* of rotations over the live book began — inherited by a group that replaces
+    /// one still assembling, never restarted, so a run of rotations that each lose their end ages
+    /// out instead of renewing the claim. `0` when the caller had no clock (the `recv_ts_ns`
+    /// sentinel).
+    serving_since_ns: u64,
     bids: BTreeMap<i64, LevelState>,
     asks: BTreeMap<i64, LevelState>,
 }
@@ -183,6 +206,34 @@ impl PriceBook {
         self.status
     }
 
+    /// Whether this book still holds a complete picture of the market — what a caller reports to the
+    /// arbitration gate as *health*, and deliberately weaker than [`Status::Ready`].
+    ///
+    /// A publisher rotates a snapshot for every instrument continuously, and a rotation captured
+    /// ahead of the deltas we have applied is **accepted while the book is `Ready`**: the group
+    /// assembles into a shadow, `bids`/`asks` keep the live book, and the deltas that arrive
+    /// meanwhile buffer and replay on install. Nothing is lost and nothing is degraded, so reporting
+    /// that as unhealthy hands the market to a peer and hands it straight back — two consumer
+    /// re-baselines per rotation, per market, for a path that never stopped holding the book.
+    ///
+    /// A group opened over a book that was *not* being served (`AwaitingSnapshot`/`Gap`) is a cold
+    /// rebuild: `bids`/`asks` are empty or stale, so it stays unhealthy until the group installs.
+    ///
+    /// ⚠️ **Bounded by [`MAX_REBUILD_SERVE_NS`].** `send_book` still refuses everything but `Ready`,
+    /// so this reports a path that holds the market and publishes nothing; nothing in this type
+    /// bounds `BuildingSnapshot`, and a lost `SnapshotEnd` leaves it there until the instrument's
+    /// next rotation. Past the bound the claim lapses and the market fails over.
+    pub fn serves_a_book(&self, now_ns: u64) -> bool {
+        match self.status {
+            Status::Ready => true,
+            Status::BuildingSnapshot => self
+                .open
+                .as_ref()
+                .is_some_and(|b| b.over_live_book && !rebuild_expired(b.serving_since_ns, now_ns)),
+            Status::AwaitingSnapshot | Status::Gap => false,
+        }
+    }
+
     pub fn depth_bound(&self) -> Option<u32> {
         self.depth_bound
     }
@@ -234,8 +285,11 @@ impl PriceBook {
     pub fn on_delta(&mut self, op: DeltaOp, removed: &mut Vec<(u8, i64)>) -> DeltaOutcome {
         removed.clear();
         if self.status != Status::Ready {
-            self.buffer(op);
-            return DeltaOutcome::Buffered;
+            return if self.buffer(op) {
+                DeltaOutcome::BufferOverflow
+            } else {
+                DeltaOutcome::Buffered
+            };
         }
         if op.seq <= self.last_applied_instrument_seq {
             return DeltaOutcome::Duplicate;
@@ -263,6 +317,7 @@ impl PriceBook {
         total_levels: u32,
         last_instrument_seq: u32,
         depth_bound: u32,
+        now_ns: u64,
     ) -> bool {
         if self.required_anchor_seq.is_some_and(|s| anchor_seq < s)
             || (self.status == Status::Ready
@@ -293,6 +348,16 @@ impl PriceBook {
         }) {
             return false;
         }
+        // Read before the status assignment below, and off `serves_a_book` rather than
+        // `status == Ready`, so a rotation replacing one that was itself assembling over the live
+        // book inherits that standing instead of reading as a cold rebuild — but inherits the
+        // *clock* with it, so a chain of rotations that each lose their end cannot keep renewing
+        // the claim.
+        let over_live_book = self.serves_a_book(now_ns);
+        let serving_since_ns = match &self.open {
+            Some(prev) if over_live_book => prev.serving_since_ns,
+            _ => now_ns,
+        };
         self.open = Some(Building {
             snapshot_id,
             anchor_seq,
@@ -300,6 +365,8 @@ impl PriceBook {
             received_levels: 0,
             last_instrument_seq,
             depth_bound,
+            over_live_book,
+            serving_since_ns,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
         });
@@ -392,6 +459,10 @@ impl PriceBook {
             .is_none_or(|b| b.anchor_seq < new_anchor_seq)
         {
             self.open = None;
+        } else if let Some(b) = &mut self.open {
+            // The live book the kept group was assembling over is gone, so the group is now a cold
+            // rebuild: this instrument must stop being reported as served until it installs.
+            b.over_live_book = false;
         }
         self.pending.retain(|d| d.mktdata_seq > new_anchor_seq);
         self.status = if self.open.is_some() {
@@ -426,11 +497,21 @@ impl PriceBook {
         self.last_event_ts = 0;
     }
 
-    fn buffer(&mut self, op: DeltaOp) {
+    /// Hold a delta for replay after the next snapshot, returning whether the cap refused it.
+    ///
+    /// A refusal means deltas are being lost, so the book leaves the served state:
+    /// [`Self::serves_a_book`] would otherwise keep claiming levels that are provably incomplete
+    /// while `send_book` publishes nothing, and no peer could take the market. The buffer goes with
+    /// the hole — it predates it and can never bridge it, exactly as on a forward sequence gap —
+    /// which also leaves room for the deltas past the hole, the ones a later snapshot can replay.
+    fn buffer(&mut self, op: DeltaOp) -> bool {
         if self.pending.len() < MAX_BUFFERED_DELTAS {
             self.pending.push(op);
+            return false;
         }
-        // else: drop; the book re-anchors on the next snapshot regardless.
+        self.pending.clear();
+        self.status = Status::Gap;
+        true
     }
 
     /// Replay buffered deltas after a snapshot installed at `anchor`. Those at/below it are already
@@ -557,6 +638,14 @@ impl PriceBook {
 
 /// The publisher's `Action` byte against what the quantity actually did. At most one is reported;
 /// none of them changes the applied result.
+/// Whether a rebuild has been assembling over the live book for longer than
+/// [`MAX_REBUILD_SERVE_NS`]. Both stamps must be real: `0` is the crate-wide "not available"
+/// sentinel on `recv_ts_ns`, and measuring against it would expire every rebuild on the first
+/// datagram — the same rule [`crate::ingest::processor`]'s boundary timeout applies.
+fn rebuild_expired(since_ns: u64, now_ns: u64) -> bool {
+    since_ns != 0 && now_ns != 0 && now_ns.saturating_sub(since_ns) > MAX_REBUILD_SERVE_NS
+}
+
 fn divergence(action: u8, qty_raw: u64, present: bool) -> Option<Divergence> {
     if action == ACTION_NEW && present {
         Some(Divergence::NewOnPresentLevel)
@@ -642,7 +731,7 @@ mod tests {
     /// Bring a book to `Ready` at anchor `S`, per-instrument seq `K`, with the given levels.
     fn synced(anchor: u64, k: u32, depth_bound: u32, levels: &[(u8, i64, u64)]) -> PriceBook {
         let mut b = PriceBook::new();
-        assert!(b.on_snapshot_begin(1, anchor, levels.len() as u32, k, depth_bound));
+        assert!(b.on_snapshot_begin(1, anchor, levels.len() as u32, k, depth_bound, 0));
         for &(side, price, qty) in levels {
             b.on_snapshot_level(1, side, price, qty, Some(1), 0);
         }
@@ -793,7 +882,7 @@ mod tests {
         let mut b = synced(100, 5, 0, &[]);
         apply_delta(&mut b, level(6, 101, SIDE_BID, 6200, 10, NEW));
         // A later snapshot at K = 20 re-baselines; seq 21 must be next, not 1.
-        assert!(b.on_snapshot_begin(2, 200, 0, 20, 0));
+        assert!(b.on_snapshot_begin(2, 200, 0, 20, 0, 0));
         assert!(b.on_snapshot_end(200, 2));
         assert!(matches!(
             apply_delta(&mut b, level(1, 201, SIDE_BID, 6200, 10, NEW)),
@@ -813,7 +902,7 @@ mod tests {
     fn snapshot_while_ready_rebuilds_when_last_instrument_seq_is_ahead() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(
-            b.on_snapshot_begin(2, 500, 1, 9, 0),
+            b.on_snapshot_begin(2, 500, 1, 9, 0, 0),
             "K=9 > 5, we are behind"
         );
         b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
@@ -837,13 +926,13 @@ mod tests {
     fn a_duplicated_snapshot_begin_does_not_restart_assembly() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(
-            b.on_snapshot_begin(2, 500, 2, 9, 0),
+            b.on_snapshot_begin(2, 500, 2, 9, 0, 0),
             "K=9 > 5, we are behind"
         );
         b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
 
         assert!(
-            !b.on_snapshot_begin(2, 500, 2, 9, 0),
+            !b.on_snapshot_begin(2, 500, 2, 9, 0, 0),
             "the duplicate must be declined, not accepted as a fresh group"
         );
 
@@ -861,9 +950,12 @@ mod tests {
     #[test]
     fn a_duplicated_snapshot_begin_from_cold_keeps_the_assembled_levels() {
         let mut b = PriceBook::new();
-        assert!(b.on_snapshot_begin(1, 100, 2, 5, 0));
+        assert!(b.on_snapshot_begin(1, 100, 2, 5, 0, 0));
         b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0);
-        assert!(!b.on_snapshot_begin(1, 100, 2, 5, 0), "duplicate declined");
+        assert!(
+            !b.on_snapshot_begin(1, 100, 2, 5, 0, 0),
+            "duplicate declined"
+        );
         b.on_snapshot_level(1, SIDE_BID, 6100, 20, Some(1), 0);
         assert!(b.on_snapshot_end(100, 1));
         assert_eq!(bids_of(&b), vec![(6200, 10), (6100, 20)]);
@@ -875,10 +967,10 @@ mod tests {
     #[test]
     fn a_new_snapshot_begin_still_replaces_a_group_under_assembly() {
         let mut b = PriceBook::new();
-        assert!(b.on_snapshot_begin(1, 100, 2, 5, 0));
+        assert!(b.on_snapshot_begin(1, 100, 2, 5, 0, 0));
         b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0);
         assert!(
-            b.on_snapshot_begin(2, 140, 1, 6, 0),
+            b.on_snapshot_begin(2, 140, 1, 6, 0, 0),
             "a different snapshot_id is a new rotation"
         );
         b.on_snapshot_level(2, SIDE_ASK, 6300, 30, Some(1), 0);
@@ -896,7 +988,7 @@ mod tests {
     fn snapshot_while_ready_is_ignored_when_current() {
         let mut b = synced(100, 9, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(
-            !b.on_snapshot_begin(2, 500, 1, 5, 0),
+            !b.on_snapshot_begin(2, 500, 1, 5, 0, 0),
             "K=5 <= 9, we are current"
         );
         b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
@@ -916,7 +1008,7 @@ mod tests {
         // Anchor is far ahead (busy channel) but K is behind (this instrument is current).
         let mut b = synced(100, 9, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(
-            !b.on_snapshot_begin(2, 9_999_999, 1, 9, 0),
+            !b.on_snapshot_begin(2, 9_999_999, 1, 9, 0, 0),
             "a huge anchor with K == ours must NOT trigger a rebuild"
         );
         assert_eq!(bids_of(&b), vec![(6200, 150)]);
@@ -928,7 +1020,7 @@ mod tests {
     #[test]
     fn snapshot_level_with_a_mismatched_id_is_discarded() {
         let mut b = PriceBook::new();
-        assert!(b.on_snapshot_begin(7, 100, 1, 0, 0));
+        assert!(b.on_snapshot_begin(7, 100, 1, 0, 0, 0));
         b.on_snapshot_level(8, SIDE_BID, 6200, 150, Some(1), 0); // wrong id
         assert!(
             !b.on_snapshot_end(100, 7),
@@ -943,7 +1035,7 @@ mod tests {
     fn snapshot_end_rejects_incomplete_or_mismatched_groups() {
         for (levels, anchor, id) in [(0u32, 100u64, 7u32), (1, 999, 7), (1, 100, 8)] {
             let mut b = PriceBook::new();
-            assert!(b.on_snapshot_begin(7, 100, 1, 0, 0));
+            assert!(b.on_snapshot_begin(7, 100, 1, 0, 0, 0));
             for _ in 0..levels {
                 b.on_snapshot_level(7, SIDE_BID, 6200, 150, Some(1), 0);
             }
@@ -959,7 +1051,7 @@ mod tests {
     fn a_failed_snapshot_end_from_ready_discards_the_stale_book() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(
-            b.on_snapshot_begin(2, 500, 1, 9, 0),
+            b.on_snapshot_begin(2, 500, 1, 9, 0, 0),
             "K=9 > 5, we are behind"
         );
         b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
@@ -975,7 +1067,7 @@ mod tests {
     #[test]
     fn a_duplicated_snapshot_level_does_not_satisfy_the_count() {
         let mut b = PriceBook::new();
-        assert!(b.on_snapshot_begin(1, 100, 3, 0, 0));
+        assert!(b.on_snapshot_begin(1, 100, 3, 0, 0, 0));
         b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0);
         b.on_snapshot_level(1, SIDE_BID, 6200, 10, Some(1), 0); // duplicate of the same price
         b.on_snapshot_level(1, SIDE_BID, 6100, 20, Some(1), 0); // the third level is lost
@@ -989,9 +1081,9 @@ mod tests {
     #[test]
     fn a_declined_snapshot_begin_leaves_the_open_group_alone() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
-        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0));
+        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0, 0));
         assert!(
-            !b.on_snapshot_begin(3, 500, MAX_LEVELS_PER_BOOK as u32 + 1, 9, 0),
+            !b.on_snapshot_begin(3, 500, MAX_LEVELS_PER_BOOK as u32 + 1, 9, 0, 0),
             "oversized -> declined"
         );
         b.on_snapshot_level(2, SIDE_ASK, 6300, 77, Some(1), 0);
@@ -1008,7 +1100,7 @@ mod tests {
     fn a_rebuild_from_ready_buffers_deltas_and_replays_them() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
         assert!(
-            b.on_snapshot_begin(2, 500, 1, 9, 0),
+            b.on_snapshot_begin(2, 500, 1, 9, 0, 0),
             "K=9 > 5, we are behind"
         );
         assert!(matches!(
@@ -1029,6 +1121,95 @@ mod tests {
             "the buffered delta replayed onto the installed snapshot"
         );
         assert_eq!(b.buffered_len(), 0);
+    }
+
+    /// A rotation accepted over a live book is a **repair, not a degradation**: the levels stay
+    /// intact, so the path still holds the market and reporting it unhealthy would hand the market
+    /// to a peer and hand it straight back — two consumer re-baselines per rotation, per market.
+    #[test]
+    fn a_rotation_over_a_live_book_still_serves_it() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(b.serves_a_book(0));
+        assert!(
+            b.on_snapshot_begin(2, 500, 1, 9, 0, 0),
+            "K=9 > 5, we are behind"
+        );
+        assert_eq!(b.status(), Status::BuildingSnapshot);
+        assert!(b.serves_a_book(0), "the live book is still complete");
+        assert_eq!(bids_of(&b), vec![(6200, 150)]);
+        // A second rotation replacing the first inherits that standing rather than reading as cold.
+        assert!(b.on_snapshot_begin(3, 600, 1, 10, 0, 0));
+        assert!(b.serves_a_book(0));
+        b.on_snapshot_level(3, SIDE_BID, 6000, 5, Some(1), 0);
+        assert!(b.on_snapshot_end(600, 3));
+        assert!(b.serves_a_book(0));
+    }
+
+    /// ⚠️ The claim is **bounded**: `send_book` publishes nothing while the group assembles, so a
+    /// rebuild that never installs — a lost `SnapshotEnd`, whose route the next instrument's
+    /// rotation takes — would otherwise hold the market on a path that has gone quiet, with no peer
+    /// failover. A chained rotation inherits the clock rather than renewing it.
+    #[test]
+    fn a_rebuild_over_a_live_book_is_bounded_and_a_chain_cannot_renew_it() {
+        const T: u64 = 1_700_000_000_000_000_000;
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(
+            b.on_snapshot_begin(2, 500, 1, 9, 0, T),
+            "K=9 > 5, we are behind"
+        );
+        assert!(
+            b.serves_a_book(T + MAX_REBUILD_SERVE_NS),
+            "inside the bound"
+        );
+        assert!(
+            !b.serves_a_book(T + MAX_REBUILD_SERVE_NS + 1),
+            "past it the market fails over instead of freezing"
+        );
+
+        // A second rotation replacing the first keeps serving — the live levels are still intact —
+        // but ages from the first one, so a run of lost ends cannot keep the claim alive.
+        assert!(b.on_snapshot_begin(3, 600, 1, 10, 0, T + 1_000));
+        assert!(b.serves_a_book(T + 2_000));
+        assert!(
+            !b.serves_a_book(T + MAX_REBUILD_SERVE_NS + 1),
+            "the chain ages from the rebuild that started it"
+        );
+
+        // With no clock (the `recv_ts_ns` sentinel) nothing expires, as everywhere else.
+        let mut c = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(c.on_snapshot_begin(2, 500, 1, 9, 0, 0));
+        assert!(c.serves_a_book(0));
+    }
+
+    /// The other side of that rule, and what keeps a `Gap` off the wire: a group assembling over a
+    /// book that was *not* being served is a cold rebuild, and the market must stay with the peer
+    /// until it installs. Same for a group the reset kept — the reset emptied the book under it.
+    #[test]
+    fn a_cold_rebuild_serves_nothing_until_it_installs() {
+        let mut b = PriceBook::new();
+        assert!(!b.serves_a_book(0));
+        assert!(b.on_snapshot_begin(1, 100, 1, 5, 0, 0));
+        assert_eq!(b.status(), Status::BuildingSnapshot);
+        assert!(!b.serves_a_book(0), "cold from AwaitingSnapshot");
+
+        let mut g = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert_eq!(
+            apply_delta(&mut g, level(8, 101, SIDE_BID, 6100, 20, NEW)),
+            DeltaOutcome::Gap,
+            "seq 8 skips 6 and 7"
+        );
+        assert!(!g.serves_a_book(0));
+        assert!(g.on_snapshot_begin(2, 500, 1, 9, 0, 0));
+        assert!(!g.serves_a_book(0), "cold from Gap");
+
+        let mut r = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(r.on_snapshot_begin(2, 500, 1, 9, 0, 0));
+        r.on_instrument_reset(400);
+        assert_eq!(r.status(), Status::BuildingSnapshot, "the group is kept");
+        assert!(
+            !r.serves_a_book(0),
+            "the reset emptied the book the group was assembling over"
+        );
     }
 
     /// Publishers SHOULD emit levels best-to-worst, but subscribers MUST NOT depend on it: the
@@ -1059,7 +1240,7 @@ mod tests {
         apply_delta(&mut b, level(6, 101, SIDE_BID, 6100, 20, NEW));
         apply_delta(&mut b, level(7, 102, SIDE_BID, 6200, 30, NEW));
         assert_eq!(b.buffered_len(), 3);
-        assert!(b.on_snapshot_begin(1, 100, 1, 5, 0));
+        assert!(b.on_snapshot_begin(1, 100, 1, 5, 0, 0));
         b.on_snapshot_level(1, SIDE_ASK, 6300, 99, Some(1), 0);
         assert!(b.on_snapshot_end(100, 1));
         assert_eq!(b.status(), Status::Ready);
@@ -1077,7 +1258,7 @@ mod tests {
         let mut b = PriceBook::new();
         apply_delta(&mut b, level(6, 101, SIDE_BID, 6100, 20, NEW));
         apply_delta(&mut b, level(9, 104, SIDE_BID, 6200, 30, NEW)); // gap: 7, 8 missing
-        assert!(b.on_snapshot_begin(1, 100, 0, 5, 0));
+        assert!(b.on_snapshot_begin(1, 100, 0, 5, 0, 0));
         assert!(b.on_snapshot_end(100, 1));
         assert_eq!(b.status(), Status::Gap);
     }
@@ -1305,12 +1486,12 @@ mod tests {
         assert!(bids_of(&b).is_empty());
         assert_eq!(b.buffered_len(), 0, "buffered deltas at/below S' discarded");
         assert!(
-            !b.on_snapshot_begin(2, 499, 0, 9, 0),
+            !b.on_snapshot_begin(2, 499, 0, 9, 0, 0),
             "older than S' -> discarded"
         );
         assert_eq!(b.status(), Status::AwaitingSnapshot);
         assert!(
-            b.on_snapshot_begin(3, 501, 0, 9, 0),
+            b.on_snapshot_begin(3, 501, 0, 9, 0, 0),
             "at or past S' -> accepted"
         );
     }
@@ -1322,7 +1503,7 @@ mod tests {
     #[test]
     fn instrument_reset_keeps_the_group_anchored_at_its_own_new_anchor() {
         let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 10)]);
-        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0));
+        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0, 0));
         b.on_snapshot_level(2, SIDE_BID, 6100, 20, Some(1), 0);
         b.on_instrument_reset(500);
         assert_eq!(b.status(), Status::BuildingSnapshot);
@@ -1338,16 +1519,16 @@ mod tests {
     fn required_anchor_clears_on_any_snapshot_at_or_past_it() {
         let mut b = synced(100, 5, 0, &[]);
         b.on_instrument_reset(500);
-        assert!(b.on_snapshot_begin(2, 700, 0, 9, 0));
+        assert!(b.on_snapshot_begin(2, 700, 0, 9, 0, 0));
         assert!(b.on_snapshot_end(700, 2));
         assert_eq!(b.status(), Status::Ready);
         // A subsequent older snapshot is now judged by the ordinary Ready rule, not the anchor.
         assert!(
-            !b.on_snapshot_begin(3, 600, 0, 9, 0),
+            !b.on_snapshot_begin(3, 600, 0, 9, 0, 0),
             "K == ours -> ignored, not anchor-blocked"
         );
         // Below the old requirement and behind on K: accepted only because the anchor no longer gates.
-        assert!(b.on_snapshot_begin(4, 400, 0, 99, 0));
+        assert!(b.on_snapshot_begin(4, 400, 0, 99, 0, 0));
     }
 
     /// Deltas past `S'` survive the reset and replay onto the recovery snapshot; only those the reset
@@ -1359,7 +1540,7 @@ mod tests {
         apply_delta(&mut b, level(7, 501, SIDE_BID, 6100, 20, NEW)); // past S', kept
         b.on_instrument_reset(500);
         assert_eq!(b.buffered_len(), 1);
-        assert!(b.on_snapshot_begin(2, 500, 0, 6, 0));
+        assert!(b.on_snapshot_begin(2, 500, 0, 6, 0, 0));
         assert!(b.on_snapshot_end(500, 2));
         assert_eq!(
             bids_of(&b),
@@ -1390,7 +1571,7 @@ mod tests {
             "no publisher claim survives the session"
         );
         // A new-session snapshot with a restarted (small) anchor re-bootstraps cleanly.
-        assert!(b.on_snapshot_begin(1, 3, 0, 1, 0));
+        assert!(b.on_snapshot_begin(1, 3, 0, 1, 0, 0));
     }
 
     // ---- Crossed-book monitoring ----
@@ -1416,15 +1597,54 @@ mod tests {
 
     // ---- Buffer bound ----
 
-    /// The per-instrument buffer is bounded. Excess deltas are dropped, not grown — the book
-    /// re-anchors on the next snapshot regardless of which buffered deltas survived.
+    /// The per-instrument buffer is bounded, and crossing the bound drops it rather than growing
+    /// it: the deltas held predate the hole the cap just made and can never bridge it, so the
+    /// buffer restarts on the deltas a later snapshot can actually replay.
     #[test]
     fn buffered_deltas_are_bounded() {
         let mut b = PriceBook::new();
         for i in 1..=(MAX_BUFFERED_DELTAS as u32 + 100) {
             apply_delta(&mut b, level(i, i as u64, SIDE_BID, 6200, 1, NEW));
         }
-        assert_eq!(b.buffered_len(), MAX_BUFFERED_DELTAS);
+        assert!(b.buffered_len() < MAX_BUFFERED_DELTAS);
+        assert_eq!(b.status(), Status::Gap);
+    }
+
+    /// ⚠️ A rebuild assembling over a live book reports the path **healthy** while `send_book`
+    /// publishes nothing, so a buffer overflow there is the one case where the gate's claim becomes
+    /// provably false: the levels it says this path holds are missing every dropped delta. The book
+    /// must leave the served state so the peer takes the market.
+    #[test]
+    fn a_buffer_overflow_during_a_rebuild_over_a_live_book_gives_the_market_up() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0, 0), "K=9 > 5, behind");
+        assert!(b.serves_a_book(0), "the live book is still complete");
+
+        for i in 1..=(MAX_BUFFERED_DELTAS as u32 + 1) {
+            let outcome = apply_delta(
+                &mut b,
+                level(10 + i, 500 + i as u64, SIDE_BID, 6100, 1, NEW),
+            );
+            assert_eq!(
+                outcome,
+                if i as usize > MAX_BUFFERED_DELTAS {
+                    DeltaOutcome::BufferOverflow
+                } else {
+                    DeltaOutcome::Buffered
+                }
+            );
+        }
+        assert_eq!(b.status(), Status::Gap);
+        assert!(!b.serves_a_book(0), "the market fails over to the peer");
+
+        // The group still installs — and re-baselines, rather than replaying a buffer whose
+        // surviving deltas sit on the far side of the hole.
+        b.on_snapshot_level(2, SIDE_BID, 6000, 5, Some(1), 0);
+        assert!(b.on_snapshot_end(500, 2));
+        assert_eq!(b.status(), Status::Ready);
+        assert!(b.serves_a_book(0));
+        assert_eq!(bids_of(&b), vec![(6000, 5)], "the snapshot's levels alone");
+        assert_eq!(b.buffered_len(), 0);
     }
 
     /// `drop_buffer` is the action behind the cross-instrument overflow policy: the instrument
@@ -1468,7 +1688,7 @@ mod tests {
     #[test]
     fn snapshot_begin_rejects_an_oversized_total_levels() {
         let mut b = PriceBook::new();
-        assert!(!b.on_snapshot_begin(1, 100, MAX_LEVELS_PER_BOOK as u32 + 1, 0, 0));
+        assert!(!b.on_snapshot_begin(1, 100, MAX_LEVELS_PER_BOOK as u32 + 1, 0, 0, 0));
         assert_eq!(b.status(), Status::AwaitingSnapshot);
         assert!(!b.on_snapshot_end(100, 1), "no group was opened");
     }
@@ -1478,7 +1698,7 @@ mod tests {
     #[test]
     fn snapshot_shadow_levels_are_bounded() {
         let mut b = PriceBook::new();
-        assert!(b.on_snapshot_begin(1, 100, MAX_LEVELS_PER_BOOK as u32, 0, 0));
+        assert!(b.on_snapshot_begin(1, 100, MAX_LEVELS_PER_BOOK as u32, 0, 0, 0));
         for i in 1..=(MAX_LEVELS_PER_BOOK as i64 + 100) {
             b.on_snapshot_level(1, SIDE_BID, i, 1, Some(1), 0);
         }

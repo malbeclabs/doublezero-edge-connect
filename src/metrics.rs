@@ -160,8 +160,9 @@ pub struct Metrics {
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
     /// [`crate::ingest::path_race::PathRace`] pairs, never by a dropped copy's inter-path phase.
     pub path_lead_ns: HistogramVec,
-    /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
-    /// thresholds are too loose: every transfer re-baselines each consumer's book.
+    /// Authority transfers by `reason` (initial/health/health_revert/silence/margin) and whether the
+    /// handover `rebaselined` the consumer (`yes`/`no`). A sustained re-baselining rate means the
+    /// thresholds are too loose.
     pub path_transfers: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
@@ -207,8 +208,9 @@ pub struct Metrics {
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
     pub book_resurrections_dropped: IntCounterVec,
-    /// Order-level markets forced to re-baseline because two paths claimed different resting state for
-    /// one order (`reason="disagreement"`).
+    /// Markets forced to re-baseline, by `reason`: `disagreement` (two paths claimed different
+    /// resting state for one order) and `dropped_batch` (the single-path gate dropped a batch from
+    /// the path the consumer was following). The `mbo_` in the name is historical.
     pub mbo_forced_rebaselines: IntCounterVec,
     /// Order-level changes refused because the batch carrying them is older than its channel's
     /// retention window — a link returning with a backlog, or a forged replay. Expected to spike once
@@ -243,6 +245,11 @@ pub struct Metrics {
     /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
     /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
     pub mbp_buffer_overflows: IntCounterVec,
+    /// One book's own delta buffer overflowed: it held `pricebook`'s `MAX_BUFFERED_DELTAS` deltas
+    /// with no snapshot arriving to anchor them, so the buffer was dropped and the book marked
+    /// `Gap`. Separate from the cross-instrument budget above — that is the host's memory ceiling
+    /// across books, this is one instrument whose rotation never came.
+    pub mbp_book_buffer_overflows: IntCounterVec,
     /// A book discarded because its per-book price-level cap was hit — a malformed or forged feed,
     /// never packet loss. Deliberately not counted as a sequence gap: the cause and the resulting
     /// status differ, and merging them would read a hostile book as a lossy network.
@@ -260,6 +267,19 @@ pub struct Metrics {
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
     /// series that surfaces that wedge.
     pub mbp_duplicate_deltas: IntCounterVec,
+    /// Logical events abandoned because their buffered changes outgrew the accumulator's cap. The
+    /// market is withheld from every bootstrap until a producer re-baseline, so a non-zero rate is
+    /// markets missing from connecting clients, not just a wide event.
+    pub book_events_abandoned: IntCounterVec,
+    /// Closing batches a publish gate refused (mid-rotation, gapped, not yet revealed). The
+    /// instrument stays owed its close and is retried at the next boundary; a sustained rate means
+    /// one path is holding markets it cannot publish.
+    pub mbp_closes_refused: IntCounterVec,
+    /// `BatchBoundary` naming a slot at or below the one its channel had already committed. It is
+    /// ignored — no event closes on it, the slot does not move — so a consumer's committed slot
+    /// never moves backwards; a non-zero rate is one path's boundary stream naming a slot it had
+    /// already passed.
+    pub mbp_slot_regressions: IntCounterVec,
     /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
     pub mbp_crossed: IntCounterVec,
     /// Publisher `Action`-vs-quantity disagreements by `kind`. Never changes the applied result.
@@ -624,9 +644,9 @@ impl Metrics {
             path_transfers: counter_vec(
                 &registry,
                 "dz_path_authority_transfers_total",
-                "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
-                 means the thresholds are too loose — every transfer re-baselines each consumer.",
-                &["venue", "reason"],
+                "Authority transfers by reason (initial/health/health_revert/silence/margin) and \
+                 whether the handover re-baselined the consumer (rebaselined=yes/no).",
+                &["venue", "reason", "rebaselined"],
             ),
             path_markets_held: gauge_vec(
                 &registry,
@@ -666,6 +686,13 @@ impl Metrics {
                 "dz_mbp_buffer_overflows_total",
                 "Cross-instrument delta-buffer budget overflows; the largest instrument's buffer \
                  was dropped. Sustained means the snapshot period is too long for this host.",
+                &["venue"],
+            ),
+            mbp_book_buffer_overflows: counter_vec(
+                &registry,
+                "dz_mbp_book_buffer_overflows_total",
+                "One book's delta buffer overflowed with no snapshot to anchor it; the buffer was \
+                 dropped, the book marked Gap and the market failed over to a peer",
                 &["venue"],
             ),
             mbp_level_overflows: counter_vec(
@@ -709,6 +736,28 @@ impl Metrics {
                 "dz_mbp_duplicate_deltas_total",
                 "Deltas discarded as duplicates. A Ready book emitting only these is a baseline \
                  above the publisher's real counter, which only a Reset Count clears.",
+                &["venue"],
+            ),
+            book_events_abandoned: counter_vec(
+                &registry,
+                "dz_book_events_abandoned_total",
+                "Logical events whose buffered changes outgrew the accumulator cap. The market is \
+                 withheld from bootstraps until it re-baselines.",
+                &["venue"],
+            ),
+            mbp_closes_refused: counter_vec(
+                &registry,
+                "dz_mbp_closes_refused_total",
+                "Closing batches a publish gate refused. The instrument stays owed its close and \
+                 is retried at the next boundary rather than forgotten.",
+                &["venue"],
+            ),
+            mbp_slot_regressions: counter_vec(
+                &registry,
+                "dz_mbp_slot_regressions_total",
+                "BatchBoundary naming a slot at or below the one the channel had already \
+                 committed. It is ignored: no event closes on it and the slot does not move, so a \
+                 consumer's committed slot never moves backwards.",
                 &["venue"],
             ),
             mbp_crossed: counter_vec(
@@ -780,10 +829,12 @@ impl Metrics {
             mbo_forced_rebaselines: counter_vec(
                 &registry,
                 "dz_mbo_forced_rebaselines_total",
-                "Order-level markets withheld and re-baselined because the cross-publisher guard \
-                 could not answer. reason=disagreement: two paths claimed different resting state for \
-                 one order, so neither is known to be right. A sustained rate is the signal to \
-                 reconsider the per-publisher book model.",
+                "Markets withheld and re-baselined because a gate could not carry the consumer's \
+                 book forward. reason=disagreement: two paths claimed different resting state for \
+                 one order, so neither is known to be right; a sustained rate is the signal to \
+                 reconsider the per-publisher book model. reason=dropped_batch: the single-path gate \
+                 dropped a batch from the path the consumer was following, so its book has a hole \
+                 only a re-baseline can close.",
                 &["venue", "reason"],
             ),
             mbo_events_past_frontier: counter_vec(
@@ -1137,7 +1188,7 @@ mod tests {
             .with_label_values(&["KALSHI", "leader"])
             .observe(123_456.0);
         m.path_transfers
-            .with_label_values(&["KALSHI", "silence"])
+            .with_label_values(&["KALSHI", "silence", "yes"])
             .inc();
         m.path_markets_held
             .with_label_values(&["KALSHI", "path0"])
@@ -1147,6 +1198,9 @@ mod tests {
         m.tape_path_dropped.with_label_values(&["KALSHI"]).inc();
         m.mbp_channel_resets.with_label_values(&["KALSHI"]).inc();
         m.mbp_buffer_overflows.with_label_values(&["KALSHI"]).inc();
+        m.mbp_book_buffer_overflows
+            .with_label_values(&["KALSHI"])
+            .inc();
         m.mbp_level_overflows.with_label_values(&["KALSHI"]).inc();
         m.mbp_orphan_snapshot_levels
             .with_label_values(&["KALSHI"])
@@ -1158,6 +1212,9 @@ mod tests {
             .with_label_values(&["KALSHI", "reset"])
             .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
+        m.book_events_abandoned.with_label_values(&["KALSHI"]).inc();
+        m.mbp_closes_refused.with_label_values(&["KALSHI"]).inc();
+        m.mbp_slot_regressions.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
         m.mbp_divergence
             .with_label_values(&["KALSHI", "delete_with_quantity"])
@@ -1235,11 +1292,15 @@ mod tests {
             "dz_tape_path_dropped_total",
             "dz_mbp_channel_resets_total",
             "dz_mbp_buffer_overflows_total",
+            "dz_mbp_book_buffer_overflows_total",
             "dz_mbp_level_overflows_total",
             "dz_mbp_orphan_snapshot_levels_total",
             "dz_mbp_declined_rotation_levels_total",
             "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
+            "dz_book_events_abandoned_total",
+            "dz_mbp_closes_refused_total",
+            "dz_mbp_slot_regressions_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",
             "dz_path_unmatched_trades_total",

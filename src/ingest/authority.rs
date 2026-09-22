@@ -188,6 +188,17 @@ struct MarketState {
     /// Who was last admitted here, so `opened_tick` marks a real change of served path rather than
     /// every leader message.
     last_admitted: Option<Transport>,
+    /// The **leader this market was overridden away from**, when the last admitted path served it
+    /// as a health override rather than as the universe's leader. Stored because the leader taking
+    /// a market back is only attributable in retrospect: by the time its own batch arrives its book
+    /// is healthy again, so nothing in the state at that moment separates a revert from the first
+    /// market to speak after a margin transfer.
+    ///
+    /// ⚠️ It names the leader rather than a bare flag, because an election moves the leader without
+    /// touching any other market's state: a memo that only said "was overridden" would still say so
+    /// after a `margin` or `silence` transfer, and the new leader's first batch on a quiet market
+    /// would score as a revert of an override it never made.
+    overridden_from: Option<Transport>,
 }
 
 pub struct StickyAuthority {
@@ -316,9 +327,11 @@ impl StickyAuthority {
         if self.serving(&key) != Some(publisher) {
             return Admit::Dropped;
         }
+        let overridden_from = self.scope_leader(&scope).filter(|l| *l != publisher);
         let m = self.market_mut(&key);
         let opened_tick = m.last_admitted != Some(publisher);
         m.last_admitted = Some(publisher);
+        m.overridden_from = overridden_from;
         Admit::Emitted { opened_tick }
     }
 
@@ -436,6 +449,13 @@ impl StickyAuthority {
     /// this across an [`Self::admit`] is what obliges the caller to re-baseline that market.
     pub fn last_admitted(&self, key: &MarketKey) -> Option<Transport> {
         self.markets.get(key)?.last_admitted
+    }
+
+    /// The leader one market was overridden away from, if the path last admitted held it as a
+    /// health override — see [`MarketState::overridden_from`]. Read *before* an [`Self::admit`]
+    /// call, which overwrites it.
+    pub fn overridden_from(&self, key: &MarketKey) -> Option<Transport> {
+        self.markets.get(key).and_then(|m| m.overridden_from)
     }
 
     /// Every known `(venue, path)` with the market count it currently serves — the `dz_path_markets_held`

@@ -41,6 +41,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **A publisher's own snapshot rotation was reported to the book gate as an unhealthy path**,
+  so every rotation moved the market to the mirror and straight back, at two full book re-sends per
+  rotation per market. Book health is now `PriceBook::serves_a_book()` — `Ready`, or a group
+  assembling over levels that are still complete — while a group over a book that was *not* being
+  served stays unhealthy. A subscriber now gets one publisher-driven re-baseline per rotation instead
+  of two more, and a book that stands still for the length of an assembly. An assembly that loses
+  buffered deltas to the per-book cap leaves that served state again — the levels it would be
+  claiming are provably incomplete, so the market fails over rather than freezing on a path that
+  cannot complete it (`dz_mbp_book_buffer_overflows_total`).
+- ⚠️ **A batch dropped from the path a consumer was following left its book with a permanent
+  hole**, and served a crossed book for minutes: with the peer silent for that market the gate's
+  `last_admitted` never moved, so the path resuming read as a continuation and the dropped changes
+  were never republished. Such a drop now forces a re-baseline of that market, discharged off the
+  serving path's own accumulator and counted as
+  `dz_mbo_forced_rebaselines_total{reason="dropped_batch"}`.
+- ⚠️ **A `BatchBoundary` naming a slot at or below the one its channel had already committed closed
+  every open market's event and stamped it backwards.** Seen live after a 1.5 s stall: 30 markets
+  took an empty closing batch five slots behind their own previous one, the observed cause being
+  the publisher relaying the slot of a block executed late on an abandoned fork. Such a boundary is
+  now ignored, no event closes on it, and a failover to a path whose own boundary stream is behind
+  withholds `batch_id` until it passes — a committed slot never moves backwards, whatever produced
+  it (`dz_mbp_slot_regressions_total`).
+- ⚠️ **A closing batch the publish gate refused was forgotten, leaving every consumer buffering that
+  event for good** — routine now that a path keeps a market through its own snapshot rotation. The
+  instrument stays owed its close and is retried (`dz_mbp_closes_refused_total`), a rebuild records
+  the close it performs, and a rotation that never installs gives the market up after 3 s rather
+  than holding it unpublished — the bound trades a stall of at most that long against the pair of
+  re-baselines a failover and its return cost. A client is no longer bootstrapped mid-event either:
+  a market whose event is still open is withheld until it re-baselines instead of handed a book it
+  cannot complete.
+- ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset
+  purges the instrument's wire Source ID in the same message that reports its book unhealthy, so the
+  readmitting snapshot's healthy report had no venue to file the report under — and the
+  transition memo recorded it as filed regardless, leaving the path unhealthy at the gate while its
+  book was `Ready`. The memo now records only a report that was actually filed, so a subscriber's
+  book unfreezes when the *first* publisher readmits rather than when the last one does.
+- ⚠️ **A reordered or duplicated market-data datagram closed every open book event on its
+  channel**, at a slot the venue had already left: Market-by-Price ran no stale-datagram check and a
+  `BatchBoundary` carries no sequence of its own. It now runs the shared `SeqTracker` per publisher
+  on the market-data role and drops a stale datagram whole, reporting `dz_seq_events_total` for the
+  first time, so a consumer's buffered event is no longer committed mid-flight. The boundary-timeout
+  fallback drops the channel's committed slot too, leaving `batch_id` absent rather than stale.
 - ⚠️ **Every per-datagram `book` batch was published as a finished logical event, exposing locked
   and crossed intermediate books to every consumer that honours `last`.** A venue event's level
   changes routinely span two datagrams — the bid lifts in one, the ask moves away in the next — so
@@ -197,6 +239,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **`dz_path_authority_transfers_total` gains a `rebaselined` label (`yes`/`no`) and a
+  `reason="health_revert"` value, and every transfer now logs one line naming the market and both
+  paths.** ⚠️ The new label changes series identity: aggregating queries keep working, but an
+  instant selector pinning `{venue,reason}` now returns two series. Existing `reason` values are
+  unchanged.
 - **`edge-kalshi-sports-mbp`'s `category` is now `events`, and its group `code` is unchanged.** The
   universe that row carries is event markets, of which sport is one kind, so `sports` named it too
   narrowly; the group name is the ledger's and a subscriber matches `doublezero status` on it, so
