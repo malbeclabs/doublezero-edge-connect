@@ -2205,6 +2205,8 @@ pub struct MbpProcessor {
     warned_invalid_manifest: bool,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
+    /// Rate limit for the slot-regression warning — see the `BatchBoundary` arm.
+    slot_warn: WarnRateLimit,
     /// Whether this receiver currently owns its venue's tape — see [`TobProcessor::tape`].
     tape: TapeOwner,
     /// Per-publisher, per-channel datagram sequence tracker — see [`PublisherSeq`], and
@@ -2233,6 +2235,7 @@ impl MbpProcessor {
             revealed: HashMap::new(),
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
+            slot_warn: WarnRateLimit::default(),
             tape,
             seq: PublisherSeq::default(),
             seq_events: SeqEvents::default(),
@@ -3324,6 +3327,22 @@ impl DatagramProcessor for MbpProcessor {
                                 .mbp_slot_regressions
                                 .with_label_values(&[ctx.venue])
                                 .inc();
+                            // Which publisher, and both slots: the counter says a regression
+                            // happened, and only these say whether one path's stream passed a slot
+                            // twice or the two paths are simply apart. Rate-limited because a
+                            // publisher stuck below its high-water emits one per boundary.
+                            if let Some(suppressed) = self.slot_warn.allow() {
+                                warn!(
+                                    venue = ctx.venue,
+                                    channel,
+                                    ?ctx.publisher,
+                                    committed = self.last_batch.get(&key).copied(),
+                                    named = b.batch_id,
+                                    suppressed,
+                                    "mbp batch boundary named a slot at or below the committed one; \
+                                     batch_id withheld until the channel passes it"
+                                );
+                            }
                         } else {
                             self.last_batch.insert(key, b.batch_id);
                         }
