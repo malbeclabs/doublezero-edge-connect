@@ -1525,6 +1525,11 @@ struct BookMarket {
     /// publisher, which is the only grain it has; PROTOCOL.md states the promise per **consumer
     /// stream**, and this gate moves that stream between publishers whose boundary streams sit
     /// slots apart. See [`Arbiter::monotonic_slot`].
+    ///
+    /// Deliberately survives a publisher era change (only [`Arbiter::drop_market_state`] clears it),
+    /// unlike the processor's per-publisher high-water: `batch_id` is the venue's own slot, which
+    /// keeps rising across a restart, so a new era resumes above it and the field is never withheld
+    /// for good. An era that committed below it would withhold permanently; unreachable today.
     wire_slot: Option<u32>,
 }
 
