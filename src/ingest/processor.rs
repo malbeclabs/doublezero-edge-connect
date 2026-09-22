@@ -28,7 +28,7 @@ use crate::{
         codec_mbo, codec_mbp, codec_midpoint,
         pricebook::{
             BookDelta, DeltaOp as PriceDeltaOp, DeltaOutcome, Divergence, PriceBook,
-            Status as BookStatus,
+            Status as BookStatus, MAX_BUFFERED_DELTAS,
         },
         receiver::{DatagramCtx, DatagramProcessor, SeqCheck, SeqTracker},
         reconcile::TapeOwner,
@@ -2222,6 +2222,8 @@ pub struct MbpProcessor {
     decode_warn: WarnRateLimit,
     /// Rate limit for the slot-regression warning — see the `BatchBoundary` arm.
     slot_warn: WarnRateLimit,
+    /// Rate limit for the per-book delta-buffer overflow warning — see [`Self::record_outcome`].
+    buffer_warn: WarnRateLimit,
     /// Whether this receiver currently owns its venue's tape — see [`TobProcessor::tape`].
     tape: TapeOwner,
     /// Per-publisher, per-channel datagram sequence tracker — see [`PublisherSeq`], and
@@ -2251,6 +2253,7 @@ impl MbpProcessor {
             warned_invalid_manifest: false,
             decode_warn: WarnRateLimit::default(),
             slot_warn: WarnRateLimit::default(),
+            buffer_warn: WarnRateLimit::default(),
             tape,
             seq: PublisherSeq::default(),
             seq_events: SeqEvents::default(),
@@ -2598,14 +2601,36 @@ impl MbpProcessor {
             .inc();
     }
 
-    /// Count what a delta did. `Overflow` (the per-book level cap: a malformed or forged feed) is
-    /// deliberately its own series rather than a gap — the cause and the resulting status both
-    /// differ, and merging them would read a hostile book as a lossy network.
-    fn record_outcome(&self, venue: &str, outcome: &DeltaOutcome) {
+    /// Count what a delta did. `Overflow` (the per-book level cap: a malformed or forged feed) and
+    /// `BufferOverflow` (that book's delta buffer, which packet loss does reach) are deliberately
+    /// their own series rather than gaps — the cause and the resulting status differ, and merging
+    /// them would read a hostile book as a lossy network.
+    ///
+    /// A buffer overflow is also logged, since unlike the cross-instrument budget it says one
+    /// instrument alone buffered `MAX_BUFFERED_DELTAS` deltas without a snapshot arriving.
+    fn record_outcome(&mut self, ctx: &DatagramCtx, key: &PriceBookKey, outcome: &DeltaOutcome) {
         let m = metrics();
+        let venue = ctx.venue;
         match outcome {
             DeltaOutcome::Duplicate => m.mbp_duplicate_deltas.with_label_values(&[venue]).inc(),
             DeltaOutcome::Overflow => m.mbp_level_overflows.with_label_values(&[venue]).inc(),
+            DeltaOutcome::BufferOverflow => {
+                m.mbp_book_buffer_overflows
+                    .with_label_values(&[venue])
+                    .inc();
+                if let Some(suppressed) = self.buffer_warn.allow() {
+                    warn!(
+                        venue,
+                        channel = key.1,
+                        ?ctx.publisher,
+                        instrument_id = key.2,
+                        cap = MAX_BUFFERED_DELTAS,
+                        suppressed,
+                        "mbp delta buffer full with no snapshot to anchor it; the book is dropped \
+                         to Gap and the market fails over"
+                    );
+                }
+            }
             DeltaOutcome::Applied {
                 divergence: Some(d),
             } => m
@@ -2984,7 +3009,7 @@ impl DatagramProcessor for MbpProcessor {
                     else {
                         continue;
                     };
-                    self.record_outcome(ctx.venue, &outcome);
+                    self.record_outcome(ctx, &key, &outcome);
                     if self.reveal_if_needed(ctx, key, l.source_id) {
                         revealed_this_datagram.insert(l.instrument_id);
                     }
@@ -3032,7 +3057,7 @@ impl DatagramProcessor for MbpProcessor {
                     else {
                         continue;
                     };
-                    self.record_outcome(ctx.venue, &outcome);
+                    self.record_outcome(ctx, &key, &outcome);
                     if self.reveal_if_needed(ctx, key, c.source_id) {
                         revealed_this_datagram.insert(c.instrument_id);
                     }

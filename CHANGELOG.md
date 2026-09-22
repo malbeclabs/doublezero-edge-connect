@@ -46,7 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rotation per market. Book health is now `PriceBook::serves_a_book()` — `Ready`, or a group
   assembling over levels that are still complete — while a group over a book that was *not* being
   served stays unhealthy. A subscriber now gets one publisher-driven re-baseline per rotation instead
-  of two more, and a book that stands still for the length of an assembly.
+  of two more, and a book that stands still for the length of an assembly. An assembly that loses
+  buffered deltas to the per-book cap leaves that served state again — the levels it would be
+  claiming are provably incomplete, so the market fails over rather than freezing on a path that
+  cannot complete it (`dz_mbp_book_buffer_overflows_total`).
 - ⚠️ **A batch dropped from the path a consumer was following left its book with a permanent
   hole**, and served a crossed book for minutes: with the peer silent for that market the gate's
   `last_admitted` never moved, so the path resuming read as a continuation and the dropped changes
@@ -63,9 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ⚠️ **A closing batch the publish gate refused was forgotten, leaving every consumer buffering that
   event for good** — routine now that a path keeps a market through its own snapshot rotation. The
   instrument stays owed its close and is retried (`dz_mbp_closes_refused_total`), a rebuild records
-  the close it performs, and a rotation that never installs gives the market up after 15 s rather
-  than holding it unpublished. A client is no longer bootstrapped mid-event either: a market whose
-  event is still open is withheld until it re-baselines instead of handed a book it cannot complete.
+  the close it performs, and a rotation that never installs gives the market up after 3 s rather
+  than holding it unpublished — the bound trades a stall of at most that long against the pair of
+  re-baselines a failover and its return cost. A client is no longer bootstrapped mid-event either:
+  a market whose event is still open is withheld until it re-baselines instead of handed a book it
+  cannot complete.
 - ⚠️ **A market both publishers reset stayed on whichever path readmitted it last.** The reset
   purges the instrument's wire Source ID in the same message that reports its book unhealthy, so the
   readmitting snapshot's healthy report had no venue to file the report under — and the

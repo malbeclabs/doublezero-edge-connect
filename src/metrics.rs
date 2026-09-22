@@ -245,6 +245,11 @@ pub struct Metrics {
     /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
     /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
     pub mbp_buffer_overflows: IntCounterVec,
+    /// One book's own delta buffer overflowed: it held `pricebook`'s `MAX_BUFFERED_DELTAS` deltas
+    /// with no snapshot arriving to anchor them, so the buffer was dropped and the book marked
+    /// `Gap`. Separate from the cross-instrument budget above — that is the host's memory ceiling
+    /// across books, this is one instrument whose rotation never came.
+    pub mbp_book_buffer_overflows: IntCounterVec,
     /// A book discarded because its per-book price-level cap was hit — a malformed or forged feed,
     /// never packet loss. Deliberately not counted as a sequence gap: the cause and the resulting
     /// status differ, and merging them would read a hostile book as a lossy network.
@@ -681,6 +686,13 @@ impl Metrics {
                 "dz_mbp_buffer_overflows_total",
                 "Cross-instrument delta-buffer budget overflows; the largest instrument's buffer \
                  was dropped. Sustained means the snapshot period is too long for this host.",
+                &["venue"],
+            ),
+            mbp_book_buffer_overflows: counter_vec(
+                &registry,
+                "dz_mbp_book_buffer_overflows_total",
+                "One book's delta buffer overflowed with no snapshot to anchor it; the buffer was \
+                 dropped, the book marked Gap and the market failed over to a peer",
                 &["venue"],
             ),
             mbp_level_overflows: counter_vec(
@@ -1186,6 +1198,9 @@ mod tests {
         m.tape_path_dropped.with_label_values(&["KALSHI"]).inc();
         m.mbp_channel_resets.with_label_values(&["KALSHI"]).inc();
         m.mbp_buffer_overflows.with_label_values(&["KALSHI"]).inc();
+        m.mbp_book_buffer_overflows
+            .with_label_values(&["KALSHI"])
+            .inc();
         m.mbp_level_overflows.with_label_values(&["KALSHI"]).inc();
         m.mbp_orphan_snapshot_levels
             .with_label_values(&["KALSHI"])
@@ -1277,6 +1292,7 @@ mod tests {
             "dz_tape_path_dropped_total",
             "dz_mbp_channel_resets_total",
             "dz_mbp_buffer_overflows_total",
+            "dz_mbp_book_buffer_overflows_total",
             "dz_mbp_level_overflows_total",
             "dz_mbp_orphan_snapshot_levels_total",
             "dz_mbp_declined_rotation_levels_total",

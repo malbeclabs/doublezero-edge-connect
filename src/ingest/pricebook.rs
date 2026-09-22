@@ -30,8 +30,8 @@ const ACTION_DELETE: u8 = 3;
 
 /// Cap on deltas buffered while not `Ready`. In normal operation the buffer holds at most one
 /// snapshot cycle; this bounds a flood of deltas for an instrument that never receives a snapshot.
-/// Excess deltas are dropped — the book re-anchors on the next snapshot regardless of which
-/// buffered deltas survived. Matches `book.rs`'s `MAX_PENDING_DELTAS`.
+/// Crossing it costs the book its served state — see [`PriceBook::buffer`]. Matches `book.rs`'s
+/// `MAX_PENDING_DELTAS`.
 pub(crate) const MAX_BUFFERED_DELTAS: usize = 1 << 18;
 
 /// How long a book may keep being reported as served while a snapshot group assembles over its
@@ -39,12 +39,10 @@ pub(crate) const MAX_BUFFERED_DELTAS: usize = 1 << 18;
 /// to a peer instead of freezing on a path that publishes nothing (`send_book` refuses a book that
 /// is not `Ready`).
 ///
-/// 15 s, from the assemblies actually measured on the live feed: p50 0.65 s, p90 3.25 s, p99
-/// 7.07 s and a maximum of 13.09 s over 13.5 h. A group still assembling past that has almost
-/// certainly lost its `SnapshotEnd` — `MbpProcessor` routes one open group per `(publisher,
-/// channel)`, so the next instrument's rotation takes the route and this one waits for its own
-/// next rotation, minutes away on a 318-instrument channel.
-const MAX_REBUILD_SERVE_NS: u64 = 15_000_000_000;
+/// The value is what a consumer trades: an assembly inside the bound costs it a stall of at most
+/// this long and no re-baseline, and one past it costs a re-baseline pair as the market fails over
+/// and comes back.
+const MAX_REBUILD_SERVE_NS: u64 = 3_000_000_000;
 
 /// Cap on price levels held per book — both the live sides and the snapshot under assembly. The
 /// multicast wire is unauthenticated, so a forged feed of level updates at distinct prices would
@@ -126,6 +124,10 @@ pub enum DeltaOutcome {
     /// because the cause (a malformed or forged feed, never packet loss) and the resulting `status`
     /// both differ; a caller counting one as the other would read a hostile book as a lossy network.
     Overflow,
+    /// The delta buffer was full, so this delta and the buffer behind it were discarded and
+    /// `status` is [`Status::Gap`] — see [`PriceBook::buffer`]. Distinct from [`Self::Gap`], whose
+    /// hole is in the publisher's sequence rather than in what we agreed to hold.
+    BufferOverflow,
     Applied {
         divergence: Option<Divergence>,
     },
@@ -283,8 +285,11 @@ impl PriceBook {
     pub fn on_delta(&mut self, op: DeltaOp, removed: &mut Vec<(u8, i64)>) -> DeltaOutcome {
         removed.clear();
         if self.status != Status::Ready {
-            self.buffer(op);
-            return DeltaOutcome::Buffered;
+            return if self.buffer(op) {
+                DeltaOutcome::BufferOverflow
+            } else {
+                DeltaOutcome::Buffered
+            };
         }
         if op.seq <= self.last_applied_instrument_seq {
             return DeltaOutcome::Duplicate;
@@ -492,11 +497,21 @@ impl PriceBook {
         self.last_event_ts = 0;
     }
 
-    fn buffer(&mut self, op: DeltaOp) {
+    /// Hold a delta for replay after the next snapshot, returning whether the cap refused it.
+    ///
+    /// A refusal means deltas are being lost, so the book leaves the served state:
+    /// [`Self::serves_a_book`] would otherwise keep claiming levels that are provably incomplete
+    /// while `send_book` publishes nothing, and no peer could take the market. The buffer goes with
+    /// the hole — it predates it and can never bridge it, exactly as on a forward sequence gap —
+    /// which also leaves room for the deltas past the hole, the ones a later snapshot can replay.
+    fn buffer(&mut self, op: DeltaOp) -> bool {
         if self.pending.len() < MAX_BUFFERED_DELTAS {
             self.pending.push(op);
+            return false;
         }
-        // else: drop; the book re-anchors on the next snapshot regardless.
+        self.pending.clear();
+        self.status = Status::Gap;
+        true
     }
 
     /// Replay buffered deltas after a snapshot installed at `anchor`. Those at/below it are already
@@ -1582,15 +1597,54 @@ mod tests {
 
     // ---- Buffer bound ----
 
-    /// The per-instrument buffer is bounded. Excess deltas are dropped, not grown — the book
-    /// re-anchors on the next snapshot regardless of which buffered deltas survived.
+    /// The per-instrument buffer is bounded, and crossing the bound drops it rather than growing
+    /// it: the deltas held predate the hole the cap just made and can never bridge it, so the
+    /// buffer restarts on the deltas a later snapshot can actually replay.
     #[test]
     fn buffered_deltas_are_bounded() {
         let mut b = PriceBook::new();
         for i in 1..=(MAX_BUFFERED_DELTAS as u32 + 100) {
             apply_delta(&mut b, level(i, i as u64, SIDE_BID, 6200, 1, NEW));
         }
-        assert_eq!(b.buffered_len(), MAX_BUFFERED_DELTAS);
+        assert!(b.buffered_len() < MAX_BUFFERED_DELTAS);
+        assert_eq!(b.status(), Status::Gap);
+    }
+
+    /// ⚠️ A rebuild assembling over a live book reports the path **healthy** while `send_book`
+    /// publishes nothing, so a buffer overflow there is the one case where the gate's claim becomes
+    /// provably false: the levels it says this path holds are missing every dropped delta. The book
+    /// must leave the served state so the peer takes the market.
+    #[test]
+    fn a_buffer_overflow_during_a_rebuild_over_a_live_book_gives_the_market_up() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(b.on_snapshot_begin(2, 500, 1, 9, 0, 0), "K=9 > 5, behind");
+        assert!(b.serves_a_book(0), "the live book is still complete");
+
+        for i in 1..=(MAX_BUFFERED_DELTAS as u32 + 1) {
+            let outcome = apply_delta(
+                &mut b,
+                level(10 + i, 500 + i as u64, SIDE_BID, 6100, 1, NEW),
+            );
+            assert_eq!(
+                outcome,
+                if i as usize > MAX_BUFFERED_DELTAS {
+                    DeltaOutcome::BufferOverflow
+                } else {
+                    DeltaOutcome::Buffered
+                }
+            );
+        }
+        assert_eq!(b.status(), Status::Gap);
+        assert!(!b.serves_a_book(0), "the market fails over to the peer");
+
+        // The group still installs — and re-baselines, rather than replaying a buffer whose
+        // surviving deltas sit on the far side of the hole.
+        b.on_snapshot_level(2, SIDE_BID, 6000, 5, Some(1), 0);
+        assert!(b.on_snapshot_end(500, 2));
+        assert_eq!(b.status(), Status::Ready);
+        assert!(b.serves_a_book(0));
+        assert_eq!(bids_of(&b), vec![(6000, 5)], "the snapshot's levels alone");
+        assert_eq!(b.buffered_len(), 0);
     }
 
     /// `drop_buffer` is the action behind the cross-instrument overflow policy: the instrument
