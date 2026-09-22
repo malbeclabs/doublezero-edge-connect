@@ -43,7 +43,7 @@ use std::{
 
 use prometheus::{Histogram, IntCounter};
 use tokio::sync::broadcast;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     ingest::{
@@ -1512,14 +1512,19 @@ struct BookMarket {
 }
 
 /// The `dz_path_authority_transfers_total` reason for an admitted `book` batch, or `None` when nothing
-/// moved. `margin` is counted where it happens (the sampler tick), and the venue leader taking a
-/// market back from a health override follows either that or a recovery, so it is not attributable
-/// here and is deliberately left uncounted rather than mislabelled.
+/// moved. `margin` is counted where it happens (the sampler tick).
+///
+/// `overridden` is whether the path that last served this market held it as a health override
+/// ([`StickyAuthority::overridden`], read before the admission). It is what makes the leader taking
+/// a market **back** attributable: the leader's own book is healthy again by then, so the state at
+/// that moment cannot otherwise tell a revert from the first market to speak after a `margin`
+/// transfer — which is why the revert used to go uncounted.
 fn transfer_reason(
     prev: Option<Transport>,
     leader_before: Option<Transport>,
     leader_after: Option<Transport>,
     publisher: Transport,
+    overridden: bool,
 ) -> Option<&'static str> {
     if leader_before.is_none() {
         return Some("initial"); // the venue's first eligible path
@@ -1530,7 +1535,20 @@ fn transfer_reason(
     if leader_after != Some(publisher) && prev != Some(publisher) {
         return Some("health"); // the per-market override took this market
     }
+    if prev != Some(publisher) && overridden {
+        return Some("health_revert"); // the leader took it back, its own book recovered
+    }
     None
+}
+
+/// The `rebaselined` label value. A label rather than a second counter: one series per transfer, read
+/// with or without the dimension.
+fn yes_no(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// A `clear`-only re-baseline for one market: what a consumer gets when the gate has no accumulated
@@ -2795,8 +2813,10 @@ impl Arbiter {
     pub fn close_authority_windows(&mut self) {
         for ((venue, _category), _) in self.books.close_window(now_ns()) {
             metrics()
+                // `yes`: a margin transfer re-baselines every market it moves, each on that
+                // market's own next admitted batch (which counts no transfer of its own).
                 .path_transfers
-                .with_label_values(&[venue.as_ref(), "margin"])
+                .with_label_values(&[venue.as_ref(), "margin", "yes"])
                 .inc();
         }
         // Never `path_ordinal` on either loop: labelling must not admit. `drain_unmatched`'s keys are
@@ -3109,6 +3129,7 @@ impl Arbiter {
                     self.track_book_market(&key);
                 }
                 let prev = self.books.last_admitted(&key);
+                let overridden_before = self.books.overridden(&key);
                 let leader_before = self.books.scope_leader(&scope);
                 let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
                 // Accumulate the path's feed whether or not it was admitted: a transfer republishes
@@ -3119,12 +3140,36 @@ impl Arbiter {
                     return;
                 }
                 let leader_after = self.books.scope_leader(&scope);
-                if let Some(reason) = transfer_reason(prev, leader_before, leader_after, publisher)
-                {
+                if let Some(reason) = transfer_reason(
+                    prev,
+                    leader_before,
+                    leader_after,
+                    publisher,
+                    overridden_before,
+                ) {
+                    // Whether the handover obliges a re-baseline, not whether *this* batch carries
+                    // it: one waiting for its new path's `last` is discharged by a later batch, which
+                    // counts no transfer of its own.
+                    let rebaselined = prev != Some(publisher)
+                        || self.book_markets.get(&key).is_some_and(|m| m.rebaseline);
                     metrics()
                         .path_transfers
-                        .with_label_values(&[b.venue.as_ref(), reason])
+                        .with_label_values(&[b.venue.as_ref(), reason, yes_no(rebaselined)])
                         .inc();
+                    // One line per transfer, with the market it moved: the counter says how many and
+                    // why, this says which, and reconstructing that from re-baseline timing alone is
+                    // what an overnight investigation had to do without it.
+                    info!(
+                        venue = %b.venue,
+                        category = %key.1,
+                        symbol = %b.symbol,
+                        instrument_id = b.instrument_id,
+                        reason,
+                        from = ?prev,
+                        to = ?publisher,
+                        rebaselined,
+                        "book authority transfer"
+                    );
                 }
                 // Anything other than "the path that last reached the wire for this market" means the
                 // consumer's state cannot be assumed to continue from this batch: a serving-path change,
@@ -4824,7 +4869,7 @@ mod tests {
         let transfers = |reason: &str| {
             metrics()
                 .path_transfers
-                .with_label_values(&[venue, reason])
+                .with_label_values(&[venue, reason, "yes"])
                 .get()
         };
         let (initial, margin) = (transfers("initial"), transfers("margin"));
@@ -4885,7 +4930,7 @@ mod tests {
         let venue = "BookHealthOverride";
         let health = metrics()
             .path_transfers
-            .with_label_values(&[venue, "health"]);
+            .with_label_values(&[venue, "health", "yes"]);
         let before = health.get();
         let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
         let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
@@ -4919,6 +4964,104 @@ mod tests {
             "the venue is untouched"
         );
         assert_eq!(health.get(), before + 1);
+    }
+
+    /// The other half of a health episode, and the one that used to be invisible: the leader takes
+    /// the market back once its own book recovers, at the cost of a second full re-baseline. It is
+    /// attributable only because the authority remembers that the path it is taking the market from
+    /// held it as an override — the state at this moment is otherwise identical to the first market
+    /// to speak after a `margin` transfer, which is already counted.
+    #[test]
+    fn the_leader_taking_a_market_back_is_counted_as_a_health_revert() {
+        let venue = "BookHealthRevert";
+        let revert = metrics()
+            .path_transfers
+            .with_label_values(&[venue, "health_revert", "yes"]);
+        let before = revert.get();
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            path(1),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 55.0)], true, 1_101),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+
+        a.set_book_health(&key, path(1), false);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 66.0)], true, 1_200),
+            path(2),
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_books(&mut rx).len(), 1, "the override re-baselines");
+
+        a.set_book_health(&key, path(1), true);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.43, 12.0)], true, 1_300),
+            path(1),
+            TEST_CATEGORY,
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1, "and so does the revert");
+        assert!(out[0].snapshot && out[0].last);
+        assert_eq!(out[0].changes[0], clear_both());
+        assert_eq!(
+            a.books.scope_leader(&bscope(venue)),
+            Some(path(1)),
+            "the venue never moved: this is the override unwinding"
+        );
+        assert_eq!(revert.get(), before + 1);
+    }
+
+    /// `rebaselined` separates a handover that costs a consumer a whole book from one that costs
+    /// nothing. Venue authority following a silent leader onto the path *already* serving this
+    /// market moves the leader and republishes nothing: the consumer's state already came from
+    /// there.
+    #[test]
+    fn a_silence_handover_onto_the_serving_path_rebaselines_nothing() {
+        let venue = "BookSilenceNoRebaseline";
+        let silence = metrics()
+            .path_transfers
+            .with_label_values(&[venue, "silence", "no"]);
+        let before = silence.get();
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 10.0)], true, 1_100),
+            path(1),
+            TEST_CATEGORY,
+        );
+        a.set_book_health(&key, path(1), false);
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.42, 66.0)], true, 1_200),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+
+        // The leader has now been quiet for longer than its timeout, so path(2)'s next batch takes
+        // the venue — a market it is already serving.
+        let late = 1_200 + AuthorityConfig::DEFAULT.leader_timeout_ns + 1;
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.44, 9.0)], true, late),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let out = drain_books(&mut rx);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].snapshot, "the batch goes out as itself");
+        assert_eq!(out[0].changes, vec![bid(0.44, 9.0)]);
+        assert_eq!(
+            a.books.scope_leader(&bscope(venue)),
+            Some(path(2)),
+            "the venue moved"
+        );
+        assert_eq!(silence.get(), before + 1);
     }
 
     /// A re-baseline waits for the new path to close a logical event. Materializing a half-applied one

@@ -593,8 +593,15 @@ Modules are grouped by role under `src/`:
   `8 x N` paths — the forged-flood bound still holds per universe, which is the grain that decides
   anything, and the metric label set stays `{venue, path}` (`dz_path_markets_held` sums a venue's
   universes; two universes' `path0` are different publishers)
-  (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
-  overrides the elected path for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
+  (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` health transition) and
+  overrides the elected path for that market alone. ⚠️ **Health is `PriceBook::serves_a_book()`, not
+  `status() == Ready`.** A publisher rotates a snapshot per instrument continuously and one captured
+  ahead of our applied deltas is accepted *while the book is `Ready`*, assembling into a shadow while
+  the live levels stand; reporting that as unhealthy handed the market to the peer and took it
+  straight back, at two consumer re-baselines per rotation (measured: 622 transfers and 1,244 of the
+  night's 1,278 clear-led re-baselines in 13.5 h on two Phoenix publishers). A group assembling over
+  a book that was *not* being served stays unhealthy — that one is empty. Both directions are now
+  counted, `reason="health"` and `reason="health_revert"` with a `rebaselined` label. Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
   serving-path change (margin, silence, or that health override), a market's first admission, or a market
   whose state was evicted. The re-baseline is a `clear` plus the new path's complete current level set,
@@ -681,7 +688,9 @@ Modules are grouped by role under `src/`:
   count small enough to bound the wedge sits inside a single busy slot, fires mid-event and
   re-exposes the very books this closes. `MAX_DATAGRAMS_WITHOUT_BOUNDARY` survives only as the
   backstop for a datagram whose `recv_ts_ns` is the `0` sentinel. The fallback closes whatever
-  `open` still holds; the paths that instead *drop* that map (channel reset, `EndOfSession`,
+  `open` still holds — and drops `last_batch` with it, since the last boundary seen names a slot the
+  venue has moved past (PROTOCOL.md already promises `batch_id` absent rather than stale); the paths
+  that instead *drop* that map (channel reset, `EndOfSession`,
   publisher eviction) emit nothing on purpose — the books are already gone and the recovery is a
   `Clear`-led re-baseline, which discards the consumer's buffer rather than committing it. All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-transport dedup is **not** here anymore — it moved to `arbiter.rs`.
@@ -718,9 +727,15 @@ Modules are grouped by role under `src/`:
   snapshot group whose era disagrees with the market data's is refused for the same reason — it
   belongs to the publisher's previous run, and installing it would republish a dead session's book.
   `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
-  O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are
-  reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped path
-  over to its peer. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
+  O(1); a test recomputes the true sum after every mutation path. Per-market health transitions are
+  reported to the arbiter's `StickyAuthority` (`set_book_health`) off `serves_a_book()`, never
+  `status()`, which is what fails a gapped path over to its peer without failing over a healthy one
+  mid-rotation. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
+  and publishes nothing until the install's re-baseline. It also runs the shared `SeqTracker` per
+  publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
+  `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
+  `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
+  closes every open event at a slot the venue has left — committing each consumer's buffer mid-event. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
   `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
   whole-side clear would tell the consumer to drop levels this book still holds. Its
   `ManifestSummary`/`InstrumentDefinition` branches are `handle_refdata`-gated exactly like the three

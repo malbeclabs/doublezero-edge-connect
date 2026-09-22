@@ -188,6 +188,11 @@ struct MarketState {
     /// Who was last admitted here, so `opened_tick` marks a real change of served path rather than
     /// every leader message.
     last_admitted: Option<Transport>,
+    /// Whether that path serves this market as a health **override** rather than as its universe's
+    /// leader. Stored because the leader taking the market back is only attributable in retrospect:
+    /// by the time its own batch arrives its book is healthy again, so nothing in the state at that
+    /// moment separates a revert from the first market to speak after a margin transfer.
+    overridden: bool,
 }
 
 pub struct StickyAuthority {
@@ -316,9 +321,11 @@ impl StickyAuthority {
         if self.serving(&key) != Some(publisher) {
             return Admit::Dropped;
         }
+        let overridden = self.scope_leader(&scope) != Some(publisher);
         let m = self.market_mut(&key);
         let opened_tick = m.last_admitted != Some(publisher);
         m.last_admitted = Some(publisher);
+        m.overridden = overridden;
         Admit::Emitted { opened_tick }
     }
 
@@ -436,6 +443,12 @@ impl StickyAuthority {
     /// this across an [`Self::admit`] is what obliges the caller to re-baseline that market.
     pub fn last_admitted(&self, key: &MarketKey) -> Option<Transport> {
         self.markets.get(key)?.last_admitted
+    }
+
+    /// Whether the path last admitted for one market held it as a health override — see
+    /// [`MarketState::overridden`]. Read *before* an [`Self::admit`] call, which overwrites it.
+    pub fn overridden(&self, key: &MarketKey) -> bool {
+        self.markets.get(key).is_some_and(|m| m.overridden)
     }
 
     /// Every known `(venue, path)` with the market count it currently serves — the `dz_path_markets_held`

@@ -130,6 +130,10 @@ struct Building {
     received_levels: u32,
     last_instrument_seq: u32,
     depth_bound: u32,
+    /// Whether the live book this group is replacing is still complete — see
+    /// [`PriceBook::serves_a_book`]. Set from the status the group opened over, so a rotation
+    /// accepted while the market was already being served does not read as a cold rebuild.
+    over_live_book: bool,
     bids: BTreeMap<i64, LevelState>,
     asks: BTreeMap<i64, LevelState>,
 }
@@ -181,6 +185,26 @@ impl PriceBook {
 
     pub fn status(&self) -> Status {
         self.status
+    }
+
+    /// Whether this book still holds a complete picture of the market — what a caller reports to the
+    /// arbitration gate as *health*, and deliberately weaker than [`Status::Ready`].
+    ///
+    /// A publisher rotates a snapshot for every instrument continuously, and a rotation captured
+    /// ahead of the deltas we have applied is **accepted while the book is `Ready`**: the group
+    /// assembles into a shadow, `bids`/`asks` keep the live book, and the deltas that arrive
+    /// meanwhile buffer and replay on install. Nothing is lost and nothing is degraded, so reporting
+    /// that as unhealthy hands the market to a peer and hands it straight back — two consumer
+    /// re-baselines per rotation, per market, for a path that never stopped holding the book.
+    ///
+    /// A group opened over a book that was *not* being served (`AwaitingSnapshot`/`Gap`) is a cold
+    /// rebuild: `bids`/`asks` are empty or stale, so it stays unhealthy until the group installs.
+    pub fn serves_a_book(&self) -> bool {
+        match self.status {
+            Status::Ready => true,
+            Status::BuildingSnapshot => self.open.as_ref().is_some_and(|b| b.over_live_book),
+            Status::AwaitingSnapshot | Status::Gap => false,
+        }
     }
 
     pub fn depth_bound(&self) -> Option<u32> {
@@ -300,6 +324,10 @@ impl PriceBook {
             received_levels: 0,
             last_instrument_seq,
             depth_bound,
+            // Read before the status assignment below, and off `serves_a_book` rather than
+            // `status == Ready`, so a rotation replacing one that was itself assembling over the
+            // live book inherits that standing instead of reading as a cold rebuild.
+            over_live_book: self.serves_a_book(),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
         });
@@ -392,6 +420,10 @@ impl PriceBook {
             .is_none_or(|b| b.anchor_seq < new_anchor_seq)
         {
             self.open = None;
+        } else if let Some(b) = &mut self.open {
+            // The live book the kept group was assembling over is gone, so the group is now a cold
+            // rebuild: this instrument must stop being reported as served until it installs.
+            b.over_live_book = false;
         }
         self.pending.retain(|d| d.mktdata_seq > new_anchor_seq);
         self.status = if self.open.is_some() {
@@ -1029,6 +1061,59 @@ mod tests {
             "the buffered delta replayed onto the installed snapshot"
         );
         assert_eq!(b.buffered_len(), 0);
+    }
+
+    /// A rotation accepted over a live book is a **repair, not a degradation**: the levels stay
+    /// intact, so the path still holds the market and reporting it unhealthy would hand the market
+    /// to a peer and hand it straight back — two consumer re-baselines per rotation, per market.
+    #[test]
+    fn a_rotation_over_a_live_book_still_serves_it() {
+        let mut b = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(b.serves_a_book());
+        assert!(
+            b.on_snapshot_begin(2, 500, 1, 9, 0),
+            "K=9 > 5, we are behind"
+        );
+        assert_eq!(b.status(), Status::BuildingSnapshot);
+        assert!(b.serves_a_book(), "the live book is still complete");
+        assert_eq!(bids_of(&b), vec![(6200, 150)]);
+        // A second rotation replacing the first inherits that standing rather than reading as cold.
+        assert!(b.on_snapshot_begin(3, 600, 1, 10, 0));
+        assert!(b.serves_a_book());
+        b.on_snapshot_level(3, SIDE_BID, 6000, 5, Some(1), 0);
+        assert!(b.on_snapshot_end(600, 3));
+        assert!(b.serves_a_book());
+    }
+
+    /// The other side of that rule, and what keeps a `Gap` off the wire: a group assembling over a
+    /// book that was *not* being served is a cold rebuild, and the market must stay with the peer
+    /// until it installs. Same for a group the reset kept — the reset emptied the book under it.
+    #[test]
+    fn a_cold_rebuild_serves_nothing_until_it_installs() {
+        let mut b = PriceBook::new();
+        assert!(!b.serves_a_book());
+        assert!(b.on_snapshot_begin(1, 100, 1, 5, 0));
+        assert_eq!(b.status(), Status::BuildingSnapshot);
+        assert!(!b.serves_a_book(), "cold from AwaitingSnapshot");
+
+        let mut g = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert_eq!(
+            apply_delta(&mut g, level(8, 101, SIDE_BID, 6100, 20, NEW)),
+            DeltaOutcome::Gap,
+            "seq 8 skips 6 and 7"
+        );
+        assert!(!g.serves_a_book());
+        assert!(g.on_snapshot_begin(2, 500, 1, 9, 0));
+        assert!(!g.serves_a_book(), "cold from Gap");
+
+        let mut r = synced(100, 5, 0, &[(SIDE_BID, 6200, 150)]);
+        assert!(r.on_snapshot_begin(2, 500, 1, 9, 0));
+        r.on_instrument_reset(400);
+        assert_eq!(r.status(), Status::BuildingSnapshot, "the group is kept");
+        assert!(
+            !r.serves_a_book(),
+            "the reset emptied the book the group was assembling over"
+        );
     }
 
     /// Publishers SHOULD emit levels best-to-worst, but subscribers MUST NOT depend on it: the

@@ -160,8 +160,9 @@ pub struct Metrics {
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
     /// [`crate::ingest::path_race::PathRace`] pairs, never by a dropped copy's inter-path phase.
     pub path_lead_ns: HistogramVec,
-    /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
-    /// thresholds are too loose: every transfer re-baselines each consumer's book.
+    /// Authority transfers by `reason` (initial/health/health_revert/silence/margin) and whether the
+    /// handover `rebaselined` the consumer (`yes`/`no`). A sustained re-baselining rate means the
+    /// thresholds are too loose.
     pub path_transfers: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
@@ -624,9 +625,9 @@ impl Metrics {
             path_transfers: counter_vec(
                 &registry,
                 "dz_path_authority_transfers_total",
-                "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
-                 means the thresholds are too loose — every transfer re-baselines each consumer.",
-                &["venue", "reason"],
+                "Authority transfers by reason (initial/health/health_revert/silence/margin) and \
+                 whether the handover re-baselined the consumer (rebaselined=yes/no).",
+                &["venue", "reason", "rebaselined"],
             ),
             path_markets_held: gauge_vec(
                 &registry,
@@ -1137,7 +1138,7 @@ mod tests {
             .with_label_values(&["KALSHI", "leader"])
             .observe(123_456.0);
         m.path_transfers
-            .with_label_values(&["KALSHI", "silence"])
+            .with_label_values(&["KALSHI", "silence", "yes"])
             .inc();
         m.path_markets_held
             .with_label_values(&["KALSHI", "path0"])

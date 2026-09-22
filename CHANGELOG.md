@@ -41,6 +41,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **A publisher's own snapshot rotation was reported to the book gate as an unhealthy path, so
+  every rotation moved the market to the peer and straight back.** A Market-by-Price book accepts a
+  rotation captured ahead of the deltas it has applied *while it is `Ready`*: the group assembles
+  into a shadow, the live levels stand, the deltas in the meantime buffer and replay on install.
+  Nothing is lost and nothing is degraded — but the processor reported health as
+  `status() == Ready`, so the path was reported unhealthy for the length of the assembly, the
+  per-market health override handed the market to the mirror, and the leader's recovery handed it
+  back. Each direction is a serving-path change the gate discharges as a clear-led re-baseline, so
+  one rotation cost a subscriber two full book re-sends. Measured overnight on the Oregon bridge
+  against two Phoenix publishers: 622 authority transfers in 13.5 h, 1,244 of the window's 1,278
+  clear-led re-baselines attributable to them, episodes p50 0.65 s and p90 3.25 s, recurring per
+  market at 380 to 1,020 s — the publisher's rotation cadence, not a link event. The peer held 0 of
+  82 markets throughout: nothing had failed over.
+
+  Health is now `PriceBook::serves_a_book()` — `Ready`, or a group assembling over levels that are
+  still complete. A group opened over a book that was *not* being served (`Gap`,
+  `AwaitingSnapshot`, or one a reset emptied under it) stays unhealthy, because that one is empty and
+  serving it would take the market dark while a healthy peer is dropped. `send_book`'s own `Ready`
+  gate is unchanged, so a path mid-rotation keeps the market and publishes nothing until the
+  install's re-baseline: one publisher-driven re-baseline per rotation instead of two more from a
+  path that bounced. A subscriber sees strictly fewer re-baselines and, for the length of an
+  assembly, a book that stands still rather than one that is re-sent twice — coordinated and
+  uncoordinated venues alike, since nothing on this path reads a shared coordinate.
+- ⚠️ **A reordered or duplicated market-data datagram closed every open book event on its channel,
+  at a slot the venue had already left.** Market-by-Price was the one market-data processor running
+  no stale-datagram check. Its stale *deltas* were refused as duplicates anyway, but a
+  `BatchBoundary` carries no sequence of its own, so an old one was processed in full: it wrote the
+  channel's committed `batch_id` backwards and closed every instrument whose logical event was open,
+  committing each consumer's buffer mid-event — precisely the locked and crossed intermediate book
+  the batching design exists to hide. Observed as seven bursts overnight, 5 to 21 markets each
+  receiving an empty `last: true` batch stamped 3 to 12 slots behind their own previous one, spans of
+  1 to 105 ms, and the backwards slot then riding every later batch until the next real boundary.
+
+  The processor now runs the shared `SeqTracker` per publisher on the market-data role only — the
+  same rule and the same role scoping top-of-book and midpoint have always applied, and the same
+  reason the `Reset Count` memo uses that role: three ports are three kernel queues carrying one era,
+  and one socket is FIFO. A stale datagram is dropped whole, and Market-by-Price now reports the
+  `dz_seq_events_total{venue,kind}` series it was missing, so a reordering publisher is visible
+  rather than silent. Separately, the boundary-timeout fallback now drops the channel's committed
+  slot along with the events it closes: once boundaries lapse the last one seen names a slot the
+  venue has moved past, and PROTOCOL.md already promises `batch_id` absent rather than stale.
 - ⚠️ **Every per-datagram `book` batch was published as a finished logical event, exposing locked
   and crossed intermediate books to every consumer that honours `last`.** A venue event's level
   changes routinely span two datagrams — the bid lifts in one, the ask moves away in the next — so
@@ -197,6 +238,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A market-by-price `InstrumentReset` discarded its own recovery snapshot group.** A publisher withholding and then re-admitting a market emits two resets, and the re-admission's recovery `SnapshotBegin` follows its own reset by ~0.1 ms on a different port — resets ride mktdata, snapshot groups the snapshot port, on independent sequence series — so which is processed first is a coin flip. When the begin won, both the book's assembly and the processor's level route were torn out, the market waited a full snapshot rotation to heal, and the group's levels were counted on `dz_mbp_snapshot_levels_dropped_total{reason="reset"}`. A group anchored at or after the reset's `New Anchor Seq` is now kept — the same test a `SnapshotBegin` is already judged by — and only one that predates the reset is dropped and tombstoned. Observed on a live Phoenix feed at roughly two flaps per hour per market; expect that `reason="reset"` series to fall substantially.
 
 ### Changed
+- **`dz_path_authority_transfers_total` gains a `rebaselined` label and a `reason="health_revert"`
+  value, and every transfer now writes one log line.** The counter could not answer the question an
+  overnight investigation needed: which handovers cost a consumer a full book, and how many were the
+  elected path merely taking a market back. That second direction went uncounted because it was
+  indistinguishable at the gate from the first market to speak after a `margin` transfer; the
+  authority now records whether the path it is taking a market from held it as a health override, so
+  the revert is attributable. `rebaselined` (`yes`/`no`) says whether the handover obliges a
+  re-baseline — not whether the batch carrying the count delivered it, since one waiting for its new
+  path's `last` is discharged by a later batch. The `info!` line per transfer carries the venue,
+  category, symbol, instrument, reason, both paths and that flag.
+
+  ⚠️ **The new label changes series identity.** Aggregating queries keep working; an instant selector
+  pinning `{venue,reason}` now returns two series. Existing `reason` values are unchanged — renaming
+  one would have broken the dashboards this is meant to serve.
 - **`edge-kalshi-sports-mbp`'s `category` is now `events`, and its group `code` is unchanged.** The
   universe that row carries is event markets, of which sport is one kind, so `sports` named it too
   narrowly; the group name is the ledger's and a subscriber matches `doublezero status` on it, so
