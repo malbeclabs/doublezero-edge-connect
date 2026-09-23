@@ -10131,7 +10131,7 @@ mod tests {
     /// Measured on a deliberate fra restart at 18:12:09Z the same day: BTC declared and delivered
     /// 127 levels flagged complete, and the next rotation declared 548.
     #[test]
-    fn mbp_a_short_first_install_is_reanchored_by_the_next_rotation() {
+    fn mbp_a_short_first_install_is_reanchored_by_two_short_rotations() {
         let venue = "MbpShortInstallTest";
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = MbpProcessor::new(tape(false));
@@ -10171,15 +10171,30 @@ mod tests {
         let before = (reanchors(), shortfalls());
 
         // The publisher's next rotation, now carrying the whole book. Declined for being captured
-        // behind us, exactly as before — but it declares 421 levels more than we hold.
+        // behind us, exactly as before — but it declares 421 levels more than we hold. One such
+        // rotation only arms the strike: a book that legitimately shrank looks the same.
         mbp_send_group(
             &mut proc,
             &snap,
             4,
             &mbp_snapshot(41, 2, 0, 0, &levels(548)),
         );
+        assert_eq!(reanchors(), before.0, "one short rotation is not enough");
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "and the book keeps being served meanwhile"
+        );
+
+        // The one after it confirms.
+        mbp_send_group(
+            &mut proc,
+            &snap,
+            7,
+            &mbp_snapshot(41, 3, 0, 0, &levels(548)),
+        );
         assert_eq!(reanchors(), before.0 + 1, "the re-anchor is counted");
-        assert_eq!(shortfalls(), before.1 + 1, "and its shortfall recorded");
+        assert_eq!(shortfalls(), before.1 + 2, "both shortfalls recorded");
         assert_eq!(
             mbp_status(&proc, TEST_PUB, 0, 41),
             Some(BookStatus::AwaitingSnapshot),
@@ -10200,7 +10215,7 @@ mod tests {
             &mut proc,
             &snap,
             10,
-            &mbp_snapshot(41, 3, 0, 1, &levels(548)),
+            &mbp_snapshot(41, 4, 0, 1, &levels(548)),
         );
         assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
         let books = drain_books(&mut rx);

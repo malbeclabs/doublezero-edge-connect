@@ -804,8 +804,14 @@ Modules are grouped by role under `src/`:
   publisher is still refilling: the short install then pins, and is republished to every consumer and
   into the WS bootstrap as a **complete** `Clear`-led re-baseline. `on_snapshot_begin` therefore
   re-anchors (`force_resync`, `BeginOutcome::Resynced`, `dz_mbp_reanchor_total{reason="short_book"}`)
-  when a declined rotation claims completeness (`depth_bound == 0`) and declares materially more
-  levels than the book holds. ⚠️ **The triggering rotation cannot install itself**: `on_snapshot_end`
+  when **two consecutive** declined rotations claim completeness (`depth_bound == 0`) and declare
+  materially more levels than the book holds. ⚠️ **One rotation is not evidence**: a book that
+  legitimately *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes
+  past that rotation's `last_instrument_seq` — is indistinguishable from a short install by
+  shortfall alone, and the rotation *after* such a clear is captured post-clear and declares the
+  true smaller total, which clears the strike. The two strikes are keyed on `snapshot_id`, because a
+  multicast wire redelivers datagrams routinely and one rotation must never be its own
+  confirmation. ⚠️ **The triggering rotation cannot install itself**: `on_snapshot_end`
   takes `last_applied_instrument_seq` from the group, which is behind what a `Ready` book applied, and
   the deltas in between were *applied* rather than buffered — so `replay` would gap and drop the book.
   Bridging that needs a rolling per-book buffer of applied deltas; instead the repair is deferred one
@@ -819,6 +825,8 @@ Modules are grouped by role under `src/`:
   of `Ready`, so three things bound it and their **order inside `on_snapshot_begin` is load-bearing**:
   `MAX_LEVELS_PER_BOOK` and the `required_anchor_seq` check run first, a bounded group never triggers
   it at all, and `REANCHOR_MIN_INTERVAL_NS` (60 s, longer than one rotation) allows one per book.
+  `on_snapshot_end`'s success path is the **only** place `Ready` is entered and so the only place
+  the strike has to be cleared.
 - **`ingest/subscriber.rs`** — `RefDataState<D>`, the reference-data state machine, **generic over** any
   instrument-definition type implementing `InstrumentDef` (its id + manifest seq), so all three
   protocols reuse it. Collects definitions tagged with the latest `ManifestSummary` seq; `ready()`
