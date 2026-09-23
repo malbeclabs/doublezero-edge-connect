@@ -798,6 +798,27 @@ Modules are grouped by role under `src/`:
   resulting quantity, so `Action` never gates the apply (quantity alone decides) and the
   `Add`/`Cancel`/`Execute` vocabulary does not apply. Reports the levels a `BookClear` removed through
   a caller-supplied buffer, since the wire `Clear` has no price bound.
+  ⚠️ **Once `Ready`, a book declines every rotation for the rest of the publisher era** — each one is
+  captured behind the deltas it has applied — so the group that *installed* is the book, permanently.
+  That is fine until a publisher restart, whose new era's first rotation is served from a book the
+  publisher is still refilling: the short install then pins, and is republished to every consumer and
+  into the WS bootstrap as a **complete** `Clear`-led re-baseline. `on_snapshot_begin` therefore
+  re-anchors (`force_resync`, `BeginOutcome::Resynced`, `dz_mbp_reanchor_total{reason="short_book"}`)
+  when a declined rotation claims completeness (`depth_bound == 0`) and declares materially more
+  levels than the book holds. ⚠️ **The triggering rotation cannot install itself**: `on_snapshot_end`
+  takes `last_applied_instrument_seq` from the group, which is behind what a `Ready` book applied, and
+  the deltas in between were *applied* rather than buffered — so `replay` would gap and drop the book.
+  Bridging that needs a rolling per-book buffer of applied deltas; instead the repair is deferred one
+  rotation (~18.5 s measured on Phoenix), with `serves_a_book()` false meanwhile so the existing health
+  override hands the market to the peer. **"Materially" is a jitter bound, not an acceptance of a short
+  book**: the shortfall must exceed both 8 levels and 10% of the declared total, against the 1–3% a
+  rotation captured a few hundred ms early shows on a ~550-level book — every shortfall under it is
+  still recorded on `dz_mbp_declined_rotation_shortfall_levels`, because completeness is the
+  publisher's own claim and a short complete-flagged group is a publisher defect, not something to
+  tolerate silently. `total_levels` is wire-supplied and unauthenticated and can now take a market out
+  of `Ready`, so three things bound it and their **order inside `on_snapshot_begin` is load-bearing**:
+  `MAX_LEVELS_PER_BOOK` and the `required_anchor_seq` check run first, a bounded group never triggers
+  it at all, and `REANCHOR_MIN_INTERVAL_NS` (60 s, longer than one rotation) allows one per book.
 - **`ingest/subscriber.rs`** — `RefDataState<D>`, the reference-data state machine, **generic over** any
   instrument-definition type implementing `InstrumentDef` (its id + manifest seq), so all three
   protocols reuse it. Collects definitions tagged with the latest `ManifestSummary` seq; `ready()`

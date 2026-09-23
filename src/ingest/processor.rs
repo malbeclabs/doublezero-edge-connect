@@ -27,7 +27,7 @@ use crate::{
         codec::{apply_exponent, decode_datagram, InstrumentDefinition, Message},
         codec_mbo, codec_mbp, codec_midpoint,
         pricebook::{
-            BookDelta, DeltaOp as PriceDeltaOp, DeltaOutcome, Divergence, PriceBook,
+            BeginOutcome, BookDelta, DeltaOp as PriceDeltaOp, DeltaOutcome, Divergence, PriceBook,
             Status as BookStatus, MAX_BUFFERED_DELTAS,
         },
         receiver::{DatagramCtx, DatagramProcessor, SeqCheck, SeqTracker},
@@ -2224,6 +2224,10 @@ pub struct MbpProcessor {
     slot_warn: WarnRateLimit,
     /// Rate limit for the per-book delta-buffer overflow warning — see [`Self::record_outcome`].
     buffer_warn: WarnRateLimit,
+    /// Rate limit for the short-book re-anchor warning — see the `SnapshotBegin` arm.
+    reanchor_warn: WarnRateLimit,
+    /// Rate limit for the shrinking-install warning — see the `SnapshotEnd` arm.
+    shrink_warn: WarnRateLimit,
     /// Whether this receiver currently owns its venue's tape — see [`TobProcessor::tape`].
     tape: TapeOwner,
     /// Per-publisher, per-channel datagram sequence tracker — see [`PublisherSeq`], and
@@ -2254,6 +2258,8 @@ impl MbpProcessor {
             decode_warn: WarnRateLimit::default(),
             slot_warn: WarnRateLimit::default(),
             buffer_warn: WarnRateLimit::default(),
+            reanchor_warn: WarnRateLimit::default(),
+            shrink_warn: WarnRateLimit::default(),
             tape,
             seq: PublisherSeq::default(),
             seq_events: SeqEvents::default(),
@@ -3064,6 +3070,17 @@ impl DatagramProcessor for MbpProcessor {
                     if !matches!(outcome, DeltaOutcome::Applied { .. }) {
                         continue;
                     }
+                    metrics()
+                        .mbp_book_clears
+                        .with_label_values(&[
+                            ctx.venue,
+                            if c.scope == codec_mbp::SCOPE_ENTIRE_SIDE {
+                                "entire_side"
+                            } else {
+                                "from_price"
+                            },
+                        ])
+                        .inc();
                     let changes = accum.entry(c.instrument_id).or_default();
                     if c.scope == codec_mbp::SCOPE_ENTIRE_SIDE {
                         // Only for a side the apply acted on: an unrecognized byte clears nothing in
@@ -3128,7 +3145,7 @@ impl DatagramProcessor for MbpProcessor {
                         continue;
                     };
                     touched.insert(s.instrument_id);
-                    let accepted = self
+                    let outcome = self
                         .with_book(&key, |b| {
                             b.on_snapshot_begin(
                                 s.snapshot_id,
@@ -3139,9 +3156,38 @@ impl DatagramProcessor for MbpProcessor {
                                 ctx.recv_ts_ns,
                             )
                         })
-                        .unwrap_or(false);
+                        .unwrap_or(BeginOutcome::Declined { shortfall: None });
+                    // Every declined *complete* rotation is measured, not only the ones past the
+                    // re-anchor bound: the tolerance is there for capture jitter, so a population
+                    // creeping up inside it is a publisher shipping short complete-flagged groups
+                    // and has to be visible before it crosses.
+                    if let Some(shortfall) = outcome.shortfall() {
+                        metrics()
+                            .mbp_declined_rotation_shortfall
+                            .with_label_values(&[ctx.venue])
+                            .observe(shortfall as f64);
+                    }
+                    if let BeginOutcome::Resynced { shortfall } = outcome {
+                        metrics()
+                            .mbp_reanchor
+                            .with_label_values(&[ctx.venue, "short_book"])
+                            .inc();
+                        if let Some(suppressed) = self.reanchor_warn.allow() {
+                            warn!(
+                                venue = ctx.venue,
+                                channel,
+                                ?ctx.publisher,
+                                instrument_id = s.instrument_id,
+                                declared_levels = s.total_levels,
+                                shortfall,
+                                suppressed,
+                                "mbp book is short of a complete rotation's declared levels; \
+                                 re-anchoring off Ready so the next rotation installs it whole"
+                            );
+                        }
+                    }
                     let group = (ctx.publisher, channel);
-                    if accepted {
+                    if outcome.accepted() {
                         self.open.insert(
                             group,
                             OpenGroup {
@@ -3256,10 +3302,46 @@ impl DatagramProcessor for MbpProcessor {
                     }
                     let key = (ctx.publisher, channel, e.instrument_id);
                     touched.insert(e.instrument_id);
-                    let installed = self
-                        .with_book(&key, |b| b.on_snapshot_end(e.anchor_seq, e.snapshot_id))
-                        .unwrap_or(false);
+                    let (installed, before, after, depth_bound) = self
+                        .with_book(&key, |b| {
+                            let before = b.levels_len();
+                            let installed = b.on_snapshot_end(e.anchor_seq, e.snapshot_id);
+                            (installed, before, b.levels_len(), b.depth_bound())
+                        })
+                        .unwrap_or((false, 0, 0, None));
                     if installed {
+                        // `Some(0)` is the publisher's positive claim of a complete book; anything
+                        // else is a bound, and a bounded group's level count says nothing about the
+                        // size of the market.
+                        let completeness = match depth_bound {
+                            Some(0) => "complete",
+                            _ => "bounded",
+                        };
+                        metrics()
+                            .mbp_snapshot_installs
+                            .with_label_values(&[ctx.venue, completeness])
+                            .inc();
+                        // Zero by construction on a cold rebuild (the book was empty), so this is
+                        // the rotation-over-a-live-book case: an install that took levels away.
+                        if after < before {
+                            metrics()
+                                .mbp_install_shrank_book
+                                .with_label_values(&[ctx.venue])
+                                .inc();
+                            if let Some(suppressed) = self.shrink_warn.allow() {
+                                warn!(
+                                    venue = ctx.venue,
+                                    channel,
+                                    ?ctx.publisher,
+                                    instrument_id = e.instrument_id,
+                                    before,
+                                    after,
+                                    ?depth_bound,
+                                    suppressed,
+                                    "mbp snapshot install left the book smaller than it was"
+                                );
+                            }
+                        }
                         // The re-baseline replaces everything accumulated for this instrument so
                         // far, and goes out here (not deferred to the end-of-datagram emit pass below) so a
                         // delta later in the same datagram follows it as an incremental batch. Also
@@ -10025,5 +10107,296 @@ mod tests {
                 && !proc.reveal_rebaselined_ns.keys().any(|(p, _)| *p == victim),
             "the eviction must drop the same sibling maps a book eviction does"
         );
+    }
+
+    /// Feed a snapshot group in as many datagrams as it needs. `msg_count` is one byte on the
+    /// wire, so a several-hundred-level group is several datagrams on the real feed too.
+    fn mbp_send_group(
+        proc: &mut MbpProcessor,
+        ctx: &DatagramCtx,
+        first_seq: u64,
+        msgs: &[Vec<u8>],
+    ) {
+        for (i, chunk) in msgs.chunks(200).enumerate() {
+            proc.on_datagram(&mbp_wire::datagram(0, 0, first_seq + i as u64, chunk), ctx);
+        }
+    }
+
+    /// **The 2026-09-23 Phoenix BTC truncation.** A publisher restart wipes its books; the new
+    /// era's first rotation is served from a book the publisher is still refilling, installs, and
+    /// takes ours to `Ready`; every later rotation is then declined for being captured behind us.
+    /// The short book was therefore permanent for the life of the era — served to every consumer
+    /// and, as a `Clear`-led re-baseline, to every WS client that connected afterwards.
+    ///
+    /// Measured on a deliberate fra restart at 18:12:09Z the same day: BTC declared and delivered
+    /// 127 levels flagged complete, and the next rotation declared 548.
+    #[test]
+    fn mbp_a_short_first_install_is_reanchored_by_the_next_rotation() {
+        let venue = "MbpShortInstallTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        let levels =
+            |n: i64| -> Vec<(u8, i64, u64)> { (0..n).map(|i| (MBP_BID, 10_000 - i, 7)).collect() };
+
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        mbp_send_group(
+            &mut proc,
+            &snap,
+            2,
+            &mbp_snapshot(41, 1, 0, 0, &levels(127)),
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 1)]), &mkt);
+        assert_eq!(
+            drain_books(&mut rx).pop().map(|b| b.changes.len()),
+            Some(128),
+            "the short group installs and re-baselines: one Clear plus 127 levels"
+        );
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+
+        let reanchors = || {
+            metrics()
+                .mbp_reanchor
+                .with_label_values(&[venue, "short_book"])
+                .get()
+        };
+        let shortfalls = || {
+            metrics()
+                .mbp_declined_rotation_shortfall
+                .with_label_values(&[venue])
+                .get_sample_count()
+        };
+        let before = (reanchors(), shortfalls());
+
+        // The publisher's next rotation, now carrying the whole book. Declined for being captured
+        // behind us, exactly as before — but it declares 421 levels more than we hold.
+        mbp_send_group(
+            &mut proc,
+            &snap,
+            4,
+            &mbp_snapshot(41, 2, 0, 0, &levels(548)),
+        );
+        assert_eq!(reanchors(), before.0 + 1, "the re-anchor is counted");
+        assert_eq!(shortfalls(), before.1 + 1, "and its shortfall recorded");
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::AwaitingSnapshot),
+            "the short book stops being served rather than being republished as complete"
+        );
+        assert_eq!(
+            proc.health_reported.get(&(TEST_PUB, 0, 41)),
+            Some(&false),
+            "the path is reported unhealthy, so the gate hands the market to its peer"
+        );
+        assert!(
+            drain_books(&mut rx).is_empty(),
+            "a re-anchor publishes nothing: the triggering rotation never installed"
+        );
+
+        // One rotation later the replacement installs and the consumer is re-baselined whole.
+        mbp_send_group(
+            &mut proc,
+            &snap,
+            10,
+            &mbp_snapshot(41, 3, 0, 1, &levels(548)),
+        );
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+        let books = drain_books(&mut rx);
+        assert_eq!(
+            books.last().map(|b| b.changes.len()),
+            Some(549),
+            "Clear plus all 548 levels"
+        );
+        assert_eq!(
+            proc.health_reported.get(&(TEST_PUB, 0, 41)),
+            Some(&true),
+            "and the path takes the market back"
+        );
+    }
+
+    /// The negative control. A rotation captured a few hundred milliseconds ahead of the deltas we
+    /// have applied is a handful of levels larger than our book; that is capture jitter, and
+    /// re-anchoring on it would take a healthy market off this path every rotation.
+    #[test]
+    fn mbp_a_rotation_within_the_jitter_tolerance_changes_nothing() {
+        let venue = "MbpJitterToleranceTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+        let levels =
+            |n: i64| -> Vec<(u8, i64, u64)> { (0..n).map(|i| (MBP_BID, 10_000 - i, 7)).collect() };
+
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        mbp_send_group(
+            &mut proc,
+            &snap,
+            2,
+            &mbp_snapshot(41, 1, 0, 0, &levels(540)),
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 1)]), &mkt);
+        let _ = drain_books(&mut rx);
+
+        let reanchors = || {
+            metrics()
+                .mbp_reanchor
+                .with_label_values(&[venue, "short_book"])
+                .get()
+        };
+        let before = reanchors();
+        mbp_send_group(
+            &mut proc,
+            &snap,
+            4,
+            &mbp_snapshot(41, 2, 0, 0, &levels(548)),
+        );
+        assert_eq!(
+            reanchors(),
+            before,
+            "8 levels short of 548 is inside the bound"
+        );
+        assert_eq!(
+            mbp_status(&proc, TEST_PUB, 0, 41),
+            Some(BookStatus::Ready),
+            "the rotation is declined exactly as it was before"
+        );
+        assert!(drain_books(&mut rx).is_empty());
+        assert_eq!(
+            metrics()
+                .mbp_declined_rotation_shortfall
+                .with_label_values(&[venue])
+                .get_sample_sum(),
+            8.0,
+            "and the shortfall is still recorded, so a creeping population is visible"
+        );
+    }
+
+    /// The cold path is unchanged: a rebuild that installs a complete group serves immediately,
+    /// records the install as `complete`, and neither re-anchors nor reads as a shrink.
+    #[test]
+    fn mbp_a_complete_rebuild_counts_the_install() {
+        let venue = "MbpInstallCountTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                2,
+                &mbp_snapshot(41, 1, 0, 0, &[(MBP_BID, 6200, 10), (MBP_ASK, 6300, 20)]),
+            ),
+            &snap,
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 1)]), &mkt);
+        let _ = drain_books(&mut rx);
+
+        assert_eq!(
+            metrics()
+                .mbp_snapshot_installs
+                .with_label_values(&[venue, "complete"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics()
+                .mbp_install_shrank_book
+                .with_label_values(&[venue])
+                .get(),
+            0,
+            "a cold rebuild is zero by construction: the book was empty"
+        );
+        assert_eq!(
+            metrics()
+                .mbp_reanchor
+                .with_label_values(&[venue, "short_book"])
+                .get(),
+            0
+        );
+        assert_eq!(mbp_status(&proc, TEST_PUB, 0, 41), Some(BookStatus::Ready));
+    }
+
+    /// A wire `BookClear` was uncounted, and a whole-side clear the publisher never repopulates
+    /// leaves the same shape as a short install — so the two have to be tellable apart.
+    #[test]
+    fn mbp_a_wire_clear_is_counted_by_scope() {
+        let venue = "MbpClearScopeTest";
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MbpProcessor::new(tape(false));
+        let refdata = mbp_ctx(venue, &arbiter, &instruments, PortRole::Combined);
+        let snap = mbp_ctx(venue, &arbiter, &instruments, PortRole::Snapshot);
+        let mkt = mbp_ctx(venue, &arbiter, &instruments, PortRole::Mktdata);
+
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])), &refdata);
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                2,
+                &mbp_snapshot(
+                    41,
+                    1,
+                    0,
+                    0,
+                    &[
+                        (MBP_BID, 6200, 10),
+                        (MBP_BID, 6100, 20),
+                        (MBP_ASK, 6300, 30),
+                    ],
+                ),
+            ),
+            &snap,
+        );
+        proc.on_datagram(&mbp_wire::datagram(0, 0, 3, &[mbp_reveal(41, 1)]), &mkt);
+        let _ = drain_books(&mut rx);
+
+        let clear = |seq: u32, clear_side: u8, scope: u8, from: i64| {
+            mbp_wire::enc_book_clear(&codec_mbp::BookClear {
+                instrument_id: 41,
+                source_id: 0,
+                clear_side,
+                scope,
+                per_instrument_seq: seq,
+                from_price_raw: from,
+                ts: 7_000 + seq as u64,
+                clear_reason: 0,
+            })
+        };
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[
+                    clear(
+                        1,
+                        codec_mbp::CLEAR_SIDE_BID,
+                        codec_mbp::SCOPE_FROM_PRICE,
+                        6100,
+                    ),
+                    clear(
+                        2,
+                        codec_mbp::CLEAR_SIDE_ASK,
+                        codec_mbp::SCOPE_ENTIRE_SIDE,
+                        0,
+                    ),
+                ],
+            ),
+            &mkt,
+        );
+        let count = |scope: &str| {
+            metrics()
+                .mbp_book_clears
+                .with_label_values(&[venue, scope])
+                .get()
+        };
+        assert_eq!((count("from_price"), count("entire_side")), (1, 1));
     }
 }

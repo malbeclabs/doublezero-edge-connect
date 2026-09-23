@@ -41,6 +41,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- ⚠️ **A publisher restart could truncate a market-by-price book for the life of the publisher era,
+  and every later subscriber inherited it.** A restart is a `Reset Count` change, which discards
+  that publisher's books; the new era's first snapshot rotation is served from a book the publisher
+  is still refilling, and it installs. From then on the book is `Ready` and every later rotation is
+  declined for having been captured behind us, so nothing ever replaces the short install — and it
+  is republished to consumers, and into the WebSocket bootstrap, as a *complete* `Clear`-led
+  re-baseline. Measured on the Oregon bridge 2026-09-23: Phoenix BTC lost about 100 bid and 7–11 ask
+  levels at the ams publisher's restart and never recovered, with the far tail (lowest bid 82000
+  where the venue goes to 100) missing at every later sample, while both wire sources carried the
+  full book throughout.
+
+  A declined rotation that claims a **complete** book (`depth_bound == 0`) and declares materially
+  more levels than we hold now takes the book out of `Ready` instead of simply declining. The
+  triggering rotation cannot install itself — its sequence is behind what the live book applied, so
+  the deltas in between were applied rather than buffered and a replay would gap — so the repair is
+  deferred one rotation (~18.5 s on the flagship Phoenix markets) while the peer path holds the
+  market through the existing health override. "Materially" is a jitter bound and nothing more: the
+  shortfall must exceed both 8 levels and 10% of the declared total, against the 1–3% a rotation
+  captured a few hundred milliseconds early shows on a ~550-level book. One re-anchor per market per
+  60 s; a bounded group never triggers one, and an oversized `total_levels` is still refused first,
+  so a wire-supplied figure cannot take a market out of `Ready` on its own.
+- New market-by-price series: `dz_mbp_reanchor_total{venue,reason}` (the re-anchor above),
+  `dz_mbp_declined_rotation_shortfall_levels{venue}` (every declined complete rotation's shortfall,
+  so a publisher shipping short complete-flagged groups is visible before one crosses the bound),
+  `dz_mbp_snapshot_installs_total{venue,completeness}`, `dz_mbp_install_shrank_book_total{venue}` and
+  `dz_mbp_book_clears_total{venue,scope}`.
 - ⚠️ **A fresh WebSocket subscriber could receive no book at all for a live market, for tens of minutes**, while quotes and trades for that same market kept flowing. A market that was mid-event at the instant of the join was withheld — correctly, since the batches buffered behind their `last` are in no bootstrap — but released only by the market's next producer re-baseline, which is one or two an hour. Reproduced on 5 of 8 joins against the Oregon bridge; it is also what an external reviewer read as a maker's ladder missing from our feed, when our wire carried it. A withheld market is now released at its next *completed event*, under a second, bounded by `BOOTSTRAP_RELEASE_DEADLINE` (5s) for a channel whose events stop closing at all. Before: a subscriber saw an empty book for that market and no way to tell it from a market that was not trading. After: it is bootstrapped at the venue's next slot boundary and streams from there. A market with no complete book anywhere in the process is still withheld rather than bootstrapped with a partial one.
 - **The same withhold could take a market off a client that had already been bootstrapped**, since the lag repair re-runs the same replay pass and re-armed the withhold for whatever was mid-event at that moment. That is the "bootstrap then silence" half of the report above, and the same release rule closes it.
 - **A join watermark can no longer silence a market for the life of a connection.** It exists to drop the batches queued behind a bootstrap that already contains them, and it is now spent by the first frame that passes it (broadcast order is wire order, so everything after that frame is newer than the bootstrap) and expires at the same 5s bound regardless — so a `recv_ts_ns` that lands above the live feed, which a backwards host-clock step is enough to produce, costs a bounded prefix instead of the market.
