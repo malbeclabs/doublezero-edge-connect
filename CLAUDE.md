@@ -834,7 +834,15 @@ Modules are grouped by role under `src/`:
   client is bootstrapped from the last complete state anyway and the open event's earlier batches
   are lost to it (`dz_ws_bootstrap_withheld_total{release="deadline"}`). ⚠️ **A market with no
   complete book anywhere in this process is never released, deadline included** — there is nothing
-  honest to send, and dark beats a book that claims to be whole. ⚠️ **A replayed market
+  honest to send, and dark beats a book that claims to be whole. ⚠️ **Out of scope is not
+  withheld** (`Withheld::OutOfScope`): a market the unfiltered connect replay withheld and a later
+  `subscribe` narrowed away is owed nothing, so it leaves the list — conflating the two kept it
+  there for the life of the connection, charging every frame to
+  `dz_ws_frames_dropped_total{reason="awaiting"}` and holding the 1 Hz sweep on the shared
+  `BookSnapshot` mutex for it. The pairing that makes dropping it safe is that **`unsubscribe` runs
+  the `Replay::Books` bootstrap for what comes back into scope**, exactly as `subscribe` does for
+  what enters it: a widening onto a market with neither a bootstrap nor a withhold is the
+  invented-levels corruption again. ⚠️ **A replayed market
   records a per-client watermark and every `replay_scoped()` call takes one**, because `rx` is
   subscribed in the accept loop and the caches are read after the handshake, so the frames in
   between are queued *behind* a bootstrap that already holds them — harmless on full-state

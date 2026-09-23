@@ -463,23 +463,31 @@ const BOOTSTRAP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// second is what left a client dark on a live market for tens of minutes. `overdue` is the backstop
 /// for a channel whose events stop closing at all.
 ///
-/// `None` while [`BookAccumulator::baselined`] does not hold, `overdue` included: an accumulator
-/// seeded partway through holds only what has moved since, and there is no honest bootstrap to send
-/// until some path re-baselines it. Dark is the correct answer there, and the client keeps waiting.
+/// [`Withheld::Waiting`] while [`BookAccumulator::baselined`] does not hold, `overdue` included: an
+/// accumulator seeded partway through holds only what has moved since, and there is no honest
+/// bootstrap to send until some path re-baselines it. Dark is the correct answer there, and the
+/// client keeps waiting.
 fn withheld_bootstrap(
     books: &BookSnapshot,
     key: &BookKey,
     subs: &[SubFilter],
     overdue: bool,
-) -> Option<(FeedMessage, u64, &'static str)> {
+) -> Withheld {
     let guard = crate::model::lock(books);
-    let acc = guard.get(key)?;
+    // A market with no accumulator at all is `Waiting`, not `OutOfScope`: an evicted one is
+    // recreated by the next batch and forced to re-baseline, so it is still owed a bootstrap.
+    let Some(acc) = guard.get(key) else {
+        return Withheld::Waiting;
+    };
     let wanted = subs.is_empty()
         || subs
             .iter()
             .any(|f| f.matches(&key.0, Some(acc.symbol()), Some(key.2), book_kind(acc)));
-    if !wanted || !acc.baselined() {
-        return None;
+    if !wanted {
+        return Withheld::OutOfScope;
+    }
+    if !acc.baselined() {
+        return Withheld::Waiting;
     }
     let release = match (acc.pending_empty(), overdue) {
         (true, _) => "complete",
@@ -487,7 +495,7 @@ fn withheld_bootstrap(
         // while the market was withheld, and the ones still to come land on a bootstrap without
         // them. Bounded staleness on levels that event touched, against a client dark for minutes.
         (false, true) => "deadline",
-        (false, false) => return None,
+        (false, false) => return Withheld::Waiting,
     };
     let book = acc.to_book(key, book_scope(acc));
     let msg = if acc.is_order_level() {
@@ -495,7 +503,31 @@ fn withheld_bootstrap(
     } else {
         FeedMessage::Book(book)
     };
-    Some((msg, acc.wire_ts_ns(), release))
+    Withheld::Ready {
+        msg,
+        wire_ts: acc.wire_ts_ns(),
+        release,
+    }
+}
+
+/// What [`withheld_bootstrap`] found for one withheld market.
+///
+/// ⚠️ **`OutOfScope` is not `Waiting`.** A market the unfiltered connect replay withheld and a later
+/// `subscribe` put out of scope is owed no bootstrap at all, and conflating the two left it on the
+/// withhold list for the life of the connection: every frame for it charged
+/// `dz_ws_frames_dropped_total{reason="awaiting"}`, which reads as a client dark on that book, and
+/// the sweep arm stayed armed taking the shared `BookSnapshot` mutex once a second for it.
+enum Withheld {
+    /// No honest bootstrap yet — keep withholding.
+    Waiting,
+    /// Outside this client's subscription scope, so nothing is owed. Stop tracking it; a widening
+    /// re-accounts for it through [`replay_scoped`].
+    OutOfScope,
+    Ready {
+        msg: FeedMessage,
+        wire_ts: u64,
+        release: &'static str,
+    },
 }
 
 /// Shortest interval between one client's lag-triggered book repairs (see [`Replay::Books`] and the
@@ -686,8 +718,19 @@ where
         return Ok(false);
     };
     let overdue = since.elapsed() >= deadline;
-    let Some((msg, wire_ts, release)) = withheld_bootstrap(books, key, subs, overdue) else {
-        return Ok(true);
+    let (msg, wire_ts, release) = match withheld_bootstrap(books, key, subs, overdue) {
+        Withheld::Waiting => return Ok(true),
+        // Nothing is owed, so nothing is withheld — and the caller must not charge the frame to
+        // the withhold counters. The client's own filter excludes it from here on.
+        Withheld::OutOfScope => {
+            books_seen.awaiting.remove(key);
+            return Ok(false);
+        }
+        Withheld::Ready {
+            msg,
+            wire_ts,
+            release,
+        } => (msg, wire_ts, release),
     };
     books_seen.awaiting.remove(key);
     // The same pairing the join makes: the bootstrap stands at the accumulator's wire point, so the
@@ -837,11 +880,23 @@ async fn serve_client(
                         }
                         Ok(ClientMsg::Unsubscribe { subscription }) => {
                             metrics().ws_inbound.with_label_values(&["unsubscribe"]).inc();
+                            let before = subs.len();
                             subs.retain(|s| s != &subscription);
+                            let widened = subs.len() != before;
                             write.send(text(json!({
                                 "channel": "subscription_response", "method": "unsubscribe",
                                 "subscription": subscription,
                             }))).await?;
+                            // ⚠️ Widening needs the same book bootstrap `subscribe` does, for the
+                            // markets coming back into scope: one dropped from `awaiting` as
+                            // `Withheld::OutOfScope` has neither a bootstrap nor a withhold, so
+                            // without this its batches would be applied to a book the client does
+                            // not hold. `Books` only — the catalog is #149's cost and a client
+                            // widening already holds it. Guarded on an actual removal, so a
+                            // no-op unsubscribe cannot drive O(markets) at the inbound rate.
+                            if widened {
+                                replay_scoped(&mut write, &instruments, &depth, &books, &subs, Replay::Books, &mut books_seen).await?;
+                            }
                         }
                         Err(_) => {
                             metrics().ws_inbound.with_label_values(&["error"]).inc();
@@ -2412,6 +2467,202 @@ mod tests {
         );
         assert_eq!(released(), before + 1, "counted as a deadline release");
         srv.abort();
+    }
+
+    /// A market the connect replay withheld and a later `subscribe` puts out of scope must leave
+    /// the withhold list, not sit on it for the life of the connection. It is not owed a bootstrap
+    /// while it is out of scope, so charging its frames to
+    /// `dz_ws_frames_dropped_total{reason="awaiting"}` reads as a client dark on a book it never
+    /// asked for, and the sweep arm stays armed taking the shared `BookSnapshot` mutex once a
+    /// second for it.
+    #[tokio::test]
+    #[serial]
+    async fn a_market_put_out_of_scope_leaves_the_withhold_list() {
+        let (books, tx, _addr, srv) = withheld_and_narrowed().await;
+
+        // A frame for the out-of-scope market: excluded by the client's filter either way, so what
+        // this pins is the accounting, not the delivery.
+        let awaiting = || {
+            metrics()
+                .ws_frames_dropped
+                .with_label_values(&["KALSHI", "awaiting"])
+                .get()
+        };
+        let before = awaiting();
+        let mut ws = books.1;
+        let more = mid_event_batch(300, false);
+        fold(&books.0, &mid_event_key(), &more);
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(more)));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "the client's own filter excludes it"
+        );
+        assert_eq!(
+            awaiting(),
+            before,
+            "an out-of-scope market is not a withheld one"
+        );
+        srv.abort();
+    }
+
+    /// ⚠️ And dropping it must not leave the market unaccounted for: `unsubscribe` widens the
+    /// client's scope back, and a market with no bootstrap and no withhold would then have its
+    /// incremental batches applied to a book the client does not hold — the corruption the withhold
+    /// exists to prevent. Widening re-runs the book bootstrap, exactly as `subscribe` does.
+    #[tokio::test]
+    #[serial]
+    async fn widening_the_scope_again_re_accounts_for_the_market() {
+        let (books, tx, _addr, srv) = withheld_and_narrowed().await;
+        let (books, mut ws) = books;
+
+        // Take the market out of the withhold list the way the test above does.
+        let more = mid_event_batch(300, false);
+        fold(&books, &mid_event_key(), &more);
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(more)));
+        assert_eq!(next_frame(&mut ws, Duration::from_millis(300)).await, None);
+
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"unsubscribe","subscription":{"symbol":"KXETHPERP"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("unsubscribe ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        // The widening re-bootstraps the books back in scope: 42 is complete, 41 is mid-event and
+        // so is re-withheld rather than sent.
+        assert_eq!(
+            parse_book(
+                &next_frame(&mut ws, Duration::from_secs(2))
+                    .await
+                    .expect("the complete market is re-bootstrapped")
+            )
+            .instrument_id,
+            42
+        );
+
+        // Back on the firehose, and the market is still mid-event: its batches must still be
+        // withheld rather than applied to a book this client was never given.
+        let open = mid_event_batch(400, false);
+        fold(&books, &mid_event_key(), &open);
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(open)));
+        assert_eq!(
+            next_frame(&mut ws, Duration::from_millis(300)).await,
+            None,
+            "an incremental batch onto a book the client does not hold"
+        );
+
+        // And the event closing releases it, as it would for any withheld market.
+        let closing = mid_event_batch(500, true);
+        fold(&books, &mid_event_key(), &closing);
+        let _ = tx.send(std::sync::Arc::new(FeedMessage::Book(closing)));
+        let boot = parse_book(
+            &next_frame(&mut ws, Duration::from_secs(2))
+                .await
+                .expect("the market is bootstrapped once its event closes"),
+        );
+        assert_eq!((boot.instrument_id, boot.snapshot), (41, true));
+        srv.abort();
+    }
+
+    fn mid_event_key() -> crate::model::BookKey {
+        (
+            Arc::<str>::from("KALSHI"),
+            Arc::<str>::from("perps"),
+            2u8,
+            41u32,
+        )
+    }
+
+    fn mid_event_batch(recv_ts_ns: u64, last: bool) -> NormalizedBook {
+        NormalizedBook {
+            recv_ts_ns,
+            channel: 2,
+            instrument_id: 41,
+            category: "perps".into(),
+            ..book_batch(
+                "KXBTCPERP",
+                vec![level_update(BookSide::Ask, 0.64, 3.0)],
+                last,
+            )
+        }
+    }
+
+    /// A connected client that was withheld market 41 (mid-event at connect) and has since
+    /// subscribed to a different symbol, so 41 is out of its scope.
+    #[allow(clippy::type_complexity)]
+    async fn withheld_and_narrowed() -> (
+        (
+            crate::model::BookSnapshot,
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ),
+        broadcast::Sender<std::sync::Arc<FeedMessage>>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let mut mid_event = accumulator("KXBTCPERP", 0.61, 0.63);
+        mid_event.apply(&mid_event_batch(100, false));
+        assert!(mid_event.baselined() && !mid_event.pending_empty());
+        let mut books = BookReplay::default();
+        books.insert(mid_event_key(), mid_event);
+        books.insert(
+            (
+                Arc::<str>::from("KALSHI"),
+                Arc::<str>::from("perps"),
+                2u8,
+                42u32,
+            ),
+            accumulator("KXETHPERP", 0.41, 0.43),
+        );
+        let (srv, tx, addr, books) = spawn_server_shared(
+            HashMap::new(),
+            Arc::new(Mutex::new(books)),
+            // Long, so what these two tests pin is the scope accounting and never the deadline
+            // release — which would otherwise discharge the market the moment its scope widened.
+            Some(Duration::from_secs(60)),
+        )
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        // Connect is unfiltered: 42 is bootstrapped, 41 is withheld.
+        assert_eq!(
+            parse_book(
+                &next_frame(&mut ws, Duration::from_secs(2))
+                    .await
+                    .expect("the complete market")
+            )
+            .instrument_id,
+            42
+        );
+        use futures_util::SinkExt;
+        ws.send(WsMessage::Text(
+            r#"{"method":"subscribe","subscription":{"symbol":"KXETHPERP"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = next_frame(&mut ws, Duration::from_secs(2))
+            .await
+            .expect("subscribe ack");
+        assert!(ack.contains("subscription_response"), "got {ack}");
+        assert_eq!(
+            parse_book(
+                &next_frame(&mut ws, Duration::from_secs(2))
+                    .await
+                    .expect("the scoped replay")
+            )
+            .instrument_id,
+            42
+        );
+        // Long enough for a sweep tick to have run over the withheld market.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        ((books, ws), tx, addr, srv)
     }
 
     /// A market with no complete book anywhere in this process stays withheld at the deadline too:
