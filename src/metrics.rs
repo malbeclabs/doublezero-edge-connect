@@ -318,6 +318,17 @@ pub struct Metrics {
     pub ws_rate_limited: IntCounter,
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
+    /// Market bootstraps a client's join withheld because the market was mid-event, by `venue` and
+    /// how the wait ended: `complete` (the event closed, the normal case, sub-second) or `deadline`
+    /// (it did not, so the client was bootstrapped from the last complete state anyway). A market
+    /// with no complete book anywhere in this process is never released and never counted here —
+    /// there is nothing honest to send it.
+    pub ws_bootstrap_withheld: IntCounterVec,
+    /// Book frames a client was not sent, by `venue` and `reason`: `watermark` (the batch is
+    /// already in the bootstrap this client was just handed) or `awaiting` (the market is still
+    /// withheld). Both are correct in the small and pathological in the large — a market whose
+    /// `awaiting` drops never stop is a client dark on that book.
+    pub ws_frames_dropped: IntCounterVec,
 
     // --- Hyperliquid-compatible sink (off by default) ---
     /// Currently-connected clients of the Hyperliquid-compatible sink.
@@ -964,6 +975,19 @@ impl Metrics {
                 &registry,
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
+            ),
+            ws_bootstrap_withheld: counter_vec(
+                &registry,
+                "dz_ws_bootstrap_withheld_total",
+                "Market bootstraps a client's join withheld for being mid-event, by how the wait \
+                 ended (complete/deadline)",
+                &["venue", "release"],
+            ),
+            ws_frames_dropped: counter_vec(
+                &registry,
+                "dz_ws_frames_dropped_total",
+                "Book frames not forwarded to a client, by reason (watermark/awaiting)",
+                &["venue", "reason"],
             ),
             hl_sink_clients: gauge(
                 &registry,

@@ -818,11 +818,23 @@ Modules are grouped by role under `src/`:
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
   materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
   every other dimension), then streams quotes/trades/midpoints/depth/book. ⚠️ **A market the
-  bootstrap skips is withheld from that client until it re-baselines** (`AwaitingRebaseline`): one
-  accumulated partway holds only what moved since, and one **mid-event** has batches buffered
-  behind their `last` that are in no bootstrap and — if they were broadcast before this client's
-  `rx` subscribed — in no queue either, so applying what does arrive leaves the untouched levels at
-  invented values. ⚠️ **A replayed market
+  bootstrap skips is withheld from that client until its accumulator is whole again**
+  (`WithheldMarkets`): one accumulated partway holds only what moved since, and one **mid-event**
+  has batches buffered behind their `last` that are in no bootstrap and — if they were broadcast
+  before this client's `rx` subscribed — in no queue either, so applying what does arrive leaves the
+  untouched levels at invented values. ⚠️ **What releases it is the market's next *completed event*,
+  never its next producer re-baseline.** `withheld_bootstrap` re-reads the accumulator on every
+  frame for that market and on a 1 Hz sweep (a market that goes quiet mid-event produces no frame to
+  carry the check, and is the one whose bootstrap the client cannot get any other way), and sends
+  the bootstrap the join owed the moment `baselined() && pending_empty()` holds — under a second,
+  where a re-baseline is one or two an hour. Releasing on the re-baseline was #163's own rule and it
+  left a fresh subscriber with no book at all for a live market on 5 of 8 joins against the Oregon
+  bridge, quotes and trades flowing throughout. The wait is bounded by
+  `BOOTSTRAP_RELEASE_DEADLINE` (5 s, a `WsConfig` field so a test can collapse it): past it the
+  client is bootstrapped from the last complete state anyway and the open event's earlier batches
+  are lost to it (`dz_ws_bootstrap_withheld_total{release="deadline"}`). ⚠️ **A market with no
+  complete book anywhere in this process is never released, deadline included** — there is nothing
+  honest to send, and dark beats a book that claims to be whole. ⚠️ **A replayed market
   records a per-client watermark and every `replay_scoped()` call takes one**, because `rx` is
   subscribed in the accept loop and the caches are read after the handshake, so the frames in
   between are queued *behind* a bootstrap that already holds them — harmless on full-state
@@ -835,7 +847,15 @@ Modules are grouped by role under `src/`:
   stamp, and only the first folds, so `<=` would drop the second and the next boundary would
   deliver its `last` over a buffer missing those changes. Re-delivering a tie is free: a change
   carries an absolute size and the bootstrap ends at the last folded batch of the tie set. Moving
-  the subscribe after the snapshot instead trades the overlap for a gap and is the worse bug. Replay is one
+  the subscribe after the snapshot instead trades the overlap for a gap and is the worse bug.
+  ⚠️ **The only thing a watermark may drop is the queued prefix that predates the bootstrap**, so it
+  is *spent* by the first frame that passes it — broadcast order is wire order, so everything after
+  that frame is newer than the bootstrap whatever its stamp says — and expires at
+  `BOOTSTRAP_RELEASE_DEADLINE` regardless. Both rules exist because the stamp is a wall clock:
+  every book frame carries `now_ns()` (the datagram's, or the materializing read for the arbiter's
+  synthesized re-baselines), so a backwards host-clock step is all it takes for a watermark to sit
+  above the whole live feed and take that market off a client for the life of the connection. The
+  drops are `dz_ws_frames_dropped_total{reason="watermark"}`, the withheld ones `reason="awaiting"`. Replay is one
   `replay_scoped()` used three times, and `Replay::{Full,Books}` is what says how much of it goes out:
   **`Full`** on connect (unfiltered — no subscriptions yet) and per `subscribe` (scoped to the filter
   just added, so a client that narrows after connecting is bootstrapped without replaying every

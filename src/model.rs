@@ -615,7 +615,7 @@ impl BookAccumulator {
 
     /// Whether every batch folded so far has been terminated by its `last`. False means an event is
     /// still buffered here, so what [`Self::to_book`] materializes is a whole logical event behind
-    /// the feed — see `sinks::ws`'s `AwaitingRebaseline`.
+    /// the feed — see `sinks::ws`'s `WithheldMarkets`.
     pub fn pending_empty(&self) -> bool {
         self.pending.is_empty()
     }
