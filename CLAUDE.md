@@ -804,14 +804,18 @@ Modules are grouped by role under `src/`:
   publisher is still refilling: the short install then pins, and is republished to every consumer and
   into the WS bootstrap as a **complete** `Clear`-led re-baseline. `on_snapshot_begin` therefore
   re-anchors (`force_resync`, `BeginOutcome::Resynced`, `dz_mbp_reanchor_total{reason="short_book"}`)
-  when **two consecutive** declined rotations claim completeness (`depth_bound == 0`) and declare
-  materially more levels than the book holds. ⚠️ **One rotation is not evidence**: a book that
-  legitimately *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes
-  past that rotation's `last_instrument_seq` — is indistinguishable from a short install by
-  shortfall alone, and the rotation *after* such a clear is captured post-clear and declares the
-  true smaller total, which clears the strike. The two strikes are keyed on `snapshot_id`, because a
-  multicast wire redelivers datagrams routinely and one rotation must never be its own
-  confirmation. ⚠️ **The triggering rotation cannot install itself**: `on_snapshot_end`
+  when **two** declined rotations claim completeness (`depth_bound == 0`) and declare materially
+  more levels than the book holds. ⚠️ **One rotation is not evidence**: a book that legitimately
+  *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes past that
+  rotation's `last_instrument_seq` — is indistinguishable from a short install by shortfall alone,
+  and the rotation *after* such a clear is captured post-clear and declares the true smaller total,
+  which clears the strike. The two strikes are keyed on `snapshot_id`, because a multicast wire
+  redelivers datagrams routinely and one rotation must never be its own confirmation. ⚠️ **"Two"
+  means two complete rotations with no agreeing one in between, not two in a row on the wall
+  clock** — a bounded rotation returns before the strike is read, so nothing expires it by elapsed
+  time and a strike armed an hour ago can still be confirmed. Deliberate: the evidence does not
+  rot, and acting on stale evidence costs the same single bounded failover as acting on fresh
+  evidence. ⚠️ **The triggering rotation cannot install itself**: `on_snapshot_end`
   takes `last_applied_instrument_seq` from the group, which is behind what a `Ready` book applied, and
   the deltas in between were *applied* rather than buffered — so `replay` would gap and drop the book.
   Bridging that needs a rolling per-book buffer of applied deltas; instead the repair is deferred one

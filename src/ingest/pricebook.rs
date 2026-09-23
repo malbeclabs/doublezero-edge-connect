@@ -237,13 +237,20 @@ pub struct PriceBook {
     /// When this book was last forced out of `Ready` by a short-book re-anchor, for the
     /// [`REANCHOR_MIN_INTERVAL_NS`] guard. `None` until one happens.
     last_reanchor_ns: Option<u64>,
-    /// `snapshot_id` of the first of two consecutive declined complete rotations whose shortfall
-    /// was past the bound — the first strike. Its purpose is one false-positive class: a book that
-    /// legitimately **shrank** since a rotation was captured (a whole-side `BookClear`, or enough
-    /// deletes applied past that rotation's `last_instrument_seq`) is indistinguishable from a
-    /// short install by shortfall alone. The rotation *after* such a clear is captured post-clear
-    /// and declares the true, smaller total, which clears this — so requiring two costs one extra
-    /// rotation on a genuinely short book and removes the class outright.
+    /// `snapshot_id` of the first of the two declined complete rotations a re-anchor needs — the
+    /// first strike. Its purpose is one false-positive class: a book that legitimately **shrank**
+    /// since a rotation was captured (a whole-side `BookClear`, or enough deletes applied past that
+    /// rotation's `last_instrument_seq`) is indistinguishable from a short install by shortfall
+    /// alone. The rotation *after* such a clear is captured post-clear and declares the true,
+    /// smaller total, which clears this — so requiring two costs one extra rotation on a genuinely
+    /// short book and removes the class outright.
+    ///
+    /// ⚠️ **"Two" is two complete rotations with no agreeing one in between, not two in a row on the
+    /// wall clock.** A bounded rotation returns before this is read and an install clears it, so
+    /// nothing in between resets it by elapsed time: a strike armed an hour ago can still be the
+    /// one a short rotation confirms. Left that way deliberately — the evidence does not rot, and
+    /// the cost of acting on stale evidence is the same single bounded failover acting on fresh
+    /// evidence costs.
     short_strike: Option<u32>,
 }
 
@@ -392,9 +399,10 @@ impl PriceBook {
     /// era and is republished to every consumer, and into the WS bootstrap, as a *complete*
     /// re-baseline. When a declined rotation claims a complete book (`depth_bound == 0`) and
     /// declares materially more levels than this one holds, the book therefore leaves `Ready`
-    /// instead of simply declining — see [`Self::force_resync`]. **Two consecutive rotations must
-    /// say so**, because a book that legitimately *shrank* since a rotation was captured is
-    /// otherwise indistinguishable from a short install — see [`Self::short_strike`].
+    /// instead of simply declining — see [`Self::force_resync`]. **Two complete rotations must say
+    /// so, with no agreeing one in between**, because a book that legitimately *shrank* since a
+    /// rotation was captured is otherwise indistinguishable from a short install — see
+    /// [`Self::short_strike`].
     pub fn on_snapshot_begin(
         &mut self,
         snapshot_id: u32,
@@ -774,6 +782,10 @@ impl PriceBook {
         self.depth_bound = None;
         self.status = Status::AwaitingSnapshot;
         self.last_reanchor_ns = Some(now_ns);
+        // Unreadable from here either way — the branch that reads it needs `Ready`, and only an
+        // install gets back there — but cleared so the strike's lifecycle is local to the two
+        // places that own it rather than a consequence of where `Ready` is assigned.
+        self.short_strike = None;
     }
 
     /// One forced re-anchor per [`REANCHOR_MIN_INTERVAL_NS`]. A `recv_ts_ns` of `0` (the crate-wide
