@@ -42,6 +42,12 @@ const LEAD_NS_BUCKETS: &[f64] = &[
     1_000_000_000.0,
 ];
 
+/// Buckets for the declined-rotation shortfall: how many levels a complete rotation declared above
+/// what the book holds. Small and fixed, because the only readings that matter are near zero —
+/// capture jitter is a handful of levels, and anything past the re-anchor threshold is already
+/// counted on `dz_mbp_reanchor_total`. The `+Inf` bucket carries the gross shortfalls.
+const SHORTFALL_LEVEL_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+
 /// Every metric the bridge exports, plus the [`Registry`] they are registered against. Built once
 /// via [`Metrics::new`] and reachable through [`metrics`].
 pub struct Metrics {
@@ -259,6 +265,23 @@ pub struct Metrics {
     /// are `mbp_declined_rotation_levels` and `mbp_snapshot_levels_dropped`.
     pub mbp_orphan_snapshot_levels: IntCounterVec,
     pub mbp_declined_rotation_levels: IntCounterVec,
+    /// How many levels a declined **complete** rotation declared above what the book holds. The
+    /// jitter tolerance the re-anchor threshold allows is a few levels, so this is what shows a
+    /// publisher shipping short complete-flagged groups before any of them crosses it.
+    pub mbp_declined_rotation_shortfall: HistogramVec,
+    /// Books forced out of `Ready` without installing anything, by `reason`. A declined rotation
+    /// is the only place a short install can be caught, and once caught the book has to stop
+    /// serving those levels — see `PriceBook::force_resync`.
+    pub mbp_reanchor: IntCounterVec,
+    /// Snapshot groups that installed, by whether the publisher declared the book `complete`
+    /// (`depth_bound == 0`) or `bounded`.
+    pub mbp_snapshot_installs: IntCounterVec,
+    /// Installs that left the book with fewer levels than it held. Zero by construction on a cold
+    /// rebuild, so this is a rotation replacing a live book with a smaller one.
+    pub mbp_install_shrank_book: IntCounterVec,
+    /// Wire `BookClear`s the book applied, by `scope`. A whole-side clear the publisher never
+    /// repopulates produces the same shape as a short install, so the two need telling apart.
+    pub mbp_book_clears: IntCounterVec,
     /// Levels of a group the processor deliberately did not route, by `reason`. Expected traffic,
     /// counted apart from the orphan series so that one stays alertable.
     pub mbp_snapshot_levels_dropped: IntCounterVec,
@@ -730,6 +753,45 @@ impl Metrics {
                  in steady state this tracks the feed's whole snapshot-level rate. Counted apart \
                  from the orphan counter so a real orphan stays visible.",
                 &["venue"],
+            ),
+            mbp_declined_rotation_shortfall: histogram_vec(
+                &registry,
+                "dz_mbp_declined_rotation_shortfall_levels",
+                "Levels a declined complete rotation declared above what the book holds. The \
+                 re-anchor threshold tolerates only capture jitter, so this is what makes a \
+                 publisher's short complete-flagged groups visible before one crosses it.",
+                &["venue"],
+                SHORTFALL_LEVEL_BUCKETS,
+            ),
+            mbp_reanchor: counter_vec(
+                &registry,
+                "dz_mbp_reanchor_total",
+                "Books forced out of Ready without installing anything, by reason. short_book: a \
+                 declined complete rotation declared materially more levels than the book holds, \
+                 so the short install it is serving is dropped and the next rotation installs \
+                 whole. The market is held by its peer path meanwhile.",
+                &["venue", "reason"],
+            ),
+            mbp_snapshot_installs: counter_vec(
+                &registry,
+                "dz_mbp_snapshot_installs_total",
+                "Snapshot groups that installed, by whether the publisher declared the book \
+                 complete (depth_bound == 0) or bounded",
+                &["venue", "completeness"],
+            ),
+            mbp_install_shrank_book: counter_vec(
+                &registry,
+                "dz_mbp_install_shrank_book_total",
+                "Snapshot installs that left the book with fewer levels than it held. Zero by \
+                 construction on a cold rebuild, so this is a rotation replacing a live book with \
+                 a smaller one.",
+                &["venue"],
+            ),
+            mbp_book_clears: counter_vec(
+                &registry,
+                "dz_mbp_book_clears_total",
+                "Wire BookClears the book applied, by scope (entire_side/from_price)",
+                &["venue", "scope"],
             ),
             mbp_snapshot_levels_dropped: counter_vec(
                 &registry,
@@ -1232,6 +1294,21 @@ mod tests {
         m.mbp_declined_rotation_levels
             .with_label_values(&["KALSHI"])
             .inc();
+        m.mbp_declined_rotation_shortfall
+            .with_label_values(&["KALSHI"])
+            .observe(3.0);
+        m.mbp_reanchor
+            .with_label_values(&["KALSHI", "short_book"])
+            .inc();
+        m.mbp_snapshot_installs
+            .with_label_values(&["KALSHI", "complete"])
+            .inc();
+        m.mbp_install_shrank_book
+            .with_label_values(&["KALSHI"])
+            .inc();
+        m.mbp_book_clears
+            .with_label_values(&["KALSHI", "entire_side"])
+            .inc();
         m.mbp_snapshot_levels_dropped
             .with_label_values(&["KALSHI", "reset"])
             .inc();
@@ -1320,6 +1397,11 @@ mod tests {
             "dz_mbp_level_overflows_total",
             "dz_mbp_orphan_snapshot_levels_total",
             "dz_mbp_declined_rotation_levels_total",
+            "dz_mbp_declined_rotation_shortfall_levels",
+            "dz_mbp_reanchor_total",
+            "dz_mbp_snapshot_installs_total",
+            "dz_mbp_install_shrank_book_total",
+            "dz_mbp_book_clears_total",
             "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
             "dz_book_events_abandoned_total",
