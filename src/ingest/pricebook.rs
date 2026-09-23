@@ -237,6 +237,21 @@ pub struct PriceBook {
     /// When this book was last forced out of `Ready` by a short-book re-anchor, for the
     /// [`REANCHOR_MIN_INTERVAL_NS`] guard. `None` until one happens.
     last_reanchor_ns: Option<u64>,
+    /// `snapshot_id` of the first of the two declined complete rotations a re-anchor needs — the
+    /// first strike. Its purpose is one false-positive class: a book that legitimately **shrank**
+    /// since a rotation was captured (a whole-side `BookClear`, or enough deletes applied past that
+    /// rotation's `last_instrument_seq`) is indistinguishable from a short install by shortfall
+    /// alone. The rotation *after* such a clear is captured post-clear and declares the true,
+    /// smaller total, which clears this — so requiring two costs one extra rotation on a genuinely
+    /// short book and removes the class outright.
+    ///
+    /// ⚠️ **"Two" is two complete rotations with no agreeing one in between, not two in a row on the
+    /// wall clock.** A bounded rotation returns before this is read and an install clears it, so
+    /// nothing in between resets it by elapsed time: a strike armed an hour ago can still be the
+    /// one a short rotation confirms. Left that way deliberately — the evidence does not rot, and
+    /// the cost of acting on stale evidence is the same single bounded failover acting on fresh
+    /// evidence costs.
+    short_strike: Option<u32>,
 }
 
 impl Default for PriceBook {
@@ -258,6 +273,7 @@ impl PriceBook {
             open: None,
             pending: Vec::new(),
             last_reanchor_ns: None,
+            short_strike: None,
         }
     }
 
@@ -383,7 +399,10 @@ impl PriceBook {
     /// era and is republished to every consumer, and into the WS bootstrap, as a *complete*
     /// re-baseline. When a declined rotation claims a complete book (`depth_bound == 0`) and
     /// declares materially more levels than this one holds, the book therefore leaves `Ready`
-    /// instead of simply declining — see [`Self::force_resync`].
+    /// instead of simply declining — see [`Self::force_resync`]. **Two complete rotations must say
+    /// so, with no agreeing one in between**, because a book that legitimately *shrank* since a
+    /// rotation was captured is otherwise indistinguishable from a short install — see
+    /// [`Self::short_strike`].
     pub fn on_snapshot_begin(
         &mut self,
         snapshot_id: u32,
@@ -413,7 +432,21 @@ impl PriceBook {
             else {
                 return BeginOutcome::Declined { shortfall: None };
             };
-            if reanchor_warranted(shortfall, total_levels) && self.reanchor_allowed(now_ns) {
+            if !reanchor_warranted(shortfall, total_levels) {
+                // A rotation that agrees with the book clears the evidence behind it: whatever the
+                // previous one disagreed about, the publisher has since re-declared and matched.
+                self.short_strike = None;
+                return BeginOutcome::Declined {
+                    shortfall: Some(shortfall),
+                };
+            }
+            // Two strikes, and they must be two distinct **rotations** — a duplicated datagram
+            // repeats `snapshot_id`, and on a multicast wire that is routine, so counting it would
+            // make one rotation its own confirmation. The first strike keeps its id, so a re-anchor
+            // held off by the interval guard stays confirmed for the rotation after it.
+            let confirmed = self.short_strike.is_some_and(|first| first != snapshot_id);
+            self.short_strike.get_or_insert(snapshot_id);
+            if confirmed && self.reanchor_allowed(now_ns) {
                 self.force_resync(now_ns);
                 return BeginOutcome::Resynced { shortfall };
             }
@@ -529,6 +562,10 @@ impl PriceBook {
         self.last_applied_instrument_seq = b.last_instrument_seq;
         self.depth_bound = Some(b.depth_bound);
         self.required_anchor_seq = None;
+        // The only place `Ready` is entered, and so the only place the short-book evidence has to
+        // be cleared: every rotation it was gathered against was measured on the book this install
+        // just replaced.
+        self.short_strike = None;
         self.status = Status::Ready;
         self.replay(b.anchor_seq);
         true
@@ -723,20 +760,32 @@ impl PriceBook {
     /// publisher says a complete book is, so they must stop being served and stop being
     /// republished as a complete re-baseline.
     ///
-    /// The triggering rotation deliberately does **not** install. `on_snapshot_end` takes
-    /// `last_applied_instrument_seq` from the group, which is behind what a `Ready` book has
-    /// applied, and the deltas in between were applied rather than buffered — so [`Self::replay`]
-    /// would see a gap and drop the book anyway. Bridging that would need a rolling buffer of
-    /// recently-applied deltas per book. Instead `pending` is kept (empty at this point, but every
-    /// delta from here on buffers) so the *next* rotation installs and replays contiguously, one
-    /// rotation later. Until then [`Self::serves_a_book`] is false and the peer path holds the
-    /// market.
+    /// The triggering rotation is not installed from here, and installing it is not something this
+    /// type can arrange: `on_snapshot_end` takes `last_applied_instrument_seq` from the group,
+    /// which is behind what a `Ready` book has applied, and the deltas in between were applied
+    /// rather than buffered — so [`Self::replay`] would see a gap. Bridging that would need a
+    /// rolling buffer of recently-applied deltas per book. Instead `pending` is kept (empty at this
+    /// point, but every delta from here on buffers) so the *next* rotation installs and replays
+    /// contiguously, one rotation later. Until then [`Self::serves_a_book`] is false and the peer
+    /// path holds the market.
+    ///
+    /// ⚠️ That is weaker than "the triggering rotation cannot install": a **duplicated**
+    /// `SnapshotBegin` for the same group arriving after this is accepted, because the status is no
+    /// longer `Ready` and there is no open group to match it against. It routes whatever levels are
+    /// still on the wire and then fails `on_snapshot_end`'s count, whose failure path clears a book
+    /// that is already empty — or, if the whole group is re-sent, installs and then gaps in
+    /// `replay` for the reason above. Both cost one further rotation and neither serves anything,
+    /// since `send_book` refuses a book that is not `Ready`.
     fn force_resync(&mut self, now_ns: u64) {
         self.bids.clear();
         self.asks.clear();
         self.depth_bound = None;
         self.status = Status::AwaitingSnapshot;
         self.last_reanchor_ns = Some(now_ns);
+        // Unreadable from here either way — the branch that reads it needs `Ready`, and only an
+        // install gets back there — but cleared so the strike's lifecycle is local to the two
+        // places that own it rather than a consequence of where `Ready` is assigned.
+        self.short_strike = None;
     }
 
     /// One forced re-anchor per [`REANCHOR_MIN_INTERVAL_NS`]. A `recv_ts_ns` of `0` (the crate-wide
@@ -1854,12 +1903,20 @@ mod tests {
     /// complete re-baseline. A shortfall past the jitter bound now takes the book out of `Ready`
     /// instead — the market fails over to its peer and the next rotation installs whole.
     #[test]
-    fn a_short_book_is_re_anchored_by_a_complete_rotation() {
+    fn a_short_book_is_re_anchored_by_two_consecutive_complete_rotations() {
         const T: u64 = 1_700_000_000_000_000_000;
         let mut b = synced(100, 5, 0, &short_book(127));
         assert!(b.serves_a_book(T));
         assert_eq!(
             b.on_snapshot_begin(2, 500, 548, 5, 0, T),
+            BeginOutcome::Declined {
+                shortfall: Some(421)
+            },
+            "the first short rotation only arms the strike",
+        );
+        assert_eq!(b.status(), Status::Ready);
+        assert_eq!(
+            b.on_snapshot_begin(3, 600, 548, 5, 0, T),
             BeginOutcome::Resynced { shortfall: 421 },
         );
         assert_eq!(b.status(), Status::AwaitingSnapshot);
@@ -1867,7 +1924,7 @@ mod tests {
         assert_eq!(b.depth_bound(), None);
         assert!(!b.serves_a_book(T), "the peer path takes the market");
         assert!(
-            !b.on_snapshot_end(500, 2),
+            !b.on_snapshot_end(600, 3),
             "the triggering rotation installs nothing — its levels were never routed"
         );
     }
@@ -1940,10 +1997,7 @@ mod tests {
     fn a_re_anchor_keeps_buffered_deltas_so_the_next_install_replays_contiguously() {
         const T: u64 = 1_700_000_000_000_000_000;
         let mut b = synced(100, 5, 0, &short_book(127));
-        assert!(matches!(
-            b.on_snapshot_begin(2, 500, 548, 5, 0, T),
-            BeginOutcome::Resynced { .. }
-        ));
+        assert!(re_anchor(&mut b, T));
         assert!(matches!(
             apply_delta(&mut b, level(11, 700, SIDE_ASK, 6300, 9, NEW)),
             DeltaOutcome::Buffered
@@ -1964,29 +2018,122 @@ mod tests {
     fn a_re_anchor_is_rate_limited_per_book() {
         const T: u64 = 1_700_000_000_000_000_000;
         let mut b = synced(100, 5, 0, &short_book(127));
-        assert!(matches!(
-            b.on_snapshot_begin(2, 500, 548, 5, 0, T),
-            BeginOutcome::Resynced { .. }
-        ));
+        assert!(re_anchor(&mut b, T));
         // The replacement install lands, still short of the declared total.
-        assert!(b.on_snapshot_begin(3, 600, 1, 10, 0, T + 1_000).accepted());
-        b.on_snapshot_level(3, SIDE_BID, 6200, 150, Some(1), 0);
-        assert!(b.on_snapshot_end(600, 3));
-        assert_eq!(
-            b.on_snapshot_begin(4, 700, 548, 10, 0, T + 1_000_000_000),
-            BeginOutcome::Declined {
-                shortfall: Some(547)
-            },
-            "inside REANCHOR_MIN_INTERVAL_NS",
-        );
+        assert!(b.on_snapshot_begin(10, 600, 1, 10, 0, T + 1_000).accepted());
+        b.on_snapshot_level(10, SIDE_BID, 6200, 150, Some(1), 0);
+        assert!(b.on_snapshot_end(600, 10));
+        for (sid, note) in [(11, "arms"), (12, "confirmed but inside the interval")] {
+            assert_eq!(
+                b.on_snapshot_begin(sid, 700, 548, 10, 0, T + 1_000_000_000),
+                BeginOutcome::Declined {
+                    shortfall: Some(547)
+                },
+                "{note}",
+            );
+        }
         assert_eq!(b.status(), Status::Ready);
         assert!(
             matches!(
-                b.on_snapshot_begin(5, 800, 548, 10, 0, T + REANCHOR_MIN_INTERVAL_NS + 1),
+                b.on_snapshot_begin(13, 800, 548, 10, 0, T + REANCHOR_MIN_INTERVAL_NS + 1),
                 BeginOutcome::Resynced { .. }
             ),
-            "past the interval, a persistent mismatch re-anchors again"
+            "past the interval the strike is still armed, so the next rotation re-anchors"
         );
+    }
+
+    /// Juan's false-positive class (#166 review): a book that legitimately **shrank** since a
+    /// rotation was captured looks exactly like a short install. The rotation after the clear is
+    /// captured post-clear and declares the true, smaller total, so the second strike never lands.
+    #[test]
+    fn a_book_that_shrank_since_the_rotation_was_captured_is_not_re_anchored() {
+        const T: u64 = 1_700_000_000_000_000_000;
+        let mut b = synced(100, 5, 0, &short_book(336));
+        // The venue clears the whole bid side; our book drops to nothing.
+        assert!(matches!(
+            apply_delta(&mut b, clear(6, 600, CLEAR_SIDE_BID, SCOPE_ENTIRE_SIDE, 0)),
+            DeltaOutcome::Applied { .. }
+        ));
+        assert_eq!(b.levels_len(), 0);
+        // A rotation captured before the clear still declares the old total.
+        assert_eq!(
+            b.on_snapshot_begin(2, 500, 336, 5, 0, T),
+            BeginOutcome::Declined {
+                shortfall: Some(336)
+            },
+        );
+        assert_eq!(b.status(), Status::Ready, "one strike changes nothing");
+        // The next one is captured post-clear and agrees with us.
+        assert_eq!(
+            b.on_snapshot_begin(3, 700, 0, 5, 0, T),
+            BeginOutcome::Declined { shortfall: Some(0) },
+        );
+        assert_eq!(b.status(), Status::Ready);
+        // And the evidence is gone, so a later stale straggler cannot confirm the first one.
+        assert_eq!(
+            b.on_snapshot_begin(4, 800, 336, 5, 0, T),
+            BeginOutcome::Declined {
+                shortfall: Some(336)
+            },
+            "the strike was cleared, so this arms it afresh rather than confirming",
+        );
+        assert_eq!(b.status(), Status::Ready);
+    }
+
+    /// A multicast wire redelivers datagrams routinely, so the two strikes are keyed on
+    /// `snapshot_id`: one rotation must never be its own confirmation.
+    #[test]
+    fn a_duplicated_short_rotation_is_not_a_second_strike() {
+        const T: u64 = 1_700_000_000_000_000_000;
+        let mut b = synced(100, 5, 0, &short_book(127));
+        for _ in 0..4 {
+            assert_eq!(
+                b.on_snapshot_begin(2, 500, 548, 5, 0, T),
+                BeginOutcome::Declined {
+                    shortfall: Some(421)
+                },
+            );
+        }
+        assert_eq!(b.status(), Status::Ready);
+        assert!(matches!(
+            b.on_snapshot_begin(3, 600, 548, 5, 0, T),
+            BeginOutcome::Resynced { .. }
+        ));
+    }
+
+    /// An install is the one way back into `Ready`, so it is the one place the strike has to be
+    /// cleared: the rotations it was gathered against measured a book this install replaced.
+    #[test]
+    fn an_install_clears_the_strike() {
+        const T: u64 = 1_700_000_000_000_000_000;
+        let mut b = synced(100, 5, 0, &short_book(127));
+        assert_eq!(
+            b.on_snapshot_begin(2, 500, 548, 5, 0, T),
+            BeginOutcome::Declined {
+                shortfall: Some(421)
+            },
+        );
+        // A rotation the book does need arrives and installs.
+        assert!(b.on_snapshot_begin(3, 600, 1, 9, 0, T).accepted());
+        b.on_snapshot_level(3, SIDE_BID, 6200, 150, Some(1), 0);
+        assert!(b.on_snapshot_end(600, 3));
+        assert_eq!(
+            b.on_snapshot_begin(4, 700, 548, 9, 0, T),
+            BeginOutcome::Declined {
+                shortfall: Some(547)
+            },
+            "the pre-install strike does not carry over",
+        );
+        assert_eq!(b.status(), Status::Ready);
+    }
+
+    /// Drive the two short rotations a re-anchor now needs, returning whether it happened.
+    fn re_anchor(b: &mut PriceBook, now_ns: u64) -> bool {
+        b.on_snapshot_begin(2, 500, 548, 5, 0, now_ns);
+        matches!(
+            b.on_snapshot_begin(3, 600, 548, 5, 0, now_ns),
+            BeginOutcome::Resynced { .. }
+        )
     }
 
     /// `levels` distinct bid prices, for the shortfall tests.

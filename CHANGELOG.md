@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- **A market-by-price re-anchor now needs two short rotations, not one.** A book that
+  legitimately *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes
+  applied past that rotation's `last_instrument_seq` — is indistinguishable from the short install
+  the re-anchor exists for, and would take the market off its path for a rotation. The rotation
+  after such a clear is captured post-clear and declares the true smaller total, so requiring two
+  costs one extra rotation on a genuinely short book and removes the false-positive class. The two
+  strikes are keyed on `snapshot_id`: a multicast wire redelivers datagrams, and one rotation must
+  never be its own confirmation. "Two" means two complete rotations with no agreeing one in
+  between — nothing expires a first strike by elapsed time, since the cost of acting on stale
+  evidence is the same single bounded failover as acting on fresh evidence.
 - ⚠️ **A publisher restart could truncate a market-by-price book for the life of the publisher era,
   and every later subscriber inherited it.** A restart is a `Reset Count` change, which discards
   that publisher's books; the new era's first snapshot rotation is served from a book the publisher
