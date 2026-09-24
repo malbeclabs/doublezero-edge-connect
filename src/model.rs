@@ -61,6 +61,12 @@ impl SourceKey {
         Self(m.source_id(), m.venue().clone())
     }
 
+    /// Test fixtures only: an unassigned (`0`) key, for messages that stamp no Source ID.
+    #[cfg(test)]
+    pub fn unassigned(name: &str) -> Self {
+        Self(0, Arc::from(name))
+    }
+
     pub fn id(&self) -> u16 {
         self.0
     }
@@ -1002,8 +1008,8 @@ impl BookAccumulator {
     pub fn to_clear(&self, key: &BookKey) -> NormalizedBook {
         let (venue, category, channel, instrument_id) = key;
         NormalizedBook {
-            venue: venue.clone(),
-            source_name: venue.clone(),
+            venue: venue.name_arc().clone(),
+            source_name: venue.name_arc().clone(),
             source_id: self.source_id,
             symbol: self.symbol.clone(),
             channel: *channel,
@@ -1051,7 +1057,7 @@ pub type BookSnapshot = Arc<Mutex<BookReplay>>;
 
 /// A market's replay key: the arbitration scope plus the wire identity. Structurally
 /// `ingest::authority::MarketKey`, and required to stay so — see [`BookSnapshot`].
-pub type BookKey = (Arc<str>, Arc<str>, u8, u32);
+pub type BookKey = (SourceKey, Arc<str>, u8, u32);
 
 /// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
 pub type BookMap = HashMap<BookKey, BookAccumulator>;
@@ -1208,7 +1214,12 @@ mod tests {
 
     /// The replay key a test's accumulator materializes under.
     fn bkey(venue: &Arc<str>, channel: u8, instrument_id: u32) -> BookKey {
-        (venue.clone(), TEST_CATEGORY.into(), channel, instrument_id)
+        (
+            SourceKey::new(0, venue.clone()),
+            TEST_CATEGORY.into(),
+            channel,
+            instrument_id,
+        )
     }
 
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {

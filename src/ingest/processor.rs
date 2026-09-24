@@ -1119,8 +1119,8 @@ impl MboProcessor {
     /// anything that reaches into the arbiter's per-venue state for this key — a floor clear, a
     /// WS-replay purge, a health report — must resolve it the same way or it targets a key nothing
     /// was ever filed under.
-    fn wire_venue(&self, key: &(IpAddr, u32)) -> Option<&'static str> {
-        self.revealed.get(key).copied().map(source_label)
+    fn wire_venue(&self, key: &(IpAddr, u32)) -> Option<SourceKey> {
+        self.revealed.get(key).copied().map(SourceKey::from_id)
     }
 
     /// Clear the depth floor (and its WS-replay entries) for every `(wire venue, symbol)` this
@@ -1135,7 +1135,7 @@ impl MboProcessor {
         let mut arb = lock(ctx.arbiter);
         for (key, symbol) in &self.emitted_symbol {
             if let Some(venue) = self.wire_venue(key) {
-                arb.reset_depth_floor_for_symbol(venue, symbol, reason);
+                arb.reset_depth_floor_for_symbol(venue.name(), symbol, reason);
             }
         }
     }
@@ -1356,7 +1356,7 @@ impl MboProcessor {
     fn market_key(&self, key: &(IpAddr, u32), ctx: &DatagramCtx) -> Option<MarketKey> {
         let venue = self.wire_venue(key)?;
         let channel = self.pending_channel.get(key).copied().unwrap_or(0);
-        Some((venue_arc(venue), category_arc(ctx.category), channel, key.1))
+        Some((venue, category_arc(ctx.category), channel, key.1))
     }
 
     /// Handle a delta-carrying message's Source ID: reveal the instrument if it moved, and decide what
@@ -1900,7 +1900,7 @@ impl DatagramProcessor for MboProcessor {
                     match (latched_symbol, latched_venue) {
                         (Some(symbol), Some(venue)) => {
                             lock(ctx.arbiter).reset_depth_floor_for_symbol(
-                                venue,
+                                venue.name(),
                                 &symbol,
                                 "instrument_reset",
                             );
@@ -2324,8 +2324,8 @@ impl MbpProcessor {
     /// arbiter's own `b.venue.clone()` at admission), so anything that reaches into the arbiter's
     /// per-market state for this key — a health report — must resolve it the same way or it targets
     /// a `MarketKey` nothing was ever filed under.
-    fn wire_venue(&self, key: &PriceBookKey) -> Option<&'static str> {
-        self.revealed.get(key).copied().map(source_label)
+    fn wire_venue(&self, key: &PriceBookKey) -> Option<SourceKey> {
+        self.revealed.get(key).copied().map(SourceKey::from_id)
     }
 
     /// One instrument's `(price, qty)` exponents, or `None` while its definition is unknown — the
@@ -2561,7 +2561,7 @@ impl MbpProcessor {
         // `ctx.canonical_channel`, not the raw `key.1`, so a mirror path's health report lands on
         // the SAME `MarketKey` `send_book` admits its `book` under — see `DatagramCtx::canonical_channel`.
         let market: MarketKey = (
-            venue_arc(venue),
+            venue,
             category_arc(ctx.category),
             ctx.canonical_channel(key.1),
             key.2,
@@ -3754,8 +3754,8 @@ mod tests {
         },
         metrics::metrics,
         model::{
-            category_arc, venue_arc, BookAction, BookSide, DepthSnapshot, FeedMessage,
-            NormalizedBook, NormalizedInstrument,
+            category_arc, BookAction, BookSide, DepthSnapshot, FeedMessage, NormalizedBook,
+            NormalizedInstrument,
         },
     };
 
@@ -7315,12 +7315,10 @@ mod tests {
     /// unhealthy at the gate for the life of the process.
     #[test]
     fn mbp_a_readmitted_instrument_reports_healthy_again() {
-        use crate::ingest::sources::source_label;
-
         let (arbiter, mut rx, instruments) = mbp_harness();
         let mut proc = synced_mbp_proc(&arbiter, &instruments, 0, 0, &[41]);
         let market: MarketKey = (
-            venue_arc(source_label(0)),
+            crate::model::SourceKey::from_id(0),
             category_arc("testcategory"),
             0,
             41,
@@ -9240,7 +9238,7 @@ mod tests {
             &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
         );
         let market = (
-            crate::model::venue_arc("HYPERLIQUID"),
+            crate::model::SourceKey::from("HYPERLIQUID"),
             crate::model::category_arc("testcategory"),
             3u8,
             41u32,
@@ -9525,7 +9523,7 @@ mod tests {
             !lock(&arbiter).authority().healthy(
                 // "SOURCE_0": every `mbp_level` delta above stamps wire Source ID 0.
                 &(
-                    crate::model::venue_arc("SOURCE_0"),
+                    crate::model::SourceKey::from_id(0),
                     crate::model::category_arc("testcategory"),
                     0u8,
                     0u32,
@@ -9917,7 +9915,6 @@ mod tests {
     /// surviving path's only re-baseline against it.
     #[test]
     fn end_of_session_reports_every_publishers_book_unsynced() {
-        use crate::ingest::sources::source_label;
         use std::net::Ipv4Addr;
         fn ctx_for<'a>(
             publisher: IpAddr,
@@ -9969,7 +9966,7 @@ mod tests {
             );
         }
         let market: MarketKey = (
-            venue_arc(source_label(0)),
+            crate::model::SourceKey::from_id(0),
             category_arc("testcategory"),
             0,
             0,
@@ -10042,7 +10039,6 @@ mod tests {
     /// eviction drops the same sibling maps a book eviction does.
     #[test]
     fn an_evicted_publisher_releases_its_path_and_its_sibling_state() {
-        use crate::ingest::sources::source_label;
         use std::net::Ipv4Addr;
         let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(1024);
         let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
@@ -10085,7 +10081,7 @@ mod tests {
             &ctx_for(victim, PortRole::Mktdata),
         );
         let market: MarketKey = (
-            venue_arc(source_label(0)),
+            crate::model::SourceKey::from_id(0),
             category_arc("testcategory"),
             0,
             0,

@@ -2047,8 +2047,12 @@ mod tests {
             10u8,
             1u32,
         );
-        let book_key: crate::ingest::authority::MarketKey =
-            (Arc::from("KALSHI"), Arc::from("events"), 10, 1);
+        let book_key: crate::ingest::authority::MarketKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            Arc::from("events"),
+            10,
+            1,
+        );
         let hist_key = history::Key {
             source_id: 3,
             category: "events".into(),
@@ -2160,8 +2164,12 @@ mod tests {
             10u8,
             1u32,
         );
-        let book_key: crate::ingest::authority::MarketKey =
-            (Arc::from("KALSHI"), Arc::from("events"), 10, 1);
+        let book_key: crate::ingest::authority::MarketKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            Arc::from("events"),
+            10,
+            1,
+        );
         let hist_key = history::Key {
             source_id: 3,
             category: "events".into(),

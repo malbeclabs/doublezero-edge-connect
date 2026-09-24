@@ -193,7 +193,7 @@ const FORCED_REBASELINE_MIN_INTERVAL_NS: u64 = 250_000_000; // 250ms
 
 /// One order-level channel: an arbitration scope plus the wire's `channel_id`. The grain the venue
 /// clock is kept at, since a market's own stamps say nothing about how far the venue has moved.
-type ChannelKey = (Arc<str>, Arc<str>, u8);
+type ChannelKey = (SourceKey, Arc<str>, u8);
 
 /// The cross-publisher resurrection guard's venue-time tunables (`--arb-book-*`), so the values a
 /// test-built arbiter guards on and the ones `--help` advertises cannot drift apart.
@@ -1436,7 +1436,7 @@ pub struct Arbiter {
     /// print from a path that is not the leader. That drop has no bound in practice — the silence
     /// handover only fires once the incumbent stops, and an incumbent streaming its own universe
     /// never does — so the loser's tape goes dark for the life of the process.
-    tape_leader: HashMap<(Arc<str>, Arc<str>), TapeLead>,
+    tape_leader: HashMap<ScopeKey, TapeLead>,
     /// Whether the zero-id double-print warning has fired; the metric carries the ongoing rate.
     no_id_conflict_logged: bool,
     /// Whether the "batches carry no `last`" warning has fired.
@@ -1996,7 +1996,7 @@ impl Arbiter {
             // `book_order` scan per evicted market, on the ingest hot path, to remove a key that
             // is already gone.
             self.drop_market_state(&old);
-            self.vm(&old.0).book_markets_evicted.inc();
+            self.vm(old.0.name_arc()).book_markets_evicted.inc();
         }
         self.book_order.push_back(key.clone());
         self.book_markets.insert(key.clone(), BookMarket::default());
@@ -2676,14 +2676,15 @@ impl Arbiter {
         let doomed: Vec<MarketKey> = self
             .book_markets
             .keys()
-            .filter(|k| k.0.as_ref() == venue && k.1.as_ref() == category && k.2 == channel)
+            .filter(|k| k.0.name() == venue && k.1.as_ref() == category && k.2 == channel)
             .cloned()
             .collect();
         let dropped = doomed.len();
         self.reset_books_for_markets(&doomed);
-        let ck: ChannelKey = (Arc::from(venue), Arc::from(category), channel);
-        self.channel_clocks.remove(&ck);
-        self.channel_clock_order.retain(|k| k != &ck);
+        let in_channel =
+            |k: &ChannelKey| k.0.name() == venue && k.1.as_ref() == category && k.2 == channel;
+        self.channel_clocks.retain(|k, _| !in_channel(k));
+        self.channel_clock_order.retain(|k| !in_channel(k));
         dropped
     }
 
@@ -2779,7 +2780,7 @@ impl Arbiter {
     ) -> bool {
         // Interned, so the per-print key is two refcount bumps rather than an allocation. One key for
         // the tape gate and the authority alike: they must not disagree about what a universe is.
-        let key: ScopeKey = (t.venue.clone(), category_arc(category));
+        let key: ScopeKey = (SourceKey::of(t), category_arc(category));
         let elected = self.books.scope_leader(&key);
         let tracked = self.books.tracks_path(&key, publisher);
         let Some(lead) = self.tape_leader.get_mut(&key) else {
@@ -2881,7 +2882,7 @@ impl Arbiter {
                 // `yes`: a margin transfer re-baselines every market it moves, each on that
                 // market's own next admitted batch (which counts no transfer of its own).
                 .path_transfers
-                .with_label_values(&[venue.as_ref(), "margin", "yes"])
+                .with_label_values(&[venue.name(), "margin", "yes"])
                 .inc();
         }
         // Never `path_ordinal` on either loop: labelling must not admit. `drain_unmatched`'s keys are
@@ -2902,7 +2903,7 @@ impl Arbiter {
             let label = self.books.path_label(&scope, path);
             metrics()
                 .path_unmatched_trades
-                .with_label_values(&[scope.0.as_ref(), label])
+                .with_label_values(&[scope.0.name(), label])
                 .inc_by(n);
         }
     }
@@ -2990,7 +2991,7 @@ impl Arbiter {
                 // Feed the cross-path matcher BEFORE the `trade_id == 0` bypass returns: that sentinel
                 // is exactly what a FIX-sourced path prints, so a call below it would never see the path
                 // the election exists to judge.
-                let scope: ScopeKey = (t.venue.clone(), category_arc(category));
+                let scope: ScopeKey = (SourceKey::of(t), category_arc(category));
                 if self.race_eligible(&scope, publisher) {
                     self.observe_trade_race(&scope, t, publisher);
                 }
@@ -3166,7 +3167,7 @@ impl Arbiter {
                 // The arbitration scope rides in on the key: one election per instrument universe,
                 // never one per venue (see `authority`'s module doc — a venue-wide election drops a
                 // disjoint universe's whole book feed).
-                let scope: ScopeKey = (b.venue.clone(), category_arc(category));
+                let scope: ScopeKey = (SourceKey::of(b), category_arc(category));
                 let key: MarketKey = (scope.0.clone(), scope.1.clone(), b.channel, b.instrument_id);
                 // Eligibility first, exactly as `admit` applies it: a path past the authority's
                 // per-universe cap enters no map here either, so a forged publisher can neither be
@@ -4693,14 +4694,14 @@ mod tests {
 
     /// The arbitration scope every book test runs in: one venue, one instrument universe.
     fn bscope(venue: &str) -> ScopeKey {
-        (Arc::from(venue), TEST_CATEGORY.into())
+        (SourceKey::unassigned(venue), TEST_CATEGORY.into())
     }
 
     /// The authority's key for `(venue, TEST_CATEGORY, BOOK_CHANNEL, instrument)` — what the gate
     /// itself builds for a batch `book()` produces.
     fn mkey(venue: &str, instrument_id: u32) -> MarketKey {
         (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             TEST_CATEGORY.into(),
             BOOK_CHANNEL,
             instrument_id,
@@ -5821,13 +5822,13 @@ mod tests {
         // The same wire identity in two universes, each with a producer re-baseline of its own so
         // both replay entries are complete.
         let doomed: MarketKey = (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             "perps".into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT,
         );
         let kept: MarketKey = (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             "sports".into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT,
@@ -6005,25 +6006,25 @@ mod tests {
         );
 
         let doomed_a: MarketKey = (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             "sports".into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT,
         );
         let doomed_b: MarketKey = (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             "sports".into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT + 1,
         );
         let peer_category: MarketKey = (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             "perps".into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT,
         );
         let peer_channel: MarketKey = (
-            Arc::from(venue),
+            SourceKey::unassigned(venue),
             "sports".into(),
             OTHER_CHANNEL,
             BOOK_INSTRUMENT,
@@ -6207,25 +6208,25 @@ mod tests {
 
         let keys: Vec<MarketKey> = vec![
             (
-                Arc::from(venue),
+                SourceKey::unassigned(venue),
                 "sports".into(),
                 BOOK_CHANNEL,
                 BOOK_INSTRUMENT,
             ),
             (
-                Arc::from(venue),
+                SourceKey::unassigned(venue),
                 "sports".into(),
                 BOOK_CHANNEL,
                 BOOK_INSTRUMENT + 1,
             ),
             (
-                Arc::from(venue),
+                SourceKey::unassigned(venue),
                 "perps".into(),
                 BOOK_CHANNEL,
                 BOOK_INSTRUMENT,
             ),
             (
-                Arc::from(venue),
+                SourceKey::unassigned(venue),
                 "sports".into(),
                 OTHER_CHANNEL,
                 BOOK_INSTRUMENT,

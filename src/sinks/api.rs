@@ -451,7 +451,7 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
         let books = crate::model::lock(&state.books);
         if let Some(order_level) = books
             .get(&(
-                i.venue.clone(),
+                crate::model::SourceKey::of(i),
                 i.category.clone(),
                 i.channel,
                 i.instrument_id,
@@ -648,7 +648,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
         let books = crate::model::lock(&state.books);
         books
             .get(&(
-                inst.venue.clone(),
+                crate::model::SourceKey::of(inst),
                 inst.category.clone(),
                 inst.channel,
                 inst.instrument_id,
@@ -709,7 +709,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // on a copy taken out from under the guard, the same discipline `sinks/hyperliquid.rs` follows:
     // ~617 µs held to clone the 44,598-order market against ~8.9 ms to fold it.
     let key = (
-        inst.venue.clone(),
+        crate::model::SourceKey::of(inst),
         inst.category.clone(),
         inst.channel,
         inst.instrument_id,
@@ -2395,7 +2395,12 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u8, 1u32),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "perps".into(),
+                9u8,
+                1u32,
+            ),
             inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2),
         );
         {
@@ -2427,7 +2432,15 @@ mod tests {
                 level = end;
             }
             assert!(acc.baselined(), "fixture sanity");
-            map.insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+            map.insert(
+                (
+                    crate::model::SourceKey::new(3, "HUGE".into()),
+                    "perps".into(),
+                    9,
+                    1,
+                ),
+                acc,
+            );
         }
 
         let state = ApiState {
@@ -2648,10 +2661,15 @@ mod tests {
                 o = end;
             }
             assert!(acc.baselined() && acc.is_order_level(), "fixture sanity");
-            books
-                .lock()
-                .unwrap()
-                .insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+            books.lock().unwrap().insert(
+                (
+                    crate::model::SourceKey::new(3, "HUGE".into()),
+                    "perps".into(),
+                    9,
+                    1,
+                ),
+                acc,
+            );
         }
         let state = ApiState {
             instruments,

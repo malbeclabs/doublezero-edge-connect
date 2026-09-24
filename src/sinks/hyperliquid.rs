@@ -853,7 +853,7 @@ fn prepare_one(
     }
     let coin = b.symbol.as_ref();
     let key: BookKey = (
-        b.venue.clone(),
+        crate::model::SourceKey::of(b),
         b.category.clone(),
         b.channel,
         b.instrument_id,
@@ -1022,7 +1022,7 @@ fn sent(channel: &'static str) {
 /// order population, so such a market would render as an *empty* book, telling the consumer to discard
 /// levels the bridge holds.
 fn publishable(key: &BookKey, acc: &BookAccumulator, coin: &str) -> bool {
-    key.0.as_ref() == VENUE
+    key.0.name() == VENUE
         && acc.symbol().as_ref() == coin
         && acc.baselined()
         && acc.is_order_level()
@@ -1545,7 +1545,12 @@ mod tests {
     }
 
     fn key() -> BookKey {
-        (Arc::from(VENUE), Arc::from(TEST_CATEGORY), 0, 7)
+        (
+            crate::model::SourceKey::new(1, VENUE.into()),
+            Arc::from(TEST_CATEGORY),
+            0,
+            7,
+        )
     }
 
     /// The order set the sink copies out under the lock, in the form the renderer receives it.
