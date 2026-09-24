@@ -62,5 +62,6 @@ Two PRs.
 
 ## Overlap
 
-- #110 changes `BookKey`; land it first or rebase PR 1 onto it.
+- #110 re-keys the MBO processor's own book map (not `BookKey`); it overlaps in `processor.rs`, so
+  whichever lands second rebases.
 - #161 publishes `src/ingest/registry.json`; unaffected.
