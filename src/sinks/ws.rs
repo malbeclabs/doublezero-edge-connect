@@ -1417,7 +1417,7 @@ mod tests {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
-                    Arc::<str>::from("HYPERLIQUID"),
+                    crate::model::SourceKey::from("HYPERLIQUID"),
                     Arc::<str>::from("default"),
                     0u8,
                     n as u32,
@@ -1546,7 +1546,7 @@ mod tests {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
-                    Arc::<str>::from("KALSHI"),
+                    crate::model::SourceKey::from("KALSHI"),
                     Arc::<str>::from("default"),
                     channel,
                     41u32,
@@ -1703,7 +1703,7 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
+        instruments: HashMap<(crate::model::SourceKey, Arc<str>, u8, u32), NormalizedInstrument>,
         books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1719,7 +1719,7 @@ mod tests {
     /// accumulator the way the arbiter does — under the shared lock, *before* the batch is
     /// broadcast — instead of serving a map frozen at connect time.
     async fn spawn_server_shared(
-        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
+        instruments: HashMap<(crate::model::SourceKey, Arc<str>, u8, u32), NormalizedInstrument>,
         books: crate::model::BookSnapshot,
         deadline: Option<Duration>,
     ) -> (
@@ -2198,7 +2198,7 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::from("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2853,7 +2853,7 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::from("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,

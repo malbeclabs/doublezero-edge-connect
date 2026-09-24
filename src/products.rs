@@ -276,7 +276,7 @@ mod tests {
         for d in defs {
             map.insert(
                 (
-                    d.venue.clone(),
+                    crate::model::SourceKey::of(&d),
                     d.category.clone(),
                     d.channel,
                     d.instrument_id,
@@ -285,6 +285,14 @@ mod tests {
             );
         }
         std::sync::Arc::new(std::sync::Mutex::new(map))
+    }
+
+    #[test]
+    fn instrument_snapshot_separates_ids_sharing_a_name() {
+        let mut other = instrument("c", "X", 0, 5);
+        other.source_id = 7;
+        let snap = snapshot(vec![instrument("c", "X", 0, 5), other]);
+        assert_eq!(crate::model::lock(&snap).len(), 2);
     }
 
     /// Two disjoint universes ("perps" and "sports") under one Source ID both happen to use

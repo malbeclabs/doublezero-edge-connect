@@ -75,6 +75,15 @@ impl SourceKey {
     }
 }
 
+/// Test fixtures only: the key a registered label resolves to, or an unassigned (`0`) key.
+#[cfg(test)]
+impl From<&str> for SourceKey {
+    fn from(name: &str) -> Self {
+        let id = crate::ingest::sources::source_id_of(name).unwrap_or(0);
+        Self(id, Arc::from(name))
+    }
+}
+
 impl std::fmt::Display for SourceKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.1)
@@ -570,13 +579,13 @@ impl FeedMessage {
 /// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
 /// diverge.
 pub type InstrumentSnapshot =
-    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>>>;
+    Arc<Mutex<HashMap<(SourceKey, Arc<str>, u8, u32), NormalizedInstrument>>>;
 
 /// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
 /// subscriber (depth is full state, so one replayed snapshot bootstraps the consumer immediately
 /// instead of making it wait for the next periodic one). Updated by the MBO receiver.
-pub type DepthSnapshot = Arc<Mutex<HashMap<(Arc<str>, Arc<str>), NormalizedDepth>>>;
+pub type DepthSnapshot = Arc<Mutex<HashMap<(SourceKey, Arc<str>), NormalizedDepth>>>;
 
 /// Accumulated book state for one market, so a connecting or newly-subscribing client can be
 /// bootstrapped immediately instead of waiting a full snapshot cycle.

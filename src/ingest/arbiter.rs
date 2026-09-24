@@ -56,7 +56,7 @@ use crate::{
     model::{
         self, category_arc, now_mono_ns, now_ns, BookAccumulator, BookAction, BookChange,
         BookSnapshot, DepthSnapshot, FeedMessage, NormalizedBook, NormalizedDepth, NormalizedQuote,
-        NormalizedTrade, ReplayScope,
+        NormalizedTrade, ReplayScope, SourceKey,
     },
 };
 
@@ -1923,7 +1923,7 @@ impl Arbiter {
     pub fn reset_depth_floor_for_venue(&mut self, venue: &str, reason: &'static str) {
         let cleared = self.depths.reset_where(|(v, _)| v.as_ref() == venue);
         if let Some(replay) = &self.depth_replay {
-            model::lock(replay).retain(|(v, _), _| v.as_ref() != venue);
+            model::lock(replay).retain(|(v, _), _| v.name() != venue);
         }
         self.record_floor_resets(venue, reason, cleared);
     }
@@ -1949,7 +1949,7 @@ impl Arbiter {
             .depths
             .reset_where(|(v, s)| v.as_ref() == venue && s.as_ref() == symbol);
         if let Some(replay) = &self.depth_replay {
-            model::lock(replay).remove(&(Arc::from(venue), Arc::from(symbol)));
+            model::lock(replay).retain(|(v, s), _| !(v.name() == venue && s.as_ref() == symbol));
         }
         self.record_floor_resets(venue, reason, cleared);
     }
@@ -3134,7 +3134,7 @@ impl Arbiter {
                         // non-leader's divergent copy).
                         if let Some(replay) = &self.depth_replay {
                             model::lock(replay)
-                                .insert((d.venue.clone(), d.symbol.clone()), d.clone());
+                                .insert((SourceKey::of(d), d.symbol.clone()), d.clone());
                         }
                         let _ = self.tx.send(Arc::new(msg));
                     }
@@ -4214,7 +4214,7 @@ mod tests {
         ); // B's divergent copy at same tick -> dropped, must NOT overwrite replay
         let map = model::lock(&replay);
         let entry = map
-            .get(&("HYPERLIQUID".into(), "BTC".into()))
+            .get(&(SourceKey::new(0, "HYPERLIQUID".into()), "BTC".into()))
             .expect("leader depth recorded in replay map");
         assert_eq!(
             entry.bids,
@@ -4237,7 +4237,7 @@ mod tests {
             FeedMessage::Depth(d)
         };
         let key =
-            |venue: &str, symbol: &str| -> (Arc<str>, Arc<str>) { (venue.into(), symbol.into()) };
+            |venue: &str, symbol: &str| -> (SourceKey, Arc<str>) { (venue.into(), symbol.into()) };
         let (tx, _rx) = broadcast::channel(64);
         let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);

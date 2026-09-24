@@ -57,7 +57,7 @@ use crate::{
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
-        sources::{source_id_of, source_label},
+        sources::source_id_of,
     },
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
@@ -243,10 +243,14 @@ fn lookup_instrument(
     channel: u8,
     instrument_id: u32,
 ) -> Option<NormalizedInstrument> {
-    let venue = venue_arc(source_label(source_id));
     let map = crate::model::lock(&state.instruments);
-    map.get(&(venue, category.clone(), channel, instrument_id))
-        .cloned()
+    map.get(&(
+        crate::model::SourceKey::from_id(source_id),
+        category.clone(),
+        channel,
+        instrument_id,
+    ))
+    .cloned()
 }
 
 /// Whether more than one instrument shares `(source_id, symbol)` — what decides whether a
@@ -466,7 +470,7 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
     }
     {
         let depth = crate::model::lock(&state.depth);
-        if depth.contains_key(&(i.venue.clone(), i.symbol.clone())) {
+        if depth.contains_key(&(crate::model::SourceKey::of(i), i.symbol.clone())) {
             return "market_by_order";
         }
     }
@@ -666,7 +670,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
         return (None, None);
     }
     let depth = crate::model::lock(&state.depth);
-    if let Some(d) = depth.get(&(inst.venue.clone(), inst.symbol.clone())) {
+    if let Some(d) = depth.get(&(crate::model::SourceKey::of(inst), inst.symbol.clone())) {
         let bid = d.bids.first().map(|b| (b[0], b[1]));
         let ask = d.asks.first().map(|a| (a[0], a[1]));
         return (bid, ask);
@@ -802,7 +806,8 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // honest answer is "we don't know" — `complete: false`, not a guess.
     let depth_entry = {
         let d = crate::model::lock(&state.depth);
-        d.get(&(inst.venue.clone(), inst.symbol.clone())).cloned()
+        d.get(&(crate::model::SourceKey::of(inst), inst.symbol.clone()))
+            .cloned()
     };
     if let Some(d) = depth_entry {
         let complete = d.bids.len() < DEPTH_LEVELS && d.asks.len() < DEPTH_LEVELS;
@@ -2586,11 +2591,19 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u8, 1u32),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "perps".into(),
+                9u8,
+                1u32,
+            ),
             inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2),
         );
         depth.lock().unwrap().insert(
-            ("HUGE".into(), "HUGEL3".into()),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "HUGEL3".into(),
+            ),
             NormalizedDepth {
                 venue: "HUGE".into(),
                 source_name: "HUGE".into(),

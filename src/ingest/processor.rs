@@ -39,7 +39,7 @@ use crate::{
     model::{
         category_arc, now_mono_ns, venue_arc, BookAction, BookChange, BookSide, DepthSnapshot,
         FeedMessage, NormalizedBook, NormalizedDepth, NormalizedInstrument, NormalizedMidpoint,
-        NormalizedQuote, NormalizedTrade, Side,
+        NormalizedQuote, NormalizedTrade, Side, SourceKey,
     },
 };
 
@@ -264,7 +264,7 @@ impl<D: InstrumentDef> PerPublisher<D> {
 /// `InstrumentSnapshot`'s doc.
 fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &NormalizedInstrument) {
     let key = (
-        inst.venue.clone(),
+        SourceKey::of(inst),
         inst.category.clone(),
         inst.channel,
         inst.instrument_id,
@@ -298,13 +298,13 @@ fn upsert_instrument(instruments: &crate::model::InstrumentSnapshot, inst: &Norm
 /// which is current.
 fn remove_instrument(
     instruments: &crate::model::InstrumentSnapshot,
-    venue: &Arc<str>,
+    source: &SourceKey,
     category: &Arc<str>,
     channel: u8,
     instrument_id: u32,
 ) {
     crate::model::lock(instruments).remove(&(
-        venue.clone(),
+        source.clone(),
         category.clone(),
         channel,
         instrument_id,
@@ -403,7 +403,7 @@ impl TobProcessor {
                 .inc();
             remove_instrument(
                 ctx.instruments,
-                &venue_arc(source_label(old_id)),
+                &SourceKey::from_id(old_id),
                 &category_arc(ctx.category),
                 channel,
                 instrument_id,
@@ -756,7 +756,7 @@ impl MidpointProcessor {
                 .inc();
             remove_instrument(
                 ctx.instruments,
-                &venue_arc(source_label(old_id)),
+                &SourceKey::from_id(old_id),
                 &category_arc(ctx.category),
                 channel,
                 instrument_id,
@@ -1057,7 +1057,7 @@ impl MboProcessor {
             self.last_top.remove(&key);
             remove_instrument(
                 ctx.instruments,
-                &venue_arc(source_label(old_id)),
+                &SourceKey::from_id(old_id),
                 &category_arc(ctx.category),
                 channel,
                 instrument_id,
@@ -1202,7 +1202,8 @@ impl MboProcessor {
                         // below must key by the same venue `emit_depth` used, not `ctx.venue`. `None`
                         // when the key was never revealed (nothing was ever filed, so nothing to
                         // purge).
-                        let evicted_venue = self.wire_venue(&old);
+                        let evicted_source =
+                            self.revealed.get(&old).copied().map(SourceKey::from_id);
                         self.revealed.remove(&old);
                         // NOT `pending_channel` here: it mirrors `RefDataState.defs`'s lifecycle
                         // (populated straight from refdata, independent of whether a book was ever
@@ -1217,10 +1218,10 @@ impl MboProcessor {
                             // Resolved against the evicted book's OWN publisher: reference data is
                             // per publisher, so two paths can map one id to different symbols.
                             if let (Some(def), Some(venue)) =
-                                (self.state.def(old_pub, old_id), evicted_venue)
+                                (self.state.def(old_pub, old_id), evicted_source)
                             {
                                 crate::model::lock(&self.depth)
-                                    .remove(&(venue_arc(venue), def.symbol.clone()));
+                                    .remove(&(venue, def.symbol.clone()));
                             }
                         }
                     }
@@ -2292,7 +2293,7 @@ impl MbpProcessor {
                 .inc();
             remove_instrument(
                 ctx.instruments,
-                &venue_arc(source_label(old_id)),
+                &SourceKey::from_id(old_id),
                 &category_arc(ctx.category),
                 ctx.canonical_channel(key.1),
                 key.2,
@@ -4395,7 +4396,7 @@ mod tests {
         );
         assert!(
             !map.contains_key(&(
-                venue_arc("HYPERLIQUID"),
+                crate::model::SourceKey::from_id(1),
                 category_arc("testcategory"),
                 0,
                 41
@@ -4403,7 +4404,12 @@ mod tests {
             "the stale entry under the OLD source name must be purged, not merely superseded"
         );
         assert!(
-            map.contains_key(&(venue_arc("PHOENIX"), category_arc("testcategory"), 0, 41)),
+            map.contains_key(&(
+                crate::model::SourceKey::from_id(2),
+                category_arc("testcategory"),
+                0,
+                41
+            )),
             "the entry under the CURRENT source name must remain"
         );
     }
@@ -5878,7 +5884,7 @@ mod tests {
         let snapshot = crate::model::lock(&instruments);
         let reannounced = snapshot
             .get(&(
-                std::sync::Arc::<str>::from("SOURCE_0"),
+                crate::model::SourceKey::from_id(0),
                 category_arc("testcategory"),
                 7,
                 0,
