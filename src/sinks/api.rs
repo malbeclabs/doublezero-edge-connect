@@ -229,10 +229,9 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
 }
 
 /// Re-fetch the full instrument record for an identity `resolve()` already matched.
-/// `InstrumentSnapshot` is keyed exactly on this identity (`(venue, category, channel,
-/// instrument_id)`), so this is a direct lookup, not a scan — `venue` is rederived from
-/// `source_id` the same way `ingest::processor` resolved it when it wrote the entry
-/// (`venue_arc(source_label(source_id))`). `category` must come from the same resolved
+/// `InstrumentSnapshot` is keyed exactly on this identity (`(source, category, channel,
+/// instrument_id)`), so this is a direct lookup, not a scan — the source key is rebuilt from
+/// `source_id` (`SourceKey::from_id`), as `ingest::processor` built it when it wrote the entry. `category` must come from the same resolved
 /// `ProductId` `resolve()` returned: two disjoint universes under one Source ID can share
 /// `(channel, instrument_id)`, and a lookup keyed on the wire identity alone would silently name
 /// whichever universe's entry happened to occupy that slot.
@@ -251,6 +250,27 @@ fn lookup_instrument(
         instrument_id,
     ))
     .cloned()
+}
+
+/// Sort on exactly `InstrumentSnapshot`'s own key (`(source, category, channel, instrument_id)`),
+/// the one tuple that uniquely identifies every entry, so a cursor walk neither skips nor repeats.
+fn sort_catalog(instruments: &mut [NormalizedInstrument]) {
+    instruments.sort_by(|a, b| {
+        (
+            a.venue.as_ref(),
+            a.source_id,
+            a.category.as_ref(),
+            a.channel,
+            a.instrument_id,
+        )
+            .cmp(&(
+                b.venue.as_ref(),
+                b.source_id,
+                b.category.as_ref(),
+                b.channel,
+                b.instrument_id,
+            ))
+    });
 }
 
 /// Whether more than one instrument shares `(name, symbol)` — what decides whether a `product_id`
@@ -293,25 +313,8 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
     // `limit`/`cursor` page the catalog — the same shape the emulated tool's own paginated list
     // endpoints use. Unset `limit` keeps today's behaviour (every product, one response, no
     // `cursor` field): a page size is never imposed unless the caller asks for one. Pagination
-    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own, so this
-    // sorts on exactly `InstrumentSnapshot`'s own key (`(source, category, channel,
-    // instrument_id)`), the one tuple that already uniquely identifies every entry.
-    instruments.sort_by(|a, b| {
-        (
-            a.venue.as_ref(),
-            a.source_id,
-            a.category.as_ref(),
-            a.channel,
-            a.instrument_id,
-        )
-            .cmp(&(
-                b.venue.as_ref(),
-                b.source_id,
-                b.category.as_ref(),
-                b.channel,
-                b.instrument_id,
-            ))
-    });
+    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own.
+    sort_catalog(&mut instruments);
 
     let limit = match req.query("limit") {
         None => None,
@@ -1691,6 +1694,19 @@ mod tests {
             paginated_ids, unpaginated_ids,
             "accumulating every page must equal the unpaginated response"
         );
+    }
+
+    /// Two IDs under one label at the same identity sort the same whatever order the map yields them.
+    #[test]
+    fn the_catalog_order_does_not_depend_on_map_order() {
+        let a = inst_in("c", 4, "SHARED", "X", 0, 1, -2, -2);
+        let b = inst_in("c", 10, "SHARED", "Y", 0, 1, -2, -2);
+        let mut one = vec![a.clone(), b.clone()];
+        let mut two = vec![b, a];
+        sort_catalog(&mut one);
+        sort_catalog(&mut two);
+        let ids = |v: &[NormalizedInstrument]| v.iter().map(|i| i.source_id).collect::<Vec<_>>();
+        assert_eq!(ids(&one), ids(&two));
     }
 
     /// A malformed/zero `limit` and an unparseable `cursor` are both rejected with a named remedy

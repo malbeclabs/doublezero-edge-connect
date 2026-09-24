@@ -101,7 +101,7 @@ pub enum Resolution {
 
 /// Match a parsed id against the instrument snapshot.
 ///
-/// `instruments` is now keyed `(venue, category, channel, instrument_id)` — two disjoint universes
+/// `instruments` is keyed `(source, category, channel, instrument_id)` — two disjoint universes
 /// under one Source ID can share `(channel, instrument_id)`, so filtering by source+symbol alone
 /// can legitimately produce hits from more than one category. That is not a defect to paper over:
 /// each hit already carries the category its own `NormalizedInstrument` entry was stored under (no

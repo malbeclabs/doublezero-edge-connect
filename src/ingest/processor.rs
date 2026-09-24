@@ -1224,8 +1224,7 @@ impl MboProcessor {
                         // below must key by the same venue `emit_depth` used, not `ctx.venue`. `None`
                         // when the key was never revealed (nothing was ever filed, so nothing to
                         // purge).
-                        let evicted_source =
-                            self.revealed.get(&old).copied().map(SourceKey::from_id);
+                        let evicted_source = self.wire_venue(&old);
                         self.revealed.remove(&old);
                         // NOT `pending_channel` here: it mirrors `RefDataState.defs`'s lifecycle
                         // (populated straight from refdata, independent of whether a book was ever
