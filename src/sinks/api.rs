@@ -401,8 +401,14 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
         "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
-        "feed_kind": feed_kind_for(state, i),
     });
+    let (feed_kind, book_complete) = feed_kind_for(state, i);
+    entry["feed_kind"] = json!(feed_kind);
+    // Present only for a market with a book: `false` is a market every new WebSocket subscriber is
+    // bootstrapped without — `status` is venue-level and reads `online` throughout.
+    if let Some(complete) = book_complete {
+        entry["book_complete"] = json!(complete);
+    }
     if i.tick_size > 0 {
         entry["tick_size"] = json!(i.tick_size);
     }
@@ -451,32 +457,33 @@ fn decimal_string(value: f64, exponent: i8) -> String {
 /// actually serves it is unknown — reporting the category's Top-of-Book row in that case would be
 /// a guess (e.g. an about-to-baseline market-by-price instrument would misreport as
 /// `top_of_book`), which this module's docs promise never to do.
-fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
+///
+/// Also returns whether the market's `book` replay entry is a complete book
+/// ([`crate::model::BookAccumulator::baselined`]), `None` when it has none — read off the same lookup.
+fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> (&'static str, Option<bool>) {
     {
         let books = crate::model::lock(&state.books);
-        if let Some(order_level) = books
-            .get(&(
-                crate::model::SourceKey::of(i),
-                i.category.clone(),
-                i.channel,
-                i.instrument_id,
-            ))
-            .map(crate::model::BookAccumulator::is_order_level)
-        {
+        if let Some(acc) = books.get(&(
+            crate::model::SourceKey::of(i),
+            i.category.clone(),
+            i.channel,
+            i.instrument_id,
+        )) {
             // The same accumulator serves both products. Which one it holds is the market's own
             // property, not the map's — reported as `market_by_price` regardless, every
             // Market-by-Order instrument misdescribes itself the moment it starts publishing.
-            return if order_level {
+            let kind = if acc.is_order_level() {
                 "market_by_order"
             } else {
                 "market_by_price"
             };
+            return (kind, Some(acc.baselined()));
         }
     }
     {
         let depth = crate::model::lock(&state.depth);
         if depth.contains_key(&(crate::model::SourceKey::of(i), i.symbol.clone())) {
-            return "market_by_order";
+            return ("market_by_order", None);
         }
     }
     let kinds: HashSet<FeedKind> = feeds()
@@ -484,10 +491,11 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
         .filter(|f| f.venue == i.venue.as_ref() && f.category == i.category.as_ref())
         .map(|f| f.kind)
         .collect();
-    match kinds.len() {
+    let kind = match kinds.len() {
         1 => feed_kind_label(*kinds.iter().next().expect("len() == 1")),
         _ => "unknown",
-    }
+    };
+    (kind, None)
 }
 
 fn feed_kind_label(kind: FeedKind) -> &'static str {
@@ -2249,6 +2257,58 @@ mod tests {
             ws_send_ts_ns: 0,
             category: crate::model::empty_category(),
         }
+    }
+
+    /// `book_complete` is what finds a market every new WebSocket subscriber is bootstrapped without:
+    /// `status` is venue-level and reads `online` for it. Absent for a market with no book at all.
+    #[tokio::test]
+    async fn products_list_reports_whether_each_book_is_complete() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            for (id, symbol) in [(1u32, "WHOLE"), (2, "WITHHELD"), (3, "BOOKLESS")] {
+                map.insert(
+                    ("KALSHI".into(), "perps".into(), 9u8, id),
+                    inst_in("perps", 3, "KALSHI", symbol, 9, id, -4, -2),
+                );
+            }
+        }
+        {
+            let mut map = books.lock().unwrap();
+            let mut whole = BookAccumulator::new("WHOLE".into());
+            let clear = BookChange {
+                action: BookAction::Clear,
+                side: BookSide::Both,
+                price: 0.0,
+                size: 0.0,
+                order_id: 0,
+            };
+            whole.apply(&book_batch("KALSHI", "WHOLE", 9, 1, vec![clear], true));
+            map.insert(("KALSHI".into(), "perps".into(), 9, 1), whole);
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 9, 2),
+                BookAccumulator::new("WITHHELD".into()),
+            );
+        }
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let body: Value = reqwest::get(format!("{base}/v1/products"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let products = body["products"].as_array().unwrap();
+        let complete = |symbol: &str| {
+            products
+                .iter()
+                .find(|p| p["symbol"] == symbol)
+                .unwrap_or_else(|| panic!("{symbol} missing"))
+                .get("book_complete")
+                .cloned()
+        };
+        assert_eq!(complete("WHOLE"), Some(json!(true)));
+        assert_eq!(complete("WITHHELD"), Some(json!(false)));
+        assert_eq!(complete("BOOKLESS"), None);
     }
 
     #[tokio::test]
