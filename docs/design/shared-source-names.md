@@ -26,8 +26,8 @@ Two PRs.
   `DepthSnapshot`, and the arbiter's inline `(venue, symbol)` / `(venue, category)` keys) take a
   `SourceKey { id, name }` in place of the name. Equality includes the ID; the name keeps messages
   with no assigned ID (`source_id == 0`) apart, as today.
-- Name-equality purges (`reset_depth_floor_for_venue` / `_for_symbol`, `remove_instrument` on an
-  ID change) match on ID.
+- Name-equality purges (`reset_depth_floor_for_symbol`, `remove_instrument` on an ID change)
+  match on ID.
 - The name stays the label: WebSocket `venue`/`source_name`, metric labels, subscription filters.
 - Row-keyed state (`ReceiverKey`, `FeedKey`, `Universe`, arbitration mode) stays keyed by the row's
   configured name.
@@ -40,6 +40,8 @@ Two PRs.
 - The revealed set records IDs, not names. `emit_status`, `reconcile` channel purges
   (`forget_channel_books`, the catalog retain) and `/v1/products` history counts use the row's
   revealed IDs instead of a name or first match.
+- Name-only lookups filter on a fixed Source ID: the public backstops'
+  `instrument_known` / `resolve_instrument`, and the order-book sink's venue filter.
 - Product ids: `resolve` already matches by name. The ambiguity count moves from
   `(source_id, symbol)` to `(name, symbol)`, so a symbol listed under two IDs of one name renders
   with the `#channel.instrument` suffix and resolves back.

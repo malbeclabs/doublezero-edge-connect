@@ -275,7 +275,8 @@ Modules are grouped by role under `src/`:
   codes and nothing fed the old name in. A `venue` in the document **must** be a name that resolves,
   or `receiver::record_revealed` silently drops it and the row's `status` feed goes unrecorded. An
   unassigned ID is **not** an error: it gets a stable synthesized `SOURCE_<id>` (distinct per ID,
-  since the arbiter keys dedup on `(venue, symbol)`), bounded by `MAX_UNREGISTERED_SOURCES`.
+  so consumers can tell them apart), bounded by `MAX_UNREGISTERED_SOURCES`; past it every ID shares
+  `UNREGISTERED` and one `SourceKey`.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
@@ -1063,14 +1064,15 @@ Modules are grouped by role under `src/`:
   all. That last property is what `GET /admin/diagnostics` rests on.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
-  `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by
-  **`(venue, channel, instrument_id)`** and `BookSnapshot` by that **prefixed with the arbitration
-  scope** (`(venue, category, channel, instrument_id)` — exactly `authority::MarketKey`) — a
+  `now_ns()` / `now_mono_ns()` clocks. Per-source state is keyed by `SourceKey` (Source ID plus its
+  label; IDs past the unregistered cap share one key), never the name alone. `InstrumentSnapshot`
+  and `BookSnapshot` are keyed **`(SourceKey, category, channel, instrument_id)`** — exactly
+  `authority::MarketKey` — a
   market-by-price `symbol` is a truncated display label
   that collides across markets (confirmed against a real capture — two distinct instrument_ids
   sharing one truncated symbol, see `tests/fixtures/PROVENANCE.md`), so it is not an identity; a
-  `(venue, symbol)`-keyed map would have the second market's insert silently destroy the first's
-  entry. `DepthSnapshot` (Market-by-Order only) is still keyed **`(venue, symbol)`** — unconfirmed
+  `(source, symbol)`-keyed map would have the second market's insert silently destroy the first's
+  entry. `DepthSnapshot` (Market-by-Order only) is still keyed **`(SourceKey, symbol)`** — unconfirmed
   whether that feed's own truncated symbols can collide the same way; not addressed here.
   `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
   absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the

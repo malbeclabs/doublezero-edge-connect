@@ -150,7 +150,7 @@ pub struct Metrics {
     /// Depth-floor entries cleared by the session-reset escape hatch, by `reason`
     /// (`end_of_session` / `instrument_reset`). A venue restarting its event clock below the
     /// latched high-water would otherwise wedge depth permanently; see
-    /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_venue`].
+    /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_symbol`].
     pub depth_floor_resets: IntCounterVec,
     /// Depth *cross-publisher* contest lead time (ns): when a second publisher's book snapshot arrives
     /// at a `source_ts` tick the leader already opened, how far ahead the leader was, labelled by the

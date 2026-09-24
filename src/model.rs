@@ -41,24 +41,29 @@ pub fn venue_arc(venue: &'static str) -> Arc<str> {
     intern_static(&INTERN, venue)
 }
 
-/// A source's internal identity: its wire Source ID plus its label. Equality includes the ID, so two
-/// IDs sharing a label keep separate state; the label keeps unassigned (`0`) sources apart. The label
-/// is for output only: there is no `PartialEq<str>`, so a name comparison is always explicit.
+/// A source's internal identity, keyed by its wire Source ID so IDs sharing a name keep separate
+/// state. The label is derived from the ID (`sources::source_label`) and carried for output; it
+/// only separates keys in test fixtures that stamp no ID. IDs past the unregistered cap share one
+/// key, as they share one label. There is no `PartialEq<str>`, so a name comparison is explicit.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceKey(u16, Arc<str>);
 
 impl SourceKey {
     pub fn new(id: u16, name: Arc<str>) -> Self {
+        // Collapsed so a hostile wire cannot grow per-source state past the label cap.
+        if name.as_ref() == crate::ingest::sources::UNREGISTERED {
+            return Self(0, name);
+        }
         Self(id, name)
     }
 
     /// The key for a wire Source ID, labelled as the registry names it.
     pub fn from_id(id: u16) -> Self {
-        Self(id, venue_arc(crate::ingest::sources::source_label(id)))
+        Self::new(id, venue_arc(crate::ingest::sources::source_label(id)))
     }
 
     pub fn of<M: HasSource>(m: &M) -> Self {
-        Self(m.source_id(), m.venue().clone())
+        Self::new(m.source_id(), m.venue().clone())
     }
 
     /// Test fixtures only: an unassigned (`0`) key, for messages that stamp no Source ID.
@@ -558,7 +563,7 @@ impl FeedMessage {
     }
 }
 
-/// Latest known instrument definitions, keyed by `(venue, category, channel, instrument_id)`,
+/// Latest known instrument definitions, keyed by `(SourceKey, category, channel, instrument_id)`,
 /// shared between the receivers (which update it) and the WebSocket server (which replays it to
 /// each new subscriber so reference data arrives before quotes - otherwise a client that connects
 /// partway through sees a quote first and has to guess the price/qty precision).
@@ -587,7 +592,7 @@ impl FeedMessage {
 pub type InstrumentSnapshot =
     Arc<Mutex<HashMap<(SourceKey, Arc<str>, u8, u32), NormalizedInstrument>>>;
 
-/// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
+/// Latest order-book `depth` snapshot per `(SourceKey, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
 /// subscriber (depth is full state, so one replayed snapshot bootstraps the consumer immediately
 /// instead of making it wait for the next periodic one). Updated by the MBO receiver.
@@ -629,10 +634,6 @@ pub struct BookAccumulator {
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
     baselined: bool,
-    /// The producer's Source ID for this market, retained so `to_book` can stamp a materialized
-    /// re-baseline or replay with it. Not derivable here — `to_book`'s `venue` comes from the map
-    /// key, but the id is not part of that key.
-    source_id: u16,
 }
 
 /// One folded price level as `(price, total size, resting order count)`.
@@ -684,7 +685,6 @@ impl BookAccumulator {
             pending_batch_id: None,
             batch_id: None,
             baselined: false,
-            source_id: 0,
         }
     }
 
@@ -713,7 +713,6 @@ impl BookAccumulator {
     /// producer's event size — the same one the consumer already pays.
     pub fn apply(&mut self, b: &NormalizedBook) {
         self.symbol = b.symbol.clone();
-        self.source_id = b.source_id;
         // 0 is the "unknown" sentinel, never a real time: a batch without one must not blank the
         // last known event time on every subsequent replay.
         if b.source_ts_ns != 0 {
@@ -1010,7 +1009,7 @@ impl BookAccumulator {
         NormalizedBook {
             venue: venue.name_arc().clone(),
             source_name: venue.name_arc().clone(),
-            source_id: self.source_id,
+            source_id: venue.id(),
             symbol: self.symbol.clone(),
             channel: *channel,
             instrument_id: *instrument_id,
@@ -1182,6 +1181,29 @@ mod tests {
         );
     }
 
+    /// Past the unregistered-ID cap every ID shares one label, and must share one key, or a hostile
+    /// wire grows every per-source map without bound.
+    #[test]
+    fn ids_past_the_unregistered_cap_share_one_key() {
+        let capped = crate::ingest::sources::UNREGISTERED;
+        assert_eq!(
+            SourceKey::new(900, Arc::from(capped)),
+            SourceKey::new(901, Arc::from(capped))
+        );
+        assert_ne!(
+            SourceKey::new(900, Arc::from("SOURCE_900")),
+            SourceKey::new(901, Arc::from("SOURCE_901"))
+        );
+    }
+
+    /// A book materialized before its first batch is stamped with its key's ID, not a default.
+    #[test]
+    fn an_unapplied_accumulator_stamps_its_keys_id() {
+        let acc = BookAccumulator::new("X".into());
+        let key: BookKey = (SourceKey::new(5, "S".into()), "c".into(), 0, 1);
+        assert_eq!(acc.to_clear(&key).source_id, 5);
+    }
+
     #[test]
     fn source_key_displays_its_name() {
         assert_eq!(SourceKey::new(3, Arc::from("NAME")).to_string(), "NAME");
@@ -1215,7 +1237,7 @@ mod tests {
     /// The replay key a test's accumulator materializes under.
     fn bkey(venue: &Arc<str>, channel: u8, instrument_id: u32) -> BookKey {
         (
-            SourceKey::new(0, venue.clone()),
+            SourceKey::from(venue.as_ref()),
             TEST_CATEGORY.into(),
             channel,
             instrument_id,

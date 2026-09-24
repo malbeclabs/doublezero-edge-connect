@@ -1369,23 +1369,23 @@ pub struct Arbiter {
     /// depth floor gets (see `depths` below): the TOB `source_ts` is block time in the Unix epoch, monotonic
     /// across sessions by construction, so a session boundary cannot restart it below the latched
     /// high-water — and 0, the "not available" sentinel, bypasses this floor entirely. Revisit if
-    /// a venue with a session-scoped quote clock is ever added. The key `(venue, symbol)` is
-    /// `Arc<str>` (venues interned via `model::venue_arc`), so building it allocates nothing.
+    /// a venue with a session-scoped quote clock is ever added. The key is `(SourceKey, symbol)`, both
+    /// halves interned `Arc`s, so building it allocates nothing.
     quotes: StalenessFloor<(SourceKey, Arc<str>), QuoteId, Transport>,
     trades: WindowedDedup<(SourceKey, Arc<str>), u64, Transport>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
-    /// collapses redundant BBOs — latch-to-leader per `(venue, symbol)` tick, keyed on [`DepthId`].
+    /// collapses redundant BBOs — latch-to-leader per `(source, symbol)` tick, keyed on [`DepthId`].
     ///
     /// The floor assumes `source_ts_ns` is monotonic non-decreasing **within a session**; it does
     /// NOT assume monotonicity across session boundaries. If a venue restarts its event clock below
     /// the latched high-water, every later depth would be dropped as stale with no full-state
     /// self-heal (the floor stays latched) — so the MBO processor clears the affected entries on
-    /// `EndOfSession` / `InstrumentReset` via [`Arbiter::reset_depth_floor_for_venue`] /
-    /// [`Arbiter::reset_depth_floor_for_symbol`], the session-reset escape hatch.
+    /// `EndOfSession` / `InstrumentReset` via [`Arbiter::reset_depth_floor_for_symbol`], the
+    /// session-reset escape hatch.
     depths: StalenessFloor<(SourceKey, Arc<str>), DepthId, Transport>,
-    /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
+    /// Shared latest-`depth` map the WS server replays on connect, keyed `(source, symbol)`. Written
     /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
     /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
     /// the floor. `None` when no WS replay map is wired (e.g. unit tests that only inspect the
@@ -1414,7 +1414,7 @@ pub struct Arbiter {
     /// the registry's `&'static str` rather than the `Arc<str>` the dedup keys use; lookups borrow
     /// as `&str`, so this needs no `venue_arc` interning.
     modes: HashMap<&'static str, ArbitrationMode>,
-    /// Who owns each `(venue, symbol)` zero-id tape, and when they last printed. A bypassed
+    /// Who owns each `(source, symbol)` zero-id tape, and when they last printed. A bypassed
     /// `trade_id == 0` has no window to collapse against, so a *concurrent* second publisher's
     /// zero-id prints are pure duplicates; they are still forwarded (dropping is an authority
     /// decision, not a dedup one) but counted and logged.
@@ -1425,10 +1425,10 @@ pub struct Arbiter {
     /// the first publisher forever would report every legitimate failover as a double-print for the
     /// life of the process, which is exactly the alert nobody would then trust.
     ///
-    /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
+    /// Bounded like `instrument_defs`: one entry per `(source, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
     no_id_owner: HashMap<(SourceKey, Arc<str>), (Transport, u64)>,
-    /// Which **path** serves each `Sticky` universe's tape, keyed on `(venue, category)`. See
+    /// Which **path** serves each `Sticky` universe's tape, keyed on `(source, category)`. See
     /// [`Arbiter::tape_path_admits`]. One entry per `Sticky` universe that has ever printed.
     ///
     /// Venue alone would let a publisher on one universe mute a publisher on a disjoint one: a
@@ -1455,8 +1455,8 @@ pub struct Arbiter {
     /// queue (oldest first, mirroring `processor::PerPublisher`).
     book_markets: HashMap<MarketKey, BookMarket>,
     book_order: VecDeque<MarketKey>,
-    /// Shared accumulated-`book` map the WS server replays on connect, keyed `(venue, channel,
-    /// instrument_id)`. Mirrors the serving path's state: seeded from its accumulator on every
+    /// Shared accumulated-`book` map the WS server replays on connect, keyed by [`MarketKey`].
+    /// Mirrors the serving path's state: seeded from its accumulator on every
     /// re-baseline, then advanced by each admitted batch. `None` when no replay map is wired.
     book_replay: Option<BookSnapshot>,
     /// Per order-level market, each publisher's standing (see [`PeerState`]). Bounded twice: evicted
@@ -1465,7 +1465,7 @@ pub struct Arbiter {
     book_sync: HashMap<MarketKey, HashMap<Transport, PeerState>>,
     /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
     book_events: HashMap<MarketKey, MarketEvents>,
-    /// Per `(venue, category, channel)` venue clock — the frontier the resurrection guard admits and
+    /// Per `(source, category, channel)` venue clock — the frontier the resurrection guard admits and
     /// forgets on. Bounded by [`MAX_CHANNEL_CLOCKS`], oldest first, with `channel_clock_order` as the
     /// eviction queue.
     channel_clocks: HashMap<ChannelKey, ChannelClock>,
@@ -1905,33 +1905,14 @@ impl Arbiter {
         &self.tx
     }
 
-    /// Clear every latched depth-floor entry for `venue` — the session-reset escape hatch, called
-    /// by the MBO processor on `EndOfSession` (which carries no instrument id, so the whole venue
-    /// resets). Without it a venue that restarts its event clock below the latched high-water
-    /// would have every post-session depth dropped as stale, permanently (see the `depths` docs).
-    /// The venue's WS-replay `depth` entries are purged in the same step: they hold the ended
-    /// session's final books, and (unlike the floor, which the next admitted depth re-opens) the
-    /// replay map has no other cleanup for an instrument the new session never re-lists — a client
-    /// connecting after the boundary would be served that phantom book indefinitely. Replay
-    /// repopulates from the first admitted new-session depth. Cleared floor entries are counted in
+    /// Clear one `(source, symbol)` latched depth-floor entry and its WS-replay entry — the
+    /// session-reset escape hatch, called by the MBO processor on `EndOfSession` (per latched
+    /// symbol) and `InstrumentReset` (the book re-snapshots, and the post-reset anchor may carry a
+    /// lower `source_ts`). Without it a venue restarting its event clock below the latched
+    /// high-water would have every later depth dropped as stale, permanently. The replay entry goes
+    /// too: it holds the ended session's book, and nothing else removes it for an instrument the
+    /// new session never re-lists. Cleared entries are counted in
     /// `dz_depth_floor_resets_total{venue, reason}`.
-    ///
-    /// Worst case of a spurious reset (e.g. a forged `EndOfSession` — the source IP address is spoofable):
-    /// a still-live publisher's next depth re-opens the tick, possibly re-admitting a snapshot at
-    /// an already-served `source_ts` — full-state, so consumers self-heal. Strictly better than
-    /// the permanent wedge the reset prevents.
-    pub fn reset_depth_floor_for_venue(&mut self, source: &SourceKey, reason: &'static str) {
-        let cleared = self.depths.reset_where(|(v, _)| v == source);
-        if let Some(replay) = &self.depth_replay {
-            model::lock(replay).retain(|(v, _), _| v != source);
-        }
-        self.record_floor_resets(source.name(), reason, cleared);
-    }
-
-    /// Clear one `(venue, symbol)` latched depth-floor entry (and its WS-replay entry, for the
-    /// same reason as [`Self::reset_depth_floor_for_venue`]) — the per-instrument variant, called
-    /// by the MBO processor on `InstrumentReset` (the book re-snapshots, and the post-reset anchor
-    /// may carry a lower `source_ts`).
     ///
     /// The floor entry is shared across publishers while `InstrumentReset` arrives per publisher,
     /// so a one-publisher reset also clears a healthy mirror's latch: worst case the resetting
@@ -4294,7 +4275,7 @@ mod tests {
         a.emit(mk(1), edge, TEST_CATEGORY);
         a.emit(mk(7), edge, TEST_CATEGORY);
         while rx.try_recv().is_ok() {}
-        a.reset_depth_floor_for_venue(&SourceKey::new(1, "SHARED".into()), "test");
+        a.reset_depth_floor_for_symbol(&SourceKey::new(1, "SHARED".into()), "BTC", "test");
         {
             let map = model::lock(&replay);
             let key = |id: u16| (SourceKey::new(id, "SHARED".into()), Arc::from("BTC"));
@@ -4321,7 +4302,7 @@ mod tests {
     /// The floor resets purge the matching WS-replay entries: a client connecting across a
     /// session boundary must not be replayed the ended session's final book — and for an
     /// instrument the new session never re-lists, nothing else would ever remove the entry. The
-    /// symbol reset purges exactly its key; the venue reset purges only that venue's entries.
+    /// reset purges exactly its key.
     #[test]
     fn arbiter_depth_floor_reset_purges_replay_entries() {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -4352,21 +4333,11 @@ mod tests {
             );
             assert!(map.contains_key(&key("VenueB", "BTC")), "other venue kept");
         }
-
-        a.reset_depth_floor_for_venue(&SourceKey::unassigned("VenueA"), "end_of_session");
-        {
-            let map = model::lock(&replay);
-            assert!(
-                !map.contains_key(&key("VenueA", "ETH")),
-                "venue's entries purged"
-            );
-            assert!(map.contains_key(&key("VenueB", "BTC")), "other venue kept");
-        }
     }
 
     /// The session-reset escape hatch: a venue that restarts its event clock below the latched
-    /// high-water would have every later depth dropped as stale forever; clearing the venue's floor
-    /// entries (what the MBO processor does on `EndOfSession`) re-opens the tick so the lower
+    /// high-water would have every later depth dropped as stale forever; clearing the latched floor
+    /// entry (what the MBO processor does on `EndOfSession`) re-opens the tick so the lower
     /// `source_ts` is admitted. Also pins the cleared-entry count reaching
     /// `dz_depth_floor_resets_total{venue, reason}` (venue unique to this test).
     #[test]
@@ -4382,7 +4353,7 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         a.emit(mk(5000, 100.0), edge, TEST_CATEGORY); // latches high_water at 5000
         a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // post-restart lower tick -> stale, dropped (the wedge)
-        a.reset_depth_floor_for_venue(&SourceKey::unassigned(venue), "end_of_session");
+        a.reset_depth_floor_for_symbol(&SourceKey::unassigned(venue), "BTC", "end_of_session");
         a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // floor cleared -> re-opens the tick, admitted
         let ts: Vec<u64> = {
             let mut out = Vec::new();
@@ -4404,10 +4375,10 @@ mod tests {
         );
     }
 
-    /// A venue-wide floor reset touches only that venue's entries: another venue's latched floor
-    /// still drops its stale ticks.
+    /// A floor reset touches only its own source's entry: another source's latched floor still drops
+    /// its stale ticks.
     #[test]
-    fn arbiter_depth_session_reset_is_venue_scoped() {
+    fn arbiter_depth_session_reset_is_source_scoped() {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let mk = |venue: &str, ts: u64| {
             let mut d = depth(ts, vec![[100.0, 1.0]], vec![]);
@@ -4418,7 +4389,7 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         a.emit(mk("VenueA", 5000), edge, TEST_CATEGORY);
         a.emit(mk("VenueB", 5000), edge, TEST_CATEGORY);
-        a.reset_depth_floor_for_venue(&SourceKey::unassigned("VenueA"), "end_of_session");
+        a.reset_depth_floor_for_symbol(&SourceKey::unassigned("VenueA"), "BTC", "end_of_session");
         a.emit(mk("VenueA", 100), edge, TEST_CATEGORY); // cleared -> admitted
         a.emit(mk("VenueB", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
@@ -5011,8 +4982,6 @@ mod tests {
         }
     }
 
-    /// The replay map must hold what was broadcast, so a connecting client is bootstrapped with the
-    /// authoritative path's book and never a discarded path's divergent copy.
     /// Two IDs under one name hold separate books: each path's market is its own replay entry.
     #[test]
     fn book_replay_keeps_two_ids_sharing_a_name_apart() {
@@ -5045,6 +5014,8 @@ mod tests {
         }
     }
 
+    /// The replay map must hold what was broadcast, so a connecting client is bootstrapped with the
+    /// authoritative path's book and never a discarded path's divergent copy.
     #[test]
     fn book_replay_accumulates_the_authoritative_path() {
         let venue = "BookReplayLeader";
