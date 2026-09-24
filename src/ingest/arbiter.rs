@@ -101,10 +101,14 @@ const BOUND_ANCHOR: &str = "anchor";
 /// memory; the cap sits an order of magnitude above the largest real venue (~1,200 instruments).
 const MAX_BOOK_MARKETS: usize = 16_384;
 
-/// Markets that get their own `dz_book_bootstrap_*` label set; past it they share an `other` one. A
-/// forged path's first batch for a market it invents is enough to withhold that market, so the label
-/// set needs a bound of its own — far above the ~90 markets a real venue could have dark at once.
+/// Markets withheld **at once** that get their own `dz_book_bootstrap_withheld` series; past it they
+/// share an `other` one. A forged path can withhold a market it invents, so the set needs a bound —
+/// far above the ~90 markets a real venue could have dark at once. Released markets leave it.
 const MAX_LABELLED_WITHHELD_MARKETS: usize = 1024;
+
+/// Distinct markets **ever** given their own `dz_book_bootstrap_lost_total` series. Lifetime, not
+/// concurrent: retiring a counter's series would reset it and break `rate()`.
+const MAX_LABELLED_LOST_MARKETS: usize = 4096;
 
 /// Cap on batches withheld from one market while waiting for the new path to close a logical event.
 /// `last` is mandatory in PROTOCOL.md, but a producer that stops setting it — a bug, a truncated
@@ -1464,10 +1468,10 @@ pub struct Arbiter {
     /// instrument_id)`. Mirrors the serving path's state: seeded from its accumulator on every
     /// re-baseline, then advanced by each admitted batch. `None` when no replay map is wired.
     book_replay: Option<BookSnapshot>,
-    /// Markets that have been given their own `dz_book_bootstrap_*` label set, bounded by
-    /// [`MAX_LABELLED_WITHHELD_MARKETS`]. Only grows, so a market keeps the labels it was withheld
-    /// under until it is released.
+    /// Withheld markets with their own gauge series ([`MAX_LABELLED_WITHHELD_MARKETS`]).
     book_withheld_labelled: HashSet<MarketKey>,
+    /// Markets with their own counter series ([`MAX_LABELLED_LOST_MARKETS`]); never pruned.
+    book_lost_labelled: HashSet<MarketKey>,
     /// Per order-level market, each publisher's standing (see [`PeerState`]). Bounded twice: evicted
     /// alongside `book_markets`, and the inner map only admits paths the authority already counts, so a
     /// spoofed-publisher flood cannot grow it.
@@ -1746,6 +1750,7 @@ impl Arbiter {
             book_order: VecDeque::new(),
             book_replay: None,
             book_withheld_labelled: HashSet::new(),
+            book_lost_labelled: HashSet::new(),
             book_sync: HashMap::new(),
             book_events: HashMap::new(),
             channel_clocks: HashMap::new(),
@@ -2727,23 +2732,29 @@ impl Arbiter {
         if withheld(was) == withheld(now) {
             return;
         }
-        let labelled = self.book_withheld_labelled.contains(key)
-            || (withheld(now)
-                && self.book_withheld_labelled.len() < MAX_LABELLED_WITHHELD_MARKETS
-                && self.book_withheld_labelled.insert(key.clone()));
-        let (channel, instrument) = if labelled {
-            (key.2.to_string(), key.3.to_string())
-        } else {
-            ("other".to_owned(), "other".to_owned())
-        };
-        let labels = [key.0.as_ref(), key.1.as_ref(), &channel, &instrument];
+        let (channel, instrument) = (key.2.to_string(), key.3.to_string());
+        let own = [key.0.as_ref(), key.1.as_ref(), &channel, &instrument];
+        let other = [key.0.as_ref(), key.1.as_ref(), "other", "other"];
         let m = metrics();
-        if withheld(now) {
-            m.book_bootstrap_lost.with_label_values(&labels).inc();
-            m.book_bootstrap_withheld.with_label_values(&labels).inc();
-        } else {
-            m.book_bootstrap_withheld.with_label_values(&labels).dec();
+        if !withheld(now) {
+            if self.book_withheld_labelled.remove(key) {
+                let _ = m.book_bootstrap_withheld.remove_label_values(&own);
+            } else {
+                m.book_bootstrap_withheld.with_label_values(&other).dec();
+            }
+            return;
         }
+        let gauge = self.book_withheld_labelled.len() < MAX_LABELLED_WITHHELD_MARKETS
+            && self.book_withheld_labelled.insert(key.clone());
+        m.book_bootstrap_withheld
+            .with_label_values(if gauge { &own } else { &other })
+            .inc();
+        let counter = self.book_lost_labelled.contains(key)
+            || (self.book_lost_labelled.len() < MAX_LABELLED_LOST_MARKETS
+                && self.book_lost_labelled.insert(key.clone()));
+        m.book_bootstrap_lost
+            .with_label_values(if counter { &own } else { &other })
+            .inc();
     }
 
     /// For each of `keys`, whether `publisher` owes that market a full re-baseline at its next event
@@ -5077,6 +5088,14 @@ mod tests {
             "the serving path's `Clear` discharged it"
         );
         assert_eq!((lost(), withheld()), (1, 0));
+        assert!(
+            a.book_withheld_labelled.is_empty(),
+            "a released market gives back its gauge label budget"
+        );
+        assert!(
+            a.book_lost_labelled.contains(&key),
+            "but keeps its counter series"
+        );
 
         overflow(&mut a);
         assert_eq!((lost(), withheld()), (2, 1));

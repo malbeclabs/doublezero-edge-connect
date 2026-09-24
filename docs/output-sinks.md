@@ -189,7 +189,7 @@ levels might not be all of them).
 `book_complete` on a product is the WebSocket bootstrap's view of that market. Present only for a
 market with a `book`; `false` means a subscriber connecting now receives no `book`/`order_book`
 bootstrap for it and none of its book frames until it completes, while quotes and trades keep flowing.
-`status` is venue-level and reads `online` throughout, so this is the field to check. It should read
+`status` is venue-level and reads `online` throughout, so this is the field to check. `true` can lead the bootstrap by one open event: a subscriber joining mid-event waits for that event to close. It should read
 `false` for at most about one slot; one stuck at `false` is worth reporting, together with
 `dz_book_bootstrap_withheld` if the metrics endpoint is on.
 

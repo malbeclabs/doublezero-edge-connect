@@ -1117,8 +1117,10 @@ Modules are grouped by role under `src/`:
   serving MBP path then republishes at its next close (see `MbpProcessor` above). Every write of a
   replay entry reports its completeness transition to `Arbiter::note_bootstrap`, which drives the only
   market-labelled series, `dz_book_bootstrap_lost_total`/`dz_book_bootstrap_withheld` — label sets
-  capped at `MAX_LABELLED_WITHHELD_MARKETS`, since a forged path's first batch for an invented market
-  is enough to withhold it. `BookSnapshot`
+  capped, since a forged path's first batch for an invented market is enough to withhold it: the
+  gauge by markets withheld **at once** (`MAX_LABELLED_WITHHELD_MARKETS`, pruned and its series
+  removed on release), the counter by distinct markets **ever** (`MAX_LABELLED_LOST_MARKETS`, never
+  pruned, since removing a counter's series resets it and breaks `rate()`). `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
