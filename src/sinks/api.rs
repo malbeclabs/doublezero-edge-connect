@@ -57,7 +57,7 @@ use crate::{
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
-        sources::source_id_of,
+        sources::source_ids_of,
     },
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
@@ -1182,7 +1182,7 @@ fn channels_block(state: &ApiState) -> Value {
         // Every enabled row's venue resolves to a Source ID by construction (`feeds::init`
         // validates it) — if it somehow didn't, there is no history key to look products up under,
         // so the row is skipped rather than reported with a fabricated zero.
-        let Some(source_id) = source_id_of(f.venue) else {
+        let Some(source_id) = source_ids_of(f.venue).first().copied() else {
             continue;
         };
         let category = category_arc(f.category);
@@ -3896,7 +3896,9 @@ mod tests {
         // or not-yet-bound receiver" case `ingest::health::TapeLiveness::Unregistered` exists for.
         // Channel 12 is excluded by the filter outright; nothing registers for it either.
 
-        let source_id = source_id_of(row.venue).expect("fixture sanity: KALSHI resolves");
+        let source_id = *source_ids_of(row.venue)
+            .first()
+            .expect("fixture sanity: KALSHI resolves");
         let category = category_arc(row.category);
         {
             let mut store = history.lock().unwrap();

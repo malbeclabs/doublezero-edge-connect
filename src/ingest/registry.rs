@@ -87,8 +87,7 @@ pub enum RegistryError {
         id: u16,
         name: String,
     },
-    /// Two `sources` rows claim the same `id`, or the same `name`. Either way one venue's messages
-    /// would resolve to the other's identity, and the arbiter keys dedup on `(venue, symbol)`.
+    /// Two `sources` rows claim the same `id`, giving one wire value two names.
     DuplicateSource {
         id: u16,
         name: String,
@@ -182,12 +181,9 @@ impl std::fmt::Display for RegistryError {
                  label value and as the `SOURCE:SYMBOL` product identifier — and neither \
                  `UNREGISTERED` nor `SOURCE_<id>`, which are synthesized for an unassigned id"
             ),
-            RegistryError::DuplicateSource { id, name } => write!(
-                f,
-                "source id {id} (`{name}`) is assigned twice, or shares a name with another id; \
-                 either way two sources would collapse to one identity and the arbiter keys dedup \
-                 on (venue, symbol)"
-            ),
+            RegistryError::DuplicateSource { id, name } => {
+                write!(f, "source id {id} (`{name}`) is assigned twice")
+            }
             RegistryError::UnknownVenue(v) => write!(
                 f,
                 "venue `{v}` resolves to no Source ID; its messages would be dropped and its \
@@ -731,7 +727,7 @@ fn source_assignments(
                 name: r.name.clone(),
             });
         }
-        if out.iter().any(|a| a.id == r.id || a.name == r.name) {
+        if out.iter().any(|a| a.id == r.id) {
             return Err(RegistryError::DuplicateSource {
                 id: r.id,
                 name: r.name.clone(),
@@ -933,7 +929,7 @@ fn feed_from(
     // the venue string (arbitration mode, the channel-filter purge, `--feed` selection).
     let resolves = match sources {
         Some(a) => a.iter().any(|s| s.name == row.venue),
-        None => sources::source_id_of(&row.venue).is_some(),
+        None => !sources::source_ids_of(&row.venue).is_empty(),
     };
     if !resolves {
         return Err(RegistryError::UnknownVenue(row.venue.clone()));
@@ -1844,7 +1840,10 @@ mod tests {
                 name: "NEWVENUE"
             }]
         );
-        assert!(sources::source_id_of("NEWVENUE").is_none(), "not installed");
+        assert!(
+            sources::source_ids_of("NEWVENUE").is_empty(),
+            "not installed"
+        );
     }
 
     /// A document with no block is legal (adding it bumps no `SUPPORTED_VERSION`), so its rows are
@@ -1854,7 +1853,7 @@ mod tests {
     fn a_document_with_no_sources_block_falls_back_to_the_compiled_in_table() {
         let loaded = build(&doc_with(SPORTS_ROW), "test").expect("legal without the block");
         assert!(loaded.sources.is_none());
-        assert_eq!(sources::source_id_of("KALSHI"), Some(3));
+        assert_eq!(sources::source_ids_of("KALSHI"), vec![3]);
     }
 
     /// The validation inverts with the mapping: once a document carries the block, a `venue` that
@@ -1881,22 +1880,22 @@ mod tests {
         ));
     }
 
-    /// Two rows sharing an id or a name would collapse two sources to one identity, and the arbiter
-    /// keys dedup on `(venue, symbol)` — unrelated markets would merge into one bucket.
+    /// Two rows sharing an id would give one wire value two names.
     #[test]
-    fn a_duplicate_source_id_or_name_is_fatal() {
-        for block in [
-            r#"{"id":3,"name":"KALSHI"},{"id":3,"name":"OTHER"}"#,
-            r#"{"id":3,"name":"KALSHI"},{"id":4,"name":"KALSHI"}"#,
-        ] {
-            assert!(
-                matches!(
-                    build(&doc_with_sources(block, SPORTS_ROW), "test"),
-                    Err(RegistryError::DuplicateSource { .. })
-                ),
-                "{block}"
-            );
-        }
+    fn a_duplicate_source_id_is_fatal() {
+        let block = r#"{"id":3,"name":"KALSHI"},{"id":3,"name":"OTHER"}"#;
+        assert!(matches!(
+            build(&doc_with_sources(block, SPORTS_ROW), "test"),
+            Err(RegistryError::DuplicateSource { .. })
+        ));
+    }
+
+    /// Several ids may share a name; a row naming it resolves.
+    #[test]
+    fn ids_sharing_a_name_load() {
+        let block = r#"{"id":3,"name":"KALSHI"},{"id":4,"name":"KALSHI"}"#;
+        let loaded = build(&doc_with_sources(block, SPORTS_ROW), "test").expect("loads");
+        assert_eq!(loaded.sources.expect("installed").len(), 2);
     }
 
     /// The synthesized-label namespace and the `0` sentinel are reserved: a block claiming either

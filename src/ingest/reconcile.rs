@@ -880,7 +880,7 @@ impl Reconciler {
             channel,
         );
 
-        let history_dropped = match sources::source_id_of(feed.venue) {
+        let history_dropped = match sources::source_ids_of(feed.venue).first().copied() {
             Some(source_id) => {
                 crate::model::lock(&self.cfg.history).forget_channel(source_id, &category, channel)
             }

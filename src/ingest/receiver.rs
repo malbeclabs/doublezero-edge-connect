@@ -227,7 +227,7 @@ fn record_revealed(venue: &'static str, wire_venue: &str) {
     if already_known {
         return; // fully lock-free fast path: the steady-state common case
     }
-    if sources::source_id_of(wire_venue).is_none() {
+    if sources::source_ids_of(wire_venue).is_empty() {
         return; // not a registered name: never recorded (see the doc above)
     }
     let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
@@ -405,7 +405,10 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
         if wire_venue.as_ref() != venue && feeds().iter().any(|f| f.venue == wire_venue.as_ref()) {
             continue; // that venue has its own row(s) and its own aggregate; it speaks for itself
         }
-        let source_id = sources::source_id_of(wire_venue.as_ref()).unwrap_or(0);
+        let source_id = sources::source_ids_of(wire_venue.as_ref())
+            .first()
+            .copied()
+            .unwrap_or(0);
         // Status carries no business identity to dedup, so it goes straight to the broadcast sender
         // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the allocation
         // here is off the per-message hot path.

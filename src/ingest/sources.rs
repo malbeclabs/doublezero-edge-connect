@@ -72,15 +72,20 @@ pub fn source_name(source_id: u16) -> Option<&'static str> {
 /// in on input either.
 const KALSHI: &str = "KALSHI";
 
-/// Map a registry source *name* back to its `Source ID`, exactly — the inverse of [`source_name`].
-///
-/// This is what lets a resolved source name carry a numeric identity a consumer can join against the
-/// registry, and what `receiver::record_revealed` tests a wire venue against before recording it.
-pub fn source_id_of(source: &str) -> Option<u16> {
-    assignments()
+/// Every `Source ID` assigned a registry source *name*, ascending — the inverse of [`source_name`].
+/// Several IDs may share one name; empty when the name is unassigned.
+pub fn source_ids_of(source: &str) -> Vec<u16> {
+    ids_in(assignments(), source)
+}
+
+fn ids_in(table: &[SourceAssignment], source: &str) -> Vec<u16> {
+    let mut ids: Vec<u16> = table
         .iter()
-        .find(|a| a.name == source)
+        .filter(|a| a.name == source)
         .map(|a| a.id)
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Cap on distinct synthesized labels for unregistered Source IDs. Bounded like every other
@@ -216,8 +221,8 @@ mod tests {
     /// a second name for the same ID.
     #[test]
     fn only_the_registry_name_resolves_to_id_3() {
-        assert_eq!(source_id_of(KALSHI), Some(3));
-        assert_eq!(source_id_of("LASHAY"), None);
+        assert_eq!(source_ids_of(KALSHI), vec![3]);
+        assert!(source_ids_of("LASHAY").is_empty());
     }
 
     /// The public entry point's unregistered branch: read-lock miss, write-lock re-check,
@@ -282,20 +287,39 @@ mod tests {
 
     #[test]
     fn names_map_back_to_their_registry_ids() {
-        assert_eq!(source_id_of("HYPERLIQUID"), Some(1));
-        assert_eq!(source_id_of("PHOENIX"), Some(2));
-        assert_eq!(source_id_of("Nonesuch"), None);
+        assert_eq!(source_ids_of("HYPERLIQUID"), vec![1]);
+        assert_eq!(source_ids_of("PHOENIX"), vec![2]);
+        assert!(source_ids_of("Nonesuch").is_empty());
     }
 
-    /// Every name the forward table yields must round-trip back to the same id, or the two tables
+    /// A shared name maps back to every id carrying it, in id order.
+    #[test]
+    fn a_shared_name_maps_back_to_every_id() {
+        let table = [
+            SourceAssignment {
+                id: 10,
+                name: "SHARED",
+            },
+            SourceAssignment {
+                id: 4,
+                name: "SHARED",
+            },
+            SourceAssignment {
+                id: 5,
+                name: "OTHER",
+            },
+        ];
+        assert_eq!(ids_in(&table, "SHARED"), vec![4, 10]);
+    }
+
+    /// Every name the forward table yields maps back to a set containing its id, or the two tables
     /// have drifted apart.
     #[test]
     fn forward_and_reverse_tables_agree() {
         for id in 0u16..1024 {
             if let Some(name) = source_name(id) {
-                assert_eq!(
-                    source_id_of(name),
-                    Some(id),
+                assert!(
+                    source_ids_of(name).contains(&id),
                     "id {id} ({name}) does not round-trip"
                 );
             }

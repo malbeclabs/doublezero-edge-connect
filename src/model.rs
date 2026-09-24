@@ -85,7 +85,10 @@ impl SourceKey {
 #[cfg(test)]
 impl From<&str> for SourceKey {
     fn from(name: &str) -> Self {
-        let id = crate::ingest::sources::source_id_of(name).unwrap_or(0);
+        let id = crate::ingest::sources::source_ids_of(name)
+            .first()
+            .copied()
+            .unwrap_or(0);
         Self(id, Arc::from(name))
     }
 }
