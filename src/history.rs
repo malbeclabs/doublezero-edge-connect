@@ -302,10 +302,12 @@ impl Store {
     /// occupancy to this one). Used by the `/v1/status` `channels` block to answer, per channel,
     /// "how much of the store does an admitted channel actually hold" — the number that turns a
     /// flat RSS reading into an answer to "is my channel filter narrow enough."
-    pub fn products_for(&self, source_id: u16, category: &Arc<str>, channel: u8) -> usize {
+    pub fn products_for(&self, source_ids: &[u16], category: &Arc<str>, channel: u8) -> usize {
         self.products
             .keys()
-            .filter(|k| k.source_id == source_id && k.category == *category && k.channel == channel)
+            .filter(|k| {
+                source_ids.contains(&k.source_id) && k.category == *category && k.channel == channel
+            })
             .count()
     }
 
@@ -553,11 +555,18 @@ impl Store {
     ///
     /// Keeps `buckets_total` in step (subtracting exactly the removed products' own bucket counts),
     /// the same discipline every other removal path in this module follows — see that field's doc.
-    pub fn forget_channel(&mut self, source_id: u16, category: &Arc<str>, channel: u8) -> usize {
+    pub fn forget_channel(
+        &mut self,
+        source_ids: &[u16],
+        category: &Arc<str>,
+        channel: u8,
+    ) -> usize {
         let doomed: Vec<Key> = self
             .products
             .keys()
-            .filter(|k| k.source_id == source_id && k.category == *category && k.channel == channel)
+            .filter(|k| {
+                source_ids.contains(&k.source_id) && k.category == *category && k.channel == channel
+            })
             .cloned()
             .collect();
         let mut dropped = 0usize;
@@ -1107,7 +1116,7 @@ mod tests {
             "fixture sanity: the print must be queryable before the drop"
         );
 
-        let dropped = s.forget_channel(3, &"default".into(), 10);
+        let dropped = s.forget_channel(&[3], &"default".into(), 10);
         assert_eq!(dropped, 1, "exactly the one product on that channel");
         assert!(
             s.candles(&dropped_key, 60, 10, 1_100).is_empty(),
@@ -1151,7 +1160,7 @@ mod tests {
         s.ingest(peer_diff_source.clone(), trade(1_060, 31.0, 1.0));
         s.ingest(peer_diff_source.clone(), trade(1_120, 32.0, 1.0));
 
-        s.forget_channel(3, &"default".into(), 10);
+        s.forget_channel(&[3], &"default".into(), 10);
 
         let peer_channel_candles = s.candles(&peer_diff_channel, 60, 10, 1_200);
         assert_eq!(
@@ -1200,7 +1209,7 @@ mod tests {
         s.ingest(peer_diff_source, trade(1_000, 30.0, 1.0)); // same channel id, different source_id
         let before = s.buckets_total;
 
-        let dropped = s.forget_channel(3, &"default".into(), 10);
+        let dropped = s.forget_channel(&[3], &"default".into(), 10);
         assert_eq!(dropped, 1);
 
         assert_eq!(
@@ -1230,7 +1239,7 @@ mod tests {
             },
             trade(1_000, 10.0, 1.0),
         );
-        assert_eq!(s.forget_channel(3, &"default".into(), 10), 0);
+        assert_eq!(s.forget_channel(&[3], &"default".into(), 10), 0);
         assert_eq!(s.len(), 1, "the untouched product is still there");
     }
 
@@ -1260,7 +1269,7 @@ mod tests {
         s.ingest(peer_diff_category.clone(), trade(1_060, 21.0, 1.0));
         s.ingest(peer_diff_category.clone(), trade(1_120, 22.0, 1.0));
 
-        let dropped_count = s.forget_channel(3, &"perps".into(), 10);
+        let dropped_count = s.forget_channel(&[3], &"perps".into(), 10);
         assert_eq!(
             dropped_count, 1,
             "only the perps universe's product on channel 10"
@@ -1386,29 +1395,40 @@ mod tests {
         s.ingest(peer_diff_category, trade(1_000, 10.0, 1.0));
 
         assert_eq!(
-            s.products_for(3, &"perps".into(), 10),
+            s.products_for(&[3], &"perps".into(), 10),
             2,
             "exactly the two products in the named scope"
         );
         assert_eq!(
-            s.products_for(3, &"perps".into(), 11),
+            s.products_for(&[3], &"perps".into(), 11),
             1,
             "the peer channel's own single product"
         );
         assert_eq!(
-            s.products_for(7, &"perps".into(), 10),
+            s.products_for(&[7], &"perps".into(), 10),
             1,
             "the peer source_id's own single product"
         );
         assert_eq!(
-            s.products_for(3, &"sports".into(), 10),
+            s.products_for(&[3], &"sports".into(), 10),
             1,
             "the peer category's own single product"
         );
         assert_eq!(
-            s.products_for(3, &"perps".into(), 99),
+            s.products_for(&[3], &"perps".into(), 99),
             0,
             "an untracked channel counts zero, not an error"
         );
+        assert_eq!(
+            s.products_for(&[3, 7], &"perps".into(), 10),
+            3,
+            "every listed ID counts"
+        );
+        assert_eq!(
+            s.forget_channel(&[3, 7], &"perps".into(), 10),
+            3,
+            "every listed ID is purged"
+        );
+        assert_eq!(s.products_for(&[3, 7], &"perps".into(), 10), 0);
     }
 }

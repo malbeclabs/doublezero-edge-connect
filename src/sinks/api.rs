@@ -1182,9 +1182,10 @@ fn channels_block(state: &ApiState) -> Value {
         // Every enabled row's venue resolves to a Source ID by construction (`feeds::init`
         // validates it) — if it somehow didn't, there is no history key to look products up under,
         // so the row is skipped rather than reported with a fabricated zero.
-        let Some(source_id) = source_ids_of(f.venue).first().copied() else {
+        let source_ids = source_ids_of(f.venue);
+        if source_ids.is_empty() {
             continue;
-        };
+        }
         let category = category_arc(f.category);
         let venue = venue_arc(f.venue);
 
@@ -1203,7 +1204,7 @@ fn channels_block(state: &ApiState) -> Value {
             let key: crate::ingest::health::ReceiverKey =
                 (f.venue, f.category, f.kind, p.base_port());
             let bound = matches!(state.health.liveness(&key), TapeLiveness::Up);
-            let products = history.products_for(source_id, &category, channel);
+            let products = history.products_for(&source_ids, &category, channel);
             let mut entry = json!({
                 "channel": channel,
                 "allowed": admitted,
