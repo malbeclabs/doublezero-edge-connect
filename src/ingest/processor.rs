@@ -1062,6 +1062,28 @@ impl MboProcessor {
                 channel,
                 instrument_id,
             );
+            // The old ID's depth and book are keyed apart from the new one's, so nothing overwrites
+            // them: drop them unless another publisher here still serves the instrument there.
+            let still_served = self
+                .revealed
+                .iter()
+                .any(|(k, &id)| *k != key && k.1 == instrument_id && id == old_id);
+            if !still_served {
+                let old = SourceKey::from_id(old_id);
+                let symbol = self
+                    .emitted_symbol
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| def.symbol.clone());
+                let mut arb = lock(ctx.arbiter);
+                arb.reset_depth_floor_for_symbol(&old, &symbol, "source_id_changed");
+                arb.reset_books_for_markets(&[(
+                    old,
+                    category_arc(ctx.category),
+                    channel,
+                    instrument_id,
+                )]);
+            }
         }
         self.revealed.insert(key, source_id);
         let source = venue_arc(source_label(source_id));
@@ -2298,6 +2320,20 @@ impl MbpProcessor {
                 ctx.canonical_channel(key.1),
                 key.2,
             );
+            // As for order-level books: the old ID's book is keyed apart, so drop it unless another
+            // publisher here still serves the instrument there.
+            let still_served = self
+                .revealed
+                .iter()
+                .any(|(k, &id)| *k != key && k.1 == key.1 && k.2 == key.2 && id == old_id);
+            if !still_served {
+                lock(ctx.arbiter).reset_books_for_markets(&[(
+                    SourceKey::from_id(old_id),
+                    category_arc(ctx.category),
+                    ctx.canonical_channel(key.1),
+                    key.2,
+                )]);
+            }
         }
         self.revealed.insert(key, source_id);
         let source = venue_arc(source_label(source_id));
@@ -5069,7 +5105,14 @@ mod tests {
         arbiter: &SharedArbiter,
         instruments: &crate::model::InstrumentSnapshot,
     ) -> MboProcessor {
-        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        synced_mbo_proc_with(arbiter, instruments, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    fn synced_mbo_proc_with(
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+        depth: DepthSnapshot,
+    ) -> MboProcessor {
         let mut proc = MboProcessor::new(depth, tape(false));
         proc.on_datagram(
             &datagram(&[
@@ -5101,9 +5144,14 @@ mod tests {
 
     /// One bid `OrderAdd` for instrument 0 at per-instrument `seq`, stamped `ts`.
     fn add(seq: u32, order_id: u64, ts: u64) -> Vec<u8> {
+        add_from(0, seq, order_id, ts)
+    }
+
+    /// [`add`] stamped with `source_id`.
+    fn add_from(source_id: u16, seq: u32, order_id: u64, ts: u64) -> Vec<u8> {
         enc_order_add(&OrderAdd {
             instrument_id: 0,
-            source_id: 0,
+            source_id,
             side: SIDE_BID,
             order_flags: 0,
             per_instrument_seq: seq,
@@ -5302,6 +5350,138 @@ mod tests {
             drain_depth_ts(&mut rx),
             vec![5000, 100],
             "an unresolvable InstrumentReset id must still clear the floor (venue-wide fallback)"
+        );
+    }
+
+    /// An instrument that moves to another Source ID leaves no depth replayed under the old one.
+    #[test]
+    fn mbo_source_id_change_drops_the_old_ids_depth_replay() {
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_depth_replay(depth.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc_with(&arbiter, &instruments, depth.clone());
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let key = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                Arc::<str>::from("INST-0"),
+            )
+        };
+
+        proc.on_datagram(&datagram(&[add_from(1, 1, 100, 5000)]), &mkt);
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "fixture sanity"
+        );
+        proc.on_datagram(&datagram(&[add_from(2, 2, 101, 5001)]), &mkt);
+
+        let map = crate::model::lock(&depth);
+        assert!(
+            !map.contains_key(&key(1)),
+            "the old ID's depth is not replayed"
+        );
+        assert!(map.contains_key(&key(2)), "the new ID's depth is");
+    }
+
+    /// An instrument that moves to another Source ID leaves no book replayed under the old one.
+    #[test]
+    fn mbo_source_id_change_drops_the_old_ids_book_replay() {
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let books: crate::model::BookSnapshot = Arc::new(Mutex::new(Default::default()));
+        lock(&arbiter).set_book_replay(books.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let market = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                category_arc("testcategory"),
+                0u8,
+                0u32,
+            )
+        };
+
+        proc.on_datagram(&datagram(&[add_from(1, 1, 100, 5000)]), &mkt);
+        assert!(
+            crate::model::lock(&books).get(&market(1)).is_some(),
+            "fixture sanity"
+        );
+        proc.on_datagram(&datagram(&[add_from(2, 2, 101, 5001)]), &mkt);
+        assert!(
+            crate::model::lock(&books).get(&market(1)).is_none(),
+            "the old ID's book is not replayed"
+        );
+    }
+
+    /// A publisher moving to another Source ID leaves the old ID's depth alone while a peer still
+    /// serves the instrument there.
+    #[test]
+    fn mbo_source_id_change_keeps_depth_a_peer_still_serves() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_depth_replay(depth.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth.clone(), tape(false));
+        let ctx = |publisher, role| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(
+                &datagram(&[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(0, "INST-0", 1),
+                ]),
+                &ctx(publisher, PortRole::Combined),
+            );
+            proc.on_datagram(
+                &datagram(&[
+                    enc_snapshot_begin(&SnapshotBegin {
+                        instrument_id: 0,
+                        anchor_seq: 0,
+                        total_orders: 0,
+                        snapshot_id: 1,
+                        last_instrument_seq: 0,
+                        ts: 1,
+                    }),
+                    enc_snapshot_end(&SnapshotEnd {
+                        instrument_id: 0,
+                        anchor_seq: 0,
+                        snapshot_id: 1,
+                    }),
+                ]),
+                &ctx(publisher, PortRole::Snapshot),
+            );
+            proc.on_datagram(
+                &datagram(&[add_from(1, 1, 100, 5000)]),
+                &ctx(publisher, PortRole::Mktdata),
+            );
+        }
+        let key = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                Arc::<str>::from("INST-0"),
+            )
+        };
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "fixture sanity"
+        );
+        proc.on_datagram(
+            &datagram(&[add_from(2, 2, 101, 5001)]),
+            &ctx(pub_a, PortRole::Mktdata),
+        );
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "the peer still serves the old ID"
         );
     }
 

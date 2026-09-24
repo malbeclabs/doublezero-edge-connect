@@ -2136,7 +2136,7 @@ impl Arbiter {
     /// channel's markets (the common floor-narrowing case: a handful of channels admitted out of
     /// dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for tens
     /// of milliseconds to seconds.
-    fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
+    pub(crate) fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
         if keys.is_empty() {
             return;
         }
