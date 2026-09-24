@@ -549,6 +549,19 @@ impl FeedMessage {
         }
     }
 
+    /// The wire Source ID this message carries.
+    pub fn source_id(&self) -> u16 {
+        match self {
+            FeedMessage::Instrument(i) => i.source_id,
+            FeedMessage::Quote(q) => q.source_id,
+            FeedMessage::Trade(t) => t.source_id,
+            FeedMessage::Midpoint(m) => m.source_id,
+            FeedMessage::Depth(d) => d.source_id,
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => b.source_id,
+            FeedMessage::Status(s) => s.source_id,
+        }
+    }
+
     /// The `channel_id` this message is about, for per-channel subscription filtering. The
     /// incremental `book` product and the `instrument` definition that scales it carry one; every
     /// other type is venue/symbol-scoped.
