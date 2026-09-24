@@ -3771,9 +3771,6 @@ mod tests {
         assert_eq!(drain_quotes(&mut rx), vec![(1000, 100.0)]);
     }
 
-    /// The same BBO at the same `source_ts` mirrored by two distinct multicast publishers collapses
-    /// to one emission: the first publisher to open the tick leads it, and the second's identical
-    /// copy is a non-leader no-op. This is the cross-publisher duplicate-packet case.
     fn quote_from(source_id: u16, source_ts_ns: u64) -> NormalizedQuote {
         let mut q = quote(source_ts_ns, 100.0, 101.0);
         q.source_id = source_id;
@@ -3825,6 +3822,9 @@ mod tests {
         assert_eq!(n, 2);
     }
 
+    /// The same BBO at the same `source_ts` mirrored by two distinct multicast publishers collapses
+    /// to one emission: the first publisher to open the tick leads it, and the second's identical
+    /// copy is a non-leader no-op. This is the cross-publisher duplicate-packet case.
     #[test]
     fn duplicate_quote_from_two_multicast_publishers_emitted_once() {
         let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -4275,17 +4275,15 @@ mod tests {
         );
     }
 
-    /// The floor resets purge the matching WS-replay entries: a client connecting across a
-    /// session boundary must not be replayed the ended session's final book — and for an
-    /// instrument the new session never re-lists, nothing else would ever remove the entry. The
-    /// symbol reset purges exactly its key; the venue reset purges only that venue's entries.
     /// A reset for one ID leaves a sibling under the same name alone: the sibling's repeat is still
     /// dropped after the other ID's floor is cleared.
     #[test]
     fn resetting_one_ids_depth_floor_leaves_the_sibling_intact() {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         let (tx, mut rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
         let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
         let mk = |id: u16| {
             let mut d = depth(1000, vec![[100.0, 1.0]], vec![[101.0, 1.0]]);
             d.source_id = id;
@@ -4297,6 +4295,18 @@ mod tests {
         a.emit(mk(7), edge, TEST_CATEGORY);
         while rx.try_recv().is_ok() {}
         a.reset_depth_floor_for_venue(&SourceKey::new(1, "SHARED".into()), "test");
+        {
+            let map = model::lock(&replay);
+            let key = |id: u16| (SourceKey::new(id, "SHARED".into()), Arc::from("BTC"));
+            assert!(
+                !map.contains_key(&key(1)),
+                "the reset ID's replay entry is purged"
+            );
+            assert!(
+                map.contains_key(&key(7)),
+                "the sibling's replay entry survives"
+            );
+        }
         a.emit(mk(1), edge, TEST_CATEGORY);
         a.emit(mk(7), edge, TEST_CATEGORY);
         let mut ids = Vec::new();
@@ -4308,6 +4318,10 @@ mod tests {
         assert_eq!(ids, vec![1]);
     }
 
+    /// The floor resets purge the matching WS-replay entries: a client connecting across a
+    /// session boundary must not be replayed the ended session's final book — and for an
+    /// instrument the new session never re-lists, nothing else would ever remove the entry. The
+    /// symbol reset purges exactly its key; the venue reset purges only that venue's entries.
     #[test]
     fn arbiter_depth_floor_reset_purges_replay_entries() {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -4999,6 +5013,38 @@ mod tests {
 
     /// The replay map must hold what was broadcast, so a connecting client is bootstrapped with the
     /// authoritative path's book and never a discarded path's divergent copy.
+    /// Two IDs under one name hold separate books: each path's market is its own replay entry.
+    #[test]
+    fn book_replay_keeps_two_ids_sharing_a_name_apart() {
+        let venue = "BookSharedName";
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let (tx, _rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+        for (id, p) in [(1u16, path(1)), (7u16, path(2))] {
+            let FeedMessage::Book(mut b) =
+                book(venue, BOOK_INSTRUMENT, vec![clear_both()], true, 1_000)
+            else {
+                unreachable!()
+            };
+            b.source_id = id;
+            a.emit(FeedMessage::Book(b), p, TEST_CATEGORY);
+        }
+        let guard = model::lock(&replay);
+        for id in [1u16, 7] {
+            let key: MarketKey = (
+                SourceKey::new(id, venue.into()),
+                TEST_CATEGORY.into(),
+                BOOK_CHANNEL,
+                BOOK_INSTRUMENT,
+            );
+            assert!(
+                guard.get(&key).is_some(),
+                "ID {id} has its own replay entry"
+            );
+        }
+    }
+
     #[test]
     fn book_replay_accumulates_the_authoritative_path() {
         let venue = "BookReplayLeader";
@@ -5651,6 +5697,22 @@ mod tests {
         tape_print(&mut a, venue, path(1), 501, 1_000);
         tape_print(&mut a, venue, path(2), 902, 1_001);
         assert_eq!(drain_trades(&mut rx), 1);
+    }
+
+    /// Two IDs under one name are separate tapes: each gets its own leader, so neither mutes the other.
+    #[test]
+    fn sticky_tapes_of_two_ids_sharing_a_name_both_print() {
+        let venue = "TapeSharedName";
+        let (mut a, mut rx) = sticky_tape(venue);
+        for (id, p, trade_id) in [(1u16, path(1), 501u64), (7u16, path(2), 902u64)] {
+            let mut t = trade(trade_id);
+            t.venue = venue.into();
+            t.source_name = venue.into();
+            t.source_id = id;
+            t.recv_ts_ns = 1_000;
+            a.emit(FeedMessage::Trade(t), p, TEST_CATEGORY);
+        }
+        assert_eq!(drain_trades(&mut rx), 2);
     }
 
     /// A dead leader must not mute the tape: past the handover window the challenger takes it, and the
