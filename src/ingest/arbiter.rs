@@ -2754,7 +2754,7 @@ impl Arbiter {
     /// completeness when an event outgrows the accumulator's cap, when a transfer lands on a path
     /// whose own accumulator is incomplete, or when eviction or a reset drops it — and only a
     /// `Clear`-led batch *from the serving path* restores it. A `Ready` price book declines every
-    /// snapshot rotation for the rest of its era, so the serving path never sends one again, and the
+    /// snapshot rotation until it gaps, so a serving path that stays healthy never sends one, and the
     /// peer's install is dropped by this gate. The complete book the consumer needs sits in the
     /// serving path's `PriceBook`, which is where the processor republishes it from.
     pub fn book_rebaselines_owed(&self, publisher: Transport, keys: &[MarketKey]) -> Vec<bool> {

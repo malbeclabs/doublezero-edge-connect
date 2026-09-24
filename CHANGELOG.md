@@ -43,10 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - A price-book market no longer goes dark to new subscribers after one very large event. An
   event carrying more than 8,192 changes before its `last` un-baselines the WebSocket replay entry,
-  and only a `Clear`-led batch from the serving path could restore it — which a `Ready` book never
-  sends again, while the peer path's snapshot install is dropped by the single-path gate. On
-  2026-09-24 Phoenix UNI hit it and was bootstrapped for no new subscriber for hours, though the
-  bridge held a correct book. The serving path now republishes its whole book at the market's next
+  and only a `Clear`-led batch from the serving path could restore it: a book that stays `Ready` sends
+  none, and the peer path's snapshot install is dropped by the single-path gate. On 2026-09-24 Phoenix
+  UNI hit it and was bootstrapped for no new subscriber for 2 h 12 min, though the bridge held a
+  correct book, until something incidental released it. The serving path now republishes its whole book at the market's next
   event close, so recovery takes about one slot. Connected consumers see one extra `Clear`-led
   re-baseline per overflow.
 - **A market-by-price re-anchor now needs two short rotations, not one.** A book that

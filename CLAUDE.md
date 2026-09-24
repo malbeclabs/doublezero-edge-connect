@@ -743,9 +743,12 @@ Modules are grouped by role under `src/`:
   whether the replay entry is owed a republish** (`Arbiter::book_rebaselines_owed`: the entry is not
   `baselined()` and this path is `last_admitted`) and, if so, closes with `emit_rebaseline` instead of
   the plain closing batch. Nothing else can restore that entry for a price-aggregated market: only a
-  `Clear`-led batch from the serving path does, a `Ready` book never re-installs, and the peer's
+  `Clear`-led batch from the serving path does, a book that stays `Ready` never re-installs, and the peer's
   install is dropped by the gate — so on the live Oregon bridge one event past the replay cap took UNI
-  off every new subscriber for good while the bridge held a correct book (2026-09-24). The four routes
+  off every new subscriber for 2 h 12 min while the bridge held a correct book (2026-09-24). Before
+  this, only two things released such a market mid-era, both incidental: an entire-side `BookClear` of
+  both sides in one event from the serving path, or that path's book gapping and re-installing while
+  no healthy peer exists (so no transfer happens). The four routes
   (the cap, a transfer onto an incomplete accumulator, eviction, a reset) all recover here at the
   serving path's next close while its book is `Ready`; one that is not `Ready` hands the market to a
   healthy peer or re-installs at its next rotation. Asked **only at a close**, never at a mid-event

@@ -8627,12 +8627,8 @@ mod tests {
 
     const PAST_THE_CAP: u32 = crate::model::MAX_PENDING_CHANGES as u32 + 808;
 
-    /// **The Oregon UNI outage.** An event carrying more changes than the replay accumulator's cap
-    /// abandons the replay entry's completeness, on both mirrored paths at once. Only a `Clear`-led
-    /// batch from the serving path restores it, and a `Ready` price book never re-installs, so before
-    /// this fix the market stayed dark to every new subscriber for good — a peer's complete snapshot
-    /// included, since the gate drops it. The serving path now republishes its book at the event's
-    /// own close, so a subscriber connecting one slot later is bootstrapped with it.
+    /// The Oregon UNI outage: an event past the replay cap, then a peer install the gate drops. Fails
+    /// on `main`, where a new subscriber gets no book until the serving path gaps or clears.
     #[test]
     fn an_event_past_the_cap_is_rebaselined_for_new_subscribers_at_its_close() {
         let mut m = MirroredMarket::new();
@@ -8670,7 +8666,9 @@ mod tests {
         assert_eq!(mbp_status(&m.proc, PATH_B, 0, 41), Some(BookStatus::Ready));
         assert!(!m.replay_baselined(), "a peer's install cannot release it");
 
-        // The serving path closes the event.
+        // The serving path closes the event. It has neither gapped nor sent a wire clear, the two
+        // things that release the market on `main`, so only the republish can.
+        assert_eq!(mbp_status(&m.proc, PATH_A, 0, 41), Some(BookStatus::Ready));
         m.send(PATH_A, PortRole::Mktdata, seq_a, vec![m.boundary(901)]);
         let bootstrap = new_subscriber_bootstrap(&m.replay, &m.key)
             .expect("a new subscriber is bootstrapped one slot after the overflow");

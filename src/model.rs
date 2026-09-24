@@ -576,10 +576,8 @@ pub enum ReplayScope {
 /// Overflowing it desynchronizes the accumulator rather than silently dropping changes from a book
 /// still claimed to be complete, and the serving path then re-baselines the market at its next close.
 ///
-/// ⚠️ **Not** far above every real event: it counts changes, not distinct levels, and a slot that
-/// re-quotes a ~2,800-level spline several times carries more than this (Phoenix UNI, 8,204). That
-/// is survivable only because the re-baseline follows; without it the market went dark to every new
-/// subscriber for good.
+/// ⚠️ Real events reach it: it counts changes, not levels (Phoenix UNI carried 8,204 over ~2,800
+/// levels). Survivable only because the serving path's republish follows.
 pub(crate) const MAX_PENDING_CHANGES: usize = 8192;
 
 /// Cap on resting orders one market's replay state holds — the same ceiling `ingest::book`'s own
