@@ -1099,8 +1099,7 @@ mod tests {
         assert_eq!(revealed_ids_for(b), BTreeSet::from([3]));
     }
 
-    /// A wire label the registry does not resolve (`sources::source_id_of` returns `None` — the
-    /// synthesized `SOURCE_<id>` fallback for an unassigned Source ID, or plain garbage) is never
+    /// A Source ID the registry assigns no name (`sources::source_name` returns `None`) is never
     /// recorded: the wire is unauthenticated and this map never decays, so one forged burst would
     /// otherwise permanently seed a phantom venue that every later edge for this row emits a
     /// `status` for.

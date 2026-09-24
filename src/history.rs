@@ -542,7 +542,7 @@ impl Store {
     /// that no longer ingests must not keep answering `/candles`/`/ticker` from a frozen window that
     /// looks live, so its buckets and print ring are removed with it rather than left to age out of
     /// the window on their own. `(group code, channel_id) -> source_id` resolution is the caller's
-    /// job (via `ingest::feeds::feeds()` + `ingest::sources::source_id_of`) — this store has no
+    /// job (via `ingest::feeds::feeds()` + `ingest::sources::source_ids_of`) — this store has no
     /// notion of a group code, only the wire `source_id` every `Key` already carries.
     ///
     /// `category` is what makes this filter safe across two disjoint universes sharing one Source

@@ -168,7 +168,7 @@ impl PhoenixVenue {
         // Resolves precision AND the (channel, instrument_id) identity in one scan — see
         // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
         let Some((channel, instrument_id)) =
-            resolve_instrument(instruments, phoenix_venue(), symbol)
+            resolve_instrument(instruments, PHOENIX_SOURCE_ID, symbol)
         else {
             return; // precision unknown / symbol not defined by the edge; drop
         };
@@ -344,7 +344,7 @@ mod tests {
                 tick_size: 0,
                 venue: phoenix_venue().into(),
                 source_name: phoenix_venue().into(),
-                source_id: 0,
+                source_id: PHOENIX_SOURCE_ID,
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,

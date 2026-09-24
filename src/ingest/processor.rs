@@ -2322,10 +2322,12 @@ impl MbpProcessor {
             );
             // As for order-level books: the old ID's book is keyed apart, so drop it unless another
             // publisher here still serves the instrument there.
-            let still_served = self
-                .revealed
-                .iter()
-                .any(|(k, &id)| *k != key && k.1 == key.1 && k.2 == key.2 && id == old_id);
+            let still_served = self.revealed.iter().any(|(k, &id)| {
+                *k != key
+                    && ctx.canonical_channel(k.1) == ctx.canonical_channel(key.1)
+                    && k.2 == key.2
+                    && id == old_id
+            });
             if !still_served {
                 lock(ctx.arbiter).reset_books_for_markets(&[(
                     SourceKey::from_id(old_id),
