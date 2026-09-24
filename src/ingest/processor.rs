@@ -2780,6 +2780,40 @@ impl MbpProcessor {
             .map(|b| std::mem::take(&mut b.open))
             .unwrap_or_default()
     }
+
+    /// The instruments among `ids`, all closing an event on this channel now, whose close must be a
+    /// full re-baseline instead: the market's replay entry is incomplete and this path serves it
+    /// (see [`crate::ingest::arbiter::Arbiter::book_rebaselines_owed`]). Asked only at a close, so
+    /// the book republished is the one the venue's consistency point describes, never an
+    /// intermediate state. One arbiter lock for the whole set.
+    fn rebaselines_owed(
+        &self,
+        ctx: &DatagramCtx,
+        channel: u8,
+        ids: impl IntoIterator<Item = u32>,
+    ) -> BTreeSet<u32> {
+        let (ids, keys): (Vec<u32>, Vec<MarketKey>) = ids
+            .into_iter()
+            .filter_map(|id| {
+                let venue = self.wire_venue(&(ctx.publisher, channel, id))?;
+                let key = (
+                    venue_arc(venue),
+                    category_arc(ctx.category),
+                    ctx.canonical_channel(channel),
+                    id,
+                );
+                Some((id, key))
+            })
+            .unzip();
+        if keys.is_empty() {
+            return BTreeSet::new();
+        }
+        let owed = lock(ctx.arbiter).book_rebaselines_owed(Transport::Edge(ctx.publisher), &keys);
+        ids.into_iter()
+            .zip(owed)
+            .filter_map(|(id, owed)| owed.then_some(id))
+            .collect()
+    }
 }
 
 /// The wire book `Side` mapped to the published side. Only `SIDE_ASK` is distinguished, matching
@@ -3504,6 +3538,7 @@ impl DatagramProcessor for MbpProcessor {
                             let mut closing: BTreeSet<u32> = accum.keys().copied().collect();
                             closing.extend(open_ids.iter().copied());
                             let mut refused: BTreeSet<u32> = BTreeSet::new();
+                            let owed = self.rebaselines_owed(ctx, channel, closing.iter().copied());
                             for id in closing {
                                 let changes = accum.remove(&id).unwrap_or_default();
                                 // Touched but with nothing to publish — a clear that removed
@@ -3514,7 +3549,10 @@ impl DatagramProcessor for MbpProcessor {
                                 if changes.is_empty() && !open_ids.contains(&id) {
                                     continue;
                                 }
-                                let published = if revealed_this_datagram.remove(&id) {
+                                // A re-baseline owed to the replay map closes the event too — it
+                                // is `last: true` and holds every change this one applied.
+                                let reveal = revealed_this_datagram.remove(&id);
+                                let published = if reveal || owed.contains(&id) {
                                     self.emit_rebaseline(ctx, channel, id)
                                 } else {
                                     // An empty closing batch is the ordinary case for an instrument
@@ -3651,8 +3689,22 @@ impl DatagramProcessor for MbpProcessor {
             }
         }
         let accum_keys: BTreeSet<u32> = accum.keys().copied().collect();
+        // Only where this datagram closes the event: mid-event, the book is an intermediate state.
+        let owed = if closes_event {
+            let ids = accum_keys.iter().copied();
+            let open = self
+                .batching
+                .get(&(ctx.publisher, channel))
+                .map(|b| b.open.clone())
+                .unwrap_or_default();
+            self.rebaselines_owed(ctx, channel, ids.chain(open))
+        } else {
+            BTreeSet::new()
+        };
         for (instrument_id, changes) in accum {
-            let published = if revealed_this_datagram.contains(&instrument_id) {
+            let rebaseline = revealed_this_datagram.contains(&instrument_id)
+                || (!changes.is_empty() && owed.contains(&instrument_id));
+            let published = if rebaseline {
                 self.emit_rebaseline(ctx, channel, instrument_id)
                     .then_some(true)
             } else if !changes.is_empty() {
@@ -3681,7 +3733,12 @@ impl DatagramProcessor for MbpProcessor {
         if closes_event {
             let mut refused: BTreeSet<u32> = BTreeSet::new();
             for id in self.take_open(ctx.publisher, channel) {
-                if !self.send_book(ctx, channel, id, Vec::new(), false, true) {
+                let published = if owed.contains(&id) {
+                    self.emit_rebaseline(ctx, channel, id)
+                } else {
+                    self.send_book(ctx, channel, id, Vec::new(), false, true)
+                };
+                if !published {
                     // ⚠️ This path runs only once the boundaries have already lapsed, so a refused
                     // close that is forgotten here is the wedge the fallback exists to end: nothing
                     // re-opens the instrument, every later drain finds it gone, and the consumer
@@ -8383,6 +8440,392 @@ mod tests {
             Some(BookStatus::Ready),
             "the peer path keeps serving; authority transfers to it"
         );
+    }
+
+    /// What a consumer honouring `last` holds: buffered batches fold only on the batch that ends the
+    /// event. Hand-rolled rather than a `BookAccumulator`, which carries the very cap under test.
+    #[derive(Default)]
+    struct Consumer {
+        bids: std::collections::BTreeMap<i64, f64>,
+        asks: std::collections::BTreeMap<i64, f64>,
+        pending: Vec<crate::model::BookChange>,
+    }
+
+    impl Consumer {
+        /// Fold `b`, returning whether it committed an event.
+        fn apply(&mut self, b: &NormalizedBook) -> bool {
+            self.pending.extend(b.changes.iter().cloned());
+            if !b.last {
+                return false;
+            }
+            for c in std::mem::take(&mut self.pending) {
+                let (price, size) = (c.price as i64, c.size);
+                match (c.action, c.side) {
+                    (BookAction::Clear, side) => {
+                        if matches!(side, BookSide::Bid | BookSide::Both) {
+                            self.bids.clear();
+                        }
+                        if matches!(side, BookSide::Ask | BookSide::Both) {
+                            self.asks.clear();
+                        }
+                    }
+                    (BookAction::Delete, BookSide::Bid) => {
+                        self.bids.remove(&price);
+                    }
+                    (BookAction::Delete, BookSide::Ask) => {
+                        self.asks.remove(&price);
+                    }
+                    (BookAction::Update, BookSide::Bid) => {
+                        self.bids.insert(price, size);
+                    }
+                    (BookAction::Update, BookSide::Ask) => {
+                        self.asks.insert(price, size);
+                    }
+                    (_, BookSide::Both) => {}
+                }
+            }
+            true
+        }
+
+        fn crossed_or_locked(&self) -> bool {
+            match (self.bids.keys().next_back(), self.asks.keys().next()) {
+                (Some(bid), Some(ask)) => bid >= ask,
+                _ => false,
+            }
+        }
+    }
+
+    /// One path's reconstructed levels, as the `(bids, asks)` a consumer should hold.
+    type Levels = (Vec<(i64, f64)>, Vec<(i64, f64)>);
+
+    fn price_book_levels(proc: &MbpProcessor, publisher: IpAddr, id: u32) -> Levels {
+        let book = &proc.books[&(publisher, 0, id)];
+        (
+            book.bids().map(|(p, l)| (p, l.qty_raw as f64)).collect(),
+            book.asks().map(|(p, l)| (p, l.qty_raw as f64)).collect(),
+        )
+    }
+
+    fn consumer_levels(c: &Consumer) -> Levels {
+        (
+            c.bids.iter().rev().map(|(&p, &s)| (p, s)).collect(),
+            c.asks.iter().map(|(&p, &s)| (p, s)).collect(),
+        )
+    }
+
+    /// What a subscriber connecting now would be bootstrapped with, or `None` if `sinks::ws` would
+    /// withhold the market — the same `baselined() && pending_empty()` its release reads.
+    fn new_subscriber_bootstrap(
+        replay: &crate::model::BookSnapshot,
+        key: &MarketKey,
+    ) -> Option<Consumer> {
+        let guard = crate::model::lock(replay);
+        let acc = guard.get(key)?;
+        if !acc.baselined() || !acc.pending_empty() {
+            return None;
+        }
+        let mut c = Consumer::default();
+        c.apply(&acc.to_book(key, crate::model::ReplayScope::Levels));
+        Some(c)
+    }
+
+    /// Two paths mirroring instrument 41 on a channel that has shown a `BatchBoundary`, with a replay
+    /// map wired and path A serving. Each path's per-instrument sequence stands at 0 and its
+    /// market-data sequence at 10, so the callers continue both from there.
+    struct MirroredMarket {
+        arbiter: SharedArbiter,
+        rx: broadcast::Receiver<std::sync::Arc<FeedMessage>>,
+        instruments: crate::model::InstrumentSnapshot,
+        replay: crate::model::BookSnapshot,
+        proc: MbpProcessor,
+        key: MarketKey,
+    }
+
+    const PATH_A: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 9, 0, 1));
+    const PATH_B: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 9, 0, 2));
+
+    impl MirroredMarket {
+        fn new() -> Self {
+            let (tx, rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(4096);
+            let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+            let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(Default::default()));
+            lock(&arbiter).set_book_replay(replay.clone());
+            let instruments = Arc::new(Mutex::new(HashMap::new()));
+            let proc = MbpProcessor::new(tape(false));
+            let key = (
+                venue_arc(super::source_label(0)),
+                category_arc("testcategory"),
+                0,
+                41,
+            );
+            let mut m = Self {
+                arbiter,
+                rx,
+                instruments,
+                replay,
+                proc,
+                key,
+            };
+            for publisher in [PATH_A, PATH_B] {
+                m.send(publisher, PortRole::Combined, 1, mbp_refdata(&[41]));
+                let asks = [(MBP_ASK, 3_000, 5), (MBP_ASK, 3_001, 5)];
+                m.send(
+                    publisher,
+                    PortRole::Snapshot,
+                    2,
+                    mbp_snapshot(41, 1, 0, 0, &asks),
+                );
+                m.send(publisher, PortRole::Mktdata, 3, vec![mbp_reveal(41, 0)]);
+                m.send(publisher, PortRole::Mktdata, 4, vec![m.boundary(900)]);
+            }
+            assert_eq!(
+                lock(&m.arbiter).authority().last_admitted(&m.key),
+                Some(Transport::Edge(PATH_A)),
+                "the first path to publish serves the market"
+            );
+            assert!(new_subscriber_bootstrap(&m.replay, &m.key).is_some());
+            m
+        }
+
+        fn boundary(&self, batch_id: u32) -> Vec<u8> {
+            mbp_wire::enc_batch_boundary(&codec_mbp::BatchBoundary {
+                batch_id,
+                batch_time: 5,
+            })
+        }
+
+        fn send(&mut self, publisher: IpAddr, role: PortRole, seq: u64, msgs: Vec<Vec<u8>>) {
+            let mut ctx = make_ctx(&self.arbiter, &self.instruments, role);
+            ctx.publisher = publisher;
+            self.proc
+                .on_datagram(&mbp_wire::datagram(0, 0, seq, &msgs), &ctx);
+        }
+
+        /// Stream one open event of `n` bid-level changes on `publisher` — re-quoting 2,000 levels,
+        /// the shape of a spline slot — starting at per-instrument sequence `from + 1` and market-data
+        /// sequence `*seq`, in datagrams of 250 (the `msg_count` field is a `u8`).
+        fn requote(&mut self, publisher: IpAddr, seq: &mut u64, from: u32, n: u32) {
+            let changes: Vec<Vec<u8>> = (1..=n)
+                .map(|i| {
+                    let price = 1 + i64::from(i % 2_000);
+                    let qty = 1 + u64::from(i % 7);
+                    mbp_level(41, from + i, MBP_BID, price, qty, 7_000 + u64::from(i))
+                })
+                .collect();
+            for chunk in changes.chunks(250) {
+                self.send(publisher, PortRole::Mktdata, *seq, chunk.to_vec());
+                *seq += 1;
+            }
+        }
+
+        fn replay_baselined(&self) -> bool {
+            crate::model::lock(&self.replay)
+                .get(&self.key)
+                .is_some_and(|a| a.baselined())
+        }
+    }
+
+    const PAST_THE_CAP: u32 = crate::model::MAX_PENDING_CHANGES as u32 + 808;
+
+    /// **The Oregon UNI outage.** An event carrying more changes than the replay accumulator's cap
+    /// abandons the replay entry's completeness, on both mirrored paths at once. Only a `Clear`-led
+    /// batch from the serving path restores it, and a `Ready` price book never re-installs, so before
+    /// this fix the market stayed dark to every new subscriber for good — a peer's complete snapshot
+    /// included, since the gate drops it. The serving path now republishes its book at the event's
+    /// own close, so a subscriber connecting one slot later is bootstrapped with it.
+    #[test]
+    fn an_event_past_the_cap_is_rebaselined_for_new_subscribers_at_its_close() {
+        let mut m = MirroredMarket::new();
+        let mut connected = Consumer::default();
+        for b in drain_books(&mut m.rx) {
+            connected.apply(&b);
+        }
+        let (mut seq_a, mut seq_b) = (10, 10);
+        m.requote(PATH_A, &mut seq_a, 0, PAST_THE_CAP);
+        m.requote(PATH_B, &mut seq_b, 0, PAST_THE_CAP);
+        assert!(
+            !m.replay_baselined(),
+            "precondition: the cap abandoned the replay entry's completeness"
+        );
+        assert!(new_subscriber_bootstrap(&m.replay, &m.key).is_none());
+
+        // The peer gaps and then installs a complete snapshot, which the gate drops: it is not the
+        // serving path. (A `Ready` book declines every rotation, so only a book that has left
+        // `Ready` installs one.)
+        m.send(PATH_B, PortRole::Mktdata, seq_b, vec![m.boundary(901)]);
+        let skipped = PAST_THE_CAP + 2;
+        let gap = vec![mbp_level(41, skipped, MBP_BID, 2_500, 1, 9_000)];
+        m.send(PATH_B, PortRole::Mktdata, seq_b + 1, gap);
+        assert_eq!(mbp_status(&m.proc, PATH_B, 0, 41), Some(BookStatus::Gap));
+        let levels_b: Vec<(u8, i64, u64)> = {
+            let (bids, asks) = price_book_levels(&m.proc, PATH_B, 41);
+            let bids = bids.into_iter().map(|(p, q)| (MBP_BID, p, q as u64));
+            bids.chain(asks.into_iter().map(|(p, q)| (MBP_ASK, p, q as u64)))
+                .collect()
+        };
+        let group = mbp_snapshot(41, 2, seq_b + 1, skipped, &levels_b);
+        for (i, chunk) in group.chunks(200).enumerate() {
+            m.send(PATH_B, PortRole::Snapshot, 3 + i as u64, chunk.to_vec());
+        }
+        assert_eq!(mbp_status(&m.proc, PATH_B, 0, 41), Some(BookStatus::Ready));
+        assert!(!m.replay_baselined(), "a peer's install cannot release it");
+
+        // The serving path closes the event.
+        m.send(PATH_A, PortRole::Mktdata, seq_a, vec![m.boundary(901)]);
+        let bootstrap = new_subscriber_bootstrap(&m.replay, &m.key)
+            .expect("a new subscriber is bootstrapped one slot after the overflow");
+        let served = price_book_levels(&m.proc, PATH_A, 41);
+        assert_eq!(
+            consumer_levels(&bootstrap),
+            served,
+            "with the serving path's whole book"
+        );
+        assert_eq!(served.0.len(), 2_000);
+
+        // A consumer connected throughout is left holding the same book: the republish replaced
+        // its state wholesale rather than being applied on top of it.
+        for b in drain_books(&mut m.rx) {
+            connected.apply(&b);
+        }
+        assert_eq!(consumer_levels(&connected), served);
+    }
+
+    /// The route the gate itself takes: a transfer onto a path whose own accumulator is incomplete
+    /// degrades to a bare `clear`, leaving the replay entry incomplete with the new serving path's
+    /// book `Ready`. That path republishes it at its next close.
+    #[test]
+    fn a_transfer_onto_an_incomplete_path_is_rebaselined_at_its_next_close() {
+        let mut m = MirroredMarket::new();
+        let (mut seq_a, mut seq_b) = (10, 10);
+        // Only the peer's accumulator overflows; the serving path closes an ordinary event.
+        m.requote(PATH_B, &mut seq_b, 0, PAST_THE_CAP);
+        m.requote(PATH_A, &mut seq_a, 0, 10);
+        m.send(PATH_A, PortRole::Mktdata, seq_a, vec![m.boundary(901)]);
+        m.send(PATH_B, PortRole::Mktdata, seq_b, vec![m.boundary(901)]);
+        seq_b += 1;
+        assert!(m.replay_baselined());
+
+        // The serving path falls unhealthy, handing the market to the peer on its next event.
+        lock(&m.arbiter).set_book_health(&m.key, Transport::Edge(PATH_A), false);
+        m.requote(PATH_B, &mut seq_b, PAST_THE_CAP, 10);
+        m.send(PATH_B, PortRole::Mktdata, seq_b, vec![m.boundary(902)]);
+        seq_b += 1;
+        assert_eq!(
+            lock(&m.arbiter).authority().last_admitted(&m.key),
+            Some(Transport::Edge(PATH_B))
+        );
+        assert!(
+            new_subscriber_bootstrap(&m.replay, &m.key).is_none(),
+            "precondition: the transfer could only send a bare clear"
+        );
+
+        m.requote(PATH_B, &mut seq_b, PAST_THE_CAP + 10, 10);
+        m.send(PATH_B, PortRole::Mktdata, seq_b, vec![m.boundary(903)]);
+        let bootstrap = new_subscriber_bootstrap(&m.replay, &m.key)
+            .expect("the new serving path republishes its book at its next close");
+        assert_eq!(
+            consumer_levels(&bootstrap),
+            price_book_levels(&m.proc, PATH_B, 41)
+        );
+    }
+
+    /// The negative control: a market whose replay entry is complete pays nothing. Its closes stay
+    /// ordinary incremental batches, never a whole-book republish.
+    #[test]
+    fn a_complete_market_is_not_republished_at_its_close() {
+        let mut m = MirroredMarket::new();
+        let _ = drain_books(&mut m.rx);
+        let mut seq_a = 10;
+        for batch in 0..3 {
+            m.requote(PATH_A, &mut seq_a, batch * 10, 10);
+            m.send(
+                PATH_A,
+                PortRole::Mktdata,
+                seq_a,
+                vec![m.boundary(901 + batch)],
+            );
+            seq_a += 1;
+        }
+        let books = drain_books(&mut m.rx);
+        assert!(books.iter().any(|b| b.last), "the events closed");
+        assert!(
+            books
+                .iter()
+                .all(|b| b.changes.first().map(|c| c.action) != Some(BookAction::Clear)),
+            "no close was a re-baseline"
+        );
+        assert!(m.replay_baselined());
+    }
+
+    /// An owed republish waits for the venue's consistency point. Published at a datagram's end
+    /// mid-event instead, it would go out `last: true` holding an intermediate — here locked — book,
+    /// and every consumer honouring `last` would commit it; published with the boundary datagram's
+    /// *later* changes folded in, it would commit a slot ahead of itself.
+    #[test]
+    fn an_owed_rebaseline_waits_for_the_close_and_describes_the_boundary() {
+        let mut m = MirroredMarket::new();
+        let mut connected = Consumer::default();
+        for b in drain_books(&mut m.rx) {
+            connected.apply(&b);
+        }
+        let mut seq = 10;
+        m.requote(PATH_A, &mut seq, 0, PAST_THE_CAP);
+        assert!(!m.replay_baselined(), "precondition: the republish is owed");
+        let n = PAST_THE_CAP;
+        // Still inside the event: the bid lifts to the resting ask, then the ask lifts away.
+        m.send(
+            PATH_A,
+            PortRole::Mktdata,
+            seq,
+            vec![mbp_level(41, n + 1, MBP_BID, 3_000, 1, 9_001)],
+        );
+        m.send(
+            PATH_A,
+            PortRole::Mktdata,
+            seq + 1,
+            vec![mbp_level(41, n + 2, MBP_ASK, 3_000, 0, 9_002)],
+        );
+        let mid_event = drain_books(&mut m.rx);
+        assert!(
+            mid_event.iter().all(|b| !b.last),
+            "nothing closes the event before its boundary, the owed republish included"
+        );
+        // The boundary, then the next event's first change, which the republish must not contain.
+        m.send(
+            PATH_A,
+            PortRole::Mktdata,
+            seq + 2,
+            vec![
+                m.boundary(901),
+                mbp_level(41, n + 3, MBP_BID, 2_999, 1, 9_003),
+            ],
+        );
+        let books = drain_books(&mut m.rx);
+        let rebaseline = books
+            .iter()
+            .find(|b| b.last)
+            .expect("the boundary closes the event");
+        assert_eq!(rebaseline.changes[0].action, BookAction::Clear);
+        assert!(
+            !rebaseline
+                .changes
+                .iter()
+                .any(|c| c.side == BookSide::Bid && c.price == 2_999.0),
+            "the republish describes the book at the boundary, not after it"
+        );
+        m.send(PATH_A, PortRole::Mktdata, seq + 3, vec![m.boundary(902)]);
+        let books: Vec<_> = books.into_iter().chain(drain_books(&mut m.rx)).collect();
+        for b in mid_event.iter().chain(&books) {
+            if connected.apply(b) {
+                assert!(
+                    !connected.crossed_or_locked(),
+                    "a consumer committed a locked book"
+                );
+            }
+        }
+        let bootstrap = new_subscriber_bootstrap(&m.replay, &m.key).expect("released");
+        assert!(!bootstrap.crossed_or_locked());
+        assert_eq!(consumer_levels(&bootstrap), consumer_levels(&connected));
     }
 
     /// §4.9 — a reset is any CHANGE in `Reset Count`, including the 255 -> 0 wrap. Comparing for

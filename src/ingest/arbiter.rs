@@ -101,6 +101,11 @@ const BOUND_ANCHOR: &str = "anchor";
 /// memory; the cap sits an order of magnitude above the largest real venue (~1,200 instruments).
 const MAX_BOOK_MARKETS: usize = 16_384;
 
+/// Markets that get their own `dz_book_bootstrap_*` label set; past it they share an `other` one. A
+/// forged path's first batch for a market it invents is enough to withhold that market, so the label
+/// set needs a bound of its own — far above the ~90 markets a real venue could have dark at once.
+const MAX_LABELLED_WITHHELD_MARKETS: usize = 1024;
+
 /// Cap on batches withheld from one market while waiting for the new path to close a logical event.
 /// `last` is mandatory in PROTOCOL.md, but a producer that stops setting it — a bug, a truncated
 /// datagram, a forged publisher — would otherwise withhold that market from the wire forever. Sized like
@@ -1459,6 +1464,10 @@ pub struct Arbiter {
     /// instrument_id)`. Mirrors the serving path's state: seeded from its accumulator on every
     /// re-baseline, then advanced by each admitted batch. `None` when no replay map is wired.
     book_replay: Option<BookSnapshot>,
+    /// Markets that have been given their own `dz_book_bootstrap_*` label set, bounded by
+    /// [`MAX_LABELLED_WITHHELD_MARKETS`]. Only grows, so a market keeps the labels it was withheld
+    /// under until it is released.
+    book_withheld_labelled: HashSet<MarketKey>,
     /// Per order-level market, each publisher's standing (see [`PeerState`]). Bounded twice: evicted
     /// alongside `book_markets`, and the inner map only admits paths the authority already counts, so a
     /// spoofed-publisher flood cannot grow it.
@@ -1736,6 +1745,7 @@ impl Arbiter {
             book_markets: HashMap::new(),
             book_order: VecDeque::new(),
             book_replay: None,
+            book_withheld_labelled: HashSet::new(),
             book_sync: HashMap::new(),
             book_events: HashMap::new(),
             channel_clocks: HashMap::new(),
@@ -2016,7 +2026,8 @@ impl Arbiter {
             .and_then(|m| m.paths.get(&publisher))
             .cloned()?;
         if let Some(replay) = &self.book_replay {
-            model::lock(replay).insert(key.clone(), acc.clone());
+            let was = model::lock(replay).insert(key.clone(), acc.clone());
+            self.note_bootstrap(key, was.map(|a| a.baselined()), Some(acc.baselined()));
         }
         // `Orders` scope: this re-baselines the live feed, so it must carry whatever granularity that
         // feed carries, or an order-level consumer is handed levels and then cancels for ids it never
@@ -2162,7 +2173,8 @@ impl Arbiter {
         self.book_sync.remove(key);
         self.drop_book_events(key);
         if let Some(replay) = &self.book_replay {
-            model::lock(replay).remove(key);
+            let was = model::lock(replay).remove(key);
+            self.note_bootstrap(key, was.map(|a| a.baselined()), None);
         }
         self.books.forget_market(key);
     }
@@ -2696,9 +2708,66 @@ impl Arbiter {
         if !self.book_markets.contains_key(key) {
             return;
         }
-        model::lock(replay)
-            .entry_or_insert_with(key, || BookAccumulator::new(b.symbol.clone()))
-            .apply(b);
+        let (was, now) = {
+            let mut replay = model::lock(replay);
+            let was = replay.get(key).map(BookAccumulator::baselined);
+            let acc = replay.entry_or_insert_with(key, || BookAccumulator::new(b.symbol.clone()));
+            acc.apply(b);
+            (was, acc.baselined())
+        };
+        self.note_bootstrap(key, was, Some(now));
+    }
+
+    /// Account one write of a market's replay entry, given whether it was complete before and after
+    /// (`None`: no entry). An entry that exists but is not [`BookAccumulator::baselined`] is a market
+    /// `sinks::ws` withholds from every new subscriber, and nothing but these two series and
+    /// `/v1/products`' `book_complete` says so — the WARN that may have caused it fires once.
+    fn note_bootstrap(&mut self, key: &MarketKey, was: Option<bool>, now: Option<bool>) {
+        let withheld = |c: Option<bool>| c == Some(false);
+        if withheld(was) == withheld(now) {
+            return;
+        }
+        let labelled = self.book_withheld_labelled.contains(key)
+            || (withheld(now)
+                && self.book_withheld_labelled.len() < MAX_LABELLED_WITHHELD_MARKETS
+                && self.book_withheld_labelled.insert(key.clone()));
+        let (channel, instrument) = if labelled {
+            (key.2.to_string(), key.3.to_string())
+        } else {
+            ("other".to_owned(), "other".to_owned())
+        };
+        let labels = [key.0.as_ref(), key.1.as_ref(), &channel, &instrument];
+        let m = metrics();
+        if withheld(now) {
+            m.book_bootstrap_lost.with_label_values(&labels).inc();
+            m.book_bootstrap_withheld.with_label_values(&labels).inc();
+        } else {
+            m.book_bootstrap_withheld.with_label_values(&labels).dec();
+        }
+    }
+
+    /// For each of `keys`, whether `publisher` owes that market a full re-baseline at its next event
+    /// close: the market's replay entry is not a complete book and `publisher` is the path the
+    /// consumer is following.
+    ///
+    /// The MBP processor asks, because nothing else here can answer. A replay entry loses
+    /// completeness when an event outgrows the accumulator's cap, when a transfer lands on a path
+    /// whose own accumulator is incomplete, or when eviction or a reset drops it — and only a
+    /// `Clear`-led batch *from the serving path* restores it. A `Ready` price book declines every
+    /// snapshot rotation for the rest of its era, so the serving path never sends one again, and the
+    /// peer's install is dropped by this gate. The complete book the consumer needs sits in the
+    /// serving path's `PriceBook`, which is where the processor republishes it from.
+    pub fn book_rebaselines_owed(&self, publisher: Transport, keys: &[MarketKey]) -> Vec<bool> {
+        let Some(replay) = &self.book_replay else {
+            return vec![false; keys.len()];
+        };
+        let replay = model::lock(replay);
+        keys.iter()
+            .map(|key| {
+                replay.get(key).is_some_and(|acc| !acc.baselined())
+                    && self.books.last_admitted(key) == Some(publisher)
+            })
+            .collect()
     }
 
     /// Whether a trade from `publisher` is evidence about a book-serving path.
@@ -4941,6 +5010,85 @@ mod tests {
             full.changes[1..].to_vec(),
             vec![bid(0.40, 10.0)],
             "the loser's size must not reach the replay state"
+        );
+    }
+
+    /// A market whose replay entry has lost completeness is owed a republish by the path the consumer
+    /// is following and by no other, and only until a `Clear`-led batch from it folds in. The two
+    /// market-labelled series follow the same transitions: the counter once per loss, the gauge back
+    /// to zero on recovery and on the market's state being dropped.
+    #[test]
+    fn a_rebaseline_is_owed_by_the_serving_path_while_the_replay_is_incomplete() {
+        let venue = "BookRebaselineOwed";
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let (tx, _rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(replay.clone());
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 1_000);
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(2), 1_001);
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let owed =
+            |a: &Arbiter, p: Transport| a.book_rebaselines_owed(p, std::slice::from_ref(&key))[0];
+        let (channel, instrument) = (BOOK_CHANNEL.to_string(), BOOK_INSTRUMENT.to_string());
+        let labels = [venue, TEST_CATEGORY, &channel, &instrument];
+        let lost = || {
+            metrics()
+                .book_bootstrap_lost
+                .with_label_values(&labels)
+                .get()
+        };
+        let withheld = || {
+            metrics()
+                .book_bootstrap_withheld
+                .with_label_values(&labels)
+                .get()
+        };
+        assert!(!owed(&a, path(1)), "a complete market is owed nothing");
+        assert_eq!((lost(), withheld()), (0, 0));
+
+        let overflow = |a: &mut Arbiter| {
+            let flood = (0..=crate::model::MAX_PENDING_CHANGES)
+                .map(|i| bid(0.01 * (1 + i % 500) as f64, 1.0))
+                .collect();
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, flood, false, 1_100),
+                path(1),
+                TEST_CATEGORY,
+            );
+        };
+        overflow(&mut a);
+        assert!(owed(&a, path(1)), "the serving path owes the republish");
+        assert!(
+            !owed(&a, path(2)),
+            "a peer's re-baseline would be dropped by the gate anyway"
+        );
+        assert_eq!((lost(), withheld()), (1, 1));
+        // A later batch of the same event neither re-counts nor releases it.
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, vec![bid(0.40, 1.0)], true, 1_101),
+            path(1),
+            TEST_CATEGORY,
+        );
+        assert_eq!((lost(), withheld()), (1, 1));
+
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 1_200);
+        assert!(
+            !owed(&a, path(1)),
+            "the serving path's `Clear` discharged it"
+        );
+        assert_eq!((lost(), withheld()), (1, 0));
+
+        overflow(&mut a);
+        assert_eq!((lost(), withheld()), (2, 1));
+        a.reset_book_for_market(&key);
+        assert_eq!(
+            (lost(), withheld()),
+            (2, 0),
+            "a dropped market is no longer withheld"
+        );
+        assert!(
+            !owed(&a, path(1)),
+            "and there is nothing left to republish into"
         );
     }
 

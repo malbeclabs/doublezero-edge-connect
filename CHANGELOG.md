@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- A price-book market no longer goes dark to new subscribers after one very large event. An
+  event carrying more than 8,192 changes before its `last` un-baselines the WebSocket replay entry,
+  and only a `Clear`-led batch from the serving path could restore it — which a `Ready` book never
+  sends again, while the peer path's snapshot install is dropped by the single-path gate. On
+  2026-09-24 Phoenix UNI hit it and was bootstrapped for no new subscriber for hours, though the
+  bridge held a correct book. The serving path now republishes its whole book at the market's next
+  event close, so recovery takes about one slot. Connected consumers see one extra `Clear`-led
+  re-baseline per overflow.
 - **A market-by-price re-anchor now needs two short rotations, not one.** A book that
   legitimately *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes
   applied past that rotation's `last_instrument_seq` — is indistinguishable from the short install
@@ -391,6 +399,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   introduces it.
 
 ### Added
+- A market withheld from the WebSocket bootstrap is now visible. `/v1/products` rows carry
+  `book_complete` (`false`: no new subscriber gets this market's book), and
+  `dz_book_bootstrap_lost_total` / `dz_book_bootstrap_withheld` are labelled by `venue`, `category`,
+  `channel` and `instrument_id`. The cap's WARN line now names the symbol.
 - ⚠️ **Kalshi elections, a pair of rows the registry did not have.** The political event markets are
   activated on the ledger and running on their own two groups, separate from perps and events:
   top-of-book on `233.84.178.21` and market-by-price on `233.84.178.22`, six channels each (`50`-`55`,

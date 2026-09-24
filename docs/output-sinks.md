@@ -186,6 +186,17 @@ never seen), which otherwise look like the same empty response. Every `book`/dep
 a `coverage` block with the same honesty (`complete: false` rather than a guess whenever the served
 levels might not be all of them).
 
+`book_complete` on a product is the WebSocket bootstrap's view of that market. Present only for a
+market with a `book`; `false` means a subscriber connecting now receives no `book`/`order_book`
+bootstrap for it and none of its book frames until it completes, while quotes and trades keep flowing.
+`status` is venue-level and reads `online` throughout, so this is the field to check. It should read
+`false` for at most about one slot; one stuck at `false` is worth reporting, together with
+`dz_book_bootstrap_withheld` if the metrics endpoint is on.
+
+```bash
+curl -s localhost:9099/v1/products | jq '.products[] | select(.book_complete == false) | .product_id'
+```
+
 **The catalog is not necessarily every instrument the feed defines.** A product is listed in
 `/v1/products` once its Source ID is known: immediately, for a publisher whose reference data carries
 its own Source ID; only after its first price, for a publisher whose reference data carries no Source

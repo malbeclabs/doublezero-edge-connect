@@ -739,7 +739,18 @@ Modules are grouped by role under `src/`:
   so the install that readmits the instrument has no venue to file under, and marking that report
   done would leave the path unhealthy at the gate with a `Ready` book — the market then sits on a
   stale peer while a live path is on the wire. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
-  and publishes nothing until the install's re-baseline. It also runs the shared `SeqTracker` per
+  and publishes nothing until the install's re-baseline. ⚠️ **At every event close it asks the arbiter
+  whether the replay entry is owed a republish** (`Arbiter::book_rebaselines_owed`: the entry is not
+  `baselined()` and this path is `last_admitted`) and, if so, closes with `emit_rebaseline` instead of
+  the plain closing batch. Nothing else can restore that entry for a price-aggregated market: only a
+  `Clear`-led batch from the serving path does, a `Ready` book never re-installs, and the peer's
+  install is dropped by the gate — so on the live Oregon bridge one event past the replay cap took UNI
+  off every new subscriber for good while the bridge held a correct book (2026-09-24). The four routes
+  (the cap, a transfer onto an incomplete accumulator, eviction, a reset) all recover here at the
+  serving path's next close while its book is `Ready`; one that is not `Ready` hands the market to a
+  healthy peer or re-installs at its next rotation. Asked **only at a close**, never at a mid-event
+  datagram end, or the republish would go out `last: true` holding an intermediate book. It also runs
+  the shared `SeqTracker` per
   publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
   `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
   `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
@@ -996,6 +1007,10 @@ Modules are grouped by role under `src/`:
   A lagging client is re-bootstrapped on `l4Book` at most once per `REBOOTSTRAP_MIN_INTERVAL`, since
   that frame is the most expensive the sink produces and is what makes a struggling client lag again;
   a second gap inside the window ends the connection.
+- **`sinks/api.rs`**'s `/v1/products` rows carry `book_complete` (the replay entry's `baselined()`,
+  absent for a market with no book), read off the same `BookSnapshot` lookup `feed_kind` already makes.
+  It is the one place a market withheld from every new WebSocket subscriber shows without the
+  metrics endpoint, which is off by default: `status` is venue-level and reads `online` throughout.
 - **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
   `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
   bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical
@@ -1094,7 +1109,13 @@ Modules are grouped by role under `src/`:
   `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
   of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
   `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
-  baseline. `BookSnapshot`
+  baseline. ⚠️ The cap is **reachable by real markets** (it counts changes, not levels: Phoenix UNI
+  carried 8,204 in one slot over ~2,800 levels), and overflowing it un-baselines the entry, which the
+  serving MBP path then republishes at its next close (see `MbpProcessor` above). Every write of a
+  replay entry reports its completeness transition to `Arbiter::note_bootstrap`, which drives the only
+  market-labelled series, `dz_book_bootstrap_lost_total`/`dz_book_bootstrap_withheld` — label sets
+  capped at `MAX_LABELLED_WITHHELD_MARKETS`, since a forged path's first batch for an invented market
+  is enough to withhold it. `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since

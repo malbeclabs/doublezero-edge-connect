@@ -572,10 +572,15 @@ pub enum ReplayScope {
 }
 
 /// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
-/// datagram publisher, so a feed that never sets `last` must not grow this without limit; the cap sits
-/// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
-/// rather than silently dropping changes from a book still claimed to be complete.
-const MAX_PENDING_CHANGES: usize = 8192;
+/// datagram publisher, so a feed that never sets `last` must not grow this without limit.
+/// Overflowing it desynchronizes the accumulator rather than silently dropping changes from a book
+/// still claimed to be complete, and the serving path then re-baselines the market at its next close.
+///
+/// ⚠️ **Not** far above every real event: it counts changes, not distinct levels, and a slot that
+/// re-quotes a ~2,800-level spline several times carries more than this (Phoenix UNI, 8,204). That
+/// is survivable only because the re-baseline follows; without it the market went dark to every new
+/// subscriber for good.
+pub(crate) const MAX_PENDING_CHANGES: usize = 8192;
 
 /// Cap on resting orders one market's replay state holds — the same ceiling `ingest::book`'s own
 /// `MAX_ORDERS_PER_BOOK` puts on the producer, so a well-behaved market never reaches it.
@@ -655,21 +660,23 @@ impl BookAccumulator {
             // below whatever its size, or an order-level snapshot — tens of thousands of orders in one
             // batch — could never baseline.
             if self.pending.len() > MAX_PENDING_CHANGES {
-                // ⚠️ Observable, because the consequence is silent and lasts until a producer
-                // `Clear`: the market drops out of every bootstrap (`sinks::ws` filters on
-                // `baselined`) and the gate's own re-baseline degrades to a bare clear. The cap
-                // bounds a whole boundary interval now, not one datagram, so it is reachable.
+                // ⚠️ The market drops out of every bootstrap (`sinks::ws` filters on `baselined`)
+                // until a `Clear`-led batch from the serving path folds in. For a price-aggregated
+                // market the arbiter asks that path's processor for one at its next close
+                // (`Arbiter::book_rebaselines_owed`); nothing else would ever send it. The cap bounds
+                // a whole boundary interval, not one datagram, and the busiest markets reach it.
                 crate::metrics::metrics()
                     .book_events_abandoned
                     .with_label_values(&[b.venue.as_ref()])
                     .inc();
                 tracing::warn!(
                     venue = %b.venue,
+                    symbol = %b.symbol,
                     channel = b.channel,
                     instrument_id = b.instrument_id,
                     pending = self.pending.len(),
-                    "book event outgrew the pending-change cap; the market is withheld until it \
-                     re-baselines"
+                    "book event outgrew the pending-change cap; the market is re-baselined from \
+                     the serving path at its next close"
                 );
                 self.pending.clear();
                 self.baselined = false;
@@ -995,9 +1002,9 @@ pub struct BookReplay {
 }
 
 impl BookReplay {
-    /// Replace one market's accumulator (the re-baseline path).
-    pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) {
-        self.books.insert(key, acc);
+    /// Replace one market's accumulator (the re-baseline path), returning the one it replaced.
+    pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) -> Option<BookAccumulator> {
+        self.books.insert(key, acc)
     }
 
     /// The accumulator for `key`, created with `f` when the market is new (the streaming path).
