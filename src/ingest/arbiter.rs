@@ -60,7 +60,7 @@ use crate::{
     },
 };
 
-/// Default number of recent `trade_id`s remembered per `(venue, symbol)` for cross-transport trade
+/// Default number of recent `trade_id`s remembered per `(source, symbol)` for cross-transport trade
 /// dedup. Const for now; promote to config alongside a multi-publisher trade test that can size it.
 pub const TRADE_DEDUP_WINDOW: usize = 8192;
 
@@ -724,7 +724,7 @@ impl GuardBudget {
     }
 }
 
-/// The venue-time clock one `(venue, category, channel)` runs on, and the frontier derived from it.
+/// The venue-time clock one `(source, category, channel)` runs on, and the frontier derived from it.
 ///
 /// Per channel rather than per market because most markets on a channel are idle: a market's own
 /// stamps say nothing about how far the venue has moved, so a frontier advanced only by a market's
@@ -1301,7 +1301,7 @@ impl MarketEvents {
 /// memory stays bounded.
 ///
 /// Window correctness depends on the `no_business_duplicates` oracle's assumption that each identity
-/// is unique per `(venue, symbol)`: the window must exceed the worst-case number of distinct values
+/// is unique per `(source, symbol)`: the window must exceed the worst-case number of distinct values
 /// between competing publishers' copies of the same value, or a late duplicate re-emits.
 /// Per-key window contents: each tracked value mapped to the `(publisher, arrival_ns)` of the copy
 /// that first delivered it, plus a FIFO of values for bounded (capacity) eviction.
@@ -1355,12 +1355,12 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
 
 /// The shared emit stage: owns the broadcast `Sender` plus the dedup state, and exposes one
 /// `emit(msg, publisher)` entry point every ingest input funnels through. Quotes pass through the
-/// per-`(venue, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Transport`),
+/// per-`(source, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Transport`),
 /// MBO `depth` through its own latch-to-leader floor (keyed on [`DepthId`] — but with no
 /// `source_ts == 0` bypass, see the `Depth` branch), trades through the [`WindowedDedup`] on `trade_id`,
 /// and everything else (`Instrument`/`Midpoint`/`Status`) is broadcast unchanged. Wrapped in
 /// [`SharedArbiter`] so the multicast receiver tasks and the WS input share one instance — hence one
-/// floor per `(venue, symbol)`, on which all sources race.
+/// floor per `(source, symbol)`, on which all sources race.
 pub struct Arbiter {
     /// The backbone carries `Arc<FeedMessage>` so a per-subscriber delivery is a refcount bump, not
     /// a deep clone of the message's `String`/`Vec`s.
@@ -1394,10 +1394,10 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
-    /// Last broadcast content per `(venue, channel, instrument_id)` plus the monotonic time it went
+    /// Last broadcast content per `(source, channel, instrument_id)` plus the monotonic time it went
     /// out, so mirrored publishers' identical definition bursts collapse to one wire message while
     /// the content is still re-announced every [`INSTRUMENT_REANNOUNCE_NS`]. Keyed on the identity
-    /// triple rather than `(venue, symbol)`: the market-by-price wire truncates symbols to 16 bytes
+    /// triple rather than `(source, symbol)`: the market-by-price wire truncates symbols to 16 bytes
     /// and two instrument ids already collide on one truncation in a live capture, so a
     /// symbol-keyed rate limit would starve a `{"channel":N}` subscriber of a definition another
     /// channel announced first. Bounded by the distinct instrument count, like the
@@ -2697,7 +2697,7 @@ impl Arbiter {
     }
 
     /// Whether this path currently serves a `Sticky` **universe**'s tape — one gate per
-    /// `(venue, category)`, never one per venue.
+    /// `(source, category)`, never one per venue.
     ///
     /// Scope first, because it is what makes every rule below safe to state: a single Source ID can
     /// carry instrument universes that mirror nothing of one another, and this gate exists to pick
@@ -2746,7 +2746,7 @@ impl Arbiter {
     /// — deliberately its own counter, not folded into `dz_trades_dropped_total`, whose steady state
     /// here is the challenger's whole feed.
     ///
-    /// The two `books` lookups below read the authority at the **same** `(venue, category)` grain
+    /// The two `books` lookups below read the authority at the **same** `(source, category)` grain
     /// this gate runs at, so the deferral can only ever name a path elected on *this* universe. While
     /// [`StickyAuthority`] was venue-wide they could name a path elected on a disjoint universe — a
     /// stranger to this tape — and hand it prints it never makes.
@@ -2797,7 +2797,7 @@ impl Arbiter {
         true
     }
 
-    /// Claim the `(venue, symbol)` zero-id tape for `publisher`, returning whether a *concurrent*
+    /// Claim the `(source, symbol)` zero-id tape for `publisher`, returning whether a *concurrent*
     /// second emitter was detected. `Coordinated` venues only — see the `Trade` branch.
     fn claim_no_id_tape(&mut self, t: &NormalizedTrade, publisher: Transport) -> bool {
         let key = (SourceKey::of(t), t.symbol.clone());
@@ -2823,7 +2823,7 @@ impl Arbiter {
     /// Pair this trade with the peer path's copy and hand the signed lead to the authority — the only
     /// producer of the evidence [`StickyAuthority::close_window`] elects on.
     ///
-    /// `scope` is the emitting row's `(venue, category)`: the election it feeds is per universe, so a
+    /// `scope` is the emitting row's `(source, category)`: the election it feeds is per universe, so a
     /// lead measured between two of one universe's mirrors must not be filed against another's paths.
     fn observe_trade_race(&mut self, scope: &ScopeKey, t: &NormalizedTrade, publisher: Transport) {
         let Some(m) = self.race.on_trade(
@@ -2978,7 +2978,7 @@ impl Arbiter {
                 }
                 // Then the per-universe path gate, for the same reason the `book` branch has one: a
                 // `Sticky` universe's two paths mirror one tape with no shared identity to collapse
-                // them on. Scoped by `(venue, category)`, not by venue — see `tape_path_admits`.
+                // them on. Scoped by `(source, category)`, not by venue — see `tape_path_admits`.
                 let sticky = self.mode_for(&t.venue) == ArbitrationMode::Sticky;
                 if sticky && !self.tape_path_admits(t, publisher, category) {
                     metrics()
@@ -4412,7 +4412,7 @@ mod tests {
     }
 
     /// The per-symbol reset (what the MBO processor does on `InstrumentReset`) clears only that
-    /// `(venue, symbol)` entry: the resetting instrument's lower tick is re-admitted while a
+    /// `(source, symbol)` entry: the resetting instrument's lower tick is re-admitted while a
     /// sibling symbol's floor stays latched.
     #[test]
     fn arbiter_depth_symbol_reset_clears_only_that_symbol() {
@@ -5818,7 +5818,7 @@ mod tests {
         a
     }
 
-    /// One print from `p` for `(venue, category)`, returning whether it reached the wire. The
+    /// One print from `p` for `(source, category)`, returning whether it reached the wire. The
     /// receiver is subscribed immediately before the emit, so it observes this print alone.
     fn tape_print_in(
         a: &mut Arbiter,
@@ -5836,7 +5836,7 @@ mod tests {
         matches!(rx.try_recv(), Ok(m) if matches!(&*m, FeedMessage::Trade(_)))
     }
 
-    /// The path gate is per `(venue, category)`. Two publishers on disjoint universes are not
+    /// The path gate is per `(source, category)`. Two publishers on disjoint universes are not
     /// competing for one tape, so neither may mute the other — a venue-wide gate drops the
     /// loser's prints forever, since a continuously-printing incumbent never goes silent.
     #[test]
@@ -7494,7 +7494,7 @@ mod tests {
         assert_eq!(a.guard.held, held);
     }
 
-    /// The channel clocks are keyed on the wire's `(venue, category, channel_id)`, so a forged feed
+    /// The channel clocks are keyed on the wire's `(source, category, channel_id)`, so a forged feed
     /// must cost evictions rather than memory. Losing a clock degrades that channel to "frontier
     /// unset", which its next batch re-seeds.
     ///

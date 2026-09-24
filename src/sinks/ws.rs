@@ -1422,7 +1422,7 @@ mod tests {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
-                    crate::model::SourceKey::from("HYPERLIQUID"),
+                    crate::model::SourceKey::unassigned("HYPERLIQUID"),
                     Arc::<str>::from("default"),
                     0u8,
                     n as u32,
@@ -1551,7 +1551,7 @@ mod tests {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
-                    crate::model::SourceKey::from("KALSHI"),
+                    crate::model::SourceKey::unassigned("KALSHI"),
                     Arc::<str>::from("default"),
                     channel,
                     41u32,
@@ -2203,7 +2203,7 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             (
-                crate::model::SourceKey::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2858,7 +2858,7 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             (
-                crate::model::SourceKey::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
