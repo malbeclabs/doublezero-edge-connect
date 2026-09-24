@@ -43,6 +43,8 @@ Two PRs.
 - Product ids: `resolve` already matches by name. The ambiguity count moves from
   `(source_id, symbol)` to `(name, symbol)`, so a symbol listed under two IDs of one name renders
   with the `#channel.instrument` suffix and resolves back.
+- An instrument that moves off an ID drops that ID's depth and book replay, unless another publisher
+  still serves it there.
 - Docs: `self-hosting.md` drops "a name may appear only once".
 
 ## Out of scope
