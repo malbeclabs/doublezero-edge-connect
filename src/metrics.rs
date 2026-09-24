@@ -290,10 +290,17 @@ pub struct Metrics {
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
     /// series that surfaces that wedge.
     pub mbp_duplicate_deltas: IntCounterVec,
-    /// Logical events abandoned because their buffered changes outgrew the accumulator's cap. The
-    /// market is withheld from every bootstrap until a producer re-baseline, so a non-zero rate is
-    /// markets missing from connecting clients, not just a wide event.
+    /// Logical events abandoned because their buffered changes outgrew the accumulator's cap —
+    /// counted per accumulator, so one event on a mirrored market scores up to once per path plus
+    /// once for the replay map. The serving path re-baselines the market at its next close, so each
+    /// one costs connected consumers one extra `Clear`-led re-baseline.
     pub book_events_abandoned: IntCounterVec,
+    /// Times a market's replay entry stopped being a complete book, so new subscribers stopped
+    /// being bootstrapped with it. Market-labelled, which no other series is.
+    pub book_bootstrap_lost: IntCounterVec,
+    /// Markets currently withheld from every new subscriber's bootstrap for want of a complete
+    /// book. `1` per market while it lasts; the `other` bucket counts past the label cap.
+    pub book_bootstrap_withheld: IntGaugeVec,
     /// Closing batches a publish gate refused (mid-rotation, gapped, not yet revealed). The
     /// instrument stays owed its close and is retried at the next boundary; a sustained rate means
     /// one path is holding markets it cannot publish.
@@ -814,9 +821,23 @@ impl Metrics {
             book_events_abandoned: counter_vec(
                 &registry,
                 "dz_book_events_abandoned_total",
-                "Logical events whose buffered changes outgrew the accumulator cap. The market is \
-                 withheld from bootstraps until it re-baselines.",
+                "Logical events whose buffered changes outgrew the accumulator cap, per \
+                 accumulator. The serving path re-baselines the market at its next close.",
                 &["venue"],
+            ),
+            book_bootstrap_lost: counter_vec(
+                &registry,
+                "dz_book_bootstrap_lost_total",
+                "Times a market's replay entry stopped being a complete book, withholding it from \
+                 new subscribers' bootstraps.",
+                &["venue", "category", "channel", "instrument_id"],
+            ),
+            book_bootstrap_withheld: gauge_vec(
+                &registry,
+                "dz_book_bootstrap_withheld",
+                "Markets currently withheld from new subscribers' bootstraps for want of a complete \
+                 book.",
+                &["venue", "category", "channel", "instrument_id"],
             ),
             mbp_closes_refused: counter_vec(
                 &registry,
@@ -1314,6 +1335,12 @@ mod tests {
             .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
         m.book_events_abandoned.with_label_values(&["KALSHI"]).inc();
+        m.book_bootstrap_lost
+            .with_label_values(&["KALSHI", "perps", "0", "1"])
+            .inc();
+        m.book_bootstrap_withheld
+            .with_label_values(&["KALSHI", "perps", "0", "1"])
+            .inc();
         m.mbp_closes_refused.with_label_values(&["KALSHI"]).inc();
         m.mbp_slot_regressions.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
@@ -1405,6 +1432,8 @@ mod tests {
             "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
             "dz_book_events_abandoned_total",
+            "dz_book_bootstrap_lost_total",
+            "dz_book_bootstrap_withheld",
             "dz_mbp_closes_refused_total",
             "dz_mbp_slot_regressions_total",
             "dz_mbp_crossed_total",
