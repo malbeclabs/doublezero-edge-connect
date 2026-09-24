@@ -167,7 +167,7 @@ fn prepare(m: &FeedMessage) -> Option<Arc<PreparedFrame>> {
     let (book_market, recv_ts_ns) = match &m {
         FeedMessage::Book(b) | FeedMessage::OrderBook(b) => (
             Some((
-                b.venue.clone(),
+                crate::model::SourceKey::of(b),
                 b.category.clone(),
                 b.channel,
                 b.instrument_id,
@@ -480,9 +480,14 @@ fn withheld_bootstrap(
         return Withheld::Waiting;
     };
     let wanted = subs.is_empty()
-        || subs
-            .iter()
-            .any(|f| f.matches(&key.0, Some(acc.symbol()), Some(key.2), book_kind(acc)));
+        || subs.iter().any(|f| {
+            f.matches(
+                key.0.name(),
+                Some(acc.symbol()),
+                Some(key.2),
+                book_kind(acc),
+            )
+        });
     if !wanted {
         return Withheld::OutOfScope;
     }
@@ -658,7 +663,7 @@ where
             // Filtered and tagged under the market's *own* type, matching the live feed it
             // precedes: a client subscribed to `order_book` alone must still be bootstrapped, and
             // one subscribed to `book` alone must not be handed a market it cannot apply.
-            if !pass(&key.0, acc.symbol(), Some(key.2), book_kind(acc)) {
+            if !pass(key.0.name(), acc.symbol(), Some(key.2), book_kind(acc)) {
                 continue;
             }
             // A market accumulated partway through holds only the levels that have moved since, so
@@ -742,7 +747,7 @@ where
     }
     metrics()
         .ws_bootstrap_withheld
-        .with_label_values(&[&key.0, release])
+        .with_label_values(&[key.0.name(), release])
         .inc();
     write
         .send(WsMessage::Text(serde_json::to_string(&msg)?.into()))
@@ -1417,7 +1422,7 @@ mod tests {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
-                    Arc::<str>::from("HYPERLIQUID"),
+                    crate::model::SourceKey::unassigned("HYPERLIQUID"),
                     Arc::<str>::from("default"),
                     0u8,
                     n as u32,
@@ -1546,7 +1551,7 @@ mod tests {
             let arc: Arc<str> = sym.into();
             defs.insert(
                 (
-                    Arc::<str>::from("KALSHI"),
+                    crate::model::SourceKey::unassigned("KALSHI"),
                     Arc::<str>::from("default"),
                     channel,
                     41u32,
@@ -1703,7 +1708,7 @@ mod tests {
     /// Spawn a server over the given replay maps (`depth` empty). The returned sender must be held by
     /// the caller for the lifetime of the test.
     async fn spawn_server(
-        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
+        instruments: HashMap<(crate::model::SourceKey, Arc<str>, u8, u32), NormalizedInstrument>,
         books: BookReplay,
     ) -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1719,7 +1724,7 @@ mod tests {
     /// accumulator the way the arbiter does — under the shared lock, *before* the batch is
     /// broadcast — instead of serving a map frozen at connect time.
     async fn spawn_server_shared(
-        instruments: HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>,
+        instruments: HashMap<(crate::model::SourceKey, Arc<str>, u8, u32), NormalizedInstrument>,
         books: crate::model::BookSnapshot,
         deadline: Option<Duration>,
     ) -> (
@@ -1804,7 +1809,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -1924,7 +1929,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("HYPERLIQUID"),
+                crate::model::SourceKey::unassigned("HYPERLIQUID"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -1935,7 +1940,7 @@ mod tests {
         // the `book` subscriber must still be bootstrapped with this one.
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2027,7 +2032,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("HYPERLIQUID"),
+                crate::model::SourceKey::unassigned("HYPERLIQUID"),
                 Arc::<str>::from("perps"),
                 0u8,
                 1u32,
@@ -2100,7 +2105,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2109,7 +2114,7 @@ mod tests {
         );
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 3u8,
                 7u32,
@@ -2198,7 +2203,7 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2219,7 +2224,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2267,7 +2272,7 @@ mod tests {
         };
         let key = |id: u32| {
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 id,
@@ -2417,7 +2422,7 @@ mod tests {
     #[serial]
     async fn a_market_whose_event_never_closes_is_released_at_the_deadline() {
         let key = (
-            Arc::<str>::from("KALSHI"),
+            crate::model::SourceKey::unassigned("KALSHI"),
             Arc::<str>::from("perps"),
             2u8,
             41u32,
@@ -2570,7 +2575,7 @@ mod tests {
 
     fn mid_event_key() -> crate::model::BookKey {
         (
-            Arc::<str>::from("KALSHI"),
+            crate::model::SourceKey::unassigned("KALSHI"),
             Arc::<str>::from("perps"),
             2u8,
             41u32,
@@ -2612,7 +2617,7 @@ mod tests {
         books.insert(mid_event_key(), mid_event);
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 42u32,
@@ -2687,7 +2692,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2727,7 +2732,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 3u8,
                 7u32,
@@ -2736,7 +2741,7 @@ mod tests {
         );
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2782,7 +2787,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2853,7 +2858,7 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2874,7 +2879,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -2948,7 +2953,7 @@ mod tests {
 
         const N: u64 = 1_000;
         let market = (
-            Arc::<str>::from("KALSHI"),
+            crate::model::SourceKey::unassigned("KALSHI"),
             Arc::<str>::from("perps"),
             2u8,
             41u32,
@@ -3061,7 +3066,7 @@ mod tests {
 
         const T: u64 = 1_000;
         let market = (
-            Arc::<str>::from("KALSHI"),
+            crate::model::SourceKey::unassigned("KALSHI"),
             Arc::<str>::from("perps"),
             2u8,
             41u32,
@@ -3174,7 +3179,7 @@ mod tests {
 
         const N: u64 = 1_000;
         let market = (
-            Arc::<str>::from("KALSHI"),
+            crate::model::SourceKey::unassigned("KALSHI"),
             Arc::<str>::from("perps"),
             2u8,
             41u32,
@@ -3296,7 +3301,7 @@ mod tests {
         use super::{prepare, serve_client};
 
         let market = (
-            Arc::<str>::from("KALSHI"),
+            crate::model::SourceKey::unassigned("KALSHI"),
             Arc::<str>::from("perps"),
             2u8,
             41u32,
@@ -3413,7 +3418,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -3493,7 +3498,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -3582,7 +3587,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,
@@ -3705,7 +3710,7 @@ mod tests {
         let mut books = BookReplay::default();
         books.insert(
             (
-                Arc::<str>::from("KALSHI"),
+                crate::model::SourceKey::unassigned("KALSHI"),
                 Arc::<str>::from("perps"),
                 2u8,
                 41u32,

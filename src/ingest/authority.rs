@@ -80,10 +80,10 @@ use crate::ingest::arbiter::{Admit, Transport};
 /// The arbitration scope: a venue's Source ID plus the instrument **universe** within it
 /// (`ingest::feeds::Feed::category`). One election, one path numbering and one silence clock per
 /// scope — see the module doc for why the venue alone is the wrong grain.
-pub type ScopeKey = (Arc<str>, Arc<str>);
+pub type ScopeKey = (crate::model::SourceKey, Arc<str>);
 
 /// The published market key: the arbitration scope plus the wire identity pair.
-pub type MarketKey = (Arc<str>, Arc<str>, u8, u32);
+pub type MarketKey = (crate::model::SourceKey, Arc<str>, u8, u32);
 
 /// The scope one market arbitrates in. Two `Arc` bumps, not an allocation.
 fn scope_of(key: &MarketKey) -> ScopeKey {
@@ -395,7 +395,7 @@ impl StickyAuthority {
     pub fn path_label_in_venue(&self, venue: &str, publisher: Transport) -> &'static str {
         self.ordinals
             .iter()
-            .filter(|((v, _), _)| v.as_ref() == venue)
+            .filter(|((v, _), _)| v.name() == venue)
             .filter_map(|(_, paths)| paths.get(&publisher).copied())
             // Lexicographic, which is ordinal order only while [`MAX_LABELLED_PATHS`] <= 10
             // ("path10" < "path2"). Raising the cap past ten means parsing the suffix here.
@@ -472,11 +472,11 @@ impl StickyAuthority {
         let mut held: HashMap<(Arc<str>, Transport), usize> = self
             .scopes
             .iter()
-            .flat_map(|((venue, _), v)| v.paths.keys().map(|&a| ((venue.clone(), a), 0)))
+            .flat_map(|((venue, _), v)| v.paths.keys().map(|&a| ((venue.name_arc().clone(), a), 0)))
             .collect();
         for key in self.markets.keys() {
             if let Some(p) = self.leader_of(key) {
-                *held.entry((key.0.clone(), p)).or_default() += 1;
+                *held.entry((key.0.name_arc().clone(), p)).or_default() += 1;
             }
         }
         held.into_iter().map(|((v, p), n)| (v, p, n)).collect()
@@ -582,6 +582,24 @@ fn best_challenger(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn scopes_with_the_same_name_and_category_but_different_ids_are_separate() {
+        let cat: Arc<str> = Arc::from("c");
+        let a: MarketKey = (
+            crate::model::SourceKey::new(1, Arc::from("SHARED")),
+            cat.clone(),
+            0,
+            9,
+        );
+        let b: MarketKey = (
+            crate::model::SourceKey::new(7, Arc::from("SHARED")),
+            cat,
+            0,
+            9,
+        );
+        assert_ne!(scope_of(&a), scope_of(&b));
+    }
 
     fn path(n: u8) -> Transport {
         Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))

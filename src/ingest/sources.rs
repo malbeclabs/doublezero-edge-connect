@@ -87,6 +87,9 @@ pub fn source_id_of(source: &str) -> Option<u16> {
 /// per-key map in this crate so a garbage or hostile wire cannot grow it without limit.
 pub const MAX_UNREGISTERED_SOURCES: usize = 64;
 
+/// The label every unregistered ID shares past [`MAX_UNREGISTERED_SOURCES`].
+pub const UNREGISTERED: &str = "UNREGISTERED";
+
 /// Which branch [`label_in`] took, so the caller owns the metrics.
 pub(crate) enum LabelOutcome {
     Existing,
@@ -105,7 +108,7 @@ pub(crate) fn label_in(
         return (label, LabelOutcome::Existing);
     }
     if map.len() >= MAX_UNREGISTERED_SOURCES {
-        return ("UNREGISTERED", LabelOutcome::Capped);
+        return (UNREGISTERED, LabelOutcome::Capped);
     }
     let leaked: &'static str = Box::leak(format!("SOURCE_{source_id}").into_boxed_str());
     map.insert(source_id, leaked);
@@ -115,9 +118,9 @@ pub(crate) fn label_in(
 /// The label to stamp as `source_name`/`venue` for a Source ID. Total — `venue` is never blank.
 ///
 /// A registered ID yields its registry name. An unregistered one yields a stable synthesized
-/// `SOURCE_<id>`, distinct per ID: the arbiter keys dedup on `(venue, symbol)`, so collapsing
-/// distinct unregistered sources into one label would merge unrelated markets. Past
-/// [`MAX_UNREGISTERED_SOURCES`] distinct IDs, everything shares `UNREGISTERED`.
+/// `SOURCE_<id>`, distinct per ID, so consumers can tell them apart. Past
+/// [`MAX_UNREGISTERED_SOURCES`] distinct IDs, everything shares [`UNREGISTERED`], and
+/// `model::SourceKey` collapses those IDs to one key, which is what bounds per-source state.
 ///
 /// Labels are leaked deliberately — `venue` is `&'static str` throughout the ingest hot path, and
 /// the leak is bounded by the cap.

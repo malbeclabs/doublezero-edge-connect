@@ -57,7 +57,7 @@ use crate::{
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
-        sources::{source_id_of, source_label},
+        sources::source_id_of,
     },
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
@@ -229,10 +229,9 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
 }
 
 /// Re-fetch the full instrument record for an identity `resolve()` already matched.
-/// `InstrumentSnapshot` is keyed exactly on this identity (`(venue, category, channel,
-/// instrument_id)`), so this is a direct lookup, not a scan — `venue` is rederived from
-/// `source_id` the same way `ingest::processor` resolved it when it wrote the entry
-/// (`venue_arc(source_label(source_id))`). `category` must come from the same resolved
+/// `InstrumentSnapshot` is keyed exactly on this identity (`(source, category, channel,
+/// instrument_id)`), so this is a direct lookup, not a scan — the source key is rebuilt from
+/// `source_id` (`SourceKey::from_id`), as `ingest::processor` built it when it wrote the entry. `category` must come from the same resolved
 /// `ProductId` `resolve()` returned: two disjoint universes under one Source ID can share
 /// `(channel, instrument_id)`, and a lookup keyed on the wire identity alone would silently name
 /// whichever universe's entry happened to occupy that slot.
@@ -243,10 +242,35 @@ fn lookup_instrument(
     channel: u8,
     instrument_id: u32,
 ) -> Option<NormalizedInstrument> {
-    let venue = venue_arc(source_label(source_id));
     let map = crate::model::lock(&state.instruments);
-    map.get(&(venue, category.clone(), channel, instrument_id))
-        .cloned()
+    map.get(&(
+        crate::model::SourceKey::from_id(source_id),
+        category.clone(),
+        channel,
+        instrument_id,
+    ))
+    .cloned()
+}
+
+/// Sort on exactly `InstrumentSnapshot`'s own key (`(source, category, channel, instrument_id)`),
+/// the one tuple that uniquely identifies every entry, so a cursor walk neither skips nor repeats.
+fn sort_catalog(instruments: &mut [NormalizedInstrument]) {
+    instruments.sort_by(|a, b| {
+        (
+            a.venue.as_ref(),
+            a.source_id,
+            a.category.as_ref(),
+            a.channel,
+            a.instrument_id,
+        )
+            .cmp(&(
+                b.venue.as_ref(),
+                b.source_id,
+                b.category.as_ref(),
+                b.channel,
+                b.instrument_id,
+            ))
+    });
 }
 
 /// Whether more than one instrument shares `(source_id, symbol)` — what decides whether a
@@ -288,23 +312,8 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
     // `limit`/`cursor` page the catalog — the same shape the emulated tool's own paginated list
     // endpoints use. Unset `limit` keeps today's behaviour (every product, one response, no
     // `cursor` field): a page size is never imposed unless the caller asks for one. Pagination
-    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own, so this
-    // sorts on exactly `InstrumentSnapshot`'s own key (`(venue, category, channel,
-    // instrument_id)`), the one tuple that already uniquely identifies every entry.
-    instruments.sort_by(|a, b| {
-        (
-            a.venue.as_ref(),
-            a.category.as_ref(),
-            a.channel,
-            a.instrument_id,
-        )
-            .cmp(&(
-                b.venue.as_ref(),
-                b.category.as_ref(),
-                b.channel,
-                b.instrument_id,
-            ))
-    });
+    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own.
+    sort_catalog(&mut instruments);
 
     let limit = match req.query("limit") {
         None => None,
@@ -455,7 +464,7 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> (&'static str, O
     {
         let books = crate::model::lock(&state.books);
         if let Some(acc) = books.get(&(
-            i.venue.clone(),
+            crate::model::SourceKey::of(i),
             i.category.clone(),
             i.channel,
             i.instrument_id,
@@ -473,7 +482,7 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> (&'static str, O
     }
     {
         let depth = crate::model::lock(&state.depth);
-        if depth.contains_key(&(i.venue.clone(), i.symbol.clone())) {
+        if depth.contains_key(&(crate::model::SourceKey::of(i), i.symbol.clone())) {
             return ("market_by_order", None);
         }
     }
@@ -652,7 +661,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
         let books = crate::model::lock(&state.books);
         books
             .get(&(
-                inst.venue.clone(),
+                crate::model::SourceKey::of(inst),
                 inst.category.clone(),
                 inst.channel,
                 inst.instrument_id,
@@ -674,7 +683,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
         return (None, None);
     }
     let depth = crate::model::lock(&state.depth);
-    if let Some(d) = depth.get(&(inst.venue.clone(), inst.symbol.clone())) {
+    if let Some(d) = depth.get(&(crate::model::SourceKey::of(inst), inst.symbol.clone())) {
         let bid = d.bids.first().map(|b| (b[0], b[1]));
         let ask = d.asks.first().map(|a| (a[0], a[1]));
         return (bid, ask);
@@ -713,7 +722,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // on a copy taken out from under the guard, the same discipline `sinks/hyperliquid.rs` follows:
     // ~617 µs held to clone the 44,598-order market against ~8.9 ms to fold it.
     let key = (
-        inst.venue.clone(),
+        crate::model::SourceKey::of(inst),
         inst.category.clone(),
         inst.channel,
         inst.instrument_id,
@@ -810,7 +819,8 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // honest answer is "we don't know" — `complete: false`, not a guess.
     let depth_entry = {
         let d = crate::model::lock(&state.depth);
-        d.get(&(inst.venue.clone(), inst.symbol.clone())).cloned()
+        d.get(&(crate::model::SourceKey::of(inst), inst.symbol.clone()))
+            .cloned()
     };
     if let Some(d) = depth_entry {
         let complete = d.bids.len() < DEPTH_LEVELS && d.asks.len() < DEPTH_LEVELS;
@@ -1696,6 +1706,19 @@ mod tests {
         );
     }
 
+    /// Two IDs under one label at the same identity sort the same whatever order the map yields them.
+    #[test]
+    fn the_catalog_order_does_not_depend_on_map_order() {
+        let a = inst_in("c", 4, "SHARED", "X", 0, 1, -2, -2);
+        let b = inst_in("c", 10, "SHARED", "Y", 0, 1, -2, -2);
+        let mut one = vec![a.clone(), b.clone()];
+        let mut two = vec![b, a];
+        sort_catalog(&mut one);
+        sort_catalog(&mut two);
+        let ids = |v: &[NormalizedInstrument]| v.iter().map(|i| i.source_id).collect::<Vec<_>>();
+        assert_eq!(ids(&one), ids(&two));
+    }
+
     /// A malformed/zero `limit` and an unparseable `cursor` are both rejected with a named remedy
     /// rather than silently substituted — the same strictness `candles`' own `limit` gets.
     #[tokio::test]
@@ -2450,7 +2473,12 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u8, 1u32),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "perps".into(),
+                9u8,
+                1u32,
+            ),
             inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2),
         );
         {
@@ -2482,7 +2510,15 @@ mod tests {
                 level = end;
             }
             assert!(acc.baselined(), "fixture sanity");
-            map.insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+            map.insert(
+                (
+                    crate::model::SourceKey::new(3, "HUGE".into()),
+                    "perps".into(),
+                    9,
+                    1,
+                ),
+                acc,
+            );
         }
 
         let state = ApiState {
@@ -2646,11 +2682,19 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u8, 1u32),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "perps".into(),
+                9u8,
+                1u32,
+            ),
             inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2),
         );
         depth.lock().unwrap().insert(
-            ("HUGE".into(), "HUGEL3".into()),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "HUGEL3".into(),
+            ),
             NormalizedDepth {
                 venue: "HUGE".into(),
                 source_name: "HUGE".into(),
@@ -2695,10 +2739,15 @@ mod tests {
                 o = end;
             }
             assert!(acc.baselined() && acc.is_order_level(), "fixture sanity");
-            books
-                .lock()
-                .unwrap()
-                .insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+            books.lock().unwrap().insert(
+                (
+                    crate::model::SourceKey::new(3, "HUGE".into()),
+                    "perps".into(),
+                    9,
+                    1,
+                ),
+                acc,
+            );
         }
         let state = ApiState {
             instruments,
