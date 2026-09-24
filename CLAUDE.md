@@ -150,7 +150,7 @@ Modules are grouped by role under `src/`:
   `doublezero-edge/src/types.rs` — so an additive upstream change is ignored and reported by path at
   `warn`, never rejected; a *missing required* field stays fatal, so a typo cannot quietly default.
   Validation covers the structural per-row rules (non-empty `code`/`category`, a `venue` that
-  `sources::source_id_of` resolves, base ports unique within a row, a non-empty published set, no port
+  `sources::source_ids_of` resolves, base ports unique within a row, a non-empty published set, no port
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
   port roles, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key
   from a
@@ -268,9 +268,10 @@ Modules are grouped by role under `src/`:
   against **that document's own** block when one is present, so a row and the block naming its venue
   always travel together. Names are **uppercase** because that is the form that reaches consumers —
   `venue`/`source_name` on the WebSocket, every `venue=` metric label value, and the `SOURCE:SYMBOL`
-  product identifier a consumer composes from them — and the loader refuses a lowercase name, a
-  duplicate id and a duplicate name for that reason. `source_name` is the one emitted name per ID and
-  `source_id_of` is its exact inverse. ID 3's pre-launch codename used to be accepted on input as
+  product identifier a consumer composes from them — and the loader refuses a lowercase name and a
+  duplicate id. Several IDs may share a name (one venue running several matching engines); state
+  stays per ID. `source_name` is the one emitted name per ID and `source_ids_of` returns every ID
+  for a name. ID 3's pre-launch codename used to be accepted on input as
   well; it was dropped once the ledger re-registered the Kalshi groups under their `edge-kalshi-*`
   codes and nothing fed the old name in. A `venue` in the document **must** be a name that resolves,
   or `receiver::record_revealed` silently drops it and the row's `status` feed goes unrecorded. An
@@ -941,7 +942,7 @@ Modules are grouped by role under `src/`:
   **not** subscription-gated): the same broadcast re-served in *Hyperliquid's* schema so an existing
   Hyperliquid client needs only a URL change. A **rendering, not a second pipeline** — no ingest state,
   no dedup identity, no arbitration input — so it is documented in `docs/output-sinks.md` and **never**
-  in PROTOCOL.md, which is the contract for our own protocol only. Scoped to `VENUE = "HYPERLIQUID"`
+  in PROTOCOL.md, which is the contract for our own protocol only. Scoped to `SOURCE_ID = 1`
   (`coin` is our `symbol`), with `bind()` split from `serve()` like `ws`'s. Three channels off the
   order-keyed `BookAccumulator` in the shared `BookSnapshot`: `l2Book` (snapshot-per-update from
   `price_fold()` — whose per-level order count is the whole reason the accumulator is order-keyed;
