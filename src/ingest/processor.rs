@@ -1135,7 +1135,7 @@ impl MboProcessor {
         let mut arb = lock(ctx.arbiter);
         for (key, symbol) in &self.emitted_symbol {
             if let Some(venue) = self.wire_venue(key) {
-                arb.reset_depth_floor_for_symbol(venue.name(), symbol, reason);
+                arb.reset_depth_floor_for_symbol(&venue, symbol, reason);
             }
         }
     }
@@ -1900,7 +1900,7 @@ impl DatagramProcessor for MboProcessor {
                     match (latched_symbol, latched_venue) {
                         (Some(symbol), Some(venue)) => {
                             lock(ctx.arbiter).reset_depth_floor_for_symbol(
-                                venue.name(),
+                                &venue,
                                 &symbol,
                                 "instrument_reset",
                             );

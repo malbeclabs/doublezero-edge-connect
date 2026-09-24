@@ -1920,12 +1920,12 @@ impl Arbiter {
     /// a still-live publisher's next depth re-opens the tick, possibly re-admitting a snapshot at
     /// an already-served `source_ts` — full-state, so consumers self-heal. Strictly better than
     /// the permanent wedge the reset prevents.
-    pub fn reset_depth_floor_for_venue(&mut self, venue: &str, reason: &'static str) {
-        let cleared = self.depths.reset_where(|(v, _)| v.name() == venue);
+    pub fn reset_depth_floor_for_venue(&mut self, source: &SourceKey, reason: &'static str) {
+        let cleared = self.depths.reset_where(|(v, _)| v == source);
         if let Some(replay) = &self.depth_replay {
-            model::lock(replay).retain(|(v, _), _| v.name() != venue);
+            model::lock(replay).retain(|(v, _), _| v != source);
         }
-        self.record_floor_resets(venue, reason, cleared);
+        self.record_floor_resets(source.name(), reason, cleared);
     }
 
     /// Clear one `(venue, symbol)` latched depth-floor entry (and its WS-replay entry, for the
@@ -1941,17 +1941,17 @@ impl Arbiter {
     /// clear (a venue clock restart would wedge the symbol permanently).
     pub fn reset_depth_floor_for_symbol(
         &mut self,
-        venue: &str,
+        source: &SourceKey,
         symbol: &str,
         reason: &'static str,
     ) {
         let cleared = self
             .depths
-            .reset_where(|(v, s)| v.name() == venue && s.as_ref() == symbol);
+            .reset_where(|(v, s)| v == source && s.as_ref() == symbol);
         if let Some(replay) = &self.depth_replay {
-            model::lock(replay).retain(|(v, s), _| !(v.name() == venue && s.as_ref() == symbol));
+            model::lock(replay).remove(&(source.clone(), Arc::from(symbol)));
         }
-        self.record_floor_resets(venue, reason, cleared);
+        self.record_floor_resets(source.name(), reason, cleared);
     }
 
     /// Record cleared floor entries in `dz_depth_floor_resets_total{venue, reason}` (shared by
@@ -4279,6 +4279,35 @@ mod tests {
     /// session boundary must not be replayed the ended session's final book — and for an
     /// instrument the new session never re-lists, nothing else would ever remove the entry. The
     /// symbol reset purges exactly its key; the venue reset purges only that venue's entries.
+    /// A reset for one ID leaves a sibling under the same name alone: the sibling's repeat is still
+    /// dropped after the other ID's floor is cleared.
+    #[test]
+    fn resetting_one_ids_depth_floor_leaves_the_sibling_intact() {
+        let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        let mk = |id: u16| {
+            let mut d = depth(1000, vec![[100.0, 1.0]], vec![[101.0, 1.0]]);
+            d.source_id = id;
+            d.venue = "SHARED".into();
+            d.source_name = "SHARED".into();
+            FeedMessage::Depth(d)
+        };
+        a.emit(mk(1), edge, TEST_CATEGORY);
+        a.emit(mk(7), edge, TEST_CATEGORY);
+        while rx.try_recv().is_ok() {}
+        a.reset_depth_floor_for_venue(&SourceKey::new(1, "SHARED".into()), "test");
+        a.emit(mk(1), edge, TEST_CATEGORY);
+        a.emit(mk(7), edge, TEST_CATEGORY);
+        let mut ids = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let FeedMessage::Depth(d) = &*m {
+                ids.push(d.source_id);
+            }
+        }
+        assert_eq!(ids, vec![1]);
+    }
+
     #[test]
     fn arbiter_depth_floor_reset_purges_replay_entries() {
         let edge = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
@@ -4299,7 +4328,7 @@ mod tests {
         a.emit(mk("VenueB", "BTC"), edge, TEST_CATEGORY);
         assert_eq!(model::lock(&replay).len(), 3);
 
-        a.reset_depth_floor_for_symbol("VenueA", "BTC", "instrument_reset");
+        a.reset_depth_floor_for_symbol(&SourceKey::unassigned("VenueA"), "BTC", "instrument_reset");
         {
             let map = model::lock(&replay);
             assert!(!map.contains_key(&key("VenueA", "BTC")), "reset key purged");
@@ -4310,7 +4339,7 @@ mod tests {
             assert!(map.contains_key(&key("VenueB", "BTC")), "other venue kept");
         }
 
-        a.reset_depth_floor_for_venue("VenueA", "end_of_session");
+        a.reset_depth_floor_for_venue(&SourceKey::unassigned("VenueA"), "end_of_session");
         {
             let map = model::lock(&replay);
             assert!(
@@ -4339,7 +4368,7 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         a.emit(mk(5000, 100.0), edge, TEST_CATEGORY); // latches high_water at 5000
         a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // post-restart lower tick -> stale, dropped (the wedge)
-        a.reset_depth_floor_for_venue(venue, "end_of_session");
+        a.reset_depth_floor_for_venue(&SourceKey::unassigned(venue), "end_of_session");
         a.emit(mk(100, 99.0), edge, TEST_CATEGORY); // floor cleared -> re-opens the tick, admitted
         let ts: Vec<u64> = {
             let mut out = Vec::new();
@@ -4375,7 +4404,7 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         a.emit(mk("VenueA", 5000), edge, TEST_CATEGORY);
         a.emit(mk("VenueB", 5000), edge, TEST_CATEGORY);
-        a.reset_depth_floor_for_venue("VenueA", "end_of_session");
+        a.reset_depth_floor_for_venue(&SourceKey::unassigned("VenueA"), "end_of_session");
         a.emit(mk("VenueA", 100), edge, TEST_CATEGORY); // cleared -> admitted
         a.emit(mk("VenueB", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
@@ -4412,7 +4441,11 @@ mod tests {
         let mut a = Arbiter::new(tx, 8);
         a.emit(mk("BTC", 5000), edge, TEST_CATEGORY);
         a.emit(mk("ETH", 5000), edge, TEST_CATEGORY);
-        a.reset_depth_floor_for_symbol("HYPERLIQUID", "BTC", "instrument_reset");
+        a.reset_depth_floor_for_symbol(
+            &SourceKey::unassigned("HYPERLIQUID"),
+            "BTC",
+            "instrument_reset",
+        );
         a.emit(mk("BTC", 100), edge, TEST_CATEGORY); // cleared -> admitted
         a.emit(mk("ETH", 100), edge, TEST_CATEGORY); // untouched -> still stale, dropped
         let seen: Vec<(String, u64)> = {
