@@ -41,6 +41,74 @@ pub fn venue_arc(venue: &'static str) -> Arc<str> {
     intern_static(&INTERN, venue)
 }
 
+/// A source's internal identity: its wire Source ID plus its label. Equality includes the ID, so two
+/// IDs sharing a label keep separate state; the label keeps unassigned (`0`) sources apart. The label
+/// is for output only: there is no `PartialEq<str>`, so a name comparison is always explicit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceKey(u16, Arc<str>);
+
+impl SourceKey {
+    pub fn new(id: u16, name: Arc<str>) -> Self {
+        Self(id, name)
+    }
+
+    /// The key for a wire Source ID, labelled as the registry names it.
+    pub fn from_id(id: u16) -> Self {
+        Self(id, venue_arc(crate::ingest::sources::source_label(id)))
+    }
+
+    pub fn of<M: HasSource>(m: &M) -> Self {
+        Self(m.source_id(), m.venue().clone())
+    }
+
+    pub fn id(&self) -> u16 {
+        self.0
+    }
+
+    pub fn name(&self) -> &str {
+        &self.1
+    }
+
+    /// The label as the shared `Arc`, for a message field.
+    pub fn name_arc(&self) -> &Arc<str> {
+        &self.1
+    }
+}
+
+impl std::fmt::Display for SourceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+/// A normalized message that names its source.
+pub trait HasSource {
+    fn source_id(&self) -> u16;
+    fn venue(&self) -> &Arc<str>;
+}
+
+macro_rules! impl_has_source {
+    ($($t:ty),*) => {$(
+        impl HasSource for $t {
+            fn source_id(&self) -> u16 {
+                self.source_id
+            }
+            fn venue(&self) -> &Arc<str> {
+                &self.venue
+            }
+        }
+    )*};
+}
+
+impl_has_source!(
+    NormalizedQuote,
+    NormalizedTrade,
+    NormalizedMidpoint,
+    NormalizedDepth,
+    NormalizedBook,
+    NormalizedInstrument
+);
+
 /// The same interner for a feed **category** (`ingest::feeds::Feed::category`), which the arbiter's
 /// tape gate pairs with the venue to key one entry per *universe* rather than per venue. Interned
 /// for exactly the reason venues are: that key is built on the trade hot path, once per print, and
@@ -1081,6 +1149,28 @@ pub fn now_mono_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_key_equality_includes_the_id() {
+        let a = SourceKey::new(1, Arc::from("SHARED"));
+        let b = SourceKey::new(7, Arc::from("SHARED"));
+        assert_ne!(a, b);
+        assert_eq!(a.name(), b.name());
+        assert_eq!(a, SourceKey::new(1, Arc::from("SHARED")));
+    }
+
+    #[test]
+    fn source_key_keeps_unassigned_names_apart() {
+        assert_ne!(
+            SourceKey::new(0, Arc::from("A")),
+            SourceKey::new(0, Arc::from("B"))
+        );
+    }
+
+    #[test]
+    fn source_key_displays_its_name() {
+        assert_eq!(SourceKey::new(3, Arc::from("NAME")).to_string(), "NAME");
+    }
 
     /// `order_id` is additive: a payload written before the field still parses, and an order-level
     /// change round-trips its id. Zero is the price-aggregated sentinel — what Market-by-Price emits
