@@ -120,10 +120,7 @@ pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
     let map = crate::model::lock(instruments);
     let mut hits: Vec<ProductId> = map
         .values()
-        .filter(|i| {
-            source_label(i.source_id).eq_ignore_ascii_case(&id.source)
-                && i.symbol.as_ref() == id.symbol
-        })
+        .filter(|i| i.venue.eq_ignore_ascii_case(&id.source) && i.symbol.as_ref() == id.symbol)
         .map(|i| ProductId {
             source_id: i.source_id,
             symbol: i.symbol.clone(),
@@ -285,6 +282,42 @@ mod tests {
             );
         }
         std::sync::Arc::new(std::sync::Mutex::new(map))
+    }
+
+    fn shared(source_id: u16, symbol: &str, instrument_id: u32) -> NormalizedInstrument {
+        let mut i = instrument("c", symbol, 0, instrument_id);
+        i.source_id = source_id;
+        i.venue = "SHARED".into();
+        i.source_name = "SHARED".into();
+        i
+    }
+
+    /// Distinct symbols under two IDs of one name resolve by name, each to its own ID.
+    #[test]
+    fn distinct_symbols_under_a_shared_name_resolve_to_their_own_id() {
+        let snap = snapshot(vec![shared(4, "A", 1), shared(10, "dex:A", 2)]);
+        for (raw, want) in [("SHARED:A", 4), ("SHARED:dex:A", 10)] {
+            match resolve(&snap, &parse(raw).unwrap()) {
+                Resolution::One(p) => assert_eq!(p.source_id, want, "{raw}"),
+                other => panic!("{raw}: {other:?}"),
+            }
+        }
+    }
+
+    /// A symbol listed under both IDs is ambiguous by name, and each suffix resolves to its own ID.
+    #[test]
+    fn a_symbol_under_two_ids_of_a_shared_name_needs_its_suffix() {
+        let snap = snapshot(vec![shared(4, "B", 1), shared(10, "B", 2)]);
+        assert!(matches!(
+            resolve(&snap, &parse("SHARED:B").unwrap()),
+            Resolution::Ambiguous(c) if c.len() == 2
+        ));
+        for (raw, want) in [("SHARED:B#0.1", 4), ("SHARED:B#0.2", 10)] {
+            match resolve(&snap, &parse(raw).unwrap()) {
+                Resolution::One(p) => assert_eq!(p.source_id, want, "{raw}"),
+                other => panic!("{raw}: {other:?}"),
+            }
+        }
     }
 
     #[test]
