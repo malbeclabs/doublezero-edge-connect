@@ -1371,8 +1371,8 @@ pub struct Arbiter {
     /// high-water — and 0, the "not available" sentinel, bypasses this floor entirely. Revisit if
     /// a venue with a session-scoped quote clock is ever added. The key `(venue, symbol)` is
     /// `Arc<str>` (venues interned via `model::venue_arc`), so building it allocates nothing.
-    quotes: StalenessFloor<(Arc<str>, Arc<str>), QuoteId, Transport>,
-    trades: WindowedDedup<(Arc<str>, Arc<str>), u64, Transport>,
+    quotes: StalenessFloor<(SourceKey, Arc<str>), QuoteId, Transport>,
+    trades: WindowedDedup<(SourceKey, Arc<str>), u64, Transport>,
     /// Cross-publisher dedup for MBO `depth`. Each publisher reconstructs its own book (per
     /// `(publisher, instrument)` in [`crate::ingest::processor::MboProcessor`]) and emits full-state
     /// snapshots; this floor collapses the redundant publishers' depth the same way the quote floor
@@ -1384,7 +1384,7 @@ pub struct Arbiter {
     /// self-heal (the floor stays latched) — so the MBO processor clears the affected entries on
     /// `EndOfSession` / `InstrumentReset` via [`Arbiter::reset_depth_floor_for_venue`] /
     /// [`Arbiter::reset_depth_floor_for_symbol`], the session-reset escape hatch.
-    depths: StalenessFloor<(Arc<str>, Arc<str>), DepthId, Transport>,
+    depths: StalenessFloor<(SourceKey, Arc<str>), DepthId, Transport>,
     /// Shared latest-`depth` map the WS server replays on connect, keyed `(venue, symbol)`. Written
     /// here — on the floor's **admit** decision — so the replayed snapshot is always the *leader's*
     /// broadcast book, never a non-leader publisher's (possibly divergent) copy that never crossed
@@ -1402,7 +1402,7 @@ pub struct Arbiter {
     /// symbol-keyed rate limit would starve a `{"channel":N}` subscriber of a definition another
     /// channel announced first. Bounded by the distinct instrument count, like the
     /// `InstrumentSnapshot` `processor::upsert_instrument` maintains.
-    instrument_defs: HashMap<(Arc<str>, u8, u32), (InstrumentId, u64)>,
+    instrument_defs: HashMap<(SourceKey, u8, u32), (InstrumentId, u64)>,
     /// Per-venue pre-resolved metric children, so `emit` increments a cached handle instead of doing
     /// a `with_label_values` label-map lookup per message (mirrors the `SeqEvents` pattern in the
     /// receiver). Populated lazily on the first message for each venue; venues are a tiny fixed set.
@@ -1427,7 +1427,7 @@ pub struct Arbiter {
     ///
     /// Bounded like `instrument_defs`: one entry per `(venue, symbol)` that ever carries a zero-id
     /// print, which no live feed does today.
-    no_id_owner: HashMap<(Arc<str>, Arc<str>), (Transport, u64)>,
+    no_id_owner: HashMap<(SourceKey, Arc<str>), (Transport, u64)>,
     /// Which **path** serves each `Sticky` universe's tape, keyed on `(venue, category)`. See
     /// [`Arbiter::tape_path_admits`]. One entry per `Sticky` universe that has ever printed.
     ///
@@ -1921,7 +1921,7 @@ impl Arbiter {
     /// an already-served `source_ts` — full-state, so consumers self-heal. Strictly better than
     /// the permanent wedge the reset prevents.
     pub fn reset_depth_floor_for_venue(&mut self, venue: &str, reason: &'static str) {
-        let cleared = self.depths.reset_where(|(v, _)| v.as_ref() == venue);
+        let cleared = self.depths.reset_where(|(v, _)| v.name() == venue);
         if let Some(replay) = &self.depth_replay {
             model::lock(replay).retain(|(v, _), _| v.name() != venue);
         }
@@ -1947,7 +1947,7 @@ impl Arbiter {
     ) {
         let cleared = self
             .depths
-            .reset_where(|(v, s)| v.as_ref() == venue && s.as_ref() == symbol);
+            .reset_where(|(v, s)| v.name() == venue && s.as_ref() == symbol);
         if let Some(replay) = &self.depth_replay {
             model::lock(replay).retain(|(v, s), _| !(v.name() == venue && s.as_ref() == symbol));
         }
@@ -2819,7 +2819,7 @@ impl Arbiter {
     /// Claim the `(venue, symbol)` zero-id tape for `publisher`, returning whether a *concurrent*
     /// second emitter was detected. `Coordinated` venues only — see the `Trade` branch.
     fn claim_no_id_tape(&mut self, t: &NormalizedTrade, publisher: Transport) -> bool {
-        let key = (t.venue.clone(), t.symbol.clone());
+        let key = (SourceKey::of(t), t.symbol.clone());
         match self.no_id_owner.get_mut(&key) {
             // The owner printing again, or a challenger inheriting a tape that has gone quiet past
             // the handover window: either way one emitter, no conflict.
@@ -2951,7 +2951,7 @@ impl Arbiter {
                     self.vm(&q.venue).quotes_future_rejected.inc();
                     return;
                 }
-                let key = (q.venue.clone(), q.symbol.clone());
+                let key = (SourceKey::of(q), q.symbol.clone());
                 // `recv_ts_ns` is the cross-transport-comparable arrival clock (host wall clock,
                 // sampled for both the edge receiver and the public WS input).
                 let decision =
@@ -3040,7 +3040,7 @@ impl Arbiter {
                     let _ = self.tx.send(Arc::new(msg));
                     return;
                 }
-                let key = (t.venue.clone(), t.symbol.clone());
+                let key = (SourceKey::of(t), t.symbol.clone());
                 let decision = self.trades.admit(key, t.trade_id, publisher, t.recv_ts_ns);
                 let vm = self.vm(&t.venue);
                 match decision {
@@ -3072,7 +3072,7 @@ impl Arbiter {
                     tick_size: i.tick_size,
                 };
                 let now = now_mono_ns();
-                let key = (i.venue.clone(), i.channel, i.instrument_id);
+                let key = (SourceKey::of(i), i.channel, i.instrument_id);
                 let forward = match self.instrument_defs.get(&key) {
                     Some((prev, last)) => {
                         *prev != id || now.saturating_sub(*last) >= INSTRUMENT_REANNOUNCE_NS
@@ -3113,7 +3113,7 @@ impl Arbiter {
                 // later event has `source_ts > 0` and re-advances the floor; only a perpetually-empty
                 // book (no market data at all — nothing to serve) leaves the non-leader dropped, and
                 // depth is full-state self-healing so nothing is lost.
-                let key = (d.venue.clone(), d.symbol.clone());
+                let key = (SourceKey::of(d), d.symbol.clone());
                 let decision =
                     self.depths
                         .admit(key, d.source_ts_ns, DepthId::of(d), publisher, d.recv_ts_ns);
@@ -3774,6 +3774,57 @@ mod tests {
     /// The same BBO at the same `source_ts` mirrored by two distinct multicast publishers collapses
     /// to one emission: the first publisher to open the tick leads it, and the second's identical
     /// copy is a non-leader no-op. This is the cross-publisher duplicate-packet case.
+    fn quote_from(source_id: u16, source_ts_ns: u64) -> NormalizedQuote {
+        let mut q = quote(source_ts_ns, 100.0, 101.0);
+        q.source_id = source_id;
+        q.venue = "SHARED".into();
+        q.source_name = "SHARED".into();
+        q
+    }
+
+    /// Two IDs under one name are not mirrors: an identical quote from each is emitted twice.
+    #[test]
+    fn identical_quotes_from_two_ids_sharing_a_name_both_emit() {
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        a.emit(
+            FeedMessage::Quote(quote_from(1, 1000)),
+            pub_a,
+            TEST_CATEGORY,
+        );
+        a.emit(
+            FeedMessage::Quote(quote_from(7, 1000)),
+            pub_b,
+            TEST_CATEGORY,
+        );
+        assert_eq!(drain_quotes(&mut rx).len(), 2);
+    }
+
+    /// Same for trades: one ID's trade_id window does not swallow the other's.
+    #[test]
+    fn identical_trades_from_two_ids_sharing_a_name_both_emit() {
+        let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let pub_b = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut a = Arbiter::new(tx, 8);
+        for (id, publisher) in [(1u16, pub_a), (7u16, pub_b)] {
+            let mut t = trade(42);
+            t.source_id = id;
+            t.venue = "SHARED".into();
+            t.source_name = "SHARED".into();
+            a.emit(FeedMessage::Trade(t), publisher, TEST_CATEGORY);
+        }
+        let mut n = 0;
+        while let Ok(m) = rx.try_recv() {
+            if matches!(&*m, FeedMessage::Trade(_)) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 2);
+    }
+
     #[test]
     fn duplicate_quote_from_two_multicast_publishers_emitted_once() {
         let pub_a = Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
