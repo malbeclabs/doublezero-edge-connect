@@ -39,7 +39,7 @@ pub const DEFAULT_WS_INPUT_URL: &str = "wss://api.hyperliquid.xyz/ws";
 /// ID, see `processor.rs`) and this backstop cannot drift into naming one market two different
 /// things — a split that would fork the arbiter's `(venue, symbol)` dedup floor and emit both
 /// copies to the wire as duplicates under two names.
-const HL_SOURCE_ID: u16 = 1;
+use crate::ingest::sources::HYPERLIQUID_SOURCE_ID as HL_SOURCE_ID;
 
 /// The venue every public message is tagged with — always [`HL_SOURCE_ID`]'s registry name, so it
 /// matches whatever the edge HL feed names the same market and both land in the same arbiter floor.

@@ -46,7 +46,7 @@ use crate::{
 /// our `symbol`; a message from another source has no `coin` to be and is dropped before any
 /// rendering. Matched on the ID, not the name: several IDs may share a name, and another ID is a
 /// different engine.
-const SOURCE_ID: u16 = 1;
+use crate::ingest::sources::HYPERLIQUID_SOURCE_ID as SOURCE_ID;
 
 /// `nLevels` when the subscription omits it, and the ceiling it is clamped to — both from the
 /// publisher's `types/subscription.rs`.

@@ -23,10 +23,14 @@ pub struct SourceAssignment {
     pub name: &'static str,
 }
 
+/// Hyperliquid's Source ID, shared by the public backstop (`ingest::ws_input`) and the
+/// Hyperliquid-schema sink (`sinks::hyperliquid`) so the two cannot drift apart.
+pub const HYPERLIQUID_SOURCE_ID: u16 = 1;
+
 /// The compiled-in mirror, used when the resolved document carries no `sources` block.
 const BUILT_IN: [SourceAssignment; 3] = [
     SourceAssignment {
-        id: 1,
+        id: HYPERLIQUID_SOURCE_ID,
         name: "HYPERLIQUID",
     },
     SourceAssignment {
