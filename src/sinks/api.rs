@@ -284,6 +284,17 @@ fn is_ambiguous(state: &ApiState, name: &str, symbol: &Arc<str>) -> bool {
         > 1
 }
 
+/// Whether more than one instrument shares `(source_id, symbol)` — the grain the `depth` snapshot
+/// is keyed on, so what decides whether [`best_levels`] can name whose inside market it holds. By
+/// ID, unlike [`is_ambiguous`]: two IDs under one name keep separate depth entries.
+fn depth_is_ambiguous(state: &ApiState, source_id: u16, symbol: &Arc<str>) -> bool {
+    let map = crate::model::lock(&state.instruments);
+    map.values()
+        .filter(|i| i.source_id == source_id && i.symbol.as_ref() == symbol.as_ref())
+        .count()
+        > 1
+}
+
 // ---------------------------------------------------------------------------------------------
 // GET /v1/products, GET /v1/products/{id}
 // ---------------------------------------------------------------------------------------------
@@ -610,7 +621,11 @@ fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         .collect();
 
     // One instrument, so one catalog scan — the same cost `book()` already pays per request.
-    let (bid, ask) = best_levels(state, inst, is_ambiguous(state, &inst.venue, &inst.symbol));
+    let (bid, ask) = best_levels(
+        state,
+        inst,
+        depth_is_ambiguous(state, inst.source_id, &inst.symbol),
+    );
     ok_json(json!({
         "trades": trades_json,
         "best_bid": bid.map(|(p, _)| decimal_string(p, inst.price_exponent)),
@@ -646,7 +661,7 @@ type Level = Option<(f64, f64)>;
 /// catalog under the lock the ingest hot path's `upsert_instrument` writes on every refdata burst,
 /// and the fall-through below is reached for *every* order-level and depth-only market — so deriving
 /// it here would make one unfiltered `best_bid_ask` O(catalog²) with an acquisition per instrument.
-/// That endpoint already counts `(source_id, symbol)` once for its `product_id` rendering.
+/// That endpoint counts `(source_id, symbol)` once up front.
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -> (Level, Level) {
     let from_book = {
         let books = crate::model::lock(&state.books);
@@ -914,10 +929,12 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
         map.values().cloned().collect()
     };
     let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut depth_counts: HashMap<(u16, &str), usize> = HashMap::new();
     for i in &instruments {
         *counts
             .entry((i.venue.to_string(), i.symbol.to_string()))
             .or_insert(0) += 1;
+        *depth_counts.entry((i.source_id, &i.symbol)).or_insert(0) += 1;
     }
 
     // `product_ids==A,B` (comma-separated, matching the emulated tool's own filter) narrows the
@@ -971,15 +988,20 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
                 continue;
             }
         }
-        // The same count that renders `product_id` below also decides whether the `depth` fallback
-        // can name whose inside market it holds, so both read one map built once — rather than
-        // `best_levels` re-scanning the catalog per instrument, which is what made this O(catalog²).
+        // Counted once up front rather than `best_levels` re-scanning the catalog per instrument,
+        // which is what made this O(catalog²). By name for `product_id`, by ID for the `depth`
+        // fallback, since that is the grain each is keyed on.
         let ambiguous = counts
             .get(&(i.venue.to_string(), i.symbol.to_string()))
             .copied()
             .unwrap_or(1)
             > 1;
-        let (bid, ask) = best_levels(state, i, ambiguous);
+        let depth_ambiguous = depth_counts
+            .get(&(i.source_id, i.symbol.as_ref()))
+            .copied()
+            .unwrap_or(1)
+            > 1;
+        let (bid, ask) = best_levels(state, i, depth_ambiguous);
         if bid.is_none() && ask.is_none() {
             // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
             // docs); omitting it is honest, a zeroed/fabricated level would not be.
@@ -2650,16 +2672,34 @@ mod tests {
     }
 
     /// A symbol listed under two IDs of one name is ambiguous: its product id is `NAME:SYMBOL`
-    /// either way, so only the suffix tells them apart.
+    /// either way, so only the suffix tells them apart. Its depth is keyed per ID, so each still
+    /// reads its own inside market.
     #[test]
     fn a_symbol_under_two_ids_of_one_name_is_ambiguous() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
-        for (id, iid) in [(4u16, 1u32), (10, 2)] {
+        let mut insts = Vec::new();
+        for (id, iid, bid) in [(4u16, 1u32, 0.5), (10, 2, 0.7)] {
             let inst = inst_in("c", id, "SHARED", "B", 0, iid, -2, -2);
             instruments.lock().unwrap().insert(
                 (crate::model::SourceKey::of(&inst), "c".into(), 0, iid),
-                inst,
+                inst.clone(),
             );
+            depth.lock().unwrap().insert(
+                (crate::model::SourceKey::of(&inst), "B".into()),
+                NormalizedDepth {
+                    venue: "SHARED".into(),
+                    source_name: "SHARED".into(),
+                    source_id: id,
+                    symbol: "B".into(),
+                    bids: vec![[bid, 1.0]],
+                    asks: vec![],
+                    source_ts_ns: 7,
+                    recv_ts_ns: 0,
+                    kernel_rx_ts_ns: 0,
+                    ws_send_ts_ns: 0,
+                },
+            );
+            insts.push((inst, bid));
         }
         let state = ApiState {
             instruments,
@@ -2671,6 +2711,14 @@ mod tests {
             enabled,
         };
         assert!(is_ambiguous(&state, "SHARED", &Arc::from("B")));
+        for (inst, bid) in insts {
+            let ambiguous = depth_is_ambiguous(&state, inst.source_id, &inst.symbol);
+            assert!(!ambiguous, "one instrument per ID");
+            assert_eq!(
+                best_levels(&state, &inst, ambiguous),
+                (Some((bid, 1.0)), None)
+            );
+        }
     }
 
     /// `best_levels` runs under the same `books` guard `book()` does — and `best_bid_ask` fans it out
