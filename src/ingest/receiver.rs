@@ -312,8 +312,9 @@ struct ReceiverRegistration {
     arbiter: SharedArbiter,
     key: ReceiverKey,
     up_gauge: prometheus::IntGauge,
-    /// Source IP addresses this receiver has carried, so their book standing goes with it. Only Market-by-Order
-    /// receivers produce that standing, and a publisher host uses one IP, so this stays tiny.
+    /// Source IP addresses this receiver has carried, so their book standing and Source ID paths go
+    /// with it. Only the book kinds produce either, and a publisher host uses one IP, so this stays
+    /// tiny.
     publishers: Vec<IpAddr>,
 }
 
@@ -341,7 +342,11 @@ impl ReceiverRegistration {
     /// at the cap would let 256 forged datagrams stop a real publisher's standing being released on
     /// exit — the wedge this exists to close.
     fn note_publisher(&mut self, publisher: IpAddr) {
-        if self.key.2 != FeedKind::MarketByOrder || self.publishers.contains(&publisher) {
+        if !matches!(
+            self.key.2,
+            FeedKind::MarketByOrder | FeedKind::MarketByPrice
+        ) || self.publishers.contains(&publisher)
+        {
             return;
         }
         if self.publishers.len() >= MAX_PUBLISHERS {
@@ -369,7 +374,11 @@ impl Drop for ReceiverRegistration {
         if !self.publishers.is_empty() {
             let mut a = lock(arbiter);
             for &ip in &self.publishers {
-                a.forget_publisher_books(self.key.1, Transport::Edge(ip));
+                if self.key.2 == FeedKind::MarketByOrder {
+                    a.forget_publisher_books(self.key.1, Transport::Edge(ip));
+                } else {
+                    a.forget_publisher_sources(self.key.1, Transport::Edge(ip));
+                }
             }
         }
         self.health.deregister(self.key, |venue_up| {
@@ -1276,6 +1285,74 @@ mod tests {
         assert!(
             lock(&tob).book_path_synced(&market, Transport::Edge(ip)),
             "a quote receiver's exit says nothing about its publisher's books"
+        );
+    }
+
+    /// A Market-by-Price receiver's exit releases the Source ID paths it revealed, so a release
+    /// waiting on it is carried out; a Top-of-Book receiver of the same host reveals none.
+    #[test]
+    fn an_mbp_receivers_exit_releases_its_source_paths() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Transport},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let (ip, peer) = (
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        );
+        let market: crate::ingest::authority::MarketKey =
+            ("MBPDEPART".into(), "test".into(), 2u8, 41u32);
+        let catalog_after_exit = |kind, port| {
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let arbiter: SharedArbiter =
+                std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+            let catalog: crate::model::InstrumentSnapshot = Default::default();
+            crate::model::lock(&catalog).insert(
+                market.clone(),
+                crate::model::NormalizedInstrument {
+                    venue: "MBPDEPART".into(),
+                    source_name: "MBPDEPART".into(),
+                    source_id: 0,
+                    symbol: "X".into(),
+                    channel: 2,
+                    instrument_id: 41,
+                    category: "test".into(),
+                    price_exponent: 0,
+                    qty_exponent: 0,
+                    tick_size: 1,
+                },
+            );
+            {
+                let mut a = lock(&arbiter);
+                a.set_instrument_catalog(catalog.clone());
+                a.note_source_path(&market, Transport::Edge(ip));
+                a.note_source_path(&market, Transport::Edge(peer));
+                a.release_source_market(&market, None, Transport::Edge(peer));
+            }
+            let up_gauge = metrics()
+                .receiver_up
+                .with_label_values(&["MBPDEPART", "test", port]);
+            let mut reg = ReceiverRegistration::new(
+                FeedHealth::new().into(),
+                arbiter.clone(),
+                ("MBPDEPART", "test", kind, 9201),
+                up_gauge,
+            );
+            reg.note_publisher(ip);
+            drop(reg);
+            let present = crate::model::lock(&catalog).contains_key(&market);
+            present
+        };
+
+        assert!(
+            !catalog_after_exit(FeedKind::MarketByPrice, "9201"),
+            "the waiting release is carried out"
+        );
+        assert!(
+            catalog_after_exit(FeedKind::TopOfBook, "9202"),
+            "a quote receiver's exit releases nothing"
         );
     }
 
