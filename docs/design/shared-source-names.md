@@ -39,8 +39,9 @@ Two PRs.
   checks that at least one exists.
 - The revealed set records IDs, not names; `emit_status` reports each revealed ID.
 - `reconcile` channel purges and `/v1/status` product counts cover every ID of the row's name,
-  scoped by the row's category and channel. Rows sharing a name differ in category, since
-  `(venue, category, kind)` is unique.
+  scoped by the row's category and channel. That reaches the same rows as today's
+  `(name, category, channel)` scope, which already includes a same-name row of another kind in
+  that category. Shared IDs widen it by no row.
 - Name-only lookups filter on a fixed Source ID: the public backstops'
   `instrument_known` / `resolve_instrument`, and the order-book sink's venue filter.
 - Product ids: `resolve` already matches by name. The ambiguity count moves from

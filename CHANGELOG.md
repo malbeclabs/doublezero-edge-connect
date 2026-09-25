@@ -289,7 +289,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - A `sources` block may give several Source IDs one name. Each ID keeps its own state and
-  `status`; product ids use the shared name.
+  `status`; product ids use the shared name. A `status` carries its feed's health, so IDs on one
+  feed go down together. Consumers must key on `source_id`, not the name (see PROTOCOL.md).
 - Internal per-source state is keyed by Source ID and name, not name alone. No behavior change
   while names are unique.
 - **`dz_path_authority_transfers_total` gains a `rebaselined` label (`yes`/`no`) and a
