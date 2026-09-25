@@ -148,7 +148,7 @@ pub struct Metrics {
     /// *losing* the book race) is directly visible.
     pub depth_dropped: IntCounterVec,
     /// Depth-floor entries cleared by the session-reset escape hatch, by `reason`
-    /// (`end_of_session` / `instrument_reset`). A venue restarting its event clock below the
+    /// (`end_of_session` / `instrument_reset` / `source_id_changed`). A venue restarting its event clock below the
     /// latched high-water would otherwise wedge depth permanently; see
     /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_symbol`].
     pub depth_floor_resets: IntCounterVec,

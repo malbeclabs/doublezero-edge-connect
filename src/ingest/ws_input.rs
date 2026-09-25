@@ -39,7 +39,7 @@ pub const DEFAULT_WS_INPUT_URL: &str = "wss://api.hyperliquid.xyz/ws";
 /// ID, see `processor.rs`) and this backstop cannot drift into naming one market two different
 /// things — a split that would fork the arbiter's `(venue, symbol)` dedup floor and emit both
 /// copies to the wire as duplicates under two names.
-const HL_SOURCE_ID: u16 = 1;
+use crate::ingest::sources::HYPERLIQUID_SOURCE_ID as HL_SOURCE_ID;
 
 /// The venue every public message is tagged with — always [`HL_SOURCE_ID`]'s registry name, so it
 /// matches whatever the edge HL feed names the same market and both land in the same arbiter floor.
@@ -218,7 +218,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
     let (Some(bid), Some(ask)) = (&d.bbo[0], &d.bbo[1]) else {
         return; // one-sided book; cannot form a two-sided quote
     };
-    if !instrument_known(instruments, hl_venue(), &d.coin) {
+    if !instrument_known(instruments, HL_SOURCE_ID, &d.coin) {
         return; // precision unknown; drop until the edge refdata defines this instrument
     }
     let (Some((bid_px, bid_sz, bid_n)), Some((ask_px, ask_sz, ask_n))) =
@@ -258,7 +258,7 @@ fn emit_bbo(d: BboData, arbiter: &SharedArbiter, instruments: &InstrumentSnapsho
 fn emit_trade(t: TradeData, arbiter: &SharedArbiter, instruments: &InstrumentSnapshot) {
     // Resolves precision AND the (channel, instrument_id) identity in one scan — see
     // `resolve_instrument`'s doc for why a bare symbol match is safe for this venue.
-    let Some((channel, instrument_id)) = resolve_instrument(instruments, hl_venue(), &t.coin)
+    let Some((channel, instrument_id)) = resolve_instrument(instruments, HL_SOURCE_ID, &t.coin)
     else {
         return;
     };
@@ -340,7 +340,7 @@ mod tests {
                 tick_size: 0,
                 venue: hl_venue().into(),
                 source_name: hl_venue().into(),
-                source_id: 0,
+                source_id: HL_SOURCE_ID,
                 symbol: symbol.into(),
                 channel: 0,
                 instrument_id: 1,

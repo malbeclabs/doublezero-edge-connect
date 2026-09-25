@@ -90,7 +90,10 @@ impl SourceKey {
 #[cfg(test)]
 impl From<&str> for SourceKey {
     fn from(name: &str) -> Self {
-        let id = crate::ingest::sources::source_id_of(name).unwrap_or(0);
+        let id = crate::ingest::sources::source_ids_of(name)
+            .first()
+            .copied()
+            .unwrap_or(0);
         Self(id, Arc::from(name))
     }
 }
@@ -548,6 +551,19 @@ impl FeedMessage {
                 (b.venue.as_ref(), b.symbol.as_ref())
             }
             FeedMessage::Status(s) => (s.venue.as_ref(), ""),
+        }
+    }
+
+    /// The wire Source ID this message carries.
+    pub fn source_id(&self) -> u16 {
+        match self {
+            FeedMessage::Instrument(i) => i.source_id,
+            FeedMessage::Quote(q) => q.source_id,
+            FeedMessage::Trade(t) => t.source_id,
+            FeedMessage::Midpoint(m) => m.source_id,
+            FeedMessage::Depth(d) => d.source_id,
+            FeedMessage::Book(b) | FeedMessage::OrderBook(b) => b.source_id,
+            FeedMessage::Status(s) => s.source_id,
         }
     }
 

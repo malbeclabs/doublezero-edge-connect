@@ -88,11 +88,12 @@ generated from `edge-feed-spec/sources/spec.md`, which stays the authority for i
 ```
 
 A name is emitted verbatim as `venue`/`source_name` on the WebSocket and as every `venue=` metric
-label value, so it must be uppercase, and an id or a name may appear only once. The block is
-**optional**: adding it bumps no schema version, so a document written before it existed still
-loads and resolves against the copy compiled into the binary. A Source ID the block does not assign
-is not an error — the wire value is authoritative and gets a distinct synthesized `SOURCE_<id>`
-label. Assigning a venue is therefore a republish of this document rather than a new release.
+label value, so it must be uppercase. An id may appear only once; several ids may share a name. The
+block is **optional**: adding it bumps no schema version, so a document written before it existed
+still loads and resolves against the copy compiled into the binary. A Source ID the block does not
+assign is not an error — the wire value is authoritative and gets a distinct synthesized
+`SOURCE_<id>` label. Assigning a venue is therefore a republish of this document rather than a new
+release.
 
 ⚠️ **With one ordering constraint.** A binary that predates the block has no `sources` field, so it
 warns about `$.sources` and ignores it — and then validates the rows against its own compiled-in

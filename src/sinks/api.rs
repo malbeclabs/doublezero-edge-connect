@@ -57,7 +57,7 @@ use crate::{
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
-        sources::source_id_of,
+        sources::source_ids_of,
     },
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
@@ -218,7 +218,7 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
 
     match sub {
         None | Some("") => {
-            let ambiguous = is_ambiguous(state, inst.source_id, &inst.symbol);
+            let ambiguous = is_ambiguous(state, &inst.venue, &inst.symbol);
             ok_json(json!({ "product": product_entry(state, &inst, ambiguous) }))
         }
         Some("ticker") => ticker(state, &inst),
@@ -273,9 +273,21 @@ fn sort_catalog(instruments: &mut [NormalizedInstrument]) {
     });
 }
 
-/// Whether more than one instrument shares `(source_id, symbol)` — what decides whether a
-/// `product_id` needs its `#<channel>.<instrument_id>` suffix to stay unique.
-fn is_ambiguous(state: &ApiState, source_id: u16, symbol: &Arc<str>) -> bool {
+/// Whether more than one instrument shares `(name, symbol)` — what decides whether a `product_id`
+/// needs its `#<channel>.<instrument_id>` suffix to stay unique. By name, not ID: several IDs may
+/// share a name, and the product id carries only the name.
+fn is_ambiguous(state: &ApiState, name: &str, symbol: &Arc<str>) -> bool {
+    let map = crate::model::lock(&state.instruments);
+    map.values()
+        .filter(|i| i.venue.as_ref() == name && i.symbol.as_ref() == symbol.as_ref())
+        .count()
+        > 1
+}
+
+/// Whether more than one instrument shares `(source_id, symbol)` — the grain the `depth` snapshot
+/// is keyed on, so what decides whether [`best_levels`] can name whose inside market it holds. By
+/// ID, unlike [`is_ambiguous`]: two IDs under one name keep separate depth entries.
+fn depth_is_ambiguous(state: &ApiState, source_id: u16, symbol: &Arc<str>) -> bool {
     let map = crate::model::lock(&state.instruments);
     map.values()
         .filter(|i| i.source_id == source_id && i.symbol.as_ref() == symbol.as_ref())
@@ -302,10 +314,10 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
     // calls. Sort deterministically by `(channel, instrument_id)` so every client benefits, not
     // just one that happens to sort client-side.
     instruments.sort_by_key(|i| (i.channel, i.instrument_id));
-    let mut counts: HashMap<(u16, String), usize> = HashMap::new();
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
     for i in &instruments {
         *counts
-            .entry((i.source_id, i.symbol.to_string()))
+            .entry((i.venue.to_string(), i.symbol.to_string()))
             .or_insert(0) += 1;
     }
 
@@ -351,7 +363,7 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
         .iter()
         .map(|i| {
             let ambiguous = counts
-                .get(&(i.source_id, i.symbol.to_string()))
+                .get(&(i.venue.to_string(), i.symbol.to_string()))
                 .copied()
                 .unwrap_or(1)
                 > 1;
@@ -378,13 +390,7 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 /// not a decimal string like the increments: it is wire metadata, and one name must not mean two
 /// things across the two surfaces.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
-    let pid = products::ProductId {
-        source_id: i.source_id,
-        symbol: i.symbol.clone(),
-        channel: i.channel,
-        instrument_id: i.instrument_id,
-        category: i.category.clone(),
-    };
+    let pid = products::ProductId::of(i);
     let mut entry = json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
@@ -618,7 +624,7 @@ fn ticker(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     let (bid, ask) = best_levels(
         state,
         inst,
-        is_ambiguous(state, inst.source_id, &inst.symbol),
+        depth_is_ambiguous(state, inst.source_id, &inst.symbol),
     );
     ok_json(json!({
         "trades": trades_json,
@@ -655,7 +661,7 @@ type Level = Option<(f64, f64)>;
 /// catalog under the lock the ingest hot path's `upsert_instrument` writes on every refdata burst,
 /// and the fall-through below is reached for *every* order-level and depth-only market — so deriving
 /// it here would make one unfiltered `best_bid_ask` O(catalog²) with an acquisition per instrument.
-/// That endpoint already counts `(source_id, symbol)` once for its `product_id` rendering.
+/// That endpoint counts `(source_id, symbol)` once up front.
 fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -> (Level, Level) {
     let from_book = {
         let books = crate::model::lock(&state.books);
@@ -696,15 +702,8 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
 // ---------------------------------------------------------------------------------------------
 
 fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
-    let ambiguous = is_ambiguous(state, inst.source_id, &inst.symbol);
-    let rendered_id = products::ProductId {
-        source_id: inst.source_id,
-        symbol: inst.symbol.clone(),
-        channel: inst.channel,
-        instrument_id: inst.instrument_id,
-        category: inst.category.clone(),
-    }
-    .render(ambiguous);
+    let ambiguous = is_ambiguous(state, &inst.venue, &inst.symbol);
+    let rendered_id = products::ProductId::of(inst).render(ambiguous);
 
     // Prefer the incremental market-by-price accumulator when this identity has one. Looked up by
     // the full category-carrying key (a category-blind lookup would return whichever universe's
@@ -929,11 +928,13 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
         let map = crate::model::lock(&state.instruments);
         map.values().cloned().collect()
     };
-    let mut counts: HashMap<(u16, String), usize> = HashMap::new();
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut depth_counts: HashMap<(u16, &str), usize> = HashMap::new();
     for i in &instruments {
         *counts
-            .entry((i.source_id, i.symbol.to_string()))
+            .entry((i.venue.to_string(), i.symbol.to_string()))
             .or_insert(0) += 1;
+        *depth_counts.entry((i.source_id, &i.symbol)).or_insert(0) += 1;
     }
 
     // `product_ids==A,B` (comma-separated, matching the emulated tool's own filter) narrows the
@@ -987,28 +988,26 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
                 continue;
             }
         }
-        // The same count that renders `product_id` below also decides whether the `depth` fallback
-        // can name whose inside market it holds, so both read one map built once — rather than
-        // `best_levels` re-scanning the catalog per instrument, which is what made this O(catalog²).
+        // Counted once up front rather than `best_levels` re-scanning the catalog per instrument,
+        // which is what made this O(catalog²). By name for `product_id`, by ID for the `depth`
+        // fallback, since that is the grain each is keyed on.
         let ambiguous = counts
-            .get(&(i.source_id, i.symbol.to_string()))
+            .get(&(i.venue.to_string(), i.symbol.to_string()))
             .copied()
             .unwrap_or(1)
             > 1;
-        let (bid, ask) = best_levels(state, i, ambiguous);
+        let depth_ambiguous = depth_counts
+            .get(&(i.source_id, i.symbol.as_ref()))
+            .copied()
+            .unwrap_or(1)
+            > 1;
+        let (bid, ask) = best_levels(state, i, depth_ambiguous);
         if bid.is_none() && ask.is_none() {
             // Nothing derivable for this identity (no persisted quote cache — see `best_levels`'s
             // docs); omitting it is honest, a zeroed/fabricated level would not be.
             continue;
         }
-        let product_id = products::ProductId {
-            source_id: i.source_id,
-            symbol: i.symbol.clone(),
-            channel: i.channel,
-            instrument_id: i.instrument_id,
-            category: i.category.clone(),
-        }
-        .render(ambiguous);
+        let product_id = products::ProductId::of(i).render(ambiguous);
         pricebooks.push(json!({
             "product_id": product_id,
             "bids": bid.map(|(p, s)| vec![json!([decimal_string(p, i.price_exponent), decimal_string(s, i.qty_exponent)])]).unwrap_or_default(),
@@ -1195,9 +1194,10 @@ fn channels_block(state: &ApiState) -> Value {
         // Every enabled row's venue resolves to a Source ID by construction (`feeds::init`
         // validates it) — if it somehow didn't, there is no history key to look products up under,
         // so the row is skipped rather than reported with a fabricated zero.
-        let Some(source_id) = source_id_of(f.venue) else {
+        let source_ids = source_ids_of(f.venue);
+        if source_ids.is_empty() {
             continue;
-        };
+        }
         let category = category_arc(f.category);
         let venue = venue_arc(f.venue);
 
@@ -1216,7 +1216,7 @@ fn channels_block(state: &ApiState) -> Value {
             let key: crate::ingest::health::ReceiverKey =
                 (f.venue, f.category, f.kind, p.base_port());
             let bound = matches!(state.health.liveness(&key), TapeLiveness::Up);
-            let products = history.products_for(source_id, &category, channel);
+            let products = history.products_for(&source_ids, &category, channel);
             let mut entry = json!({
                 "channel": channel,
                 "allowed": admitted,
@@ -2661,12 +2661,62 @@ mod tests {
             let inst = inst_in("perps", 3, "KALSHI", "COLLIDE", 2, id, -4, -2);
             // Derived from the catalog, not passed as a literal, so the two colliding entries above
             // stay load-bearing: a test handing `true` down would pass with `is_ambiguous` broken.
-            let ambiguous = is_ambiguous(&state, inst.source_id, &inst.symbol);
+            let ambiguous = is_ambiguous(&state, &inst.venue, &inst.symbol);
             assert!(ambiguous, "fixture sanity: the two entries collide");
             assert_eq!(
                 best_levels(&state, &inst, ambiguous),
                 (None, None),
                 "instrument {id} must not be handed a depth entry that may be its neighbour's"
+            );
+        }
+    }
+
+    /// A symbol listed under two IDs of one name is ambiguous: its product id is `NAME:SYMBOL`
+    /// either way, so only the suffix tells them apart. Its depth is keyed per ID, so each still
+    /// reads its own inside market.
+    #[test]
+    fn a_symbol_under_two_ids_of_one_name_is_ambiguous() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        let mut insts = Vec::new();
+        for (id, iid, bid) in [(4u16, 1u32, 0.5), (10, 2, 0.7)] {
+            let inst = inst_in("c", id, "SHARED", "B", 0, iid, -2, -2);
+            instruments.lock().unwrap().insert(
+                (crate::model::SourceKey::of(&inst), "c".into(), 0, iid),
+                inst.clone(),
+            );
+            depth.lock().unwrap().insert(
+                (crate::model::SourceKey::of(&inst), "B".into()),
+                NormalizedDepth {
+                    venue: "SHARED".into(),
+                    source_name: "SHARED".into(),
+                    source_id: id,
+                    symbol: "B".into(),
+                    bids: vec![[bid, 1.0]],
+                    asks: vec![],
+                    source_ts_ns: 7,
+                    recv_ts_ns: 0,
+                    kernel_rx_ts_ns: 0,
+                    ws_send_ts_ns: 0,
+                },
+            );
+            insts.push((inst, bid));
+        }
+        let state = ApiState {
+            instruments,
+            depth,
+            books,
+            history,
+            health,
+            filter,
+            enabled,
+        };
+        assert!(is_ambiguous(&state, "SHARED", &Arc::from("B")));
+        for (inst, bid) in insts {
+            let ambiguous = depth_is_ambiguous(&state, inst.source_id, &inst.symbol);
+            assert!(!ambiguous, "one instrument per ID");
+            assert_eq!(
+                best_levels(&state, &inst, ambiguous),
+                (Some((bid, 1.0)), None)
             );
         }
     }
@@ -3974,7 +4024,9 @@ mod tests {
         // or not-yet-bound receiver" case `ingest::health::TapeLiveness::Unregistered` exists for.
         // Channel 12 is excluded by the filter outright; nothing registers for it either.
 
-        let source_id = source_id_of(row.venue).expect("fixture sanity: KALSHI resolves");
+        let source_id = *source_ids_of(row.venue)
+            .first()
+            .expect("fixture sanity: KALSHI resolves");
         let category = category_arc(row.category);
         {
             let mut store = history.lock().unwrap();

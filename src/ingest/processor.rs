@@ -1032,9 +1032,9 @@ impl MboProcessor {
     ///
     /// Also re-announces if a LATER message names a DIFFERENT Source ID for a key already revealed
     /// — see [`TobProcessor::reveal_if_needed`] for why pinning the first id forever is wrong.
-    /// Counted in `dz_source_id_changed_total{venue}` (the new venue), and purges the stale
-    /// `(old_venue, channel, instrument_id)` `InstrumentSnapshot` entry (see
-    /// [`TobProcessor::reveal_if_needed`]'s doc comment).
+    /// Counted in `dz_source_id_changed_total{venue}` (the new venue). The old ID's
+    /// `InstrumentSnapshot` entry, depth and book go together once no path still serves the
+    /// instrument there (`Arbiter::release_source_market`).
     fn reveal_if_needed(&mut self, ctx: &DatagramCtx, instrument_id: u32, source_id: u16) -> bool {
         let key = (ctx.publisher, instrument_id);
         let previous = self.revealed.get(&key).copied();
@@ -1060,15 +1060,34 @@ impl MboProcessor {
             // same map for the identical reason (a remapped id must not inherit a stale suppression
             // memo); a Source ID change is the same case at the reveal layer instead of the id layer.
             self.last_top.remove(&key);
-            remove_instrument(
-                ctx.instruments,
-                &SourceKey::from_id(old_id),
-                &category_arc(ctx.category),
-                channel,
-                instrument_id,
+            // The old ID's definition, depth and book are keyed apart from the new one's, so nothing
+            // overwrites them: drop them unless another path still serves the instrument there.
+            let symbol = self
+                .emitted_symbol
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| def.symbol.clone());
+            lock(ctx.arbiter).release_source_market(
+                &(
+                    SourceKey::from_id(old_id),
+                    category_arc(ctx.category),
+                    channel,
+                    instrument_id,
+                ),
+                Some(&symbol),
+                Transport::Edge(ctx.publisher),
             );
         }
         self.revealed.insert(key, source_id);
+        lock(ctx.arbiter).note_source_path(
+            &(
+                SourceKey::from_id(source_id),
+                category_arc(ctx.category),
+                channel,
+                instrument_id,
+            ),
+            Transport::Edge(ctx.publisher),
+        );
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -1114,8 +1133,25 @@ impl MboProcessor {
         self.synced_reported.retain(|(p, _), _| *p != publisher);
         self.reveal_rebaselined_ns
             .retain(|(p, _), _| *p != publisher);
+        let revealed: Vec<(IpAddr, u32)> = self
+            .revealed
+            .keys()
+            .filter(|(p, _)| *p == publisher)
+            .copied()
+            .collect();
+        for key in revealed {
+            self.forget_source_path(&key, ctx);
+        }
         self.revealed.retain(|(p, _), _| *p != publisher);
         self.pending_channel.retain(|(p, _), _| *p != publisher);
+    }
+
+    /// This path no longer carries `key`'s instrument under its revealed Source ID. Call before
+    /// dropping the `revealed` entry, which is what resolves the market.
+    fn forget_source_path(&self, key: &(IpAddr, u32), ctx: &DatagramCtx) {
+        if let Some(market) = self.market_key(key, ctx) {
+            lock(ctx.arbiter).forget_source_path(&market, Transport::Edge(key.0));
+        }
     }
 
     /// The wire venue to key arbiter state by for `(publisher, instrument)`, or `None` before it
@@ -1208,6 +1244,7 @@ impl MboProcessor {
                         // when the key was never revealed (nothing was ever filed, so nothing to
                         // purge).
                         let evicted_source = self.wire_venue(&old);
+                        self.forget_source_path(&old, ctx);
                         self.revealed.remove(&old);
                         // NOT `pending_channel` here: it mirrors `RefDataState.defs`'s lifecycle
                         // (populated straight from refdata, independent of whether a book was ever
@@ -1875,6 +1912,7 @@ impl DatagramProcessor for MboProcessor {
                     // tombstones to refuse the new session's re-used order ids, which drops those
                     // orders from every consumer's book until retention expires.
                     let market = self.market_key(&key, ctx);
+                    self.forget_source_path(&key, ctx);
                     self.revealed.remove(&key);
                     // The re-snapshot may anchor at a `source_ts` below the latched floor (e.g. the
                     // venue reset this instrument's clock); clear the `(venue, symbol)` floor entry
@@ -2279,9 +2317,9 @@ impl MbpProcessor {
     ///
     /// Also re-announces if a LATER message names a DIFFERENT Source ID for a key already revealed
     /// — see [`TobProcessor::reveal_if_needed`] for why pinning the first id forever is wrong.
-    /// Counted in `dz_source_id_changed_total{venue}` (the new venue), and purges the stale
-    /// `(old_venue, channel, instrument_id)` `InstrumentSnapshot` entry the same way (see there) —
-    /// `key.1`/`key.2` are unaffected by the Source ID change, so no separate memo is needed.
+    /// Counted in `dz_source_id_changed_total{venue}` (the new venue). The old ID's
+    /// `InstrumentSnapshot` entry and book go together once no path still serves them, as for
+    /// order-level books.
     fn reveal_if_needed(&mut self, ctx: &DatagramCtx, key: PriceBookKey, source_id: u16) -> bool {
         let previous = self.revealed.get(&key).copied();
         if previous == Some(source_id) {
@@ -2295,15 +2333,29 @@ impl MbpProcessor {
                 .source_id_changed
                 .with_label_values(&[source_label(source_id)])
                 .inc();
-            remove_instrument(
-                ctx.instruments,
-                &SourceKey::from_id(old_id),
-                &category_arc(ctx.category),
-                ctx.canonical_channel(key.1),
-                key.2,
+            // As for order-level books: the old ID's definition and book are keyed apart, so drop
+            // them unless another path still serves the instrument there.
+            lock(ctx.arbiter).release_source_market(
+                &(
+                    SourceKey::from_id(old_id),
+                    category_arc(ctx.category),
+                    ctx.canonical_channel(key.1),
+                    key.2,
+                ),
+                None,
+                Transport::Edge(ctx.publisher),
             );
         }
         self.revealed.insert(key, source_id);
+        lock(ctx.arbiter).note_source_path(
+            &(
+                SourceKey::from_id(source_id),
+                category_arc(ctx.category),
+                ctx.canonical_channel(key.1),
+                key.2,
+            ),
+            Transport::Edge(ctx.publisher),
+        );
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -2418,7 +2470,7 @@ impl MbpProcessor {
                         // leaving the authority its last `healthy` report would keep electing it
                         // while a peer path's live book is dropped.
                         self.report_health(ctx, &old, false);
-                        self.forget_book(&old);
+                        self.forget_book(&old, ctx);
                     }
                     None => break,
                 }
@@ -2432,11 +2484,12 @@ impl MbpProcessor {
     /// Drop one book and every map keyed off it, keeping the buffer total in step. Does not touch
     /// `books_order`: the eviction path has already popped the key, and the reset path clears the
     /// whole channel's keys in one pass.
-    fn forget_book(&mut self, key: &PriceBookKey) {
+    fn forget_book(&mut self, key: &PriceBookKey, ctx: &DatagramCtx) {
         if let Some(book) = self.books.remove(key) {
             self.buffered_total = self.buffered_total.saturating_sub(book.buffered_len());
         }
         self.health_reported.remove(key);
+        self.forget_source_path(key, ctx);
         self.revealed.remove(key);
         if self
             .open
@@ -2458,7 +2511,7 @@ impl MbpProcessor {
     /// it still holds its buffered deltas against [`MAX_BUFFERED_DELTAS_ACROSS_BOOKS`] and its slot
     /// against [`MAX_PRICE_BOOKS`]. Routed through [`Self::forget_book`] so `buffered_total` stays
     /// in step, exactly as every other book-dropping path does.
-    fn forget_publisher(&mut self, publisher: IpAddr) {
+    fn forget_publisher(&mut self, publisher: IpAddr, ctx: &DatagramCtx) {
         let keys: Vec<PriceBookKey> = self
             .books
             .keys()
@@ -2466,7 +2519,7 @@ impl MbpProcessor {
             .copied()
             .collect();
         for key in keys {
-            self.forget_book(&key);
+            self.forget_book(&key, ctx);
         }
         self.books_order.retain(|(p, _, _)| *p != publisher);
         // `forget_book` only clears an `open` group whose instrument matches the book it dropped; a
@@ -2480,6 +2533,15 @@ impl MbpProcessor {
         self.channel_order.retain(|(p, _)| *p != publisher);
         // Belt and braces: `forget_book` already removed these for every key that had a book, but a
         // reveal without a surviving book must not leave an orphan behind.
+        let revealed: Vec<PriceBookKey> = self
+            .revealed
+            .keys()
+            .filter(|(p, _, _)| *p == publisher)
+            .copied()
+            .collect();
+        for key in revealed {
+            self.forget_source_path(&key, ctx);
+        }
         self.revealed.retain(|(p, _, _), _| *p != publisher);
         self.health_reported.retain(|(p, _, _), _| *p != publisher);
         // The sequence anchor goes with the rest: kept, it would refuse this publisher's own next
@@ -2537,6 +2599,20 @@ impl MbpProcessor {
 
     /// Report one book's health for its market, but only when it changed: an unhealthy path loses
     /// the market to its peer, so this is a transition signal rather than a per-datagram one.
+    /// This path no longer carries `key`'s instrument under its revealed Source ID. Call before
+    /// dropping the `revealed` entry, which is what resolves the market.
+    fn forget_source_path(&self, key: &PriceBookKey, ctx: &DatagramCtx) {
+        if let Some(venue) = self.wire_venue(key) {
+            let market: MarketKey = (
+                venue,
+                category_arc(ctx.category),
+                ctx.canonical_channel(key.1),
+                key.2,
+            );
+            lock(ctx.arbiter).forget_source_path(&market, Transport::Edge(key.0));
+        }
+    }
+
     fn report_health(&mut self, ctx: &DatagramCtx, key: &PriceBookKey, healthy: bool) {
         if self.health_reported.get(key) == Some(&healthy) {
             return;
@@ -2589,7 +2665,7 @@ impl MbpProcessor {
         for key in &keys {
             // Unhealthy before forgetting: `forget_book` drops the memo this reads.
             self.report_health(ctx, key, false);
-            self.forget_book(key);
+            self.forget_book(key, ctx);
         }
         self.books_order
             .retain(|(p, c, _)| !(*p == ctx.publisher && *c == channel));
@@ -2917,7 +2993,7 @@ impl DatagramProcessor for MbpProcessor {
             // outliving the reference data they are meaningless without — see
             // [`Self::forget_publisher`], and `MboProcessor`'s identical drain.
             if let Some(evicted) = self.state.take_evicted() {
-                self.forget_publisher(evicted);
+                self.forget_publisher(evicted, ctx);
             }
         }
         // §4.9: a reset is any CHANGE of `Reset Count` — `!=`, never `>`, so the `255 -> 0` wrap is
@@ -3417,6 +3493,7 @@ impl DatagramProcessor for MbpProcessor {
                         // bump can reassign this instrument_id to a different market, and the old
                         // Source ID would then misdescribe the new one. Drop it too, so the
                         // post-reset market is deferred again until a fresh delta reveals it.
+                        self.forget_source_path(&key, ctx);
                         self.revealed.remove(&key);
                     }
                     // A group anchored BEFORE this reset died with the book's assembly, so the
@@ -5208,7 +5285,14 @@ mod tests {
         arbiter: &SharedArbiter,
         instruments: &crate::model::InstrumentSnapshot,
     ) -> MboProcessor {
-        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        synced_mbo_proc_with(arbiter, instruments, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    fn synced_mbo_proc_with(
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+        depth: DepthSnapshot,
+    ) -> MboProcessor {
         let mut proc = MboProcessor::new(depth, tape(false));
         proc.on_datagram(
             &datagram(&[
@@ -5240,9 +5324,14 @@ mod tests {
 
     /// One bid `OrderAdd` for instrument 0 at per-instrument `seq`, stamped `ts`.
     fn add(seq: u32, order_id: u64, ts: u64) -> Vec<u8> {
+        add_from(0, seq, order_id, ts)
+    }
+
+    /// [`add`] stamped with `source_id`.
+    fn add_from(source_id: u16, seq: u32, order_id: u64, ts: u64) -> Vec<u8> {
         enc_order_add(&OrderAdd {
             instrument_id: 0,
-            source_id: 0,
+            source_id,
             side: SIDE_BID,
             order_flags: 0,
             per_instrument_seq: seq,
@@ -5441,6 +5530,222 @@ mod tests {
             drain_depth_ts(&mut rx),
             vec![5000, 100],
             "an unresolvable InstrumentReset id must still clear the floor (venue-wide fallback)"
+        );
+    }
+
+    /// An instrument that moves to another Source ID leaves no depth replayed under the old one.
+    #[test]
+    fn mbo_source_id_change_drops_the_old_ids_depth_replay() {
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_depth_replay(depth.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc_with(&arbiter, &instruments, depth.clone());
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let key = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                Arc::<str>::from("INST-0"),
+            )
+        };
+
+        proc.on_datagram(&datagram(&[add_from(1, 1, 100, 5000)]), &mkt);
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "fixture sanity"
+        );
+        proc.on_datagram(&datagram(&[add_from(2, 2, 101, 5001)]), &mkt);
+
+        let map = crate::model::lock(&depth);
+        assert!(
+            !map.contains_key(&key(1)),
+            "the old ID's depth is not replayed"
+        );
+        assert!(map.contains_key(&key(2)), "the new ID's depth is");
+    }
+
+    /// An instrument that moves to another Source ID leaves no book replayed under the old one.
+    #[test]
+    fn mbo_source_id_change_drops_the_old_ids_book_replay() {
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let books: crate::model::BookSnapshot = Arc::new(Mutex::new(Default::default()));
+        lock(&arbiter).set_book_replay(books.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = synced_mbo_proc(&arbiter, &instruments);
+        let mkt = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        let market = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                category_arc("testcategory"),
+                0u8,
+                0u32,
+            )
+        };
+
+        proc.on_datagram(&datagram(&[add_from(1, 1, 100, 5000)]), &mkt);
+        assert!(
+            crate::model::lock(&books).get(&market(1)).is_some(),
+            "fixture sanity"
+        );
+        proc.on_datagram(&datagram(&[add_from(2, 2, 101, 5001)]), &mkt);
+        assert!(
+            crate::model::lock(&books).get(&market(1)).is_none(),
+            "the old ID's book is not replayed"
+        );
+    }
+
+    /// A publisher moving to another Source ID leaves the old ID's depth alone while a peer still
+    /// serves the instrument there.
+    #[test]
+    fn mbo_source_id_change_keeps_depth_a_peer_still_serves() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_depth_replay(depth.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth.clone(), tape(false));
+        let ctx = |publisher, role| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(
+                &datagram(&[
+                    enc_manifest_summary(1, 1),
+                    enc_instrument_def(0, "INST-0", 1),
+                ]),
+                &ctx(publisher, PortRole::Combined),
+            );
+            proc.on_datagram(
+                &datagram(&[
+                    enc_snapshot_begin(&SnapshotBegin {
+                        instrument_id: 0,
+                        anchor_seq: 0,
+                        total_orders: 0,
+                        snapshot_id: 1,
+                        last_instrument_seq: 0,
+                        ts: 1,
+                    }),
+                    enc_snapshot_end(&SnapshotEnd {
+                        instrument_id: 0,
+                        anchor_seq: 0,
+                        snapshot_id: 1,
+                    }),
+                ]),
+                &ctx(publisher, PortRole::Snapshot),
+            );
+            proc.on_datagram(
+                &datagram(&[add_from(1, 1, 100, 5000)]),
+                &ctx(publisher, PortRole::Mktdata),
+            );
+        }
+        let key = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                Arc::<str>::from("INST-0"),
+            )
+        };
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "fixture sanity"
+        );
+        proc.on_datagram(
+            &datagram(&[add_from(2, 2, 101, 5001)]),
+            &ctx(pub_a, PortRole::Mktdata),
+        );
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "the peer still serves the old ID"
+        );
+    }
+
+    /// A peer on another receiver (its own processor) still serving the old ID keeps its depth: the
+    /// check is the arbiter's, which every receiver shares, not one processor's.
+    #[test]
+    fn mbo_source_id_change_keeps_depth_a_peer_on_another_receiver_serves() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_depth_replay(depth.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_instrument_catalog(instruments.clone());
+        let ctx = |publisher, role| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        let mut procs: Vec<(IpAddr, MboProcessor)> = [pub_a, pub_b]
+            .into_iter()
+            .map(|publisher| {
+                let mut proc = MboProcessor::new(depth.clone(), tape(false));
+                proc.on_datagram(
+                    &datagram(&[
+                        enc_manifest_summary(1, 1),
+                        enc_instrument_def(0, "INST-0", 1),
+                    ]),
+                    &ctx(publisher, PortRole::Combined),
+                );
+                proc.on_datagram(
+                    &datagram(&[
+                        enc_snapshot_begin(&SnapshotBegin {
+                            instrument_id: 0,
+                            anchor_seq: 0,
+                            total_orders: 0,
+                            snapshot_id: 1,
+                            last_instrument_seq: 0,
+                            ts: 1,
+                        }),
+                        enc_snapshot_end(&SnapshotEnd {
+                            instrument_id: 0,
+                            anchor_seq: 0,
+                            snapshot_id: 1,
+                        }),
+                    ]),
+                    &ctx(publisher, PortRole::Snapshot),
+                );
+                proc.on_datagram(
+                    &datagram(&[add_from(1, 1, 100, 5000)]),
+                    &ctx(publisher, PortRole::Mktdata),
+                );
+                (publisher, proc)
+            })
+            .collect();
+        let key = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                Arc::<str>::from("INST-0"),
+            )
+        };
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "fixture sanity"
+        );
+        let (publisher, proc) = &mut procs[0];
+        proc.on_datagram(
+            &datagram(&[add_from(2, 2, 101, 5001)]),
+            &ctx(*publisher, PortRole::Mktdata),
+        );
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "the peer on another receiver still serves the old ID"
+        );
+        assert!(
+            crate::model::lock(&instruments).contains_key(&(
+                crate::model::SourceKey::from_id(1),
+                category_arc("testcategory"),
+                0,
+                0,
+            )),
+            "and its definition stays with the depth"
         );
     }
 
@@ -6637,6 +6942,148 @@ mod tests {
             );
         }
         proc
+    }
+
+    /// An `MbpProcessor` for `publisher` with instrument 41 synced and revealed under `source_id`.
+    fn mbp_revealed_under(
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+        publisher: IpAddr,
+        source_id: u16,
+    ) -> MbpProcessor {
+        let ctx = |role| {
+            let mut c = make_ctx(arbiter, instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        let mut proc = MbpProcessor::new(tape(false));
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 1, &mbp_refdata(&[41])),
+            &ctx(PortRole::Combined),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(0, 0, 2, &mbp_snapshot(41, 1, 0, 0, &[])),
+            &ctx(PortRole::Snapshot),
+        );
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                3,
+                &[mbp_level_with_source(
+                    41, 1, MBP_BID, 6200, 10, 7_000, source_id,
+                )],
+            ),
+            &ctx(PortRole::Mktdata),
+        );
+        proc
+    }
+
+    /// Two paths on separate receivers serving instrument 41 under Source ID 1, with the catalog
+    /// and book replay wired to the arbiter.
+    fn mbp_two_paths_on_one_id() -> (
+        SharedArbiter,
+        crate::model::InstrumentSnapshot,
+        crate::model::BookSnapshot,
+        [(IpAddr, MbpProcessor); 2],
+    ) {
+        use std::net::Ipv4Addr;
+        let (arbiter, _rx, instruments) = mbp_harness();
+        let books: crate::model::BookSnapshot = Arc::new(Mutex::new(Default::default()));
+        lock(&arbiter).set_book_replay(books.clone());
+        lock(&arbiter).set_instrument_catalog(instruments.clone());
+        let paths = [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        ]
+        .map(|p| (p, mbp_revealed_under(&arbiter, &instruments, p, 1)));
+        (arbiter, instruments, books, paths)
+    }
+
+    /// Whether the catalog and the book replay hold instrument 41 under `id`.
+    fn mbp_held_under(
+        instruments: &crate::model::InstrumentSnapshot,
+        books: &crate::model::BookSnapshot,
+        id: u16,
+    ) -> (bool, bool) {
+        let market: MarketKey = (
+            crate::model::SourceKey::from_id(id),
+            category_arc("testcategory"),
+            0,
+            41,
+        );
+        (
+            crate::model::lock(instruments).contains_key(&market),
+            crate::model::lock(books).get(&market).is_some(),
+        )
+    }
+
+    /// Move `proc`'s instrument 41 to Source ID 2.
+    fn mbp_remap(
+        proc: &mut MbpProcessor,
+        arbiter: &SharedArbiter,
+        instruments: &crate::model::InstrumentSnapshot,
+        publisher: IpAddr,
+    ) {
+        let mut ctx = make_ctx(arbiter, instruments, PortRole::Mktdata);
+        ctx.publisher = publisher;
+        proc.on_datagram(
+            &mbp_wire::datagram(
+                0,
+                0,
+                4,
+                &[mbp_level_with_source(41, 2, MBP_BID, 6200, 11, 7_001, 2)],
+            ),
+            &ctx,
+        );
+    }
+
+    /// A price book moving to another Source ID on one receiver keeps the old ID's definition and
+    /// book while a peer on another receiver still serves it there, and drops both once the peer
+    /// moves too.
+    #[test]
+    fn mbp_source_id_change_purges_the_old_id_once_no_peer_serves_it() {
+        let (arbiter, instruments, books, [(a, mut proc_a), (b, mut proc_b)]) =
+            mbp_two_paths_on_one_id();
+        assert_eq!(
+            mbp_held_under(&instruments, &books, 1),
+            (true, true),
+            "fixture sanity"
+        );
+
+        mbp_remap(&mut proc_a, &arbiter, &instruments, a);
+        assert_eq!(
+            mbp_held_under(&instruments, &books, 1),
+            (true, true),
+            "the peer still serves the old ID"
+        );
+        mbp_remap(&mut proc_b, &arbiter, &instruments, b);
+        assert_eq!(
+            mbp_held_under(&instruments, &books, 1),
+            (false, false),
+            "no path serves the old ID any more"
+        );
+        assert!(
+            mbp_held_under(&instruments, &books, 2).0,
+            "the new ID's definition stands"
+        );
+    }
+
+    /// A path whose instrument resets stops holding the old ID, so a peer's move off it purges.
+    #[test]
+    fn mbp_instrument_reset_stops_a_path_holding_its_source_id() {
+        let (arbiter, instruments, books, [(a, mut proc_a), (b, mut proc_b)]) =
+            mbp_two_paths_on_one_id();
+        let mut ctx = make_ctx(&arbiter, &instruments, PortRole::Mktdata);
+        ctx.publisher = a;
+        proc_a.on_datagram(&mbp_wire::datagram(0, 0, 4, &[mbp_reset(41, 4)]), &ctx);
+
+        mbp_remap(&mut proc_b, &arbiter, &instruments, b);
+        assert_eq!(
+            mbp_held_under(&instruments, &books, 1),
+            (false, false),
+            "the reset path no longer holds the old ID"
+        );
     }
 
     /// A shared arbiter over a fresh broadcast channel — the four lines every processor test needs.
@@ -9130,7 +9577,7 @@ mod tests {
             &mbp_wire::datagram(0, 0, 105, &[mbp_level(41, 30, MBP_BID, 6200, 10, 7_005)]),
             &mkt,
         );
-        proc.forget_book(&(TEST_PUB, 0, 41));
+        proc.forget_book(&(TEST_PUB, 0, 41), &mkt);
         assert_eq!(proc.buffered_total, recomputed(&proc), "after an eviction");
     }
 

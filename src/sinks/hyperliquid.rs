@@ -42,9 +42,11 @@ use crate::{
     },
 };
 
-/// The one venue this sink renders. Hyperliquid's schema names an instrument by `coin`, which is our
-/// `symbol`; a message from another venue has no `coin` to be and is dropped before any rendering.
-const VENUE: &str = "HYPERLIQUID";
+/// The one Source ID this sink renders. Hyperliquid's schema names an instrument by `coin`, which is
+/// our `symbol`; a message from another source has no `coin` to be and is dropped before any
+/// rendering. Matched on the ID, not the name: several IDs may share a name, and another ID is a
+/// different engine.
+use crate::ingest::sources::HYPERLIQUID_SOURCE_ID as SOURCE_ID;
 
 /// `nLevels` when the subscription omits it, and the ceiling it is clamped to — both from the
 /// publisher's `types/subscription.rs`.
@@ -536,7 +538,7 @@ fn raw_diff(c: &crate::model::BookChange, published: Option<f64>) -> RawDiff {
 /// channel last sent for the market, read **before** the batch is folded into it. `None` when the
 /// batch carries no order-level change at all.
 fn render_l4book_diff(b: &NormalizedBook, coin: &str, published: &MarketOrders) -> Option<String> {
-    if b.venue.as_ref() != VENUE || b.symbol.as_ref() != coin {
+    if b.source_id != SOURCE_ID || b.symbol.as_ref() != coin {
         return None;
     }
     let book_diffs: Vec<OrderDiffEntry> = b
@@ -582,7 +584,7 @@ struct TradeData<'a> {
 /// A trade whose aggressor we do not know is dropped rather than guessed: the side is the only field
 /// on this channel a consumer acts on directionally, and Hyperliquid's schema has no "unknown".
 fn render_trade(t: &NormalizedTrade, coin: &str) -> Option<String> {
-    if t.venue.as_ref() != VENUE || t.symbol.as_ref() != coin {
+    if t.source_id != SOURCE_ID || t.symbol.as_ref() != coin {
         return None;
     }
     let side = match t.aggressor_side {
@@ -848,7 +850,7 @@ fn prepare_one(
     let FeedMessage::Book(b) = &**m else {
         return bare(None);
     };
-    if b.venue.as_ref() != VENUE {
+    if b.source_id != SOURCE_ID {
         return bare(None);
     }
     let coin = b.symbol.as_ref();
@@ -1022,7 +1024,7 @@ fn sent(channel: &'static str) {
 /// order population, so such a market would render as an *empty* book, telling the consumer to discard
 /// levels the bridge holds.
 fn publishable(key: &BookKey, acc: &BookAccumulator, coin: &str) -> bool {
-    key.0.name() == VENUE
+    key.0.id() == SOURCE_ID
         && acc.symbol().as_ref() == coin
         && acc.baselined()
         && acc.is_order_level()
@@ -1150,7 +1152,7 @@ fn frames(
                 }
             }
         }
-        FeedMessage::Book(b) if b.venue.as_ref() == VENUE => {
+        FeedMessage::Book(b) if b.source_id == SOURCE_ID => {
             let coin = b.symbol.as_ref();
             let Some(key) = p.key.as_ref() else {
                 return out;
@@ -1506,6 +1508,9 @@ mod tests {
 
     const TEST_CATEGORY: &str = "perps";
 
+    /// The name [`SOURCE_ID`] carries.
+    const VENUE: &str = "HYPERLIQUID";
+
     use crate::model::BookReplay;
 
     /// The shared replay map a test hands the sink, holding exactly the markets listed.
@@ -1542,6 +1547,16 @@ mod tests {
         let mut acc = BookAccumulator::new("BTC".into());
         acc.apply(&order_book(orders));
         acc
+    }
+
+    /// Another Source ID under the same name is a different engine, not this sink's.
+    #[test]
+    fn another_id_under_the_same_name_is_not_published() {
+        let acc = accumulated(vec![(BookSide::Bid, 100.0, 1.0, 1)]);
+        assert!(publishable(&key(), &acc, "BTC"), "fixture sanity");
+        let mut other = key();
+        other.0 = crate::model::SourceKey::new(7, VENUE.into());
+        assert!(!publishable(&other, &acc, "BTC"));
     }
 
     fn key() -> BookKey {
@@ -1951,6 +1966,7 @@ mod tests {
         }]);
         assert!(render_l4book_diff(&b, "ETH", &MarketOrders::default()).is_none());
         b.venue = "PHOENIX".into();
+        b.source_id = 2;
         assert!(render_l4book_diff(&b, "BTC", &MarketOrders::default()).is_none());
     }
 
@@ -1996,7 +2012,8 @@ mod tests {
 
     #[test]
     fn trades_from_another_venue_render_nothing() {
-        let t = normalized_trade("PHOENIX", "BTC", 1.0, 1.0, true, 1);
+        let mut t = normalized_trade("PHOENIX", "BTC", 1.0, 1.0, true, 1);
+        t.source_id = 2;
         assert!(render_trade(&t, "BTC").is_none());
     }
 

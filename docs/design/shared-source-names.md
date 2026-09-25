@@ -37,14 +37,18 @@ Two PRs.
 - `DuplicateSource` refuses a repeated ID only.
 - `source_id_of` becomes `source_ids_of`, returning every ID for a name. `registry::feed_from`
   checks that at least one exists.
-- The revealed set records IDs, not names. `emit_status`, `reconcile` channel purges
-  (`forget_channel_books`, the catalog retain) and `/v1/products` history counts use the row's
-  revealed IDs instead of a name or first match.
+- The revealed set records IDs, not names; `emit_status` reports each revealed ID.
+- `reconcile` channel purges and `/v1/status` product counts cover every ID of the row's name,
+  scoped by the row's category and channel. That reaches the same rows as today's
+  `(name, category, channel)` scope, which already includes a same-name row of another kind in
+  that category. Shared IDs widen it by no row.
 - Name-only lookups filter on a fixed Source ID: the public backstops'
   `instrument_known` / `resolve_instrument`, and the order-book sink's venue filter.
 - Product ids: `resolve` already matches by name. The ambiguity count moves from
   `(source_id, symbol)` to `(name, symbol)`, so a symbol listed under two IDs of one name renders
   with the `#channel.instrument` suffix and resolves back.
+- An instrument that moves off an ID drops that ID's depth and book replay once no path still
+  serves it there. The arbiter tracks the paths, since it sees every receiver.
 - Docs: `self-hosting.md` drops "a name may appear only once".
 
 ## Out of scope
