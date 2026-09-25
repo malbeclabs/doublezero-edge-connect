@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a bare passthrough: with both mirrors unblocked, a slower one's older mid overwrites the fresher.
   Which clock that floor latches on is undecidable until this codec's offsets are validated against
   a live datagram, so it is recorded alongside that precondition rather than guessed at. (#109)
+- Market-by-Order books were keyed `(publisher, instrument_id)`, dropping the `channel_id` that the
+  edge-feed-spec makes part of an instrument's unique key — `instrument_id` is scoped to its channel
+  and need not be unique across channels. Two channels on one group both carrying instrument id 7
+  had their books merged, applying each channel's deltas to the other's state; every per-publisher
+  sequence check still passed, so it surfaced only as a silently corrupt book. The book key, every
+  map keyed off it, and the `SnapshotOrder` routing filter now all carry the raw `channel_id` from
+  the datagram header. Latent — the live publishers put everything on channel 0. Reference data
+  remains channel-flat, so two such channels still resolve one definition and publish one symbol,
+  which the venue-wide depth floor then leaves flip-flopping between the two books. (#110)
 - A price-book market no longer goes dark to new subscribers after one very large event. An
   event carrying more than 8,192 changes before its `last` un-baselines the WebSocket replay entry,
   and only a `Clear`-led batch from the serving path could restore it: a book that stays `Ready` sends

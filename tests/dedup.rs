@@ -46,8 +46,8 @@ fn port_role(role: u8) -> PortRole {
 /// Replay combined MBO records through a single re-keyed `MboProcessor` feeding the shared `Arbiter`
 /// in capture order, collecting the emitted WS messages as JSON. The production demux+dedup path:
 /// each record's source IP address becomes `DatagramCtx.publisher`, so the processor reconstructs an independent
-/// book per `(publisher, instrument)` and the cross-publisher latch-to-leader depth floor runs in the
-/// arbiter — exactly as in the binary.
+/// book per `(publisher, channel, instrument)` and the cross-publisher latch-to-leader depth floor
+/// runs in the arbiter — exactly as in the binary.
 fn replay_mbo(recs: &[(IpAddr, u8, Vec<u8>)]) -> Vec<Value> {
     let (tx, mut rx) = broadcast::channel(1 << 16);
     let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, TRADE_DEDUP_WINDOW)));
@@ -473,7 +473,7 @@ fn duplicate_multicast_trade_packet_collapses() {
 ///      Source ID, and the anchor alone carries none, so by the time either publisher's first
 ///      `depth` is emitted it already reflects real post-reveal content, never the empty anchor.
 ///   3. Both publishers reconstruct independently: each replayed ALONE emits depth (its book syncs
-///      from its own anchor + deltas — proving the per-`(publisher, instrument)` re-key).
+///      from its own anchor + deltas — proving the publisher axis of the book key).
 ///   4. **Not** cross-publisher collapse. This fixture's two publisher IPs are the same pair
 ///      captured in the TOB dedup fixture (`two_publishers_latch_to_leader_no_stale_or_dupes`),
 ///      and carry the SAME real defect there: the first publisher stamps every order/trade with wire
