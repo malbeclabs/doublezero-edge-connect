@@ -991,8 +991,10 @@ pub async fn run_feed(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::{
+        collections::BTreeSet,
+        net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    };
 
     use super::{
         datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_ids_for,
