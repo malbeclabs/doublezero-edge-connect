@@ -1478,6 +1478,10 @@ pub struct Arbiter {
     book_sync: HashMap<MarketKey, HashMap<Transport, PeerState>>,
     /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
     book_events: HashMap<MarketKey, MarketEvents>,
+    /// Which paths have revealed each market under its Source ID, across every receiver, so an
+    /// instrument moving off an ID purges that ID's state only once no path still serves it.
+    /// Bounded like `book_markets`; a market past the bound is untracked and purges on release.
+    source_paths: HashMap<MarketKey, HashSet<Transport>>,
     /// Per `(source, category, channel)` venue clock — the frontier the resurrection guard admits and
     /// forgets on. Bounded by [`MAX_CHANNEL_CLOCKS`], oldest first, with `channel_clock_order` as the
     /// eviction queue.
@@ -1753,6 +1757,7 @@ impl Arbiter {
             book_lost_labelled: HashSet::new(),
             book_sync: HashMap::new(),
             book_events: HashMap::new(),
+            source_paths: HashMap::new(),
             channel_clocks: HashMap::new(),
             channel_clock_order: VecDeque::new(),
             guard: GuardBudget::default(),
@@ -1843,6 +1848,12 @@ impl Arbiter {
                 paths.remove(&publisher);
             }
         }
+        self.source_paths.retain(|key, paths| {
+            if key.1.as_ref() == category {
+                paths.remove(&publisher);
+            }
+            !paths.is_empty()
+        });
     }
 
     /// Install the `--arb-*` arbitration tunables: the single-path authority config, and the cross-path
@@ -2133,6 +2144,38 @@ impl Arbiter {
     /// channel's markets (the common floor-narrowing case: a handful of channels admitted out of
     /// dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for tens
     /// of milliseconds to seconds.
+    /// Record that `path` revealed `market` under its Source ID.
+    pub(crate) fn note_source_path(&mut self, market: &MarketKey, path: Transport) {
+        if let Some(paths) = self.source_paths.get_mut(market) {
+            paths.insert(path);
+        } else if self.source_paths.len() < MAX_BOOK_MARKETS {
+            self.source_paths
+                .insert(market.clone(), HashSet::from([path]));
+        }
+    }
+
+    /// An instrument moved off `market`'s Source ID on `releasing`: drop that ID's book, and the
+    /// `symbol` depth floor and replay when given, unless another path still serves it there.
+    /// Decided here because the arbiter sees every receiver's paths; one processor sees only its own.
+    pub(crate) fn release_source_market(
+        &mut self,
+        market: &MarketKey,
+        symbol: Option<&str>,
+        releasing: Transport,
+    ) {
+        if let Some(paths) = self.source_paths.get_mut(market) {
+            paths.remove(&releasing);
+            if !paths.is_empty() {
+                return;
+            }
+            self.source_paths.remove(market);
+        }
+        if let Some(symbol) = symbol {
+            self.reset_depth_floor_for_symbol(&market.0, symbol, "source_id_changed");
+        }
+        self.reset_books_for_markets(std::slice::from_ref(market));
+    }
+
     pub(crate) fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
         if keys.is_empty() {
             return;
@@ -4377,6 +4420,47 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![1]);
+    }
+
+    /// Releasing an ID purges its state only once no path still serves it; a peer whose receiver
+    /// exits stops holding it.
+    #[test]
+    fn a_released_id_is_purged_once_no_path_serves_it() {
+        let (a_path, b_path) = (
+            Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+        );
+        let (tx, _rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
+        let mut d = depth(1000, vec![[100.0, 1.0]], vec![]);
+        d.source_id = 1;
+        d.venue = "SHARED".into();
+        d.source_name = "SHARED".into();
+        a.emit(FeedMessage::Depth(d), a_path, TEST_CATEGORY);
+        let market: MarketKey = (
+            SourceKey::new(1, "SHARED".into()),
+            TEST_CATEGORY.into(),
+            0,
+            0,
+        );
+        let entry = (SourceKey::new(1, "SHARED".into()), Arc::<str>::from("BTC"));
+        a.note_source_path(&market, a_path);
+        a.note_source_path(&market, b_path);
+
+        a.release_source_market(&market, Some("BTC"), a_path);
+        assert!(
+            model::lock(&replay).contains_key(&entry),
+            "the peer still serves it"
+        );
+        a.forget_publisher_books(TEST_CATEGORY, b_path);
+        a.note_source_path(&market, a_path);
+        a.release_source_market(&market, Some("BTC"), a_path);
+        assert!(
+            !model::lock(&replay).contains_key(&entry),
+            "no path serves it any more"
+        );
     }
 
     /// The floor resets purge the matching WS-replay entries: a client connecting across a

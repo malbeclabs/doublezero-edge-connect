@@ -1063,29 +1063,33 @@ impl MboProcessor {
                 instrument_id,
             );
             // The old ID's depth and book are keyed apart from the new one's, so nothing overwrites
-            // them: drop them unless another publisher here still serves the instrument there.
-            let still_served = self
-                .revealed
-                .iter()
-                .any(|(k, &id)| *k != key && k.1 == instrument_id && id == old_id);
-            if !still_served {
-                let old = SourceKey::from_id(old_id);
-                let symbol = self
-                    .emitted_symbol
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| def.symbol.clone());
-                let mut arb = lock(ctx.arbiter);
-                arb.reset_depth_floor_for_symbol(&old, &symbol, "source_id_changed");
-                arb.reset_books_for_markets(&[(
-                    old,
+            // them: drop them unless another path still serves the instrument there.
+            let symbol = self
+                .emitted_symbol
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| def.symbol.clone());
+            lock(ctx.arbiter).release_source_market(
+                &(
+                    SourceKey::from_id(old_id),
                     category_arc(ctx.category),
                     channel,
                     instrument_id,
-                )]);
-            }
+                ),
+                Some(&symbol),
+                Transport::Edge(ctx.publisher),
+            );
         }
         self.revealed.insert(key, source_id);
+        lock(ctx.arbiter).note_source_path(
+            &(
+                SourceKey::from_id(source_id),
+                category_arc(ctx.category),
+                channel,
+                instrument_id,
+            ),
+            Transport::Edge(ctx.publisher),
+        );
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -2320,23 +2324,28 @@ impl MbpProcessor {
                 key.2,
             );
             // As for order-level books: the old ID's book is keyed apart, so drop it unless another
-            // publisher here still serves the instrument there.
-            let still_served = self.revealed.iter().any(|(k, &id)| {
-                *k != key
-                    && ctx.canonical_channel(k.1) == ctx.canonical_channel(key.1)
-                    && k.2 == key.2
-                    && id == old_id
-            });
-            if !still_served {
-                lock(ctx.arbiter).reset_books_for_markets(&[(
+            // path still serves the instrument there.
+            lock(ctx.arbiter).release_source_market(
+                &(
                     SourceKey::from_id(old_id),
                     category_arc(ctx.category),
                     ctx.canonical_channel(key.1),
                     key.2,
-                )]);
-            }
+                ),
+                None,
+                Transport::Edge(ctx.publisher),
+            );
         }
         self.revealed.insert(key, source_id);
+        lock(ctx.arbiter).note_source_path(
+            &(
+                SourceKey::from_id(source_id),
+                category_arc(ctx.category),
+                ctx.canonical_channel(key.1),
+                key.2,
+            ),
+            Transport::Edge(ctx.publisher),
+        );
         let source = venue_arc(source_label(source_id));
         let inst = NormalizedInstrument {
             venue: source.clone(),
@@ -5540,6 +5549,80 @@ mod tests {
         assert!(
             crate::model::lock(&depth).contains_key(&key(1)),
             "the peer still serves the old ID"
+        );
+    }
+
+    /// A peer on another receiver (its own processor) still serving the old ID keeps its depth: the
+    /// check is the arbiter's, which every receiver shares, not one processor's.
+    #[test]
+    fn mbo_source_id_change_keeps_depth_a_peer_on_another_receiver_serves() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let pub_a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let (tx, _rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        lock(&arbiter).set_depth_replay(depth.clone());
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = |publisher, role| {
+            let mut c = make_ctx(&arbiter, &instruments, role);
+            c.publisher = publisher;
+            c
+        };
+        let mut procs: Vec<(IpAddr, MboProcessor)> = [pub_a, pub_b]
+            .into_iter()
+            .map(|publisher| {
+                let mut proc = MboProcessor::new(depth.clone(), tape(false));
+                proc.on_datagram(
+                    &datagram(&[
+                        enc_manifest_summary(1, 1),
+                        enc_instrument_def(0, "INST-0", 1),
+                    ]),
+                    &ctx(publisher, PortRole::Combined),
+                );
+                proc.on_datagram(
+                    &datagram(&[
+                        enc_snapshot_begin(&SnapshotBegin {
+                            instrument_id: 0,
+                            anchor_seq: 0,
+                            total_orders: 0,
+                            snapshot_id: 1,
+                            last_instrument_seq: 0,
+                            ts: 1,
+                        }),
+                        enc_snapshot_end(&SnapshotEnd {
+                            instrument_id: 0,
+                            anchor_seq: 0,
+                            snapshot_id: 1,
+                        }),
+                    ]),
+                    &ctx(publisher, PortRole::Snapshot),
+                );
+                proc.on_datagram(
+                    &datagram(&[add_from(1, 1, 100, 5000)]),
+                    &ctx(publisher, PortRole::Mktdata),
+                );
+                (publisher, proc)
+            })
+            .collect();
+        let key = |id: u16| {
+            (
+                crate::model::SourceKey::from_id(id),
+                Arc::<str>::from("INST-0"),
+            )
+        };
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "fixture sanity"
+        );
+        let (publisher, proc) = &mut procs[0];
+        proc.on_datagram(
+            &datagram(&[add_from(2, 2, 101, 5001)]),
+            &ctx(*publisher, PortRole::Mktdata),
+        );
+        assert!(
+            crate::model::lock(&depth).contains_key(&key(1)),
+            "the peer on another receiver still serves the old ID"
         );
     }
 
