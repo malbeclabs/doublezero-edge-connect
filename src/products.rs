@@ -20,11 +20,13 @@
 
 use std::sync::Arc;
 
-use crate::{ingest::sources::source_label, model::InstrumentSnapshot};
+use crate::model::InstrumentSnapshot;
 
 /// One market's full identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductId {
+    /// The source's name, as its instruments carry it: what the id renders and resolves by.
+    pub source: Arc<str>,
     pub source_id: u16,
     pub symbol: Arc<str>,
     pub channel: u8,
@@ -38,10 +40,22 @@ pub struct ProductId {
 }
 
 impl ProductId {
+    /// The id of one catalog entry.
+    pub fn of(i: &crate::model::NormalizedInstrument) -> Self {
+        Self {
+            source: i.venue.clone(),
+            source_id: i.source_id,
+            symbol: i.symbol.clone(),
+            channel: i.channel,
+            instrument_id: i.instrument_id,
+            category: i.category.clone(),
+        }
+    }
+
     /// Render as a CLI-facing id. `ambiguous` is the caller's finding that this symbol is not unique
     /// within its source — it is not derivable here, because it depends on the whole catalog.
     pub fn render(&self, ambiguous: bool) -> String {
-        let src = source_label(self.source_id);
+        let src = &self.source;
         if ambiguous {
             format!(
                 "{src}:{}#{}.{}",
@@ -121,13 +135,7 @@ pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
     let mut hits: Vec<ProductId> = map
         .values()
         .filter(|i| i.venue.eq_ignore_ascii_case(&id.source) && i.symbol.as_ref() == id.symbol)
-        .map(|i| ProductId {
-            source_id: i.source_id,
-            symbol: i.symbol.clone(),
-            channel: i.channel,
-            instrument_id: i.instrument_id,
-            category: i.category.clone(),
-        })
+        .map(ProductId::of)
         .collect();
 
     if let Some((ch, inst)) = id.identity {
@@ -143,22 +151,31 @@ pub fn resolve(instruments: &InstrumentSnapshot, id: &ParsedId) -> Resolution {
 
 /// Render each ambiguous candidate for the error list, one string per hit. The plain suffixed
 /// rendering (`ProductId::render(true)`) is enough to tell two candidates apart *unless* they share
-/// both symbol and `(channel, instrument_id)` — which can only happen across two different
-/// categories (within one category that pair is already unique, since it prefixes
-/// `InstrumentSnapshot`'s own key). In exactly that case the plain rendering is byte-identical for
-/// both and names neither market, so this appends the category — never inside the id syntax itself
-/// (see this module's docs for why), only in the error text, which is free to say more than the id
-/// can.
+/// both symbol and `(channel, instrument_id)` — which happens across two categories, or across two
+/// Source IDs sharing a name. Then the plain rendering is byte-identical for both and names neither
+/// market, so this appends the category, and the Source ID when the category matches too — never
+/// inside the id syntax itself (see this module's docs for why), only in the error text, which is
+/// free to say more than the id can.
 fn render_ambiguous(hits: &[ProductId]) -> Vec<String> {
     let rendered: Vec<String> = hits.iter().map(|p| p.render(true)).collect();
     hits.iter()
         .zip(rendered.iter())
         .map(|(p, r)| {
             let collides = rendered.iter().filter(|other| *other == r).count() > 1;
-            if collides {
-                format!("{r} (category: {})", p.category)
+            if !collides {
+                return r.clone();
+            }
+            // Several IDs may share a name, so the category can collide too; the Source ID cannot.
+            let same_category = hits
+                .iter()
+                .zip(rendered.iter())
+                .filter(|(o, other)| *other == r && o.category == p.category)
+                .count()
+                > 1;
+            if same_category {
+                format!("{r} (category: {}, source_id: {})", p.category, p.source_id)
             } else {
-                r.clone()
+                format!("{r} (category: {})", p.category)
             }
         })
         .collect()
@@ -172,6 +189,7 @@ mod tests {
     #[test]
     fn a_unique_symbol_renders_as_source_and_symbol() {
         let p = ProductId {
+            source: "HYPERLIQUID".into(),
             source_id: 1,
             symbol: "BTC".into(),
             channel: 0,
@@ -186,6 +204,7 @@ mod tests {
     #[test]
     fn a_colliding_symbol_renders_with_its_identity_suffix() {
         let p = ProductId {
+            source: "HYPERLIQUID".into(),
             source_id: 1,
             symbol: "BTC".into(),
             channel: 2,
@@ -326,6 +345,22 @@ mod tests {
         other.source_id = 7;
         let snap = snapshot(vec![instrument("c", "X", 0, 5), other]);
         assert_eq!(crate::model::lock(&snap).len(), 2);
+    }
+
+    /// Two IDs under one name can share symbol, identity and category; the id cannot separate them,
+    /// so the ambiguity error names each one's Source ID rather than printing one string twice.
+    #[test]
+    fn an_identical_market_under_two_ids_is_named_by_source_id() {
+        let snap = snapshot(vec![shared(4, "B", 1), shared(10, "B", 1)]);
+        match resolve(&snap, &parse("SHARED:B#0.1").unwrap()) {
+            Resolution::Ambiguous(c) => {
+                assert_eq!(c.len(), 2);
+                assert_ne!(c[0], c[1], "{c:?}");
+                assert!(c.iter().any(|r| r.contains("source_id: 4")), "{c:?}");
+                assert!(c.iter().any(|r| r.contains("source_id: 10")), "{c:?}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Two disjoint universes ("perps" and "sports") under one Source ID both happen to use

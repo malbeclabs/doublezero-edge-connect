@@ -379,13 +379,7 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 /// not a decimal string like the increments: it is wire metadata, and one name must not mean two
 /// things across the two surfaces.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
-    let pid = products::ProductId {
-        source_id: i.source_id,
-        symbol: i.symbol.clone(),
-        channel: i.channel,
-        instrument_id: i.instrument_id,
-        category: i.category.clone(),
-    };
+    let pid = products::ProductId::of(i);
     let mut entry = json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
@@ -694,14 +688,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
 
 fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     let ambiguous = is_ambiguous(state, &inst.venue, &inst.symbol);
-    let rendered_id = products::ProductId {
-        source_id: inst.source_id,
-        symbol: inst.symbol.clone(),
-        channel: inst.channel,
-        instrument_id: inst.instrument_id,
-        category: inst.category.clone(),
-    }
-    .render(ambiguous);
+    let rendered_id = products::ProductId::of(inst).render(ambiguous);
 
     // Prefer the incremental market-by-price accumulator when this identity has one. Looked up by
     // the full category-carrying key (a category-blind lookup would return whichever universe's
@@ -998,14 +985,7 @@ fn best_bid_ask(state: &ApiState, req: &Request) -> Response {
             // docs); omitting it is honest, a zeroed/fabricated level would not be.
             continue;
         }
-        let product_id = products::ProductId {
-            source_id: i.source_id,
-            symbol: i.symbol.clone(),
-            channel: i.channel,
-            instrument_id: i.instrument_id,
-            category: i.category.clone(),
-        }
-        .render(ambiguous);
+        let product_id = products::ProductId::of(i).render(ambiguous);
         pricebooks.push(json!({
             "product_id": product_id,
             "bids": bid.map(|(p, s)| vec![json!([decimal_string(p, i.price_exponent), decimal_string(s, i.qty_exponent)])]).unwrap_or_default(),
