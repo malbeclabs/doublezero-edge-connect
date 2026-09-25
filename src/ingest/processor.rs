@@ -110,12 +110,13 @@ impl SeqEvents {
     }
 }
 
-/// Cap on the number of distinct publishers (source IP addresses) tracked by [`TobProcessor`]'s per-publisher
-/// sequence map. The source IP address comes from an *unauthenticated, spoofable* UDP datagram, so without a
-/// bound an attacker who can inject into the multicast group could mint a fresh `SeqTracker` per
-/// forged source IP address and grow the map without limit (memory-exhaustion DoS). Real deployments have a
-/// handful of mirrored publishers, so this is set far above that; once full, the least-recently-
-/// inserted publisher is evicted (it simply re-anchors its sequence on its next datagram).
+/// Cap on the number of distinct publishers (source IP addresses) tracked by each [`PublisherSeq`]
+/// (`TobProcessor`, `MidpointProcessor`, `MbpProcessor`) and each [`PerPublisher`] map. The source IP
+/// address comes from an *unauthenticated, spoofable* UDP datagram, so without a bound an attacker who
+/// can inject into the multicast group could mint a fresh entry per forged source IP address and grow
+/// the map without limit (memory-exhaustion DoS). Real deployments have a handful of mirrored
+/// publishers, so this is set far above that; once full, the least-recently-inserted publisher is
+/// evicted (it re-anchors its sequence, or re-learns its definitions, on its next datagram).
 pub(crate) const MAX_PUBLISHERS: usize = 256;
 
 /// Per-publisher [`SeqTracker`]s. Independent publishers mirror one feed onto one group sharing a
@@ -702,7 +703,8 @@ impl DatagramProcessor for TobProcessor {
 pub struct MidpointProcessor {
     /// Per-publisher reference-data state (see [`PerPublisher`]).
     state: PerPublisher<codec_midpoint::InstrumentDefinition>,
-    seq: SeqTracker,
+    /// Per-publisher, per-channel datagram sequence tracker — see [`PublisherSeq`].
+    seq: PublisherSeq,
     /// Rate limit for the per-datagram decode-error warning.
     decode_warn: WarnRateLimit,
     /// Pre-resolved datagram-sequence metric children (bound lazily on the first datagram).
@@ -727,7 +729,7 @@ impl MidpointProcessor {
     pub fn new() -> Self {
         Self {
             state: PerPublisher::default(),
-            seq: SeqTracker::default(),
+            seq: PublisherSeq::default(),
             decode_warn: WarnRateLimit::default(),
             seq_events: SeqEvents::default(),
             revealed: HashMap::new(),
@@ -822,9 +824,12 @@ impl DatagramProcessor for MidpointProcessor {
 
         // Same stale/out-of-order rejection as quotes: a midpoint is full state per instrument.
         let mids_fresh = if handle_mids {
-            let check = self
-                .seq
-                .check(header.channel_id, header.reset_count, header.sequence);
+            let check = self.seq.check(
+                ctx.publisher,
+                header.channel_id,
+                header.reset_count,
+                header.sequence,
+            );
             self.seq_events.record(ctx.venue, &check);
             !matches!(check, SeqCheck::Stale)
         } else {
@@ -4180,6 +4185,13 @@ mod tests {
         f
     }
 
+    /// [`codec_midpoint::tests::datagram`] with an explicit sequence (datagram-header bytes 4..12).
+    fn midpoint_datagram_seq(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
+        let mut f = midpoint_wire::datagram(messages.concat(), messages.len() as u8);
+        f[4..12].copy_from_slice(&sequence.to_le_bytes());
+        f
+    }
+
     /// [`tob_datagram`], but stamped with Schema Version 3 — for the tests exercising a v3
     /// `InstrumentDefinition`'s own Source ID.
     fn tob_datagram_v3(sequence: u64, messages: &[Vec<u8>]) -> Vec<u8> {
@@ -4366,6 +4378,77 @@ mod tests {
     /// rather than a live bug — the point is that the first mirrored midpoint row must not be what
     /// discovers this half was never exercised.
     ///
+    /// A shared tracker leaves the lower-numbered publisher permanently below the other's anchor, so
+    /// every one of its mids is dropped as stale.
+    #[test]
+    fn midpoint_seq_is_tracked_per_publisher() {
+        let (arbiter, mut rx, instruments) = mbp_harness();
+        let mut proc = MidpointProcessor::new();
+        let ctx = |publisher, role| tob_ctx(&arbiter, &instruments, role, publisher);
+        let pub_a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let pub_b = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        let mid = |raw: i64| {
+            midpoint_wire::encode_midpoint(&codec_midpoint::Midpoint {
+                instrument_id: 41,
+                source_id: 1,
+                method: 0,
+                quality_flags: 0,
+                book_ts: 1,
+                compute_ts: 1,
+                mid_price_raw: raw,
+            })
+        };
+
+        // Each publisher carries its own definitions; a definition is per-publisher state too.
+        for publisher in [pub_a, pub_b] {
+            proc.on_datagram(
+                &midpoint_datagram_seq(
+                    1,
+                    &[
+                        enc_manifest_summary(1, 1),
+                        midpoint_wire::encode_instrument(&codec_midpoint::InstrumentDefinition {
+                            instrument_id: 41,
+                            symbol: "MARKET-X".into(),
+                            price_exponent: 0, // raw mid == emitted mid
+                            default_method: 0,
+                            manifest_seq: 1,
+                        }),
+                    ],
+                ),
+                &ctx(publisher, PortRole::Refdata),
+            );
+        }
+
+        // Interleaved, and far apart on purpose: independent counters have no reason to be close, so
+        // every one of B's datagrams sits below A's anchor.
+        for (publisher, sequence, raw) in [
+            (pub_a, 1000, 10),
+            (pub_b, 5, 20),
+            (pub_a, 1001, 11),
+            (pub_b, 6, 21),
+            (pub_a, 1002, 12),
+            (pub_b, 7, 22),
+        ] {
+            proc.on_datagram(
+                &midpoint_datagram_seq(sequence, &[mid(raw)]),
+                &ctx(publisher, PortRole::Mktdata),
+            );
+        }
+
+        let mids: Vec<f64> = drain_all(&mut rx)
+            .iter()
+            .filter_map(|m| match m {
+                FeedMessage::Midpoint(mp) => Some(mp.mid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mids,
+            vec![10.0, 20.0, 11.0, 21.0, 12.0, 22.0],
+            "both publishers' mids must survive; one shared tracker drops B's entirely"
+        );
+    }
+
     /// Both bursts come from the same source IP address on purpose: the registry's `MIRROR` note
     /// keys the two paths apart by `channel_id`, never by host, so a fix that canonicalized only the
     /// publisher axis would pass a two-address test and still fail this one.

@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked every unrelated pull request until now.
 
 ### Fixed
+- `MidpointProcessor` held one `SeqTracker` for every publisher, where `TobProcessor` and
+  `MbpProcessor` key theirs per publisher. Datagram sequence is scoped to `(source_ip, group, port)`,
+  so under a shared port block two mirrored publishers' independent sequence spaces interleaved onto
+  one anchor and whichever ran lower read as stale on every datagram: its mids were dropped outright
+  while `dz_seq_events_total{kind="stale"}` climbed on a perfectly healthy feed. It now uses the same
+  bounded `PublisherSeq`. Latent — no feed row selects `FeedKind::Midpoint`. **Enabling one now
+  also requires giving `Midpoint` a `(venue, symbol)` staleness floor in the arbiter**, where it is
+  a bare passthrough: with both mirrors unblocked, a slower one's older mid overwrites the fresher.
+  Which clock that floor latches on is undecidable until this codec's offsets are validated against
+  a live datagram, so it is recorded alongside that precondition rather than guessed at. (#109)
 - Market-by-Order books were keyed `(publisher, instrument_id)`, dropping the `channel_id` that the
   edge-feed-spec makes part of an instrument's unique key — `instrument_id` is scoped to its channel
   and need not be unique across channels. Two channels on one group both carrying instrument id 7
