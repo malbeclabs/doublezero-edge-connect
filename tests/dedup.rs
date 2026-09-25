@@ -662,6 +662,7 @@ fn level(side: BookSide, price: f64, size: f64) -> BookChange {
 /// One `book` batch for the single market under test. `recv_ns` is the authority's arrival clock.
 fn book_batch(changes: Vec<BookChange>, last: bool, recv_ns: u64) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
+        batch_id: None,
         venue: BOOK_VENUE.into(),
         source_name: BOOK_VENUE.into(),
         source_id: 0,
@@ -778,7 +779,7 @@ fn interleaved_book_paths_publish_one_coherent_feed() {
     }
     let full = acc.to_book(
         &(
-            BOOK_VENUE.into(),
+            doublezero_edge_connect::model::SourceKey::new(0, BOOK_VENUE.into()),
             BOOK_CATEGORY.into(),
             BOOK_CHANNEL,
             BOOK_INSTRUMENT,

@@ -101,7 +101,7 @@ pub enum Resolution {
 
 /// Match a parsed id against the instrument snapshot.
 ///
-/// `instruments` is now keyed `(venue, category, channel, instrument_id)` — two disjoint universes
+/// `instruments` is keyed `(source, category, channel, instrument_id)` — two disjoint universes
 /// under one Source ID can share `(channel, instrument_id)`, so filtering by source+symbol alone
 /// can legitimately produce hits from more than one category. That is not a defect to paper over:
 /// each hit already carries the category its own `NormalizedInstrument` entry was stored under (no
@@ -258,6 +258,7 @@ mod tests {
         instrument_id: u32,
     ) -> NormalizedInstrument {
         NormalizedInstrument {
+            tick_size: 0,
             venue: "HYPERLIQUID".into(),
             source_name: "HYPERLIQUID".into(),
             source_id: 1,
@@ -275,7 +276,7 @@ mod tests {
         for d in defs {
             map.insert(
                 (
-                    d.venue.clone(),
+                    crate::model::SourceKey::of(&d),
                     d.category.clone(),
                     d.channel,
                     d.instrument_id,
@@ -284,6 +285,14 @@ mod tests {
             );
         }
         std::sync::Arc::new(std::sync::Mutex::new(map))
+    }
+
+    #[test]
+    fn instrument_snapshot_separates_ids_sharing_a_name() {
+        let mut other = instrument("c", "X", 0, 5);
+        other.source_id = 7;
+        let snap = snapshot(vec![instrument("c", "X", 0, 5), other]);
+        assert_eq!(crate::model::lock(&snap).len(), 2);
     }
 
     /// Two disjoint universes ("perps" and "sports") under one Source ID both happen to use

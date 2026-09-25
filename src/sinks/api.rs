@@ -23,8 +23,12 @@
 //!   backs.** An accumulator that has not folded in a producer re-baseline holds only the levels
 //!   that moved since it started accumulating; serving that as `"complete": true` would tell an
 //!   agent to treat a partial reconstruction as the whole book.
-//! - **No field is fabricated to fill out the emulated envelope.** `price_increment`/
-//!   `base_increment` are derived from the instrument's own price/qty exponent (`10^exponent`);
+//! - **No field is fabricated to fill out the emulated envelope.** `price_increment` is the
+//!   definition's own `Tick Size` at its price exponent — the tradable increment, not the
+//!   fixed-point granularity, which they are not the same thing (see [`price_increment_string`]) —
+//!   and `tick_size` is present beside it exactly when the publisher stated one, so a caller can
+//!   tell which of the two it was given (see [`product_entry`]); `base_increment` is derived from
+//!   the instrument's own qty exponent (`10^exponent`);
 //!   `volume_24h`, `price_percentage_change_24h`, `base_currency_id`/`quote_currency_id` and
 //!   `quote_increment` have no honest basis in this crate's reference data or its one-hour window,
 //!   so they are omitted rather than guessed. An absent field is safe under PROTOCOL.md's
@@ -53,7 +57,7 @@ use crate::{
         feeds::{feeds, Feed, FeedKind},
         health::{SharedFeedHealth, TapeLiveness},
         processor::DEPTH_LEVELS,
-        sources::{source_id_of, source_label},
+        sources::source_id_of,
     },
     model::{
         category_arc, venue_arc, BookSnapshot, DepthSnapshot, InstrumentSnapshot,
@@ -225,10 +229,9 @@ fn product_scoped(state: &ApiState, rest: &str, req: &Request) -> Response {
 }
 
 /// Re-fetch the full instrument record for an identity `resolve()` already matched.
-/// `InstrumentSnapshot` is keyed exactly on this identity (`(venue, category, channel,
-/// instrument_id)`), so this is a direct lookup, not a scan — `venue` is rederived from
-/// `source_id` the same way `ingest::processor` resolved it when it wrote the entry
-/// (`venue_arc(source_label(source_id))`). `category` must come from the same resolved
+/// `InstrumentSnapshot` is keyed exactly on this identity (`(source, category, channel,
+/// instrument_id)`), so this is a direct lookup, not a scan — the source key is rebuilt from
+/// `source_id` (`SourceKey::from_id`), as `ingest::processor` built it when it wrote the entry. `category` must come from the same resolved
 /// `ProductId` `resolve()` returned: two disjoint universes under one Source ID can share
 /// `(channel, instrument_id)`, and a lookup keyed on the wire identity alone would silently name
 /// whichever universe's entry happened to occupy that slot.
@@ -239,10 +242,35 @@ fn lookup_instrument(
     channel: u8,
     instrument_id: u32,
 ) -> Option<NormalizedInstrument> {
-    let venue = venue_arc(source_label(source_id));
     let map = crate::model::lock(&state.instruments);
-    map.get(&(venue, category.clone(), channel, instrument_id))
-        .cloned()
+    map.get(&(
+        crate::model::SourceKey::from_id(source_id),
+        category.clone(),
+        channel,
+        instrument_id,
+    ))
+    .cloned()
+}
+
+/// Sort on exactly `InstrumentSnapshot`'s own key (`(source, category, channel, instrument_id)`),
+/// the one tuple that uniquely identifies every entry, so a cursor walk neither skips nor repeats.
+fn sort_catalog(instruments: &mut [NormalizedInstrument]) {
+    instruments.sort_by(|a, b| {
+        (
+            a.venue.as_ref(),
+            a.source_id,
+            a.category.as_ref(),
+            a.channel,
+            a.instrument_id,
+        )
+            .cmp(&(
+                b.venue.as_ref(),
+                b.source_id,
+                b.category.as_ref(),
+                b.channel,
+                b.instrument_id,
+            ))
+    });
 }
 
 /// Whether more than one instrument shares `(source_id, symbol)` — what decides whether a
@@ -284,23 +312,8 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
     // `limit`/`cursor` page the catalog — the same shape the emulated tool's own paginated list
     // endpoints use. Unset `limit` keeps today's behaviour (every product, one response, no
     // `cursor` field): a page size is never imposed unless the caller asks for one. Pagination
-    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own, so this
-    // sorts on exactly `InstrumentSnapshot`'s own key (`(venue, category, channel,
-    // instrument_id)`), the one tuple that already uniquely identifies every entry.
-    instruments.sort_by(|a, b| {
-        (
-            a.venue.as_ref(),
-            a.category.as_ref(),
-            a.channel,
-            a.instrument_id,
-        )
-            .cmp(&(
-                b.venue.as_ref(),
-                b.category.as_ref(),
-                b.channel,
-                b.instrument_id,
-            ))
-    });
+    // needs a stable order to walk — the catalog is a `HashMap` with no order of its own.
+    sort_catalog(&mut instruments);
 
     let limit = match req.query("limit") {
         None => None,
@@ -356,6 +369,14 @@ fn products_list(state: &ApiState, req: &Request) -> Response {
 /// One product's identity + registry-derived fields. Carries the discrete identity fields
 /// (`source_id`/`source_name`/`symbol`/`channel`/`instrument_id`) alongside the rendered `product_id`
 /// string — an agent joining on identity should never have to re-parse the display id.
+///
+/// `tick_size` is **present only when the publisher stated one**, and that presence is the caller's
+/// signal for which of two things `price_increment` is: the venue's tradable tick when it is there,
+/// the fixed-point granularity when it is not (see [`price_increment_string`]). Reporting `0` for
+/// "none stated" instead would hand an agent a number it can divide or round by; an absent field it
+/// has to handle. Raw and in the same units as the `instrument` message's field of the same name,
+/// not a decimal string like the increments: it is wire metadata, and one name must not mean two
+/// things across the two surfaces.
 fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) -> Value {
     let pid = products::ProductId {
         source_id: i.source_id,
@@ -364,7 +385,7 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         instrument_id: i.instrument_id,
         category: i.category.clone(),
     };
-    json!({
+    let mut entry = json!({
         "product_id": pid.render(ambiguous),
         "source_id": i.source_id,
         "source_name": i.source_name.as_ref(),
@@ -377,18 +398,43 @@ fn product_entry(state: &ApiState, i: &NormalizedInstrument, ambiguous: bool) ->
         "symbol": i.symbol.as_ref(),
         "channel": i.channel,
         "instrument_id": i.instrument_id,
-        "price_increment": increment_string(i.price_exponent),
+        "price_increment": price_increment_string(i.tick_size, i.price_exponent),
         "base_increment": increment_string(i.qty_exponent),
         "status": if state.health.venue_up(i.venue.as_ref()) { "online" } else { "offline" },
-        "feed_kind": feed_kind_for(state, i),
-    })
+    });
+    let (feed_kind, book_complete) = feed_kind_for(state, i);
+    entry["feed_kind"] = json!(feed_kind);
+    // Present only for a market with a book: `false` is a market every new WebSocket subscriber is
+    // bootstrapped without — `status` is venue-level and reads `online` throughout.
+    if let Some(complete) = book_complete {
+        entry["book_complete"] = json!(complete);
+    }
+    if i.tick_size > 0 {
+        entry["tick_size"] = json!(i.tick_size);
+    }
+    entry
 }
 
-/// `10^exponent` rendered as a decimal string — `price_increment`/`base_increment`. Derivable from
-/// the instrument's own exponent, unlike `quote_increment` (no honest basis; deliberately omitted
-/// — see the module docs).
+/// `10^exponent` rendered as a decimal string — the fixed-point granularity, which is `base_increment`
+/// and is the fallback for `price_increment`. Derivable from the instrument's own exponent, unlike
+/// `quote_increment` (no honest basis; deliberately omitted — see the module docs).
 fn increment_string(exponent: i8) -> String {
     decimal_string(10f64.powi(exponent as i32), exponent)
+}
+
+/// The **tradable** price increment: the definition's `Tick Size` at its own price exponent. The
+/// two differ by orders of magnitude — BTC on Phoenix is exponent `-2` with a tick of `100`, so it
+/// moves in dollars while `10^-2` claims cents — and `price_increment` conventionally means the
+/// tradable one. A `tick_size` of `0` is the publisher stating none (every Hyperliquid definition
+/// does), and there the granularity is the only honest answer left.
+fn price_increment_string(tick_size: i64, price_exponent: i8) -> String {
+    if tick_size <= 0 {
+        return increment_string(price_exponent);
+    }
+    decimal_string(
+        crate::ingest::codec_common::apply_exponent(tick_size, price_exponent),
+        price_exponent,
+    )
 }
 
 /// Render `value` as a fixed-decimal string at `exponent`'s precision (never Rust's scientific/debug
@@ -411,32 +457,33 @@ fn decimal_string(value: f64, exponent: i8) -> String {
 /// actually serves it is unknown — reporting the category's Top-of-Book row in that case would be
 /// a guess (e.g. an about-to-baseline market-by-price instrument would misreport as
 /// `top_of_book`), which this module's docs promise never to do.
-fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
+///
+/// Also returns whether the market's `book` replay entry is a complete book
+/// ([`crate::model::BookAccumulator::baselined`]), `None` when it has none — read off the same lookup.
+fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> (&'static str, Option<bool>) {
     {
         let books = crate::model::lock(&state.books);
-        if let Some(order_level) = books
-            .get(&(
-                i.venue.clone(),
-                i.category.clone(),
-                i.channel,
-                i.instrument_id,
-            ))
-            .map(crate::model::BookAccumulator::is_order_level)
-        {
+        if let Some(acc) = books.get(&(
+            crate::model::SourceKey::of(i),
+            i.category.clone(),
+            i.channel,
+            i.instrument_id,
+        )) {
             // The same accumulator serves both products. Which one it holds is the market's own
             // property, not the map's — reported as `market_by_price` regardless, every
             // Market-by-Order instrument misdescribes itself the moment it starts publishing.
-            return if order_level {
+            let kind = if acc.is_order_level() {
                 "market_by_order"
             } else {
                 "market_by_price"
             };
+            return (kind, Some(acc.baselined()));
         }
     }
     {
         let depth = crate::model::lock(&state.depth);
-        if depth.contains_key(&(i.venue.clone(), i.symbol.clone())) {
-            return "market_by_order";
+        if depth.contains_key(&(crate::model::SourceKey::of(i), i.symbol.clone())) {
+            return ("market_by_order", None);
         }
     }
     let kinds: HashSet<FeedKind> = feeds()
@@ -444,10 +491,11 @@ fn feed_kind_for(state: &ApiState, i: &NormalizedInstrument) -> &'static str {
         .filter(|f| f.venue == i.venue.as_ref() && f.category == i.category.as_ref())
         .map(|f| f.kind)
         .collect();
-    match kinds.len() {
+    let kind = match kinds.len() {
         1 => feed_kind_label(*kinds.iter().next().expect("len() == 1")),
         _ => "unknown",
-    }
+    };
+    (kind, None)
 }
 
 fn feed_kind_label(kind: FeedKind) -> &'static str {
@@ -613,7 +661,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
         let books = crate::model::lock(&state.books);
         books
             .get(&(
-                inst.venue.clone(),
+                crate::model::SourceKey::of(inst),
                 inst.category.clone(),
                 inst.channel,
                 inst.instrument_id,
@@ -635,7 +683,7 @@ fn best_levels(state: &ApiState, inst: &NormalizedInstrument, ambiguous: bool) -
         return (None, None);
     }
     let depth = crate::model::lock(&state.depth);
-    if let Some(d) = depth.get(&(inst.venue.clone(), inst.symbol.clone())) {
+    if let Some(d) = depth.get(&(crate::model::SourceKey::of(inst), inst.symbol.clone())) {
         let bid = d.bids.first().map(|b| (b[0], b[1]));
         let ask = d.asks.first().map(|a| (a[0], a[1]));
         return (bid, ask);
@@ -674,7 +722,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // on a copy taken out from under the guard, the same discipline `sinks/hyperliquid.rs` follows:
     // ~617 µs held to clone the 44,598-order market against ~8.9 ms to fold it.
     let key = (
-        inst.venue.clone(),
+        crate::model::SourceKey::of(inst),
         inst.category.clone(),
         inst.channel,
         inst.instrument_id,
@@ -684,7 +732,15 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // copy out for).
     enum Held {
         Fold(Box<crate::model::BookAccumulator>),
-        Top(bool, u64, Vec<(f64, f64)>, Vec<(f64, f64)>, usize, usize),
+        Top(
+            bool,
+            u64,
+            Option<u32>,
+            Vec<(f64, f64)>,
+            Vec<(f64, f64)>,
+            usize,
+            usize,
+        ),
     }
     let held = {
         let books = crate::model::lock(&state.books);
@@ -696,6 +752,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
                 Held::Top(
                     acc.baselined(),
                     acc.source_ts_ns(),
+                    acc.batch_id(),
                     bids,
                     asks,
                     bids_total,
@@ -717,18 +774,19 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             Some((
                 acc.baselined(),
                 acc.source_ts_ns(),
+                acc.batch_id(),
                 level(bids),
                 level(asks),
                 bids_total,
                 asks_total,
             ))
         }
-        Some(Held::Top(baselined, ts, bids, asks, bids_total, asks_total)) => {
-            Some((baselined, ts, bids, asks, bids_total, asks_total))
+        Some(Held::Top(baselined, ts, batch_id, bids, asks, bids_total, asks_total)) => {
+            Some((baselined, ts, batch_id, bids, asks, bids_total, asks_total))
         }
         None => None,
     };
-    if let Some((baselined, source_ts_ns, bids, asks, bids_total, asks_total)) = mbp {
+    if let Some((baselined, source_ts_ns, batch_id, bids, asks, bids_total, asks_total)) = mbp {
         // Our own serving cap, independent of `baselined()`: even a fully re-baselined book is
         // truncated here, and — unlike the market-by-order path below — we know the true pre-cap
         // count, so cutting real levels off is itself what makes the response incomplete.
@@ -743,7 +801,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            source_ts_ns,
+            (source_ts_ns, batch_id),
             (inst.price_exponent, inst.qty_exponent),
             MAX_LEVELS_PER_SIDE,
             complete,
@@ -761,7 +819,8 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
     // honest answer is "we don't know" — `complete: false`, not a guess.
     let depth_entry = {
         let d = crate::model::lock(&state.depth);
-        d.get(&(inst.venue.clone(), inst.symbol.clone())).cloned()
+        d.get(&(crate::model::SourceKey::of(inst), inst.symbol.clone()))
+            .cloned()
     };
     if let Some(d) = depth_entry {
         let complete = d.bids.len() < DEPTH_LEVELS && d.asks.len() < DEPTH_LEVELS;
@@ -771,7 +830,8 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
             &rendered_id,
             bids,
             asks,
-            d.source_ts_ns,
+            // The market-by-order path carries no committed slot — see `NormalizedBook::batch_id`.
+            (d.source_ts_ns, None),
             (inst.price_exponent, inst.qty_exponent),
             DEPTH_LEVELS,
             complete,
@@ -784,7 +844,7 @@ fn book(state: &ApiState, inst: &NormalizedInstrument) -> Response {
         &rendered_id,
         Vec::new(),
         Vec::new(),
-        0,
+        (0, None),
         (inst.price_exponent, inst.qty_exponent),
         MAX_LEVELS_PER_SIDE,
         false,
@@ -807,7 +867,7 @@ fn book_response(
     product_id: &str,
     mut bids: Vec<(f64, f64)>,
     mut asks: Vec<(f64, f64)>,
-    time_ns: u64,
+    (time_ns, batch_id): (u64, Option<u32>),
     (price_exponent, qty_exponent): (i8, i8),
     levels_capped_at: usize,
     complete: bool,
@@ -828,13 +888,20 @@ fn book_response(
             .collect()
     };
 
+    let mut pricebook = json!({
+        "product_id": product_id,
+        "bids": render(&bids),
+        "asks": render(&asks),
+        "time": time_ns.to_string(),
+    });
+    // Omitted, never null, until a `BatchBoundary` has named one: the venue's committed slot, which
+    // is what turns a ladder comparison against a slot-stamped venue snapshot from a time-window
+    // one (measuring sampling skew) into an instantaneous one.
+    if let Some(id) = batch_id {
+        pricebook["batch_id"] = json!(id);
+    }
     ok_json(json!({
-        "pricebook": {
-            "product_id": product_id,
-            "bids": render(&bids),
-            "asks": render(&asks),
-            "time": time_ns.to_string(),
-        },
+        "pricebook": pricebook,
         "coverage": {
             "levels_returned": levels_returned,
             "levels_capped_at": levels_capped_at,
@@ -1399,6 +1466,7 @@ mod tests {
         qty_exponent: i8,
     ) -> NormalizedInstrument {
         NormalizedInstrument {
+            tick_size: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,
@@ -1473,10 +1541,12 @@ mod tests {
     #[tokio::test]
     async fn products_list_carries_discrete_identity_fields() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
-        instruments.lock().unwrap().insert(
-            ("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32),
-            inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5),
-        );
+        let mut btc = inst_in("perps", 1, "HYPERLIQUID", "BTC", 0, 41, -2, -5);
+        btc.tick_size = 100; // BTC trades in dollars at a fixed point of cents
+        instruments
+            .lock()
+            .unwrap()
+            .insert(("HYPERLIQUID".into(), "perps".into(), 0u8, 41u32), btc);
         health.register(("HYPERLIQUID", "perps", FeedKind::TopOfBook, 9001), |_| {});
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
@@ -1494,7 +1564,15 @@ mod tests {
         assert_eq!(p["symbol"], "BTC");
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 41);
-        assert_eq!(p["price_increment"], "0.01");
+        assert_eq!(
+            p["price_increment"], "1.00",
+            "the venue's tradable tick (tick_size x 10^price_exponent), not 10^price_exponent"
+        );
+        assert_eq!(
+            p["tick_size"], 100,
+            "present exactly when the publisher stated a tick, which is how a caller knows \
+             `price_increment` is that tick and not the fixed-point granularity"
+        );
         assert_eq!(p["base_increment"], "0.00001");
         assert_eq!(p["status"], "online");
         // Hyperliquid carries two `FEEDS` kinds (Top-of-Book + Market-by-Order) and this fixture
@@ -1626,6 +1704,19 @@ mod tests {
             paginated_ids, unpaginated_ids,
             "accumulating every page must equal the unpaginated response"
         );
+    }
+
+    /// Two IDs under one label at the same identity sort the same whatever order the map yields them.
+    #[test]
+    fn the_catalog_order_does_not_depend_on_map_order() {
+        let a = inst_in("c", 4, "SHARED", "X", 0, 1, -2, -2);
+        let b = inst_in("c", 10, "SHARED", "Y", 0, 1, -2, -2);
+        let mut one = vec![a.clone(), b.clone()];
+        let mut two = vec![b, a];
+        sort_catalog(&mut one);
+        sort_catalog(&mut two);
+        let ids = |v: &[NormalizedInstrument]| v.iter().map(|i| i.source_id).collect::<Vec<_>>();
+        assert_eq!(ids(&one), ids(&two));
     }
 
     /// A malformed/zero `limit` and an unparseable `cursor` are both rejected with a named remedy
@@ -2149,6 +2240,7 @@ mod tests {
         last: bool,
     ) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id: 3,
@@ -2165,6 +2257,58 @@ mod tests {
             ws_send_ts_ns: 0,
             category: crate::model::empty_category(),
         }
+    }
+
+    /// `book_complete` is what finds a market every new WebSocket subscriber is bootstrapped without:
+    /// `status` is venue-level and reads `online` for it. Absent for a market with no book at all.
+    #[tokio::test]
+    async fn products_list_reports_whether_each_book_is_complete() {
+        let (instruments, depth, books, history, health, filter, enabled) = empty_state();
+        {
+            let mut map = instruments.lock().unwrap();
+            for (id, symbol) in [(1u32, "WHOLE"), (2, "WITHHELD"), (3, "BOOKLESS")] {
+                map.insert(
+                    ("KALSHI".into(), "perps".into(), 9u8, id),
+                    inst_in("perps", 3, "KALSHI", symbol, 9, id, -4, -2),
+                );
+            }
+        }
+        {
+            let mut map = books.lock().unwrap();
+            let mut whole = BookAccumulator::new("WHOLE".into());
+            let clear = BookChange {
+                action: BookAction::Clear,
+                side: BookSide::Both,
+                price: 0.0,
+                size: 0.0,
+                order_id: 0,
+            };
+            whole.apply(&book_batch("KALSHI", "WHOLE", 9, 1, vec![clear], true));
+            map.insert(("KALSHI".into(), "perps".into(), 9, 1), whole);
+            map.insert(
+                ("KALSHI".into(), "perps".into(), 9, 2),
+                BookAccumulator::new("WITHHELD".into()),
+            );
+        }
+        let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
+        let body: Value = reqwest::get(format!("{base}/v1/products"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let products = body["products"].as_array().unwrap();
+        let complete = |symbol: &str| {
+            products
+                .iter()
+                .find(|p| p["symbol"] == symbol)
+                .unwrap_or_else(|| panic!("{symbol} missing"))
+                .get("book_complete")
+                .cloned()
+        };
+        assert_eq!(complete("WHOLE"), Some(json!(true)));
+        assert_eq!(complete("WITHHELD"), Some(json!(false)));
+        assert_eq!(complete("BOOKLESS"), None);
     }
 
     #[tokio::test]
@@ -2187,7 +2331,7 @@ mod tests {
             // A fully re-baselined market: a producer `Clear` was folded in, so this holds the
             // market's whole book.
             let mut baselined = BookAccumulator::new("BASELINED".into());
-            baselined.apply(&book_batch(
+            let mut batch = book_batch(
                 "KALSHI",
                 "BASELINED",
                 2,
@@ -2204,7 +2348,9 @@ mod tests {
                     level_update(BookSide::Ask, 0.63, 50.0),
                 ],
                 true,
-            ));
+            );
+            batch.batch_id = Some(900);
+            baselined.apply(&batch);
             assert!(baselined.baselined());
             map.insert(("KALSHI".into(), "perps".into(), 2, 41), baselined);
 
@@ -2237,6 +2383,10 @@ mod tests {
         assert_eq!(body["coverage"]["levels_returned"], 2);
         assert_eq!(body["pricebook"]["bids"][0][0], "0.6100");
         assert_eq!(body["pricebook"]["asks"][0][0], "0.6300");
+        assert_eq!(
+            body["pricebook"]["batch_id"], 900,
+            "the slot these levels stand at, for a same-slot comparison against the venue"
+        );
 
         let resp = reqwest::get(format!("{base}/v1/products/KALSHI:PARTWAY%233.7/book"))
             .await
@@ -2246,6 +2396,10 @@ mod tests {
         assert_eq!(
             body["coverage"]["complete"], false,
             "an accumulator seeded partway through must never claim completeness it cannot back: {body}"
+        );
+        assert!(
+            body["pricebook"]["batch_id"].is_null(),
+            "and a market whose venue has named no slot omits the field rather than sending 0"
         );
     }
 
@@ -2319,7 +2473,12 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u8, 1u32),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "perps".into(),
+                9u8,
+                1u32,
+            ),
             inst_in("perps", 3, "HUGE", "HUGEBOOK", 9, 1, -4, -2),
         );
         {
@@ -2351,7 +2510,15 @@ mod tests {
                 level = end;
             }
             assert!(acc.baselined(), "fixture sanity");
-            map.insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+            map.insert(
+                (
+                    crate::model::SourceKey::new(3, "HUGE".into()),
+                    "perps".into(),
+                    9,
+                    1,
+                ),
+                acc,
+            );
         }
 
         let state = ApiState {
@@ -2515,11 +2682,19 @@ mod tests {
 
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("HUGE".into(), "perps".into(), 9u8, 1u32),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "perps".into(),
+                9u8,
+                1u32,
+            ),
             inst_in("perps", 3, "HUGE", "HUGEL3", 9, 1, -4, -2),
         );
         depth.lock().unwrap().insert(
-            ("HUGE".into(), "HUGEL3".into()),
+            (
+                crate::model::SourceKey::new(3, "HUGE".into()),
+                "HUGEL3".into(),
+            ),
             NormalizedDepth {
                 venue: "HUGE".into(),
                 source_name: "HUGE".into(),
@@ -2564,10 +2739,15 @@ mod tests {
                 o = end;
             }
             assert!(acc.baselined() && acc.is_order_level(), "fixture sanity");
-            books
-                .lock()
-                .unwrap()
-                .insert(("HUGE".into(), "perps".into(), 9, 1), acc);
+            books.lock().unwrap().insert(
+                (
+                    crate::model::SourceKey::new(3, "HUGE".into()),
+                    "perps".into(),
+                    9,
+                    1,
+                ),
+                acc,
+            );
         }
         let state = ApiState {
             instruments,
@@ -2907,10 +3087,10 @@ mod tests {
     async fn product_detail_returns_the_full_entry() {
         let (instruments, depth, books, history, health, filter, enabled) = empty_state();
         instruments.lock().unwrap().insert(
-            ("PHOENIX".into(), "spot".into(), 0u8, 7u32),
-            inst_in("spot", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
+            ("PHOENIX".into(), "perps".into(), 0u8, 7u32),
+            inst_in("perps", 2, "PHOENIX", "SOL", 0, 7, -3, -4),
         );
-        health.register(("PHOENIX", "spot", FeedKind::TopOfBook, 9201), |_| {});
+        health.register(("PHOENIX", "perps", FeedKind::TopOfBook, 9201), |_| {});
 
         let base = spawn(instruments, depth, books, history, health, filter, enabled).await;
         let resp = reqwest::get(format!("{base}/v1/products/PHOENIX:SOL"))
@@ -2923,12 +3103,19 @@ mod tests {
         assert_eq!(p["source_id"], 2);
         assert_eq!(p["channel"], 0);
         assert_eq!(p["instrument_id"], 7);
-        assert_eq!(p["price_increment"], "0.001");
+        assert_eq!(
+            p["price_increment"], "0.001",
+            "a publisher stating no tick falls back to the fixed-point granularity"
+        );
+        assert!(
+            p["tick_size"].is_null(),
+            "and omits the field rather than reporting a 0 an agent could round by: {p}"
+        );
         assert_eq!(p["base_increment"], "0.0001");
         assert_eq!(p["status"], "online");
-        // Phoenix carries exactly one `FEEDS` kind and has no book/depth entry — an unambiguous
-        // registry fallback.
-        assert_eq!(p["feed_kind"], "top_of_book");
+        // Phoenix's perps category carries two `FEEDS` kinds (Top-of-Book + Market-by-Price) and
+        // this fixture holds no book/depth evidence — the ladder must not guess.
+        assert_eq!(p["feed_kind"], "unknown");
     }
 
     #[tokio::test]
@@ -3422,13 +3609,13 @@ mod tests {
 
     /// Pins all four rungs of `feed_kind_for`'s derivation ladder against one snapshot: a
     /// `BookSnapshot` entry wins outright; failing that a `DepthSnapshot` entry; failing that, the
-    /// registry rung filtered by `(venue, category)` — Kalshi's `sports` category carries exactly
-    /// one `FEEDS` kind and resolves it, same as Phoenix's single-category venue; and `"unknown"`
-    /// — never a guess — for Kalshi's `perps` category, which genuinely carries two (Top-of-Book +
+    /// registry rung filtered by `(venue, category)` — Kalshi's `events` category carries exactly
+    /// one `FEEDS` kind and resolves it; and `"unknown"` — never a guess — for Kalshi's `perps`
+    /// and Phoenix's `perps` categories, which genuinely carry two (Top-of-Book +
     /// Market-by-Price) with no evidence yet for this exact identity. A fixture with only one
     /// category per venue could not express the difference the `(venue, category)` filter makes:
     /// a venue-wide filter would see Kalshi's four rows together (three kinds across two
-    /// categories) and report `"unknown"` for `sports` too, which would be a false negative for
+    /// categories) and report `"unknown"` for `events` too, which would be a false negative for
     /// the very venue this fix targets.
     #[tokio::test]
     async fn feed_kind_ladder_prefers_book_then_depth_then_registry_then_unknown() {
@@ -3444,16 +3631,16 @@ mod tests {
                 inst_in("perps", 1, "HYPERLIQUID", "DEPTHED", 0, 2, -2, -5),
             );
             map.insert(
-                ("PHOENIX".into(), "spot".into(), 0u8, 3u32),
-                inst_in("spot", 2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
+                ("PHOENIX".into(), "perps".into(), 0u8, 3u32),
+                inst_in("perps", 2, "PHOENIX", "PLAIN", 0, 3, -3, -4),
             );
             map.insert(
                 ("KALSHI".into(), "perps".into(), 9u8, 4u32),
                 inst_in("perps", 3, "KALSHI", "UNRESOLVED", 9, 4, -4, -2),
             );
             map.insert(
-                ("KALSHI".into(), "sports".into(), 20u8, 5u32),
-                inst_in("sports", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
+                ("KALSHI".into(), "events".into(), 20u8, 5u32),
+                inst_in("events", 3, "KALSHI", "SINGLE_CATEGORY", 20, 5, -4, -2),
             );
         }
         books.lock().unwrap().insert(
@@ -3501,8 +3688,9 @@ mod tests {
         );
         assert_eq!(
             kind_of("PLAIN"),
-            "top_of_book",
-            "Phoenix has exactly one FEEDS kind"
+            "unknown",
+            "Phoenix's perps category now carries two FEEDS kinds (Top-of-Book + Market-by-Price) — \
+             a single-category venue is just as ambiguous as Kalshi's perps category"
         );
         assert_eq!(
             kind_of("UNRESOLVED"),
@@ -3513,7 +3701,7 @@ mod tests {
         assert_eq!(
             kind_of("SINGLE_CATEGORY"),
             "market_by_price",
-            "Kalshi's sports category has exactly one FEEDS kind, distinct from its ambiguous \
+            "Kalshi's events category has exactly one FEEDS kind, distinct from its ambiguous \
              perps category on the same venue"
         );
     }
@@ -3661,14 +3849,16 @@ mod tests {
     // /v1/status: history, channels and process blocks (Task 6)
     // -----------------------------------------------------------------------------------------
 
-    /// The real built-in "sports" row (group code `edge-kalshi-sports-mbp`) — a genuinely derived, multi-channel
-    /// row, matching `sinks::admin`'s and `ingest::channel_filter`'s own tests. Using the real row (rather
-    /// than a hand-built one) is what lets a real `ChannelFilter::parse` spec actually narrow it.
+    /// The real built-in row whose group `code` is `edge-kalshi-sports-mbp` — a genuinely derived,
+    /// multi-channel row, matching `sinks::admin`'s and `ingest::channel_filter`'s own tests. Using
+    /// the real row (rather than a hand-built one) is what lets a real `ChannelFilter::parse` spec
+    /// actually narrow it. The helper is named for that code, not for the `category`, which is
+    /// `events`: the code is the ledger's and does not change with the universe's name.
     fn sports_row() -> Feed {
         *feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row")
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row")
     }
 
     /// A store below cap must report real occupancy, not a hardcoded shape: exactly one product,
@@ -3825,7 +4015,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "one enabled row: {rows:?}");
         let row_json = &rows[0];
         assert_eq!(row_json["venue"], "KALSHI");
-        assert_eq!(row_json["category"], "sports");
+        assert_eq!(row_json["category"], "events");
         assert_eq!(row_json["code"], "edge-kalshi-sports-mbp");
 
         let channels = row_json["channels"].as_array().unwrap();

@@ -705,6 +705,8 @@ async fn main() -> Result<()> {
         max_subs: args.ws_max_subs,
         max_inbound_per_min: args.ws_max_inbound_per_min,
         broadcast_capacity: args.ws_broadcast_capacity,
+        lag_repair_min_interval: sinks::ws::LAG_REPAIR_MIN_INTERVAL,
+        bootstrap_release_deadline: sinks::ws::BOOTSTRAP_RELEASE_DEADLINE,
     };
 
     // Hyperliquid-compatible sink: off by default (opt-in via `--hl-ws-bind`), and not
@@ -966,12 +968,14 @@ mod tests {
             .map(|f| f.category)
             .collect();
         mbp.sort_unstable();
-        // The categories themselves, not a count: a count of 2 would also be satisfied by the same
-        // universe selected twice, which is the opposite failure and equally wrong.
+        // The categories themselves, each exactly once — not a count, which the same universe
+        // selected twice would also satisfy, the opposite failure and equally wrong. Elections
+        // joined perps and events as a third market-by-price universe on this venue, which is the
+        // case the dedup has to keep getting right rather than a reason to loosen the assertion.
         assert_eq!(
             mbp,
-            vec!["perps", "sports"],
-            "both universes must be selected, each once"
+            vec!["elections", "events", "perps"],
+            "every universe must be selected, each once"
         );
     }
 
@@ -1044,7 +1048,7 @@ mod tests {
     }
 
     /// A feed left with no matching publisher drops out entirely rather than running with zero
-    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201).
+    /// publishers (9401 is a Hyperliquid-only block; Phoenix publishes on 9201/9211).
     #[test]
     fn feeds_without_a_matching_base_port_drop_out() {
         registry();
@@ -1054,8 +1058,8 @@ mod tests {
     }
 
     /// Base ports are unique **within** a feed, not across feeds: 9201 is both a Hyperliquid TOB
-    /// block and Phoenix's only block, so selecting it keeps a publisher on each. Scoping to one
-    /// venue is `--feed`'s job.
+    /// block and Phoenix's top-of-book block, so selecting it keeps a publisher on each. Scoping
+    /// to one venue is `--feed`'s job.
     #[test]
     fn base_ports_are_not_unique_across_feeds() {
         registry();
@@ -1088,8 +1092,8 @@ mod tests {
         registry();
         let sports = feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row");
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row");
         let chan10_port = sports
             .publishers
             .iter()
@@ -1125,8 +1129,8 @@ mod tests {
         registry();
         let sports = feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row");
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row");
         let chan10_port = sports
             .publishers
             .iter()

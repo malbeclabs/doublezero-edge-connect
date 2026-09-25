@@ -16,15 +16,12 @@ on:
   repository_dispatch:
     types: [doublezero-base-published]
 
-# Serialize rebuilds of the same variant so two dispatches for one env (or a
-# dispatch racing its own retry) can't push the same moving tag concurrently and
-# invert ordering. cancel-in-progress: false — let an in-flight build finish
-# rather than abort a push mid-flight. NOTE: only serializes dispatches with each
-# other; poll.yml/publish can still race a dispatch (they don't share this group
-# yet — benign today, all three build the same default-branch HEAD).
-concurrency:
-  group: edge-connect-publish-${{ github.event.client_payload.env }}
-  cancel-in-progress: false
+# No concurrency group here. Serializing same-variant pushes is the reusable
+# builder's job (release.docker.edge-connect.build.yml), which is the one job that
+# pushes, so a dispatch, the poll's rebuild and a main publish all share one lane
+# per variant — the group this workflow used to declare only serialized dispatches
+# against each other. Do not restore it: a run holding a group at workflow level
+# while a job inside that run requests the same group would queue behind itself.
 
 # Least-privilege default; the rebuild job (via the reusable builder) inherits the
 # packages:write it grants below.
