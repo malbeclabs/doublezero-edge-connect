@@ -42,6 +42,12 @@ const LEAD_NS_BUCKETS: &[f64] = &[
     1_000_000_000.0,
 ];
 
+/// Buckets for the declined-rotation shortfall: how many levels a complete rotation declared above
+/// what the book holds. Small and fixed, because the only readings that matter are near zero —
+/// capture jitter is a handful of levels, and anything past the re-anchor threshold is already
+/// counted on `dz_mbp_reanchor_total`. The `+Inf` bucket carries the gross shortfalls.
+const SHORTFALL_LEVEL_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+
 /// Every metric the bridge exports, plus the [`Registry`] they are registered against. Built once
 /// via [`Metrics::new`] and reachable through [`metrics`].
 pub struct Metrics {
@@ -144,7 +150,7 @@ pub struct Metrics {
     /// Depth-floor entries cleared by the session-reset escape hatch, by `reason`
     /// (`end_of_session` / `instrument_reset`). A venue restarting its event clock below the
     /// latched high-water would otherwise wedge depth permanently; see
-    /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_venue`].
+    /// [`crate::ingest::arbiter::Arbiter::reset_depth_floor_for_symbol`].
     pub depth_floor_resets: IntCounterVec,
     /// Depth *cross-publisher* contest lead time (ns): when a second publisher's book snapshot arrives
     /// at a `source_ts` tick the leader already opened, how far ahead the leader was, labelled by the
@@ -160,8 +166,9 @@ pub struct Metrics {
     /// the series `--arb-transfer-margin-us` is read off. Fed only by
     /// [`crate::ingest::path_race::PathRace`] pairs, never by a dropped copy's inter-path phase.
     pub path_lead_ns: HistogramVec,
-    /// Authority transfers by `reason` (initial/health/silence/margin). A sustained rate means the
-    /// thresholds are too loose: every transfer re-baselines each consumer's book.
+    /// Authority transfers by `reason` (initial/health/health_revert/silence/margin) and whether the
+    /// handover `rebaselined` the consumer (`yes`/`no`). A sustained re-baselining rate means the
+    /// thresholds are too loose.
     pub path_transfers: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
@@ -207,8 +214,9 @@ pub struct Metrics {
     /// lagging publisher's stale copy, refused so it cannot resurrect a dead order. This is the guard
     /// order-level racing rests on, so a non-zero rate is the guard working, not a fault.
     pub book_resurrections_dropped: IntCounterVec,
-    /// Order-level markets forced to re-baseline because two paths claimed different resting state for
-    /// one order (`reason="disagreement"`).
+    /// Markets forced to re-baseline, by `reason`: `disagreement` (two paths claimed different
+    /// resting state for one order) and `dropped_batch` (the single-path gate dropped a batch from
+    /// the path the consumer was following). The `mbo_` in the name is historical.
     pub mbo_forced_rebaselines: IntCounterVec,
     /// Order-level changes refused because the batch carrying them is older than its channel's
     /// retention window — a link returning with a backlog, or a forged replay. Expected to spike once
@@ -243,19 +251,65 @@ pub struct Metrics {
     /// Cross-instrument delta-buffer budget overflows; each dropped the largest instrument's buffer.
     /// Sustained means the publisher's snapshot period is too long for this host's memory budget.
     pub mbp_buffer_overflows: IntCounterVec,
+    /// One book's own delta buffer overflowed: it held `pricebook`'s `MAX_BUFFERED_DELTAS` deltas
+    /// with no snapshot arriving to anchor them, so the buffer was dropped and the book marked
+    /// `Gap`. Separate from the cross-instrument budget above — that is the host's memory ceiling
+    /// across books, this is one instrument whose rotation never came.
+    pub mbp_book_buffer_overflows: IntCounterVec,
     /// A book discarded because its per-book price-level cap was hit — a malformed or forged feed,
     /// never packet loss. Deliberately not counted as a sequence gap: the cause and the resulting
     /// status differ, and merging them would read a hostile book as a lossy network.
     pub mbp_level_overflows: IntCounterVec,
     /// `SnapshotLevel` with no open group to route it to — a publisher interleaving snapshot groups,
-    /// or a lost `SnapshotBegin`.
+    /// or a lost `SnapshotBegin`. Excludes the groups the processor itself declines to route: those
+    /// are `mbp_declined_rotation_levels` and `mbp_snapshot_levels_dropped`.
     pub mbp_orphan_snapshot_levels: IntCounterVec,
     pub mbp_declined_rotation_levels: IntCounterVec,
+    /// How many levels a declined **complete** rotation declared above what the book holds. The
+    /// jitter tolerance the re-anchor threshold allows is a few levels, so this is what shows a
+    /// publisher shipping short complete-flagged groups before any of them crosses it.
+    pub mbp_declined_rotation_shortfall: HistogramVec,
+    /// Books forced out of `Ready` without installing anything, by `reason`. A declined rotation
+    /// is the only place a short install can be caught, and once caught the book has to stop
+    /// serving those levels — see `PriceBook::force_resync`.
+    pub mbp_reanchor: IntCounterVec,
+    /// Snapshot groups that installed, by whether the publisher declared the book `complete`
+    /// (`depth_bound == 0`) or `bounded`.
+    pub mbp_snapshot_installs: IntCounterVec,
+    /// Installs that left the book with fewer levels than it held. Zero by construction on a cold
+    /// rebuild, so this is a rotation replacing a live book with a smaller one.
+    pub mbp_install_shrank_book: IntCounterVec,
+    /// Wire `BookClear`s the book applied, by `scope`. A whole-side clear the publisher never
+    /// repopulates produces the same shape as a short install, so the two need telling apart.
+    pub mbp_book_clears: IntCounterVec,
+    /// Levels of a group the processor deliberately did not route, by `reason`. Expected traffic,
+    /// counted apart from the orphan series so that one stays alertable.
+    pub mbp_snapshot_levels_dropped: IntCounterVec,
     /// Deltas discarded as duplicates (`seq` at or below the applied baseline). A `Ready` book
     /// emitting nothing but duplicates is the signature of a baseline installed above the
     /// publisher's real counter, which only a routed `Reset Count` clears — so this is the one
     /// series that surfaces that wedge.
     pub mbp_duplicate_deltas: IntCounterVec,
+    /// Logical events abandoned because their buffered changes outgrew the accumulator's cap —
+    /// counted per accumulator, so one event on a mirrored market scores up to once per path plus
+    /// once for the replay map. The serving path re-baselines the market at its next close, so each
+    /// one costs connected consumers one extra `Clear`-led re-baseline.
+    pub book_events_abandoned: IntCounterVec,
+    /// Times a market's replay entry stopped being a complete book, so new subscribers stopped
+    /// being bootstrapped with it. Market-labelled, which no other series is.
+    pub book_bootstrap_lost: IntCounterVec,
+    /// Markets currently withheld from every new subscriber's bootstrap for want of a complete
+    /// book. `1` per market while it lasts; the `other` bucket counts past the label cap.
+    pub book_bootstrap_withheld: IntGaugeVec,
+    /// Closing batches a publish gate refused (mid-rotation, gapped, not yet revealed). The
+    /// instrument stays owed its close and is retried at the next boundary; a sustained rate means
+    /// one path is holding markets it cannot publish.
+    pub mbp_closes_refused: IntCounterVec,
+    /// `BatchBoundary` naming a slot at or below the one its channel had already committed. It is
+    /// ignored — no event closes on it, the slot does not move — so a consumer's committed slot
+    /// never moves backwards; a non-zero rate is one path's boundary stream naming a slot it had
+    /// already passed.
+    pub mbp_slot_regressions: IntCounterVec,
     /// Crossed inside markets observed at a `BatchBoundary`. Observability only; never acted on.
     pub mbp_crossed: IntCounterVec,
     /// Publisher `Action`-vs-quantity disagreements by `kind`. Never changes the applied result.
@@ -272,6 +326,18 @@ pub struct Metrics {
     pub ws_bytes_sent: IntCounterVec,
     /// Times a client fell behind and the broadcast dropped messages for it (`Lagged`).
     pub ws_client_lagged: IntCounter,
+    /// Book-repair passes run for a lagging client. Counts the **pass**, not the re-baselines it
+    /// wrote: a pass over a client whose filters match no baselined market sends nothing, which is
+    /// the ordinary case on a deployment carrying no book-bearing feed at all. Counting the frames
+    /// instead would make this metric silent exactly where it is read from — the pace, below.
+    ///
+    /// Paced per client (`sinks::ws::LAG_REPAIR_MIN_INTERVAL`), so this is **below**
+    /// [`Self::ws_client_lagged`] whenever a client is lagging faster than it can be repaired; the
+    /// difference is the lag events that were coalesced into a later repair, not lost ones. A ratio
+    /// near 1 with a high lag count means many separate slow moments; a ratio far below 1 means one
+    /// client is continuously behind, which is a consumer or link problem — the repair itself is
+    /// bounded either way.
+    pub ws_lag_repairs: IntCounter,
     /// Times the single serializer task fell behind the backbone and dropped messages (`Lagged`).
     /// Distinct from [`Self::ws_client_lagged`]: this is a global stall (every client misses those
     /// messages), not one slow consumer, so it must not hide behind the per-client counter.
@@ -282,6 +348,17 @@ pub struct Metrics {
     pub ws_rate_limited: IntCounter,
     /// Clients reaped for crossing the idle timeout.
     pub ws_idle_timeout: IntCounter,
+    /// Market bootstraps a client's join withheld because the market was mid-event, by `venue` and
+    /// how the wait ended: `complete` (the event closed, the normal case, sub-second) or `deadline`
+    /// (it did not, so the client was bootstrapped from the last complete state anyway). A market
+    /// with no complete book anywhere in this process is never released and never counted here —
+    /// there is nothing honest to send it.
+    pub ws_bootstrap_withheld: IntCounterVec,
+    /// Book frames a client was not sent, by `venue` and `reason`: `watermark` (the batch is
+    /// already in the bootstrap this client was just handed) or `awaiting` (the market is still
+    /// withheld). Both are correct in the small and pathological in the large — a market whose
+    /// `awaiting` drops never stop is a client dark on that book.
+    pub ws_frames_dropped: IntCounterVec,
 
     // --- Hyperliquid-compatible sink (off by default) ---
     /// Currently-connected clients of the Hyperliquid-compatible sink.
@@ -608,9 +685,9 @@ impl Metrics {
             path_transfers: counter_vec(
                 &registry,
                 "dz_path_authority_transfers_total",
-                "Authority transfers by reason (initial/health/silence/margin). A sustained rate \
-                 means the thresholds are too loose — every transfer re-baselines each consumer.",
-                &["venue", "reason"],
+                "Authority transfers by reason (initial/health/health_revert/silence/margin) and \
+                 whether the handover re-baselined the consumer (rebaselined=yes/no).",
+                &["venue", "reason", "rebaselined"],
             ),
             path_markets_held: gauge_vec(
                 &registry,
@@ -652,6 +729,13 @@ impl Metrics {
                  was dropped. Sustained means the snapshot period is too long for this host.",
                 &["venue"],
             ),
+            mbp_book_buffer_overflows: counter_vec(
+                &registry,
+                "dz_mbp_book_buffer_overflows_total",
+                "One book's delta buffer overflowed with no snapshot to anchor it; the buffer was \
+                 dropped, the book marked Gap and the market failed over to a peer",
+                &["venue"],
+            ),
             mbp_level_overflows: counter_vec(
                 &registry,
                 "dz_mbp_level_overflows_total",
@@ -664,8 +748,8 @@ impl Metrics {
                 "dz_mbp_orphan_snapshot_levels_total",
                 "SnapshotLevel with no open group to route it to (interleaved groups, or a lost \
                  SnapshotBegin). An anomaly: a level that should have been attributable was not. \
-                 A rotation the book deliberately declined is NOT counted here — see \
-                 dz_mbp_declined_rotation_levels_total.",
+                 Groups the processor itself declined or dropped are NOT counted here — see \
+                 dz_mbp_declined_rotation_levels_total and dz_mbp_snapshot_levels_dropped_total.",
                 &["venue"],
             ),
             mbp_declined_rotation_levels: counter_vec(
@@ -677,11 +761,97 @@ impl Metrics {
                  from the orphan counter so a real orphan stays visible.",
                 &["venue"],
             ),
+            mbp_declined_rotation_shortfall: histogram_vec(
+                &registry,
+                "dz_mbp_declined_rotation_shortfall_levels",
+                "Levels a declined complete rotation declared above what the book holds. The \
+                 re-anchor threshold tolerates only capture jitter, so this is what makes a \
+                 publisher's short complete-flagged groups visible before one crosses it.",
+                &["venue"],
+                SHORTFALL_LEVEL_BUCKETS,
+            ),
+            mbp_reanchor: counter_vec(
+                &registry,
+                "dz_mbp_reanchor_total",
+                "Books forced out of Ready without installing anything, by reason. short_book: a \
+                 declined complete rotation declared materially more levels than the book holds, \
+                 so the short install it is serving is dropped and the next rotation installs \
+                 whole. The market is held by its peer path meanwhile.",
+                &["venue", "reason"],
+            ),
+            mbp_snapshot_installs: counter_vec(
+                &registry,
+                "dz_mbp_snapshot_installs_total",
+                "Snapshot groups that installed, by whether the publisher declared the book \
+                 complete (depth_bound == 0) or bounded",
+                &["venue", "completeness"],
+            ),
+            mbp_install_shrank_book: counter_vec(
+                &registry,
+                "dz_mbp_install_shrank_book_total",
+                "Snapshot installs that left the book with fewer levels than it held. Zero by \
+                 construction on a cold rebuild, so this is a rotation replacing a live book with \
+                 a smaller one.",
+                &["venue"],
+            ),
+            mbp_book_clears: counter_vec(
+                &registry,
+                "dz_mbp_book_clears_total",
+                "Wire BookClears the book applied, by scope (entire_side/from_price)",
+                &["venue", "scope"],
+            ),
+            mbp_snapshot_levels_dropped: counter_vec(
+                &registry,
+                "dz_mbp_snapshot_levels_dropped_total",
+                "SnapshotLevel belonging to a group the processor deliberately did not route: \
+                 reason=reset (an InstrumentReset killed the anchor it was assembling against), \
+                 stale_era (its Reset Count is the publisher's previous run), no_definition (its \
+                 instrument's definition had not resolved yet — a cold-start transient), \
+                 end_of_session (the session it belonged to ended). All expected; counted apart \
+                 from the orphan counter so a real orphan stays visible.",
+                &["venue", "reason"],
+            ),
             mbp_duplicate_deltas: counter_vec(
                 &registry,
                 "dz_mbp_duplicate_deltas_total",
                 "Deltas discarded as duplicates. A Ready book emitting only these is a baseline \
                  above the publisher's real counter, which only a Reset Count clears.",
+                &["venue"],
+            ),
+            book_events_abandoned: counter_vec(
+                &registry,
+                "dz_book_events_abandoned_total",
+                "Logical events whose buffered changes outgrew the accumulator cap, per \
+                 accumulator. The serving path re-baselines the market at its next close.",
+                &["venue"],
+            ),
+            book_bootstrap_lost: counter_vec(
+                &registry,
+                "dz_book_bootstrap_lost_total",
+                "Times a market's replay entry stopped being a complete book, withholding it from \
+                 new subscribers' bootstraps.",
+                &["venue", "category", "channel", "instrument_id"],
+            ),
+            book_bootstrap_withheld: gauge_vec(
+                &registry,
+                "dz_book_bootstrap_withheld",
+                "Markets currently withheld from new subscribers' bootstraps for want of a complete \
+                 book.",
+                &["venue", "category", "channel", "instrument_id"],
+            ),
+            mbp_closes_refused: counter_vec(
+                &registry,
+                "dz_mbp_closes_refused_total",
+                "Closing batches a publish gate refused. The instrument stays owed its close and \
+                 is retried at the next boundary rather than forgotten.",
+                &["venue"],
+            ),
+            mbp_slot_regressions: counter_vec(
+                &registry,
+                "dz_mbp_slot_regressions_total",
+                "BatchBoundary naming a slot at or below the one the channel had already \
+                 committed. It is ignored: no event closes on it and the slot does not move, so a \
+                 consumer's committed slot never moves backwards.",
                 &["venue"],
             ),
             mbp_crossed: counter_vec(
@@ -753,10 +923,12 @@ impl Metrics {
             mbo_forced_rebaselines: counter_vec(
                 &registry,
                 "dz_mbo_forced_rebaselines_total",
-                "Order-level markets withheld and re-baselined because the cross-publisher guard \
-                 could not answer. reason=disagreement: two paths claimed different resting state for \
-                 one order, so neither is known to be right. A sustained rate is the signal to \
-                 reconsider the per-publisher book model.",
+                "Markets withheld and re-baselined because a gate could not carry the consumer's \
+                 book forward. reason=disagreement: two paths claimed different resting state for \
+                 one order, so neither is known to be right; a sustained rate is the signal to \
+                 reconsider the per-publisher book model. reason=dropped_batch: the single-path gate \
+                 dropped a batch from the path the consumer was following, so its book has a hole \
+                 only a re-baseline can close.",
                 &["venue", "reason"],
             ),
             mbo_events_past_frontier: counter_vec(
@@ -860,6 +1032,12 @@ impl Metrics {
                 "dz_ws_client_lagged_total",
                 "Times a slow client fell behind and the broadcast dropped messages for it",
             ),
+            ws_lag_repairs: counter(
+                &registry,
+                "dz_ws_lag_repairs_total",
+                "Book-repair passes run for a lagging WebSocket client, paced per client (a pass \
+                 writes nothing when the client's filters match no baselined market)",
+            ),
             ws_serializer_lagged: counter(
                 &registry,
                 "dz_ws_serializer_lagged_total",
@@ -880,6 +1058,19 @@ impl Metrics {
                 &registry,
                 "dz_ws_idle_timeout_total",
                 "Clients reaped for crossing the idle timeout",
+            ),
+            ws_bootstrap_withheld: counter_vec(
+                &registry,
+                "dz_ws_bootstrap_withheld_total",
+                "Market bootstraps a client's join withheld for being mid-event, by how the wait \
+                 ended (complete/deadline)",
+                &["venue", "release"],
+            ),
+            ws_frames_dropped: counter_vec(
+                &registry,
+                "dz_ws_frames_dropped_total",
+                "Book frames not forwarded to a client, by reason (watermark/awaiting)",
+                &["venue", "reason"],
             ),
             hl_sink_clients: gauge(
                 &registry,
@@ -1104,7 +1295,7 @@ mod tests {
             .with_label_values(&["KALSHI", "leader"])
             .observe(123_456.0);
         m.path_transfers
-            .with_label_values(&["KALSHI", "silence"])
+            .with_label_values(&["KALSHI", "silence", "yes"])
             .inc();
         m.path_markets_held
             .with_label_values(&["KALSHI", "path0"])
@@ -1114,6 +1305,9 @@ mod tests {
         m.tape_path_dropped.with_label_values(&["KALSHI"]).inc();
         m.mbp_channel_resets.with_label_values(&["KALSHI"]).inc();
         m.mbp_buffer_overflows.with_label_values(&["KALSHI"]).inc();
+        m.mbp_book_buffer_overflows
+            .with_label_values(&["KALSHI"])
+            .inc();
         m.mbp_level_overflows.with_label_values(&["KALSHI"]).inc();
         m.mbp_orphan_snapshot_levels
             .with_label_values(&["KALSHI"])
@@ -1121,7 +1315,34 @@ mod tests {
         m.mbp_declined_rotation_levels
             .with_label_values(&["KALSHI"])
             .inc();
+        m.mbp_declined_rotation_shortfall
+            .with_label_values(&["KALSHI"])
+            .observe(3.0);
+        m.mbp_reanchor
+            .with_label_values(&["KALSHI", "short_book"])
+            .inc();
+        m.mbp_snapshot_installs
+            .with_label_values(&["KALSHI", "complete"])
+            .inc();
+        m.mbp_install_shrank_book
+            .with_label_values(&["KALSHI"])
+            .inc();
+        m.mbp_book_clears
+            .with_label_values(&["KALSHI", "entire_side"])
+            .inc();
+        m.mbp_snapshot_levels_dropped
+            .with_label_values(&["KALSHI", "reset"])
+            .inc();
         m.mbp_duplicate_deltas.with_label_values(&["KALSHI"]).inc();
+        m.book_events_abandoned.with_label_values(&["KALSHI"]).inc();
+        m.book_bootstrap_lost
+            .with_label_values(&["KALSHI", "perps", "0", "1"])
+            .inc();
+        m.book_bootstrap_withheld
+            .with_label_values(&["KALSHI", "perps", "0", "1"])
+            .inc();
+        m.mbp_closes_refused.with_label_values(&["KALSHI"]).inc();
+        m.mbp_slot_regressions.with_label_values(&["KALSHI"]).inc();
         m.mbp_crossed.with_label_values(&["KALSHI"]).inc();
         m.mbp_divergence
             .with_label_values(&["KALSHI", "delete_with_quantity"])
@@ -1199,10 +1420,22 @@ mod tests {
             "dz_tape_path_dropped_total",
             "dz_mbp_channel_resets_total",
             "dz_mbp_buffer_overflows_total",
+            "dz_mbp_book_buffer_overflows_total",
             "dz_mbp_level_overflows_total",
             "dz_mbp_orphan_snapshot_levels_total",
             "dz_mbp_declined_rotation_levels_total",
+            "dz_mbp_declined_rotation_shortfall_levels",
+            "dz_mbp_reanchor_total",
+            "dz_mbp_snapshot_installs_total",
+            "dz_mbp_install_shrank_book_total",
+            "dz_mbp_book_clears_total",
+            "dz_mbp_snapshot_levels_dropped_total",
             "dz_mbp_duplicate_deltas_total",
+            "dz_book_events_abandoned_total",
+            "dz_book_bootstrap_lost_total",
+            "dz_book_bootstrap_withheld",
+            "dz_mbp_closes_refused_total",
+            "dz_mbp_slot_regressions_total",
             "dz_mbp_crossed_total",
             "dz_mbp_divergence_total",
             "dz_path_unmatched_trades_total",

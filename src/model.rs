@@ -41,6 +41,94 @@ pub fn venue_arc(venue: &'static str) -> Arc<str> {
     intern_static(&INTERN, venue)
 }
 
+/// A source's internal identity, keyed by its wire Source ID so IDs sharing a name keep separate
+/// state. The label is derived from the ID (`sources::source_label`) and carried for output; it
+/// only separates keys in test fixtures that stamp no ID. IDs past the unregistered cap share one
+/// key, as they share one label. There is no `PartialEq<str>`, so a name comparison is explicit.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SourceKey(u16, Arc<str>);
+
+impl SourceKey {
+    pub fn new(id: u16, name: Arc<str>) -> Self {
+        // Collapsed so a hostile wire cannot grow per-source state past the label cap.
+        if name.as_ref() == crate::ingest::sources::UNREGISTERED {
+            return Self(0, name);
+        }
+        Self(id, name)
+    }
+
+    /// The key for a wire Source ID, labelled as the registry names it.
+    pub fn from_id(id: u16) -> Self {
+        Self::new(id, venue_arc(crate::ingest::sources::source_label(id)))
+    }
+
+    pub fn of<M: HasSource>(m: &M) -> Self {
+        Self::new(m.source_id(), m.venue().clone())
+    }
+
+    /// Test fixtures only: an unassigned (`0`) key, for messages that stamp no Source ID.
+    #[cfg(test)]
+    pub fn unassigned(name: &str) -> Self {
+        Self(0, Arc::from(name))
+    }
+
+    pub fn id(&self) -> u16 {
+        self.0
+    }
+
+    pub fn name(&self) -> &str {
+        &self.1
+    }
+
+    /// The label as the shared `Arc`, for a message field.
+    pub fn name_arc(&self) -> &Arc<str> {
+        &self.1
+    }
+}
+
+/// Test fixtures only: the key a registered label resolves to, or an unassigned (`0`) key.
+#[cfg(test)]
+impl From<&str> for SourceKey {
+    fn from(name: &str) -> Self {
+        let id = crate::ingest::sources::source_id_of(name).unwrap_or(0);
+        Self(id, Arc::from(name))
+    }
+}
+
+impl std::fmt::Display for SourceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+/// A normalized message that names its source.
+pub trait HasSource {
+    fn source_id(&self) -> u16;
+    fn venue(&self) -> &Arc<str>;
+}
+
+macro_rules! impl_has_source {
+    ($($t:ty),*) => {$(
+        impl HasSource for $t {
+            fn source_id(&self) -> u16 {
+                self.source_id
+            }
+            fn venue(&self) -> &Arc<str> {
+                &self.venue
+            }
+        }
+    )*};
+}
+
+impl_has_source!(
+    NormalizedQuote,
+    NormalizedTrade,
+    NormalizedMidpoint,
+    NormalizedDepth,
+    NormalizedBook,
+    NormalizedInstrument
+);
+
 /// The same interner for a feed **category** (`ingest::feeds::Feed::category`), which the arbiter's
 /// tape gate pairs with the venue to key one entry per *universe* rather than per venue. Interned
 /// for exactly the reason venues are: that key is built on the trade hot path, once per print, and
@@ -331,6 +419,13 @@ pub struct NormalizedBook {
     #[serde(skip)]
     pub order_level: bool,
     pub changes: Vec<BookChange>,
+    /// The venue's committed slot, truncated to `u32` by the publisher: the `Batch ID` of the most
+    /// recent `BatchBoundary` seen on this market's channel when the batch was produced. Absent
+    /// until one has been seen, and on the Market-by-Order path, which does not carry it. Lets a
+    /// consumer compare this book against a slot-stamped venue snapshot at the same slot, instead
+    /// of over a time window that measures sampling skew rather than correctness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<u32>,
     /// Advisory: this batch is part of a rebuild rather than ordinary activity. Deliberately NOT
     /// what re-baselines a consumer — `changes[0].action == Clear` is.
     pub snapshot: bool,
@@ -384,6 +479,13 @@ pub struct NormalizedInstrument {
     pub category: Arc<str>,
     pub price_exponent: i8,
     pub qty_exponent: i8,
+    /// The venue's tradable price increment as `tick_size * 10^price_exponent` — the wire's `Tick
+    /// Size` in the same fixed point as every price on the feed. **`0` means the publisher stated
+    /// none**, not a zero tick, and is what a Hyperliquid definition carries today. Distinct from
+    /// `10^price_exponent`, which is only the fixed-point granularity: BTC on Phoenix is exponent
+    /// `-2` with a tick of `100`, so it moves in dollars, not cents.
+    #[serde(default)]
+    pub tick_size: i64,
 }
 
 /// A venue-level feed-health status (the PROTOCOL.md `status` candidate extension). Emitted when
@@ -461,7 +563,7 @@ impl FeedMessage {
     }
 }
 
-/// Latest known instrument definitions, keyed by `(venue, category, channel, instrument_id)`,
+/// Latest known instrument definitions, keyed by `(SourceKey, category, channel, instrument_id)`,
 /// shared between the receivers (which update it) and the WebSocket server (which replays it to
 /// each new subscriber so reference data arrives before quotes - otherwise a client that connects
 /// partway through sees a quote first and has to guess the price/qty precision).
@@ -488,13 +590,13 @@ impl FeedMessage {
 /// expected to agree on precision; `upsert_instrument` in `processor.rs` warns if their exponents
 /// diverge.
 pub type InstrumentSnapshot =
-    Arc<Mutex<HashMap<(Arc<str>, Arc<str>, u8, u32), NormalizedInstrument>>>;
+    Arc<Mutex<HashMap<(SourceKey, Arc<str>, u8, u32), NormalizedInstrument>>>;
 
-/// Latest order-book `depth` snapshot per `(venue, symbol)`, derived from the Market-by-Order feed
+/// Latest order-book `depth` snapshot per `(SourceKey, symbol)`, derived from the Market-by-Order feed
 /// and shared with the WebSocket server so it can replay the current book to a newly-connecting
 /// subscriber (depth is full state, so one replayed snapshot bootstraps the consumer immediately
 /// instead of making it wait for the next periodic one). Updated by the MBO receiver.
-pub type DepthSnapshot = Arc<Mutex<HashMap<(Arc<str>, Arc<str>), NormalizedDepth>>>;
+pub type DepthSnapshot = Arc<Mutex<HashMap<(SourceKey, Arc<str>), NormalizedDepth>>>;
 
 /// Accumulated book state for one market, so a connecting or newly-subscribing client can be
 /// bootstrapped immediately instead of waiting a full snapshot cycle.
@@ -519,14 +621,19 @@ pub struct BookAccumulator {
     pending: Vec<BookChange>,
     pending_ts_ns: u64,
     source_ts_ns: u64,
+    /// `recv_ts_ns` of the newest batch folded in — the join watermark. See
+    /// [`BookAccumulator::wire_ts_ns`].
+    wire_ts_ns: u64,
+    pending_wire_ts_ns: u64,
+    pending_batch_id: Option<u32>,
+    /// The venue's committed slot the accumulated state stands at — see
+    /// [`NormalizedBook::batch_id`]. Committed with the event clock, so it names a slot whose
+    /// changes are actually folded in rather than one still waiting for its `last` batch.
+    batch_id: Option<u32>,
     /// Whether a producer re-baseline has been folded in, i.e. whether these levels are the market's
     /// **whole** book rather than only what has changed since accumulation started. See
     /// [`BookAccumulator::baselined`].
     baselined: bool,
-    /// The producer's Source ID for this market, retained so `to_book` can stamp a materialized
-    /// re-baseline or replay with it. Not derivable here — `to_book`'s `venue` comes from the map
-    /// key, but the id is not part of that key.
-    source_id: u16,
 }
 
 /// One folded price level as `(price, total size, resting order count)`.
@@ -549,10 +656,13 @@ pub enum ReplayScope {
 }
 
 /// Cap on changes buffered for one unterminated logical event. The producer is an unauthenticated
-/// datagram publisher, so a feed that never sets `last` must not grow this without limit; the cap sits
-/// far above any real market's full-book rebuild, and overflowing it desynchronizes the accumulator
-/// rather than silently dropping changes from a book still claimed to be complete.
-const MAX_PENDING_CHANGES: usize = 8192;
+/// datagram publisher, so a feed that never sets `last` must not grow this without limit.
+/// Overflowing it desynchronizes the accumulator rather than silently dropping changes from a book
+/// still claimed to be complete, and the serving path then re-baselines the market at its next close.
+///
+/// ⚠️ Real events reach it: it counts changes, not levels (Phoenix UNI carried 8,204 over ~2,800
+/// levels). Survivable only because the serving path's republish follows.
+pub(crate) const MAX_PENDING_CHANGES: usize = 8192;
 
 /// Cap on resting orders one market's replay state holds — the same ceiling `ingest::book`'s own
 /// `MAX_ORDERS_PER_BOOK` puts on the producer, so a well-behaved market never reaches it.
@@ -573,8 +683,11 @@ impl BookAccumulator {
             pending: Vec::new(),
             pending_ts_ns: 0,
             source_ts_ns: 0,
+            wire_ts_ns: 0,
+            pending_wire_ts_ns: 0,
+            pending_batch_id: None,
+            batch_id: None,
             baselined: false,
-            source_id: 0,
         }
     }
 
@@ -584,6 +697,13 @@ impl BookAccumulator {
     /// as `snapshot: true` would tell a consumer to discard the levels it is missing.
     pub fn baselined(&self) -> bool {
         self.baselined
+    }
+
+    /// Whether every batch folded so far has been terminated by its `last`. False means an event is
+    /// still buffered here, so what [`Self::to_book`] materializes is a whole logical event behind
+    /// the feed — see `sinks::ws`'s `WithheldMarkets`.
+    pub fn pending_empty(&self) -> bool {
+        self.pending.is_empty()
     }
 
     /// Buffer one broadcast batch, and fold the whole logical event into the book on its `last`
@@ -596,12 +716,16 @@ impl BookAccumulator {
     /// producer's event size — the same one the consumer already pays.
     pub fn apply(&mut self, b: &NormalizedBook) {
         self.symbol = b.symbol.clone();
-        self.source_id = b.source_id;
         // 0 is the "unknown" sentinel, never a real time: a batch without one must not blank the
         // last known event time on every subsequent replay.
         if b.source_ts_ns != 0 {
             self.pending_ts_ns = b.source_ts_ns;
         }
+        // Same rule as the event clock: a batch that names no slot must not blank the last one.
+        if b.batch_id.is_some() {
+            self.pending_batch_id = b.batch_id;
+        }
+        self.pending_wire_ts_ns = self.pending_wire_ts_ns.max(b.recv_ts_ns);
         // A non-finite price would saturate the fixed-point key (NaN to 0, inf to i128::MIN/MAX),
         // silently merging unrelated levels into one entry that then lives in the replay map forever.
         self.pending.extend(
@@ -616,8 +740,34 @@ impl BookAccumulator {
             // below whatever its size, or an order-level snapshot — tens of thousands of orders in one
             // batch — could never baseline.
             if self.pending.len() > MAX_PENDING_CHANGES {
+                // ⚠️ The market drops out of every bootstrap (`sinks::ws` filters on `baselined`)
+                // until a `Clear`-led batch from the serving path folds in. For a price-aggregated
+                // market the arbiter asks that path's processor for one at its next close
+                // (`Arbiter::book_rebaselines_owed`); nothing else would ever send it. The cap bounds
+                // a whole boundary interval, not one datagram, and the busiest markets reach it.
+                crate::metrics::metrics()
+                    .book_events_abandoned
+                    .with_label_values(&[b.venue.as_ref()])
+                    .inc();
+                tracing::warn!(
+                    venue = %b.venue,
+                    symbol = %b.symbol,
+                    channel = b.channel,
+                    instrument_id = b.instrument_id,
+                    pending = self.pending.len(),
+                    "book event outgrew the pending-change cap; the market is re-baselined from \
+                     the serving path at its next close"
+                );
                 self.pending.clear();
                 self.baselined = false;
+                // The abandoned event's changes are gone, so its stamps go with them, or the next
+                // event's `last` commits a time and a slot for state that was never folded in —
+                // ahead of the book, which is the one direction PROTOCOL.md's "at least that slot"
+                // rules out. Rolled back to what IS folded in rather than zeroed: zeroing would let
+                // a later batch naming neither blank both.
+                self.pending_ts_ns = self.source_ts_ns;
+                self.pending_batch_id = self.batch_id;
+                self.pending_wire_ts_ns = self.wire_ts_ns;
             }
             return;
         }
@@ -681,6 +831,8 @@ impl BookAccumulator {
             self.baselined = false;
         }
         self.source_ts_ns = self.pending_ts_ns;
+        self.batch_id = self.pending_batch_id;
+        self.wire_ts_ns = self.pending_wire_ts_ns;
     }
 
     /// Discard one or both sides of the book, across **both** populations — a `Clear` names a side, and
@@ -740,6 +892,25 @@ impl BookAccumulator {
     /// [`Self::to_book`] — which stamps this same value — just to read it.
     pub fn source_ts_ns(&self) -> u64 {
         self.source_ts_ns
+    }
+
+    /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
+    pub fn batch_id(&self) -> Option<u32> {
+        self.batch_id
+    }
+
+    /// The `recv_ts_ns` of the newest batch **folded in**, or `0` if none has been. This is the
+    /// watermark a joining client is bootstrapped at: `sinks::ws` records it when it replays this
+    /// market and then discards queued `book` frames strictly below it, which are the batches the
+    /// replayed state already contains (see that module's `BookWatermarks`). Strictly: two batches
+    /// for one market can share a stamp with only the first folded, so a tie is forwarded.
+    ///
+    /// Advanced on the fold, never on a buffered batch, and that is the whole contract: the batches
+    /// of an event still awaiting its `last` are **not** in what [`Self::to_book`] materializes, so
+    /// a watermark that counted them would have the client drop the very batches its bootstrap is
+    /// missing.
+    pub fn wire_ts_ns(&self) -> u64 {
+        self.wire_ts_ns
     }
 
     /// Fold the accumulated orders into price levels with the order count at each, bids best-first
@@ -841,9 +1012,9 @@ impl BookAccumulator {
     pub fn to_clear(&self, key: &BookKey) -> NormalizedBook {
         let (venue, category, channel, instrument_id) = key;
         NormalizedBook {
-            venue: venue.clone(),
-            source_name: venue.clone(),
-            source_id: self.source_id,
+            venue: venue.name_arc().clone(),
+            source_name: venue.name_arc().clone(),
+            source_id: venue.id(),
             symbol: self.symbol.clone(),
             channel: *channel,
             instrument_id: *instrument_id,
@@ -856,6 +1027,7 @@ impl BookAccumulator {
                 size: 0.0,
                 order_id: 0,
             }],
+            batch_id: self.batch_id,
             snapshot: true,
             last: true,
             source_ts_ns: self.source_ts_ns,
@@ -889,7 +1061,7 @@ pub type BookSnapshot = Arc<Mutex<BookReplay>>;
 
 /// A market's replay key: the arbitration scope plus the wire identity. Structurally
 /// `ingest::authority::MarketKey`, and required to stay so — see [`BookSnapshot`].
-pub type BookKey = (Arc<str>, Arc<str>, u8, u32);
+pub type BookKey = (SourceKey, Arc<str>, u8, u32);
 
 /// The map behind [`BookReplay`], named so a reader can borrow it without respelling the key.
 pub type BookMap = HashMap<BookKey, BookAccumulator>;
@@ -910,9 +1082,9 @@ pub struct BookReplay {
 }
 
 impl BookReplay {
-    /// Replace one market's accumulator (the re-baseline path).
-    pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) {
-        self.books.insert(key, acc);
+    /// Replace one market's accumulator (the re-baseline path), returning the one it replaced.
+    pub fn insert(&mut self, key: BookKey, acc: BookAccumulator) -> Option<BookAccumulator> {
+        self.books.insert(key, acc)
     }
 
     /// The accumulator for `key`, created with `f` when the market is new (the streaming path).
@@ -997,6 +1169,51 @@ pub fn now_mono_ns() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_key_equality_includes_the_id() {
+        let a = SourceKey::new(1, Arc::from("SHARED"));
+        let b = SourceKey::new(7, Arc::from("SHARED"));
+        assert_ne!(a, b);
+        assert_eq!(a.name(), b.name());
+        assert_eq!(a, SourceKey::new(1, Arc::from("SHARED")));
+    }
+
+    #[test]
+    fn source_key_keeps_unassigned_names_apart() {
+        assert_ne!(
+            SourceKey::new(0, Arc::from("A")),
+            SourceKey::new(0, Arc::from("B"))
+        );
+    }
+
+    /// Past the unregistered-ID cap every ID shares one label, and must share one key, or a hostile
+    /// wire grows every per-source map without bound.
+    #[test]
+    fn ids_past_the_unregistered_cap_share_one_key() {
+        let capped = crate::ingest::sources::UNREGISTERED;
+        assert_eq!(
+            SourceKey::new(900, Arc::from(capped)),
+            SourceKey::new(901, Arc::from(capped))
+        );
+        assert_ne!(
+            SourceKey::new(900, Arc::from("SOURCE_900")),
+            SourceKey::new(901, Arc::from("SOURCE_901"))
+        );
+    }
+
+    /// A book materialized before its first batch is stamped with its key's ID, not a default.
+    #[test]
+    fn an_unapplied_accumulator_stamps_its_keys_id() {
+        let acc = BookAccumulator::new("X".into());
+        let key: BookKey = (SourceKey::new(5, "S".into()), "c".into(), 0, 1);
+        assert_eq!(acc.to_clear(&key).source_id, 5);
+    }
+
+    #[test]
+    fn source_key_displays_its_name() {
+        assert_eq!(SourceKey::new(3, Arc::from("NAME")).to_string(), "NAME");
+    }
+
     /// `order_id` is additive: a payload written before the field still parses, and an order-level
     /// change round-trips its id. Zero is the price-aggregated sentinel — what Market-by-Price emits
     /// and what a consumer reads as "no order identity".
@@ -1024,11 +1241,17 @@ mod tests {
 
     /// The replay key a test's accumulator materializes under.
     fn bkey(venue: &Arc<str>, channel: u8, instrument_id: u32) -> BookKey {
-        (venue.clone(), TEST_CATEGORY.into(), channel, instrument_id)
+        (
+            SourceKey::from(venue.as_ref()),
+            TEST_CATEGORY.into(),
+            channel,
+            instrument_id,
+        )
     }
 
     fn book(changes: Vec<BookChange>, snapshot: bool, last: bool) -> NormalizedBook {
         NormalizedBook {
+            batch_id: None,
             venue: "KALSHI".into(),
             source_name: "KALSHI".into(),
             source_id: 0,
@@ -1045,6 +1268,44 @@ mod tests {
             kernel_rx_ts_ns: 1_781_019_263_715_300_010,
             ws_send_ts_ns: 0,
         }
+    }
+
+    /// The join watermark advances on the **fold**, never on a buffered batch. A batch still
+    /// waiting for its `last` is not in what `to_book` materializes, so counting it would have
+    /// `sinks::ws` drop the very batches a joining client's bootstrap is missing.
+    #[test]
+    fn the_wire_watermark_advances_only_when_the_event_folds() {
+        let level = |price: f64| BookChange {
+            action: BookAction::Update,
+            side: BookSide::Bid,
+            price,
+            size: 1.0,
+            order_id: 0,
+        };
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        assert_eq!(acc.wire_ts_ns(), 0, "nothing folded yet");
+
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: 100,
+            ..book(vec![level(0.61)], false, true)
+        });
+        assert_eq!(acc.wire_ts_ns(), 100);
+
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: 200,
+            ..book(vec![level(0.62)], false, false)
+        });
+        assert_eq!(
+            acc.wire_ts_ns(),
+            100,
+            "a buffered batch is not in the materialized state"
+        );
+
+        acc.apply(&NormalizedBook {
+            recv_ts_ns: 300,
+            ..book(vec![level(0.63)], false, true)
+        });
+        assert_eq!(acc.wire_ts_ns(), 300, "the whole event folded");
     }
 
     /// The wire shape PROTOCOL.md documents, pinned exactly — field names and the `type` tag are the
@@ -1493,6 +1754,7 @@ mod tests {
         let venue: Arc<str> = Arc::from("HYPERLIQUID");
         let mut acc = BookAccumulator::new(Arc::from("SOL"));
         acc.apply(&NormalizedBook {
+            batch_id: None,
             venue: venue.clone(),
             source_name: venue.clone(),
             source_id: 1,
@@ -1704,6 +1966,50 @@ mod tests {
         acc.apply(&book(flood, false, false));
         assert!(!acc.baselined());
         assert!(acc.price_fold().0.is_empty());
+    }
+
+    /// ...and its stamps are abandoned with it. Committing the discarded event's slot on the next
+    /// event's `last` would name a slot the accumulated state is not at — ahead of it, which is the
+    /// direction PROTOCOL.md's "at least that slot's" rules out.
+    #[test]
+    fn an_abandoned_events_stamps_are_not_committed_by_the_next_one() {
+        let mut acc = BookAccumulator::new("BTC".into());
+        let mut first = book(
+            vec![order(BookAction::Clear, BookSide::Both, 0.0, 0.0, 0)],
+            true,
+            true,
+        );
+        first.batch_id = Some(900);
+        first.source_ts_ns = 100;
+        acc.apply(&first);
+        assert_eq!(acc.batch_id(), Some(900));
+
+        let mut abandoned = book(
+            (1..=MAX_PENDING_CHANGES as u64 + 1)
+                .map(|id| order(BookAction::Update, BookSide::Bid, id as f64, 1.0, id))
+                .collect(),
+            false,
+            false,
+        );
+        abandoned.batch_id = Some(901);
+        abandoned.source_ts_ns = 200;
+        acc.apply(&abandoned);
+
+        // An ordinary later batch, naming neither a slot nor a time of its own.
+        let mut next = book(
+            vec![order(BookAction::Update, BookSide::Bid, 1.0, 1.0, 1)],
+            false,
+            true,
+        );
+        next.batch_id = None;
+        next.source_ts_ns = 0;
+        acc.apply(&next);
+        assert_eq!(
+            acc.batch_id(),
+            Some(900),
+            "the abandoned event's slot is not the state's"
+        );
+        assert_eq!(acc.source_ts_ns(), 100, "nor its event time");
     }
 
     /// A connecting client is bootstrapped with price levels by default, so an L2 consumer never pays

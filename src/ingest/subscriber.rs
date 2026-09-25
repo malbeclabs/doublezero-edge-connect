@@ -106,6 +106,7 @@ mod tests {
 
     fn defn(iid: u32, seq: u16) -> InstrumentDefinition {
         InstrumentDefinition {
+            tick_size: 0,
             instrument_id: iid,
             source_id: None,
             symbol: format!("SYM{iid}").into(),

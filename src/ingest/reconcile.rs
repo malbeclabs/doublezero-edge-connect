@@ -869,7 +869,7 @@ impl Reconciler {
         // departing row's own universe — see the doc above.
         let category = category_arc(feed.category);
         crate::model::lock(&self.cfg.instruments)
-            .retain(|k, _| !(k.0.as_ref() == feed.venue && k.1 == category && k.2 == channel));
+            .retain(|k, _| !(k.0.name() == feed.venue && k.1 == category && k.2 == channel));
 
         // The book: routed through the arbiter, never hand-deleted from the replay map directly, so
         // the accumulator, the replay entry and `StickyAuthority::last_admitted` drop together —
@@ -1100,7 +1100,7 @@ async fn feed_history(
                     // silently unattributable, invisible in both the API and Prometheus, so it is
                     // counted and dropped rather than trusted blind.
                     let known = crate::model::lock(&instruments).contains_key(&(
-                        t.venue.clone(),
+                        crate::model::SourceKey::of(t),
                         t.category.clone(),
                         t.channel,
                         t.instrument_id,
@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn disjoint_categories_each_hold_their_own_tape() {
         let perps_tob = ("KALSHI", "perps", TOB, 7576);
-        let sports_mbp = ("KALSHI", "sports", MBP, 34010);
+        let sports_mbp = ("KALSHI", "events", MBP, 34010);
         let owners = tape_owners([perps_tob, sports_mbp], all_live);
         assert!(owns(&owners, &perps_tob));
         assert!(
@@ -1521,8 +1521,8 @@ mod tests {
     fn the_filter_narrows_the_desired_receiver_set() {
         let sports = *crate::ingest::feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row");
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row");
         let filter = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
 
         let narrowed = test_reconciler_with_filter(vec![sports], filter);
@@ -1543,14 +1543,14 @@ mod tests {
         );
     }
 
-    /// The real "sports" row (group code `edge-kalshi-sports-mbp`), for tests that need genuine channel-filter
+    /// The real "events" row (group code `edge-kalshi-sports-mbp`), for tests that need genuine channel-filter
     /// narrowing — `ChannelFilter::parse` validates against the loaded registry, so a custom `Feed`
     /// with a made-up code cannot be narrowed at all.
     fn sports_row() -> Feed {
         *crate::ingest::feeds::feeds()
             .iter()
-            .find(|f| f.category == "sports")
-            .expect("the built-in registry has a sports row")
+            .find(|f| f.category == "events")
+            .expect("the built-in registry has an events row")
     }
 
     /// One `book` batch for a given identity, reused by the tests below that seed a real arbiter.
@@ -1565,6 +1565,7 @@ mod tests {
         changes: Vec<crate::model::BookChange>,
     ) -> FeedMessage {
         FeedMessage::Book(crate::model::NormalizedBook {
+            batch_id: None,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,
@@ -1657,11 +1658,11 @@ mod tests {
             vec![sports_row()],
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
-        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
+        let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
 
         let hist_key = history::Key {
             source_id: 3,
-            category: "sports".into(),
+            category: "events".into(),
             channel: 10,
             instrument_id: 1,
         };
@@ -1922,23 +1923,24 @@ mod tests {
         );
 
         r.cfg.instruments.lock().unwrap().insert(
-            ("KALSHI".into(), "sports".into(), 10u8, 1u32),
+            ("KALSHI".into(), "events".into(), 10u8, 1u32),
             crate::model::NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "DEPARTED".into(),
                 channel: 10,
                 instrument_id: 1,
-                category: "sports".into(),
+                category: "events".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
             },
         );
-        seed_book(&r, "KALSHI", 3, "DEPARTED", "sports", 10, 1);
+        seed_book(&r, "KALSHI", 3, "DEPARTED", "events", 10, 1);
         let hist_key = history::Key {
             source_id: 3,
-            category: "sports".into(),
+            category: "events".into(),
             channel: 10,
             instrument_id: 1,
         };
@@ -2038,14 +2040,22 @@ mod tests {
             vec![feed],
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
-        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
-            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
-        let book_key: crate::ingest::authority::MarketKey =
-            (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
+        let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "events".into(),
+            10u8,
+            1u32,
+        );
+        let book_key: crate::ingest::authority::MarketKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            Arc::from("events"),
+            10,
+            1,
+        );
         let hist_key = history::Key {
             source_id: 3,
-            category: "sports".into(),
+            category: "events".into(),
             channel: 10,
             instrument_id: 1,
         };
@@ -2061,18 +2071,19 @@ mod tests {
         r.cfg.instruments.lock().unwrap().insert(
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "NARROWED".into(),
                 channel: 10,
                 instrument_id: 1,
-                category: "sports".into(),
+                category: "events".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
             },
         );
-        seed_book(&r, "KALSHI", 3, "NARROWED", "sports", 10, 1);
+        seed_book(&r, "KALSHI", 3, "NARROWED", "events", 10, 1);
         r.cfg.history.lock().unwrap().ingest(
             hist_key.clone(),
             history::Print {
@@ -2146,14 +2157,22 @@ mod tests {
             vec![sports_row()],
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
-        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
-            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
-        let book_key: crate::ingest::authority::MarketKey =
-            (Arc::from("KALSHI"), Arc::from("sports"), 10, 1);
+        let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "events".into(),
+            10u8,
+            1u32,
+        );
+        let book_key: crate::ingest::authority::MarketKey = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            Arc::from("events"),
+            10,
+            1,
+        );
         let hist_key = history::Key {
             source_id: 3,
-            category: "sports".into(),
+            category: "events".into(),
             channel: 10,
             instrument_id: 1,
         };
@@ -2176,18 +2195,19 @@ mod tests {
         r.cfg.instruments.lock().unwrap().insert(
             catalog_key.clone(),
             crate::model::NormalizedInstrument {
+                tick_size: 0,
                 venue: "KALSHI".into(),
                 source_name: "KALSHI".into(),
                 source_id: 3,
                 symbol: "STILLHERE".into(),
                 channel: 10,
                 instrument_id: 1,
-                category: "sports".into(),
+                category: "events".into(),
                 price_exponent: -4,
                 qty_exponent: -2,
             },
         );
-        seed_book(&r, "KALSHI", 3, "STILLHERE", "sports", 10, 1);
+        seed_book(&r, "KALSHI", 3, "STILLHERE", "events", 10, 1);
         r.cfg.history.lock().unwrap().ingest(
             hist_key.clone(),
             history::Print {
@@ -2259,9 +2279,13 @@ mod tests {
             vec![sports_row()],
             ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap(),
         );
-        let key10 = ("KALSHI", "sports", FeedKind::MarketByPrice, 34010u16);
-        let catalog_key: (Arc<str>, Arc<str>, u8, u32) =
-            ("KALSHI".into(), "sports".into(), 10u8, 1u32);
+        let key10 = ("KALSHI", "events", FeedKind::MarketByPrice, 34010u16);
+        let catalog_key: (crate::model::SourceKey, Arc<str>, u8, u32) = (
+            crate::model::SourceKey::new(3, "KALSHI".into()),
+            "events".into(),
+            10u8,
+            1u32,
+        );
 
         // Tick 1: both channels admitted (spawns real, never-polled receivers).
         r.tick().await;
@@ -2282,7 +2306,7 @@ mod tests {
         // Seed the catalog entry the departure is supposed to purge.
         r.cfg.instruments.lock().unwrap().insert(
             catalog_key.clone(),
-            test_instrument_in("sports", "KALSHI", 3, "NARROWED", 10, 1),
+            test_instrument_in("events", "KALSHI", 3, "NARROWED", 10, 1),
         );
 
         // Narrow the filter: channel 10 departs. Tick 2 aborts the stand-in and queues it in
@@ -2298,7 +2322,7 @@ mod tests {
         // ordering the finding describes.
         r.cfg.instruments.lock().unwrap().insert(
             catalog_key.clone(),
-            test_instrument_in("sports", "KALSHI", 3, "LATE-WRITE", 10, 1),
+            test_instrument_in("events", "KALSHI", 3, "LATE-WRITE", 10, 1),
         );
 
         // Give the runtime a chance to actually process the stand-in's cancellation: it's parked
@@ -2354,6 +2378,8 @@ mod tests {
                 max_subs: 1,
                 max_inbound_per_min: 1,
                 broadcast_capacity: 1,
+                lag_repair_min_interval: crate::sinks::ws::LAG_REPAIR_MIN_INTERVAL,
+                bootstrap_release_deadline: crate::sinks::ws::BOOTSTRAP_RELEASE_DEADLINE,
             },
             api_bind: String::new(),
             history: Arc::new(Mutex::new(Store::new())),
@@ -2395,6 +2421,7 @@ mod tests {
         instrument_id: u32,
     ) -> crate::model::NormalizedInstrument {
         crate::model::NormalizedInstrument {
+            tick_size: 0,
             venue: venue.into(),
             source_name: venue.into(),
             source_id,

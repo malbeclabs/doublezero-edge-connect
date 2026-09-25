@@ -65,7 +65,12 @@ fn clear_both() -> BookChange {
 }
 
 fn market(instrument_id: u32) -> BookKey {
-    (VENUE.into(), CATEGORY.into(), CHANNEL, instrument_id)
+    (
+        doublezero_edge_connect::model::SourceKey::new(1, VENUE.into()),
+        CATEGORY.into(),
+        CHANNEL,
+        instrument_id,
+    )
 }
 
 /// A market's wire symbol. Not part of [`BookKey`], but two markets sharing one must not be how a
@@ -92,6 +97,7 @@ fn batch_for(
     recv_ts_ns: u64,
 ) -> FeedMessage {
     FeedMessage::Book(NormalizedBook {
+        batch_id: None,
         venue: VENUE.into(),
         source_name: VENUE.into(),
         source_id: 1,

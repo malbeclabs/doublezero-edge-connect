@@ -393,7 +393,7 @@ mod tests {
     /// excluded channel either way, so that assertion could not fail.
     #[test]
     fn an_excluded_sports_channel_binds_no_socket() {
-        let feed = feeds().iter().find(|f| f.category == "sports").unwrap();
+        let feed = feeds().iter().find(|f| f.category == "events").unwrap();
         let f = ChannelFilter::parse("edge-kalshi-sports-mbp=10,11").unwrap();
         let ports: Vec<u16> = f
             .publishers_for(feed)
@@ -407,7 +407,7 @@ mod tests {
     /// filtering a feed nobody narrowed: an unmentioned feed binds its whole published set.
     #[test]
     fn an_unmentioned_feed_binds_every_publisher() {
-        let feed = feeds().iter().find(|f| f.category == "sports").unwrap();
+        let feed = feeds().iter().find(|f| f.category == "events").unwrap();
         let f = ChannelFilter::parse("").unwrap();
         assert_eq!(f.publishers_for(feed).len(), feed.publishers.len());
         assert!(

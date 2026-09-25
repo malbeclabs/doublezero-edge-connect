@@ -65,7 +65,7 @@ fn phoenix_venue() -> &'static str {
 /// that line, and it holds only because the public `tradeSequenceNumber` matches the edge id on this
 /// venue (validated 2026-06-30); a venue where it did not would double-print.
 /// `category_names_the_row_this_backstop_mirrors` pins the value.
-const PHOENIX_CATEGORY: &str = "spot";
+const PHOENIX_CATEGORY: &str = "perps";
 
 /// One Phoenix `trades` frame: the channel tag, the public market symbol, and the fills. Only the
 /// `trades` channel is acted on; every other frame (subscription status, heartbeat/pong, or one with
@@ -341,6 +341,7 @@ mod tests {
         map.lock().unwrap().insert(
             (phoenix_venue().into(), PHOENIX_CATEGORY.into(), 0u8, 1u32),
             NormalizedInstrument {
+                tick_size: 0,
                 venue: phoenix_venue().into(),
                 source_name: phoenix_venue().into(),
                 source_id: 0,

@@ -12,8 +12,8 @@ feeds, each selected per feed by `FeedKind` in `src/ingest/feeds.rs`:
 `midpoint`), **Market-by-Order** (magic `0x4444`; the bridge reconstructs the L3 book and
 re-serves it both as full-state `depth` and as the order-level incremental **`order_book`**, carrying
 the venue's own `order_id`), and **Market-by-Price** (magic `0x4442`; the bridge
-reconstructs the price-aggregated book and re-serves it as the incremental `book`; the `edge-kalshi-perps-mbp`
-row selects it, on a group that is live). Each feed maps to one venue. The
+reconstructs the price-aggregated book and re-serves it as the incremental `book`; the
+`edge-kalshi-perps-mbp` and `edge-phoenix-mbp` rows select it, both on live groups). Each feed maps to one venue. The
 input (multicast/binary) is an implementation detail; the *only* external contract is the
 WebSocket output, fully specified in
 **PROTOCOL.md** (v1). Any engine that speaks WebSocket + JSON consumes it via a thin adapter; the
@@ -176,7 +176,7 @@ Modules are grouped by role under `src/`:
   installed by `feeds::init` (called once from `main` before any receiver spawns); the backing
   `OnceLock` is deliberately **not** `pub`, so a consumer reading it directly is a compile error
   rather than a silently-missing row. Each `Feed` is one multicast group mapped to one
-  venue, with a group `code` (`tiredsolid`/`scottsdale` — the identifier `doublezero status` reports,
+  venue, with a group `code` (`tiredsolid`/`edge-phoenix-tob` — the identifier `doublezero status` reports,
   matched by the reconciler), a `FeedKind` (which protocol) and **N `FeedPublisher` rows**, one per
   publisher mirroring the feed, each with its own `FeedPorts` block (`TwoPort` for TOB/Midpoint, or
   `ThreePort` adding a snapshot port for MBO). One receiver task runs per publisher. A publisher's
@@ -200,11 +200,24 @@ Modules are grouped by role under `src/`:
   `..._match_the_deployment`) asserts the document against literals written beside it — the code
   agreeing with itself. It catches a later edit that moves a value, never a value that was wrong when
   written. On 2026-08-09 **all three rows** were found on ports no publisher sends to, each carrying a
-  sibling row's block, with the build green throughout. **The external check is a packet capture**, and
-  the procedure lives in `registry.json`'s `PORT PROVENANCE` block; run it whenever a row is added or a
-  port moves. A third **Kalshi** row
+  sibling row's block, with the build green throughout. **The external check is a packet capture** —
+  run it whenever a row is added or a port moves. **PORT PROVENANCE**, the rule that check exists to
+  serve: a port in that document is a claim about a machine outside this process, so it is verified
+  from *outside* — by capture, or by the publishers' own deployment inventory — or the row is marked
+  unverified in its `notes`. Never from prose that describes an allocation; read the values the
+  publisher actually renders. And the authoritative fleet list is the **feed-capture recorder**
+  inventory in the private infra repo, **not** the publisher deployment inventory: the latter covers
+  only a subset of the hosts on a group, and sourcing the table from it alone is what left five
+  blocks unbound and the bridge ingesting about a third of the group's datagrams. (The rule used to
+  live in the document's own notes; it moved here when those notes were rewritten for the operators
+  who read them — `registry.json` states what a subscriber needs, this states how we verify it.)
+  One row-level fact that lived there too: Hyperliquid's `9011`/`10011` block is on the wire and in
+  no inventory, and its depth half is the group's highest-volume publisher — its owner is still to
+  be established, so **do not drop the row** for being unattributed. A third **Kalshi** row
   (`edge-kalshi-sports-mbp`, group `233.84.178.20`, MBP, `Sticky`, claiming the tape) carries a *disjoint* universe
-  under the same Source ID — hence its own `category` — and is the one `derived` row: 31 channels
+  under the same Source ID — hence its own `category` (`events`: sport is one kind of event
+  market and the row carries more than sport, while the group `code` stays the ledger's
+  `edge-kalshi-sports-mbp`) — and is the one `derived` row: 31 channels
   (ids 10-29, 39-48, 49) expanded to `34000`/`44000`/`54000 + id`, confirmed against the publishers'
   own deployment inventory on 2026-08-09. `33000`/`43000` is the **top-of-book sibling's** base, and a
   market-by-price row built on it joins the right group and receives nothing, which reads as a dead
@@ -262,7 +275,8 @@ Modules are grouped by role under `src/`:
   codes and nothing fed the old name in. A `venue` in the document **must** be a name that resolves,
   or `receiver::record_revealed` silently drops it and the row's `status` feed goes unrecorded. An
   unassigned ID is **not** an error: it gets a stable synthesized `SOURCE_<id>` (distinct per ID,
-  since the arbiter keys dedup on `(venue, symbol)`), bounded by `MAX_UNREGISTERED_SOURCES`.
+  so consumers can tell them apart), bounded by `MAX_UNREGISTERED_SOURCES`; past it every ID shares
+  `UNREGISTERED` and one `SourceKey`.
 - **`ingest/subscriptions.rs`** — the single **detection** place. `detect()` shells out to
   `doublezero status --json` and returns the host's subscribed group **codes** (the `S:<code>`
   entries of `multicast_groups` — the authoritative per-host view), plus a code→IP map from
@@ -383,7 +397,7 @@ Modules are grouped by role under `src/`:
   so an `f64→int` saturation can't collapse distinct huge values, #66), and the
   `WindowedDedup` on `trade_id` for trades — and exposes one `emit(msg, publisher, category)` (quotes → quote
   floor, depth → depth floor, trades → the per-`(venue, category)` **tape leader** then the window, `book` → the
-  single-path authority gate below, `Instrument` → a rate limit on the precision pair per
+  single-path authority gate below, `Instrument` → a rate limit on the precision and tick per
   `(venue, symbol)` so mirrored publishers' identical refdata bursts collapse but unchanged content
   is still re-announced every `INSTRUMENT_REANNOUNCE_NS` (`dz_instruments_dropped_total`);
   `Midpoint`/`Status` are the only passthroughs); a surviving message is
@@ -580,11 +594,22 @@ Modules are grouped by role under `src/`:
   `8 x N` paths — the forged-flood bound still holds per universe, which is the grain that decides
   anything, and the metric label set stays `{venue, path}` (`dz_path_markets_held` sums a venue's
   universes; two universes' `path0` are different publishers)
-  (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` status transition) and
-  overrides the elected path for that market alone. Tunables are the `--arb-*` flags (see docs/metrics.md).
+  (`Arbiter::set_book_health`, the seam the MBP processor calls on a `PriceBook` health transition) and
+  overrides the elected path for that market alone. ⚠️ **Health is `PriceBook::serves_a_book()`,
+  never `status() == Ready`** (#163): a rotation accepted while the book is `Ready` assembles into a
+  shadow with the live levels standing, so the path still holds the market, and calling that
+  unhealthy hands it to the peer and takes it straight back at two re-baselines a rotation. A group
+  assembling over a book that was *not* being served stays unhealthy — that one is empty. Both
+  directions are counted, `reason="health"` and `reason="health_revert"`, with a `rebaselined` label.
+  Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
-  serving-path change (margin, silence, or that health override), a market's first admission, or a market
-  whose state was evicted. The re-baseline is a `clear` plus the new path's complete current level set,
+  serving-path change (margin, silence, or that health override), a market's first admission, a market
+  whose state was evicted, or ⚠️ **a batch dropped from the path the consumer was following**
+  (`force_rebaseline`, `reason="dropped_batch"`, #163) — the override mutes that path's batches, and
+  with the peer silent for that market `last_admitted` never moves, so the path resuming reads as a
+  continuation onto a book missing them, silently and until some later re-baseline. The market's own
+  re-baseline is no escape: the processor emits a snapshot install's before it reports health, so the
+  gate drops that too. The re-baseline is a `clear` plus the new path's complete current level set,
   `snapshot`/`last` true — so the gate accumulates **every eligible path's** book (`BookMarket::paths`), not
   only the serving one. Three constraints shape it: it is emitted lazily on that path's next *completed*
   logical event, never as a venue-wide burst of clears (most markets are idle, and `to_book` of a
@@ -617,8 +642,14 @@ Modules are grouped by role under `src/`:
   from parsed JSON and serves no `book`, and an untracked publisher would spend one of the scope's eight
   admission slots. `dz_path_lead_ns` is fed exclusively from those pairs, never from a dropped copy's
   `Admit::Contest` lead (that is inter-path phase against an unrelated earlier message, and structurally
-  non-negative). The only `FEEDS` row of that kind is `edge-kalshi-perps-mbp`, whose group is live, so these series
-  populate on any host subscribed to it — and report nothing on a host that is not.
+  non-negative). The `FEEDS` rows of that kind are `edge-kalshi-perps-mbp` and `edge-phoenix-mbp`, both live; on a
+  host subscribed to neither the matcher never engages at all. Where it does, a **single-publisher row is the
+  degenerate case and the matcher's two series diverge on it**: a pair needs two paths, so `dz_path_lead_ns`
+  populates only for Kalshi's mirrored pair and never for Phoenix, while every Phoenix print still *enters* the
+  matcher (the authority tracks its one path, so `race_eligible` holds) and expires unpaired onto
+  `dz_path_unmatched_trades_total{venue="PHOENIX"}` — permanently, at the venue's whole trade rate. That series'
+  alarm reading, "the paths are barely pairing," cannot apply to a row that has one path; docs/metrics.md carries
+  the same caveat, since a dashboard alerting on the ratio would otherwise show a standing false positive.
 - **`ingest/public_input.rs`** — venue-generic **public WS input** scaffolding shared by all
   public backstops: the `PublicVenue` trait (`venue`/`url`/`subscribe_msgs`/`handle_text`), one
   reconnecting `run` loop (backoff: min 500ms, max 30s, stable-session 30s; metrics labelled by
@@ -649,7 +680,24 @@ Modules are grouped by role under `src/`:
   sync state is reported to the arbiter *before* the datagram's emissions so the re-baseline suppression has
   a truthful view; a gapped book must report `false` or a recovering peer sees a phantom healthy path and
   suppresses the only re-baseline on offer), `MbpProcessor` (feeds level deltas + the snapshot feed into `pricebook.rs` and emits the
-  incremental `book` + trades). All gate emission **per instrument** on a known definition (precision before price). The
+  incremental `book` + trades). ⚠️ **A datagram is not a logical event where the venue publishes
+  `BatchBoundary`.** One event's level changes span datagrams, so on a channel that has shown a
+  boundary the per-datagram batches carry `last: false` and the boundary emits the closing batch
+  (`ChannelBatching`, which is why `open` has to outlive the datagram); publishing each datagram as
+  finished is what exposed locked and crossed intermediate books to every consumer honouring `last`.
+  A channel that has shown none keeps the datagram as the event, and a channel that shows one and
+  then stops reverts to that after `BOUNDARY_TIMEOUT_NS` — the wedge PROTOCOL.md warns about under
+  `last` is a buffering consumer held forever, so the fallback is not optional. ⚠️ **That bound is
+  wall clock and must stay so.** The publishers run a mean ~210 mktdata datagrams/s per host against
+  a two-minute-average peak near 1,250/s, so one 400 ms slot carries ~500 datagrams: any datagram
+  count small enough to bound the wedge sits inside a single busy slot, fires mid-event and
+  re-exposes the very books this closes. `MAX_DATAGRAMS_WITHOUT_BOUNDARY` survives only as the
+  backstop for a datagram whose `recv_ts_ns` is the `0` sentinel. The fallback closes whatever
+  `open` still holds — and drops `last_batch` with it, since the last boundary seen names a slot the
+  venue has moved past (PROTOCOL.md already promises `batch_id` absent rather than stale); the paths
+  that instead *drop* that map (channel reset, `EndOfSession`,
+  publisher eviction) emit nothing on purpose — the books are already gone and the recovery is a
+  `Clear`-led re-baseline, which discards the consumer's buffer rather than committing it. All gate emission **per instrument** on a known definition (precision before price). The
   quote/trade/depth cross-transport dedup is **not** here anymore — it moved to `arbiter.rs`.
   All three hold their `RefDataState` in a shared `PerPublisher<D>` map keyed on the datagram source
   IP address and bounded by `MAX_PUBLISHERS` (#97): `reset_count` is per `(source_ip, group, port)`, so under
@@ -684,9 +732,38 @@ Modules are grouped by role under `src/`:
   snapshot group whose era disagrees with the market data's is refused for the same reason — it
   belongs to the publisher's previous run, and installing it would republish a dead session's book.
   `buffered_total` is a running total maintained by the single `with_book` seam so the budget check is
-  O(1); a test recomputes the true sum after every mutation path. Per-market `Ready` transitions are
-  reported to the arbiter's `StickyAuthority` (`set_book_health`), which is what fails a gapped path
-  over to its peer. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
+  O(1); a test recomputes the true sum after every mutation path. Per-market health transitions are
+  reported to the arbiter's `StickyAuthority` (`set_book_health`) off `serves_a_book()`, never
+  `status()`, which is what fails a gapped path over to its peer without failing over a healthy one
+  mid-rotation. ⚠️ That report's transition memo records what was **filed**, never what was
+  computed (#163): an `InstrumentReset` purges `revealed` in the same message that reports unhealth,
+  so the install that readmits the instrument has no venue to file under, and marking that report
+  done would leave the path unhealthy at the gate with a `Ready` book — the market then sits on a
+  stale peer while a live path is on the wire. `send_book`'s own `Ready` gate is unchanged, so a path mid-rotation keeps the market
+  and publishes nothing until the install's re-baseline. ⚠️ **At every event close it asks the arbiter
+  whether the replay entry is owed a republish** (`Arbiter::book_rebaselines_owed`: the entry is not
+  `baselined()` and this path is `last_admitted`) and, if so, closes with `emit_rebaseline` instead of
+  the plain closing batch. Nothing else can restore that entry for a price-aggregated market: only a
+  `Clear`-led batch from the serving path does, a book that stays `Ready` never re-installs, and the peer's
+  install is dropped by the gate — so on the live Oregon bridge one event past the replay cap took UNI
+  off every new subscriber for 2 h 12 min while the bridge held a correct book (2026-09-24). Before
+  this, only two things released such a market mid-era, both incidental: an entire-side `BookClear` of
+  both sides in one event from the serving path, or that path's book gapping and re-installing while
+  no healthy peer exists (so no transfer happens). The four routes
+  (the cap, a transfer onto an incomplete accumulator, eviction, a reset) all recover here at the
+  serving path's next close while its book is `Ready`; one that is not `Ready` hands the market to a
+  healthy peer or re-installs at its next rotation. Asked **only at a close**, never at a mid-event
+  datagram end, or the republish would go out `last: true` holding an intermediate book. It also runs
+  the shared `SeqTracker` per
+  publisher on the **market-data role only** and drops a `SeqCheck::Stale` datagram whole, as
+  `TobProcessor` does: a stale datagram's deltas are refused as duplicates anyway, but a
+  `BatchBoundary` carries no sequence of its own, so an old one moves `last_batch` backwards and
+  closes every open event at a slot the venue has left — committing each consumer's buffer mid-event.
+  ⚠️ Independently of that check, a boundary naming a slot the channel has **already committed** does
+  not move `last_batch`: the high-water stands and `batch_id` goes absent until the publisher passes
+  it (`dz_mbp_slot_regressions_total`, `ChannelBatching::slot_regressed`), because PROTOCOL.md
+  promises a consumer's committed slot never moves backwards within an era and carrying the
+  high-water forward instead would claim a slot the batch's content is older than. A price-bounded `BookClear` publishes the **exact levels it removed** (reported by
   `PriceBook::on_delta` through a reused buffer): the wire `Clear` carries no price bound, so a
   whole-side clear would tell the consumer to drop levels this book still holds. Its
   `ManifestSummary`/`InstrumentDefinition` branches are `handle_refdata`-gated exactly like the three
@@ -736,6 +813,39 @@ Modules are grouped by role under `src/`:
   resulting quantity, so `Action` never gates the apply (quantity alone decides) and the
   `Add`/`Cancel`/`Execute` vocabulary does not apply. Reports the levels a `BookClear` removed through
   a caller-supplied buffer, since the wire `Clear` has no price bound.
+  ⚠️ **Once `Ready`, a book declines every rotation for the rest of the publisher era** — each one is
+  captured behind the deltas it has applied — so the group that *installed* is the book, permanently.
+  That is fine until a publisher restart, whose new era's first rotation is served from a book the
+  publisher is still refilling: the short install then pins, and is republished to every consumer and
+  into the WS bootstrap as a **complete** `Clear`-led re-baseline. `on_snapshot_begin` therefore
+  re-anchors (`force_resync`, `BeginOutcome::Resynced`, `dz_mbp_reanchor_total{reason="short_book"}`)
+  when **two** declined rotations claim completeness (`depth_bound == 0`) and declare materially
+  more levels than the book holds. ⚠️ **One rotation is not evidence**: a book that legitimately
+  *shrank* since a rotation was captured — a whole-side `BookClear`, or enough deletes past that
+  rotation's `last_instrument_seq` — is indistinguishable from a short install by shortfall alone,
+  and the rotation *after* such a clear is captured post-clear and declares the true smaller total,
+  which clears the strike. The two strikes are keyed on `snapshot_id`, because a multicast wire
+  redelivers datagrams routinely and one rotation must never be its own confirmation. ⚠️ **"Two"
+  means two complete rotations with no agreeing one in between, not two in a row on the wall
+  clock** — a bounded rotation returns before the strike is read, so nothing expires it by elapsed
+  time and a strike armed an hour ago can still be confirmed. Deliberate: the evidence does not
+  rot, and acting on stale evidence costs the same single bounded failover as acting on fresh
+  evidence. ⚠️ **The triggering rotation cannot install itself**: `on_snapshot_end`
+  takes `last_applied_instrument_seq` from the group, which is behind what a `Ready` book applied, and
+  the deltas in between were *applied* rather than buffered — so `replay` would gap and drop the book.
+  Bridging that needs a rolling per-book buffer of applied deltas; instead the repair is deferred one
+  rotation (~18.5 s measured on Phoenix), with `serves_a_book()` false meanwhile so the existing health
+  override hands the market to the peer. **"Materially" is a jitter bound, not an acceptance of a short
+  book**: the shortfall must exceed both 8 levels and 10% of the declared total, against the 1–3% a
+  rotation captured a few hundred ms early shows on a ~550-level book — every shortfall under it is
+  still recorded on `dz_mbp_declined_rotation_shortfall_levels`, because completeness is the
+  publisher's own claim and a short complete-flagged group is a publisher defect, not something to
+  tolerate silently. `total_levels` is wire-supplied and unauthenticated and can now take a market out
+  of `Ready`, so three things bound it and their **order inside `on_snapshot_begin` is load-bearing**:
+  `MAX_LEVELS_PER_BOOK` and the `required_anchor_seq` check run first, a bounded group never triggers
+  it at all, and `REANCHOR_MIN_INTERVAL_NS` (60 s, longer than one rotation) allows one per book.
+  `on_snapshot_end`'s success path is the **only** place `Ready` is entered and so the only place
+  the strike has to be cleared.
 - **`ingest/subscriber.rs`** — `RefDataState<D>`, the reference-data state machine, **generic over** any
   instrument-definition type implementing `InstrumentDef` (its id + manifest seq), so all three
   protocols reuse it. Collects definitions tagged with the latest `ManifestSummary` seq; `ready()`
@@ -755,10 +865,82 @@ Modules are grouped by role under `src/`:
   work. On connect it replays the instrument snapshot (precision first) **then the latest
   `depth` per symbol and each market's accumulated `book` re-baseline** (both full state, the `book` one
   materialized from the serving path's `BookAccumulator` and scoped by the `channel` filter dimension like
-  every other dimension), then streams quotes/trades/midpoints/depth/book. Replay is one
-  `replay_scoped()` used twice: unfiltered on connect (no subscriptions yet), then per `subscribe`
-  scoped to the filter just added, so a client that narrows after connecting is bootstrapped without
-  replaying every market. Implements the
+  every other dimension), then streams quotes/trades/midpoints/depth/book. ⚠️ **A market the
+  bootstrap skips is withheld from that client until its accumulator is whole again**
+  (`WithheldMarkets`): one accumulated partway holds only what moved since, and one **mid-event**
+  has batches buffered behind their `last` that are in no bootstrap and — if they were broadcast
+  before this client's `rx` subscribed — in no queue either, so applying what does arrive leaves the
+  untouched levels at invented values. ⚠️ **What releases it is the market's next *completed event*,
+  never its next producer re-baseline.** `withheld_bootstrap` re-reads the accumulator on every
+  frame for that market and on a 1 Hz sweep (a market that goes quiet mid-event produces no frame to
+  carry the check, and is the one whose bootstrap the client cannot get any other way), and sends
+  the bootstrap the join owed the moment `baselined() && pending_empty()` holds — under a second,
+  where a re-baseline is one or two an hour. Releasing on the re-baseline was #163's own rule and it
+  left a fresh subscriber with no book at all for a live market on 5 of 8 joins against the Oregon
+  bridge, quotes and trades flowing throughout. The wait is bounded by
+  `BOOTSTRAP_RELEASE_DEADLINE` (5 s, a `WsConfig` field so a test can collapse it): past it the
+  client is bootstrapped from the last complete state anyway and the open event's earlier batches
+  are lost to it (`dz_ws_bootstrap_withheld_total{release="deadline"}`). ⚠️ **A market with no
+  complete book anywhere in this process is never released, deadline included** — there is nothing
+  honest to send, and dark beats a book that claims to be whole. ⚠️ **Out of scope is not
+  withheld** (`Withheld::OutOfScope`): a market the unfiltered connect replay withheld and a later
+  `subscribe` narrowed away is owed nothing, so it leaves the list — conflating the two kept it
+  there for the life of the connection, charging every frame to
+  `dz_ws_frames_dropped_total{reason="awaiting"}` and holding the 1 Hz sweep on the shared
+  `BookSnapshot` mutex for it. The pairing that makes dropping it safe is that **`unsubscribe` runs
+  the `Replay::Books` bootstrap for what comes back into scope**, exactly as `subscribe` does for
+  what enters it: a widening onto a market with neither a bootstrap nor a withhold is the
+  invented-levels corruption again. ⚠️ **A replayed market
+  records a per-client watermark and every `replay_scoped()` call takes one**, because `rx` is
+  subscribed in the accept loop and the caches are read after the handshake, so the frames in
+  between are queued *behind* a bootstrap that already holds them — harmless on full-state
+  `quote`/`depth`, permanent corruption on the incremental `book`/`order_book`, which is the
+  backwards-walking book Ellipsis measured against Phoenix. The watermark is
+  `BookAccumulator::wire_ts_ns`, the newest `recv_ts_ns` the accumulator has **folded**: a batch
+  still awaiting its `last` is not in what `to_book` materializes, so counting it would drop the
+  batches the bootstrap is missing. ⚠️ **The gate is strictly `<` and a tie must be forwarded** —
+  one datagram straddling a `BatchBoundary` emits two batches for a market at that datagram's one
+  stamp, and only the first folds, so `<=` would drop the second and the next boundary would
+  deliver its `last` over a buffer missing those changes. Re-delivering a tie is free: a change
+  carries an absolute size and the bootstrap ends at the last folded batch of the tie set. Moving
+  the subscribe after the snapshot instead trades the overlap for a gap and is the worse bug.
+  ⚠️ **The only thing a watermark may drop is the queued prefix that predates the bootstrap**, so it
+  is *spent* by the first frame that passes it — broadcast order is wire order, so everything after
+  that frame is newer than the bootstrap whatever its stamp says — and expires at
+  `BOOTSTRAP_RELEASE_DEADLINE` regardless. Both rules exist because the stamp is a wall clock:
+  every book frame carries `now_ns()` (the datagram's, or the materializing read for the arbiter's
+  synthesized re-baselines), so a backwards host-clock step is all it takes for a watermark to sit
+  above the whole live feed and take that market off a client for the life of the connection. The
+  drops are `dz_ws_frames_dropped_total{reason="watermark"}`, the withheld ones `reason="awaiting"`. Replay is one
+  `replay_scoped()` used three times, and `Replay::{Full,Books}` is what says how much of it goes out:
+  **`Full`** on connect (unfiltered — no subscriptions yet) and per `subscribe` (scoped to the filter
+  just added, so a client that narrows after connecting is bootstrapped without replaying every
+  market), **`Books`** to repair a lagging client. That split is the #149 fix and it is a
+  self-healing argument, not a cost saving: `quote`/`depth` are full state and correct themselves on
+  the next message, and an `instrument` lost under backpressure is re-announced on the next refdata
+  burst — which is the whole reason `INSTRUMENT_REANNOUNCE_NS` is a rate limit and not a latch — so
+  the only product a drop can permanently corrupt is the incremental `book`/`order_book`. Replaying
+  the catalog instead wrote O(catalog) into a client that was *already* behind, blocking the very
+  recv loop whose stall caused the lag, so the repair re-armed the lag that asked for it and the
+  connection converged on replaying: measured at 144k frames/s of which 99.86% were `instrument`, with
+  every surviving book message a re-baseline whose following levels never arrived, and `/v1/status`
+  timing out behind the catalog clone that replay takes under the shared instrument mutex. The repair
+  is also **paced** per client (`WsConfig::lag_repair_min_interval`, defaulted from
+  `LAG_REPAIR_MIN_INTERVAL` — the same trade `sinks::hyperliquid`'s `REBOOTSTRAP_MIN_INTERVAL`
+  prices; a field rather than a bare constant so a test can collapse the window and prove a
+  *coalesced* lag is still discharged, which is the half a predicate test cannot reach), measured
+  from the **end** of the previous repair so the pace bounds the duty cycle and not merely the count and a lag inside the window is *owed*, not
+  dropped — `lag_repair_ready` holds it and the top of the client loop discharges it once the window
+  passes, so a client lagging faster than it can be repaired still ends up with a correct book without
+  ever driving a replay loop. A repair is only owed to a client that can actually receive a book
+  (`lag_repair_reaches`): `type` is the one filter dimension that rules the product out wholesale —
+  `venue`/`symbol`/`channel` narrow *which* markets are repaired, possibly to none — and what that
+  spares a `{"type":"quote"}` subscriber is the market scan itself, taken under the mutex the ingest
+  emit path shares, not the frames (its filter would have excluded every one).
+  `dz_ws_lag_repairs_total` against `dz_ws_client_lagged_total` is what shows the pace working — it
+  counts the repair **pass**, never the re-baselines the pass wrote, because a pass whose filters
+  match no baselined market (every pass, where no feed carries books) sends nothing and the pace is
+  still the thing being read. Implements the
   PROTOCOL.md v1 surface: optional per-client subscribe/unsubscribe filtering (empty filter list =
   firehose) over four dimensions — `venue` (case-insensitive), `symbol`, `channel` and message
   `type` — through **one** `SubFilter::matches` that both the symbol-bearing and the venue-level
@@ -829,6 +1011,10 @@ Modules are grouped by role under `src/`:
   A lagging client is re-bootstrapped on `l4Book` at most once per `REBOOTSTRAP_MIN_INTERVAL`, since
   that frame is the most expensive the sink produces and is what makes a struggling client lag again;
   a second gap inside the window ends the connection.
+- **`sinks/api.rs`**'s `/v1/products` rows carry `book_complete` (the replay entry's `baselined()`,
+  absent for a market with no book), read off the same `BookSnapshot` lookup `feed_kind` already makes.
+  It is the one place a market withheld from every new WebSocket subscriber shows without the
+  metrics endpoint, which is off by default: `status` is venue-level and reads `online` throughout.
 - **`sinks/api.rs`**'s `GET /v1/status` carries four accounting blocks beyond per-venue
   `online`/`offline`: `registry` (which feed-registry document this process resolved — a URL, a
   bind-mounted file path, or `"built-in"` — its `version`, and its row/receiver counts; the identical
@@ -896,14 +1082,15 @@ Modules are grouped by role under `src/`:
   all. That last property is what `GET /admin/diagnostics` rests on.
 - **`model.rs`** — wire types (`NormalizedQuote`/`NormalizedTrade`/`NormalizedMidpoint`/
   `NormalizedDepth`/`NormalizedBook`/`NormalizedInstrument`, the `FeedMessage` tagged enum) and the
-  `now_ns()` / `now_mono_ns()` clocks. `InstrumentSnapshot` is keyed by
-  **`(venue, channel, instrument_id)`** and `BookSnapshot` by that **prefixed with the arbitration
-  scope** (`(venue, category, channel, instrument_id)` — exactly `authority::MarketKey`) — a
+  `now_ns()` / `now_mono_ns()` clocks. Per-source state is keyed by `SourceKey` (Source ID plus its
+  label; IDs past the unregistered cap share one key), never the name alone. `InstrumentSnapshot`
+  and `BookSnapshot` are keyed **`(SourceKey, category, channel, instrument_id)`** — exactly
+  `authority::MarketKey` — a
   market-by-price `symbol` is a truncated display label
   that collides across markets (confirmed against a real capture — two distinct instrument_ids
   sharing one truncated symbol, see `tests/fixtures/PROVENANCE.md`), so it is not an identity; a
-  `(venue, symbol)`-keyed map would have the second market's insert silently destroy the first's
-  entry. `DepthSnapshot` (Market-by-Order only) is still keyed **`(venue, symbol)`** — unconfirmed
+  `(source, symbol)`-keyed map would have the second market's insert silently destroy the first's
+  entry. `DepthSnapshot` (Market-by-Order only) is still keyed **`(SourceKey, symbol)`** — unconfirmed
   whether that feed's own truncated symbols can collide the same way; not addressed here.
   `NormalizedBook` is the **incremental** counterpart of `depth`: a batch of `BookChange`s with
   absolute per-level sizes, where a re-baseline is structurally `changes[0].action == Clear` (the
@@ -927,7 +1114,15 @@ Modules are grouped by role under `src/`:
   `order_id == 0` and clears that side of **both** populations — routing it by id would leave every order
   of a re-baselined-away book resting in the replay map forever. Its pending-change cap now bounds only an event still awaiting its
   `last` — a terminated batch folds whatever its size, or a 44k-order snapshot install could never
-  baseline. `BookSnapshot`
+  baseline. ⚠️ The cap is **reachable by real markets** (it counts changes, not levels: Phoenix UNI
+  carried 8,204 in one slot over ~2,800 levels), and overflowing it un-baselines the entry, which the
+  serving MBP path then republishes at its next close (see `MbpProcessor` above). Every write of a
+  replay entry reports its completeness transition to `Arbiter::note_bootstrap`, which drives the only
+  market-labelled series, `dz_book_bootstrap_lost_total`/`dz_book_bootstrap_withheld` — label sets
+  capped, since a forged path's first batch for an invented market is enough to withhold it: the
+  gauge by markets withheld **at once** (`MAX_LABELLED_WITHHELD_MARKETS`, pruned and its series
+  removed on release), the counter by distinct markets **ever** (`MAX_LABELLED_LOST_MARKETS`, never
+  pruned, since removing a counter's series resets it and breaks `rate()`). `BookSnapshot`
   holds a `BookAccumulator` per market rather than the last message, because an incremental product's
   last batch bootstraps nothing — it accumulates what a consumer would and materializes a clear plus
   the full level set on demand. It commits per *logical event* (buffering until `last`), since
@@ -935,7 +1130,7 @@ Modules are grouped by role under `src/`:
   it is honest about completeness only while `baselined` holds. The arbiter's `Book` branch is the
   single-path
   authority gate (`ingest/authority.rs`), which owns both this replay map and its own per-path
-  accumulators; `MbpProcessor` emits `book`, and the `edge-kalshi-perps-mbp` row selects it on a live group.
+  accumulators; `MbpProcessor` emits `book`, selected by the `edge-kalshi-perps-mbp` and `edge-phoenix-mbp` rows on live groups.
   `NormalizedInstrument` carries the same `(channel, instrument_id)` identity pair as `NormalizedBook`,
   so a consumer joins a book to its precision on the identity rather than the colliding `symbol`; the
   arbiter's definition rate limit keys on that triple for the same reason.
