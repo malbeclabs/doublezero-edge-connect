@@ -153,7 +153,7 @@ where
     Ok(())
 }
 
-/// True if the `(venue, symbol)` instrument is already in the shared snapshot, so a price emitted for
+/// True if the `(source_id, symbol)` instrument is already in the shared snapshot, so a price emitted for
 /// it carries known precision (precision before price). The snapshot is populated by the edge side
 /// only once it has revealed that instrument's Source ID (see `ingest::processor`'s deferral), so
 /// this stays closed for an instrument the edge has never once gone live for — a cold start, not a
@@ -168,10 +168,13 @@ where
 /// 100,000 calls in ~339ms, ~3.4µs/call. That is negligible next to this caller's own per-frame
 /// JSON decode (called once per public WS text frame, for two venues), so no secondary
 /// `HashSet<(venue, symbol)>` is added.
-pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &str) -> bool {
+///
+/// Matched on the input's own Source ID, not its name: several IDs may share a name, and a trade
+/// built here is stamped with this one.
+pub fn instrument_known(instruments: &InstrumentSnapshot, source_id: u16, symbol: &str) -> bool {
     crate::model::lock(instruments)
         .values()
-        .any(|i| i.venue.as_ref() == venue && i.symbol.as_ref() == symbol)
+        .any(|i| i.source_id == source_id && i.symbol.as_ref() == symbol)
 }
 
 /// Resolve the `(channel, instrument_id)` identity a trade built here must carry, from the same
@@ -187,18 +190,19 @@ pub fn instrument_known(instruments: &InstrumentSnapshot, venue: &str, symbol: &
 /// it can never drift out of step with an `upsert_instrument`/`remove_instrument` the way a
 /// separately-maintained symbol→identity map would.
 ///
-/// First match wins. Safe here because neither venue this module backstops presents one symbol under
+/// Scoped to the input's own Source ID for the same reason as [`instrument_known`]. Within it, first
+/// match wins. Safe here because neither venue this module backstops presents one symbol under
 /// two different `(channel, instrument_id)` pairs the way a price-aggregated venue's mirrored paths
 /// do (see `history::Key`'s docs) — if a public backstop ever grew a mirrored-path venue of its own,
 /// this would need the same disambiguation `products::resolve` applies instead of a bare first match.
 pub fn resolve_instrument(
     instruments: &InstrumentSnapshot,
-    venue: &str,
+    source_id: u16,
     symbol: &str,
 ) -> Option<(u8, u32)> {
     crate::model::lock(instruments)
         .values()
-        .find(|i| i.venue.as_ref() == venue && i.symbol.as_ref() == symbol)
+        .find(|i| i.source_id == source_id && i.symbol.as_ref() == symbol)
         .map(|i| (i.channel, i.instrument_id))
 }
 
@@ -220,6 +224,45 @@ pub fn finite_non_negative(v: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog(entries: &[(u16, &str, u32)]) -> InstrumentSnapshot {
+        let mut map = std::collections::HashMap::new();
+        for &(source_id, symbol, instrument_id) in entries {
+            let i = crate::model::NormalizedInstrument {
+                tick_size: 0,
+                venue: "SHARED".into(),
+                source_name: "SHARED".into(),
+                source_id,
+                symbol: symbol.into(),
+                channel: 0,
+                instrument_id,
+                category: "c".into(),
+                price_exponent: -2,
+                qty_exponent: -2,
+            };
+            map.insert(
+                (
+                    crate::model::SourceKey::of(&i),
+                    i.category.clone(),
+                    0,
+                    instrument_id,
+                ),
+                i,
+            );
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(map))
+    }
+
+    /// A backstop stamps one fixed Source ID, so it must only match that ID's instruments: another
+    /// ID under the same name is a different engine.
+    #[test]
+    fn lookups_are_scoped_to_the_inputs_own_source_id() {
+        let snap = catalog(&[(4, "A", 1), (10, "dex:A", 2)]);
+        assert!(instrument_known(&snap, 4, "A"));
+        assert!(!instrument_known(&snap, 4, "dex:A"));
+        assert_eq!(resolve_instrument(&snap, 10, "dex:A"), Some((0, 2)));
+        assert_eq!(resolve_instrument(&snap, 4, "dex:A"), None);
+    }
 
     #[test]
     fn parse_decimal_rejects_non_finite_and_negative() {

@@ -664,6 +664,7 @@ async fn main() -> Result<()> {
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
         a.set_depth_replay(depth.clone());
         a.set_book_replay(books.clone());
+        a.set_instrument_catalog(instruments.clone());
         a.set_authority(
             authority_cfg,
             args.arb_match_window_secs.saturating_mul(1_000_000_000),

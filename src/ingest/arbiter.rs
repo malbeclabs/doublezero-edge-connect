@@ -55,8 +55,8 @@ use crate::{
     metrics::metrics,
     model::{
         self, category_arc, now_mono_ns, now_ns, BookAccumulator, BookAction, BookChange,
-        BookSnapshot, DepthSnapshot, FeedMessage, NormalizedBook, NormalizedDepth, NormalizedQuote,
-        NormalizedTrade, ReplayScope, SourceKey,
+        BookSnapshot, DepthSnapshot, FeedMessage, InstrumentSnapshot, NormalizedBook,
+        NormalizedDepth, NormalizedQuote, NormalizedTrade, ReplayScope, SourceKey,
     },
 };
 
@@ -1362,6 +1362,13 @@ impl<K: Eq + Hash + Clone, V: Eq + Hash + Copy, P: Eq + Copy> WindowedDedup<K, V
     }
 }
 
+/// The paths serving one market under its Source ID, and whether an instrument has moved off that
+/// ID while they still did: `Some(symbol)` is a purge owed once the last of them leaves.
+struct SourcePaths {
+    paths: HashSet<Transport>,
+    released: Option<Option<Arc<str>>>,
+}
+
 /// The shared emit stage: owns the broadcast `Sender` plus the dedup state, and exposes one
 /// `emit(msg, publisher)` entry point every ingest input funnels through. Quotes pass through the
 /// per-`(source, symbol)` latch-to-leader [`StalenessFloor`] (keyed on [`QuoteId`], `P = Transport`),
@@ -1403,6 +1410,9 @@ pub struct Arbiter {
     /// (the session-reset escape hatch), so a client connecting across a session boundary is not
     /// replayed the ended session's final book — see those methods' docs.
     depth_replay: Option<DepthSnapshot>,
+    /// The shared instrument catalog, so a Source ID purge drops the old ID's definition together
+    /// with its depth and book, never before them (see [`Self::release_source_market`]).
+    instrument_catalog: Option<InstrumentSnapshot>,
     /// Last broadcast content per `(source, channel, instrument_id)` plus the monotonic time it went
     /// out, so mirrored publishers' identical definition bursts collapse to one wire message while
     /// the content is still re-announced every [`INSTRUMENT_REANNOUNCE_NS`]. Keyed on the identity
@@ -1478,6 +1488,10 @@ pub struct Arbiter {
     book_sync: HashMap<MarketKey, HashMap<Transport, PeerState>>,
     /// Per order-level market, the raced order events (see [`MarketEvents`]). Same bound and eviction.
     book_events: HashMap<MarketKey, MarketEvents>,
+    /// Which paths have revealed each market under its Source ID, across every receiver, so an
+    /// instrument moving off an ID purges that ID's state only once no path still serves it.
+    /// Bounded like `book_markets`; a market past the bound is untracked and purges on release.
+    source_paths: HashMap<MarketKey, SourcePaths>,
     /// Per `(source, category, channel)` venue clock — the frontier the resurrection guard admits and
     /// forgets on. Bounded by [`MAX_CHANNEL_CLOCKS`], oldest first, with `channel_clock_order` as the
     /// eviction queue.
@@ -1736,6 +1750,7 @@ impl Arbiter {
             trades: WindowedDedup::new(trade_window),
             depths: StalenessFloor::new(DEPTH_TICK_CAP),
             depth_replay: None,
+            instrument_catalog: None,
             instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
             modes: HashMap::new(),
@@ -1753,6 +1768,7 @@ impl Arbiter {
             book_lost_labelled: HashSet::new(),
             book_sync: HashMap::new(),
             book_events: HashMap::new(),
+            source_paths: HashMap::new(),
             channel_clocks: HashMap::new(),
             channel_clock_order: VecDeque::new(),
             guard: GuardBudget::default(),
@@ -1843,6 +1859,23 @@ impl Arbiter {
                 paths.remove(&publisher);
             }
         }
+        self.forget_publisher_sources(category, publisher);
+    }
+
+    /// A book receiver of `category` exited: `publisher` no longer serves any market it revealed
+    /// there, so each release waiting on it is carried out ([`Self::forget_source_path`]). The only
+    /// half of [`Self::forget_publisher_books`] a Market-by-Price exit runs, since it holds no
+    /// order-level standing.
+    pub fn forget_publisher_sources(&mut self, category: &str, publisher: Transport) {
+        let markets: Vec<MarketKey> = self
+            .source_paths
+            .keys()
+            .filter(|key| key.1.as_ref() == category)
+            .cloned()
+            .collect();
+        for market in markets {
+            self.forget_source_path(&market, publisher);
+        }
     }
 
     /// Install the `--arb-*` arbitration tunables: the single-path authority config, and the cross-path
@@ -1904,6 +1937,11 @@ impl Arbiter {
     /// broadcast but maintains no replay snapshot.
     pub fn set_depth_replay(&mut self, depth: DepthSnapshot) {
         self.depth_replay = Some(depth);
+    }
+
+    /// Wire the shared instrument catalog, which a Source ID purge also clears.
+    pub fn set_instrument_catalog(&mut self, instruments: InstrumentSnapshot) {
+        self.instrument_catalog = Some(instruments);
     }
 
     /// The pre-resolved metric children for `venue`, created on first use.
@@ -2116,6 +2154,71 @@ impl Arbiter {
         self.reset_books_for_markets(std::slice::from_ref(key));
     }
 
+    /// Record that `path` revealed `market` under its Source ID. A path serving the market again
+    /// withdraws an earlier release.
+    pub(crate) fn note_source_path(&mut self, market: &MarketKey, path: Transport) {
+        if let Some(entry) = self.source_paths.get_mut(market) {
+            entry.paths.insert(path);
+            entry.released = None;
+        } else if self.source_paths.len() < MAX_BOOK_MARKETS {
+            self.source_paths.insert(
+                market.clone(),
+                SourcePaths {
+                    paths: HashSet::from([path]),
+                    released: None,
+                },
+            );
+        }
+    }
+
+    /// An instrument moved off `market`'s Source ID on `releasing`: drop that ID's definition and
+    /// book, and the `symbol` depth floor and replay when given, unless another path still serves it
+    /// there, in which case the purge waits for the last of them to leave
+    /// ([`Self::forget_source_path`]).
+    /// Decided here because the arbiter sees every receiver's paths; one processor sees only its own.
+    pub(crate) fn release_source_market(
+        &mut self,
+        market: &MarketKey,
+        symbol: Option<&str>,
+        releasing: Transport,
+    ) {
+        if let Some(entry) = self.source_paths.get_mut(market) {
+            entry.paths.remove(&releasing);
+            if !entry.paths.is_empty() {
+                entry.released = Some(symbol.map(Arc::from));
+                return;
+            }
+            self.source_paths.remove(market);
+        }
+        self.purge_source_market(market, symbol);
+    }
+
+    /// `path` no longer carries `market` at all — its receiver exited, its processor dropped the
+    /// instrument, or the channel left. Purges the ID's state if a release was waiting on this path.
+    pub(crate) fn forget_source_path(&mut self, market: &MarketKey, path: Transport) {
+        let Some(entry) = self.source_paths.get_mut(market) else {
+            return;
+        };
+        entry.paths.remove(&path);
+        if !entry.paths.is_empty() {
+            return;
+        }
+        let released = self.source_paths.remove(market).and_then(|e| e.released);
+        if let Some(symbol) = released {
+            self.purge_source_market(market, symbol.as_deref());
+        }
+    }
+
+    fn purge_source_market(&mut self, market: &MarketKey, symbol: Option<&str>) {
+        if let Some(catalog) = &self.instrument_catalog {
+            model::lock(catalog).remove(market);
+        }
+        if let Some(symbol) = symbol {
+            self.reset_depth_floor_for_symbol(&market.0, symbol, "source_id_changed");
+        }
+        self.reset_books_for_markets(std::slice::from_ref(market));
+    }
+
     /// The single expression of the **three-way drop**: the per-path accumulators (`book_markets`),
     /// the shared replay entry and `StickyAuthority`'s `last_admitted`, for a batch of keys —
     /// [`Self::reset_book_for_market`] is one key through
@@ -2133,7 +2236,7 @@ impl Arbiter {
     /// channel's markets (the common floor-narrowing case: a handful of channels admitted out of
     /// dozens) would otherwise stall the **one arbiter mutex**, and therefore all ingest, for tens
     /// of milliseconds to seconds.
-    fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
+    pub(crate) fn reset_books_for_markets(&mut self, keys: &[MarketKey]) {
         if keys.is_empty() {
             return;
         }
@@ -2683,6 +2786,8 @@ impl Arbiter {
             |k: &ChannelKey| k.0.name() == venue && k.1.as_ref() == category && k.2 == channel;
         self.channel_clocks.retain(|k, _| !in_channel(k));
         self.channel_clock_order.retain(|k| !in_channel(k));
+        self.source_paths
+            .retain(|k, _| !(k.0.name() == venue && k.1.as_ref() == category && k.2 == channel));
         dropped
     }
 
@@ -4382,6 +4487,104 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![1]);
+    }
+
+    /// Releasing an ID purges its state only once no path still serves it; a peer whose receiver
+    /// exits stops holding it.
+    #[test]
+    fn a_released_id_is_purged_once_no_path_serves_it() {
+        let (a_path, b_path) = (
+            Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+        );
+        let (tx, _rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
+        let mut d = depth(1000, vec![[100.0, 1.0]], vec![]);
+        d.source_id = 1;
+        d.venue = "SHARED".into();
+        d.source_name = "SHARED".into();
+        a.emit(FeedMessage::Depth(d), a_path, TEST_CATEGORY);
+        let market: MarketKey = (
+            SourceKey::new(1, "SHARED".into()),
+            TEST_CATEGORY.into(),
+            0,
+            0,
+        );
+        let entry = (SourceKey::new(1, "SHARED".into()), Arc::<str>::from("BTC"));
+        a.note_source_path(&market, a_path);
+        a.note_source_path(&market, b_path);
+
+        a.release_source_market(&market, Some("BTC"), a_path);
+        assert!(
+            model::lock(&replay).contains_key(&entry),
+            "the peer still serves it"
+        );
+        a.release_source_market(&market, Some("BTC"), b_path);
+        assert!(
+            !model::lock(&replay).contains_key(&entry),
+            "no path serves it any more"
+        );
+    }
+
+    /// A release that waited on a peer is carried out when that peer's receiver exits, and takes
+    /// the old ID's catalog entry with it. A peer leaving a market nobody released purges nothing.
+    #[test]
+    fn a_waiting_release_is_purged_when_the_last_path_exits() {
+        let (a_path, b_path) = (
+            Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            Transport::Edge(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+        );
+        let (tx, _rx) = broadcast::channel(64);
+        let replay: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let catalog: InstrumentSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut a = Arbiter::new(tx, 8);
+        a.set_depth_replay(replay.clone());
+        a.set_instrument_catalog(catalog.clone());
+        let source = SourceKey::new(1, "SHARED".into());
+        let entry = (source.clone(), Arc::<str>::from("BTC"));
+        let market = |iid: u32| -> MarketKey { (source.clone(), TEST_CATEGORY.into(), 0, iid) };
+        for iid in [0, 1] {
+            let mut d = depth(1000, vec![[100.0, 1.0]], vec![]);
+            d.source_id = 1;
+            d.venue = "SHARED".into();
+            d.source_name = "SHARED".into();
+            a.emit(FeedMessage::Depth(d), a_path, TEST_CATEGORY);
+            model::lock(&catalog).insert(
+                market(iid),
+                crate::model::NormalizedInstrument {
+                    venue: "SHARED".into(),
+                    source_name: "SHARED".into(),
+                    source_id: 1,
+                    symbol: "BTC".into(),
+                    channel: 0,
+                    instrument_id: iid,
+                    category: TEST_CATEGORY.into(),
+                    price_exponent: -2,
+                    qty_exponent: -2,
+                    tick_size: 1,
+                },
+            );
+            a.note_source_path(&market(iid), a_path);
+            a.note_source_path(&market(iid), b_path);
+        }
+
+        a.release_source_market(&market(0), Some("BTC"), a_path);
+        assert!(
+            model::lock(&catalog).contains_key(&market(0)),
+            "the peer still serves it"
+        );
+        a.forget_publisher_books(TEST_CATEGORY, b_path);
+        assert!(
+            !model::lock(&catalog).contains_key(&market(0)),
+            "the released market's definition goes with the last path"
+        );
+        assert!(!model::lock(&replay).contains_key(&entry), "and its depth");
+        assert!(
+            model::lock(&catalog).contains_key(&market(1)),
+            "a market nobody released is left alone"
+        );
     }
 
     /// The floor resets purge the matching WS-replay entries: a client connecting across a

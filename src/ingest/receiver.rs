@@ -166,8 +166,7 @@ impl DatagramCtx<'_> {
     /// attempted to emit, a Source-ID fact, independent of whether the arbiter's dedup floor
     /// later broadcasts that particular copy.
     pub fn emit(&self, msg: FeedMessage) {
-        let (wire_venue, _) = msg.venue_symbol();
-        record_revealed(self.venue, wire_venue);
+        record_revealed(self.venue, msg.source_id());
         lock(self.arbiter).emit(msg, Transport::Edge(self.publisher), self.category);
     }
 }
@@ -195,7 +194,7 @@ impl DatagramCtx<'_> {
 /// A `BTreeSet` inner value (not `HashSet`) so [`revealed_venues_for`]'s iteration order — and so
 /// the order `emit_status` sends multiple `FeedStatus` messages on a multi-venue edge — is
 /// deterministic rather than hash-order-dependent.
-type RevealedVenueMap = RwLock<HashMap<&'static str, BTreeSet<Arc<str>>>>;
+type RevealedVenueMap = RwLock<HashMap<&'static str, BTreeSet<u16>>>;
 static REVEALED_VENUES: OnceLock<RevealedVenueMap> = OnceLock::new();
 
 thread_local! {
@@ -206,61 +205,73 @@ thread_local! {
     /// second receiver task sharing the worker) just falls through to the global map once per new
     /// thread, not once per message. A plain (unsynchronized) cell is correct here because each OS
     /// thread only ever touches its own copy.
-    static LOCAL_REVEALED: RefCell<HashMap<&'static str, HashSet<Arc<str>>>> =
+    static LOCAL_REVEALED: RefCell<HashMap<&'static str, HashSet<u16>>> =
         RefCell::new(HashMap::new());
 }
 
-/// Record that feed row `venue` has emitted data under wire venue `wire_venue`, unless `wire_venue`
-/// is not itself a registered [`sources::source_id_of`] name. The wire is explicitly
-/// unauthenticated and this map never decays, so recording an unregistered/synthesized label (the
-/// `SOURCE_<id>` fallback `sources::source_label` produces for an unassigned id) would let one
-/// forged burst permanently seed phantom venues that every later edge for this row would then emit
-/// a `status` for — bounded by `sources::MAX_UNREGISTERED_SOURCES`, but still real, silent
-/// corruption of the wire `status` feed. Lock-free in the steady state; see [`LOCAL_REVEALED`].
-fn record_revealed(venue: &'static str, wire_venue: &str) {
+/// Record that feed row `venue` has emitted data under wire `source_id`, unless the registry assigns
+/// that ID no name. The wire is explicitly unauthenticated and this map never decays, so recording an
+/// unassigned ID would let one forged burst permanently seed phantom sources that every later edge
+/// for this row would then emit a `status` for. Lock-free in the steady state; see
+/// [`LOCAL_REVEALED`].
+fn record_revealed(venue: &'static str, source_id: u16) {
     let already_known = LOCAL_REVEALED.with(|local| {
         local
             .borrow()
             .get(venue)
-            .is_some_and(|set| set.contains(wire_venue))
+            .is_some_and(|set| set.contains(&source_id))
     });
     if already_known {
         return; // fully lock-free fast path: the steady-state common case
     }
-    if sources::source_id_of(wire_venue).is_none() {
-        return; // not a registered name: never recorded (see the doc above)
+    if sources::source_name(source_id).is_none() {
+        return; // not an assigned ID: never recorded (see the doc above)
     }
     let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
     if !map
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(venue)
-        .is_some_and(|set| set.contains(wire_venue))
+        .is_some_and(|set| set.contains(&source_id))
     {
         map.write()
             .unwrap_or_else(|e| e.into_inner())
             .entry(venue)
             .or_default()
-            .insert(Arc::from(wire_venue));
+            .insert(source_id);
     }
     LOCAL_REVEALED.with(|local| {
         local
             .borrow_mut()
             .entry(venue)
             .or_default()
-            .insert(Arc::from(wire_venue));
+            .insert(source_id);
     });
 }
 
-/// The wire venues recorded so far for feed row `venue` (see [`record_revealed`]), or an empty set
+/// The Source IDs recorded so far for feed row `venue` (see [`record_revealed`]), or an empty set
 /// if this row's receivers have not emitted any data yet.
-fn revealed_venues_for(venue: &str) -> BTreeSet<Arc<str>> {
+pub(crate) fn revealed_ids_for(venue: &str) -> BTreeSet<u16> {
     let map = REVEALED_VENUES.get_or_init(|| RwLock::new(HashMap::new()));
     map.read()
         .unwrap_or_else(|e| e.into_inner())
         .get(venue)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Which `(name, source_id)` pairs a status for row `venue` speaks for: every revealed ID, except
+/// one whose name is another row's own venue (that row reports itself).
+fn status_targets(
+    venue: &str,
+    ids: &BTreeSet<u16>,
+    label: impl Fn(u16) -> &'static str,
+    owns_row: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, u16)> {
+    ids.iter()
+        .map(|&id| (label(id), id))
+        .filter(|(name, _)| *name == venue || !owns_row(name))
+        .collect()
 }
 
 /// Protocol-specific datagram handling. Implementors own their decode (they know their datagram magic
@@ -301,8 +312,9 @@ struct ReceiverRegistration {
     arbiter: SharedArbiter,
     key: ReceiverKey,
     up_gauge: prometheus::IntGauge,
-    /// Source IP addresses this receiver has carried, so their book standing goes with it. Only Market-by-Order
-    /// receivers produce that standing, and a publisher host uses one IP, so this stays tiny.
+    /// Source IP addresses this receiver has carried, so their book standing and Source ID paths go
+    /// with it. Only the book kinds produce either, and a publisher host uses one IP, so this stays
+    /// tiny.
     publishers: Vec<IpAddr>,
 }
 
@@ -330,7 +342,11 @@ impl ReceiverRegistration {
     /// at the cap would let 256 forged datagrams stop a real publisher's standing being released on
     /// exit — the wedge this exists to close.
     fn note_publisher(&mut self, publisher: IpAddr) {
-        if self.key.2 != FeedKind::MarketByOrder || self.publishers.contains(&publisher) {
+        if !matches!(
+            self.key.2,
+            FeedKind::MarketByOrder | FeedKind::MarketByPrice
+        ) || self.publishers.contains(&publisher)
+        {
             return;
         }
         if self.publishers.len() >= MAX_PUBLISHERS {
@@ -358,7 +374,11 @@ impl Drop for ReceiverRegistration {
         if !self.publishers.is_empty() {
             let mut a = lock(arbiter);
             for &ip in &self.publishers {
-                a.forget_publisher_books(self.key.1, Transport::Edge(ip));
+                if self.key.2 == FeedKind::MarketByOrder {
+                    a.forget_publisher_books(self.key.1, Transport::Edge(ip));
+                } else {
+                    a.forget_publisher_sources(self.key.1, Transport::Edge(ip));
+                }
             }
         }
         self.health.deregister(self.key, |venue_up| {
@@ -401,11 +421,14 @@ fn emit_status(arbiter: &SharedArbiter, venue: &str, up: bool, stale_ms: u64) {
         .feed_stale_ms
         .with_label_values(&[venue])
         .set(stale_ms as i64);
-    for wire_venue in revealed_venues_for(venue) {
-        if wire_venue.as_ref() != venue && feeds().iter().any(|f| f.venue == wire_venue.as_ref()) {
-            continue; // that venue has its own row(s) and its own aggregate; it speaks for itself
-        }
-        let source_id = sources::source_id_of(wire_venue.as_ref()).unwrap_or(0);
+    let targets = status_targets(
+        venue,
+        &revealed_ids_for(venue),
+        sources::source_label,
+        |name| feeds().iter().any(|f| f.venue == name),
+    );
+    for (name, source_id) in targets {
+        let wire_venue = crate::model::venue_arc(name);
         // Status carries no business identity to dedup, so it goes straight to the broadcast sender
         // (the backbone carries `Arc<FeedMessage>`). Only fires on a down/ok edge, so the allocation
         // here is off the per-message hot path.
@@ -977,12 +1000,15 @@ pub async fn run_feed(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::{
+        collections::BTreeSet,
+        net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    };
 
     use super::{
-        datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_venues_for,
-        DatagramCtx, FeedMessage, PortRole, ReceiverRegistration, SeqCheck, SeqTracker,
-        SharedArbiter, SockaddrStorage,
+        datagram_src_ip, emit_status, init_feed_health, record_revealed, revealed_ids_for,
+        status_targets, DatagramCtx, FeedMessage, PortRole, ReceiverRegistration, SeqCheck,
+        SeqTracker, SharedArbiter, SockaddrStorage,
     };
     use crate::metrics::metrics;
 
@@ -1035,7 +1061,7 @@ mod tests {
     #[test]
     fn emit_status_reports_the_revealed_venue_with_its_registry_source_id() {
         let venue = "KALSHI";
-        record_revealed(venue, venue);
+        record_revealed(venue, 3);
         let (arbiter, mut rx) = test_arbiter();
         emit_status(&arbiter, venue, true, 0);
         match &*rx.try_recv().expect("a status was emitted") {
@@ -1049,35 +1075,52 @@ mod tests {
         }
     }
 
-    /// `record_revealed` is idempotent per `(venue, wire_venue)` pair and distinguishes rows.
+    /// Two IDs under one name each get their own status, carrying their own ID.
+    #[test]
+    fn ids_sharing_a_name_each_get_a_status() {
+        let label = |id: u16| {
+            if id == 4 || id == 10 {
+                "SHARED"
+            } else {
+                "OTHER"
+            }
+        };
+        let targets = status_targets("SHARED", &BTreeSet::from([4, 10]), label, |_| true);
+        assert_eq!(targets, vec![("SHARED", 4), ("SHARED", 10)]);
+    }
+
+    /// A revealed ID whose name owns another row speaks for itself, not through this row.
+    #[test]
+    fn a_revealed_id_owning_another_row_is_skipped() {
+        let label = |id: u16| if id == 1 { "ROW" } else { "ELSEWHERE" };
+        let targets = status_targets("ROW", &BTreeSet::from([1, 2]), label, |n| n == "ELSEWHERE");
+        assert_eq!(targets, vec![("ROW", 1)]);
+    }
+
+    /// `record_revealed` is idempotent per `(venue, source_id)` pair and distinguishes rows.
     #[test]
     fn record_revealed_is_idempotent_and_scoped_per_row() {
         let a = "RecordRevealedRowA";
         let b = "RecordRevealedRowB";
-        record_revealed(a, "HYPERLIQUID");
-        record_revealed(a, "HYPERLIQUID");
-        record_revealed(a, "PHOENIX");
-        record_revealed(b, "KALSHI");
-        let revealed_a = revealed_venues_for(a);
-        assert_eq!(revealed_a.len(), 2);
-        assert!(revealed_a.contains("HYPERLIQUID") && revealed_a.contains("PHOENIX"));
-        let revealed_b = revealed_venues_for(b);
-        assert_eq!(revealed_b.len(), 1);
-        assert!(revealed_b.contains("KALSHI"));
+        record_revealed(a, 1);
+        record_revealed(a, 1);
+        record_revealed(a, 2);
+        record_revealed(b, 3);
+        assert_eq!(revealed_ids_for(a), BTreeSet::from([1, 2]));
+        assert_eq!(revealed_ids_for(b), BTreeSet::from([3]));
     }
 
-    /// A wire label the registry does not resolve (`sources::source_id_of` returns `None` — the
-    /// synthesized `SOURCE_<id>` fallback for an unassigned Source ID, or plain garbage) is never
+    /// A Source ID the registry assigns no name (`sources::source_name` returns `None`) is never
     /// recorded: the wire is unauthenticated and this map never decays, so one forged burst would
     /// otherwise permanently seed a phantom venue that every later edge for this row emits a
     /// `status` for.
     #[test]
     fn record_revealed_ignores_unregistered_wire_labels() {
         let row = "RecordRevealedUnregisteredRow";
-        record_revealed(row, "SOURCE_54321");
-        record_revealed(row, "TotallyMadeUpVenue");
+        record_revealed(row, 54321);
+        record_revealed(row, 999);
         assert!(
-            revealed_venues_for(row).is_empty(),
+            revealed_ids_for(row).is_empty(),
             "unregistered labels must not be recorded"
         );
     }
@@ -1090,8 +1133,8 @@ mod tests {
         let row = "HYPERLIQUID";
         // This is a real `FEEDS` venue with its own rows — exactly the superset scenario
         // `feeds.rs`/`sources.rs` document for a superset group's Source-ID-3 traffic.
-        record_revealed(row, "HYPERLIQUID");
-        record_revealed(row, "KALSHI");
+        record_revealed(row, 1);
+        record_revealed(row, 3);
         let (arbiter, mut rx) = test_arbiter();
         emit_status(&arbiter, row, false, 1_234);
         match &*rx.try_recv().expect("the row's own venue still reports") {
@@ -1148,14 +1191,10 @@ mod tests {
             ws_send_ts_ns: 0,
         };
         ctx.emit(FeedMessage::Quote(quote));
-        let revealed = revealed_venues_for(row_venue);
-        assert!(
-            revealed.contains(wire_venue),
-            "ctx.emit must record the message's own venue, not the row's"
-        );
-        assert!(
-            !revealed.contains(row_venue),
-            "the feed row's static venue was never the message's own venue here"
+        assert_eq!(
+            revealed_ids_for(row_venue),
+            BTreeSet::from([2]),
+            "ctx.emit must record the message's own Source ID, not the row's"
         );
     }
 
@@ -1172,11 +1211,10 @@ mod tests {
         // scenario (`feeds.rs`) where a row's revealed set also picks up a DIFFERENT venue's
         // name, one with its own `FEEDS` rows and its own independent `FeedHealth` aggregate.
         let row_venue = "PHOENIX";
-        let foreign_venue = "KALSHI";
-        // Simulates this receiver's own `ctx.emit` calls having already resolved and emitted
-        // under both wire venues.
-        record_revealed(row_venue, row_venue);
-        record_revealed(row_venue, foreign_venue);
+        // Simulates this receiver's own `ctx.emit` calls having already emitted under this row's
+        // own ID (2) and a foreign venue's (3).
+        record_revealed(row_venue, 2);
+        record_revealed(row_venue, 3);
 
         let (arbiter, mut rx) = test_arbiter();
         let health = FeedHealth::new();
@@ -1247,6 +1285,74 @@ mod tests {
         assert!(
             lock(&tob).book_path_synced(&market, Transport::Edge(ip)),
             "a quote receiver's exit says nothing about its publisher's books"
+        );
+    }
+
+    /// A Market-by-Price receiver's exit releases the Source ID paths it revealed, so a release
+    /// waiting on it is carried out; a Top-of-Book receiver of the same host reveals none.
+    #[test]
+    fn an_mbp_receivers_exit_releases_its_source_paths() {
+        use crate::ingest::{
+            arbiter::{lock, Arbiter, Transport},
+            feeds::FeedKind,
+            health::FeedHealth,
+        };
+
+        let (ip, peer) = (
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        );
+        let market: crate::ingest::authority::MarketKey =
+            ("MBPDEPART".into(), "test".into(), 2u8, 41u32);
+        let catalog_after_exit = |kind, port| {
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let arbiter: SharedArbiter =
+                std::sync::Arc::new(std::sync::Mutex::new(Arbiter::new(tx, 1_024)));
+            let catalog: crate::model::InstrumentSnapshot = Default::default();
+            crate::model::lock(&catalog).insert(
+                market.clone(),
+                crate::model::NormalizedInstrument {
+                    venue: "MBPDEPART".into(),
+                    source_name: "MBPDEPART".into(),
+                    source_id: 0,
+                    symbol: "X".into(),
+                    channel: 2,
+                    instrument_id: 41,
+                    category: "test".into(),
+                    price_exponent: 0,
+                    qty_exponent: 0,
+                    tick_size: 1,
+                },
+            );
+            {
+                let mut a = lock(&arbiter);
+                a.set_instrument_catalog(catalog.clone());
+                a.note_source_path(&market, Transport::Edge(ip));
+                a.note_source_path(&market, Transport::Edge(peer));
+                a.release_source_market(&market, None, Transport::Edge(peer));
+            }
+            let up_gauge = metrics()
+                .receiver_up
+                .with_label_values(&["MBPDEPART", "test", port]);
+            let mut reg = ReceiverRegistration::new(
+                FeedHealth::new().into(),
+                arbiter.clone(),
+                ("MBPDEPART", "test", kind, 9201),
+                up_gauge,
+            );
+            reg.note_publisher(ip);
+            drop(reg);
+            let present = crate::model::lock(&catalog).contains_key(&market);
+            present
+        };
+
+        assert!(
+            !catalog_after_exit(FeedKind::MarketByPrice, "9201"),
+            "the waiting release is carried out"
+        );
+        assert!(
+            catalog_after_exit(FeedKind::TopOfBook, "9202"),
+            "a quote receiver's exit releases nothing"
         );
     }
 

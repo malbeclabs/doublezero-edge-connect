@@ -291,7 +291,7 @@ The two granularities are **two message types**, not one type with a flag. `book
 | `kernel_rx_ts_ns` | uint64 | Kernel RX timestamp (`SO_TIMESTAMPNS`); `0` if unavailable. |
 | `ws_send_ts_ns` | uint64 | Wall clock the instant this batch is serialized; shared by all consumers of this message. `0` if unset. |
 
-**Identity: key on `(venue, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
+**Identity: key on `(source_id, channel, instrument_id)`, not on `symbol`.** The upstream `symbol` is a fixed 16-byte field the publisher fills by keeping the ticker's rightmost 16 bytes — silently, with no hash and no length check — so on venues with long tickers distinct markets collide on it, and a consumer keying on `symbol` merges two books into one. `symbol` is for display, and for the convenience of venues where it happens to be unique. `instrument` messages carry `channel` and `instrument_id` too, so a consumer joins a book to its definition on the same identity, and learns the mapping from the connect-time replay of the definitions.
 
 **Re-baselining is structural: `changes[0].action == "clear"`.** Do **not** key it off `snapshot`. A rebuild (on connect, after a recovery, or when the producer's authoritative path changes) arrives as a `clear` followed by the complete level set, with `snapshot: true` and `last: true` on the final batch. `snapshot` exists only so a consumer can tell a rebuild from ordinary activity; a consumer that ignores it stays correct.
 
@@ -356,6 +356,10 @@ quote or trade.
 | `stale_ms`  | uint64 | Milliseconds the quote feed had been silent (`0` when `"ok"`).  |
 | `ts_ns`     | uint64 | Wall clock (ns since epoch) the status was emitted.             |
 
+Each Source ID gets its own `status`, but its health is that of the feed carrying it: every ID one
+feed carries goes `down` and `ok` together, so one ID falling silent while another on the same feed
+streams produces no `status`.
+
 Quote delivery is **not gated** on status - it is advisory health, and because every `quote` is
 full state the feed self-heals on the next quote regardless. A consumer that ignores `status`
 (per the forward-compatibility rule) simply forgoes the gray-out.
@@ -386,6 +390,13 @@ string matching.
 
 An unregistered Source ID yields a stable synthesized name (`SOURCE_<id>`) rather than being dropped,
 so data always flows and an unrecognised Source ID is visible rather than silent.
+
+**Several Source IDs can share one name.** The registry may give more than one ID the same
+`source_name` (one venue running several matching engines). Their data is never merged: each ID keeps
+its own books, depth and `status`. A name is therefore not an identity. Key per-engine state on
+`source_id`: `(source_id, channel, instrument_id)` for `book`, `order_book` and `instrument`, and
+`(source_id, symbol)` for `quote`, `trade`, `midpoint` and `depth`. A `source_name`/`venue`
+subscription filter matches every ID under the name; to follow one, filter on `source_id` client-side.
 
 **Planned for v2: `venue` names a matching engine, not a venue.** The edge-feed-spec glossary is explicit that a Source ID identifies one matching engine and that a venue may hold several IDs, so the field is misnamed as well as redundant. Retiring it — rather than merely deprecating it, which this release does — is a v2 change, and upstream's own `sources/spec.md` still describes the field the old way.
 

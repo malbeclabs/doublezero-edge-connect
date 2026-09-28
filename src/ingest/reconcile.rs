@@ -880,12 +880,11 @@ impl Reconciler {
             channel,
         );
 
-        let history_dropped = match sources::source_id_of(feed.venue) {
-            Some(source_id) => {
-                crate::model::lock(&self.cfg.history).forget_channel(source_id, &category, channel)
-            }
-            None => 0,
-        };
+        let history_dropped = crate::model::lock(&self.cfg.history).forget_channel(
+            &sources::source_ids_of(feed.venue),
+            &category,
+            channel,
+        );
 
         if history_dropped > 0 || books_dropped > 0 {
             info!(
