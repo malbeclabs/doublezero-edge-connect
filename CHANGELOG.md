@@ -58,8 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequence check still passed, so it surfaced only as a silently corrupt book. The book key, every
   map keyed off it, and the `SnapshotOrder` routing filter now all carry the raw `channel_id` from
   the datagram header. Latent — the live publishers put everything on channel 0. Reference data
-  remains channel-flat, so two such channels still resolve one definition and publish one symbol,
-  which the venue-wide depth floor then leaves flip-flopping between the two books. (#110)
+  is still keyed per publisher only, so one publisher sending two channels still does not work:
+  each channel's reset count and manifest clear the other's definitions and neither book syncs.
+  `EndOfSession` now resets only the channel it names, as the market-by-price processor already
+  did. (#110)
 - A price-book market no longer goes dark to new subscribers after one very large event. An
   event carrying more than 8,192 changes before its `last` un-baselines the WebSocket replay entry,
   and only a `Clear`-led batch from the serving path could restore it: a book that stays `Ready` sends

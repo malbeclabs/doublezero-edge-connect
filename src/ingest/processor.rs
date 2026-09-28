@@ -934,12 +934,12 @@ const MAX_BOOKS: usize = 4096;
 /// independently sequenced, and [`DatagramCtx::canonical_channel`] is for consumer-facing identity
 /// only.
 ///
-/// Reference data is still channel-flat (`PerPublisher` keys on the instrument id alone), so two
-/// channels sharing an id resolve one definition and publish under one symbol. The books are
-/// separated; their identity is not, and the venue-wide depth floor then drops whichever channel
-/// trails each tick — the consumer sees that one symbol flip-flopping between two books. Moot while
-/// publishers stay on channel 0; a genuinely multi-channel MBO feed needs the reference data keyed
-/// the same way first.
+/// ⚠️ Reference data is still keyed per publisher only, so a publisher sending more than one
+/// channel does not work yet: each channel's `Reset Count` and manifest seq clear the other's
+/// definitions, [`MboProcessor::book_for`]'s definition gate then refuses the deltas and snapshots,
+/// and the books never sync. Two channels sharing an id would also resolve one definition and one
+/// symbol. Moot while publishers stay on channel 0; a multi-channel MBO feed needs `RefDataState`
+/// keyed by channel first.
 type BookKey = (IpAddr, u8, u32);
 
 /// Market-by-Order processor: drives the reference-data state machine (refdata port), feeds order
@@ -969,8 +969,8 @@ pub struct MboProcessor {
     /// floor by this memo rather than the *current* definition, which can differ: a manifest era
     /// bump may reassign the id to another symbol, and clearing the new symbol would leave the
     /// wedged old-symbol entry latched. Written in `emit_depth`, evicted in lockstep with `books`,
-    /// cleared on `EndOfSession` (the venue-wide clear covers everything), so its keys are always
-    /// a subset of `books`' keys.
+    /// cleared for the ending channel's keys on `EndOfSession`, so its keys are always a subset of
+    /// `books`' keys.
     emitted_symbol: HashMap<BookKey, Arc<str>>,
     /// The wire Source ID revealed for one book key — absent until the FIRST
     /// delta-carrying message (`OrderAdd`/`OrderCancel`/`OrderExecute`/`Trade` — the snapshot
@@ -1149,28 +1149,38 @@ impl MboProcessor {
     /// This is a superset of `ctx.venue`'s old reach, not a subset: still a safe over-approximation
     /// (a spurious clear self-heals via full-state depth), same as the call sites it replaces.
     fn reset_all_known_depth_floors(&self, ctx: &DatagramCtx, reason: &'static str) {
+        self.reset_depth_floors_where(ctx, reason, |_| true);
+    }
+
+    /// [`Self::reset_all_known_depth_floors`] narrowed to the keys `scope` admits.
+    fn reset_depth_floors_where(
+        &self,
+        ctx: &DatagramCtx,
+        reason: &'static str,
+        scope: impl Fn(&BookKey) -> bool,
+    ) {
         let mut arb = lock(ctx.arbiter);
-        for (key, symbol) in &self.emitted_symbol {
+        for (key, symbol) in self.emitted_symbol.iter().filter(|(k, _)| scope(k)) {
             if let Some(venue) = self.wire_venue(key) {
                 arb.reset_depth_floor_for_symbol(&venue, symbol, reason);
             }
         }
     }
 
-    /// Clear the raced order-event state for every market this processor has emitted a book under — the
-    /// `EndOfSession` counterpart of [`Self::reset_all_known_depth_floors`]. A session boundary restarts
-    /// the venue's order-id space, so the ended session's tombstones would refuse the new session's
-    /// legitimately-reused ids. Scoped to the racing state only: it leaves the replay accumulator and
-    /// the authority entry alone, which is what stops it tearing down a published book.
+    /// Clear the raced order-event state for every market in `scope` this processor has emitted a book
+    /// under — the `EndOfSession` counterpart of [`Self::reset_depth_floors_where`]. A session boundary
+    /// restarts the venue's order-id space, so the ended session's tombstones would refuse the new
+    /// session's legitimately-reused ids. Scoped to the racing state only: it leaves the replay
+    /// accumulator and the authority entry alone, which is what stops it tearing down a published book.
     ///
-    /// **Every publisher's markets, matching the book reset that precedes it.** The handler drops all of
-    /// them to `Recovering` and reports all of them unsynced, so leaving a peer's tombstones behind
-    /// refuses the new session's re-used ids for exactly the markets nothing is serving any more — the
-    /// `InstrumentReset` failure, one handler over. It also means an `EndOfSession` from a publisher
+    /// **Every publisher's markets in scope, matching the book reset that precedes it.** The handler
+    /// drops all of them to `Recovering` and reports all of them unsynced, so leaving a peer's tombstones
+    /// behind refuses the new session's re-used ids for exactly the markets nothing is serving any more —
+    /// the `InstrumentReset` failure, one handler over. It also means an `EndOfSession` from a publisher
     /// holding no books of its own still clears the state of the ones that were just reset.
-    fn reset_all_known_book_events(&self, ctx: &DatagramCtx) {
+    fn reset_book_events_where(&self, ctx: &DatagramCtx, scope: impl Fn(&BookKey) -> bool) {
         let mut arb = lock(ctx.arbiter);
-        for key in self.books.keys() {
+        for key in self.books.keys().filter(|k| scope(k)) {
             if let Some(market) = self.market_key(key, ctx) {
                 // The session variant: a boundary restarts the venue's *clock* as well as its id
                 // space, so the channel's venue-time frontier goes with the racing state. The
@@ -1194,15 +1204,9 @@ impl MboProcessor {
     ///    Eviction also drops the evicted key's `last_top` and (when no other book still serves that
     ///    symbol) the shared `depth` (WS replay) entry in lockstep, so no sibling map outgrows
     ///    `books`. An evicted legitimate book simply re-syncs from the next snapshot.
-    fn book_for(
-        &mut self,
-        channel: u8,
-        instrument_id: u32,
-        ctx: &DatagramCtx,
-    ) -> Option<&mut BookState> {
+    fn book_for(&mut self, key: BookKey) -> Option<&mut BookState> {
         // Gate 1: no definition → no book (and release the `state` borrow before touching `books`).
-        self.state.def(ctx.publisher, instrument_id)?;
-        let key = (ctx.publisher, channel, instrument_id);
+        self.state.def(key.0, key.2)?;
         if !self.books.contains_key(&key) {
             while self.books.len() >= MAX_BOOKS {
                 match self.books_order.pop_front() {
@@ -1256,8 +1260,7 @@ impl MboProcessor {
     /// instrument has been revealed (see [`Self::revealed`]) — deferral applies to `depth` exactly
     /// as it does to the definition: nothing is emitted for an instrument until its Source ID is
     /// known, so a book built purely from a snapshot must not reach the wire ahead of it either.
-    fn emit_depth(&mut self, channel: u8, instrument_id: u32, ctx: &DatagramCtx) {
-        let key = (ctx.publisher, channel, instrument_id);
+    fn emit_depth(&mut self, key: BookKey, ctx: &DatagramCtx) {
         let Some(&source_id) = self.revealed.get(&key) else {
             return;
         };
@@ -1267,7 +1270,7 @@ impl MboProcessor {
         if !book.is_synced() {
             return;
         }
-        let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
+        let Some(def) = self.state.def(key.0, key.2) else {
             return; // precision unknown; don't emit a book we can't scale
         };
         let (bids_raw, asks_raw) = book.top_levels(DEPTH_LEVELS);
@@ -1347,23 +1350,21 @@ impl MboProcessor {
     /// collecting the order-level change it produced for this datagram's `book`.
     fn apply_delta(
         &mut self,
-        channel: u8,
-        instrument_id: u32,
+        key: BookKey,
         op: DeltaOp,
-        ctx: &DatagramCtx,
         changed: &mut BTreeSet<u32>,
         touched: &mut BTreeSet<u32>,
     ) {
-        touched.insert(instrument_id);
+        touched.insert(key.2);
         let mut produced = std::mem::take(&mut self.order_scratch);
         produced.clear();
-        if let Some(book) = self.book_for(channel, instrument_id, ctx) {
+        if let Some(book) = self.book_for(key) {
             if book.on_delta_reporting(op, &mut produced) {
-                changed.insert(instrument_id);
+                changed.insert(key.2);
             }
         }
         self.datagram_changes
-            .extend(produced.iter().map(|c| (instrument_id, *c)));
+            .extend(produced.iter().map(|c| (key.2, *c)));
         self.order_scratch = produced;
     }
 
@@ -1415,8 +1416,7 @@ impl MboProcessor {
     /// Report this instrument's book sync state to the arbiter when it has changed. The arbiter's
     /// re-baseline suppression reads these, so a book that gaps must say so — otherwise a peer that is
     /// itself recovering would see a phantom healthy path and suppress the only re-baseline on offer.
-    fn report_synced(&mut self, channel: u8, instrument_id: u32, ctx: &DatagramCtx) {
-        let key = (ctx.publisher, channel, instrument_id);
+    fn report_synced(&mut self, key: BookKey, ctx: &DatagramCtx) {
         let synced = self.books.get(&key).is_some_and(|b| b.is_synced());
         self.set_synced(key, synced, ctx);
     }
@@ -1425,7 +1425,7 @@ impl MboProcessor {
     /// book reaches it — an `InstrumentReset` clears the `revealed` entry that resolves the market, so
     /// waiting until the book has actually dropped leaves nothing to key the report by.
     ///
-    /// Reported under **`key`'s own publisher**, not `ctx.publisher`: a feed-wide `EndOfSession` and a
+    /// Reported under **`key`'s own publisher**, not `ctx.publisher`: a channel's `EndOfSession` and a
     /// publisher eviction both report for paths other than the one whose datagram is being handled, and
     /// naming the wrong path there would leave the departed one's `synced = true` standing while
     /// clearing an innocent peer's.
@@ -1451,8 +1451,8 @@ impl MboProcessor {
     /// all. [`BookEmit::Clear`] is the same statement without the content, for a reveal the rate
     /// limit refused to materialize. Otherwise the datagram's applied changes are published as they
     /// came.
-    fn emit_book(&mut self, channel: u8, instrument_id: u32, mode: BookEmit, ctx: &DatagramCtx) {
-        let key = (ctx.publisher, channel, instrument_id);
+    fn emit_book(&mut self, key: BookKey, mode: BookEmit, ctx: &DatagramCtx) {
+        let (publisher, channel, instrument_id) = key;
         let Some(&source_id) = self.revealed.get(&key) else {
             return;
         };
@@ -1462,7 +1462,7 @@ impl MboProcessor {
         if !book.is_synced() {
             return;
         }
-        let Some(def) = self.state.def(ctx.publisher, instrument_id) else {
+        let Some(def) = self.state.def(publisher, instrument_id) else {
             return; // precision unknown; don't emit a book we can't scale
         };
         let (price_exponent, qty_exponent) = (def.price_exponent, def.qty_exponent);
@@ -1565,6 +1565,9 @@ impl DatagramProcessor for MboProcessor {
         // is protocol-agnostic and would have to decode a header it has no magic for. Raw, never
         // canonicalized — it keys producer-side state (see [`BookKey`]).
         let channel = header.channel_id;
+        // The one place a `BookKey` is built from a datagram, so no call site can pair the wrong
+        // publisher or a canonicalized channel with an id.
+        let book_key = |instrument_id: u32| -> BookKey { (ctx.publisher, channel, instrument_id) };
         let handle_refdata = ctx.role.handles_refdata();
 
         if handle_refdata {
@@ -1636,7 +1639,7 @@ impl DatagramProcessor for MboProcessor {
                     // `source_id` differs from what's already revealed, skip this and let the eager
                     // `reveal_if_needed` call below handle it: see `TobProcessor`'s definition path
                     // for why.
-                    let key = (ctx.publisher, channel, d.instrument_id);
+                    let key = book_key(d.instrument_id);
                     if let Some(&source_id) = self.revealed.get(&key) {
                         if d.source_id.is_none() || d.source_id == Some(source_id) {
                             let source = venue_arc(source_label(source_id));
@@ -1665,43 +1668,39 @@ impl DatagramProcessor for MboProcessor {
                     // definition just stored above, so this must come after
                     // `on_instrument_definition`, not before.
                     if let Some(source_id) = eager_source_id {
-                        let _ = self.reveal_if_needed(
-                            ctx,
-                            (ctx.publisher, channel, instrument_id),
-                            source_id,
-                        );
+                        let _ = self.reveal_if_needed(ctx, book_key(instrument_id), source_id);
                     }
                 }
                 codec_mbo::Message::EndOfSession(ts) => {
-                    info!(ts, "mbo end of session");
+                    info!(ts, channel, "mbo end of session");
                     // Session boundary: the venue may restart its event clock and sequences, so
-                    // drop this publisher's books to `Recovering` and clear the venue's latched
-                    // depth-floor entries — a post-session `source_ts` below the old high-water
-                    // would otherwise be dropped as stale forever (no full-state self-heal
-                    // rescues a latched floor). Idempotent, so the duplicate copies arriving on
-                    // the other ports are harmless no-ops (deliberately not role-gated: an extra
-                    // clear also backs up a lost copy).
+                    // drop this channel's books to `Recovering` and clear their latched depth-floor
+                    // entries — a post-session `source_ts` below the old high-water would otherwise
+                    // be dropped as stale forever (no full-state self-heal rescues a latched floor).
+                    // Idempotent, so the duplicate copies arriving on the other ports are harmless
+                    // no-ops (deliberately not role-gated: an extra clear also backs up a lost copy).
                     //
-                    // SCOPE TRAP: `books` can hold several publishers' books (they share a port
-                    // block, and so one processor), while the floor cleared below is venue-wide and
-                    // shared. A mirror that loses its own EndOfSession datagram keeps a `Synced`
-                    // book and can re-latch the cleared floor at the old high-water, wedging the
-                    // venue's depth until that mirror resets on its own. Resetting every
-                    // publisher's book here is what closes that; a per-venue session era shared
-                    // across the receiver tasks is what would close it properly.
-                    for book in self.books.values_mut() {
+                    // Scoped to the channel, as `MbpProcessor` scopes it: each channel is an
+                    // independent state machine, so its session ending says nothing about a sibling
+                    // channel's books. Compared canonically, and across every publisher, because a
+                    // mirror that loses its own copy keeps a `Synced` book and can re-latch the
+                    // cleared floor at the old high-water, wedging that symbol's depth until the
+                    // mirror resets on its own. A per-channel session era shared across the receiver
+                    // tasks is what would close that properly.
+                    let session = ctx.canonical_channel(channel);
+                    let in_session = |k: &BookKey| ctx.canonical_channel(k.1) == session;
+                    for (_, book) in self.books.iter_mut().filter(|(k, _)| in_session(k)) {
                         book.on_end_of_session();
                     }
-                    // EVERY book just dropped to `Recovering`, so every one of them must say so —
-                    // the reset above is feed-wide, and reporting only this datagram's own path
-                    // would leave the arbiter reading a peer's stale `synced = true` as a healthy
-                    // path and suppressing the surviving path's only re-baseline. `touched` carries
-                    // instrument ids alone and is drained under this datagram's own key, so every
-                    // other publisher AND every other channel is reported here.
+                    // Every book just reset must say so, not only this datagram's own: a peer left
+                    // claiming `synced = true` reads as a healthy path and suppresses the surviving
+                    // path's only re-baseline. `touched` carries instrument ids alone and is drained
+                    // under this datagram's own key, so every other key in the session goes here.
+                    let own = |k: &BookKey| k.0 == ctx.publisher && k.1 == channel;
                     let peers: Vec<BookKey> = self
                         .books
                         .keys()
-                        .filter(|(p, c, _)| *p != ctx.publisher || *c != channel)
+                        .filter(|k| in_session(k) && !own(k))
                         .copied()
                         .collect();
                     for key in peers {
@@ -1710,17 +1709,15 @@ impl DatagramProcessor for MboProcessor {
                     touched.extend(
                         self.books
                             .keys()
-                            .filter(|(p, c, _)| *p == ctx.publisher && *c == channel)
+                            .filter(|k| own(k))
                             .map(|(_, _, id)| *id)
                             .collect::<Vec<_>>(),
                     );
-                    // Clear every (wire venue, symbol) this processor has latched — not a single
-                    // `ctx.venue` (see `reset_all_known_depth_floors`) — BEFORE clearing the memo
-                    // that supplies it.
-                    self.reset_all_known_depth_floors(ctx, "end_of_session");
-                    self.reset_all_known_book_events(ctx);
-                    self.last_top.clear();
-                    self.emitted_symbol.clear();
+                    // BEFORE clearing the memo that supplies the symbols.
+                    self.reset_depth_floors_where(ctx, "end_of_session", in_session);
+                    self.reset_book_events_where(ctx, in_session);
+                    self.last_top.retain(|k, _| !in_session(k));
+                    self.emitted_symbol.retain(|k, _| !in_session(k));
                 }
                 codec_mbo::Message::OrderAdd(o) => {
                     let op = DeltaOp {
@@ -1734,21 +1731,14 @@ impl DatagramProcessor for MboProcessor {
                             qty_raw: o.qty_raw,
                         },
                     };
-                    self.apply_delta(
-                        channel,
-                        o.instrument_id,
-                        op,
-                        ctx,
-                        &mut changed,
-                        &mut touched,
-                    );
+                    self.apply_delta(book_key(o.instrument_id), op, &mut changed, &mut touched);
                     // `OrderAdd` has no direct wire representation on our output (raw order events
                     // are never re-served), so a reveal here forces a `depth` re-baseline —
                     // otherwise a delta that didn't move the visible top-N would reveal the
                     // instrument's definition but never follow it with any book content.
                     self.on_reveal(
                         ctx,
-                        (ctx.publisher, channel, o.instrument_id),
+                        book_key(o.instrument_id),
                         o.source_id,
                         &mut changed,
                         &mut rebaselined,
@@ -1764,17 +1754,10 @@ impl DatagramProcessor for MboProcessor {
                             order_id: o.order_id,
                         },
                     };
-                    self.apply_delta(
-                        channel,
-                        o.instrument_id,
-                        op,
-                        ctx,
-                        &mut changed,
-                        &mut touched,
-                    );
+                    self.apply_delta(book_key(o.instrument_id), op, &mut changed, &mut touched);
                     self.on_reveal(
                         ctx,
-                        (ctx.publisher, channel, o.instrument_id),
+                        book_key(o.instrument_id),
                         o.source_id,
                         &mut changed,
                         &mut rebaselined,
@@ -1792,17 +1775,10 @@ impl DatagramProcessor for MboProcessor {
                             full_fill: o.exec_flags & 0x01 != 0,
                         },
                     };
-                    self.apply_delta(
-                        channel,
-                        o.instrument_id,
-                        op,
-                        ctx,
-                        &mut changed,
-                        &mut touched,
-                    );
+                    self.apply_delta(book_key(o.instrument_id), op, &mut changed, &mut touched);
                     self.on_reveal(
                         ctx,
-                        (ctx.publisher, channel, o.instrument_id),
+                        book_key(o.instrument_id),
                         o.source_id,
                         &mut changed,
                         &mut rebaselined,
@@ -1851,7 +1827,7 @@ impl DatagramProcessor for MboProcessor {
                     // `depth` re-baseline so that content isn't left permanently unshown.
                     self.on_reveal(
                         ctx,
-                        (ctx.publisher, channel, t.instrument_id),
+                        book_key(t.instrument_id),
                         t.source_id,
                         &mut changed,
                         &mut rebaselined,
@@ -1887,7 +1863,7 @@ impl DatagramProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::InstrumentReset(r) => {
-                    let key = (ctx.publisher, channel, r.instrument_id);
+                    let key = book_key(r.instrument_id);
                     // The book is about to drop to `Recovering`; report it while the `revealed` entry
                     // that resolves this key's market is still there to resolve it.
                     self.set_synced(key, false, ctx);
@@ -1964,7 +1940,7 @@ impl DatagramProcessor for MboProcessor {
                 }
                 codec_mbo::Message::SnapshotBegin(s) => {
                     touched.insert(s.instrument_id);
-                    if let Some(book) = self.book_for(channel, s.instrument_id, ctx) {
+                    if let Some(book) = self.book_for(book_key(s.instrument_id)) {
                         book.on_snapshot_begin(
                             s.snapshot_id,
                             s.anchor_seq,
@@ -1997,7 +1973,7 @@ impl DatagramProcessor for MboProcessor {
                     }
                 }
                 codec_mbo::Message::SnapshotEnd(s) => {
-                    if let Some(book) = self.book_for(channel, s.instrument_id, ctx) {
+                    if let Some(book) = self.book_for(book_key(s.instrument_id)) {
                         if book.on_snapshot_end(s.anchor_seq, s.snapshot_id) {
                             changed.insert(s.instrument_id);
                             rebaselined.insert(s.instrument_id);
@@ -2018,10 +1994,10 @@ impl DatagramProcessor for MboProcessor {
         // Sync state first: the arbiter decides whether a re-baseline is safe from these, so a path must
         // have declared itself before the book it publishes arrives.
         for instrument_id in touched {
-            self.report_synced(channel, instrument_id, ctx);
+            self.report_synced(book_key(instrument_id), ctx);
         }
         for instrument_id in changed {
-            self.emit_depth(channel, instrument_id, ctx);
+            self.emit_depth(book_key(instrument_id), ctx);
             // `depth` is full state, so a reveal never has to withhold it; only the incremental
             // product does. A snapshot install in the same datagram outranks the rate limit's bare
             // clear — it already has the content the clear would have withheld.
@@ -2032,7 +2008,7 @@ impl DatagramProcessor for MboProcessor {
             } else {
                 BookEmit::Delta
             };
-            self.emit_book(channel, instrument_id, mode, ctx);
+            self.emit_book(book_key(instrument_id), mode, ctx);
         }
     }
 }
@@ -4866,7 +4842,7 @@ mod tests {
     /// publisher — while the drain that keeps the derived per-publisher maps bounded only runs
     /// behind the `handles_refdata()` gate at the top of `on_datagram`, which a Mktdata-role
     /// datagram never satisfies. Reproduces the review's exact scenario: one refdata burst per
-    /// forged IP, sent to `PortRole::Mktdata`.
+    /// forged IP, sent to `PortRole::Mktdata`. Checks `PerPublisher` state only.
     #[test]
     fn mbo_manifest_burst_via_mktdata_port_does_not_mint_refdata_state() {
         use super::MAX_PUBLISHERS;
@@ -4889,11 +4865,6 @@ mod tests {
             proc.on_datagram(&burst, &ctx);
         }
 
-        assert!(
-            proc.state.states.len() <= MAX_PUBLISHERS,
-            "refdata state map must stay bounded, got {}",
-            proc.state.states.len()
-        );
         assert!(
             proc.state.states.is_empty(),
             "a role that doesn't handle refdata must process NO refdata message at all, not just \
@@ -5285,6 +5256,65 @@ mod tests {
         })
     }
 
+    /// Each channel is an independent state machine, so one channel's `EndOfSession` must leave a
+    /// sibling channel's synced book serving.
+    #[test]
+    fn mbo_end_of_session_leaves_sibling_channels_synced() {
+        let anchor = vec![
+            enc_snapshot_begin(&SnapshotBegin {
+                instrument_id: 0,
+                anchor_seq: 0,
+                total_orders: 0,
+                snapshot_id: 1,
+                last_instrument_seq: 0,
+                ts: 0,
+            }),
+            enc_snapshot_end(&SnapshotEnd {
+                instrument_id: 0,
+                anchor_seq: 0,
+                snapshot_id: 1,
+            }),
+        ];
+        let (tx, mut rx) = broadcast::channel::<std::sync::Arc<FeedMessage>>(64);
+        let arbiter: SharedArbiter = Arc::new(Mutex::new(Arbiter::new(tx, 8)));
+        let instruments = Arc::new(Mutex::new(HashMap::new()));
+        let depth: DepthSnapshot = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = MboProcessor::new(depth, tape(false));
+        proc.on_datagram(
+            &datagram(&[
+                enc_manifest_summary(1, 1),
+                enc_instrument_def(0, "INST-0", 1),
+            ]),
+            &make_ctx(&arbiter, &instruments, PortRole::Combined),
+        );
+        for channel in [0u8, 1] {
+            proc.on_datagram(
+                &mbo_datagram_on_channel(channel, &anchor),
+                &make_ctx(&arbiter, &instruments, PortRole::Snapshot),
+            );
+        }
+
+        proc.on_datagram(
+            &mbo_datagram_on_channel(0, &[enc_end_of_session(6_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert!(
+            !proc.books[&(TEST_PUB, 0, 0)].is_synced(),
+            "the ending channel resets"
+        );
+        assert!(
+            proc.books[&(TEST_PUB, 1, 0)].is_synced(),
+            "its sibling keeps serving"
+        );
+
+        let _ = drain_all(&mut rx);
+        proc.on_datagram(
+            &mbo_datagram_on_channel(1, &[add(1, 100, 7_000)]),
+            &make_ctx(&arbiter, &instruments, PortRole::Mktdata),
+        );
+        assert_eq!(drain_depth_ts(&mut rx), vec![7_000]);
+    }
+
     /// Per the edge-feed-spec an instrument's unique key is `(channel_id, instrument_id)`:
     /// `instrument_id` is scoped to its channel and need not be unique across channels. Keyed on
     /// `instrument_id` alone, two channels' books merge into one and each channel's deltas are
@@ -5366,8 +5396,8 @@ mod tests {
             .collect();
         // Each channel publishes only its OWN resting order. Merged books would instead show
         // channel 0's order on channel 1's depth, or swallow channel 1's delta as a duplicate
-        // sequence. Both depths carry the same `(venue, symbol)`, which is the residual gap the
-        // `BookKey` docs call out: the consumer sees one symbol alternating between two books.
+        // sequence. Both depths carry the same `(venue, symbol)`: reference data is not yet
+        // channel-scoped (see `BookKey`).
         assert_eq!(
             depths,
             vec![(5000, vec![[100.0, 5.0]]), (6000, vec![[200.0, 5.0]])],
@@ -5427,8 +5457,8 @@ mod tests {
         );
     }
 
-    /// `EndOfSession` is a FEED-level boundary even though it arrives per publisher: publisher A's
-    /// copy resets publisher B's book too, so B's still-in-flight old-session tail is buffered
+    /// `EndOfSession` is a channel-level boundary even though it arrives per publisher: publisher A's
+    /// copy resets publisher B's book on that channel too, so B's still-in-flight old-session tail is buffered
     /// (book `Recovering`), emits nothing, and cannot re-latch the just-cleared floor at the old
     /// high-water — the failure mode where a lost EndOfSession from B would otherwise restore the
     /// permanent wedge #66 removes.
@@ -8580,9 +8610,9 @@ mod tests {
         }
     }
 
-    /// §4.7 — `EndOfSession` from one path must drop only that path's books. Under the order-keyed
-    /// processor's handler it also cleared the venue's shared floor, so one path shutting down tore
-    /// down the live published book.
+    /// §4.7 — `EndOfSession` from one path must drop only that path's books. The order-keyed
+    /// processor's handler also resets its peers' books on the channel, which here would tear down
+    /// the live published book.
     #[test]
     fn mbp_end_of_session_is_scoped_to_the_emitting_path() {
         let (arbiter, _rx, instruments) = mbp_harness();
@@ -10424,7 +10454,7 @@ mod tests {
         );
     }
 
-    /// `EndOfSession` drops every publisher's book, so the raced state of every one of them has to go
+    /// `EndOfSession` drops every publisher's book on its channel, so the raced state of every one of them has to go
     /// with it. Scoped to the sending publisher, an `EndOfSession` from a publisher holding no books of
     /// its own — a refdata-only mirror, an evicted publisher, one forged datagram — resets every real
     /// book to `Recovering` and clears no tombstones, and the new session's re-used order ids are then
@@ -10527,7 +10557,7 @@ mod tests {
         );
     }
 
-    /// **Item F.** `EndOfSession` drops EVERY publisher's book to `Recovering` (see
+    /// **Item F.** `EndOfSession` drops EVERY publisher's book on its channel to `Recovering` (see
     /// `mbo_end_of_session_resets_peer_publisher_books` for why), so every one of them must report it.
     /// A peer left claiming `synced` is a phantom healthy path, and the arbiter suppresses the
     /// surviving path's only re-baseline against it.

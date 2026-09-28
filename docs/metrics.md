@@ -84,7 +84,7 @@ protocol — TOB, Midpoint, MBO, MBP all go through this), not by the arbiter's 
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `dz_source_id_changed_total` | counter | `venue` | A `(publisher, instrument)` already revealed under one wire Source ID named a different one on a later message — a publisher defect, not a decode issue. Labelled by the **new** (post-change) venue, which is also re-announced a fresh `instrument` under so the new venue's precision-before-price guarantee still holds. Should stay flat at zero; a nonzero rate means a publisher is relabeling an instrument's venue partway through. |
+| `dz_source_id_changed_total` | counter | `venue` | An instrument already revealed under one wire Source ID named a different one on a later message. Counted per revealed key: `(publisher, instrument)` on top-of-book and midpoint, `(publisher, channel, instrument)` on market-by-order and market-by-price, so one instrument carried on several channels counts once per channel — a publisher defect, not a decode issue. Labelled by the **new** (post-change) venue, which is also re-announced a fresh `instrument` under so the new venue's precision-before-price guarantee still holds. Should stay flat at zero; a nonzero rate means a publisher is relabeling an instrument's venue partway through. |
 | `dz_unregistered_source_ids_total` | counter | — | Distinct Source IDs seen with no registry row. |
 | `dz_unregistered_source_id_labels_capped_total` | counter | — | Messages labelled `UNREGISTERED` because the distinct-unregistered-ID cap was reached. |
 
