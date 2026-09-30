@@ -256,8 +256,10 @@ Modules are grouped by role under `src/`:
   claiming the tape (quotes only until the publisher sends `Trade`). Nothing in the name, kind or
   port tells them apart, so each row declares its **`source_id`** (see `ingest/health.rs`) and the
   per-receiver metrics carry `category`; the two engines list overlapping symbols (`BTCUSDT`), which
-  is what the WS `source_id` filter and the `#channel.instrument` product-id suffix (channel `0` vs
-  `1`) exist for. ⚠️ Their ports come from the publisher's deployment inventory and are **not yet
+  is what the WS `source_id` subscription filter exists for, and the `#channel.instrument` product-id
+  suffix separates them only if
+  their `(channel, instrument_id)` pairs differ, which no capture has confirmed; where they collide,
+  `products::render_ambiguous` names the category instead. ⚠️ Their ports come from the publisher's deployment inventory and are **not yet
   confirmed by capture** — the rows' `notes` say so until PORT PROVENANCE's check passes. Only the
   compiled-in rows carry `source_id` today: the hosted rows are copied from the publisher's fragments,
   which gain it separately, and until then they report at the name-level `(BINANCE, None)` key.

@@ -591,9 +591,10 @@ mod tests {
     }
 
     /// The venues that predate arbitration modes race on a comparable venue clock and must keep
-    /// doing so — the mode is a seam, not a behavior change. Scoped by exclusion rather than
-    /// asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose paths carry
-    /// no shared clock can declare it; a new such venue is the feature working, not a regression.
+    /// doing so — the mode is a seam, not a behavior change. Scoped to those venues by name rather
+    /// than asserting over all of `FEEDS`, because `Sticky` exists precisely so a venue whose paths
+    /// carry no shared clock can declare it; a new such venue is the feature working, not a
+    /// regression.
     #[test]
     fn existing_venues_are_coordinated() {
         for f in feeds()

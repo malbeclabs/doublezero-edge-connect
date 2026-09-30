@@ -311,14 +311,17 @@ mod tests {
         i
     }
 
-    /// The Binance shape: perps (Source ID 6, `channel_id` 0) and spot (8, `channel_id` 1) are both
-    /// `BINANCE`, and `BTCUSDT` is listed by both — here under the *same* instrument id, so only the
+    /// The Binance shape: perps (Source ID 6, category `usdsm`) and spot (8, `spot`) are both
+    /// `BINANCE`, and `BTCUSDT` is listed by both. The engines' `channel_id`s are not confirmed by
+    /// capture; this assumes they differ (0 and 1) under the *same* instrument id, so only the
     /// channel tells the suffixes apart. The bare id is ambiguous, both suffixed ids resolve back to
-    /// their own engine, and a symbol only spot lists stays bare.
+    /// their own engine, and a symbol only spot lists stays bare. The next test covers the case
+    /// where the channels agree too.
     #[test]
     fn binance_btcusdt_needs_its_suffix_and_a_spot_only_symbol_does_not() {
         let binance = |source_id, channel, symbol: &str, instrument_id| {
-            let mut i = instrument("c", symbol, channel, instrument_id);
+            let category = if source_id == 6 { "usdsm" } else { "spot" };
+            let mut i = instrument(category, symbol, channel, instrument_id);
             i.source_id = source_id;
             i.venue = "BINANCE".into();
             i.source_name = "BINANCE".into();
@@ -352,6 +355,34 @@ mod tests {
                 assert_eq!(p.render(false), "BINANCE:ETHBTC");
             }
             other => panic!("a spot-only symbol is unique: {other:?}"),
+        }
+    }
+
+    /// If both engines stamp the same `channel_id` and instrument id, the suffix cannot separate
+    /// them: resolution stays ambiguous and the error names each candidate's category instead of
+    /// printing one suffixed id twice.
+    #[test]
+    fn binance_engines_sharing_channel_and_instrument_id_are_named_by_category() {
+        let binance = |source_id, category: &str| {
+            let mut i = instrument(category, "BTCUSDT", 0, 7);
+            i.source_id = source_id;
+            i.venue = "BINANCE".into();
+            i.source_name = "BINANCE".into();
+            i
+        };
+        let snap = snapshot(vec![binance(6, "usdsm"), binance(8, "spot")]);
+        match resolve(&snap, &parse("BINANCE:BTCUSDT#0.7").unwrap()) {
+            Resolution::Ambiguous(mut rendered) => {
+                rendered.sort();
+                assert_eq!(
+                    rendered,
+                    vec![
+                        "BINANCE:BTCUSDT#0.7 (category: spot)",
+                        "BINANCE:BTCUSDT#0.7 (category: usdsm)",
+                    ]
+                );
+            }
+            other => panic!("the suffix collides too: {other:?}"),
         }
     }
 

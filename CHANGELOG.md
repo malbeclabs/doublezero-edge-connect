@@ -480,7 +480,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feed registry, `edge-binance-usdsm-tob` (group `233.84.178.23`, Source ID 6) and
   `edge-binance-spot-tob` (`233.84.178.31`, Source ID 8), both `BINANCE`, both on ports
   `30001`/`30002`, both `Sticky` and claiming the tape; each declares its `source_id`, so the two
-  engines keep separate health, `status` and `/v1/status` entries. Source IDs 6 and 8 join both the
+  engines keep separate health, `status` and `/v1/status` entries — under the built-in document only:
+  the hosted document's rows do not declare it yet, and report both engines under one name-level
+  `BINANCE` key. A consumer follows one engine with the `source_id` subscription filter (#175).
+  Source IDs 6 and 8 join both the
   document's `sources` block and the compiled-in fallback table, which a failed `Url` fetch degrades
   to. A host activates a row only while subscribed to its code, so nothing changes on a host
   subscribed to neither. Quotes only until the publisher sends `Trade`. The ports come from the

@@ -105,8 +105,8 @@ assign is not an error — the wire value is authoritative and gets a distinct s
 release.
 
 Where several ids share a name, a feed row may say which one it carries with an optional
-**`source_id`** — Binance's USD-margined row declares `"source_id": 6` and its spot row `8`. It never relabels
-data — the wire value stays authoritative — it only keeps each engine's health, `status`,
+**`source_id`** — Binance's USD-margined row declares `"source_id": 6` and its spot row `8`. It
+never relabels data — the wire value stays authoritative — it only keeps each engine's health, `status`,
 `/v1/status` entry and `dz_feed_up` series apart, so one live engine cannot mask the other's
 outage. It must be an id this document's `sources` block (or, with no block, the compiled-in table)
 assigns to that row's own `venue`; anything else refuses the document. A row without it reports at
