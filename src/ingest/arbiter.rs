@@ -1593,6 +1593,15 @@ fn transfer_reason(
     None
 }
 
+/// `dz_book_revert_holds_total`. A label lookup, which is fine: a hold ends at most twice per
+/// health episode.
+fn count_revert_hold(venue: &str, release: &'static str) {
+    metrics()
+        .book_revert_holds
+        .with_label_values(&[venue, release])
+        .inc();
+}
+
 /// The `rebaselined` label value. A label rather than a second counter: one series per transfer, read
 /// with or without the dimension.
 fn yes_no(v: bool) -> &'static str {
@@ -2868,6 +2877,13 @@ impl Arbiter {
             .collect()
     }
 
+    /// Whether `key`'s replay entry exists and is not a complete book.
+    fn replay_incomplete(&self, key: &MarketKey) -> bool {
+        self.book_replay
+            .as_ref()
+            .is_some_and(|r| model::lock(r).get(key).is_some_and(|acc| !acc.baselined()))
+    }
+
     /// Whether a trade from `publisher` is evidence about a book-serving path.
     ///
     /// Two filters, both load-bearing. **An edge path only**: the public WS backstop reaches `emit` with
@@ -3365,11 +3381,26 @@ impl Arbiter {
                 if !self.book_markets.contains_key(&key) {
                     self.track_book_market(&key);
                 }
+                if b.changes
+                    .first()
+                    .is_some_and(|c| c.action == model::BookAction::Clear)
+                {
+                    self.books.note_rebaseline_point(&key, publisher);
+                }
+                // A hold waiting on a leader that is healthy again must not outlive an incomplete
+                // replay entry: a quiet holder never closes an event, so it never republishes one.
+                if self.books.holding_revert(&key) && self.replay_incomplete(&key) {
+                    self.books.drop_hold(&key);
+                    count_revert_hold(&b.venue, "incomplete");
+                }
                 let prev = self.books.last_admitted(&key);
                 let overridden_from = self.books.overridden_from(&key);
                 let healthy_here = self.books.healthy(&key, publisher);
                 let leader_before = self.books.scope_leader(&scope);
                 let decision = self.books.admit(key.clone(), publisher, b.recv_ts_ns);
+                if let Some(release) = self.books.take_hold_release() {
+                    count_revert_hold(&b.venue, release);
+                }
                 // Accumulate the path's feed whether or not it was admitted: a transfer republishes
                 // the new path's current levels, which exist only if its copies were folded in all along.
                 self.accumulate_book(&key, publisher, b);
@@ -5756,22 +5787,225 @@ mod tests {
         );
         assert_eq!(drain_books(&mut rx).len(), 1, "the override re-baselines");
 
+        // The leader reinstalls and recovers; the revert waits out the hold while both stream.
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 1_250);
         a.set_book_health(&key, path(1), true);
-        a.emit(
-            book(venue, BOOK_INSTRUMENT, vec![bid(0.43, 12.0)], true, 1_300),
-            path(1),
-            TEST_CATEGORY,
-        );
-        let out = drain_books(&mut rx);
-        assert_eq!(out.len(), 1, "and so does the revert");
-        assert!(out[0].snapshot && out[0].last);
-        assert_eq!(out[0].changes[0], clear_both());
+        let out = every_second(&mut a, &mut rx, venue, &[path(2), path(1)], 1, 17);
+        assert_eq!(rebaselines(&out), 1, "and so does the revert");
+        let re = out.last().unwrap();
+        assert!(re.snapshot && re.last, "the leader's first batch back");
         assert_eq!(
             a.books.scope_leader(&bscope(venue)),
             Some(path(1)),
             "the venue never moved: this is the override unwinding"
         );
         assert_eq!(revert.get(), before + 1);
+    }
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn rebaselines(out: &[NormalizedBook]) -> usize {
+        out.iter()
+            .filter(|b| b.changes.first() == Some(&clear_both()))
+            .count()
+    }
+
+    /// Three paths, the leader gapped on one market while two alternates interleave: the override
+    /// used to follow whichever alternate spoke last, re-baselining the consumer on every flip.
+    #[test]
+    fn a_lost_leader_datagram_burst_costs_one_rebaseline_each_way() {
+        let venue = "BookHoldBurst";
+        let transfers = |reason: &str| {
+            metrics()
+                .path_transfers
+                .with_label_values(&[venue, reason, "yes"])
+                .get()
+        };
+        let (health, revert) = (transfers("health"), transfers("health_revert"));
+        let key: MarketKey = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(3), 1_002);
+        let _ = drain_books(&mut rx);
+
+        a.set_book_health(&key, path(1), false);
+        let mut t = 1_000;
+        for i in 0..20 {
+            t += 1_000_000;
+            let p = if i % 2 == 0 { path(2) } else { path(3) };
+            a.emit(
+                book(venue, BOOK_INSTRUMENT, vec![bid(0.40, i as f64)], true, t),
+                p,
+                TEST_CATEGORY,
+            );
+        }
+        // The leader reinstalls, reports healthy, and streams on beside the holder.
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), t + 1);
+        a.set_book_health(&key, path(1), true);
+        let all = [path(1), path(2), path(3)];
+        let out = every_second(&mut a, &mut rx, venue, &all, 1, 21);
+        assert_eq!(transfers("health"), health + 1);
+        assert_eq!(transfers("health_revert"), revert + 1);
+        assert_eq!(rebaselines(&out), 2, "one out, one back");
+    }
+
+    /// Each of `paths` sends one closing batch on the test market every second over `[from, to)`.
+    fn every_second(
+        a: &mut Arbiter,
+        rx: &mut broadcast::Receiver<Arc<FeedMessage>>,
+        venue: &str,
+        paths: &[Transport],
+        from: u64,
+        to: u64,
+    ) -> Vec<NormalizedBook> {
+        let mut out = Vec::new();
+        for s in from..to {
+            for &p in paths {
+                a.emit(
+                    book(
+                        venue,
+                        BOOK_INSTRUMENT,
+                        vec![bid(0.43, s as f64)],
+                        true,
+                        s * SEC,
+                    ),
+                    p,
+                    TEST_CATEGORY,
+                );
+            }
+            out.extend(drain_books(rx));
+        }
+        out
+    }
+
+    /// [`gated`] with a replay map, path(3) synced, and path(1) gapped so path(2) holds the market.
+    fn on_hold(
+        venue: &str,
+    ) -> (
+        Arbiter,
+        broadcast::Receiver<Arc<FeedMessage>>,
+        crate::model::BookSnapshot,
+    ) {
+        let replay: crate::model::BookSnapshot = Arc::new(Mutex::new(BookReplay::default()));
+        let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+        a.set_book_replay(replay.clone());
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(3), 1_002);
+        a.set_book_health(&mkey(venue, BOOK_INSTRUMENT), path(1), false);
+        let out = every_second(&mut a, &mut rx, venue, &[path(2), path(3)], 1, 2);
+        assert_eq!(rebaselines(&out), 1, "path(2) took the market");
+        (a, rx, replay)
+    }
+
+    /// One event larger than the accumulator's pending cap, which leaves `p`'s copy incomplete.
+    fn overflow(a: &mut Arbiter, venue: &str, p: Transport, at: u64) {
+        let flood = (0..=crate::model::MAX_PENDING_CHANGES)
+            .map(|i| bid(0.01 * (1 + i % 500) as f64, 1.0))
+            .collect();
+        a.emit(
+            book(venue, BOOK_INSTRUMENT, flood, false, at),
+            p,
+            TEST_CATEGORY,
+        );
+    }
+
+    fn revert_holds(venue: &str, release: &str) -> u64 {
+        metrics()
+            .book_revert_holds
+            .with_label_values(&[venue, release])
+            .get()
+    }
+
+    /// The leader gapping again while its revert is held costs nothing on the wire.
+    #[test]
+    fn a_second_loss_during_the_hold_adds_no_transfers() {
+        let venue = "BookHoldSecondLoss";
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let transfers = |reason: &str| {
+            metrics()
+                .path_transfers
+                .with_label_values(&[venue, reason, "yes"])
+                .get()
+        };
+        let health = transfers("health");
+        let (mut a, mut rx, _) = on_hold(venue);
+        let all = [path(1), path(2), path(3)];
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 2 * SEC);
+        a.set_book_health(&key, path(1), true);
+        let mut out = every_second(&mut a, &mut rx, venue, &all, 3, 8);
+        a.set_book_health(&key, path(1), false);
+        out.extend(every_second(&mut a, &mut rx, venue, &all, 8, 10));
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 10 * SEC);
+        a.set_book_health(&key, path(1), true);
+        out.extend(every_second(&mut a, &mut rx, venue, &all, 11, 26));
+        assert_eq!(
+            rebaselines(&out),
+            0,
+            "still held 15 s after the first recovery"
+        );
+        out.extend(every_second(&mut a, &mut rx, venue, &all, 26, 27));
+        assert_eq!(rebaselines(&out), 1, "reverted 15 s after the second");
+        assert_eq!(transfers("health"), health + 1);
+    }
+
+    /// While held, the replay entry is the holder's to repair, never the held leader's.
+    #[test]
+    fn only_the_holder_owes_a_rebaseline() {
+        let venue = "BookHoldOwed";
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, _rx, _) = on_hold(venue);
+        overflow(&mut a, venue, path(2), SEC + 1);
+        let owed = |a: &Arbiter, p| a.book_rebaselines_owed(p, std::slice::from_ref(&key))[0];
+        assert!(owed(&a, path(2)));
+        assert!(!owed(&a, path(1)));
+        assert!(!owed(&a, path(3)));
+    }
+
+    /// A `clear`-led batch from the holder (its own republish) is not the leader re-baselining, so
+    /// only the deadline releases the hold.
+    #[test]
+    fn a_holders_republish_is_not_the_leaders_rebaseline_point() {
+        let venue = "BookHoldHolderRepublish";
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let deadline = revert_holds(venue, "deadline");
+        let (mut a, mut rx, _) = on_hold(venue);
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(2), 2 * SEC);
+        a.set_book_health(&key, path(1), true);
+        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 3, 61);
+        assert_eq!(rebaselines(&out), 1, "only the holder's own clear");
+        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 61, 62);
+        assert_eq!(rebaselines(&out), 1, "reverted at the deadline");
+        assert_eq!(revert_holds(venue, "deadline"), deadline + 1);
+    }
+
+    /// A held revert must not strand a market whose replay entry is incomplete: a holder that goes
+    /// quiet on the market never closes an event, so it never republishes it.
+    #[test]
+    fn a_hold_never_outlives_an_incomplete_replay_entry() {
+        let venue = "BookHoldIncomplete";
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let incomplete = revert_holds(venue, "incomplete");
+        let (mut a, mut rx, replay) = on_hold(venue);
+        overflow(&mut a, venue, path(2), SEC + 1);
+        synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 2 * SEC);
+        a.set_book_health(&key, path(1), true);
+        let out = every_second(&mut a, &mut rx, venue, &[path(1)], 3, 4);
+        assert_eq!(rebaselines(&out), 1, "the leader took it back at once");
+        assert_eq!(revert_holds(venue, "incomplete"), incomplete + 1);
+        assert!(model::lock(&replay).get(&key).unwrap().baselined());
+    }
+
+    /// A deadline release onto a leader whose own copy is incomplete degrades to a bare `clear`,
+    /// and the leader then owes the republish.
+    #[test]
+    fn a_deadline_release_onto_an_incomplete_leader_is_owed() {
+        let venue = "BookHoldDeadlineIncomplete";
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        let (mut a, mut rx, _) = on_hold(venue);
+        a.set_book_health(&key, path(1), true);
+        let _ = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 2, 60);
+        overflow(&mut a, venue, path(1), 60 * SEC);
+        let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 61, 62);
+        assert_eq!(out[0].changes, vec![clear_both()], "a bare clear");
+        assert!(a.book_rebaselines_owed(path(1), std::slice::from_ref(&key))[0]);
     }
 
     /// `rebaselined` separates a handover that costs a consumer a whole book from one that costs

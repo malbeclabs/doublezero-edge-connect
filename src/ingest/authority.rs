@@ -48,9 +48,11 @@
 //!   book or keep serving that book, and under incremental output a lost level does not self-heal
 //!   until the next snapshot.
 //!
-//! Health is an **override**, computed from health and the universe's leader rather than stored: a
-//! market whose leader is unhealthy is served by a healthy path, and reverts on its own when the
-//! leader's book recovers. Nothing to unwind, and no second authority to keep in sync.
+//! Health is an **override** on the universe's leader, and it is **stored** ([`RevertHold`]): a
+//! market whose leader is unhealthy is pinned to one healthy path, and goes back only after the
+//! leader has been healthy for [`REVERT_HOLD_NS`] and has re-baselined that market itself, or at
+//! [`REVERT_DEADLINE_NS`]. Computed per admission instead, it followed whichever alternate spoke
+//! last, and every handover in either direction costs the consumer a whole book.
 //!
 //! # Bounding
 //!
@@ -113,6 +115,14 @@ const MAX_TRACKED_MARKETS: usize = 1 << 16;
 /// enough to hit it decides on the window's first 4096 matches — so the cap sits well above what the
 /// margin test needs rather than being a tight bound.
 const MAX_WINDOW_SAMPLES: usize = 4096;
+
+/// Continuous leader health a held market waits for before reverting. Insurance, not a measured
+/// fix: sized above the p99 (7.07 s) and max (13.09 s) unhealth episodes measured on one bridge.
+pub(crate) const REVERT_HOLD_NS: u64 = 15_000_000_000;
+
+/// Unconditional revert once the leader is healthy, so a market whose leader never re-baselines it
+/// is not held on the override for good.
+pub(crate) const REVERT_DEADLINE_NS: u64 = 60_000_000_000;
 
 /// Tunables for [`StickyAuthority`], all CLI-settable (`--arb-*`).
 #[derive(Debug, Clone, Copy)]
@@ -179,12 +189,30 @@ impl ScopeState {
     }
 }
 
-/// Per-market state. Health and the last-admitted path only; authority itself spans the scope.
+/// A market pinned to `holder` while its `leader` is, or recently was, unhealthy.
+#[derive(Clone, Copy, Debug)]
+struct RevertHold {
+    holder: Transport,
+    /// The scope leader the hold was taken from; an election moving it discards the hold.
+    leader: Transport,
+    began_ns: u64,
+    /// First admission seen with the leader healthy since it last went unhealthy. Stamped lazily,
+    /// because health reports carry no time.
+    leader_healthy_since_ns: Option<u64>,
+}
+
+/// Per-market state. Health, the last-admitted path and the override hold; authority itself spans
+/// the scope.
 #[derive(Default)]
 struct MarketState {
     /// Paths known unhealthy here (`gap`/`awaiting-snapshot`). Absent means healthy, so a market whose
     /// processor does not report health still gets served.
     unhealthy: HashSet<Transport>,
+    /// Paths that have sent this market a `clear`-led batch since they were last reported unhealthy
+    /// here. The processor emits a recovering book's install *before* it reports healthy, so this
+    /// cannot be scoped to "since healthy".
+    reinstalled: HashSet<Transport>,
+    hold: Option<RevertHold>,
     /// Who was last admitted here, so `opened_tick` marks a real change of served path rather than
     /// every leader message.
     last_admitted: Option<Transport>,
@@ -217,6 +245,8 @@ pub struct StickyAuthority {
     /// composite key.
     ordinals: HashMap<ScopeKey, HashMap<Transport, &'static str>>,
     cfg: AuthorityConfig,
+    /// How the last [`Self::admit`] ended a hold, if it did, for the caller's counter.
+    hold_released: Option<&'static str>,
 }
 
 impl StickyAuthority {
@@ -227,6 +257,7 @@ impl StickyAuthority {
             market_order: VecDeque::new(),
             ordinals: HashMap::new(),
             cfg,
+            hold_released: None,
         }
     }
 
@@ -266,7 +297,43 @@ impl StickyAuthority {
             m.unhealthy.remove(&publisher);
         } else {
             m.unhealthy.insert(publisher);
+            m.reinstalled.remove(&publisher);
+            if let Some(h) = m.hold.as_mut().filter(|h| h.leader == publisher) {
+                h.leader_healthy_since_ns = None;
+            }
         }
+    }
+
+    /// Record that `publisher` sent `key` a `clear`-led batch, admitted or not — the leader's own
+    /// re-baseline point a held revert waits for.
+    pub fn note_rebaseline_point(&mut self, key: &MarketKey, publisher: Transport) {
+        if let Some(m) = self.markets.get_mut(key) {
+            m.reinstalled.insert(publisher);
+        }
+    }
+
+    /// Whether `key` is held on an override its leader is healthy enough to take back.
+    pub fn holding_revert(&self, key: &MarketKey) -> bool {
+        let Some(leader) = self.scope_leader(&scope_of(key)) else {
+            return false;
+        };
+        self.markets
+            .get(key)
+            .and_then(|m| m.hold)
+            .is_some_and(|h| h.leader == leader)
+            && self.healthy(key, leader)
+    }
+
+    /// Discard `key`'s hold, so its next admission is served by the computed rule.
+    pub fn drop_hold(&mut self, key: &MarketKey) {
+        if let Some(m) = self.markets.get_mut(key) {
+            m.hold = None;
+        }
+    }
+
+    /// How the last [`Self::admit`] released a hold (`natural`/`deadline`), if it did.
+    pub fn take_hold_release(&mut self) -> Option<&'static str> {
+        self.hold_released.take()
     }
 
     pub(crate) fn healthy(&self, key: &MarketKey, publisher: Transport) -> bool {
@@ -286,6 +353,7 @@ impl StickyAuthority {
         publisher: Transport,
         arrival_ns: u64,
     ) -> Admit<Transport> {
+        self.hold_released = None;
         let scope = scope_of(&key);
         // Ineligible paths enter no map and are never authoritative (see the module doc).
         if self.path_ordinal(&scope, publisher) == OTHER_PATH {
@@ -324,6 +392,7 @@ impl StickyAuthority {
         // with `leader_of` and the gauge — computing it a second time here is how the unhealthy
         // leader ends up re-authorising itself when it is the path sending. It resolves its own scope
         // from the key, so there is no second place for the two to disagree.
+        self.refresh_hold(&key, publisher, arrival_ns);
         if self.serving(&key) != Some(publisher) {
             return Admit::Dropped;
         }
@@ -408,27 +477,98 @@ impl StickyAuthority {
         self.scopes.get(scope).map(|v| v.leader)
     }
 
-    /// The path actually serving one market: its scope's leader, or a healthy path overriding it when
-    /// the leader's book here is not. `None` only when the scope has no leader yet.
+    /// Take or release `key`'s hold before `publisher`'s admission at `now`.
     ///
-    /// The alternative is chosen by most-recently-live rather than by map order, so two paths cannot
-    /// be picked differently on two calls with the same state.
-    fn serving(&self, key: &MarketKey) -> Option<Transport> {
+    /// Taken by the first healthy alternate to send while the leader is unhealthy, so a market no
+    /// alternate ever served holds nothing back. Discarded when an election moves the leader or the
+    /// holder goes unhealthy or silent; the next alternate to send then takes a fresh one. Released
+    /// only on the leader's own batch, so it serves the batch that released it.
+    fn refresh_hold(&mut self, key: &MarketKey, publisher: Transport, now: u64) {
         let scope = scope_of(key);
-        let leader = self.scope_leader(&scope)?;
+        let Some(leader) = self.scope_leader(&scope) else {
+            return;
+        };
+        let leader_healthy = self.healthy(key, leader);
+        let stored = self.markets.get(key).and_then(|m| m.hold);
+        if stored.is_none() && leader_healthy {
+            return;
+        }
+        let holder_live = |h: &RevertHold| {
+            self.scopes
+                .get(&scope)
+                .and_then(|v| v.paths.get(&h.holder))
+                .is_some_and(|p| now.saturating_sub(p.last_seen_ns) <= self.cfg.leader_timeout_ns)
+        };
+        let next = match stored
+            .filter(|h| h.leader == leader && self.healthy(key, h.holder) && holder_live(h))
+        {
+            None if leader_healthy || publisher == leader || !self.healthy(key, publisher) => None,
+            None => Some(RevertHold {
+                holder: publisher,
+                leader,
+                began_ns: now,
+                leader_healthy_since_ns: None,
+            }),
+            Some(mut h) => {
+                h.leader_healthy_since_ns =
+                    leader_healthy.then(|| h.leader_healthy_since_ns.unwrap_or(now));
+                let release = match h.leader_healthy_since_ns {
+                    Some(since) if publisher == leader => {
+                        let reinstalled = self
+                            .markets
+                            .get(key)
+                            .is_some_and(|m| m.reinstalled.contains(&leader));
+                        if reinstalled && now.saturating_sub(since) >= REVERT_HOLD_NS {
+                            Some("natural")
+                        } else if now.saturating_sub(h.began_ns) >= REVERT_DEADLINE_NS {
+                            Some("deadline")
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                self.hold_released = release;
+                release.is_none().then_some(h)
+            }
+        };
+        if stored.is_some() || next.is_some() {
+            self.market_mut(key).hold = next;
+        }
+    }
+
+    /// The healthy non-leader path most recently live anywhere in the scope, other than `exclude`.
+    fn alternate(
+        &self,
+        key: &MarketKey,
+        leader: Transport,
+        exclude: Option<Transport>,
+    ) -> Option<Transport> {
+        let scope = scope_of(key);
+        self.scopes
+            .get(&scope)?
+            .paths
+            .iter()
+            .filter(|(a, _)| **a != leader && Some(**a) != exclude && self.healthy(key, **a))
+            // The ordinal breaks a `last_seen_ns` tie: without it two tying paths are ordered by
+            // `HashMap` iteration and two calls on one state could pick differently.
+            .max_by_key(|&(&a, path)| (path.last_seen_ns, self.path_label(&scope, a)))
+            .map(|(a, _)| *a)
+    }
+
+    /// The path actually serving one market: the holder of its override while it is healthy, else
+    /// its scope's leader, or a healthy path overriding it when the leader's book here is not.
+    /// `None` only when the scope has no leader yet.
+    fn serving(&self, key: &MarketKey) -> Option<Transport> {
+        let leader = self.scope_leader(&scope_of(key))?;
+        let hold = self.markets.get(key).and_then(|m| m.hold);
+        if let Some(h) = hold.filter(|h| h.leader == leader && self.healthy(key, h.holder)) {
+            return Some(h.holder);
+        }
         if self.healthy(key, leader) {
             return Some(leader);
         }
-        let paths = &self.scopes.get(&scope)?.paths;
-        Some(
-            paths
-                .iter()
-                .filter(|(a, _)| **a != leader && self.healthy(key, **a))
-                // The ordinal breaks a `last_seen_ns` tie: without it two tying paths are ordered by
-                // `HashMap` iteration and could alternate as the override, interleaving their deltas.
-                .max_by_key(|&(&a, path)| (path.last_seen_ns, self.path_label(&scope, a)))
-                .map_or(leader, |(a, _)| *a),
-        )
+        Some(self.alternate(key, leader, None).unwrap_or(leader))
     }
 
     /// The path actually serving one market — its scope's leader, or a healthy path overriding it.
@@ -870,19 +1010,149 @@ mod tests {
         assert_eq!(a.admit(other_market(), path(2), 1_350), Admit::Dropped);
     }
 
-    /// The override reverts on its own when the leader's book recovers — it is computed, not stored.
-    #[test]
-    fn the_override_reverts_when_the_leaders_book_recovers() {
+    // ---- the revert hold ----
+
+    const SEC: u64 = 1_000_000_000;
+
+    /// Keeps `paths` live scope-wide every second over `[from, to)` without touching [`key`]: a real
+    /// path streams other markets, and a silent holder releases its hold.
+    fn keep_live(a: &mut StickyAuthority, paths: &[Transport], from: u64, to: u64) {
+        for t in (from..to).step_by(SEC as usize) {
+            for &p in paths {
+                a.admit(other_market(), p, t);
+            }
+        }
+    }
+
+    /// path(1) leads and is gapped on [`key`]; path(2) takes the hold at `SEC`.
+    fn on_hold() -> StickyAuthority {
         let mut a = StickyAuthority::new(no_window_cfg());
         a.admit(key(), path(1), 1_000);
         a.set_health(&key(), path(1), false);
-        assert!(a.admit(key(), path(2), 1_100).emitted());
+        assert!(a.admit(key(), path(2), SEC).emitted());
+        a
+    }
+
+    /// The override reverts once the leader's book has recovered, re-baselined and stayed healthy.
+    #[test]
+    fn the_override_reverts_when_the_leaders_book_recovers() {
+        let mut a = on_hold();
+        a.note_rebaseline_point(&key(), path(1));
         a.set_health(&key(), path(1), true);
+        assert_eq!(a.admit(key(), path(1), 2 * SEC), Admit::Dropped, "held");
+        keep_live(&mut a, &[path(1), path(2)], 2 * SEC, 17 * SEC);
         assert!(
-            a.admit(key(), path(1), 1_200).emitted(),
+            a.admit(key(), path(1), 17 * SEC).emitted(),
             "back to the leader"
         );
-        assert_eq!(a.admit(key(), path(2), 1_250), Admit::Dropped);
+        assert_eq!(a.take_hold_release(), Some("natural"));
+        assert_eq!(a.admit(key(), path(2), 17 * SEC + 1), Admit::Dropped);
+    }
+
+    /// The processor emits a recovering book's install before it reports healthy, so an install
+    /// received while unhealthy is the re-baseline point.
+    #[test]
+    fn an_install_before_the_health_report_counts() {
+        let mut a = on_hold();
+        a.note_rebaseline_point(&key(), path(1));
+        assert_eq!(a.admit(key(), path(1), 2 * SEC), Admit::Dropped);
+        a.set_health(&key(), path(1), true);
+        a.admit(key(), path(1), 3 * SEC);
+        keep_live(&mut a, &[path(1), path(2)], 3 * SEC, 18 * SEC);
+        assert!(a.admit(key(), path(1), 18 * SEC).emitted());
+    }
+
+    /// Two alternates interleaving must not trade the market: the first to serve it holds it.
+    #[test]
+    fn the_override_is_pinned_while_its_holder_is_healthy() {
+        let mut a = on_hold();
+        for i in 1..10 {
+            let t = SEC + i * 1_000;
+            assert_eq!(a.admit(key(), path(3), t), Admit::Dropped);
+            assert!(a.admit(key(), path(2), t + 1).emitted());
+        }
+    }
+
+    /// A gapped holder hands the market to the next alternate to send, which then keeps it.
+    #[test]
+    fn an_unhealthy_holder_moves_the_hold_once() {
+        let mut a = on_hold();
+        a.admit(key(), path(3), SEC + 1);
+        a.set_health(&key(), path(2), false);
+        assert!(a.admit(key(), path(3), SEC + 2).emitted());
+        a.set_health(&key(), path(2), true);
+        assert_eq!(a.admit(key(), path(2), SEC + 3), Admit::Dropped);
+        assert!(a.admit(key(), path(3), SEC + 4).emitted());
+    }
+
+    /// Health alone does not revert: the leader's book must also have re-baselined the market, and
+    /// the holder's own re-baseline is not the leader's.
+    #[test]
+    fn a_revert_waits_for_the_leaders_own_rebaseline() {
+        let mut a = on_hold();
+        a.note_rebaseline_point(&key(), path(2));
+        a.set_health(&key(), path(1), true);
+        a.admit(key(), path(1), 2 * SEC);
+        keep_live(&mut a, &[path(1), path(2)], 2 * SEC, 30 * SEC);
+        assert_eq!(a.admit(key(), path(1), 30 * SEC), Admit::Dropped);
+        a.note_rebaseline_point(&key(), path(1));
+        assert!(a.admit(key(), path(1), 30 * SEC + 1).emitted());
+        assert_eq!(a.take_hold_release(), Some("natural"));
+    }
+
+    /// A leader that never re-baselines the market takes it back at the deadline.
+    #[test]
+    fn a_quiet_market_reverts_on_the_deadline() {
+        let mut a = on_hold();
+        a.set_health(&key(), path(1), true);
+        let deadline = SEC + REVERT_DEADLINE_NS;
+        keep_live(&mut a, &[path(1), path(2)], 2 * SEC, deadline);
+        assert_eq!(a.admit(key(), path(1), deadline - 1), Admit::Dropped);
+        assert!(a.admit(key(), path(1), deadline).emitted());
+        assert_eq!(a.take_hold_release(), Some("deadline"));
+    }
+
+    /// The leader gapping again mid-hold restarts both conditions.
+    #[test]
+    fn health_lost_during_the_hold_restarts_the_clock() {
+        let mut a = on_hold();
+        a.note_rebaseline_point(&key(), path(1));
+        a.set_health(&key(), path(1), true);
+        a.admit(key(), path(1), 2 * SEC);
+        keep_live(&mut a, &[path(1), path(2)], 2 * SEC, 10 * SEC);
+        a.set_health(&key(), path(1), false);
+        a.note_rebaseline_point(&key(), path(1));
+        a.set_health(&key(), path(1), true);
+        a.admit(key(), path(1), 10 * SEC);
+        keep_live(&mut a, &[path(1), path(2)], 10 * SEC, 25 * SEC);
+        assert_eq!(
+            a.admit(key(), path(1), 24 * SEC),
+            Admit::Dropped,
+            "15 s from the first recovery is not enough"
+        );
+        assert!(a.admit(key(), path(1), 25 * SEC).emitted());
+    }
+
+    /// A hold names the leader it was taken from; an election moving the leader discards it.
+    #[test]
+    fn an_election_discards_the_hold() {
+        let mut a = on_hold();
+        a.set_health(&key(), path(1), true);
+        assert!(a.holding_revert(&key()));
+        a.admit(key(), path(3), SEC + 1);
+        assert!(a.transfer_scope_to(&scope(), path(3), SEC + 2));
+        assert!(!a.holding_revert(&key()));
+        assert_eq!(a.admit(key(), path(2), SEC + 3), Admit::Dropped);
+        assert!(a.admit(key(), path(3), SEC + 4).emitted());
+    }
+
+    /// A holder gone silent across its scope holds nothing back.
+    #[test]
+    fn a_silent_holder_releases_the_hold() {
+        let mut a = on_hold();
+        a.set_health(&key(), path(1), true);
+        keep_live(&mut a, &[path(1)], 2 * SEC, 5 * SEC);
+        assert!(a.admit(key(), path(1), 5 * SEC).emitted());
     }
 
     /// An unhealthy challenger must not take over from an unhealthy leader — that flaps between two
