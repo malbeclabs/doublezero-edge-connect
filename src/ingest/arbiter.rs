@@ -6259,51 +6259,130 @@ mod tests {
         assert_eq!((count("no"), count("yes")), (no + 1, yes));
     }
 
-    /// Part A's hold never reads the declaration: the burst costs the same transfers either way.
+    /// Part A's hold never reads the declaration: an override and its revert cost the same
+    /// transfers either way. Every batch carries a real slot and the paths agree, so the declared run
+    /// takes the seamless predicate on both handovers.
     #[test]
     fn the_revert_hold_is_identical_whether_the_slot_is_shared() {
         let run = |venue: &'static str, declared: bool| {
             let key = mkey(venue, BOOK_INSTRUMENT);
-            let (mut a, mut rx) = gated(venue, AuthorityConfig::default());
+            let (tx, mut rx) = broadcast::channel(4096);
+            let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+            a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
             if declared {
                 a.set_shared_batch_id(venue, TEST_CATEGORY);
             }
-            synced(&mut a, venue, BOOK_INSTRUMENT, path(3), 1_002);
-            a.set_book_health(&key, path(1), false);
-            for i in 0..20u64 {
-                let p = if i % 2 == 0 { path(2) } else { path(3) };
+            let all = [path(1), path(2), path(3)];
+            for (i, p) in all.iter().enumerate() {
+                let baseline = vec![clear_both(), bid(0.40, 10.0)];
                 a.emit(
-                    book(
-                        venue,
-                        BOOK_INSTRUMENT,
-                        vec![bid(0.40, i as f64)],
-                        true,
-                        1_000_000 * (i + 1),
-                    ),
-                    p,
+                    at_slot(venue, baseline, true, 10, 10 * SEC + i as u64),
+                    *p,
                     TEST_CATEGORY,
                 );
             }
-            synced(&mut a, venue, BOOK_INSTRUMENT, path(1), 30_000_000);
-            a.set_book_health(&key, path(1), true);
-            every_second(&mut a, &mut rx, venue, &[path(1), path(2), path(3)], 1, 21);
-            ["health", "health_revert"].map(|reason| {
-                ["yes", "no"]
-                    .iter()
-                    .map(|r| {
-                        metrics()
-                            .path_transfers
-                            .with_label_values(&[venue, reason, r])
-                            .get()
-                    })
-                    .sum::<u64>()
-            })
+            a.set_book_health(&key, path(1), false);
+            for s in 11..=40u64 {
+                if s == 13 {
+                    // The leader reinstalls at the slot it stands at, then reports healthy.
+                    let install = vec![clear_both(), bid(0.40, 12.0)];
+                    a.emit(
+                        at_slot(venue, install, true, 12, s * SEC - 1),
+                        path(1),
+                        TEST_CATEGORY,
+                    );
+                    a.set_book_health(&key, path(1), true);
+                }
+                // The leader's lost datagram: it sends nothing the second it gaps.
+                let senders = if s == 11 { &all[1..] } else { &all[..] };
+                for &p in senders {
+                    let slot = u32::try_from(s).unwrap();
+                    let delta = vec![bid(0.40, s as f64)];
+                    a.emit(at_slot(venue, delta, true, slot, s * SEC), p, TEST_CATEGORY);
+                }
+                let _ = drain_books(&mut rx);
+            }
+            let count = |reason: &str, r: &str| {
+                metrics()
+                    .path_transfers
+                    .with_label_values(&[venue, reason, r])
+                    .get()
+            };
+            [
+                count("health", "yes") + count("health", "no"),
+                count("health_revert", "yes") + count("health_revert", "no"),
+                count("health", "no") + count("health_revert", "no"),
+            ]
         };
+        let declared = run("BookHoldDeclared", true);
+        let undeclared = run("BookHoldUndeclared", false);
         assert_eq!(
-            run("BookHoldDeclared", true),
-            run("BookHoldUndeclared", false)
+            declared[..2],
+            undeclared[..2],
+            "the same transfers either way"
         );
-        assert_eq!(run("BookHoldDeclared2", true), [1, 1]);
+        assert_eq!(declared[..2], [1, 1]);
+        assert_eq!(
+            declared[2], 2,
+            "both handovers went through the seamless predicate"
+        );
+        assert_eq!(undeclared[2], 0);
+    }
+
+    /// The consumer's side of the comparison is the replay entry, and it has to be whole too.
+    fn replace_replay(a: &mut Arbiter, venue: &str, acc: BookAccumulator) {
+        let replay = a.book_replay.clone().unwrap();
+        model::lock(&replay).insert(mkey(venue, BOOK_INSTRUMENT), acc);
+    }
+
+    fn replay_acc(batches: &[FeedMessage]) -> BookAccumulator {
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        for m in batches {
+            let FeedMessage::Book(b) = m else {
+                unreachable!()
+            };
+            acc.apply(b);
+        }
+        acc
+    }
+
+    /// Same levels and slot as the incoming path, but the consumer's book was never baselined.
+    #[test]
+    fn an_incomplete_served_side_never_switches_silently() {
+        let venue = "BookSeamlessServedIncomplete";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let partial = replay_acc(&[at_slot(venue, vec![bid(0.40, 10.0)], true, 10, 1)]);
+        assert!(!partial.baselined() && partial.batch_id() == Some(10));
+        replace_replay(&mut a, venue, partial);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
+    }
+
+    /// Same committed slot and levels, but the consumer is mid-event: switching now would splice the
+    /// incoming path's deltas into an event the outgoing path opened.
+    #[test]
+    fn a_served_side_with_pending_changes_never_switches_silently() {
+        let venue = "BookSeamlessServedPending";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let open = replay_acc(&[
+            at_slot(venue, vec![clear_both(), bid(0.40, 10.0)], true, 10, 1),
+            at_slot(venue, vec![bid(0.39, 1.0)], false, 11, 2),
+        ]);
+        assert!(open.baselined() && !open.pending_empty() && open.batch_id() == Some(10));
+        replace_replay(&mut a, venue, open);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
+    }
+
+    /// The market has already published a slot past the one both books stand at.
+    #[test]
+    fn a_slot_behind_the_published_one_never_switches_silently() {
+        let venue = "BookSeamlessBehindWire";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        a.book_markets.get_mut(&key).unwrap().wire_slot = Some(12);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
     }
 
     /// `rebaselined` separates a handover that costs a consumer a whole book from one that costs

@@ -138,6 +138,12 @@ pub enum RegistryError {
         venue: String,
         category: String,
     },
+    /// A row that carries no book declares `shared_batch_id`.
+    SharedBatchIdOnNonBookRow {
+        venue: String,
+        category: String,
+        kind: &'static str,
+    },
     /// A row's `emit_trades` contradicts whether its kind can ever own a tape.
     EmitTradesDisagrees {
         venue: String,
@@ -238,6 +244,15 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "{venue}/{category}: book rows disagree on `shared_batch_id`; the arbiter reads one \
                  value per venue and category"
+            ),
+            RegistryError::SharedBatchIdOnNonBookRow {
+                venue,
+                category,
+                kind,
+            } => write!(
+                f,
+                "{venue}/{category}: `shared_batch_id` is declared on a `{kind}` row, which carries \
+                 no book; declare it on the market-by-price or market-by-order row"
             ),
             RegistryError::EmitTradesDisagrees {
                 venue,
@@ -847,8 +862,16 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
         }
 
         // Book rows only: the arbiter installs one value per `(venue, category)` and only the book
-        // gate reads it, so a top-of-book sibling need not repeat it.
-        if matches!(f.kind, FeedKind::MarketByPrice | FeedKind::MarketByOrder)
+        // gate reads it, so a top-of-book row declaring it would declare the book scope unchecked.
+        let book_row = matches!(f.kind, FeedKind::MarketByPrice | FeedKind::MarketByOrder);
+        if f.shared_batch_id && !book_row {
+            return Err(RegistryError::SharedBatchIdOnNonBookRow {
+                venue: f.venue.to_string(),
+                category: f.category.to_string(),
+                kind: f.kind.label(),
+            });
+        }
+        if book_row
             && *shared_slots
                 .entry((f.venue, f.category))
                 .or_insert(f.shared_batch_id)
@@ -1732,6 +1755,19 @@ mod tests {
             build(&doc_with(&format!("{mbp},{PERPS_ROW}")), "test").is_ok(),
             "a top-of-book row need not repeat it"
         );
+    }
+
+    /// Only the book gate reads it, so a row with no book declaring it is a mistake, not a no-op.
+    #[test]
+    fn shared_batch_id_on_a_row_with_no_book_is_fatal() {
+        let tob = PERPS_ROW.replace(
+            r#""arbitration":"Sticky","#,
+            r#""arbitration":"Sticky","shared_batch_id":true,"#,
+        );
+        assert!(matches!(
+            build(&doc_with(&tob), "test"),
+            Err(RegistryError::SharedBatchIdOnNonBookRow { .. })
+        ));
     }
 
     #[test]

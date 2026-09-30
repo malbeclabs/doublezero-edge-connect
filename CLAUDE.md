@@ -610,7 +610,8 @@ Modules are grouped by role under `src/`:
   an election moves the leader, the holder goes unhealthy or silent, or the replay entry is incomplete
   (a quiet holder would never republish it); `dz_book_revert_holds_total{release}` counts the endings.
   ⚠️ **A handover skips the re-baseline only where the registry declares `shared_batch_id`** (one value
-  per `(venue, category)` over the book rows, installed beside the arbitration mode; true on
+  per `(venue, category)` over the book rows, refused at load on a row with no book, installed
+  beside the arbitration mode; true on
   `edge-phoenix-mbp` alone, whose publishers stamp the venue slot): `Arbiter::seamless_handover` then
   compares the **replay entry** (what reached the wire; a withheld batch can make the outgoing path's
   own accumulator differ from the consumer's book) against the incoming path's accumulator, before

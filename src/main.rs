@@ -659,7 +659,12 @@ async fn main() -> Result<()> {
         // SourceID, so a venue can reach the arbiter without its own feed being ingested.
         for f in ingest::feeds::feeds() {
             a.set_mode(f.venue, f.arbitration);
-            if f.shared_batch_id {
+            if f.shared_batch_id
+                && matches!(
+                    f.kind,
+                    ingest::feeds::FeedKind::MarketByPrice | ingest::feeds::FeedKind::MarketByOrder
+                )
+            {
                 a.set_shared_batch_id(f.venue, f.category);
             }
         }
