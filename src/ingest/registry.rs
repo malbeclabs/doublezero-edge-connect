@@ -142,6 +142,14 @@ pub enum RegistryError {
     ArbitrationDisagreement {
         venue: String,
     },
+    /// Two rows of one `(venue, category)` declare different Source IDs (or one declares an ID and
+    /// the other none). Rows sharing a category are one universe to tape ownership and the book
+    /// authority, so two engines there would contest one tape and one row would mute the other's
+    /// trades.
+    SourceIdDisagreement {
+        venue: String,
+        category: String,
+    },
     /// A row's `emit_trades` contradicts whether its kind can ever own a tape.
     EmitTradesDisagrees {
         venue: String,
@@ -250,6 +258,12 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "{venue}/{category}: two `{kind}` rows share one identity; the second would be \
                  dropped by feed selection and never bound"
+            ),
+            RegistryError::SourceIdDisagreement { venue, category } => write!(
+                f,
+                "{venue}/{category}: rows declare different `source_id`s; rows sharing a category \
+                 are one universe to tape ownership, so one engine's row would mute the other's \
+                 trades — give each engine its own category"
             ),
             RegistryError::ArbitrationDisagreement { venue } => write!(
                 f,
@@ -831,6 +845,8 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     let mut triples = std::collections::HashSet::new();
     let mut modes: std::collections::HashMap<&str, ArbitrationMode> =
         std::collections::HashMap::new();
+    let mut declared: std::collections::HashMap<(&str, &str), Option<u16>> =
+        std::collections::HashMap::new();
     let mut group_ports = std::collections::HashSet::new();
     let mut mbo_categories: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::new();
@@ -859,6 +875,24 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
             std::collections::hash_map::Entry::Occupied(_) => {}
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(f.arbitration);
+            }
+        }
+
+        // Tape ownership (`reconcile::tape_owners`) and the book authority's scope key on
+        // `(venue, category)`, never on the Source ID, so rows sharing one are a single universe.
+        // Two engines declared there would contest one tape and the owning row would mute the
+        // other's trades outright. `None` against `Some` disagrees too: that is a document that
+        // declared an engine on one row of the universe and forgot its sibling.
+        match declared.entry((f.venue, f.category)) {
+            std::collections::hash_map::Entry::Occupied(e) if *e.get() != f.source_id => {
+                return Err(RegistryError::SourceIdDisagreement {
+                    venue: f.venue.to_string(),
+                    category: f.category.to_string(),
+                })
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(f.source_id);
             }
         }
 
@@ -2013,6 +2047,37 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// Rows sharing a `(venue, category)` are one universe to tape ownership, so declaring two
+    /// engines there would let one row mute the other's trades. A second row of the usdsm category
+    /// (a market-by-price sibling) declaring spot's ID is refused, and so is one declaring none.
+    #[test]
+    fn rows_of_one_category_declaring_different_source_ids_are_refused() {
+        let sibling = |id: &str| {
+            format!(
+                r#",{{
+            "venue":"BINANCE","category":"usdsm","code":"x","kind":"MarketByPrice",
+            "group":"233.84.178.40","emit_trades":true,"arbitration":"Sticky"{id},
+            "publishers":{{"explicit":[{{"mktdata":31001,"refdata":31002,"snapshot":31003}}]}}}}"#
+            )
+        };
+        let rows = two_engine_rows(r#","source_id":6"#, r#","source_id":8"#);
+        for id in [r#","source_id":8"#, ""] {
+            let doc = doc_with_sources(BOTH_BINANCE_IDS, &format!("{rows}{}", sibling(id)));
+            let err = build(&doc, "test")
+                .map(|_| ())
+                .expect_err("one universe, two engines");
+            assert!(
+                matches!(&err, RegistryError::SourceIdDisagreement { category, .. } if category == "usdsm"),
+                "{id:?}: {err:?}"
+            );
+        }
+        let doc = doc_with_sources(
+            BOTH_BINANCE_IDS,
+            &format!("{rows}{}", sibling(r#","source_id":6"#)),
+        );
+        build(&doc, "test").expect("a sibling agreeing on the ID loads");
     }
 
     /// Optional: a row declaring none loads exactly as before, at the name-level status key.

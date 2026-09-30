@@ -172,7 +172,7 @@ Modules are grouped by role under `src/`:
   overflow, and a **port shape matching the protocol** — `MarketByPrice`/`MarketByOrder` bind three
   port roles, `TopOfBook`/`Midpoint` two, which is what turns a misspelled optional `snapshot` key
   from a
-  silently two-port block whose book never syncs into a startup error) **and the five cross-row
+  silently two-port block whose book never syncs into a startup error) **and the six cross-row
   invariants** — `(venue, category, kind)` uniqueness,
   one arbitration mode per **venue** (the granularity `Arbiter::set_mode` keys on, so disagreement
   cannot resolve last-write-wins by document order), `emit_trades` agreeing with
@@ -180,7 +180,9 @@ Modules are grouped by role under `src/`:
   `MarketByOrder` category** (a departing receiver releases its publishers' book standing by
   category — the one scope it and the `MarketKey` provably share, see
   `Arbiter::forget_publisher_books` — so two venues carrying that kind under one category would have
-  each exit release the other's live paths). The first four used to be
+  each exit release the other's live paths), plus **one declared `source_id` per `(venue,
+  category)`** (tape ownership and the book authority key on that pair, never on the Source ID, so
+  two engines declared in one universe would let one row mute the other's trades). The first four used to be
   `#[cfg(test)]` assertions over the built-in document, which stopped being sufficient the moment a
   document could be supplied at runtime. The rest is upstream policy this process cannot verify.
   `publishers` is a tagged union: `explicit` lists port blocks verbatim, `derived` carries a published
