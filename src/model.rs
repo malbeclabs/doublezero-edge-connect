@@ -910,6 +910,31 @@ impl BookAccumulator {
         self.source_ts_ns
     }
 
+    /// Whether `other` rests exactly the same levels and orders, sizes compared bit for bit. Says
+    /// nothing about completeness, slot or pending changes; the caller checks those.
+    pub fn same_state(&self, other: &Self) -> bool {
+        fn level_eq(a: &(f64, f64), b: &(f64, f64)) -> bool {
+            a.0.to_bits() == b.0.to_bits() && a.1.to_bits() == b.1.to_bits()
+        }
+        fn side_eq(
+            a: &std::collections::BTreeMap<i128, (f64, f64)>,
+            b: &std::collections::BTreeMap<i128, (f64, f64)>,
+        ) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((ka, va), (kb, vb))| ka == kb && level_eq(va, vb))
+        }
+        side_eq(&self.bids, &other.bids)
+            && side_eq(&self.asks, &other.asks)
+            && self.orders.len() == other.orders.len()
+            && self.orders.iter().all(|(id, (bid, key, price, size))| {
+                other.orders.get(id).is_some_and(|(b2, k2, p2, s2)| {
+                    bid == b2 && key == k2 && level_eq(&(*price, *size), &(*p2, *s2))
+                })
+            })
+    }
+
     /// The committed slot this accumulated state stands at, or `None` if no batch has named one.
     pub fn batch_id(&self) -> Option<u32> {
         self.batch_id
@@ -1827,6 +1852,50 @@ mod tests {
             size,
             order_id,
         }
+    }
+
+    /// Equal only on identical resting state: every level and order, sizes compared bit for bit.
+    #[test]
+    fn two_accumulators_compare_equal_only_on_identical_state() {
+        let level = |side, price, size| order(BookAction::Update, side, price, size, 0);
+        let base = vec![
+            level(BookSide::Bid, 100.0, 5.0),
+            level(BookSide::Ask, 101.0, 2.0),
+        ];
+        let build = |changes: Vec<BookChange>| {
+            let mut acc = BookAccumulator::new("BTC".into());
+            acc.apply(&book(changes, false, true));
+            acc
+        };
+        let a = build(base.clone());
+        assert!(a.same_state(&build(base.clone())));
+        let mut sized = base.clone();
+        sized[0].size = 5.000_000_000_1;
+        assert!(!a.same_state(&build(sized)), "a size differs");
+        let mut extra = base.clone();
+        extra.push(level(BookSide::Ask, 102.0, 1.0));
+        assert!(!a.same_state(&build(extra)), "one side has an extra level");
+        let orders = build(vec![order(
+            BookAction::Update,
+            BookSide::Bid,
+            100.0,
+            5.0,
+            7,
+        )]);
+        assert!(!orders.same_state(&build(vec![order(
+            BookAction::Update,
+            BookSide::Bid,
+            100.0,
+            5.0,
+            8
+        )])));
+        assert!(orders.same_state(&build(vec![order(
+            BookAction::Update,
+            BookSide::Bid,
+            100.0,
+            5.0,
+            7
+        )])));
     }
 
     /// The accumulator holds orders, and price levels are a fold over them — including the count per

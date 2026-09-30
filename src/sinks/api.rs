@@ -4175,6 +4175,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
         };
         let enabled = vec![row];
 
@@ -4249,6 +4250,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
         };
         let sports_row = Feed {
             venue: "KALSHI",
@@ -4260,6 +4262,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
         };
         let enabled = vec![perps_row, sports_row];
 
@@ -4355,6 +4358,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
         };
         let enabled = vec![row];
 
@@ -4416,6 +4420,7 @@ mod tests {
             emit_trades: true,
             arbitration: ArbitrationMode::Sticky,
             mirror_offset: None,
+            shared_batch_id: false,
         };
         let enabled = vec![row];
 

@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - A market whose elected book path gapped no longer ping-pongs between the other paths. The health override now holds the market on the first healthy alternate and returns it to the leader only after 15 s of continuous leader health and the leader's own re-baseline of that market, or after 60 s. One lost leader datagram on a three-path venue cost a consumer up to 15 re-baselines in 6 s; it now costs one each way. New counter `dz_book_revert_holds_total{venue,release}`.
 
+### Added
+- Registry rows may declare `shared_batch_id` (default false, one value per venue and category), set on `edge-phoenix-mbp`. In a declared scope, a book failover between paths at the same committed slot holding identical levels goes out as an ordinary delta rather than a re-baseline; a mismatch counts `dz_book_path_divergence_total{venue}` and re-baselines as before.
+
 ### Notes
 - **Open glossary item, deliberately recorded here rather than as an issue: `venue` names a matching
   engine, not a venue.** The glossary is explicit that a Source ID identifies one matching engine and

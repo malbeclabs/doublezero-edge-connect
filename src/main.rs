@@ -659,6 +659,9 @@ async fn main() -> Result<()> {
         // SourceID, so a venue can reach the arbiter without its own feed being ingested.
         for f in ingest::feeds::feeds() {
             a.set_mode(f.venue, f.arbitration);
+            if f.shared_batch_id {
+                a.set_shared_batch_id(f.venue, f.category);
+            }
         }
         // The arbiter updates the WS-replay depth map on each admitted (leader) depth, so a
         // reconnecting client replays the broadcast book, not a dropped non-leader's copy.
