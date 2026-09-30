@@ -609,6 +609,16 @@ Modules are grouped by role under `src/`:
   two alternates traded a market on every message, each trade a re-baseline. A hold is discarded when
   an election moves the leader, the holder goes unhealthy or silent, or the replay entry is incomplete
   (a quiet holder would never republish it); `dz_book_revert_holds_total{release}` counts the endings.
+  ⚠️ **A handover skips the re-baseline only where the registry declares `shared_batch_id`** (one value
+  per `(venue, category)` over the book rows, refused at load on a row with no book, installed
+  beside the arbitration mode; true on
+  `edge-phoenix-mbp` alone, whose publishers stamp the venue slot): `Arbiter::seamless_handover` then
+  compares the **replay entry** (what reached the wire; a withheld batch can make the outgoing path's
+  own accumulator differ from the consumer's book) against the incoming path's accumulator, before
+  that path's batch is folded, and requires both complete, between events, at one equal slot no lower
+  than `wire_slot`, and `BookAccumulator::same_state`. Undeclared, it always re-baselines: two paths'
+  slots are otherwise unrelated counters, and a false "equal" corrupts a book silently. A mismatch at
+  an equal slot counts `dz_book_path_divergence_total` and re-baselines.
   Tunables are the `--arb-*` flags (see docs/metrics.md).
   **Anything but "the path that last reached the wire for this market" re-baselines the consumer**: a
   serving-path change (margin, silence, or that health override), a market's first admission, a market

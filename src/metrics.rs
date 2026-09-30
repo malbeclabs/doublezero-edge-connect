@@ -173,6 +173,9 @@ pub struct Metrics {
     /// Health overrides held against an early revert, by how the hold ended
     /// (`natural`/`deadline`/`incomplete`).
     pub book_revert_holds: IntCounterVec,
+    /// Handovers between paths of a `shared_batch_id` scope that found the two books different at
+    /// an equal committed slot, and so re-baselined.
+    pub book_path_divergence: IntCounterVec,
     /// Trade-tape ownership moving from one of a venue's **feed rows** to another (the reconciler's
     /// decision, on a subscription change). Each move is a window in which a print may double or
     /// drop, so a sustained rate means subscriptions are flapping.
@@ -698,6 +701,13 @@ impl Metrics {
                 "Health overrides whose revert to the leader was held, by how the hold ended \
                  (natural/deadline/incomplete).",
                 &["venue", "release"],
+            ),
+            book_path_divergence: counter_vec(
+                &registry,
+                "dz_book_path_divergence_total",
+                "Handovers between paths declared to share batch_id that found different books at \
+                 an equal committed slot, and re-baselined instead.",
+                &["venue"],
             ),
             path_markets_held: gauge_vec(
                 &registry,
@@ -1310,6 +1320,7 @@ mod tests {
         m.book_revert_holds
             .with_label_values(&["KALSHI", "natural"])
             .inc();
+        m.book_path_divergence.with_label_values(&["KALSHI"]).inc();
         m.path_markets_held
             .with_label_values(&["KALSHI", "path0"])
             .set(1);
@@ -1428,6 +1439,7 @@ mod tests {
             "dz_path_lead_ns",
             "dz_path_authority_transfers_total",
             "dz_book_revert_holds_total",
+            "dz_book_path_divergence_total",
             "dz_path_markets_held",
             "dz_tape_owner_changes_total",
             "dz_tape_path_transfers_total",

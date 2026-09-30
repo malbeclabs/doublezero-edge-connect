@@ -1433,6 +1433,11 @@ pub struct Arbiter {
     /// the registry's `&'static str` rather than the `Arc<str>` the dedup keys use; lookups borrow
     /// as `&str`, so this needs no `venue_arc` interning.
     modes: HashMap<&'static str, ArbitrationMode>,
+    /// The `(venue, category)` scopes whose paths stamp `batch_id` from one venue coordinate
+    /// (`Feed::shared_batch_id`), keyed venue first so a lookup borrows the wire venue.
+    shared_slots: HashMap<&'static str, HashSet<&'static str>>,
+    /// Rate limit for the path-divergence warning, which runs inside the shared mutex.
+    divergence_log: WarnRateLimit,
     /// Who owns each `(source, symbol)` zero-id tape, and when they last printed. A bypassed
     /// `trade_id == 0` has no window to collapse against, so a *concurrent* second publisher's
     /// zero-id prints are pure duplicates; they are still forwarded (dropping is an authority
@@ -1763,6 +1768,8 @@ impl Arbiter {
             instrument_defs: HashMap::new(),
             venue_metrics: HashMap::new(),
             modes: HashMap::new(),
+            shared_slots: HashMap::new(),
+            divergence_log: WarnRateLimit::default(),
             no_id_owner: HashMap::new(),
             tape_leader: HashMap::new(),
             no_id_conflict_logged: false,
@@ -1932,6 +1939,76 @@ impl Arbiter {
     /// are pinned to one mode by `feeds::tests::arbitration_mode_agrees_across_a_venues_rows`.
     pub fn set_mode(&mut self, venue: &'static str, mode: ArbitrationMode) {
         self.modes.insert(venue, mode);
+    }
+
+    /// Declare that `(venue, category)`'s paths share one `batch_id` coordinate. Called at startup
+    /// for each row whose `shared_batch_id` is set.
+    pub fn set_shared_batch_id(&mut self, venue: &'static str, category: &'static str) {
+        self.shared_slots.entry(venue).or_default().insert(category);
+    }
+
+    /// Whether a handover of `key` onto `publisher` can go out as a plain delta: the scope is
+    /// declared, and what reached the wire and `publisher`'s own book are both complete, between
+    /// events, at the same committed slot (not behind the published one) and identical. Read before
+    /// `publisher`'s batch is accumulated, since that batch is the first delta from the shared state.
+    ///
+    /// A mismatch at an equal slot means two paths disagree about one venue state, so it is counted
+    /// and the market re-baselines.
+    fn seamless_handover(
+        &mut self,
+        key: &MarketKey,
+        venue: &Arc<str>,
+        category: &str,
+        publisher: Transport,
+    ) -> bool {
+        if !self
+            .shared_slots
+            .get(venue.as_ref())
+            .is_some_and(|c| c.contains(category))
+        {
+            return false;
+        }
+        let (Some(replay), Some(market)) = (&self.book_replay, self.book_markets.get(key)) else {
+            return false;
+        };
+        let Some(incoming) = market.paths.get(&publisher) else {
+            return false;
+        };
+        let agree = {
+            let replay = model::lock(replay);
+            let Some(served) = replay.get(key) else {
+                return false;
+            };
+            let whole = |a: &BookAccumulator| a.baselined() && a.pending_empty();
+            let slot = served.batch_id();
+            if !whole(served)
+                || !whole(incoming)
+                || slot.is_none()
+                || slot != incoming.batch_id()
+                || market.wire_slot > slot
+            {
+                return false;
+            }
+            served.same_state(incoming)
+        };
+        if !agree {
+            metrics()
+                .book_path_divergence
+                .with_label_values(&[venue.as_ref()])
+                .inc();
+            if let Some(suppressed) = self.divergence_log.allow() {
+                warn!(
+                    venue = %venue,
+                    category,
+                    channel = key.2,
+                    instrument_id = key.3,
+                    ?publisher,
+                    suppressed,
+                    "book paths disagree at an equal slot; re-baselining the handover"
+                );
+            }
+        }
+        agree
     }
 
     fn mode_for(&self, venue: &str) -> ArbitrationMode {
@@ -3401,6 +3478,9 @@ impl Arbiter {
                 if let Some(release) = self.books.take_hold_release() {
                     count_revert_hold(&b.venue, release);
                 }
+                let seamless = decision.emitted()
+                    && prev.is_some_and(|p| p != publisher)
+                    && self.seamless_handover(&key, &b.venue, category, publisher);
                 // Accumulate the path's feed whether or not it was admitted: a transfer republishes
                 // the new path's current levels, which exist only if its copies were folded in all along.
                 self.accumulate_book(&key, publisher, b);
@@ -3439,7 +3519,7 @@ impl Arbiter {
                     // Whether the handover obliges a re-baseline, not whether *this* batch carries
                     // it: one waiting for its new path's `last` is discharged by a later batch, which
                     // counts no transfer of its own.
-                    let rebaselined = prev != Some(publisher)
+                    let rebaselined = (prev != Some(publisher) && !seamless)
                         || self.book_markets.get(&key).is_some_and(|m| m.rebaseline);
                     metrics()
                         .path_transfers
@@ -3470,7 +3550,7 @@ impl Arbiter {
                 // a first admission, or a market whose state was evicted. All three re-baseline.
                 let (mut rebaseline_now, mut abandoned) = (false, false);
                 if let Some(m) = self.book_markets.get_mut(&key) {
-                    m.rebaseline |= prev != Some(publisher);
+                    m.rebaseline |= prev != Some(publisher) && !seamless;
                     if m.rebaseline {
                         // Wait for the new path to close a logical event before republishing its book: a
                         // `to_book` of a half-applied one goes out stamped `last` as a torn book.
@@ -6006,6 +6086,303 @@ mod tests {
         let out = every_second(&mut a, &mut rx, venue, &[path(1), path(2)], 61, 62);
         assert_eq!(out[0].changes, vec![clear_both()], "a bare clear");
         assert!(a.book_rebaselines_owed(path(1), std::slice::from_ref(&key))[0]);
+    }
+
+    // ---- seamless handover at a shared slot ----
+
+    fn at_slot(
+        venue: &str,
+        changes: Vec<BookChange>,
+        last: bool,
+        slot: u32,
+        recv: u64,
+    ) -> FeedMessage {
+        let FeedMessage::Book(mut b) = book(venue, BOOK_INSTRUMENT, changes, last, recv) else {
+            unreachable!()
+        };
+        b.batch_id = Some(slot);
+        FeedMessage::Book(b)
+    }
+
+    /// path(1) serves and path(2) shadows it, both baselined at slot 10 on `path2_book`, with a
+    /// replay map and, when `declared`, the scope's `shared_batch_id` set.
+    fn slotted(
+        venue: &'static str,
+        declared: bool,
+        path2_book: Vec<BookChange>,
+        path2_slot: u32,
+    ) -> (Arbiter, broadcast::Receiver<Arc<FeedMessage>>) {
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
+        if declared {
+            a.set_shared_batch_id(venue, TEST_CATEGORY);
+        }
+        let mut one = vec![clear_both(), bid(0.40, 10.0)];
+        a.emit(
+            at_slot(venue, one.clone(), true, 10, 1_000),
+            path(1),
+            TEST_CATEGORY,
+        );
+        one.splice(1.., path2_book);
+        a.emit(
+            at_slot(venue, one, true, path2_slot, 1_001),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        (a, rx)
+    }
+
+    /// Fail path(1) over to path(2), whose next batch moves the book on from slot 10.
+    fn fail_over(
+        a: &mut Arbiter,
+        rx: &mut broadcast::Receiver<Arc<FeedMessage>>,
+        venue: &str,
+    ) -> Vec<NormalizedBook> {
+        a.set_book_health(&mkey(venue, BOOK_INSTRUMENT), path(1), false);
+        a.emit(
+            at_slot(venue, vec![bid(0.41, 5.0)], true, 11, 2_000),
+            path(2),
+            TEST_CATEGORY,
+        );
+        drain_books(rx)
+    }
+
+    fn divergences(venue: &str) -> u64 {
+        metrics()
+            .book_path_divergence
+            .with_label_values(&[venue])
+            .get()
+    }
+
+    #[test]
+    fn a_declared_scope_switches_silently_at_an_equal_slot() {
+        let venue = "BookSeamless";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].changes,
+            vec![bid(0.41, 5.0)],
+            "the batch goes out as itself"
+        );
+        assert!(!out[0].snapshot);
+        assert_eq!(out[0].batch_id, Some(11));
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        assert!(!a.book_rebaselines_owed(path(2), std::slice::from_ref(&key))[0]);
+    }
+
+    /// Undeclared, two paths' slots are unrelated counters, so agreement proves nothing.
+    #[test]
+    fn an_undeclared_scope_rebaselines_even_when_the_paths_agree() {
+        let venue = "BookSeamlessUndeclared";
+        let (mut a, mut rx) = slotted(venue, false, vec![bid(0.40, 10.0)], 10);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(rebaselines(&out), 1);
+    }
+
+    #[test]
+    fn a_level_mismatch_counts_divergence_and_rebaselines() {
+        let venue = "BookSeamlessDiverged";
+        let before = divergences(venue);
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 11.0)], 10);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(rebaselines(&out), 1);
+        assert_eq!(divergences(venue), before + 1);
+    }
+
+    #[test]
+    fn a_slot_mismatch_rebaselines() {
+        let venue = "BookSeamlessSlot";
+        let before = divergences(venue);
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 9);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(rebaselines(&out), 1);
+        assert_eq!(
+            divergences(venue),
+            before,
+            "a different slot is not a divergence"
+        );
+    }
+
+    /// An incoming path holding an unterminated event is not at its committed slot.
+    #[test]
+    fn mid_event_never_switches_silently() {
+        let venue = "BookSeamlessMidEvent";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        a.emit(
+            at_slot(venue, vec![bid(0.39, 1.0)], false, 11, 1_500),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(rebaselines(&out), 1);
+    }
+
+    /// A path that has never re-baselined holds only what moved, so its levels prove nothing.
+    #[test]
+    fn an_incomplete_side_never_switches_silently() {
+        let venue = "BookSeamlessIncomplete";
+        let (tx, mut rx) = broadcast::channel(1024);
+        let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+        a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
+        a.set_shared_batch_id(venue, TEST_CATEGORY);
+        a.emit(
+            at_slot(venue, vec![clear_both(), bid(0.40, 10.0)], true, 10, 1_000),
+            path(1),
+            TEST_CATEGORY,
+        );
+        a.emit(
+            at_slot(venue, vec![bid(0.40, 10.0)], true, 10, 1_001),
+            path(2),
+            TEST_CATEGORY,
+        );
+        let _ = drain_books(&mut rx);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
+    }
+
+    /// The handover is still a transfer, and says it cost nothing.
+    #[test]
+    fn a_silent_switch_is_rebaselined_no() {
+        let venue = "BookSeamlessCounted";
+        let count = |rebaselined| {
+            metrics()
+                .path_transfers
+                .with_label_values(&[venue, "health", rebaselined])
+                .get()
+        };
+        let (no, yes) = (count("no"), count("yes"));
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        fail_over(&mut a, &mut rx, venue);
+        assert_eq!((count("no"), count("yes")), (no + 1, yes));
+    }
+
+    /// Part A's hold never reads the declaration: an override and its revert cost the same
+    /// transfers either way. Every batch carries a real slot and the paths agree, so the declared run
+    /// takes the seamless predicate on both handovers.
+    #[test]
+    fn the_revert_hold_is_identical_whether_the_slot_is_shared() {
+        let run = |venue: &'static str, declared: bool| {
+            let key = mkey(venue, BOOK_INSTRUMENT);
+            let (tx, mut rx) = broadcast::channel(4096);
+            let mut a = Arbiter::new(tx, TRADE_DEDUP_WINDOW);
+            a.set_book_replay(Arc::new(Mutex::new(BookReplay::default())));
+            if declared {
+                a.set_shared_batch_id(venue, TEST_CATEGORY);
+            }
+            let all = [path(1), path(2), path(3)];
+            for (i, p) in all.iter().enumerate() {
+                let baseline = vec![clear_both(), bid(0.40, 10.0)];
+                a.emit(
+                    at_slot(venue, baseline, true, 10, 10 * SEC + i as u64),
+                    *p,
+                    TEST_CATEGORY,
+                );
+            }
+            a.set_book_health(&key, path(1), false);
+            for s in 11..=40u64 {
+                if s == 13 {
+                    // The leader reinstalls at the slot it stands at, then reports healthy.
+                    let install = vec![clear_both(), bid(0.40, 12.0)];
+                    a.emit(
+                        at_slot(venue, install, true, 12, s * SEC - 1),
+                        path(1),
+                        TEST_CATEGORY,
+                    );
+                    a.set_book_health(&key, path(1), true);
+                }
+                // The leader's lost datagram: it sends nothing the second it gaps.
+                let senders = if s == 11 { &all[1..] } else { &all[..] };
+                for &p in senders {
+                    let slot = u32::try_from(s).unwrap();
+                    let delta = vec![bid(0.40, s as f64)];
+                    a.emit(at_slot(venue, delta, true, slot, s * SEC), p, TEST_CATEGORY);
+                }
+                let _ = drain_books(&mut rx);
+            }
+            let count = |reason: &str, r: &str| {
+                metrics()
+                    .path_transfers
+                    .with_label_values(&[venue, reason, r])
+                    .get()
+            };
+            [
+                count("health", "yes") + count("health", "no"),
+                count("health_revert", "yes") + count("health_revert", "no"),
+                count("health", "no") + count("health_revert", "no"),
+            ]
+        };
+        let declared = run("BookHoldDeclared", true);
+        let undeclared = run("BookHoldUndeclared", false);
+        assert_eq!(
+            declared[..2],
+            undeclared[..2],
+            "the same transfers either way"
+        );
+        assert_eq!(declared[..2], [1, 1]);
+        assert_eq!(
+            declared[2], 2,
+            "both handovers went through the seamless predicate"
+        );
+        assert_eq!(undeclared[2], 0);
+    }
+
+    /// The consumer's side of the comparison is the replay entry, and it has to be whole too.
+    fn replace_replay(a: &mut Arbiter, venue: &str, acc: BookAccumulator) {
+        let replay = a.book_replay.clone().unwrap();
+        model::lock(&replay).insert(mkey(venue, BOOK_INSTRUMENT), acc);
+    }
+
+    fn replay_acc(batches: &[FeedMessage]) -> BookAccumulator {
+        let mut acc = BookAccumulator::new("KXBTCPERP".into());
+        for m in batches {
+            let FeedMessage::Book(b) = m else {
+                unreachable!()
+            };
+            acc.apply(b);
+        }
+        acc
+    }
+
+    /// Same levels and slot as the incoming path, but the consumer's book was never baselined.
+    #[test]
+    fn an_incomplete_served_side_never_switches_silently() {
+        let venue = "BookSeamlessServedIncomplete";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let partial = replay_acc(&[at_slot(venue, vec![bid(0.40, 10.0)], true, 10, 1)]);
+        assert!(!partial.baselined() && partial.batch_id() == Some(10));
+        replace_replay(&mut a, venue, partial);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
+    }
+
+    /// Same committed slot and levels, but the consumer is mid-event: switching now would splice the
+    /// incoming path's deltas into an event the outgoing path opened.
+    #[test]
+    fn a_served_side_with_pending_changes_never_switches_silently() {
+        let venue = "BookSeamlessServedPending";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let open = replay_acc(&[
+            at_slot(venue, vec![clear_both(), bid(0.40, 10.0)], true, 10, 1),
+            at_slot(venue, vec![bid(0.39, 1.0)], false, 11, 2),
+        ]);
+        assert!(open.baselined() && !open.pending_empty() && open.batch_id() == Some(10));
+        replace_replay(&mut a, venue, open);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
+    }
+
+    /// The market has already published a slot past the one both books stand at.
+    #[test]
+    fn a_slot_behind_the_published_one_never_switches_silently() {
+        let venue = "BookSeamlessBehindWire";
+        let (mut a, mut rx) = slotted(venue, true, vec![bid(0.40, 10.0)], 10);
+        let key = mkey(venue, BOOK_INSTRUMENT);
+        a.book_markets.get_mut(&key).unwrap().wire_slot = Some(12);
+        let out = fail_over(&mut a, &mut rx, venue);
+        assert_eq!(out[0].changes[0], clear_both());
     }
 
     /// `rebaselined` separates a handover that costs a consumer a whole book from one that costs

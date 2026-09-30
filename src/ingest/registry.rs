@@ -133,6 +133,17 @@ pub enum RegistryError {
     ArbitrationDisagreement {
         venue: String,
     },
+    /// A `(venue, category)`'s book rows disagree on `shared_batch_id`.
+    SharedBatchIdDisagreement {
+        venue: String,
+        category: String,
+    },
+    /// A row that carries no book declares `shared_batch_id`.
+    SharedBatchIdOnNonBookRow {
+        venue: String,
+        category: String,
+        kind: &'static str,
+    },
     /// A row's `emit_trades` contradicts whether its kind can ever own a tape.
     EmitTradesDisagrees {
         venue: String,
@@ -228,6 +239,20 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "{venue}: rows declare two arbitration modes; the venue's mode is keyed by venue \
                  alone, so it would depend on document order"
+            ),
+            RegistryError::SharedBatchIdDisagreement { venue, category } => write!(
+                f,
+                "{venue}/{category}: book rows disagree on `shared_batch_id`; the arbiter reads one \
+                 value per venue and category"
+            ),
+            RegistryError::SharedBatchIdOnNonBookRow {
+                venue,
+                category,
+                kind,
+            } => write!(
+                f,
+                "{venue}/{category}: `shared_batch_id` is declared on a `{kind}` row, which carries \
+                 no book; declare it on the market-by-price or market-by-order row"
             ),
             RegistryError::EmitTradesDisagrees {
                 venue,
@@ -342,6 +367,10 @@ struct FeedRow {
     group: Ipv4Addr,
     emit_trades: bool,
     arbitration: WireArbitration,
+    /// Whether this row's publishers stamp `batch_id` from one venue coordinate, so two paths at an
+    /// equal slot with equal levels hold the same book. See `Feed::shared_batch_id`.
+    #[serde(default)]
+    shared_batch_id: bool,
     publishers: Publishers,
     /// A second publisher mirrors this row's whole published set on the **same ports**, stamping every
     /// wire `channel_id` raised by this amount — so a socket bound for channel `N` also receives
@@ -802,6 +831,8 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
     let mut group_ports = std::collections::HashSet::new();
     let mut mbo_categories: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::new();
+    let mut shared_slots: std::collections::HashMap<(&str, &str), bool> =
+        std::collections::HashMap::new();
 
     for f in rows {
         // `(venue, category, kind)` is the identity of a row. A duplicate is silently dropped by
@@ -828,6 +859,28 @@ fn check_cross_row_invariants(rows: &[Feed]) -> Result<(), RegistryError> {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(f.arbitration);
             }
+        }
+
+        // Book rows only: the arbiter installs one value per `(venue, category)` and only the book
+        // gate reads it, so a top-of-book row declaring it would declare the book scope unchecked.
+        let book_row = matches!(f.kind, FeedKind::MarketByPrice | FeedKind::MarketByOrder);
+        if f.shared_batch_id && !book_row {
+            return Err(RegistryError::SharedBatchIdOnNonBookRow {
+                venue: f.venue.to_string(),
+                category: f.category.to_string(),
+                kind: f.kind.label(),
+            });
+        }
+        if book_row
+            && *shared_slots
+                .entry((f.venue, f.category))
+                .or_insert(f.shared_batch_id)
+                != f.shared_batch_id
+        {
+            return Err(RegistryError::SharedBatchIdDisagreement {
+                venue: f.venue.to_string(),
+                category: f.category.to_string(),
+            });
         }
 
         // `emit_trades` is a capability claim the reconciler's ranking has to agree with, in both
@@ -978,6 +1031,7 @@ fn feed_from(
         publishers: Box::leak(publishers.into_boxed_slice()),
         emit_trades: row.emit_trades,
         arbitration: row.arbitration.into(),
+        shared_batch_id: row.shared_batch_id,
         mirror_offset,
     })
 }
@@ -1676,6 +1730,50 @@ mod tests {
             build(&doc_with(&format!("{SPORTS_ROW},{other}")), "test"),
             Err(RegistryError::ArbitrationDisagreement { .. })
         ));
+    }
+
+    /// The book rows of one `(venue, category)` must agree on `shared_batch_id`.
+    #[test]
+    fn shared_batch_id_disagreeing_within_a_venue_category_is_fatal() {
+        let mbp = SPORTS_ROW.replace(
+            r#""arbitration":"Sticky","#,
+            r#""arbitration":"Sticky","shared_batch_id":true,"#,
+        );
+        let mbo = r#"{"venue":"KALSHI","category":"sports","code":"e","kind":"MarketByOrder",
+            "group":"233.84.178.30","emit_trades":false,"arbitration":"Sticky",
+            "publishers":{"explicit":[{"mktdata":7600,"refdata":7601,"snapshot":7602}]}}"#;
+        assert!(matches!(
+            build(&doc_with(&format!("{mbp},{mbo}")), "test"),
+            Err(RegistryError::SharedBatchIdDisagreement { .. })
+        ));
+        let agreeing = mbo.replace(
+            r#""arbitration":"Sticky","#,
+            r#""arbitration":"Sticky","shared_batch_id":true,"#,
+        );
+        assert!(build(&doc_with(&format!("{mbp},{agreeing}")), "test").is_ok());
+        assert!(
+            build(&doc_with(&format!("{mbp},{PERPS_ROW}")), "test").is_ok(),
+            "a top-of-book row need not repeat it"
+        );
+    }
+
+    /// Only the book gate reads it, so a row with no book declaring it is a mistake, not a no-op.
+    #[test]
+    fn shared_batch_id_on_a_row_with_no_book_is_fatal() {
+        let tob = PERPS_ROW.replace(
+            r#""arbitration":"Sticky","#,
+            r#""arbitration":"Sticky","shared_batch_id":true,"#,
+        );
+        assert!(matches!(
+            build(&doc_with(&tob), "test"),
+            Err(RegistryError::SharedBatchIdOnNonBookRow { .. })
+        ));
+    }
+
+    #[test]
+    fn a_document_without_shared_batch_id_defaults_to_false() {
+        let loaded = build(&doc_with(SPORTS_ROW), "test").unwrap();
+        assert!(loaded.rows.iter().all(|f| !f.shared_batch_id));
     }
 
     /// Two venues' Market-by-Order rows must not share a `category`. A departing receiver releases
