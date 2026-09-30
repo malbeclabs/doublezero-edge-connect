@@ -48,7 +48,8 @@ struct PreparedFrame {
     /// and this is what tells them apart. For a `book`/`order_book` frame it is `book_market`'s
     /// (collapsed) id rather than the wire field — see [`prepare`].
     source_id: u16,
-    /// The message's symbol, or `None` for a venue-level `status` (matched by venue alone).
+    /// The message's symbol, or `None` for a venue-level `status`. `None` only exempts it from a
+    /// `symbol` (and `channel`) filter; it is still matched on `venue`, `source_id` and `type`.
     symbol: Option<Arc<str>>,
     /// The message's `channel_id`, or `None` for a type that carries none. Populated when the
     /// incremental `book` message lands; every current type is `None`.

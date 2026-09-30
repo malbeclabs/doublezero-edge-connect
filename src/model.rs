@@ -538,8 +538,9 @@ pub enum FeedMessage {
 
 impl FeedMessage {
     /// The (venue, symbol) this message is about - used for per-subscriber filtering. A `Status`
-    /// is venue-level and carries no symbol, so it reports an empty symbol (the WS server matches
-    /// it by venue alone - see `ws_server`).
+    /// is venue-level and carries no symbol, so it reports an empty symbol (the WS server exempts
+    /// it from `symbol`/`channel` filters but still matches `venue`, `source_id` and `type` - see
+    /// `sinks::ws::SubFilter::matches`).
     pub fn venue_symbol(&self) -> (&str, &str) {
         match self {
             FeedMessage::Instrument(i) => (i.venue.as_ref(), i.symbol.as_ref()),
